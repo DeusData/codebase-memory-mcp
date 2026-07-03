@@ -57,6 +57,13 @@
 #define UI_INDEX_LOG_POLL_MS 500L
 #define UI_INDEX_LOG_POLL_NS (UI_INDEX_LOG_POLL_MS * (long)CBM_NSEC_PER_MSEC)
 
+static const char UI_PROJECT_HEALTH_DIRTY_WARNING[] =
+    "project-health counts canonical graph rows; dirty file changes may be absent until "
+    "overlay or reindex completes.";
+static const char UI_LAYOUT_DIRTY_WARNING[] =
+    "layout reads canonical graph rows; dirty file changes may be absent until overlay "
+    "or reindex completes.";
+
 /* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
 
 /* Per-request CORS header buffers. Updated at the start of each dispatch.
@@ -911,13 +918,19 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     int node_count = cbm_store_count_nodes(store, name);
     int edge_count = cbm_store_count_edges(store, name);
-    cbm_store_close(store);
 
     int64_t size = cbm_file_size(db_path);
 
-    cbm_http_replyf(c, 200, g_cors_json,
-                    "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}",
-                    node_count, edge_count, (long long)size);
+    char base_json[256];
+    snprintf(base_json, sizeof(base_json),
+             "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}",
+             node_count, edge_count, (long long)size);
+    char *fresh_json =
+        cbm_mcp_add_dirty_file_freshness_to_json(base_json, store, name,
+                                                 UI_PROJECT_HEALTH_DIRTY_WARNING);
+    cbm_store_close(store);
+    cbm_http_replyf(c, 200, g_cors_json, "%s", fresh_json ? fresh_json : base_json);
+    free(fresh_json);
 }
 
 /* ── Handle GET /api/layout ───────────────────────────────────── */
@@ -1038,10 +1051,22 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 
     if (linked_count == 0) {
+        char *fresh_json =
+            cbm_mcp_add_dirty_file_freshness_to_json(primary_json, store, project,
+                                                     UI_LAYOUT_DIRTY_WARNING);
         cbm_store_close(store);
-        cbm_http_replyf(c, 200, g_cors_json, "%s", primary_json);
+        cbm_http_replyf(c, 200, g_cors_json, "%s", fresh_json ? fresh_json : primary_json);
+        free(fresh_json);
         free(primary_json);
         return;
+    }
+
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (cbm_store_count_dirty_files(store, project, &dirty_pending, &dirty_overlay_ready) !=
+        CBM_STORE_OK) {
+        dirty_pending = 0;
+        dirty_overlay_ready = 0;
     }
 
     /* Parse primary JSON and append linked_projects array */
@@ -1197,6 +1222,8 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     cbm_store_close(store);
     yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
+    cbm_mcp_add_dirty_file_freshness_counts(mdoc, mroot, dirty_pending, dirty_overlay_ready,
+                                            UI_LAYOUT_DIRTY_WARNING);
 
     size_t len = 0;
     char *final_json = yyjson_mut_write(mdoc, 0, &len);

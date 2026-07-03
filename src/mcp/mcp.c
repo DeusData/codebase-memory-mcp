@@ -189,10 +189,9 @@ static bool get_dirty_file_counts(cbm_store_t *store, const char *project,
     return true;
 }
 
-static void add_dirty_file_freshness_counts_with_warning(yyjson_mut_doc *doc,
-                                                         yyjson_mut_val *root,
-                                                         int pending, int overlay_ready,
-                                                         const char *warning_message) {
+void cbm_mcp_add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                             int pending, int overlay_ready,
+                                             const char *warning_message) {
     if (!doc || !root || (pending <= 0 && overlay_ready <= 0)) {
         return;
     }
@@ -221,7 +220,7 @@ static void add_dirty_file_freshness_counts_with_warning(yyjson_mut_doc *doc,
 
 static void add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                             int pending, int overlay_ready) {
-    add_dirty_file_freshness_counts_with_warning(doc, root, pending, overlay_ready, NULL);
+    cbm_mcp_add_dirty_file_freshness_counts(doc, root, pending, overlay_ready, NULL);
 }
 
 static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -3363,8 +3362,9 @@ static char *append_semantic_query_to_json(const char *base_json, const char *ar
     return out;
 }
 
-static char *add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t *store,
-                                              const char *project) {
+char *cbm_mcp_add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t *store,
+                                               const char *project,
+                                               const char *warning_message) {
     if (!base_json || !store || !project || !project[0]) {
         return NULL;
     }
@@ -3389,10 +3389,16 @@ static char *add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t
         return NULL;
     }
     yyjson_mut_doc_set_root(mdoc, root);
-    add_dirty_file_freshness_counts(mdoc, root, pending, overlay_ready);
+    cbm_mcp_add_dirty_file_freshness_counts(mdoc, root, pending, overlay_ready,
+                                            warning_message);
     char *out = yy_doc_to_str(mdoc);
     yyjson_mut_doc_free(mdoc);
     return out;
+}
+
+static char *add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t *store,
+                                              const char *project) {
+    return cbm_mcp_add_dirty_file_freshness_to_json(base_json, store, project, NULL);
 }
 
 /* Convert shell-glob wildcards to POSIX ERE: bare '*' → '.*', bare '?' → '.'
@@ -6452,8 +6458,8 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     if (yyjson_mut_arr_size(warnings) > 0) {
         yyjson_mut_obj_add_val(doc, root_obj, "warnings", warnings);
     }
-    add_dirty_file_freshness_counts_with_warning(doc, root_obj, dirty_pending,
-                                                 dirty_overlay_ready, dirty_warning);
+    cbm_mcp_add_dirty_file_freshness_counts(doc, root_obj, dirty_pending, dirty_overlay_ready,
+                                            dirty_warning);
 
     char *json = yy_doc_to_str(doc);
     if (json) {
