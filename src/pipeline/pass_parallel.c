@@ -1149,93 +1149,6 @@ static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sou
     }
 }
 
-/* Reject regex metacharacters, spaces, double-slashes in URL candidates. */
-static bool is_junk_url(const char *s) {
-    for (int i = 0; s[i]; i++) {
-        char ch = s[i];
-        if (ch == '\\' || ch == '^' || ch == '$' || ch == '*' || ch == '+' || ch == '(' ||
-            ch == ')' || ch == '[' || ch == ']' || ch == '|' || ch == ' ') {
-            return true;
-        }
-        if (ch == '/' && i > 0 && s[i - SKIP_ONE] == '/') {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Normalize a template literal URL and reject junk patterns.
- * Returns true if norm contains a valid API path. */
-static bool normalize_url_arg(const char *url, char *norm, int norm_sz) {
-    int ni = 0;
-    const char *p = url;
-    if (*p == '`' || *p == '"' || *p == '\'') {
-        p++;
-    }
-    if (*p != '/') {
-        return false;
-    }
-    while (*p && ni < norm_sz - PAIR_LEN) {
-        if (*p == '$' && *(p + SKIP_ONE) == '{') {
-            norm[ni++] = ':';
-            p += PAIR_LEN;
-            while (*p && *p != '}' && ni < norm_sz - PAIR_LEN) {
-                norm[ni++] = *p++;
-            }
-            if (*p == '}') {
-                p++;
-            }
-        } else if (*p == '`' || *p == '"' || *p == '\'' || *p == '?') {
-            break;
-        } else {
-            norm[ni++] = *p++;
-        }
-    }
-    norm[ni] = '\0';
-    enum { MIN_URL_LEN = 4 };
-    if (ni < MIN_URL_LEN || !strchr(norm + SKIP_ONE, '/')) {
-        return false;
-    }
-    return !is_junk_url(norm);
-}
-
-/* Detect API paths in call arguments and create HTTP_CALLS edges. */
-static void detect_url_in_args(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source, const CBMCall *call,
-                               const char *rel, CBMLanguage lang) {
-    const char *source_path = source && source->file_path && source->file_path[0] ? source->file_path : rel;
-    if (cbm_is_test_file(source_path, lang)) {
-        return;
-    }
-    for (int ai = 0; ai < call->arg_count; ai++) {
-        const CBMCallArg *ca = &call->args[ai];
-        const char *url = ca->value ? ca->value : ca->expr;
-        if (!url || (url[0] != '/' && url[0] != '`')) {
-            continue;
-        }
-        char norm[CBM_SZ_256];
-        if (!normalize_url_arg(url, norm, (int)sizeof(norm))) {
-            continue;
-        }
-        if (!cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
-            continue;
-        }
-        int64_t route_id = cbm_pipeline_upsert_service_route(
-            gbuf, norm, CBM_SVC_HTTP, NULL, NULL, "arg_url", source_path ? source_path : "");
-        if (route_id == 0) {
-            continue;
-        }
-        char esc_c[CBM_SZ_256];
-        char esc_n[CBM_SZ_256];
-        cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
-        cbm_json_escape(esc_n, sizeof(esc_n), norm);
-        char eprops[CBM_SZ_512];
-        snprintf(eprops, sizeof(eprops),
-                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
-        cbm_gbuf_insert_edge(gbuf, source->id, route_id, "HTTP_CALLS", eprops);
-        break;
-    }
-}
-
 /* Extract gRPC service and method from a callee name.
  * Handles patterns like: pb.NewFooServiceClient(conn).GetBar → Foo/GetBar
  * Also: FooServiceGrpc.newBlockingStub(ch).getBar → FooService/getBar */
@@ -1465,7 +1378,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         emit_normal_calls_edge(gbuf, source, target, call, res);
     }
 
-    detect_url_in_args(gbuf, source, call, rel, lang);
+    cbm_pipeline_detect_url_arg_routes(gbuf, source, call, rel, lang);
 }
 
 /* Find the source node for an edge: enclosing function or file node. */

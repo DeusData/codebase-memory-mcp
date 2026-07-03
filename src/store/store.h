@@ -587,6 +587,12 @@ int cbm_store_list_import_ref_paths_by_target(cbm_store_t *s, const char *projec
                                               const char *target_qn, char ***out,
                                               int *count);
 
+/* Caller frees each returned string and the array. Uses persisted graph IMPORTS
+ * edges, not import_refs metadata, so it also works for full-indexed stores. */
+int cbm_store_list_import_edge_source_paths_by_target_qn(cbm_store_t *s, const char *project,
+                                                        const char *target_qn, char ***out,
+                                                        int *count);
+
 /* Caller frees each returned string and the array. */
 int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,
                                                    const char *export_rel_path, char ***out,

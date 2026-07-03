@@ -33,6 +33,7 @@ enum {
 #include <stdint.h>
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "helpers.h"
 #include "service_patterns.h"
 
 #include <stdio.h>
@@ -196,6 +197,100 @@ int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_
     }
     return cbm_gbuf_upsert_node(gb, "Route", path, route_qn, file_path ? file_path : "", 0, 0,
                                 route_props);
+}
+
+/* Reject regex metacharacters, spaces, and double-slashes in URL candidates. */
+static bool route_arg_has_junk_chars(const char *s) {
+    if (!s) {
+        return true;
+    }
+    for (size_t i = 0; s[i] != '\0'; i++) {
+        char ch = s[i];
+        if (ch == '\\' || ch == '^' || ch == '$' || ch == '*' || ch == '+' || ch == '(' ||
+            ch == ')' || ch == '[' || ch == ']' || ch == '|' || ch == ' ') {
+            return true;
+        }
+        if (ch == '/' && i > 0 && s[i - SKIP_ONE] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Normalize a slash-path or template-literal URL argument. */
+static bool route_arg_normalize_url(const char *url, char *norm, size_t norm_sz) {
+    enum { RN_URL_ARG_MIN_PATH_LEN = 4 };
+    if (!url || !norm || norm_sz == 0) {
+        return false;
+    }
+    size_t ni = 0;
+    const char *p = url;
+    if (*p == '`' || *p == '"' || *p == '\'') {
+        p++;
+    }
+    if (*p != '/') {
+        return false;
+    }
+    while (*p && ni + PAIR_LEN < norm_sz) {
+        if (*p == '$' && *(p + SKIP_ONE) == '{') {
+            norm[ni++] = ':';
+            p += PAIR_LEN;
+            while (*p && *p != '}' && ni + PAIR_LEN < norm_sz) {
+                norm[ni++] = *p++;
+            }
+            if (*p == '}') {
+                p++;
+            }
+        } else if (*p == '`' || *p == '"' || *p == '\'' || *p == '?') {
+            break;
+        } else {
+            norm[ni++] = *p++;
+        }
+    }
+    norm[ni] = '\0';
+    if (ni < RN_URL_ARG_MIN_PATH_LEN || !strchr(norm + SKIP_ONE, '/')) {
+        return false;
+    }
+    return !route_arg_has_junk_chars(norm);
+}
+
+void cbm_pipeline_detect_url_arg_routes(cbm_gbuf_t *gb, const cbm_gbuf_node_t *source,
+                                        const CBMCall *call, const char *rel_path,
+                                        CBMLanguage lang) {
+    if (!gb || !source || !call) {
+        return;
+    }
+    const char *source_path =
+        source->file_path && source->file_path[0] ? source->file_path : rel_path;
+    if (cbm_is_test_file(source_path, lang)) {
+        return;
+    }
+    for (int ai = 0; ai < call->arg_count; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        const char *url = ca->value ? ca->value : ca->expr;
+        if (!url || (url[0] != '/' && url[0] != '`')) {
+            continue;
+        }
+        char norm[CBM_SZ_256];
+        if (!route_arg_normalize_url(url, norm, sizeof(norm)) ||
+            !cbm_service_pattern_is_http_route_literal(norm, call->callee_name)) {
+            continue;
+        }
+        int64_t route_id = cbm_pipeline_upsert_service_route(
+            gb, norm, CBM_SVC_HTTP, NULL, NULL, "arg_url", source_path ? source_path : "");
+        if (route_id == 0) {
+            continue;
+        }
+        char esc_c[CBM_SZ_256];
+        char esc_n[CBM_SZ_256];
+        cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+        cbm_json_escape(esc_n, sizeof(esc_n), norm);
+        char props[CBM_SZ_512];
+        snprintf(props, sizeof(props),
+                 "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"arg_url\"}", esc_c, esc_n);
+        cbm_gbuf_insert_edge(gb, source->id, route_id, "HTTP_CALLS", props);
+        break;
+    }
 }
 
 /* Extract a simple JSON string property emitted by the pipeline. Returns false
