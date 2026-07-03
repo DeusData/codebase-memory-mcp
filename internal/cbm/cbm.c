@@ -718,10 +718,11 @@ CBMFileResult *cbm_extract_file_with_options(const char *source, int source_len,
                         .root = pp_root,
                         .extract_macros = extract_macros,
                     };
-                    // Re-run unified extraction on expanded source.
-                    // This adds macro-expanded calls; duplicates with original calls are
-                    // harmless (pipeline deduplicates by caller+callee).
-                    cbm_extract_unified(&pp_ctx);
+                    // Re-run only call extraction on expanded source. Other metadata
+                    // from included/expanded text would be attributed to this file.
+                    // Duplicated calls are harmless (pipeline deduplicates by
+                    // caller+callee).
+                    cbm_extract_unified_calls_only(&pp_ctx);
 
                     // Also run LSP on expanded source for additional type-resolved
                     // calls (language is already C/C++/CUDA — checked in enclosing

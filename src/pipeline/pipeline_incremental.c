@@ -22,6 +22,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "discover/discover.h"
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
+#include "foundation/str_util.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
@@ -69,6 +70,37 @@ static bool incr_test_fail_phase_enabled(const char *phase) {
         cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
     return val && val[0] != '\0' && strcmp(val, cbm_incr_test_env_disabled) != 0 &&
            phase && strcmp(val, phase) == 0;
+}
+
+static bool incr_is_c_family_header(CBMLanguage lang, const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    switch (lang) {
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+    case CBM_LANG_OBJC:
+        break;
+    default:
+        return false;
+    }
+    return cbm_str_ends_with(rel_path, ".h") || cbm_str_ends_with(rel_path, ".hh") ||
+           cbm_str_ends_with(rel_path, ".hpp") || cbm_str_ends_with(rel_path, ".hxx") ||
+           cbm_str_ends_with(rel_path, ".cuh");
+}
+
+static bool incr_changed_contains_c_family_header(const cbm_file_info_t *changed_files,
+                                                  int changed_count) {
+    if (!changed_files || changed_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        if (incr_is_c_family_header(changed_files[i].language, changed_files[i].rel_path)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* ── File classification ─────────────────────────────────────────── */
@@ -1808,6 +1840,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_close(store);
         cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
         return 0;
+    }
+    const char *exact_reason = cbm_pipeline_publish_reason(p);
+    if (strcmp(exact_reason ? exact_reason : "",
+               CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE) == 0 &&
+        incr_changed_contains_c_family_header(changed_files, ci)) {
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.fallback", "reason",
+                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE, "scope", "c_family_header");
+        return CBM_NOT_FOUND;
     }
 
     bool regular_frontier_expansion_ok = cbm_pipeline_get_mode(p) >= CBM_MODE_FAST;

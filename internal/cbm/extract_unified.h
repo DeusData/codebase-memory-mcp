@@ -50,4 +50,9 @@ void handle_type_assigns(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spe
 // Definitions and imports stay as separate passes (different recursion patterns).
 void cbm_extract_unified(CBMExtractCtx *ctx);
 
+// Same traversal and scope tracking as cbm_extract_unified(), but emits only
+// CALLS. Used for preprocessed C/C++/CUDA source so macro-hidden calls are
+// recovered without attributing expanded header metadata to the including file.
+void cbm_extract_unified_calls_only(CBMExtractCtx *ctx);
+
 #endif // CBM_EXTRACT_UNIFIED_H
