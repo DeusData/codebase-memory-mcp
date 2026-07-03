@@ -233,6 +233,39 @@ static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
     add_dirty_file_freshness_counts(doc, root, pending, overlay_ready);
 }
 
+static void add_overlay_node_read_view_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                               cbm_store_t *store, const char *project,
+                                               const char *warning) {
+    if (!doc || !root || !store || !project || !project[0]) {
+        return;
+    }
+    cbm_store_overlay_node_view_summary_t summary = {0};
+    if (cbm_store_get_overlay_node_view_summary(store, project, &summary) != CBM_STORE_OK ||
+        summary.active_file_tombstones <= 0) {
+        return;
+    }
+    yyjson_mut_val *view = yyjson_mut_obj(doc);
+    if (!view) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, view, "state", "overlay_ready");
+    yyjson_mut_obj_add_int(doc, view, "overlay_ready_generations",
+                           summary.overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, view, "active_file_tombstones",
+                           summary.active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, view, "canonical_nodes_visible",
+                           summary.canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, view, "overlay_owned_nodes_visible",
+                           summary.overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, view, "total_nodes_visible", summary.total_nodes_visible);
+    yyjson_mut_obj_add_val(doc, root, "overlay_read_view", view);
+    add_response_warning(doc, root,
+                         warning ? warning
+                                 : "overlay_read_view is informational; graph search and trace "
+                                   "results remain canonical unless a tool explicitly says it is "
+                                   "overlay-aware.");
+}
+
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                            cbm_pipeline_exact_delta_stats_t stats) {
     if (!doc || !root || (stats.changed_paths < 0 && stats.affected_paths < 0 &&
@@ -4056,6 +4089,10 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                                  "index_status counts canonical graph rows; dirty file changes "
                                  "may be absent until overlay or reindex completes.");
         }
+        add_overlay_node_read_view_summary(
+            doc, root, store, project,
+            "index_status includes overlay_read_view counts, but nodes/edges are canonical counts "
+            "and search/trace results remain canonical until overlay-aware tools are enabled.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -8574,6 +8611,10 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
                              "codebase://status counts canonical graph rows; dirty file changes "
                              "may be absent until overlay or reindex completes.");
     }
+    add_overlay_node_read_view_summary(
+        doc, root, store, proj,
+        "codebase://status includes overlay_read_view counts, but nodes/edges are canonical "
+        "counts and search/trace results remain canonical until overlay-aware tools are enabled.");
 
     /* PageRank stats */
     struct sqlite3 *db = cbm_store_get_db(store);
