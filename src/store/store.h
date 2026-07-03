@@ -40,6 +40,11 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_DIRTY_SOURCE_WATCHER "watcher"
 #define CBM_STORE_DIRTY_SOURCE_WATCHMAN_CLOCK "watchman_clock"
 #define CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX "explicit_reindex"
+#define CBM_STORE_OVERLAY_STATUS_RESERVED "reserved"
+#define CBM_STORE_OVERLAY_STATUS_READY "overlay_ready"
+#define CBM_STORE_OVERLAY_STATUS_COMPACTING "compacting"
+#define CBM_STORE_OVERLAY_STATUS_COMPACTED "compacted"
+#define CBM_STORE_OVERLAY_STATUS_FAILED "failed"
 #define CBM_STORE_DERIVED_GENERATION_UNKNOWN 0
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
 #define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
@@ -643,6 +648,18 @@ int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
 /* Finish a previously reserved generation as complete or failed. */
 int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                       const char *status);
+
+/* Reserve and track foreground overlay generations. Overlay generations are
+ * metadata anchors only until overlay row tables/read views are enabled; dirty
+ * rows still do not hide canonical graph rows by themselves. */
+int cbm_store_reserve_overlay_generation(cbm_store_t *s, const char *project,
+                                         int64_t base_generation,
+                                         int64_t *out_overlay_generation);
+int cbm_store_set_overlay_generation_status(cbm_store_t *s, const char *project,
+                                            int64_t overlay_generation,
+                                            const char *status);
+int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
+                                        const char *status, int *out_count);
 
 /* Record derived-view freshness. Status must be one of CBM_STORE_DERIVED_STATUS_*. */
 int cbm_store_set_derived_view_state(cbm_store_t *s, const char *project,
