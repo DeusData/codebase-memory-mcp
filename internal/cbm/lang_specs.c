@@ -1599,7 +1599,7 @@ static const char *pine_branch_types[] = {"if_statement",     "switch_statement"
 static const char *pine_assign_types[] = {"reassignment_statement", NULL};
 // ==================== ARKTS (HarmonyOS/OpenHarmony) ====================
 // ArkTS is a TypeScript superset with declarative UI extensions.
-// Grammar: tree-sitter-arkts (https://github.com/aspect-ux/tree-sitter-arkts)
+// Grammar: tree-sitter-arkts (https://github.com/Million-mo/tree-sitter-arkts)
 // Reuses TS/JS node types where applicable, adds ArkTS-specific UI nodes.
 static const char *arkts_func_types[] = {"function_declaration",
                                          "function_expression",
