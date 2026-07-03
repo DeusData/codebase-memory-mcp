@@ -1755,6 +1755,51 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+static int collect_nodes_from_stmt(cbm_store_t *s, sqlite3_stmt *stmt, const char *op,
+                                   cbm_node_t **out, int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_t *arr = calloc((size_t)cap, sizeof(cbm_node_t));
+    if (!arr) {
+        store_set_error(s, op ? op : "collect_nodes out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            if (store_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                                 op ? op : "collect_nodes out of memory", true) != CBM_STORE_OK) {
+                cbm_store_free_nodes(arr, n);
+                return CBM_STORE_ERR;
+            }
+        }
+        if (scan_node(s, stmt, &arr[n]) != CBM_STORE_OK) {
+            cbm_store_free_nodes(arr, n + 1);
+            return CBM_STORE_ERR;
+        }
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        cbm_store_free_nodes(arr, n);
+        store_set_error_sqlite(s, op ? op : "collect_nodes");
+        return CBM_STORE_ERR;
+    }
+
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 /* Generic: find multiple nodes by a single-column filter. */
 static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *sql,
                               const char *project, const char *val, cbm_node_t **out, int *count) {
@@ -1773,39 +1818,7 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
 
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, val);
-
-    int cap = ST_INIT_CAP_16;
-    int n = 0;
-    cbm_node_t *arr = calloc((size_t)cap, sizeof(cbm_node_t));
-    if (!arr) {
-        store_set_error(s, "find_nodes_generic out of memory");
-        return CBM_STORE_ERR;
-    }
-
-    int step_rc = SQLITE_OK;
-    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        if (n >= cap) {
-            if (store_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
-                                 "find_nodes_generic out of memory", true) != CBM_STORE_OK) {
-                cbm_store_free_nodes(arr, n);
-                return CBM_STORE_ERR;
-            }
-        }
-        if (scan_node(s, stmt, &arr[n]) != CBM_STORE_OK) {
-            cbm_store_free_nodes(arr, n + 1);
-            return CBM_STORE_ERR;
-        }
-        n++;
-    }
-    if (step_rc != SQLITE_DONE) {
-        cbm_store_free_nodes(arr, n);
-        store_set_error_sqlite(s, "find_nodes_generic");
-        return CBM_STORE_ERR;
-    }
-
-    *out = arr;
-    *count = n;
-    return CBM_STORE_OK;
+    return collect_nodes_from_stmt(s, stmt, "find_nodes_generic", out, count);
 }
 
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
@@ -4986,6 +4999,95 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
 
     sqlite3_finalize(stmt);
     return CBM_STORE_OK;
+}
+
+static int store_latest_ready_overlay_for_file(cbm_store_t *s, const char *project,
+                                               const char *file_path,
+                                               int64_t *out_overlay_generation) {
+    if (out_overlay_generation) {
+        *out_overlay_generation = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !file_path || !file_path[0] ||
+        !out_overlay_generation) {
+        if (s) {
+            store_set_error(s, "latest_ready_overlay_for_file: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] =
+        "SELECT MAX(t.overlay_generation) "
+        "FROM overlay_tombstones t "
+        "JOIN overlay_generations g "
+        "  ON g.project = t.project AND g.overlay_generation = t.overlay_generation "
+        "WHERE t.project = ?1 AND t.rel_path = ?2 AND g.status = ?3 "
+        "  AND t.entity_kind = ?4 AND t.active = ?5;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "latest_ready_overlay_for_file prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, file_path);
+    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_4, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    sqlite3_bind_int(stmt, ST_COL_5, STORE_OVERLAY_TOMBSTONE_ACTIVE);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+            *out_overlay_generation = sqlite3_column_int64(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "latest_ready_overlay_for_file");
+    return CBM_STORE_ERR;
+}
+
+int cbm_store_find_nodes_by_file_overlay_view(cbm_store_t *s, const char *project,
+                                              const char *file_path, cbm_node_t **out,
+                                              int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !file_path || !file_path[0] || !out ||
+        !count) {
+        if (s) {
+            store_set_error(s, "find_nodes_by_file_overlay_view: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int64_t overlay_generation = 0;
+    int rc = store_latest_ready_overlay_for_file(s, project, file_path, &overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (overlay_generation <= 0) {
+        return cbm_store_find_nodes_by_file(s, project, file_path, out, count);
+    }
+
+    static const char sql[] =
+        "SELECT ?4 AS id, project, label, name, qualified_name, file_path, start_line, end_line, "
+        "properties FROM overlay_nodes "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3 AND owned = ?5 "
+        "ORDER BY name, qualified_name;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_nodes_by_file_overlay_view prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, file_path);
+    sqlite3_bind_int64(stmt, ST_COL_4, CBM_STORE_NO_NODE_ID);
+    sqlite3_bind_int(stmt, ST_COL_5, STORE_OVERLAY_ROW_OWNED);
+    rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_file_overlay_view", out, count);
+    sqlite3_finalize(stmt);
+    return rc;
 }
 
 static bool store_file_delta_batch_shape_valid(const cbm_store_file_delta_t *const *deltas,

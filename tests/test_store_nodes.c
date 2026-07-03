@@ -1479,6 +1479,111 @@ TEST(store_overlay_node_view_summary_counts_latest_ready_overlay) {
     PASS();
 }
 
+TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows) {
+    enum { BASE_GENERATION = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t old_main = {.project = "test",
+                           .label = "Function",
+                           .name = "old_main",
+                           .qualified_name = "test.old_main",
+                           .file_path = "main.go",
+                           .properties_json = "{}"};
+    cbm_node_t stable = {.project = "test",
+                         .label = "Function",
+                         .name = "stable",
+                         .qualified_name = "test.stable",
+                         .file_path = "stable.go",
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &old_main), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &stable), 0);
+
+    cbm_node_t *nodes = NULL;
+    int count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_file_overlay_view(s, "test", "main.go", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_GT(nodes[0].id, CBM_STORE_NO_NODE_ID);
+    ASSERT_STR_EQ(nodes[0].name, "old_main");
+    cbm_store_free_nodes(nodes, count);
+
+    int64_t first_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &first_overlay),
+              CBM_STORE_OK);
+    cbm_node_t first_nodes[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "new_main",
+         .qualified_name = "test.new_main",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "new_helper",
+         .qualified_name = "test.new_helper",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+    };
+    cbm_store_file_delta_t first_delta = {.project = "test",
+                                          .rel_path = "main.go",
+                                          .generation = BASE_GENERATION,
+                                          .nodes = first_nodes,
+                                          .node_count = 2};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &first_delta, first_overlay),
+              CBM_STORE_OK);
+
+    nodes = NULL;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_file_overlay_view(s, "test", "main.go", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(nodes[0].id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(nodes[1].id, CBM_STORE_NO_NODE_ID);
+    ASSERT_STR_EQ(nodes[0].name, "new_helper");
+    ASSERT_STR_EQ(nodes[1].name, "new_main");
+    cbm_store_free_nodes(nodes, count);
+
+    int64_t second_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &second_overlay),
+              CBM_STORE_OK);
+    cbm_node_t second_node = {.project = "test",
+                              .label = "Function",
+                              .name = "newer_main",
+                              .qualified_name = "test.newer_main",
+                              .file_path = "main.go",
+                              .properties_json = "{}"};
+    cbm_store_file_delta_t second_delta = {.project = "test",
+                                           .rel_path = "main.go",
+                                           .generation = BASE_GENERATION,
+                                           .nodes = &second_node,
+                                           .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &second_delta, second_overlay),
+              CBM_STORE_OK);
+
+    nodes = NULL;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_file_overlay_view(s, "test", "main.go", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(nodes[0].id, CBM_STORE_NO_NODE_ID);
+    ASSERT_STR_EQ(nodes[0].name, "newer_main");
+    cbm_store_free_nodes(nodes, count);
+
+    nodes = NULL;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_file_overlay_view(s, "test", "stable.go", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_GT(nodes[0].id, CBM_STORE_NO_NODE_ID);
+    ASSERT_STR_EQ(nodes[0].name, "stable");
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_owner_metadata_crud) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -4215,6 +4320,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows);
     RUN_TEST(store_overlay_file_delta_publish_rejects_failed_generation);
     RUN_TEST(store_overlay_node_view_summary_counts_latest_ready_overlay);
+    RUN_TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_rebuild_file_delta_owners_derives_from_graph);
     RUN_TEST(store_import_export_metadata_crud);

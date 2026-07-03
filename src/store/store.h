@@ -465,6 +465,14 @@ int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const ch
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count);
 
+/* Find nodes for one file using the explicit overlay read view: if a ready
+ * overlay tombstone exists for the file, return owned nodes from the latest
+ * ready overlay for that file; otherwise return canonical nodes. Overlay nodes
+ * use id=CBM_STORE_NO_NODE_ID because overlay row ids are not graph node ids. */
+int cbm_store_find_nodes_by_file_overlay_view(cbm_store_t *s, const char *project,
+                                              const char *file_path, cbm_node_t **out,
+                                              int *count);
+
 /* Batch lookup: map qualified names → node IDs.
  * qns[i] is resolved; out_ids[i] receives the ID or 0 if not found.
  * Returns number of QNs actually found, or CBM_STORE_ERR. */
