@@ -5989,16 +5989,57 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
+typedef enum {
+    SEARCH_CODE_SCAN_RECURSIVE_GREP = 0,
+    SEARCH_CODE_SCAN_FILELIST_GREP = 1,
+    SEARCH_CODE_SCAN_GIT_GREP = 2,
+} search_code_scan_mode_t;
+
+/* Return true when git can operate on root_path as a worktree. This is a
+ * capability probe, not a .git path check, so it also supports subdirectories
+ * and linked worktrees. stderr is redirected to keep MCP stdio clean. */
+static bool search_code_git_worktree_available(const char *root_path) {
+    char cmd[CBM_SZ_2K];
+#ifdef _WIN32
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git -C \"%s\" rev-parse --is-inside-work-tree 2>NUL", root_path);
+#else
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git -C \"%s\" rev-parse --is-inside-work-tree 2>/dev/null", root_path);
+#endif
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return false;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    char line[CBM_SZ_64] = "";
+    bool ok = fgets(line, sizeof(line), fp) && strncmp(line, "true", CBM_SZ_4) == 0;
+    cbm_pclose(fp);
+    return ok;
+}
+
 /* Build the grep command string based on scoped vs recursive mode.
  * case_sensitive=false adds -i for case-insensitive matching (grep default is sensitive). */
 static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_sensitive,
-                           bool scoped, const char *file_pattern, const char *tmpfile,
-                           const char *filelist, const char *root_path) {
+                           search_code_scan_mode_t scan_mode, const char *file_pattern,
+                           const char *tmpfile, const char *filelist, const char *root_path) {
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
     const char *flag = use_regex ? "-E" : "-F";
     const char *ci_flag = case_sensitive ? "" : " -i";
     int n;
-    if (scoped) {
+    if (scan_mode == SEARCH_CODE_SCAN_GIT_GREP) {
+#ifdef _WIN32
+        n = snprintf(cmd, cmd_sz,
+                     "git -C \"%s\" grep -n%s --untracked %s -f \"%s\" -- . 2>NUL",
+                     root_path, ci_flag, flag, tmpfile);
+#else
+        n = snprintf(cmd, cmd_sz,
+                     "git -C \"%s\" grep -n%s --untracked %s -f \"%s\" -- . 2>/dev/null",
+                     root_path, ci_flag, flag, tmpfile);
+#endif
+    } else if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
         if (file_pattern) {
             n = snprintf(cmd, cmd_sz,
                          "xargs grep -n%s %s --include='%s' -f '%s' < '%s' 2>/dev/null",
@@ -6776,7 +6817,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             "{\"error\":\"search failed: temporary file path too long\","
             "\"hint\":\"Use a shorter TMPDIR/TEMP path or project path.\"}", true);
     }
-    bool scoped = false;
+    search_code_scan_mode_t scan_mode = SEARCH_CODE_SCAN_RECURSIVE_GREP;
     char grep_root[CBM_PATH_MAX];
     const char *grep_target = root_path;
     if (has_exact_filter_path) {
@@ -6795,11 +6836,13 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                 "\"hint\":\"Use a shorter project path or path_filter.\"}", true);
         }
         grep_target = grep_root;
+    } else if (!file_pattern && search_code_git_worktree_available(root_path)) {
+        scan_mode = SEARCH_CODE_SCAN_GIT_GREP;
     }
 
     char cmd[CBM_SZ_4K];
-    if (!build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scoped, file_pattern, tmpfile,
-                        filelist, grep_target)) {
+    if (!build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scan_mode, file_pattern,
+                        tmpfile, filelist, grep_target)) {
         cbm_unlink(tmpfile);
         if (has_path_filter) {
             cbm_regfree(&path_regex);
@@ -6816,7 +6859,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         cbm_unlink(tmpfile);
-        if (scoped) {
+        if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
             cbm_unlink(filelist);
         }
         if (has_path_filter) {
@@ -6837,7 +6880,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                             &path_regex, grep_limit, &gm_count);
     cbm_pclose(fp);
     cbm_unlink(tmpfile);
-    if (scoped) {
+    if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
         cbm_unlink(filelist);
     }
 
@@ -6891,7 +6934,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
-    const char *search_scope = has_exact_filter_path ? "path_filter_exact" : "project_recursive";
+    const char *search_scope = has_exact_filter_path
+                                   ? "path_filter_exact"
+                                   : (scan_mode == SEARCH_CODE_SCAN_GIT_GREP ? "git_worktree"
+                                                                              : "project_recursive");
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
                                root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0,
