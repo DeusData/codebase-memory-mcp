@@ -148,6 +148,9 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_file_state;
     sqlite3_stmt *stmt_get_file_state;
     sqlite3_stmt *stmt_delete_file_state;
+    sqlite3_stmt *stmt_upsert_dirty_file;
+    sqlite3_stmt *stmt_clear_dirty_file;
+    sqlite3_stmt *stmt_count_dirty_files;
     sqlite3_stmt *stmt_upsert_node_owner;
     sqlite3_stmt *stmt_upsert_edge_owner;
     sqlite3_stmt *stmt_delete_node_owners_by_file;
@@ -531,6 +534,18 @@ static int init_schema(cbm_store_t *s) {
         "  status TEXT NOT NULL DEFAULT '" CBM_STORE_DERIVED_STATUS_STALE "',"
         "  PRIMARY KEY (project, view_name)"
         ");"
+        "CREATE TABLE IF NOT EXISTS dirty_files ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  rel_path TEXT NOT NULL,"
+        "  observed_hash TEXT DEFAULT '',"
+        "  observed_mtime_ns INTEGER NOT NULL DEFAULT 0,"
+        "  observed_size INTEGER NOT NULL DEFAULT 0,"
+        "  observed_generation INTEGER NOT NULL DEFAULT 0,"
+        "  source TEXT NOT NULL DEFAULT '" CBM_STORE_DIRTY_SOURCE_UNKNOWN "',"
+        "  status TEXT NOT NULL DEFAULT '" CBM_STORE_DIRTY_STATUS_PENDING "',"
+        "  observed_at TEXT NOT NULL,"
+        "  PRIMARY KEY (project, rel_path)"
+        ");"
         "CREATE INDEX IF NOT EXISTS idx_node_degree_project"
         "  ON node_degree(project);";
 
@@ -585,7 +600,9 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_symbol_exports_node_id ON symbol_exports(node_id);"
         "CREATE INDEX IF NOT EXISTS idx_import_refs_target ON import_refs(project, target_qn);"
         "CREATE INDEX IF NOT EXISTS idx_derived_view_state_status"
-        "  ON derived_view_state(project, status);";
+        "  ON derived_view_state(project, status);"
+        "CREATE INDEX IF NOT EXISTS idx_dirty_files_status"
+        "  ON dirty_files(project, status);";
     /* NOTE: a partial expression index on json_extract(properties,'$.is_entry_point')
      * was tried for arch_entry_points and REVERTED: json_extract in an index WHERE
      * aborts CREATE INDEX (and thus store open) on any row whose properties JSON is
@@ -1109,6 +1126,9 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_file_state);
     finalize_stmt(&s->stmt_get_file_state);
     finalize_stmt(&s->stmt_delete_file_state);
+    finalize_stmt(&s->stmt_upsert_dirty_file);
+    finalize_stmt(&s->stmt_clear_dirty_file);
+    finalize_stmt(&s->stmt_count_dirty_files);
     finalize_stmt(&s->stmt_upsert_node_owner);
     finalize_stmt(&s->stmt_upsert_edge_owner);
     finalize_stmt(&s->stmt_delete_node_owners_by_file);
@@ -2317,6 +2337,127 @@ int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char 
     bind_text(stmt, ST_COL_2, rel_path);
     if (sqlite3_step(stmt) != SQLITE_DONE) {
         store_set_error_sqlite(s, "delete_file_state");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static bool store_dirty_status_valid(const char *status) {
+    return !status || strcmp(status, CBM_STORE_DIRTY_STATUS_PENDING) == 0 ||
+           strcmp(status, CBM_STORE_DIRTY_STATUS_OVERLAY_READY) == 0 ||
+           strcmp(status, CBM_STORE_DIRTY_STATUS_FAILED) == 0;
+}
+
+static bool store_dirty_source_valid(const char *source) {
+    return !source || strcmp(source, CBM_STORE_DIRTY_SOURCE_UNKNOWN) == 0 ||
+           strcmp(source, CBM_STORE_DIRTY_SOURCE_GIT_STATUS) == 0 ||
+           strcmp(source, CBM_STORE_DIRTY_SOURCE_GIT_DIFF) == 0 ||
+           strcmp(source, CBM_STORE_DIRTY_SOURCE_WATCHER) == 0 ||
+           strcmp(source, CBM_STORE_DIRTY_SOURCE_WATCHMAN_CLOCK) == 0 ||
+           strcmp(source, CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX) == 0;
+}
+
+int cbm_store_upsert_dirty_file(cbm_store_t *s, const cbm_dirty_file_state_t *state) {
+    if (!s || !s->db || !state || !state->project || !state->project[0] ||
+        !state->rel_path || !state->rel_path[0] ||
+        !store_dirty_source_valid(state->source) || !store_dirty_status_valid(state->status)) {
+        if (s) {
+            store_set_error(s, "upsert_dirty_file: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_upsert_dirty_file,
+        "INSERT INTO dirty_files (project, rel_path, observed_hash, observed_mtime_ns, "
+        "observed_size, observed_generation, source, status, observed_at) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+        "ON CONFLICT(project, rel_path) DO UPDATE SET "
+        "observed_hash=?3, observed_mtime_ns=?4, observed_size=?5, "
+        "observed_generation=?6, source=?7, status=?8, observed_at=?9;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, state->project);
+    bind_text(stmt, ST_COL_2, state->rel_path);
+    bind_text(stmt, ST_COL_3, state->observed_hash ? state->observed_hash : "");
+    sqlite3_bind_int64(stmt, ST_COL_4, state->observed_mtime_ns);
+    sqlite3_bind_int64(stmt, ST_COL_5, state->observed_size);
+    sqlite3_bind_int64(stmt, ST_COL_6, state->observed_generation);
+    bind_text(stmt, ST_COL_7, state->source ? state->source : CBM_STORE_DIRTY_SOURCE_UNKNOWN);
+    bind_text(stmt, ST_COL_8,
+              state->status ? state->status : CBM_STORE_DIRTY_STATUS_PENDING);
+    bind_text(stmt, ST_COL_9, ts);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_dirty_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_clear_dirty_file(cbm_store_t *s, const char *project, const char *rel_path) {
+    if (!s || !s->db || !project || !project[0] || !rel_path || !rel_path[0]) {
+        if (s) {
+            store_set_error(s, "clear_dirty_file: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_clear_dirty_file,
+        "DELETE FROM dirty_files WHERE project = ?1 AND rel_path = ?2;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "clear_dirty_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_count_dirty_files(cbm_store_t *s, const char *project, int *out_pending,
+                                int *out_overlay_ready) {
+    if (out_pending) {
+        *out_pending = 0;
+    }
+    if (out_overlay_ready) {
+        *out_overlay_ready = 0;
+    }
+    if (!s || !s->db || !project || !project[0]) {
+        if (s) {
+            store_set_error(s, "count_dirty_files: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_count_dirty_files,
+        "SELECT status, COUNT(*) FROM dirty_files WHERE project = ?1 GROUP BY status;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    int rc = SQLITE_OK;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *status = (const char *)sqlite3_column_text(stmt, 0);
+        int count = sqlite3_column_int(stmt, ST_COL_1);
+        if (status && strcmp(status, CBM_STORE_DIRTY_STATUS_OVERLAY_READY) == 0) {
+            if (out_overlay_ready) {
+                *out_overlay_ready += count;
+            }
+        } else {
+            if (out_pending) {
+                *out_pending += count;
+            }
+        }
+    }
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "count_dirty_files");
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;

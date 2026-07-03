@@ -8498,6 +8498,17 @@ static int pipeline_store_file_state_generation(const char *db_path, const char 
     return rc;
 }
 
+static int pipeline_store_dirty_counts(const char *db_path, const char *project,
+                                       int *out_pending, int *out_overlay_ready) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_count_dirty_files(s, project, out_pending, out_overlay_ready);
+    cbm_store_close(s);
+    return rc;
+}
+
 static int pipeline_store_completed_generation_count(const char *db_path, const char *project) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
@@ -9341,6 +9352,13 @@ TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
                                                    &generation),
               CBM_STORE_OK);
     ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 0);
 
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
@@ -10675,6 +10693,13 @@ TEST(incremental_publish_failure_keeps_existing_db) {
     ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
     cbm_store_close(s);
     ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 1);
+    ASSERT_EQ(dirty_overlay_ready, 0);
 
     cbm_pipeline_free(p);
     free(project);

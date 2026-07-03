@@ -31,6 +31,15 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_INDEX_STATUS_FAILED "failed"
 #define CBM_STORE_DERIVED_STATUS_STALE "stale"
 #define CBM_STORE_DERIVED_STATUS_COMPLETE "complete"
+#define CBM_STORE_DIRTY_STATUS_PENDING "pending"
+#define CBM_STORE_DIRTY_STATUS_OVERLAY_READY "overlay_ready"
+#define CBM_STORE_DIRTY_STATUS_FAILED "failed"
+#define CBM_STORE_DIRTY_SOURCE_UNKNOWN "unknown"
+#define CBM_STORE_DIRTY_SOURCE_GIT_STATUS "git_status"
+#define CBM_STORE_DIRTY_SOURCE_GIT_DIFF "git_diff"
+#define CBM_STORE_DIRTY_SOURCE_WATCHER "watcher"
+#define CBM_STORE_DIRTY_SOURCE_WATCHMAN_CLOCK "watchman_clock"
+#define CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX "explicit_reindex"
 #define CBM_STORE_DERIVED_GENERATION_UNKNOWN 0
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
 #define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
@@ -99,6 +108,17 @@ typedef struct {
     const char *computed_at;
     const char *status;
 } cbm_derived_view_state_t;
+
+typedef struct {
+    const char *project;
+    const char *rel_path;
+    const char *observed_hash;
+    int64_t observed_mtime_ns;
+    int64_t observed_size;
+    int64_t observed_generation;
+    const char *source;
+    const char *status;
+} cbm_dirty_file_state_t;
 
 typedef struct {
     const char *source_qn;
@@ -528,6 +548,13 @@ int cbm_store_get_file_state(cbm_store_t *s, const char *project, const char *re
                              cbm_file_state_t *out);
 
 int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char *rel_path);
+
+/* Metadata-only dirty-file ledger. Dirty rows must not hide canonical graph rows;
+ * they only let callers warn that newer file contents may exist. */
+int cbm_store_upsert_dirty_file(cbm_store_t *s, const cbm_dirty_file_state_t *state);
+int cbm_store_clear_dirty_file(cbm_store_t *s, const char *project, const char *rel_path);
+int cbm_store_count_dirty_files(cbm_store_t *s, const char *project, int *out_pending,
+                                int *out_overlay_ready);
 
 int cbm_store_upsert_node_owner(cbm_store_t *s, const char *project, int64_t node_id,
                                 const char *rel_path, int64_t generation);

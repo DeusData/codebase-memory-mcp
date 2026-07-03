@@ -110,8 +110,25 @@ static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
 #define CBM_MCP_FRESHNESS_KEY "freshness"
 #define CBM_MCP_FRESHNESS_STATE_KEY "state"
 #define CBM_MCP_FRESHNESS_STALE_VIEWS_KEY "stale_views"
+#define CBM_MCP_FRESHNESS_STALE_SCOPE_KEY "stale_scope"
+#define CBM_MCP_FRESHNESS_DIRTY_PENDING_KEY "dirty_files_pending"
+#define CBM_MCP_FRESHNESS_DIRTY_OVERLAY_READY_KEY "dirty_files_overlay_ready"
+#define CBM_MCP_FRESHNESS_DIRTY_WITH_WARNING "dirty_with_warning"
+#define CBM_MCP_FRESHNESS_SCOPE_DIRTY_FILES "dirty_files"
 #define CBM_MCP_FRESHNESS_STALE_WITH_WARNING "stale_with_warning"
 #define CBM_MCP_EXACT_DELTA_KEY "exact_delta"
+
+static yyjson_mut_val *ensure_response_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root) {
+    if (!doc || !root) {
+        return NULL;
+    }
+    yyjson_mut_val *freshness = yyjson_mut_obj_get(root, CBM_MCP_FRESHNESS_KEY);
+    if (!freshness || !yyjson_mut_is_obj(freshness)) {
+        freshness = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_val(doc, root, CBM_MCP_FRESHNESS_KEY, freshness);
+    }
+    return freshness;
+}
 
 static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                     const char *view_name) {
@@ -119,10 +136,9 @@ static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
         return;
     }
 
-    yyjson_mut_val *freshness = yyjson_mut_obj_get(root, CBM_MCP_FRESHNESS_KEY);
-    if (!freshness || !yyjson_mut_is_obj(freshness)) {
-        freshness = yyjson_mut_obj(doc);
-        yyjson_mut_obj_add_val(doc, root, CBM_MCP_FRESHNESS_KEY, freshness);
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
     }
     if (!yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_STATE_KEY)) {
         yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_STATE_KEY,
@@ -145,6 +161,38 @@ static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
         }
     }
     yyjson_mut_arr_add_str(doc, stale_views, view_name);
+}
+
+static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     cbm_store_t *store, const char *project) {
+    if (!doc || !root || !store || !project || !project[0]) {
+        return;
+    }
+    int pending = 0;
+    int overlay_ready = 0;
+    if (cbm_store_count_dirty_files(store, project, &pending, &overlay_ready) != CBM_STORE_OK ||
+        (pending <= 0 && overlay_ready <= 0)) {
+        return;
+    }
+
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
+    }
+    if (!yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_STATE_KEY)) {
+        yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_STATE_KEY,
+                               CBM_MCP_FRESHNESS_DIRTY_WITH_WARNING);
+    }
+    if (!yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_STALE_SCOPE_KEY)) {
+        yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_STALE_SCOPE_KEY,
+                               CBM_MCP_FRESHNESS_SCOPE_DIRTY_FILES);
+    }
+    yyjson_mut_obj_add_int(doc, freshness, CBM_MCP_FRESHNESS_DIRTY_PENDING_KEY, pending);
+    yyjson_mut_obj_add_int(doc, freshness, CBM_MCP_FRESHNESS_DIRTY_OVERLAY_READY_KEY,
+                           overlay_ready);
+    add_response_warning(doc, root,
+                         "project has dirty files; canonical graph rows remain visible until "
+                         "overlay or reindex completes.");
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -3554,6 +3602,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     inject_context_once(doc, root, srv, store);
     add_derived_freshness_warnings(doc, root, out.pagerank_stale, out.linkrank_stale,
                                    out.node_degree_stale);
+    add_dirty_file_freshness(doc, root, store, project);
     if (search_graph_uses_route_derived_graph(label, relationship) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
         add_stale_derived_view_warning(

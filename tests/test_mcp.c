@@ -34,6 +34,18 @@ static bool has_stale_freshness_view(const char *json, const char *view_name) {
            strstr(json, "\"stale_views\"") && strstr(json, view_name);
 }
 
+static bool has_dirty_freshness_counts(const char *json, int pending, int overlay_ready) {
+    char pending_buf[CBM_SZ_64];
+    char overlay_buf[CBM_SZ_64];
+    snprintf(pending_buf, sizeof(pending_buf), "\"dirty_files_pending\":%d", pending);
+    snprintf(overlay_buf, sizeof(overlay_buf), "\"dirty_files_overlay_ready\":%d",
+             overlay_ready);
+    return json && strstr(json, "\"freshness\"") &&
+           strstr(json, "\"state\":\"dirty_with_warning\"") &&
+           strstr(json, "\"stale_scope\":\"dirty_files\"") &&
+           strstr(json, pending_buf) && strstr(json, overlay_buf);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
  * ══════════════════════════════════════════════════════════════════ */
@@ -778,6 +790,49 @@ TEST(tool_search_graph_warns_on_stale_route_view) {
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "routes derived view is stale"));
     ASSERT(has_stale_freshness_view(inner, CBM_STORE_DERIVED_VIEW_ROUTES));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_graph_reports_dirty_metadata_without_hiding_canonical_rows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "dirty-metadata";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/dirty-metadata"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t node = {.project = proj,
+                       .label = "Function",
+                       .name = "StillVisible",
+                       .qualified_name = "dirty.StillVisible",
+                       .file_path = "src/dirty.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    cbm_dirty_file_state_t dirty = {.project = proj,
+                                    .rel_path = "src/dirty.c",
+                                    .observed_hash = "dirty-hash",
+                                    .observed_generation = 7,
+                                    .source = CBM_STORE_DIRTY_SOURCE_GIT_STATUS,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":145,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"dirty-metadata\",\"label\":\"Function\","
+             "\"name_pattern\":\"StillVisible\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "StillVisible"));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "project has dirty files"));
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
 
     free(inner);
     free(resp);
@@ -3773,6 +3828,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_warns_on_stale_pagerank_view);
     RUN_TEST(tool_search_graph_warns_on_stale_route_view);
+    RUN_TEST(tool_search_graph_reports_dirty_metadata_without_hiding_canonical_rows);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
