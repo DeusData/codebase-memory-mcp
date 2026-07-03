@@ -8,7 +8,7 @@
  * Per-project state tracks:
  *   - Last git HEAD hash (detects commits, checkout, pull)
  *   - Last dirty-tree hash (djb2 of git status --porcelain; prevents reindex
- *     loop when tree is permanently dirty — only reindexes when content changes)
+ *     loops when the worktree remains in the same dirty status)
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
  *
@@ -69,6 +69,7 @@ typedef struct {
     int file_count;
     int interval_ms;
     int64_t next_poll_ns;
+    int64_t observed_next_poll_ns;
 } project_snapshot_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -158,6 +159,7 @@ static bool snapshot_from_state(project_snapshot_t *dst, const project_state_t *
     dst->file_count = src->file_count;
     dst->interval_ms = src->interval_ms;
     dst->next_poll_ns = src->next_poll_ns;
+    dst->observed_next_poll_ns = src->next_poll_ns;
     return true;
 }
 
@@ -171,7 +173,8 @@ static void snapshot_free(project_snapshot_t *s) {
 }
 
 static void state_apply_snapshot(project_state_t *dst, const project_snapshot_t *src) {
-    bool touched_during_poll = dst->next_poll_ns == 0 && src->next_poll_ns != 0;
+    bool touched_during_poll =
+        src->observed_next_poll_ns != 0 && dst->next_poll_ns == 0 && src->next_poll_ns != 0;
     memcpy(dst->last_head, src->last_head, sizeof(dst->last_head));
     memcpy(dst->last_dirty_hash, src->last_dirty_hash, sizeof(dst->last_dirty_hash));
     dst->is_git = src->is_git;
@@ -321,7 +324,9 @@ static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w) {
     }
 
     cbm_git_snapshot_t snap = {0};
-    if (cbm_git_snapshot_read(s->root_path, CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_FILE_COUNT,
+    if (cbm_git_snapshot_read(s->root_path,
+                              CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY |
+                                  CBM_GIT_SNAPSHOT_FILE_COUNT,
                               &snap) != 0) {
         s->baseline_done = true;
         s->is_git = false;
@@ -334,6 +339,7 @@ static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w) {
 
     if (s->is_git) {
         memcpy(s->last_head, snap.head, sizeof(s->last_head));
+        memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
         s->file_count = snap.file_count;
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -367,7 +373,7 @@ static bool check_changes(project_snapshot_t *s) {
         memcpy(s->last_head, snap.head, sizeof(s->last_head));
     }
 
-    /* Check working tree: only reindex if content changed since last poll. */
+    /* Check working tree: only reindex if git porcelain status changed since last poll. */
     if (snap.dirty_bytes <= 0) {
         /* Clean tree: clear hash so future dirt is always caught. */
         s->last_dirty_hash[0] = '\0';

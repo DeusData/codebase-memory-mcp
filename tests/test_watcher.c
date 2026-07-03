@@ -900,8 +900,9 @@ TEST(watcher_continued_dirty) {
 }
 
 TEST(watcher_baseline_dirty_repo) {
-    /* Baseline on a repo that already has uncommitted changes.
-     * Port of TestGitSentinelDetectsEdit (dirty from the start). */
+    /* Baseline on a repo that already has uncommitted changes. Watcher
+     * registration means "current state was just observed", so the same dirty
+     * state must not trigger a redundant reindex on the next poll. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_bld_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -909,7 +910,8 @@ TEST(watcher_baseline_dirty_repo) {
 
     if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
     { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
-    wt_git(tmpdir, "add file.txt");
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file2.txt"), "world\n"); }
+    wt_git(tmpdir, "add file.txt file2.txt");
     wt_git(tmpdir, "commit -q -m init");
 
     /* Make dirty BEFORE baseline */
@@ -924,11 +926,22 @@ TEST(watcher_baseline_dirty_repo) {
     cbm_watcher_watch(w, "bld-repo", tmpdir);
     index_call_count = 0;
 
-    /* Baseline — captures HEAD but doesn't check for dirty */
+    /* Baseline captures both HEAD and the current dirty hash. */
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0); /* baseline never triggers */
 
-    /* First real poll — should detect the pre-existing dirty state */
+    /* Same dirty state — should not reindex. */
+    cbm_watcher_touch(w, "bld-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* New dirty status — should reindex once. The watcher hashes porcelain
+     * status, so appending again to file.txt would keep the same status line. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file2.txt", tmpdir);
+        th_append_file(_p, "dirty after baseline\n");
+    }
     cbm_watcher_touch(w, "bld-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
@@ -991,7 +1004,8 @@ TEST(watcher_watch_after_unwatch) {
 
     if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
     { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
-    wt_git(tmpdir, "add file.txt");
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file2.txt"), "world\n"); }
+    wt_git(tmpdir, "add file.txt file2.txt");
     wt_git(tmpdir, "commit -q -m init");
 
     cbm_store_t *store = cbm_store_open_memory();
@@ -1019,7 +1033,17 @@ TEST(watcher_watch_after_unwatch) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0); /* baseline never triggers */
 
-    /* Second poll — detects dirty */
+    /* Same dirty state captured by the re-watch baseline should not reindex. */
+    cbm_watcher_touch(w, "rewatch-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* A later dirty-status change still triggers. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file2.txt", tmpdir);
+        th_append_file(_p, "dirty after rewatch baseline\n");
+    }
     cbm_watcher_touch(w, "rewatch-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
