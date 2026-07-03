@@ -49,6 +49,13 @@ PUBLISH_FULL = "full"
 PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
 PUBLISH_INCREMENTAL_CONTAINMENT = "incremental_containment"
+LOG_MARKER_PIPELINE_DONE = "pipeline.done"
+LOG_MARKER_INCREMENTAL_DONE = "incremental.done"
+LOG_MARKER_EXACT_DONE = "incremental.exact.done"
+LOG_MARKER_EXACT_FRONTIER = "incremental.exact.frontier"
+LOG_MARKER_EXACT_FALLBACK = "incremental.exact.fallback"
+LOG_MARKER_EXACT_DELETE_FALLBACK = "incremental.exact.delete.fallback"
+LOG_MARKER_EXACT_SKIP = "incremental.exact.skip"
 
 
 class BenchmarkCommandError(RuntimeError):
@@ -393,11 +400,16 @@ def is_explicit_incremental_route(publish_kind: str | None, reason: str | None =
 
 
 def parse_logged_elapsed_ms(stderr: str, marker: str) -> int | None:
+    return parse_log_int_field(stderr, marker, "elapsed_ms")
+
+
+def parse_log_int_field(stderr: str, marker: str, field: str) -> int | None:
+    prefix = f"{field}="
     for line in stderr.splitlines():
         if marker not in line:
             continue
         for item in line.split():
-            if item.startswith("elapsed_ms="):
+            if item.startswith(prefix):
                 try:
                     return int(item.split("=", 1)[1])
                 except ValueError:
@@ -406,18 +418,76 @@ def parse_logged_elapsed_ms(stderr: str, marker: str) -> int | None:
 
 
 def parse_exact_reason(stderr: str) -> str | None:
-    prefixes = (
-        "msg=incremental.exact.fallback reason=",
-        "msg=incremental.exact.delete.fallback reason=",
-        "msg=incremental.exact.skip reason=",
+    detail = parse_exact_route_detail(stderr)
+    reason = detail.get("reason")
+    return reason if isinstance(reason, str) and reason else None
+
+
+def parse_exact_route_detail(stderr: str) -> dict[str, Any]:
+    detail: dict[str, Any] = {
+        "frontier_changed_files": parse_log_int_field(stderr, LOG_MARKER_EXACT_FRONTIER, "changed"),
+        "frontier_expanded_files": parse_log_int_field(stderr, LOG_MARKER_EXACT_FRONTIER, "expanded"),
+        "exact_done_files": parse_log_int_field(stderr, LOG_MARKER_EXACT_DONE, "files"),
+        "event": None,
+        "reason": None,
+    }
+    reason_markers = (
+        (LOG_MARKER_EXACT_FALLBACK, "fallback"),
+        (LOG_MARKER_EXACT_DELETE_FALLBACK, "delete_fallback"),
+        (LOG_MARKER_EXACT_SKIP, "skip"),
     )
     for line in stderr.splitlines():
-        for prefix in prefixes:
+        for marker, event in reason_markers:
+            prefix = f"msg={marker} reason="
             if prefix not in line:
                 continue
             reason = line.split(prefix, 1)[1].split()[0]
-            return reason or None
-    return None
+            detail["event"] = event
+            detail["reason"] = reason or None
+            return detail
+    if detail["exact_done_files"] is not None:
+        detail["event"] = "exact"
+    elif detail["frontier_expanded_files"] is not None:
+        detail["event"] = "frontier_observed"
+    return detail
+
+
+def response_exact_delta(data: dict[str, Any]) -> dict[str, Any]:
+    exact_delta = data.get("exact_delta")
+    return exact_delta if isinstance(exact_delta, dict) else {}
+
+
+def merge_exact_route_detail(
+    detail: dict[str, Any],
+    data: dict[str, Any],
+    publish_kind: str,
+    publish_reason: str,
+) -> dict[str, Any]:
+    exact_delta = response_exact_delta(data)
+    field_map = {
+        "changed_paths": "frontier_changed_files",
+        "affected_paths": "frontier_expanded_files",
+        "published_paths": "exact_done_files",
+    }
+    for response_key, detail_key in field_map.items():
+        value = exact_delta.get(response_key)
+        if detail.get(detail_key) is None and isinstance(value, int):
+            detail[detail_key] = value
+    if not detail.get("reason") and publish_reason:
+        detail["reason"] = publish_reason
+    if not detail.get("event"):
+        published = detail.get("exact_done_files")
+        if isinstance(published, int) and published > 0:
+            detail["event"] = "exact"
+        elif isinstance(published, int) and published == 0:
+            detail["event"] = "noop"
+        elif publish_reason:
+            detail["event"] = "fallback"
+        elif publish_kind == PUBLISH_INCREMENTAL_EXACT:
+            detail["event"] = "exact"
+        elif publish_kind == PUBLISH_INCREMENTAL_NOOP:
+            detail["event"] = "noop"
+    return detail
 
 
 def indexed_work_elapsed_ms(logged_elapsed_ms: dict[str, int | None]) -> int | None:
@@ -461,11 +531,14 @@ def build_index_result(
     elapsed_ms_int = int(elapsed_ms)
     publish_kind = response_publish_kind(data)
     logged_elapsed_ms = {
-        "pipeline_done": parse_logged_elapsed_ms(stderr, "pipeline.done"),
-        "incremental_done": parse_logged_elapsed_ms(stderr, "incremental.done"),
+        "pipeline_done": parse_logged_elapsed_ms(stderr, LOG_MARKER_PIPELINE_DONE),
+        "incremental_done": parse_logged_elapsed_ms(stderr, LOG_MARKER_INCREMENTAL_DONE),
     }
     indexed_ms = indexed_work_elapsed_ms(logged_elapsed_ms)
     publish_reason = response_publish_reason(data)
+    exact_route_detail = merge_exact_route_detail(
+        parse_exact_route_detail(stderr), data, publish_kind, publish_reason
+    )
     freshness = response_freshness(data)
     freshness_state = response_freshness_state(data)
     result: dict[str, Any] = {
@@ -478,9 +551,9 @@ def build_index_result(
         "freshness": freshness,
         "stdout_bytes": stdout_bytes,
         "markers": {
-            "incremental_exact_done": log_has(stderr, "incremental.exact.done")
+            "incremental_exact_done": log_has(stderr, LOG_MARKER_EXACT_DONE)
             or publish_kind == PUBLISH_INCREMENTAL_EXACT,
-            "incremental_done": log_has(stderr, "incremental.done")
+            "incremental_done": log_has(stderr, LOG_MARKER_INCREMENTAL_DONE)
             or is_incremental_publish_kind(publish_kind),
             "pagerank_done": log_has(stderr, "pagerank.done"),
             "pagerank_defer": log_has(stderr, "pagerank.defer"),
@@ -490,7 +563,8 @@ def build_index_result(
             or is_incremental_publish_kind(publish_kind),
         },
         "logged_elapsed_ms": logged_elapsed_ms,
-        "exact_reason": publish_reason or parse_exact_reason(stderr),
+        "exact_reason": publish_reason or exact_route_detail.get("reason"),
+        "exact_route_detail": exact_route_detail,
         "stderr_tail": log_tail(stderr),
     }
     if include_logs:

@@ -923,6 +923,7 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST) {
         return CBM_STORE_OK;
     }
+    cbm_pipeline_set_exact_delta_stats(p, deleted_count, -1, -1);
 
     const char *rel_path = deleted[0];
     if (!rel_path || !rel_path[0]) {
@@ -982,6 +983,7 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_graph_changed(p, true);
     cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_set_publish_reason(p, NULL);
+    cbm_pipeline_set_exact_delta_stats(p, deleted_count, deleted_count, deleted_count);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
@@ -1128,9 +1130,11 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
     int max_changed_paths = cbm_pipeline_exact_max_changed_paths(p);
     int max_affected_paths = cbm_pipeline_exact_max_affected_paths(p);
+    int input_path_count = changed_count + deleted_count;
+    cbm_pipeline_set_exact_delta_stats(p, input_path_count, -1, -1);
     if (deleted_count < 0 || changed_count > max_changed_paths ||
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
-        changed_count + deleted_count > max_affected_paths) {
+        input_path_count > max_affected_paths) {
         const char *reason =
             changed_count > max_changed_paths
                 ? "changed_batch_too_large"
@@ -1163,6 +1167,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
                                                         exact_files, &exact_count, exact_file_cap,
                                                         &frontier_reason);
     if (frontier_rc != CBM_STORE_OK) {
+        cbm_pipeline_set_exact_delta_stats(p, input_path_count, exact_count + deleted_count, -1);
         cbm_pipeline_set_publish_reason(
             p, frontier_reason ? frontier_reason : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR);
         cbm_log_info("incremental.exact.fallback", "reason",
@@ -1176,6 +1181,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
 
     int delta_count = exact_count + deleted_count;
+    cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, -1);
     int rc = CBM_STORE_OK;
     const char **changed_paths = NULL;
     cbm_gbuf_t *scratch = NULL;
@@ -1408,6 +1414,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         cbm_pipeline_set_graph_changed(p, false);
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
         cbm_pipeline_set_publish_reason(p, NULL);
+        cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, 0);
         cbm_log_info("incremental.exact.noop", "files", itoa_buf_incr(delta_count));
         *applied = 1;
         goto cleanup;
@@ -1430,6 +1437,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_graph_changed(p, true);
     cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_set_publish_reason(p, NULL);
+    cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, delta_count);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
