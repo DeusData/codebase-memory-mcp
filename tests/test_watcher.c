@@ -1664,6 +1664,54 @@ TEST(watcher_watch_idempotent) {
     PASS();
 }
 
+TEST(watcher_mark_indexed_refreshes_existing_baseline) {
+    /* Explicit index_repository observes the current worktree. The watcher must
+     * not reindex that same dirty status after the response, but later status
+     * changes still need to trigger. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_mark_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file2.txt"), "world\n"); }
+    wt_git(tmpdir, "add file.txt file2.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "mark-repo", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "dirty indexed explicitly\n");
+    }
+    cbm_watcher_mark_indexed(w, "mark-repo", tmpdir);
+    cbm_watcher_touch(w, "mark-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file2.txt", tmpdir);
+        th_append_file(_p, "dirty after explicit index\n");
+    }
+    cbm_watcher_touch(w, "mark-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  RESOURCE MANAGEMENT & AUTO-INDEXING BEHAVIOR
  * ══════════════════════════════════════════════════════════════════ */
@@ -2014,6 +2062,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_dirty_content_change_retriggered);
     RUN_TEST(watcher_watch_path_change_resets_state);
     RUN_TEST(watcher_watch_idempotent);
+    RUN_TEST(watcher_mark_indexed_refreshes_existing_baseline);
     RUN_TEST(watcher_unwatch_prunes_state);
     RUN_TEST(watcher_watch_after_unwatch);
     RUN_TEST(watcher_unwatch_during_poll_callback_no_uaf);

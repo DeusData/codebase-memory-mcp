@@ -111,6 +111,19 @@ static bool watcher_git_path_supported(const char *root_path) {
     return cbm_git_snapshot_path_supported(root_path);
 }
 
+static bool watcher_validate_path(const char *event, const char *project_name, const char *root_path) {
+    if (!cbm_git_validate_repo_path(root_path)) {
+        cbm_log_warn(event, "project", project_name, "reason",
+                     "path contains shell metacharacters");
+        return false;
+    }
+    if (!watcher_git_path_supported(root_path)) {
+        cbm_log_warn(event, "project", project_name, "reason", "path too long for git command");
+        return false;
+    }
+    return true;
+}
+
 /* ── Project state lifecycle ────────────────────────────────────── */
 
 static project_state_t *state_new(const char *name, const char *root_path) {
@@ -160,6 +173,24 @@ static bool snapshot_from_state(project_snapshot_t *dst, const project_state_t *
     dst->interval_ms = src->interval_ms;
     dst->next_poll_ns = src->next_poll_ns;
     dst->observed_next_poll_ns = src->next_poll_ns;
+    return true;
+}
+
+static bool snapshot_from_project(project_snapshot_t *dst, const char *project_name,
+                                  const char *root_path) {
+    if (!dst || !project_name || !root_path) {
+        return false;
+    }
+    memset(dst, 0, sizeof(*dst));
+    dst->project_name = cbm_strdup(project_name);
+    dst->root_path = cbm_strdup(root_path);
+    if (!dst->project_name || !dst->root_path) {
+        free(dst->project_name);
+        free(dst->root_path);
+        memset(dst, 0, sizeof(*dst));
+        return false;
+    }
+    dst->interval_ms = POLL_BASE_MS;
     return true;
 }
 
@@ -225,20 +256,15 @@ void cbm_watcher_free(cbm_watcher_t *w) {
 
 /* ── Watch list management ──────────────────────────────────────── */
 
+static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w);
+
 void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
     if (!w || !project_name || !root_path) {
         return;
     }
 
     /* Reject paths with shell metacharacters: all git helpers use cbm_popen(). */
-    if (!cbm_git_validate_repo_path(root_path)) {
-        cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
-                     "path contains shell metacharacters");
-        return;
-    }
-    if (!watcher_git_path_supported(root_path)) {
-        cbm_log_warn("watcher.watch.reject", "project", project_name, "reason",
-                     "path too long for git command");
+    if (!watcher_validate_path("watcher.watch.reject", project_name, root_path)) {
         return;
     }
 
@@ -269,6 +295,45 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     cbm_ht_set(w->projects, s->project_name, s);
     cbm_mutex_unlock(&w->projects_lock);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
+}
+
+void cbm_watcher_mark_indexed(cbm_watcher_t *w, const char *project_name, const char *root_path) {
+    if (!w || !project_name || !root_path) {
+        return;
+    }
+    if (!watcher_validate_path("watcher.indexed.reject", project_name, root_path)) {
+        return;
+    }
+
+    project_snapshot_t snap = {0};
+    if (!snapshot_from_project(&snap, project_name, root_path)) {
+        cbm_log_warn("watcher.indexed.oom", "project", project_name, "path", root_path);
+        return;
+    }
+    init_baseline(&snap, w);
+
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *cur = cbm_ht_get(w->projects, project_name);
+    if (cur && strcmp(cur->root_path, root_path) != 0) {
+        cbm_ht_delete(w->projects, project_name);
+        state_free(cur);
+        cur = NULL;
+    }
+    if (!cur) {
+        cur = state_new(project_name, root_path);
+        if (!cur) {
+            cbm_mutex_unlock(&w->projects_lock);
+            snapshot_free(&snap);
+            cbm_log_warn("watcher.indexed.oom", "project", project_name, "path", root_path);
+            return;
+        }
+        cbm_ht_set(w->projects, cur->project_name, cur);
+    }
+    state_apply_snapshot(cur, &snap);
+    cbm_mutex_unlock(&w->projects_lock);
+
+    cbm_log_info("watcher.indexed", "project", project_name, "path", root_path);
+    snapshot_free(&snap);
 }
 
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {

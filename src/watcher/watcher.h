@@ -42,6 +42,11 @@ void cbm_watcher_free(cbm_watcher_t *w);
 /* Add a project to the watch list. root_path is copied. */
 void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path);
 
+/* Mark a project as explicitly indexed at its current git state.
+ * This updates the watch baseline without making duplicate watch() calls reset
+ * state during ordinary project access. */
+void cbm_watcher_mark_indexed(cbm_watcher_t *w, const char *project_name, const char *root_path);
+
 /* Remove a project from the watch list. */
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name);
 
