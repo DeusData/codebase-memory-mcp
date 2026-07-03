@@ -858,6 +858,46 @@ static int mcp_test_rebuild_nodes_fts(cbm_store_t *st) {
     return cbm_store_rebuild_nodes_fts(st);
 }
 
+TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "dirty-query-metadata";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/dirty-query-metadata"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "dirtyquerymarker",
+                                         "dirty.query.marker", "src/dirty_query.c"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
+
+    cbm_dirty_file_state_t dirty = {.project = proj,
+                                    .rel_path = "src/dirty_query.c",
+                                    .observed_hash = "dirty-query-hash",
+                                    .observed_generation = 9,
+                                    .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":146,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"dirty-query-metadata\","
+             "\"query\":\"dirtyquerymarker\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "dirtyquerymarker"));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "project has dirty files"));
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_query_sees_file_delta_fts_updates) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3829,6 +3869,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_warns_on_stale_pagerank_view);
     RUN_TEST(tool_search_graph_warns_on_stale_route_view);
     RUN_TEST(tool_search_graph_reports_dirty_metadata_without_hiding_canonical_rows);
+    RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
