@@ -2580,10 +2580,6 @@ static const char *class_label_for_kind(const char *kind) {
         strcmp(kind, "type_declaration") == 0) {
         return "Type";
     }
-    if (strcmp(kind, "component_declaration") == 0 ||
-        strcmp(kind, "decorated_export_declaration") == 0) {
-        return "Component";
-    }
     return "Class";
 }
 
@@ -3731,6 +3727,16 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         } else if (strcmp(kind, "abi_item") == 0) {
             label = "Interface";
         }
+    }
+    // ArkTS: `@Component struct Foo` parses to `component_declaration` (and
+    // `@Component export struct Foo` to `decorated_export_declaration`). These
+    // are UI components, not OOP classes — emit the precise "Component" label.
+    // Scoped to ArkTS only so templ's `component_declaration` (a Go templating
+    // function) keeps its established "Class" labeling and the golden snapshot
+    // for templ is unaffected.
+    if (ctx->language == CBM_LANG_ARKTS && (strcmp(kind, "component_declaration") == 0 ||
+                                            strcmp(kind, "decorated_export_declaration") == 0)) {
+        label = "Component";
     }
     // Rust/Swift/D: a struct is a distinct kind from a class — emit the precise
     // "Struct" label rather than collapsing it to "Class". Scoped to these three
