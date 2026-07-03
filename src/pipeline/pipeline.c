@@ -737,8 +737,9 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * Use the repo-walking variant so manifests filtered out by the main
      * discoverer (package.json, composer.json) still feed pkgmap and let
      * workspace imports like `@my/pkg` resolve to their target Module. */
-    cbm_pipeline_set_pkgmap(
-        cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count, ctx->project_name));
+    cbm_pipeline_set_pkgmap(cbm_pkgmap_build_from_repo(ctx->repo_path, files, file_count,
+                                                       ctx->project_name, ctx->excluded_dirs,
+                                                       ctx->excluded_count));
 
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
@@ -1261,7 +1262,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* Phase 2b: Load build-tool path aliases (tsconfig/jsconfig today). NULL
      * when no usable configs are found — non-TS projects pay nothing. */
-    path_aliases = cbm_load_path_aliases(p->repo_path);
+    path_aliases =
+        cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
@@ -1273,6 +1275,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
+        .excluded_dirs = p->excluded_dirs,
+        .excluded_count = p->excluded_count,
     };
 
     rc = run_extraction_phase(p, &ctx, files, file_count);

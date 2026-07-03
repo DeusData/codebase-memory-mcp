@@ -20,6 +20,8 @@
 
 #include "pipeline/path_alias.h"
 
+#include "pipeline/pipeline_internal.h"
+
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
@@ -333,7 +335,8 @@ static const char *const TS_CONFIG_NAMES[] = {"tsconfig.json", "jsconfig.json"};
 enum { TS_CONFIG_NAMES_COUNT = 2 };
 
 static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_config_hit_t *out,
-                             int *count, int max_count, int depth) {
+                             int *count, int max_count, int depth, char **excluded_dirs,
+                             int excluded_count) {
     if (*count >= max_count || depth > CBM_PATH_ALIAS_MAX_DEPTH) {
         return;
     }
@@ -375,12 +378,18 @@ static void find_alias_files(const char *abs_dir, const char *rel_dir, alias_con
         } else {
             snprintf(child_rel, sizeof(child_rel), "%s/%s", rel_dir, name);
         }
-        find_alias_files(child_abs, child_rel, out, count, max_count, depth + 1);
+        if (cbm_pipeline_relpath_is_excluded(child_rel, excluded_dirs, excluded_count)) {
+            continue;
+        }
+        find_alias_files(child_abs, child_rel, out, count, max_count, depth + 1, excluded_dirs,
+                         excluded_count);
     }
     cbm_closedir(d);
 }
 
-cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path) {
+cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
+                                                            char **excluded_dirs,
+                                                            int excluded_count) {
     if (!repo_path) {
         return NULL;
     }
@@ -389,7 +398,8 @@ cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path) {
         return NULL;
     }
     int count = 0;
-    find_alias_files(repo_path, "", hits, &count, CBM_PATH_ALIAS_MAX_FILES, 0);
+    find_alias_files(repo_path, "", hits, &count, CBM_PATH_ALIAS_MAX_FILES, 0, excluded_dirs,
+                     excluded_count);
     if (count >= CBM_PATH_ALIAS_MAX_FILES) {
         cbm_log_warn("path_alias.files.cap_hit", "repo", repo_path, "kept", "256_of_more");
     }
@@ -430,6 +440,10 @@ cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path) {
     qsort(coll->scopes, (size_t)coll->count, sizeof(cbm_path_alias_scope_t),
           cmp_scope_by_specificity);
     return coll;
+}
+
+cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path) {
+    return cbm_load_path_aliases_excluded(repo_path, NULL, 0);
 }
 
 const cbm_path_alias_map_t *cbm_path_alias_find_for_file(const cbm_path_alias_collection_t *coll,
