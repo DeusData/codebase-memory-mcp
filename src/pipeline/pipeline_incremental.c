@@ -422,6 +422,100 @@ typedef struct {
     int changed_file_count;
 } cbm_incr_classification_t;
 
+static void incr_observe_file_metadata(const cbm_file_info_t *file, int64_t *out_mtime_ns,
+                                       int64_t *out_size) {
+    if (out_mtime_ns) {
+        *out_mtime_ns = 0;
+    }
+    if (out_size) {
+        *out_size = 0;
+    }
+    if (!file || !file->path) {
+        return;
+    }
+    struct stat st;
+    if (stat(file->path, &st) == 0) {
+        if (out_mtime_ns) {
+            *out_mtime_ns = cbm_pipeline_stat_mtime_ns(&st);
+        }
+        if (out_size) {
+            *out_size = st.st_size;
+        }
+    }
+}
+
+static int incr_mark_dirty_classification(cbm_store_t *store, const char *project,
+                                          const cbm_incr_classification_t *cls) {
+    if (!store || !project || !project[0] || !cls) {
+        return CBM_STORE_ERR;
+    }
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < cls->changed_file_count; i++) {
+        int64_t mtime_ns = 0;
+        int64_t size = 0;
+        incr_observe_file_metadata(&cls->changed_files[i], &mtime_ns, &size);
+        cbm_dirty_file_state_t dirty = {
+            .project = project,
+            .rel_path = cls->changed_files[i].rel_path,
+            .observed_mtime_ns = mtime_ns,
+            .observed_size = size,
+            .observed_generation = CBM_PIPELINE_COMPAT_GENERATION,
+            .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+            .status = CBM_STORE_DIRTY_STATUS_PENDING,
+        };
+        if (cbm_store_upsert_dirty_file(store, &dirty) != CBM_STORE_OK) {
+            rc = CBM_STORE_ERR;
+        }
+    }
+    for (int i = 0; i < cls->deleted_count; i++) {
+        cbm_dirty_file_state_t dirty = {
+            .project = project,
+            .rel_path = cls->deleted[i],
+            .observed_generation = CBM_PIPELINE_COMPAT_GENERATION,
+            .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+            .status = CBM_STORE_DIRTY_STATUS_PENDING,
+        };
+        if (cbm_store_upsert_dirty_file(store, &dirty) != CBM_STORE_OK) {
+            rc = CBM_STORE_ERR;
+        }
+    }
+    return rc;
+}
+
+static int incr_clear_dirty_classification(cbm_store_t *store, const char *project,
+                                           const cbm_incr_classification_t *cls) {
+    if (!store || !project || !project[0] || !cls) {
+        return CBM_STORE_ERR;
+    }
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < cls->changed_file_count; i++) {
+        if (cbm_store_clear_dirty_file(store, project, cls->changed_files[i].rel_path) !=
+            CBM_STORE_OK) {
+            rc = CBM_STORE_ERR;
+        }
+    }
+    for (int i = 0; i < cls->deleted_count; i++) {
+        if (cbm_store_clear_dirty_file(store, project, cls->deleted[i]) != CBM_STORE_OK) {
+            rc = CBM_STORE_ERR;
+        }
+    }
+    return rc;
+}
+
+static int incr_clear_dirty_classification_path(const char *db_path, const char *project,
+                                                const cbm_incr_classification_t *cls) {
+    if (!db_path || !project || !cls) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return CBM_STORE_ERR;
+    }
+    int rc = incr_clear_dirty_classification(store, project, cls);
+    cbm_store_close(store);
+    return rc;
+}
+
 static void incr_classification_free(cbm_incr_classification_t *c) {
     if (!c) {
         return;
@@ -1818,6 +1912,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return 0;
     }
 
+    if (incr_mark_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
+        cbm_log_warn("incremental.dirty_ledger.warn", "phase", "mark");
+    }
+
     cbm_store_free_file_hashes(stored, stored_count);
 
     cbm_file_info_t *changed_files = cls.changed_files;
@@ -1826,6 +1924,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     (void)incr_try_exact_delete_route(p, store, db_path, project, cls.deleted, cls.deleted_count,
                                       ci, &exact_applied);
     if (exact_applied) {
+        if (incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
+            cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_exact_delete");
+        }
         incr_classification_free(&cls);
         cbm_store_close(store);
         cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
@@ -1836,6 +1937,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                       file_count, cls.deleted, cls.deleted_count,
                                       pass_fingerprint, &exact_applied);
     if (exact_applied) {
+        if (incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
+            cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_exact_upsert");
+        }
         incr_classification_free(&cls);
         cbm_store_close(store);
         cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
@@ -1946,9 +2050,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             }
         }
     }
-    free_deleted_paths(cls.deleted, cls.deleted_count);
-    cls.deleted = NULL;
-    cls.deleted_count = 0;
     cbm_log_info("incremental.purge", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t)));
 
     /* Step 3-5: Registry + extract + resolve */
@@ -2014,8 +2115,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
 
-    free(cls.changed_files);
-    cls.changed_files = NULL;
     if (pipeline_rc != 0) {
         cbm_registry_free(registry);
         cbm_path_alias_collection_free(path_aliases);
@@ -2076,6 +2175,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
         if (!cbm_pipeline_publish_reason(p)) {
             cbm_pipeline_set_publish_reason(p, "containment_rebuild");
+        }
+        if (incr_clear_dirty_classification_path(db_path, project, &cls) != CBM_STORE_OK) {
+            cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_containment");
         }
     }
     incr_classification_free(&cls);
