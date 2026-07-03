@@ -1493,6 +1493,166 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
     PASS();
 }
 
+/* Shared fixture for the path_filter prefilter tests (PR #756 distilled):
+ * a project with two indexed files that both contain the search pattern —
+ * src/handler.go (inside the filter) and vendor/other.go (outside it). */
+static cbm_mcp_server_t *setup_prefilter_server(char *tmp, size_t tmp_sz, char *src_path,
+                                                size_t src_sz, char *vendor_path, size_t vendor_sz) {
+    snprintf(tmp, tmp_sz, "/tmp/cbm_srch_pref_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return NULL;
+    }
+    char dir[640];
+    snprintf(dir, sizeof(dir), "%s/src", tmp);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor", tmp);
+    cbm_mkdir(dir);
+
+    snprintf(src_path, src_sz, "%s/src/handler.go", tmp);
+    snprintf(vendor_path, vendor_sz, "%s/vendor/other.go", tmp);
+    FILE *fp = fopen(src_path, "w");
+    if (!fp) {
+        return NULL;
+    }
+    fprintf(fp, "package main\n\nfunc HandleRequest() error {\n\treturn nil\n}\n");
+    fclose(fp);
+    fp = fopen(vendor_path, "w");
+    if (!fp) {
+        return NULL;
+    }
+    fprintf(fp, "package vendored\n\nfunc HandleRequest() error {\n\treturn nil\n}\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "prefilter-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, tmp);
+
+    cbm_node_t n1 = {.project = proj,
+                     .label = "Function",
+                     .name = "HandleRequest",
+                     .qualified_name = "prefilter-search.main.HandleRequest",
+                     .file_path = "src/handler.go",
+                     .start_line = 3,
+                     .end_line = 5};
+    cbm_node_t n2 = {.project = proj,
+                     .label = "Function",
+                     .name = "HandleRequest",
+                     .qualified_name = "prefilter-search.vendored.HandleRequest",
+                     .file_path = "vendor/other.go",
+                     .start_line = 3,
+                     .end_line = 5};
+    if (cbm_store_upsert_node(st, &n1) <= 0 || cbm_store_upsert_node(st, &n2) <= 0) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    return srv;
+}
+
+static void cleanup_prefilter_dir(const char *tmp, const char *src_path, const char *vendor_path) {
+    char dir[640];
+    unlink(src_path);
+    unlink(vendor_path);
+    snprintf(dir, sizeof(dir), "%s/src", tmp);
+    rmdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor", tmp);
+    rmdir(dir);
+    rmdir(tmp);
+}
+
+/* PR #756 (distilled): scoped search_code prefilters the indexed filelist by
+ * path_filter before grep runs. POSITIVE invariant guard: a path_filter that
+ * matches the file containing the hit must still return that hit (guards
+ * against over-filtering — the prefilter predicate must stay IDENTICAL to the
+ * post-grep filter in collect_grep_matches), and files outside the filter
+ * stay excluded. Green on pre-prefilter main too (the post-grep filter alone
+ * produced the same results): the change is results-preserving perf-only. */
+TEST(search_code_path_filter_prefilter_keeps_matches) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"^src/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* The in-filter hit is returned; the out-of-filter file is not. */
+    ASSERT_NOT_NULL(strstr(inner, "src/handler.go"));
+    ASSERT_TRUE(strstr(inner, "vendor/other.go") == NULL);
+
+    /* Exactly the one in-filter grep match survives (same count before and
+     * after the prefilter — predicate identity). */
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    }
+    ASSERT_EQ(grep_matches, 1);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
+/* PR #756 (distilled): path_filter matching ZERO indexed files. With the
+ * prefilter the scoped filelist has 0 records, and handle_search_code now
+ * skips the grep subprocess entirely (xargs on an empty filelist is
+ * platform-dependent: GNU execs grep once with no operands, BSD skips) and
+ * returns the empty result directly. Must be a clean zero-result response —
+ * no error. Green on pre-prefilter main too (there the full filelist is
+ * grepped and the post-grep filter drops every hit — an empty filelist is
+ * unreachable on main): guards the edge the prefilter introduces. */
+TEST(search_code_path_filter_matches_nothing) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
+             "\"path_filter\":\"^no_such_dir/\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    }
+    ASSERT_EQ(grep_matches, 0);
+    int results = -1;
+    const char *r = strstr(inner, "\"total_results\":");
+    if (r) {
+        sscanf(r, "\"total_results\":%d", &results);
+    }
+    ASSERT_EQ(results, 0);
+    ASSERT_TRUE(strstr(inner, "handler.go") == NULL);
+    ASSERT_TRUE(strstr(inner, "other.go") == NULL);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
+    PASS();
+}
+
 /* issue #283: search_code with regex=true and a syntactically invalid pattern
  * must return an explicit error, not an empty result indistinguishable from a
  * legitimate no-match. */
@@ -3810,6 +3970,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
+    RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
+    RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);

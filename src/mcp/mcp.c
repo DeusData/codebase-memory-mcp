@@ -4435,9 +4435,19 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
     }
 }
 
-/* Write indexed file list for scoped grep. Returns true if scoped. */
+/* Write indexed file list for scoped grep. Returns true if scoped.
+ * When a path_filter is provided, apply it here — before grep — so large
+ * indexed projects do not scan files only for collect_grep_matches to discard
+ * them later. The predicate is IDENTICAL to the post-grep filter: the same
+ * compiled regex run against the same root-relative path (separators
+ * normalized on Windows first), so prefiltering can only skip files whose
+ * hits would be dropped anyway — results-preserving by construction.
+ * *out_written receives the number of records written (0 = the filter
+ * excluded every indexed file). */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist) {
+                                  const char *filelist, bool has_path_filter,
+                                  cbm_regex_t *path_regex, int *out_written) {
+    *out_written = 0;
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
         return false;
@@ -4450,8 +4460,17 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     }
     FILE *fl = fopen(filelist, "wb");
     bool ok = false;
+    int written = 0;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
+            if (has_path_filter && path_regex) {
+#ifdef _WIN32
+                cbm_normalize_path_sep(indexed_files[fi]);
+#endif
+                if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
+                    continue;
+                }
+            }
             /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
              * arbitrarily long absolute path cannot overflow). Forward slash join
              * so xargs doesn't treat Windows backslashes as escapes; binary mode
@@ -4468,6 +4487,7 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
 #else
             (void)fputc('\0', fl);
 #endif
+            written++;
         }
         (void)fclose(fl);
         ok = true;
@@ -4476,6 +4496,7 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         free(indexed_files[fi]);
     }
     free(indexed_files);
+    *out_written = written;
     return ok;
 }
 
@@ -4699,33 +4720,47 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char filelist[CBM_SZ_256];
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
+    int scoped_written = 0;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist);
+    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
+                                   has_path_filter ? &path_regex : NULL, &scoped_written);
 
-    char cmd[CBM_SZ_4K];
-    build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
+    /* Collect grep matches into array */
+    int gm_count = 0;
+    grep_match_t *gm = NULL;
+    if (scoped && scoped_written == 0) {
+        /* The path_filter excluded every indexed file — nothing to scan.
+         * Skip the grep subprocess: xargs on an empty filelist is
+         * platform-dependent (GNU execs grep once with no operands, BSD
+         * skips), and the post-grep filter would drop every hit anyway. */
+        gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
+        cbm_unlink(tmpfile);
+        cbm_unlink(filelist);
+    } else {
+        char cmd[CBM_SZ_4K];
+        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
+                       root_path);
 
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+        FILE *fp = cbm_popen(cmd, "r");
+        if (!fp) {
+            cbm_unlink(tmpfile);
+            if (scoped) {
+                cbm_unlink(filelist);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            return cbm_mcp_text_result("search failed", true);
+        }
+
+        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
+                                  grep_limit, &gm_count);
+        cbm_pclose(fp);
         cbm_unlink(tmpfile);
         if (scoped) {
             cbm_unlink(filelist);
         }
-        free(root_path);
-        free(pattern);
-        free(project);
-        free(file_pattern);
-        return cbm_mcp_text_result("search failed", true);
-    }
-
-    /* Collect grep matches into array */
-    int gm_count = 0;
-    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
-                                            &path_regex, grep_limit, &gm_count);
-    cbm_pclose(fp);
-    cbm_unlink(tmpfile);
-    if (scoped) {
-        cbm_unlink(filelist);
     }
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
