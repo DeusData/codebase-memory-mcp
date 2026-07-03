@@ -1577,6 +1577,62 @@ TEST(tool_trace_path_warns_on_stale_rank_views) {
     PASS();
 }
 
+TEST(tool_trace_path_reports_dirty_metadata_as_canonical_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "trace-dirty";
+    cbm_mcp_server_set_project(srv, proj);
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/trace-dirty"), CBM_STORE_OK);
+
+    cbm_node_t root = {.project = proj,
+                       .label = "Function",
+                       .name = "root",
+                       .qualified_name = "trace-dirty.root",
+                       .file_path = "root.c"};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "callee",
+                         .qualified_name = "trace-dirty.callee",
+                         .file_path = "callee.c"};
+    int64_t root_id = cbm_store_upsert_node(st, &root);
+    int64_t callee_id = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(root_id, 0);
+    ASSERT_GT(callee_id, 0);
+    cbm_edge_t edge = {.project = proj,
+                       .source_id = root_id,
+                       .target_id = callee_id,
+                       .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+
+    cbm_dirty_file_state_t dirty = {.project = proj,
+                                    .rel_path = "root.c",
+                                    .observed_hash = "trace-dirty-hash",
+                                    .observed_generation = 12,
+                                    .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":65,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\","
+             "\"arguments\":{\"function_name\":\"root\",\"project\":\"trace-dirty\","
+             "\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callee"));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "trace_path reads canonical graph rows"));
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -3934,6 +3990,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_path_ambiguous);
     RUN_TEST(tool_trace_path_prefers_definition);
     RUN_TEST(tool_trace_path_warns_on_stale_rank_views);
+    RUN_TEST(tool_trace_path_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);

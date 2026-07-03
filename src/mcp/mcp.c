@@ -5014,6 +5014,14 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
                                    (do_outbound && tr_out.linkrank_stale) ||
                                        (do_inbound && tr_in.linkrank_stale),
                                    false);
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        add_response_warning(doc, root,
+                             "trace_path reads canonical graph rows; dirty file changes may "
+                             "be absent until overlay or reindex completes.");
+    }
 
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
