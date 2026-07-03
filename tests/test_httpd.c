@@ -21,6 +21,8 @@
 #include "test_helpers.h"
 #include "ui/httpd.h"
 #include "ui/http_server.h"
+#include <store/store.h>
+#include <watcher/watcher.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -413,10 +415,92 @@ static int th_server_start(th_server_t *ts) {
     return 0;
 }
 
+static int th_server_start_with_watcher(th_server_t *ts, cbm_watcher_t *watcher) {
+    ts->srv = cbm_http_server_new(0);
+    if (!ts->srv)
+        return -1;
+    cbm_http_server_set_watcher(ts->srv, watcher);
+    if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
+        cbm_http_server_free(ts->srv);
+        return -1;
+    }
+    return 0;
+}
+
 static void th_server_stop(th_server_t *ts) {
     cbm_http_server_stop(ts->srv);
     cbm_thread_join(&ts->tid);
     cbm_http_server_free(ts->srv);
+}
+
+typedef struct {
+    char tmpdir[256];
+    char cache_dir[512];
+    char root_dir[512];
+    char *saved_cache_dir;
+    cbm_store_t *store;
+    cbm_watcher_t *watcher;
+} ui_delete_fixture_t;
+
+static int ui_delete_fixture_init(ui_delete_fixture_t *fx) {
+    memset(fx, 0, sizeof(*fx));
+    char *tmp = th_mktempdir("cbm_httpd_delete");
+    if (!tmp)
+        return -1;
+    snprintf(fx->tmpdir, sizeof(fx->tmpdir), "%s", tmp);
+    snprintf(fx->cache_dir, sizeof(fx->cache_dir), "%s/cache", fx->tmpdir);
+    snprintf(fx->root_dir, sizeof(fx->root_dir), "%s/root", fx->tmpdir);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    fx->saved_cache_dir = saved ? strdup(saved) : NULL;
+    if (th_mkdir_p(fx->cache_dir) != 0 || th_mkdir_p(fx->root_dir) != 0) {
+        return -1;
+    }
+    cbm_setenv("CBM_CACHE_DIR", fx->cache_dir, 1);
+
+    fx->store = cbm_store_open_memory();
+    fx->watcher = cbm_watcher_new(fx->store, NULL, NULL);
+    return fx->store && fx->watcher ? 0 : -1;
+}
+
+static void ui_delete_fixture_cleanup(ui_delete_fixture_t *fx) {
+    if (fx->watcher)
+        cbm_watcher_free(fx->watcher);
+    if (fx->store)
+        cbm_store_close(fx->store);
+    if (fx->saved_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", fx->saved_cache_dir, 1);
+        free(fx->saved_cache_dir);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_cleanup(fx->tmpdir);
+}
+
+static void ui_delete_db_path(const ui_delete_fixture_t *fx, const char *project, char *out,
+                              size_t outsz) {
+    snprintf(out, outsz, "%s/%s.db", fx->cache_dir, project);
+}
+
+static int ui_delete_make_db_file(const ui_delete_fixture_t *fx, const char *project) {
+    char path[1024];
+    ui_delete_db_path(fx, project, path, sizeof(path));
+    return th_write_file(path, "test db");
+}
+
+static int ui_delete_make_sidecars(const ui_delete_fixture_t *fx, const char *project) {
+    char path[1024];
+    ui_delete_db_path(fx, project, path, sizeof(path));
+    char wal[1040], shm[1040];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    return th_write_file(wal, "wal") == 0 && th_write_file(shm, "shm") == 0 ? 0 : -1;
+}
+
+static int ui_delete_request(th_server_t *ts, const char *target, char *resp, size_t respsz) {
+    char req[512];
+    snprintf(req, sizeof(req), "DELETE %s HTTP/1.1\r\n\r\n", target);
+    return th_http(cbm_http_server_port(ts->srv), req, resp, respsz);
 }
 
 TEST(ui_server_unknown_path_404) {
@@ -559,6 +643,145 @@ TEST(ui_server_browse_traversal_probe) {
     ASSERT_NOT_NULL(json);
     ASSERT_EQ(json[4], '{');
     th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_delete_project_unwatches_after_delete) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_delete_make_db_file(&fx, "ui-delete-watch"), 0);
+    ASSERT_EQ(ui_delete_make_sidecars(&fx, "ui-delete-watch"), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-watch", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n =
+        ui_delete_request(&ts, "/api/project?name=ui-delete-watch", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "{\"deleted\":true}"));
+
+    char db[1024], wal[1040], shm[1040];
+    ui_delete_db_path(&fx, "ui-delete-watch", db, sizeof(db));
+    snprintf(wal, sizeof(wal), "%s-wal", db);
+    snprintf(shm, sizeof(shm), "%s-shm", db);
+    ASSERT_FALSE(cbm_file_exists(db));
+    ASSERT_FALSE(cbm_file_exists(wal));
+    ASSERT_FALSE(cbm_file_exists(shm));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 0);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_unwatches_missing_db) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-missing", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n =
+        ui_delete_request(&ts, "/api/project?name=ui-delete-missing", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"project not found\"}"));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 0);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_no_watcher_still_deletes) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(ui_delete_make_db_file(&fx, "ui-delete-no-watcher"), 0);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[4096];
+    int n =
+        ui_delete_request(&ts, "/api/project?name=ui-delete-no-watcher", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+
+    char db[1024];
+    ui_delete_db_path(&fx, "ui-delete-no-watcher", db, sizeof(db));
+    ASSERT_FALSE(cbm_file_exists(db));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_missing_name_keeps_watch) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-still-watched", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 400);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"missing name\"}"));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_invalid_name_keeps_watch) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_watcher_watch(fx.watcher, "bad/name", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n = ui_delete_request(&ts, "/api/project?name=bad%2Fname", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"project not found\"}"));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_delete_project_unlink_failure_keeps_watch) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    char db[1024];
+    ui_delete_db_path(&fx, "ui-delete-unlink-fails", db, sizeof(db));
+    ASSERT_EQ(th_mkdir_p(db), 0);
+    cbm_watcher_watch(fx.watcher, "ui-delete-unlink-fails", fx.root_dir);
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start_with_watcher(&ts, fx.watcher), 0);
+    char resp[4096];
+    int n =
+        ui_delete_request(&ts, "/api/project?name=ui-delete-unlink-fails", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 500);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"failed to delete\"}"));
+    ASSERT_TRUE(cbm_file_exists(db));
+    ASSERT_EQ(cbm_watcher_watch_count(fx.watcher), 1);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
     PASS();
 }
 
@@ -717,6 +940,12 @@ SUITE(httpd) {
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);
     RUN_TEST(ui_server_browse_traversal_probe);
+    RUN_TEST(ui_server_delete_project_unwatches_after_delete);
+    RUN_TEST(ui_server_delete_project_unwatches_missing_db);
+    RUN_TEST(ui_server_delete_project_no_watcher_still_deletes);
+    RUN_TEST(ui_server_delete_project_missing_name_keeps_watch);
+    RUN_TEST(ui_server_delete_project_invalid_name_keeps_watch);
+    RUN_TEST(ui_server_delete_project_unlink_failure_keeps_watch);
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
     RUN_TEST(ui_server_slow_request_hits_deadline);

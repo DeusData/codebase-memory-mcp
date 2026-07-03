@@ -637,6 +637,7 @@ int main(int argc, char **argv) {
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
+            cbm_http_server_set_watcher(g_http_server, g_watcher);
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
                 http_started = true;
             }

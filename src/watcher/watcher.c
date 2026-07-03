@@ -329,13 +329,10 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
         return;
     }
     bool removed = false;
+    bool oom = false;
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
     if (s) {
-        cbm_ht_delete(w->projects, project_name);
-        /* Defer free: the state may still be referenced by a poll_once
-         * snapshot taken before we acquired the lock.  poll_once will
-         * drain this list at the start of its next cycle. */
         if (w->pending_free_count >= w->pending_free_cap) {
             int new_cap = w->pending_free_cap ? w->pending_free_cap * 2 : 8;
             project_state_t **tmp =
@@ -343,18 +340,24 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
             if (tmp) {
                 w->pending_free = tmp;
                 w->pending_free_cap = new_cap;
+            } else {
+                oom = true;
             }
         }
-        if (w->pending_free_count < w->pending_free_cap) {
+        if (!oom) {
+            cbm_ht_delete(w->projects, project_name);
+            /* Defer free: the state may still be referenced by a poll_once
+             * snapshot taken before we acquired the lock.  poll_once will
+             * drain this list at the start of its next cycle. */
             w->pending_free[w->pending_free_count++] = s;
-        } else {
-            state_free(s); /* realloc failed — fall back to immediate free */
+            removed = true;
         }
-        removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
     if (removed) {
         cbm_log_info("watcher.unwatch", "project", project_name);
+    } else if (oom) {
+        cbm_log_warn("watcher.unwatch.oom", "project", project_name);
     }
 }
 
