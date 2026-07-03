@@ -20,7 +20,9 @@
 #endif
 #include <windows.h>
 #include <direct.h> /* _wmkdir */
-#include <io.h>     /* _wunlink */
+#include <fcntl.h>  /* _O_RDONLY */
+#include <io.h>     /* _wunlink, _open_osfhandle, _close */
+#include <stdint.h> /* intptr_t */
 #include "foundation/win_utf8.h"
 
 struct cbm_dir {
@@ -122,12 +124,170 @@ void cbm_closedir(cbm_dir_t *d) {
     }
 }
 
+/* Windows _popen replacement that inherits ONLY the child's stdout pipe.
+ *
+ * The CRT's _popen uses CreateProcess(bInheritHandles=TRUE), which leaks EVERY
+ * inheritable handle we hold into the child — listening/client sockets, the
+ * Winsock/AFD helper handles created by WSAStartup, the MCP stdio pipe, etc.
+ * When the child is git-for-Windows (MSYS2/Cygwin runtime), its startup walks
+ * every inherited handle and calls NtQueryObject on each to classify it; on an
+ * inherited socket/AFD handle NtQueryObject deadlocks. Since our UI server runs
+ * requests on a single thread, that wedges the whole server (list_projects,
+ * which shells out to git per project, never returns → the web UI hangs).
+ *
+ * The fix: spawn via CreateProcess with STARTUPINFOEX + an explicit
+ * PROC_THREAD_ATTRIBUTE_HANDLE_LIST containing only the stdout write-end and a
+ * NUL handle for stdin/stderr. Nothing else crosses into git, so there is no
+ * foreign handle to deadlock on. POSIX popen() already sets O_CLOEXEC on its
+ * pipe, so the POSIX path is unchanged. */
+
+enum { CBM_POPEN_MAX = 16 };
+static struct {
+    FILE *fp;
+    HANDLE proc;
+} g_popen_tab[CBM_POPEN_MAX];
+static CRITICAL_SECTION g_popen_lock;
+static INIT_ONCE g_popen_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK cbm_popen_init(PINIT_ONCE once, PVOID param, PVOID *ctx) {
+    (void)once;
+    (void)param;
+    (void)ctx;
+    InitializeCriticalSection(&g_popen_lock);
+    return TRUE;
+}
+
+static FILE *cbm_popen_isolated(const char *cmd) {
+    InitOnceExecuteOnce(&g_popen_once, cbm_popen_init, NULL, NULL);
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = NULL;
+    sa.bInheritHandle = TRUE;
+
+    HANDLE rd = NULL, wr = NULL;
+    if (!CreatePipe(&rd, &wr, &sa, 0)) {
+        return NULL;
+    }
+    /* The parent read-end must never cross into the child. */
+    SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+
+    /* NUL for the child's stdin/stderr so it never touches our real stdin pipe. */
+    HANDLE nul = CreateFileA("NUL", GENERIC_READ | GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+
+    HANDLE inherit[2];
+    DWORD ninherit = 0;
+    inherit[ninherit++] = wr;
+    if (nul != INVALID_HANDLE_VALUE) {
+        inherit[ninherit++] = nul;
+    }
+
+    SIZE_T attr_sz = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_sz);
+    LPPROC_THREAD_ATTRIBUTE_LIST attr = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_sz);
+    BOOL prepared = attr && InitializeProcThreadAttributeList(attr, 1, 0, &attr_sz) &&
+                    UpdateProcThreadAttribute(attr, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+                                              ninherit * sizeof(HANDLE), NULL, NULL);
+
+    STARTUPINFOEXA si;
+    ZeroMemory(&si, sizeof(si));
+    si.StartupInfo.cb = sizeof(si);
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    si.StartupInfo.hStdInput = nul;
+    si.StartupInfo.hStdOutput = wr;
+    si.StartupInfo.hStdError = nul;
+    si.lpAttributeList = attr;
+
+    /* Run through cmd.exe /c so command quoting and `2>NUL` behave as under _popen. */
+    char cmdline[2048];
+    int n = snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cmd);
+
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    BOOL created = prepared && n > 0 && n < (int)sizeof(cmdline) &&
+                   CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT,
+                                  NULL, NULL, &si.StartupInfo, &pi);
+
+    if (attr) {
+        DeleteProcThreadAttributeList(attr);
+        free(attr);
+    }
+    CloseHandle(wr); /* the child owns the write-end now */
+    if (nul != INVALID_HANDLE_VALUE) {
+        CloseHandle(nul);
+    }
+    if (!created) {
+        CloseHandle(rd);
+        return NULL;
+    }
+    CloseHandle(pi.hThread);
+
+    int fd = _open_osfhandle((intptr_t)rd, _O_RDONLY);
+    if (fd == -1) {
+        CloseHandle(rd);
+        CloseHandle(pi.hProcess);
+        return NULL;
+    }
+    FILE *fp = _fdopen(fd, "r"); /* takes ownership of fd/rd */
+    if (!fp) {
+        _close(fd);
+        CloseHandle(pi.hProcess);
+        return NULL;
+    }
+
+    EnterCriticalSection(&g_popen_lock);
+    for (int i = 0; i < CBM_POPEN_MAX; i++) {
+        if (!g_popen_tab[i].fp) {
+            g_popen_tab[i].fp = fp;
+            g_popen_tab[i].proc = pi.hProcess;
+            LeaveCriticalSection(&g_popen_lock);
+            return fp;
+        }
+    }
+    LeaveCriticalSection(&g_popen_lock);
+    /* Table full (shouldn't happen): don't leak the process handle. */
+    CloseHandle(pi.hProcess);
+    fclose(fp);
+    return NULL;
+}
+
 FILE *cbm_popen(const char *cmd, const char *mode) {
+    /* Our git shell-outs are all read-mode; only those need the isolation. */
+    if (mode && mode[0] == 'r' && mode[1] == '\0') {
+        FILE *fp = cbm_popen_isolated(cmd);
+        if (fp) {
+            return fp;
+        }
+        /* fall through to _popen if isolated spawn failed for any reason */
+    }
     return _popen(cmd, mode);
 }
 
 int cbm_pclose(FILE *f) {
-    return _pclose(f);
+    InitOnceExecuteOnce(&g_popen_once, cbm_popen_init, NULL, NULL);
+
+    HANDLE proc = NULL;
+    EnterCriticalSection(&g_popen_lock);
+    for (int i = 0; i < CBM_POPEN_MAX; i++) {
+        if (g_popen_tab[i].fp == f) {
+            proc = g_popen_tab[i].proc;
+            g_popen_tab[i].fp = NULL;
+            g_popen_tab[i].proc = NULL;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_popen_lock);
+
+    if (!proc) {
+        return _pclose(f); /* opened via the _popen fallback */
+    }
+    fclose(f);
+    WaitForSingleObject(proc, INFINITE);
+    DWORD code = 0;
+    GetExitCodeProcess(proc, &code);
+    CloseHandle(proc);
+    return (int)code;
 }
 
 FILE *cbm_fopen(const char *path, const char *mode) {
