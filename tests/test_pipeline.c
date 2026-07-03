@@ -8232,6 +8232,56 @@ static int write_incremental_frontier_fixture(int leaf_value) {
     return write_incremental_frontier_callers();
 }
 
+enum { PIPELINE_INCR_C_HEADER_IMPORTER_COUNT = CBM_SZ_4 };
+
+static int write_incremental_c_header_frontier_fixture(int marker) {
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_1K];
+    int n = snprintf(path, sizeof(path), "%s/shared.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    n = snprintf(body, sizeof(body),
+                 "#ifndef SHARED_H\n"
+                 "#define SHARED_H\n"
+                 "#define SHARED_MARKER %d\n"
+                 "int shared_value(void);\n"
+                 "#endif\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+        return -1;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/shared.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    if (th_write_file(path,
+                      "#include \"shared.h\"\n\n"
+                      "int shared_value(void) {\n"
+                      "    return SHARED_MARKER;\n"
+                      "}\n") != 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < PIPELINE_INCR_C_HEADER_IMPORTER_COUNT; i++) {
+        n = snprintf(path, sizeof(path), "%s/consumer_%d.c", g_incr_tmpdir, i);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            return -1;
+        }
+        n = snprintf(body, sizeof(body),
+                     "#include \"shared.h\"\n\n"
+                     "int consumer_%d(void) {\n"
+                     "    return shared_value() + %d;\n"
+                     "}\n",
+                     i, i);
+        if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int write_incremental_arg_url_route_file(const char *route_path, int marker) {
     char path[CBM_PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s/http_routes.c", g_incr_tmpdir);
@@ -9548,6 +9598,79 @@ TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "oversized inbound fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char skipped_dir[CBM_PATH_MAX];
+    int n = snprintf(skipped_dir, sizeof(skipped_dir), "%s/scripts", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(skipped_dir));
+    ASSERT_TRUE(cbm_mkdir_p(skipped_dir, 0755));
+    char skipped_path[CBM_PATH_MAX];
+    n = snprintf(skipped_path, sizeof(skipped_path), "%s/scripts/probe.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(skipped_path));
+    ASSERT_EQ(th_write_file(skipped_path, "def skipped_probe():\n    return 1\n"), 0);
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    ASSERT(strstr(logs,
+                  "msg=incremental.fallback reason=frontier_too_large "
+                  "scope=c_family_header") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    cbm_pipeline_free(p);
+
+    int skipped_nodes = 0;
+    ASSERT_EQ(pipeline_store_count_file_rows_sql(
+                  g_incr_dbpath, project, "scripts/probe.py",
+                  "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND file_path = ?2;",
+                  &skipped_nodes),
+              CBM_STORE_OK);
+    ASSERT_EQ(skipped_nodes, 0);
+    int skipped_hashes = 0;
+    ASSERT_EQ(pipeline_store_count_file_rows_sql(
+                  g_incr_dbpath, project, "scripts/probe.py",
+                  "SELECT COUNT(*) FROM file_hashes WHERE project = ?1 AND rel_path = ?2;",
+                  &skipped_hashes),
+              CBM_STORE_OK);
+    ASSERT_EQ(skipped_hashes, 0);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C header full fallback differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -12504,6 +12627,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_body_only_change_uses_graph_noop);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
+    RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);

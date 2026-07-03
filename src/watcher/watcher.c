@@ -57,6 +57,7 @@ typedef struct {
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    uint64_t version;          /* increments when external calls replace or refresh state */
 } project_state_t;
 
 typedef struct {
@@ -70,6 +71,7 @@ typedef struct {
     int interval_ms;
     int64_t next_poll_ns;
     int64_t observed_next_poll_ns;
+    uint64_t observed_version;
 } project_snapshot_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -80,6 +82,7 @@ struct cbm_watcher {
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
     cbm_mutex_t projects_lock;
+    uint64_t next_version;
     atomic_int stopped;
     int poll_base_ms;  /* 0 = use POLL_BASE_MS default */
     int poll_max_ms;   /* 0 = use POLL_MAX_MS default */
@@ -173,6 +176,7 @@ static bool snapshot_from_state(project_snapshot_t *dst, const project_state_t *
     dst->interval_ms = src->interval_ms;
     dst->next_poll_ns = src->next_poll_ns;
     dst->observed_next_poll_ns = src->next_poll_ns;
+    dst->observed_version = src->version;
     return true;
 }
 
@@ -232,6 +236,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     w->store = store;
     w->index_fn = index_fn;
     w->user_data = user_data;
+    w->next_version = 1;
     w->projects = cbm_ht_create(CBM_SZ_32);
     if (!w->projects) {
         free(w);
@@ -292,6 +297,7 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
         cbm_log_warn("watcher.watch.oom", "project", project_name, "path", root_path);
         return;
     }
+    s->version = w->next_version++;
     cbm_ht_set(w->projects, s->project_name, s);
     cbm_mutex_unlock(&w->projects_lock);
     cbm_log_info("watcher.watch", "project", project_name, "path", root_path);
@@ -330,6 +336,7 @@ void cbm_watcher_mark_indexed(cbm_watcher_t *w, const char *project_name, const 
         cbm_ht_set(w->projects, cur->project_name, cur);
     }
     state_apply_snapshot(cur, &snap);
+    cur->version = w->next_version++;
     cbm_mutex_unlock(&w->projects_lock);
 
     cbm_log_info("watcher.indexed", "project", project_name, "path", root_path);
@@ -363,6 +370,7 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     if (s) {
         /* Reset backoff — poll immediately on next cycle */
         s->next_poll_ns = 0;
+        s->version = w->next_version++;
     }
     cbm_mutex_unlock(&w->projects_lock);
 }
@@ -455,7 +463,8 @@ static bool watcher_snapshot_current(cbm_watcher_t *w, const project_snapshot_t 
     bool current = false;
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *cur = cbm_ht_get(w->projects, snap->project_name);
-    if (cur && strcmp(cur->root_path, snap->root_path) == 0) {
+    if (cur && strcmp(cur->root_path, snap->root_path) == 0 &&
+        cur->version == snap->observed_version) {
         current = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
@@ -552,7 +561,8 @@ static void snapshot_project(const char *key, void *val, void *ud) {
 static void watcher_apply_snapshot(cbm_watcher_t *w, const project_snapshot_t *snap) {
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *cur = cbm_ht_get(w->projects, snap->project_name);
-    if (cur && strcmp(cur->root_path, snap->root_path) == 0) {
+    if (cur && strcmp(cur->root_path, snap->root_path) == 0 &&
+        cur->version == snap->observed_version) {
         state_apply_snapshot(cur, snap);
     }
     cbm_mutex_unlock(&w->projects_lock);

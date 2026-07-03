@@ -47,6 +47,15 @@ static int has_call_exact(CBMFileResult *r, const char *callee) {
     return 0;
 }
 
+static int has_env_access(CBMFileResult *r, const char *env_key) {
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        if (r->env_accesses.items[i].env_key &&
+            strcmp(r->env_accesses.items[i].env_key, env_key) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *must_contain,
                               const char *must_not_contain) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -202,6 +211,19 @@ TEST(extract_c_macro_option_is_per_call) {
     ASSERT(has_def(fast, "Function", "main"));
     cbm_free_result(fast);
 
+    PASS();
+}
+
+TEST(extract_c_macro_expanded_pass_is_calls_only) {
+    const char *src = "#define FILTER_ENV() getenv(\"CBM_ONLY_TEST\")\n"
+                      "int main(void) { return FILTER_ENV() != 0; }\n";
+    CBMFileResult *r = cbm_extract_file_with_options(
+        src, (int)strlen(src), CBM_LANG_C, "p", "macro_env.c", 0, NULL, NULL, true);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call(r, "getenv"));
+    ASSERT_FALSE(has_env_access(r, "CBM_ONLY_TEST"));
+    cbm_free_result(r);
     PASS();
 }
 
@@ -3436,6 +3458,7 @@ SUITE(extraction) {
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_c_macro_option_is_per_call);
+    RUN_TEST(extract_c_macro_expanded_pass_is_calls_only);
     RUN_TEST(extract_gdscript_issue186);
     RUN_TEST(extract_powershell_issue35);
     RUN_TEST(extract_luau_issue39);

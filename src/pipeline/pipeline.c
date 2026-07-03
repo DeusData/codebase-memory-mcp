@@ -1339,7 +1339,11 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 
 /* Try incremental pipeline or delete old DB for reindex.
  * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
-static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
+                                      bool *out_replace_project) {
+    if (out_replace_project) {
+        *out_replace_project = false;
+    }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -1370,17 +1374,26 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
+            if (rc == CBM_NOT_FOUND && out_replace_project) {
+                *out_replace_project = true;
+            }
             free(db_path);
             return rc;
         }
         if (hash_count > 0) {
             cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
                          itoa_buf(hash_count), "discovered", itoa_buf(file_count));
+            if (out_replace_project) {
+                *out_replace_project = true;
+            }
         }
     } else if (check_store) {
         cbm_store_close(check_store);
     }
     cbm_log_info("pipeline.route", "path", "reindex", "action", "atomic_rewrite");
+    if (out_replace_project) {
+        *out_replace_project = true;
+    }
     free(db_path);
     return CBM_NOT_FOUND;
 }
@@ -1624,8 +1637,9 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
      * Skip the DB routing entirely when flush_store is set: the dep-indexing
      * path uses an in-memory store and never writes a DB file, so there is no
      * old DB to consult or delete. */
+    bool replace_project_in_existing_store = false;
     if (!p->flush_store) {
-        rc = try_incremental_or_reindex(p, files, file_count);
+        rc = try_incremental_or_reindex(p, files, file_count, &replace_project_in_existing_store);
         if (rc >= 0) {
             CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
             cbm_discover_free(files, file_count);
@@ -1747,21 +1761,34 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(p->gbuf),
                                           cbm_gbuf_edge_count(p->gbuf));
 
-        if (p->flush_store) {
-            rc = cbm_gbuf_flush_to_store(p->gbuf, p->flush_store);
+        cbm_store_t *replacement_store = NULL;
+        cbm_store_t *target_store = p->flush_store;
+        if (!target_store && replace_project_in_existing_store) {
+            replacement_store = cbm_store_open_path(db_path);
+            target_store = replacement_store;
+        }
+        if (target_store) {
+            rc = cbm_gbuf_flush_to_store(p->gbuf, target_store);
         } else {
             rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
         }
         if (rc != 0) {
             cbm_log_error("pipeline.err", "phase", "dump");
+            if (replacement_store) {
+                cbm_store_close(replacement_store);
+            }
             goto cleanup;
         }
         cbm_pipeline_set_graph_changed(p, true);
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_FULL);
         cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
-        if (p->flush_store) {
-            rc = pipeline_persist_replacement_metadata(p, p->flush_store, files, file_count, false);
+        if (target_store) {
+            rc = pipeline_persist_replacement_metadata(p, target_store, files, file_count,
+                                                       replacement_store != NULL);
+            if (replacement_store) {
+                cbm_store_close(replacement_store);
+            }
             if (rc != CBM_STORE_OK) {
                 goto cleanup;
             }

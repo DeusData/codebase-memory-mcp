@@ -955,7 +955,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     }
 }
 
-void cbm_extract_unified(CBMExtractCtx *ctx) {
+static void cbm_extract_unified_impl(CBMExtractCtx *ctx, bool calls_only) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
         return;
@@ -973,17 +973,21 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
         pop_expired_scopes(&state, depth);
         recompute_state(&state, ctx->module_qn);
 
-        handle_string_constants(ctx, node, &state);
+        if (!calls_only) {
+            handle_string_constants(ctx, node, &state);
+        }
         handle_calls(ctx, node, spec, &state);
-        handle_usages(ctx, node, spec, &state);
-        handle_throws(ctx, node, spec, &state);
-        handle_readwrites(ctx, node, spec, &state);
-        handle_type_refs(ctx, node, spec, &state);
-        handle_env_accesses(ctx, node, spec, &state);
-        handle_type_assigns(ctx, node, spec, &state);
-        handle_string_refs(ctx, node, &state);
-        handle_yaml_nested(ctx, node);
-        scan_infra_bindings(ctx, node);
+        if (!calls_only) {
+            handle_usages(ctx, node, spec, &state);
+            handle_throws(ctx, node, spec, &state);
+            handle_readwrites(ctx, node, spec, &state);
+            handle_type_refs(ctx, node, spec, &state);
+            handle_env_accesses(ctx, node, spec, &state);
+            handle_type_assigns(ctx, node, spec, &state);
+            handle_string_refs(ctx, node, &state);
+            handle_yaml_nested(ctx, node);
+            scan_infra_bindings(ctx, node);
+        }
 
         push_boundary_scopes(ctx, node, spec, &state, depth);
 
@@ -1008,4 +1012,12 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     ts_tree_cursor_delete(&cursor);
+}
+
+void cbm_extract_unified(CBMExtractCtx *ctx) {
+    cbm_extract_unified_impl(ctx, false);
+}
+
+void cbm_extract_unified_calls_only(CBMExtractCtx *ctx) {
+    cbm_extract_unified_impl(ctx, true);
 }
