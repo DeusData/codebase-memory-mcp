@@ -15,6 +15,8 @@
 
 typedef struct cbm_store cbm_store_t;       /* from store/store.h */
 typedef struct cbm_mcp_server cbm_mcp_server_t; /* forward decl for tools_list */
+typedef struct yyjson_mut_doc yyjson_mut_doc;   /* from yyjson.h */
+typedef struct yyjson_mut_val yyjson_mut_val;   /* from yyjson.h */
 struct cbm_watcher;                         /* from watcher/watcher.h */
 struct cbm_config;                          /* from cli/cli.h */
 
@@ -54,6 +56,19 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
+
+/* Add the shared dirty-file freshness object and warning to an existing JSON object.
+ * Used by MCP tools and local HTTP UI endpoints that expose canonical graph-derived data.
+ * Does nothing when both counts are zero. */
+void cbm_mcp_add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                             int pending, int overlay_ready,
+                                             const char *warning_message);
+
+/* Return a heap JSON copy with dirty freshness added, or NULL if the project is clean,
+ * inputs are invalid, or base_json is not a JSON object. */
+char *cbm_mcp_add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t *store,
+                                               const char *project,
+                                               const char *warning_message);
 
 /* Format the tools/list response. Filters by tool_mode config.
  * srv may be NULL (returns all tools). Uses the typedef declared below. */
