@@ -146,6 +146,13 @@ const char *cbm_app_local_dir(void);
  * Returns static buffer or NULL if home is unavailable. */
 const char *cbm_resolve_cache_dir(void);
 
+/* Resolve the personal memory directory. Long-lived user memory lives here,
+ * separate from cache DBs. manage_memory rejects relative paths and paths inside
+ * the active source repo even when CBM_MEMORY_DIR points there.
+ * Priority: CBM_MEMORY_DIR env var > platform data dir default.
+ * Returns static buffer or NULL if home is unavailable. */
+const char *cbm_resolve_memory_dir(void);
+
 /* ── File system ───────────────────────────────────────────────── */
 
 /* Check if a path exists. */

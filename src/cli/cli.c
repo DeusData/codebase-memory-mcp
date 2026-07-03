@@ -1305,6 +1305,7 @@ static const char skill_content[] =
     "| Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |\n"
     "| Cross-service edges | `query_graph` with Cypher |\n"
     "| Impact of local changes | `detect_changes()` |\n"
+    "| Opt-in personal repo memory | `manage_memory(mode=\"settings\")`, then enable if wanted |\n"
     "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
     "| Text search | `search_code` or Grep |\n"
     "\n"
@@ -1358,11 +1359,30 @@ static const char skill_content[] =
     "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
     "direction=\"inbound\")`\n"
     "\n"
+    "## Personal Memory Workflow (opt-in)\n"
+    "1. Keep default project memory behavior unless the user enabled local memory with "
+    "`memory_enabled=true` or explicitly asks for personal/local memory.\n"
+    "2. If enabled, call `manage_memory(mode=\"get\")` to lookup/reference "
+    "previous local learnings for this repo and branch.\n"
+    "3. If empty or stale, inspect with `get_architecture`, `get_graph_schema`, and "
+    "`search_graph`; draft compact ADR sections.\n"
+    "4. Store new learnings with `manage_memory(mode=\"update\", content=\"...\")`. "
+    "This writes local user storage only, not the repo.\n"
+    "   Store codebase knowledge: purpose, architecture, stack, module map, conventions, "
+    "gotchas, decisions, workflows, test/build commands, and branch-specific notes.\n"
+    "5. After branch work, update CHANGELOG/DECISIONS/learnings via "
+    "`manage_memory(mode=\"update\")`.\n"
+    "6. Use `manage_memory(mode=\"promote\", branch=\"feature\")` after merge-worthy branch work.\n"
+    "7. Use `manage_memory(mode=\"list\")`, `settings`, and `delete` for maintenance.\n"
+    "Config defaults: `memory_enabled=false`, `memory_default_scope=project`, "
+    "`memory_dir=<user data dir>`. Enable with `codebase-memory-mcp config set memory_enabled "
+    "true`.\n"
+    "\n"
     "## 15 MCP Tools\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
     "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
-    "`check_index_coverage`, `manage_adr`, `ingest_traces`\n"
+    "`check_index_coverage`, `manage_adr`, `manage_memory`, `ingest_traces`\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
@@ -6820,6 +6840,38 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
     return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
 }
 
+static const char *cbm_config_default_value(const char *key) {
+    if (!key) {
+        return "";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_INDEX) == 0) {
+        return "false";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_INDEX_LIMIT) == 0) {
+        return "50000";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_WATCH) == 0) {
+        return "true";
+    }
+    if (strcmp(key, CBM_CONFIG_UI_LANG) == 0) {
+        return "auto";
+    }
+    if (strcmp(key, CBM_CONFIG_AUTO_UPDATE) == 0) {
+        return "true";
+    }
+    if (strcmp(key, CBM_CONFIG_MEMORY_ENABLED) == 0) {
+        return "false";
+    }
+    if (strcmp(key, CBM_CONFIG_MEMORY_DIR) == 0) {
+        const char *dir = cbm_resolve_memory_dir();
+        return dir ? dir : "";
+    }
+    if (strcmp(key, CBM_CONFIG_MEMORY_DEFAULT_SCOPE) == 0) {
+        return "project";
+    }
+    return "";
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 /* THE config-key table. list, get, help, and key validation all read this one
@@ -6844,6 +6896,10 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
+    {CBM_CONFIG_AUTO_UPDATE, "true", "Check for newer releases on MCP startup"},
+    {CBM_CONFIG_MEMORY_ENABLED, "false", "Enable opt-in local personal repo memory"},
+    {CBM_CONFIG_MEMORY_DIR, "user-data", "Directory for local personal memory.db (overridden by CBM_MEMORY_DIR)"},
+    {CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "project", "Default memory scope for LLM workflows"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing

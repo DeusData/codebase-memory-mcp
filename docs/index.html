@@ -740,7 +740,7 @@
             </div>
             <div class="feature">
                 <h3>15 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>check_index_coverage</code>, <code>manage_adr</code>, and 7 more.</p>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>check_index_coverage</code>, <code>manage_adr</code>, <code>manage_memory</code>, and 6 more.</p>
             </div>
             <div class="feature">
                 <h3>Cypher graph queries</h3>
@@ -768,7 +768,7 @@
             </div>
             <div class="feature">
                 <h3>Architecture Decision Records</h3>
-                <p><code>manage_adr</code> persists architectural decisions alongside the graph, so design rationale survives across sessions and teammates.</p>
+                <p><code>manage_adr</code> persists project ADRs; <code>manage_memory</code> is opt-in and stores personal repo memory in a local <code>memory.db</code> under the user data directory or <code>CBM_MEMORY_DIR</code>. Personal memory paths must be absolute and outside the source repo; the tool does not upload, sync to the network, write to git, or log memory content.</p>
             </div>
         </div>
     </section>
