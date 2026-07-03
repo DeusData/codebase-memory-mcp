@@ -111,6 +111,7 @@ static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
 #define CBM_MCP_FRESHNESS_STATE_KEY "state"
 #define CBM_MCP_FRESHNESS_STALE_VIEWS_KEY "stale_views"
 #define CBM_MCP_FRESHNESS_STALE_WITH_WARNING "stale_with_warning"
+#define CBM_MCP_EXACT_DELTA_KEY "exact_delta"
 
 static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                     const char *view_name) {
@@ -144,6 +145,28 @@ static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
         }
     }
     yyjson_mut_arr_add_str(doc, stale_views, view_name);
+}
+
+static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                           cbm_pipeline_exact_delta_stats_t stats) {
+    if (!doc || !root || (stats.changed_paths < 0 && stats.affected_paths < 0 &&
+                          stats.published_paths < 0)) {
+        return;
+    }
+    yyjson_mut_val *exact = yyjson_mut_obj(doc);
+    if (!exact) {
+        return;
+    }
+    if (stats.changed_paths >= 0) {
+        yyjson_mut_obj_add_int(doc, exact, "changed_paths", stats.changed_paths);
+    }
+    if (stats.affected_paths >= 0) {
+        yyjson_mut_obj_add_int(doc, exact, "affected_paths", stats.affected_paths);
+    }
+    if (stats.published_paths >= 0) {
+        yyjson_mut_obj_add_int(doc, exact, "published_paths", stats.published_paths);
+    }
+    yyjson_mut_obj_add_val(doc, root, CBM_MCP_EXACT_DELTA_KEY, exact);
 }
 
 static void add_stale_derived_view_warning(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -5170,6 +5193,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "publish_reason", publish_reason);
     }
     yyjson_mut_obj_add_bool(doc, root, "graph_changed", graph_changed);
+    add_pipeline_exact_delta_stats(doc, root, cbm_pipeline_exact_delta_stats(p));
 
     if (rc == 0) {
         CBM_PROF_START(prof_index_resolve_store);

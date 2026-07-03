@@ -51,6 +51,12 @@ typedef enum {
     CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT,
 } cbm_pipeline_publish_kind_t;
 
+typedef struct {
+    int changed_paths;   /* source paths classified as changed/deleted before frontier expansion */
+    int affected_paths;  /* paths in the exact-delta frontier, including changed/deleted paths */
+    int published_paths; /* paths published by exact delta; 0 for exact no-op, -1 if not exact */
+} cbm_pipeline_exact_delta_stats_t;
+
 /* Generation used by compatibility full/containment publishes that replace the
  * graph as one committed view. Exact deltas reserve higher generations. */
 #define CBM_PIPELINE_FILE_DELTA_GENERATION 0
@@ -160,6 +166,7 @@ bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p);
 cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p);
 const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind);
 const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p);
+cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 

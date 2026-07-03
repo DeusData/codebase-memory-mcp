@@ -127,6 +127,7 @@ struct cbm_pipeline {
     bool graph_changed;
     cbm_pipeline_publish_kind_t publish_kind;
     char *publish_reason;
+    cbm_pipeline_exact_delta_stats_t exact_delta_stats;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -199,6 +200,9 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     p->publish_reason = NULL;
+    p->exact_delta_stats.changed_paths = -1;
+    p->exact_delta_stats.affected_paths = -1;
+    p->exact_delta_stats.published_paths = -1;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -594,6 +598,11 @@ const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p) {
     return p ? p->publish_reason : NULL;
 }
 
+cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p) {
+    static const cbm_pipeline_exact_delta_stats_t empty_stats = {-1, -1, -1};
+    return p ? p->exact_delta_stats : empty_stats;
+}
+
 const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind) {
     switch (kind) {
     case CBM_PIPELINE_PUBLISH_NONE:
@@ -630,6 +639,16 @@ void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason) {
     char *next = (reason && reason[0]) ? cbm_strdup(reason) : NULL;
     free(p->publish_reason);
     p->publish_reason = next;
+}
+
+void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
+                                        int affected_paths, int published_paths) {
+    if (!p) {
+        return;
+    }
+    p->exact_delta_stats.changed_paths = changed_paths;
+    p->exact_delta_stats.affected_paths = affected_paths;
+    p->exact_delta_stats.published_paths = published_paths;
 }
 
 static bool resolve_db_path_buf(const cbm_pipeline_t *p, char *path, size_t path_sz) {
@@ -1558,6 +1577,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     cbm_pipeline_set_publish_reason(p, NULL);
+    cbm_pipeline_set_exact_delta_stats(p, -1, -1, -1);
     p->committed_nodes = -1;
     p->committed_edges = -1;
 

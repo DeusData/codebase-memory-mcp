@@ -1905,6 +1905,8 @@ TEST(tool_index_repository_reports_incremental_containment_reason) {
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "\"publish_kind\":\"incremental_containment\""));
     ASSERT_NOT_NULL(strstr(inner, "\"publish_reason\":\"changed_batch_too_large\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"exact_delta\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"changed_paths\":3"));
 
     free(inner);
     free(resp);
