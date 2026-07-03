@@ -163,15 +163,35 @@ static void add_response_stale_view(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_arr_add_str(doc, stale_views, view_name);
 }
 
-static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                     cbm_store_t *store, const char *project) {
-    if (!doc || !root || !store || !project || !project[0]) {
-        return;
+static bool get_dirty_file_counts(cbm_store_t *store, const char *project,
+                                  int *out_pending, int *out_overlay_ready) {
+    if (out_pending) {
+        *out_pending = 0;
+    }
+    if (out_overlay_ready) {
+        *out_overlay_ready = 0;
+    }
+    if (!store || !project || !project[0]) {
+        return false;
     }
     int pending = 0;
     int overlay_ready = 0;
     if (cbm_store_count_dirty_files(store, project, &pending, &overlay_ready) != CBM_STORE_OK ||
         (pending <= 0 && overlay_ready <= 0)) {
+        return false;
+    }
+    if (out_pending) {
+        *out_pending = pending;
+    }
+    if (out_overlay_ready) {
+        *out_overlay_ready = overlay_ready;
+    }
+    return true;
+}
+
+static void add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            int pending, int overlay_ready) {
+    if (!doc || !root || (pending <= 0 && overlay_ready <= 0)) {
         return;
     }
 
@@ -193,6 +213,16 @@ static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
     add_response_warning(doc, root,
                          "project has dirty files; canonical graph rows remain visible until "
                          "overlay or reindex completes.");
+}
+
+static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                     cbm_store_t *store, const char *project) {
+    int pending = 0;
+    int overlay_ready = 0;
+    if (!get_dirty_file_counts(store, project, &pending, &overlay_ready)) {
+        return;
+    }
+    add_dirty_file_freshness_counts(doc, root, pending, overlay_ready);
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -3324,6 +3354,38 @@ static char *append_semantic_query_to_json(const char *base_json, const char *ar
     return out;
 }
 
+static char *add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t *store,
+                                              const char *project) {
+    if (!base_json || !store || !project || !project[0]) {
+        return NULL;
+    }
+    int pending = 0;
+    int overlay_ready = 0;
+    if (!get_dirty_file_counts(store, project, &pending, &overlay_ready)) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(base_json, strlen(base_json), 0);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    if (!mdoc) {
+        yyjson_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_val_mut_copy(mdoc, yyjson_doc_get_root(doc));
+    yyjson_doc_free(doc);
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(mdoc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(mdoc, root);
+    add_dirty_file_freshness_counts(mdoc, root, pending, overlay_ready);
+    char *out = yy_doc_to_str(mdoc);
+    yyjson_mut_doc_free(mdoc);
+    return out;
+}
+
 /* Convert shell-glob wildcards to POSIX ERE: bare '*' → '.*', bare '?' → '.'
  * "Bare" means not already preceded by '.' or '\'. This lets users pass
  * glob-style patterns like "*tool*" and have them work as ".*tool.*". */
@@ -3375,12 +3437,16 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                 append_semantic_query_to_json(bm25_json, args, store, project, q_limit,
                                               &sq_type_error);
             free(query);
-            free(pe.value);
             if (sq_type_error) {
+                free(pe.value);
                 free(bm25_json);
                 return semantic_query_type_error_response();
             }
-            char *result = cbm_mcp_text_result(composed_json ? composed_json : bm25_json, false);
+            const char *payload_json = composed_json ? composed_json : bm25_json;
+            char *fresh_json = add_dirty_file_freshness_to_json(payload_json, store, project);
+            char *result = cbm_mcp_text_result(fresh_json ? fresh_json : payload_json, false);
+            free(fresh_json);
+            free(pe.value);
             free(composed_json);
             free(bm25_json);
             return result;
