@@ -903,6 +903,83 @@ TEST(tool_search_graph_uses_overlay_active_node_rows) {
     PASS();
 }
 
+TEST(tool_search_graph_uses_overlay_active_relationship_rows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "search-overlay-relationship";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/search-overlay-relationship"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_main = {.project = proj,
+                           .label = "Function",
+                           .name = "old_main",
+                           .qualified_name = "search.relationship.old_main",
+                           .file_path = "main.c",
+                           .properties_json = "{}"};
+    cbm_node_t stable = {.project = proj,
+                         .label = "Function",
+                         .name = "stable",
+                         .qualified_name = "search.relationship.stable",
+                         .file_path = "stable.c",
+                         .properties_json = "{}"};
+    int64_t old_main_id = cbm_store_upsert_node(st, &old_main);
+    int64_t stable_id = cbm_store_upsert_node(st, &stable);
+    ASSERT_GT(old_main_id, 0);
+    ASSERT_GT(stable_id, 0);
+    cbm_edge_t old_edge = {.project = proj,
+                           .source_id = old_main_id,
+                           .target_id = stable_id,
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &old_edge), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t new_main = {.project = proj,
+                           .label = "Function",
+                           .name = "new_main",
+                           .qualified_name = "search.relationship.new_main",
+                           .file_path = "main.c",
+                           .properties_json = "{}"};
+    cbm_store_delta_edge_t new_edge = {.source_qn = "search.relationship.new_main",
+                                       .target_qn = "search.relationship.stable",
+                                       .type = "CALLS",
+                                       .properties_json = "{}",
+                                       .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "main.c",
+                                    .generation = 1,
+                                    .nodes = &new_main,
+                                    .node_count = 1,
+                                    .edges = &new_edge,
+                                    .edge_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":148,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\","
+                                   "\"arguments\":{\"project\":\"search-overlay-relationship\","
+                                   "\"relationship\":\"CALLS\",\"sort_by\":\"name\","
+                                   "\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "new_main"));
+    ASSERT_NOT_NULL(strstr(inner, "stable"));
+    ASSERT_NULL(strstr(inner, "old_main"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_graph\""));
+    ASSERT_NOT_NULL(strstr(inner, "overlay active node and relationship rows"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 static bool mcp_test_upsert_fts_node(cbm_store_t *st, const char *project, const char *label,
                                      const char *name, const char *qualified_name,
                                      const char *file_path) {
@@ -4228,6 +4305,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_warns_on_stale_route_view);
     RUN_TEST(tool_search_graph_reports_dirty_metadata_without_hiding_canonical_rows);
     RUN_TEST(tool_search_graph_uses_overlay_active_node_rows);
+    RUN_TEST(tool_search_graph_uses_overlay_active_relationship_rows);
     RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);

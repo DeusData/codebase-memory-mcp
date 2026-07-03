@@ -118,6 +118,7 @@ static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
 #define CBM_MCP_FRESHNESS_STALE_WITH_WARNING "stale_with_warning"
 #define CBM_MCP_FRESHNESS_READ_MODEL_KEY "read_model"
 #define CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES "overlay_active_nodes"
+#define CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_GRAPH "overlay_active_graph"
 #define CBM_MCP_EXACT_DELTA_KEY "exact_delta"
 
 static yyjson_mut_val *ensure_response_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root) {
@@ -270,7 +271,7 @@ static void add_overlay_node_read_view_summary(yyjson_mut_doc *doc, yyjson_mut_v
 
 static void add_overlay_active_node_search_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
-    const cbm_store_overlay_node_view_summary_t *summary) {
+    const cbm_store_overlay_node_view_summary_t *summary, bool uses_active_edges) {
     if (!summary || summary->active_file_tombstones <= 0) {
         return;
     }
@@ -279,7 +280,9 @@ static void add_overlay_active_node_search_freshness(
         return;
     }
     yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
-                           CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES);
+                           uses_active_edges
+                               ? CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_GRAPH
+                               : CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES);
     yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
                            summary->overlay_ready_generations);
     yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
@@ -290,10 +293,15 @@ static void add_overlay_active_node_search_freshness(
                            summary->overlay_owned_nodes_visible);
     yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
                            summary->total_nodes_visible);
-    add_response_warning(doc, root,
-                         "search_graph graph mode used overlay active node rows; edge traversal, "
-                         "FTS query mode, and trace results remain canonical until separately "
-                         "enabled.");
+    add_response_warning(
+        doc, root,
+        uses_active_edges
+            ? "search_graph graph mode used overlay active node and relationship rows; "
+              "connected-neighbor enrichment, FTS query mode, and trace results remain "
+              "canonical until separately enabled."
+            : "search_graph graph mode used overlay active node rows; connected-neighbor "
+              "enrichment, FTS query mode, and trace results remain canonical until "
+              "separately enabled.");
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -3729,9 +3737,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
             CBM_STORE_OK &&
         overlay_summary.active_file_tombstones > 0;
-    bool overlay_edge_semantics_requested =
-        relationship || include_connected || exclude_entry_points;
-    bool overlay_search_used = overlay_ready_for_nodes && !overlay_edge_semantics_requested;
+    bool overlay_active_edges_requested =
+        relationship || exclude_entry_points || min_degree >= 0 || max_degree >= 0 ||
+        (sort_by && (strcmp(sort_by, "degree") == 0 || strcmp(sort_by, "calls") == 0 ||
+                     strcmp(sort_by, "linkrank") == 0));
+    bool overlay_requires_canonical_edge_ids = include_connected;
+    bool overlay_search_used = overlay_ready_for_nodes && !overlay_requires_canonical_edge_ids;
     if (overlay_search_used) {
         cbm_store_search_overlay_view(store, &params, &out);
     } else {
@@ -3761,12 +3772,13 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                    out.node_degree_stale);
     add_dirty_file_freshness(doc, root, store, project);
     if (overlay_search_used) {
-        add_overlay_active_node_search_freshness(doc, root, &overlay_summary);
-    } else if (overlay_ready_for_nodes && overlay_edge_semantics_requested) {
+        add_overlay_active_node_search_freshness(doc, root, &overlay_summary,
+                                                 overlay_active_edges_requested);
+    } else if (overlay_ready_for_nodes && overlay_requires_canonical_edge_ids) {
         add_response_warning(doc, root,
                              "overlay rows are ready, but this search_graph request used "
-                             "canonical graph rows because relationship/connected traversal "
-                             "needs canonical edge ids until overlay edge reads are enabled.");
+                             "canonical graph rows because connected-neighbor enrichment "
+                             "needs canonical edge ids until overlay connected reads are enabled.");
     }
     if (search_graph_uses_route_derived_graph(label, relationship) &&
         cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_ROUTES)) {
