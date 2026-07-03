@@ -5222,9 +5222,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                 store, project_name, srv->config, graph_changed, deps_reindexed,
                 cbm_rank_refresh_publish_from_pipeline(publish_kind));
             CBM_PROF_END("index_repository", "rank_refresh", prof_index_rank_refresh);
-            /* Register project with watcher so future file changes trigger auto-reindex */
+            /* Explicit indexing just observed the current worktree state. Refresh
+             * the watcher baseline so it does not immediately reindex the same
+             * dirty status after this response. */
             if (srv->watcher)
-                cbm_watcher_watch(srv->watcher, project_name, repo_path);
+                cbm_watcher_mark_indexed(srv->watcher, project_name, repo_path);
 
             CBM_PROF_START(prof_index_counts);
             int nodes = cbm_store_count_nodes(store, project_name);
@@ -7756,7 +7758,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_info("autoindex.done", "project", srv->session_project);
         notify_resources_updated(srv);
         if (srv->watcher) {
-            cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+            cbm_watcher_mark_indexed(srv->watcher, srv->session_project, srv->session_root);
         }
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
