@@ -4032,6 +4032,15 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
                 }
             }
         }
+
+        int dirty_pending = 0;
+        int dirty_overlay_ready = 0;
+        if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+            add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+            add_response_warning(doc, root,
+                                 "index_status counts canonical graph rows; dirty file changes "
+                                 "may be absent until overlay or reindex completes.");
+        }
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -8433,6 +8442,14 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
     int edges = cbm_store_count_edges(store, proj);
     yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        add_response_warning(doc, root,
+                             "codebase://architecture reads canonical graph summaries; dirty "
+                             "file changes may be absent until overlay or reindex completes.");
+    }
 
     /* Key functions by PageRank (top 10), with config-driven exclude patterns */
     struct sqlite3 *db = cbm_store_get_db(store);
@@ -8522,6 +8539,14 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
     yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "edges", edges);
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        add_response_warning(doc, root,
+                             "codebase://status counts canonical graph rows; dirty file changes "
+                             "may be absent until overlay or reindex completes.");
+    }
 
     /* PageRank stats */
     struct sqlite3 *db = cbm_store_get_db(store);
