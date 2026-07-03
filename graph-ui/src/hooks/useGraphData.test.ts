@@ -15,7 +15,7 @@ describe("fetchLayout", () => {
 
     await fetchLayout("large-project");
 
-    expect(GRAPH_RENDER_NODE_LIMIT).toBe(2000);
+    expect(GRAPH_RENDER_NODE_LIMIT).toBe(60000);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const calls = fetchMock.mock.calls as unknown as Array<[string]>;
     const [url] = calls[0];

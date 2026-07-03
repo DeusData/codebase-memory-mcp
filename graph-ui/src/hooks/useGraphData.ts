@@ -9,7 +9,7 @@ interface UseGraphDataResult {
   fetchDetail: (project: string, centerNode: string) => void;
 }
 
-export const GRAPH_RENDER_NODE_LIMIT = 2000;
+export const GRAPH_RENDER_NODE_LIMIT = 60000;
 
 export async function fetchLayout(
   project: string,
