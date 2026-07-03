@@ -4278,6 +4278,14 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         add_stale_derived_view_warning(doc, root, CBM_STORE_DERIVED_VIEW_ROUTES,
                                        "routes derived view is stale; route results may be stale.");
     }
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        add_response_warning(doc, root,
+                             "get_architecture reads canonical graph summaries; dirty file "
+                             "changes may be absent until overlay or reindex completes.");
+    }
 
     /* Node label summary */
     if (aspect_wanted(aspects_doc, aspects_arr, "structure")) {
