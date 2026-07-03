@@ -189,8 +189,10 @@ static bool get_dirty_file_counts(cbm_store_t *store, const char *project,
     return true;
 }
 
-static void add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                            int pending, int overlay_ready) {
+static void add_dirty_file_freshness_counts_with_warning(yyjson_mut_doc *doc,
+                                                         yyjson_mut_val *root,
+                                                         int pending, int overlay_ready,
+                                                         const char *warning_message) {
     if (!doc || !root || (pending <= 0 && overlay_ready <= 0)) {
         return;
     }
@@ -211,8 +213,15 @@ static void add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val 
     yyjson_mut_obj_add_int(doc, freshness, CBM_MCP_FRESHNESS_DIRTY_OVERLAY_READY_KEY,
                            overlay_ready);
     add_response_warning(doc, root,
-                         "project has dirty files; canonical graph rows remain visible until "
-                         "overlay or reindex completes.");
+                         warning_message
+                             ? warning_message
+                             : "project has dirty files; canonical graph rows remain visible until "
+                               "overlay or reindex completes.");
+}
+
+static void add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            int pending, int overlay_ready) {
+    add_dirty_file_freshness_counts_with_warning(doc, root, pending, overlay_ready, NULL);
 }
 
 static void add_dirty_file_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -6350,7 +6359,8 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                                     int raw_count, int gm_count, int limit, int mode,
                                     int context_lines, const char *root_path,
                                     bool warn_literal_pipe, uint64_t elapsed_ms,
-                                    const char *search_scope) {
+                                    const char *search_scope, int dirty_pending,
+                                    int dirty_overlay_ready, const char *dirty_warning) {
     enum {
         MODE_COMPACT = 0,
         MODE_FULL = 1,
@@ -6442,6 +6452,8 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     if (yyjson_mut_arr_size(warnings) > 0) {
         yyjson_mut_obj_add_val(doc, root_obj, "warnings", warnings);
     }
+    add_dirty_file_freshness_counts_with_warning(doc, root_obj, dirty_pending,
+                                                 dirty_overlay_ready, dirty_warning);
 
     char *json = yy_doc_to_str(doc);
     if (json) {
@@ -7112,10 +7124,19 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                    ? "path_filter_exact"
                                    : (scan_mode == SEARCH_CODE_SCAN_GIT_GREP ? "git_worktree"
                                                                               : "project_recursive");
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (!get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready) &&
+        srv->store && srv->store != store) {
+        get_dirty_file_counts(srv->store, project, &dirty_pending, &dirty_overlay_ready);
+    }
     char *result =
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
                                root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0,
-                               search_scope);
+                               search_scope, dirty_pending, dirty_overlay_ready,
+                               "search_code reads live source files, but graph annotations use "
+                               "canonical graph rows; dirty file graph metadata may be absent "
+                               "until overlay or reindex completes.");
     free(gm);
     free(sr);
     free(raw);

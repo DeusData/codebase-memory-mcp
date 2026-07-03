@@ -2295,6 +2295,53 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    cbm_dirty_file_state_t dirty = {.project = "test-project",
+                                    .rel_path = "main.go",
+                                    .observed_hash = "search-code-dirty-hash",
+                                    .observed_generation = 16,
+                                    .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+                                    .status = CBM_STORE_DIRTY_STATUS_PENDING};
+    ASSERT_EQ(cbm_store_upsert_dirty_file(st, &dirty), CBM_STORE_OK);
+    int pending = 0;
+    int overlay_ready = 0;
+    ASSERT_EQ(cbm_store_count_dirty_files(st, "test-project", &pending, &overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(pending, 1);
+    ASSERT_EQ(overlay_ready, 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"HandleRequest\",\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    pending = 0;
+    overlay_ready = 0;
+    ASSERT_EQ(cbm_store_count_dirty_files(cbm_mcp_server_store(srv), "test-project", &pending,
+                                          &overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(pending, 1);
+    ASSERT_EQ(overlay_ready, 0);
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
+    ASSERT_NOT_NULL(strstr(inner, "search_code reads live source files"));
+    ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(search_code_limit_zero_uses_config_default) {
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -4097,6 +4144,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches);
     RUN_TEST(search_code_limit_zero_uses_config_default);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
