@@ -161,6 +161,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_upsert_import_ref;
     sqlite3_stmt *stmt_delete_import_refs_by_file;
     sqlite3_stmt *stmt_list_import_ref_paths_by_target;
+    sqlite3_stmt *stmt_list_import_edge_source_paths_by_target_qn;
     sqlite3_stmt *stmt_list_import_ref_paths_for_export_file;
     sqlite3_stmt *stmt_delete_owned_edges_by_file;
     sqlite3_stmt *stmt_delete_owned_nodes_by_file;
@@ -1121,6 +1122,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_upsert_import_ref);
     finalize_stmt(&s->stmt_delete_import_refs_by_file);
     finalize_stmt(&s->stmt_list_import_ref_paths_by_target);
+    finalize_stmt(&s->stmt_list_import_edge_source_paths_by_target_qn);
     finalize_stmt(&s->stmt_list_import_ref_paths_for_export_file);
     finalize_stmt(&s->stmt_delete_owned_edges_by_file);
     finalize_stmt(&s->stmt_delete_owned_nodes_by_file);
@@ -2854,6 +2856,40 @@ int cbm_store_list_import_ref_paths_by_target(cbm_store_t *s, const char *projec
     bind_text(stmt, ST_COL_1, project);
     bind_text(stmt, ST_COL_2, target_qn);
     return store_collect_text_column(s, stmt, "list_import_ref_paths_by_target", out, count);
+}
+
+int cbm_store_list_import_edge_source_paths_by_target_qn(cbm_store_t *s, const char *project,
+                                                        const char *target_qn, char ***out,
+                                                        int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !project || !target_qn || !out || !count) {
+        if (s) {
+            store_set_error(s, "list_import_edge_source_paths_by_target_qn: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_list_import_edge_source_paths_by_target_qn,
+        "SELECT DISTINCT src.file_path FROM edges e "
+        "JOIN nodes src ON src.project = e.project AND src.id = e.source_id "
+        "JOIN nodes tgt ON tgt.project = e.project AND tgt.id = e.target_id "
+        "WHERE e.project = ?1 AND e.type = 'IMPORTS' AND tgt.qualified_name = ?2 "
+        "  AND src.file_path IS NOT NULL AND src.file_path <> '' "
+        "ORDER BY src.file_path;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, target_qn);
+    return store_collect_text_column(s, stmt, "list_import_edge_source_paths_by_target_qn", out,
+                                     count);
 }
 
 int cbm_store_list_import_ref_paths_for_export_file(cbm_store_t *s, const char *project,

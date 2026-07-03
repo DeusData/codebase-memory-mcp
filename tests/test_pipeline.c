@@ -8232,6 +8232,30 @@ static int write_incremental_frontier_fixture(int leaf_value) {
     return write_incremental_frontier_callers();
 }
 
+static int write_incremental_arg_url_route_file(const char *route_path, int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/http_routes.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "static int cbm_http_path_match(const char *path, const char *pattern) {\n"
+                 "    return path && pattern;\n"
+                 "}\n\n"
+                 "int dispatch_request(const char *path) {\n"
+                 "    if (cbm_http_path_match(path, \"%s\")) {\n"
+                 "        return %d;\n"
+                 "    }\n"
+                 "    return 0;\n"
+                 "}\n",
+                 route_path, marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
 static int pipeline_store_insert_file_owned_unowned_source_edge(const char *db_path,
                                                                const char *project,
                                                                const char *rel_path,
@@ -8819,6 +8843,55 @@ TEST(import_edge_helper_preserves_long_local_name) {
     ASSERT_STR_EQ(vals[0], target->qualified_name);
     cbm_pipeline_free_import_map(keys, vals, import_count);
 
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_map_from_edges_follows_package_reexport) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t source_file =
+        cbm_gbuf_upsert_node(gb, "File", "main.py", "proj.app.main.__file__", "app/main.py", 1,
+                             1, "{}");
+    int64_t package_module =
+        cbm_gbuf_upsert_node(gb, "Folder", "fastapi", "proj.fastapi", "fastapi", 1,
+                             1, "{}");
+    int64_t package_file = cbm_gbuf_upsert_node(gb, "File", "__init__.py", "proj.fastapi.__file__",
+                                                "fastapi/__init__.py", 1, 1, "{}");
+    int64_t wrong_header = cbm_gbuf_upsert_node(gb, "Class", "Header",
+                                                "proj.fastapi.openapi.models.Header",
+                                                "fastapi/openapi/models.py", 1, 1, "{}");
+    int64_t exported_header =
+        cbm_gbuf_upsert_node(gb, "Function", "Header", "proj.fastapi.param_functions.Header",
+                             "fastapi/param_functions.py", 1, 1, "{}");
+    ASSERT_GT(source_file, 0);
+    ASSERT_GT(package_module, 0);
+    ASSERT_GT(package_file, 0);
+    ASSERT_GT(wrong_header, 0);
+    ASSERT_GT(exported_header, 0);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file,
+                                              cbm_gbuf_find_by_id(gb, package_module), "Header"),
+              1);
+    cbm_gbuf_insert_edge(gb, package_file, exported_header, "IMPORTS",
+                         "{\"local_name\":\"Header\"}");
+
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_pipeline_build_import_map_from_edges(gb, "proj", "app/main.py", &keys, &vals,
+                                                       &import_count),
+              0);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(keys[0], "Header");
+    ASSERT_STR_EQ(vals[0], "proj.fastapi.param_functions.Header");
+
+    cbm_pipeline_free_import_map(keys, vals, import_count);
     cbm_gbuf_free(gb);
     PASS();
 }
@@ -10065,6 +10138,69 @@ TEST(incremental_fast_route_decorator_change_matches_full_rebuild) {
     free(project);
     cbm_config_close(cfg);
     cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_arg_url_route_change_matches_parallel_full_rebuild) {
+    enum { ARG_URL_FILLER_FILES = 52, ARG_URL_WORKERS = 4 };
+    pipeline_env_snapshot_t workers_env = pipeline_env_save("CBM_WORKERS");
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char worker_buf[CBM_SZ_32];
+    int n = snprintf(worker_buf, sizeof(worker_buf), "%d", ARG_URL_WORKERS);
+    ASSERT(n > 0 && (size_t)n < sizeof(worker_buf));
+    ASSERT_EQ(cbm_setenv("CBM_WORKERS", worker_buf, 1), 0);
+
+    for (int i = 0; i < ARG_URL_FILLER_FILES; i++) {
+        char path[CBM_PATH_MAX];
+        char body[CBM_SZ_256];
+        n = snprintf(path, sizeof(path), "%s/filler_%02d.c", g_incr_tmpdir, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(path));
+        n = snprintf(body, sizeof(body), "int filler_%02d(void) { return %d; }\n", i, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(body));
+        ASSERT_EQ(th_write_file(path, body), 0);
+    }
+    ASSERT_EQ(write_incremental_arg_url_route_file("/api/index", 1), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/index"));
+
+    ASSERT_EQ(write_incremental_arg_url_route_file("/api/index-status", 2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_publish_kind_t kind = cbm_pipeline_publish_kind(p);
+    ASSERT(kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT ||
+           kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_route_name(g_incr_dbpath, project, "/api/index"));
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/index-status"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "arg-url route incremental differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    pipeline_env_restore(&workers_env);
     PASS();
 }
 
@@ -12357,6 +12493,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_fastapi_depends_edges);
     RUN_TEST(import_edge_helper_escapes_local_name_once);
     RUN_TEST(import_edge_helper_preserves_long_local_name);
+    RUN_TEST(import_map_from_edges_follows_package_reexport);
     RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
     RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
     /* Incremental */
@@ -12376,6 +12513,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_new_folder_exact_delta_parity);
     RUN_TEST(incremental_fast_route_decorator_change_matches_full_rebuild);
+    RUN_TEST(incremental_fast_arg_url_route_change_matches_parallel_full_rebuild);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);

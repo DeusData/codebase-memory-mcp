@@ -54,6 +54,10 @@ int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_
                                           const char *method, const char *broker,
                                           const char *source, const char *file_path);
 
+void cbm_pipeline_detect_url_arg_routes(cbm_gbuf_t *gb, const cbm_gbuf_node_t *source,
+                                        const CBMCall *call, const char *rel_path,
+                                        CBMLanguage lang);
+
 static inline bool cbm_pipeline_label_is_registry_symbol(const char *label) {
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
                      cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||

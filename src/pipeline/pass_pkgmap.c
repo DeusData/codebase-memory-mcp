@@ -1443,6 +1443,54 @@ char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge) {
     return cbm_strndup(start, len);
 }
 
+static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbuf,
+                                                           const char *module_qn);
+
+static bool import_map_target_can_own_reexports(const cbm_gbuf_node_t *target) {
+    return target && target->label &&
+           (strcmp(target->label, "Folder") == 0 || strcmp(target->label, "Module") == 0);
+}
+
+static const cbm_gbuf_node_t *
+resolve_import_map_reexport_target(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source_file,
+                                   const cbm_gbuf_node_t *target, const char *local_name) {
+    if (!gbuf || !source_file || !target || !target->qualified_name || !local_name ||
+        !local_name[0] || strcmp(local_name, "*") == 0) {
+        return NULL;
+    }
+
+    const cbm_gbuf_node_t *owner_file = NULL;
+    if (target->label && strcmp(target->label, "File") == 0) {
+        owner_file = target;
+    } else if (import_map_target_can_own_reexports(target)) {
+        owner_file = find_file_node_for_module_qn(gbuf, target->qualified_name);
+    }
+    if (!owner_file || owner_file->id == source_file->id) {
+        return NULL;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_gbuf_find_edges_by_source_type(gbuf, owner_file->id, "IMPORTS", &edges,
+                                                &edge_count);
+    if (rc != 0 || edge_count <= 0 || !edges) {
+        return NULL;
+    }
+
+    const cbm_gbuf_node_t *best = NULL;
+    for (int i = 0; i < edge_count; i++) {
+        if (!import_edge_local_name_equals(edges[i], local_name)) {
+            continue;
+        }
+        const cbm_gbuf_node_t *candidate = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        if (candidate && cbm_pipeline_label_is_import_target(candidate->label) &&
+            import_target_better(candidate, best, target->qualified_name)) {
+            best = candidate;
+        }
+    }
+    return best;
+}
+
 int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
                                              const char *rel_path, const char ***out_keys,
                                              const char ***out_vals, int *out_count) {
@@ -1491,8 +1539,10 @@ int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char 
             free(key);
             continue;
         }
+        const cbm_gbuf_node_t *resolved =
+            resolve_import_map_reexport_target(gbuf, file_node, target, key);
         keys[count] = key;
-        vals[count] = target->qualified_name;
+        vals[count] = resolved ? resolved->qualified_name : target->qualified_name;
         count++;
     }
 
