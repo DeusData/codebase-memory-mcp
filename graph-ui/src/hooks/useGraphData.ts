@@ -5,7 +5,7 @@ interface UseGraphDataResult {
   data: GraphData | null;
   loading: boolean;
   error: string | null;
-  fetchOverview: (project: string) => void;
+  fetchOverview: (project: string, silent?: boolean) => void;
   fetchDetail: (project: string, centerNode: string) => void;
 }
 
@@ -31,18 +31,25 @@ export function useGraphData(): UseGraphDataResult {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchOverview = useCallback(async (project: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await fetchLayout(project);
-      setData(result);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to fetch layout");
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const fetchOverview = useCallback(
+    async (project: string, silent = false) => {
+      if (!silent) setLoading(true);
+      setError(null);
+      try {
+        const result = await fetchLayout(project);
+        setData(result);
+      } catch (e) {
+        /* On a background poll keep the last good graph instead of blanking
+         * it with an error banner. */
+        if (!silent) {
+          setError(e instanceof Error ? e.message : "Failed to fetch layout");
+        }
+      } finally {
+        if (!silent) setLoading(false);
+      }
+    },
+    [],
+  );
 
   const fetchDetail = useCallback(
     async (project: string, _centerNode: string) => {

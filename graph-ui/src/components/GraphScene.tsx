@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect } from "react";
 import { Canvas, useThree, useFrame } from "@react-three/fiber";
 import { OrbitControls } from "@react-three/drei";
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
@@ -42,47 +42,10 @@ function CameraAnimator({ target }: { target: CameraTarget | null }) {
   return null;
 }
 
-/* ── Idle auto-rotation ──────────────────────────────────── */
+/* ── Render tuning ── */
 
-const IDLE_TIMEOUT_MS = 60_000;
 export const GRAPH_CANVAS_DPR: [number, number] = [1, 1.5];
 export const GRAPH_COMPOSER_MULTISAMPLING = 0;
-
-function IdleAutoRotate({
-  controlsRef,
-}: {
-  controlsRef: React.RefObject<OrbitControlsImpl | null>;
-}) {
-  const lastInteraction = useRef(Date.now());
-
-  /* Reset timer on any pointer/wheel event */
-  const resetTimer = useCallback(() => {
-    lastInteraction.current = Date.now();
-    if (controlsRef.current) {
-      controlsRef.current.autoRotate = false;
-    }
-  }, [controlsRef]);
-
-  useEffect(() => {
-    const canvas = document.querySelector("canvas");
-    if (!canvas) return;
-
-    canvas.addEventListener("pointerdown", resetTimer);
-    canvas.addEventListener("wheel", resetTimer);
-    return () => {
-      canvas.removeEventListener("pointerdown", resetTimer);
-      canvas.removeEventListener("wheel", resetTimer);
-    };
-  }, [resetTimer]);
-
-  useFrame(() => {
-    if (!controlsRef.current) return;
-    const idle = Date.now() - lastInteraction.current > IDLE_TIMEOUT_MS;
-    controlsRef.current.autoRotate = idle;
-  });
-
-  return null;
-}
 
 /* ── Main scene ─────────────────────────────────────────── */
 
@@ -91,6 +54,7 @@ interface GraphSceneProps {
   highlightedIds: Set<number> | null;
   cameraTarget: CameraTarget | null;
   showLabels: boolean;
+  autoRotate: boolean;
   onNodeClick: (node: GraphNode) => void;
 }
 
@@ -101,6 +65,7 @@ export function GraphScene({
   highlightedIds,
   cameraTarget,
   showLabels,
+  autoRotate,
   onNodeClick,
 }: GraphSceneProps) {
   const [hovered, setHovered] = useState<GraphNode | null>(null);
@@ -180,7 +145,6 @@ export function GraphScene({
       {hovered && <NodeTooltip node={hovered} />}
 
       <CameraAnimator target={cameraTarget} />
-      <IdleAutoRotate controlsRef={controlsRef} />
 
       <EffectComposer multisampling={GRAPH_COMPOSER_MULTISAMPLING}>
         <Bloom
@@ -194,6 +158,7 @@ export function GraphScene({
 
       <OrbitControls
         ref={controlsRef}
+        autoRotate={autoRotate}
         enableDamping
         dampingFactor={0.08}
         rotateSpeed={0.5}

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { useGraphData } from "../hooks/useGraphData";
 import {
@@ -29,6 +29,9 @@ interface GraphTabProps {
   project: string | null;
 }
 
+/* How often the graph silently re-fetches to pick up re-index changes. */
+export const GRAPH_AUTO_REFRESH_MS = 15_000;
+
 export function formatGraphLimitNotice(data: GraphData | null): string | null {
   if (!data || data.total_nodes <= data.nodes.length) return null;
   return `Showing ${data.nodes.length.toLocaleString()} of ${data.total_nodes.toLocaleString()} nodes. Use filters to narrow.`;
@@ -41,6 +44,8 @@ export function GraphTab({ project }: GraphTabProps) {
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
   const [showLabels, setShowLabels] = useState(true);
+  const [autoRotate, setAutoRotate] = useState(false);
+  const filterSig = useRef<string>("");
   const [leftWidth, setLeftWidth] = useState(() => loadWidth("cbm-left-w", 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth("cbm-right-w", 280));
   const limitNotice = formatGraphLimitNotice(data);
@@ -49,7 +54,10 @@ export function GraphTab({ project }: GraphTabProps) {
   const [enabledLabels, setEnabledLabels] = useState<Set<string>>(new Set());
   const [enabledEdgeTypes, setEnabledEdgeTypes] = useState<Set<string>>(new Set());
 
-  /* Initialize filters when data loads */
+  /* Initialize filters when the graph's label/edge-type universe changes.
+   * Guarding on the signature (not just `data`) means a silent auto-refresh —
+   * which returns the same universe — preserves the user's filter selection
+   * instead of resetting it every poll. */
   useEffect(() => {
     if (!data) return;
     const labels = new Set(data.nodes.map((n) => n.label));
@@ -59,6 +67,10 @@ export function GraphTab({ project }: GraphTabProps) {
       for (const e of lp.edges) types.add(e.type);
       for (const e of lp.cross_edges) types.add(e.type);
     }
+    const sig =
+      [...labels].sort().join("|") + "::" + [...types].sort().join("|");
+    if (sig === filterSig.current) return;
+    filterSig.current = sig;
     setEnabledLabels(labels);
     setEnabledEdgeTypes(types);
   }, [data]);
@@ -99,6 +111,17 @@ export function GraphTab({ project }: GraphTabProps) {
       setHighlightedIds(null);
       setSelectedPath(null);
     }
+  }, [project, fetchOverview]);
+
+  /* Silent auto-refresh: pick up re-index changes without blanking the graph
+   * or disturbing the current selection/filters. */
+  useEffect(() => {
+    if (!project) return;
+    const id = setInterval(
+      () => fetchOverview(project, true),
+      GRAPH_AUTO_REFRESH_MS,
+    );
+    return () => clearInterval(id);
   }, [project, fetchOverview]);
 
   const handleSelectPath = useCallback(
@@ -273,6 +296,7 @@ export function GraphTab({ project }: GraphTabProps) {
             highlightedIds={highlightedIds}
             cameraTarget={cameraTarget}
             showLabels={showLabels}
+            autoRotate={autoRotate}
             onNodeClick={handleNodeClick}
           />
         </ErrorBoundary>
@@ -312,6 +336,14 @@ export function GraphTab({ project }: GraphTabProps) {
               Clear
             </Button>
           )}
+          <Button
+            variant={autoRotate ? "default" : "outline"}
+            size="sm"
+            onClick={() => setAutoRotate((v) => !v)}
+            title="Toggle graph auto-rotation"
+          >
+            {autoRotate ? "Auto-rotate: on" : "Auto-rotate: off"}
+          </Button>
           <Button
             variant="outline"
             size="sm"
