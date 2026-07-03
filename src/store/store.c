@@ -6022,24 +6022,41 @@ static char *make_like_hint(const char *literal) {
     return buf;
 }
 
-static void search_apply_degree_filter(char *sql, size_t sql_sz, const cbm_search_params_t *p) {
+static int search_apply_degree_filter(cbm_store_t *s, char *sql, size_t sql_sz,
+                                      const cbm_search_params_t *p) {
     bool has_degree_filter = (p->min_degree >= 0 || p->max_degree >= 0);
     if (!has_degree_filter) {
-        return;
+        return CBM_STORE_OK;
     }
-    char inner_sql[CBM_SZ_4K];
-    snprintf(inner_sql, sizeof(inner_sql), "%s", sql);
+    char *inner_sql = malloc(sql_sz);
+    if (!inner_sql) {
+        store_set_error(s, "search degree filter out of memory");
+        return CBM_STORE_ERR;
+    }
+    int n = snprintf(inner_sql, sql_sz, "%s", sql);
+    if (n < 0 || (size_t)n >= sql_sz) {
+        free(inner_sql);
+        store_set_error(s, "search degree filter input SQL truncated");
+        return CBM_STORE_ERR;
+    }
     if (p->min_degree >= 0 && p->max_degree >= 0) {
-        snprintf(sql, sql_sz,
-                 "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d AND (in_deg + out_deg) <= %d",
-                 inner_sql, p->min_degree, p->max_degree);
+        n = snprintf(sql, sql_sz,
+                     "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d "
+                     "AND (in_deg + out_deg) <= %d",
+                     inner_sql, p->min_degree, p->max_degree);
     } else if (p->min_degree >= 0) {
-        snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d", inner_sql,
-                 p->min_degree);
+        n = snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) >= %d",
+                     inner_sql, p->min_degree);
     } else {
-        snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) <= %d", inner_sql,
-                 p->max_degree);
+        n = snprintf(sql, sql_sz, "SELECT * FROM (%s) WHERE (in_deg + out_deg) <= %d",
+                     inner_sql, p->max_degree);
     }
+    free(inner_sql);
+    if (n < 0 || (size_t)n >= sql_sz) {
+        store_set_error(s, "search degree filter SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 /* Append a WHERE clause fragment, joining with AND if not the first. */
@@ -6267,7 +6284,27 @@ static void search_where_advanced(const cbm_search_params_t *params, char *where
         char excl_clause[CBM_SZ_512];
         search_build_exclude_labels(params->exclude_labels, binds, bind_idx, excl_clause,
                                     (int)sizeof(excl_clause));
-        (void)where_append(where, where_sz, *wlen, nparams, excl_clause);
+        *wlen = where_append(where, where_sz, *wlen, nparams, excl_clause);
+    }
+}
+
+static void search_where_overlay_edges(const cbm_search_params_t *params, char *where,
+                                       int where_sz, int *wlen, int *nparams,
+                                       search_bind_t *binds, int *bind_idx) {
+    if (params->relationship) {
+        char rel_clause[CBM_SZ_256];
+        snprintf(rel_clause, sizeof(rel_clause),
+                 "EXISTS(SELECT 1 FROM active_edges e WHERE "
+                 "(e.source_qn = n.qualified_name OR e.target_qn = n.qualified_name) "
+                 "AND e.type = ?%d)",
+                 *bind_idx + SKIP_ONE);
+        *wlen = where_append(where, where_sz, *wlen, nparams, rel_clause);
+        where_bind_text(binds, bind_idx, params->relationship);
+    }
+    if (params->exclude_entry_points) {
+        *wlen = where_append(where, where_sz, *wlen, nparams,
+                             "EXISTS(SELECT 1 FROM active_edges e "
+                             "WHERE e.target_qn = n.qualified_name)");
     }
 }
 
@@ -6280,6 +6317,79 @@ static int search_build_where(const cbm_search_params_t *params, char *where, in
     search_where_advanced(params, where, where_sz, &wlen, &nparams, binds, bind_idx);
 
     return nparams;
+}
+
+static bool search_overlay_needs_active_edges(const cbm_search_params_t *params) {
+    if (!params) {
+        return false;
+    }
+    if (params->relationship || params->exclude_entry_points ||
+        params->min_degree >= 0 || params->max_degree >= 0) {
+        return true;
+    }
+    return params->sort_by &&
+           (strcmp(params->sort_by, "degree") == 0 ||
+            strcmp(params->sort_by, "calls") == 0 ||
+            strcmp(params->sort_by, "linkrank") == 0);
+}
+
+static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges) {
+    int n = snprintf(buf, buf_sz,
+                     "WITH active_files AS ("
+                     "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
+                     "  FROM overlay_tombstones t"
+                     "  JOIN overlay_generations g"
+                     "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
+                     "  WHERE g.status = ?1 AND t.entity_kind = ?2 AND t.active = %d"
+                     "  GROUP BY t.project, t.rel_path"
+                     "), active_nodes AS ("
+                     "  SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
+                     "         n.start_line, n.end_line, n.properties"
+                     "  FROM nodes n"
+                     "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
+                     "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
+                     "  UNION ALL"
+                     "  SELECT %d AS id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
+                     "         n.start_line, n.end_line, n.properties"
+                     "  FROM overlay_nodes n"
+                     "  JOIN active_files af"
+                     "    ON af.project = n.project AND af.rel_path = n.rel_path"
+                     "   AND af.overlay_generation = n.overlay_generation"
+                     "  WHERE n.owned = %d"
+                     ")",
+                     STORE_OVERLAY_TOMBSTONE_ACTIVE, CBM_STORE_NO_NODE_ID,
+                     STORE_OVERLAY_ROW_OWNED);
+    if (n < 0 || (size_t)n >= buf_sz) {
+        return CBM_STORE_ERR;
+    }
+    size_t used = (size_t)n;
+    if (!include_edges) {
+        n = snprintf(buf + used, buf_sz - used, " ");
+        return (n >= 0 && used + (size_t)n < buf_sz) ? CBM_STORE_OK : CBM_STORE_ERR;
+    }
+    n = snprintf(buf + used, buf_sz - used,
+                 ", active_edges AS ("
+                 "  SELECT s.qualified_name AS source_qn, t.qualified_name AS target_qn, e.type"
+                 "  FROM edges e"
+                 "  JOIN nodes s ON s.id = e.source_id"
+                 "  JOIN nodes t ON t.id = e.target_id"
+                 "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
+                 "                    WHERE af.project = s.project AND af.rel_path = s.file_path)"
+                 "    AND NOT EXISTS (SELECT 1 FROM active_files af"
+                 "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
+                 "  UNION ALL"
+                 "  SELECT e.source_qn, e.target_qn, e.type"
+                 "  FROM overlay_edges e"
+                 "  JOIN active_files af"
+                 "    ON af.project = e.project AND af.rel_path = e.rel_path"
+                 "   AND af.overlay_generation = e.overlay_generation"
+                 "  WHERE e.owned = %d"
+                 ") ",
+                 STORE_OVERLAY_ROW_OWNED);
+    if (n < 0 || used + (size_t)n >= buf_sz) {
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 static int search_execute_sql(cbm_store_t *s, const char *sql, const char *count_sql,
@@ -6483,7 +6593,10 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     /* Degree filters — upstream helper wraps in subquery on in_deg/out_deg. */
     bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
-    search_apply_degree_filter(sql, sizeof(sql), params);
+    if (search_apply_degree_filter(s, sql, sizeof(sql), params) != CBM_STORE_OK) {
+        like_pool_free(&like_pool);
+        return CBM_STORE_ERR;
+    }
 
     /* Count query — stripped of per-row edge subqueries for the common (no-degree-filter)
      * case, since we only need the row count, not in_deg/out_deg.  The degree-filter
@@ -6604,46 +6717,39 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
 
     bool use_pagerank =
         (!params->sort_by || strcmp(params->sort_by, "relevance") == 0) && !out->pagerank_stale;
+    bool use_active_edges = search_overlay_needs_active_edges(params);
+    const char *in_degree_expr =
+        use_active_edges
+            ? "(SELECT COUNT(*) FROM active_edges e WHERE e.target_qn = n.qualified_name)"
+            : "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id)";
+    const char *out_degree_expr =
+        use_active_edges
+            ? "(SELECT COUNT(*) FROM active_edges e WHERE e.source_qn = n.qualified_name)"
+            : "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id)";
+    char select_with_pr[CBM_SZ_512];
+    char select_without_pr[CBM_SZ_512];
+    snprintf(select_with_pr, sizeof(select_with_pr),
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+             "n.file_path, n.start_line, n.end_line, n.properties, "
+             "%s AS in_deg, %s AS out_deg, COALESCE(pr.rank, 0.0) AS pr_rank ",
+             in_degree_expr, out_degree_expr);
+    snprintf(select_without_pr, sizeof(select_without_pr),
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+             "n.file_path, n.start_line, n.end_line, n.properties, "
+             "%s AS in_deg, %s AS out_deg ",
+             in_degree_expr, out_degree_expr);
     const char *select_cols =
-        use_pagerank
-            ? "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-              "n.file_path, n.start_line, n.end_line, n.properties, "
-              "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id) AS in_deg, "
-              "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg, "
-              "COALESCE(pr.rank, 0.0) AS pr_rank "
-            : "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-              "n.file_path, n.start_line, n.end_line, n.properties, "
-              "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id) AS in_deg, "
-              "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id) AS out_deg ";
+        use_pagerank ? select_with_pr : select_without_pr;
     const char *from_join =
         use_pagerank ? "FROM active_nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id"
                      : "FROM active_nodes n";
 
-    char active_cte[CBM_SZ_4K];
-    snprintf(active_cte, sizeof(active_cte),
-             "WITH active_files AS ("
-             "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
-             "  FROM overlay_tombstones t"
-             "  JOIN overlay_generations g"
-             "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
-             "  WHERE g.status = ?1 AND t.entity_kind = ?2 AND t.active = %d"
-             "  GROUP BY t.project, t.rel_path"
-             "), active_nodes AS ("
-             "  SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
-             "         n.start_line, n.end_line, n.properties"
-             "  FROM nodes n"
-             "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
-             "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
-             "  UNION ALL"
-             "  SELECT %d AS id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
-             "         n.start_line, n.end_line, n.properties"
-             "  FROM overlay_nodes n"
-             "  JOIN active_files af"
-             "    ON af.project = n.project AND af.rel_path = n.rel_path"
-             "   AND af.overlay_generation = n.overlay_generation"
-             "  WHERE n.owned = %d"
-             ") ",
-             STORE_OVERLAY_TOMBSTONE_ACTIVE, CBM_STORE_NO_NODE_ID, STORE_OVERLAY_ROW_OWNED);
+    char active_cte[ST_SQL_BUF];
+    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), use_active_edges) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "search_overlay_view active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
@@ -6651,11 +6757,21 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
     int bind_idx = 0;
     where_bind_text(binds, &bind_idx, CBM_STORE_OVERLAY_STATUS_READY);
     where_bind_text(binds, &bind_idx, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    cbm_search_params_t active_params = *params;
+    if (use_active_edges) {
+        active_params.relationship = NULL;
+        active_params.exclude_entry_points = false;
+    }
     int nparams =
-        search_build_where(params, where, (int)sizeof(where), binds, &bind_idx, &like_pool);
+        search_build_where(&active_params, where, (int)sizeof(where), binds, &bind_idx, &like_pool);
+    int wlen = (int)strlen(where);
+    if (use_active_edges) {
+        search_where_overlay_edges(params, where, (int)sizeof(where), &wlen, &nparams, binds,
+                                   &bind_idx);
+    }
 
-    char sql[CBM_SZ_4K];
-    char count_sql[CBM_SZ_4K];
+    char sql[ST_SQL_BUF];
+    char count_sql[ST_SQL_BUF];
     if (nparams > 0) {
         snprintf(sql, sizeof(sql), "%s%s %s WHERE %s", active_cte, select_cols, from_join, where);
         snprintf(count_sql, sizeof(count_sql), "%sSELECT COUNT(*) FROM active_nodes n WHERE %s",
@@ -6667,7 +6783,10 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
     }
 
     bool has_degree_filter = (params->min_degree >= 0 || params->max_degree >= 0);
-    search_apply_degree_filter(sql, sizeof(sql), params);
+    if (search_apply_degree_filter(s, sql, sizeof(sql), params) != CBM_STORE_OK) {
+        like_pool_free(&like_pool);
+        return CBM_STORE_ERR;
+    }
     if (has_degree_filter) {
         snprintf(count_sql, sizeof(count_sql), "SELECT COUNT(*) FROM (%s)", sql);
     }
