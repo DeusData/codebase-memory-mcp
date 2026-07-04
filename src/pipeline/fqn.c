@@ -14,6 +14,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> // strdup
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#endif
 
 /* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
 #define FQN_MAX_PATH_SEGS 254
@@ -384,13 +388,45 @@ static char *fqn_bound_name_len(char *name) {
     return name;
 }
 
+static bool path_is_root_syntax(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    for (const char *p = path; *p; p++) {
+        if (*p != '/' && *p != '\\' && *p != ':') {
+            return false;
+        }
+    }
+    return true;
+}
+
 char *cbm_project_name_from_path(const char *abs_path) {
     if (!abs_path || !abs_path[0]) {
         return strdup("root");
     }
+    if (path_is_root_syntax(abs_path)) {
+        return strdup("root");
+    }
+
+    char real[CBM_SZ_4K];
+    const char *name_path = abs_path;
+#ifdef _WIN32
+    if (_access(abs_path, 0) == 0 && _fullpath(real, abs_path, sizeof(real))) {
+        cbm_normalize_path_sep(real);
+        name_path = real;
+    }
+#else
+    if (realpath(abs_path, real)) {
+        cbm_normalize_path_sep(real);
+        name_path = real;
+    }
+#endif
 
     /* Work on mutable copy */
-    char *path = strdup(abs_path);
+    char *path = strdup(name_path);
+    if (!path) {
+        return NULL;
+    }
     size_t len = strlen(path);
 
     /* Normalize path separators */

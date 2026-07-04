@@ -473,6 +473,19 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
     return rel_path;
 }
 
+/* Non-negatable safety core: built-in skip dirs that a .cbmignore negation
+ * can NEVER un-skip. A repo-committed .cbmignore must not be able to defeat
+ * OOM/safety skips: .git holds VCS internals (and the info/exclude sources,
+ * #489), node_modules explodes discovery, and the worktree-internal dirs
+ * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
+ * contain parallel checkouts of the same repo whose indexing would duplicate
+ * the whole codebase (#802). */
+static bool is_safety_core_dir(const char *name) {
+    static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
+                                                   ".claude-worktrees", NULL};
+    return str_in_list(name, SAFETY_CORE_DIRS);
+}
+
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
@@ -480,7 +493,15 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
-        return true;
+        /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
+         * match for this dir un-skips a built-in skip-list dir — except the
+         * non-negatable safety core. Fall through so .gitignore/global/local
+         * rules still apply to the un-skipped dir. */
+        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
+                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (!unskipped) {
+            return true;
+        }
     }
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
         return true;

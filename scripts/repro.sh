@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # repro.sh — Build + run the cumulative BUG-REPRODUCTION suite (test-repro).
 #
 # Unlike test.sh (the gating suite, must be GREEN), this suite is RED by design:
@@ -47,7 +47,7 @@ export ASAN_OPTIONS="detect_leaks=0${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
 # test-repro both builds and runs the runner; tolerate its non-zero (red) exit.
 set +e
-$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm test-repro $MAKE_ARGS 2>&1 | tee "$OUT"
+make -j"$NPROC" -f Makefile.cbm test-repro $MAKE_ARGS 2>&1 | tee "$OUT"
 set -e
 
 # The runner prints a "<N> passed[, <M> failed]" summary line only if it actually

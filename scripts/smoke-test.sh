@@ -12,11 +12,12 @@ set -euo pipefail
 BINARY="${1:?usage: smoke-test.sh <binary-path>}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 TMPDIR=$(mktemp -d)
+DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'rm -rf "$TMPDIR"' EXIT
+trap 'rm -rf "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
 
 CLI_STDERR=$(mktemp)
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
@@ -679,9 +680,27 @@ rm -f "$MCP_CL_INPUT" "$MCP_CL_OUTPUT" "$MCP_TOOL_INPUT" "$MCP_TOOL_OUTPUT"
 echo ""
 echo "=== Phase 6: CLI subcommands ==="
 
+DRYRUN_HOME=$(mktemp -d)
+DRYRUN_CACHE="$DRYRUN_HOME/.cache/codebase-memory-mcp"
+mkdir -p "$DRYRUN_CACHE" \
+  "$DRYRUN_HOME/.local/bin" \
+  "$DRYRUN_HOME/.config" \
+  "$DRYRUN_HOME/AppData/Roaming" \
+  "$DRYRUN_HOME/AppData/Local"
+
+run_dryrun_env() {
+  HOME="$DRYRUN_HOME" \
+    XDG_CONFIG_HOME="$DRYRUN_HOME/.config" \
+    APPDATA="$DRYRUN_HOME/AppData/Roaming" \
+    LOCALAPPDATA="$DRYRUN_HOME/AppData/Local" \
+    CBM_CACHE_DIR="$DRYRUN_CACHE" \
+    PATH="$DRYRUN_HOME/.local/bin:$PATH" \
+    "$@"
+}
+
 # 6a: install --dry-run -y
 echo "--- Phase 6a: install --dry-run ---"
-INSTALL_OUT=$("$BINARY" install --dry-run -y 2>&1)
+INSTALL_OUT=$(run_dryrun_env "$BINARY" install --dry-run -y 2>&1)
 if ! echo "$INSTALL_OUT" | grep -qi 'install\|skill\|mcp\|agent'; then
   echo "FAIL: install --dry-run produced unexpected output"
   echo "$INSTALL_OUT"
@@ -695,7 +714,7 @@ echo "OK: install --dry-run completed"
 
 # 6b: uninstall --dry-run -y
 echo "--- Phase 6b: uninstall --dry-run ---"
-UNINSTALL_OUT=$("$BINARY" uninstall --dry-run -y 2>&1)
+UNINSTALL_OUT=$(run_dryrun_env "$BINARY" uninstall --dry-run -y 2>&1)
 if ! echo "$UNINSTALL_OUT" | grep -qi 'uninstall\|remov'; then
   echo "FAIL: uninstall --dry-run produced unexpected output"
   echo "$UNINSTALL_OUT"
@@ -705,7 +724,7 @@ echo "OK: uninstall --dry-run completed"
 
 # 6c: update --dry-run --standard -y
 echo "--- Phase 6c: update --dry-run ---"
-UPDATE_OUT=$("$BINARY" update --dry-run --standard -y 2>&1)
+UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1)
 if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
   echo "FAIL: update --dry-run did not indicate dry-run mode"
   echo "$UPDATE_OUT"
@@ -730,13 +749,13 @@ echo "OK: update --dry-run --standard completed"
 
 # 6d: config set/get/reset round-trip
 echo "--- Phase 6d: config set/get/reset ---"
-"$BINARY" config set auto_index true 2>/dev/null
-CONFIG_VAL=$("$BINARY" config get auto_index 2>/dev/null)
+run_dryrun_env "$BINARY" config set auto_index true 2>/dev/null
+CONFIG_VAL=$(run_dryrun_env "$BINARY" config get auto_index 2>/dev/null)
 if ! echo "$CONFIG_VAL" | grep -q 'true'; then
   echo "FAIL: config get auto_index returned '$CONFIG_VAL', expected 'true'"
   exit 1
 fi
-"$BINARY" config reset auto_index 2>/dev/null
+run_dryrun_env "$BINARY" config reset auto_index 2>/dev/null
 echo "OK: config set/get/reset round-trip"
 
 # 6e: Simulated binary replacement (update flow without network)

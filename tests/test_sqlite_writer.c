@@ -121,6 +121,96 @@ TEST(sw_minimal_data) {
     PASS();
 }
 
+/* #768 schema half: two IMPORTS edges between the same two files, keyed apart
+ * by local_name, must be representable in the dumped DB. The dump's edges DDL
+ * and the hand-built sqlite_autoindex_edges_1 must carry the local_name
+ * discriminator — with the old UNIQUE(source_id,target_id,type) the two rows
+ * violate the dump's own constraint and PRAGMA integrity_check flags a
+ * non-unique autoindex entry. */
+TEST(sw_imports_local_name_unique) {
+    char path[256];
+    ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
+
+    CBMDumpNode nodes[2] = {
+        {.id = 1,
+         .project = "test",
+         .label = "File",
+         .name = "consumer.ts",
+         .qualified_name = "test.consumer.ts.__file__",
+         .file_path = "consumer.ts",
+         .start_line = 1,
+         .end_line = 3,
+         .properties = "{}"},
+        {.id = 2,
+         .project = "test",
+         .label = "File",
+         .name = "lib.ts",
+         .qualified_name = "test.lib.ts.__file__",
+         .file_path = "lib.ts",
+         .start_line = 1,
+         .end_line = 2,
+         .properties = "{}"},
+    };
+    CBMDumpEdge edges[2] = {
+        {.id = 1,
+         .project = "test",
+         .source_id = 1,
+         .target_id = 2,
+         .type = "IMPORTS",
+         .properties = "{\"local_name\":\"A\"}",
+         .url_path = "",
+         .local_name = "A"},
+        {.id = 2,
+         .project = "test",
+         .source_id = 1,
+         .target_id = 2,
+         .type = "IMPORTS",
+         .properties = "{\"local_name\":\"B\"}",
+         .url_path = "",
+         .local_name = "B"},
+    };
+
+    int rc = cbm_write_db(path, "test", "/tmp/test", "2026-03-14T00:00:00Z", nodes, 2, edges, 2,
+                          NULL, 0, NULL, 0);
+    ASSERT_EQ(rc, 0);
+
+    sqlite3 *db = NULL;
+    rc = sqlite3_open(path, &db);
+    ASSERT_EQ(rc, SQLITE_OK);
+
+    /* The dumped DB must satisfy its own UNIQUE constraint. */
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(db, "PRAGMA integrity_check", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    const char *integrity = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_STR_EQ(integrity, "ok");
+    sqlite3_finalize(stmt);
+
+    /* Both sibling imports are queryable. */
+    sqlite3_prepare_v2(db,
+                       "SELECT COUNT(*) FROM edges "
+                       "WHERE source_id=1 AND target_id=2 AND type='IMPORTS'",
+                       -1, &stmt, NULL);
+    sqlite3_step(stmt);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    /* The generated discriminator matches what the writer hand-indexed. */
+    sqlite3_prepare_v2(db, "SELECT local_name_gen FROM edges ORDER BY id", -1, &stmt, NULL);
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "A");
+    rc = sqlite3_step(stmt);
+    ASSERT_EQ(rc, SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), "B");
+    sqlite3_finalize(stmt);
+
+    sqlite3_close(db);
+    unlink(path);
+    PASS();
+}
+
 TEST(sw_scale_and_indexes) {
     char path[256];
     ASSERT_EQ(make_temp_db(path, sizeof(path)), 0);
@@ -519,6 +609,7 @@ TEST(sw_oversized_node) {
 
 SUITE(sqlite_writer) {
     RUN_TEST(sw_minimal_data);
+    RUN_TEST(sw_imports_local_name_unique);
     RUN_TEST(sw_scale_and_indexes);
     RUN_TEST(sw_long_index_keys_overflow);
     RUN_TEST(sw_empty);

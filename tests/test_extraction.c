@@ -2987,6 +2987,132 @@ TEST(complexity_guarded_recursion) {
     PASS();
 }
 
+/* #599: super().save() inside a method named save is a parent-class call —
+ * the receiver is super(), never self — so it must NOT flag self-recursion.
+ * super()-ONLY fixture: no self.save() alongside, so the assertion cannot pass
+ * vacuously off a genuine self-call. */
+TEST(complexity_super_only_not_recursive) {
+    CBMFileResult *r = extract("class B(A):\n"
+                               "    def save(self):\n"
+                               "        super().save()\n",
+                               CBM_LANG_PYTHON, "t", "super_only.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* parent-class call, not self-recursion */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #599: a same-named call on an unrelated receiver (axios.get inside a
+ * function also named get) is delegation, not self-recursion. */
+TEST(complexity_same_name_other_receiver_not_recursive) {
+    CBMFileResult *r = extract("function get(url) {\n"
+                               "    return axios.get(url);\n"
+                               "}\n",
+                               CBM_LANG_JAVASCRIPT, "t", "axios_get.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "get");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* axios.get targets axios, not this fn */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Guard: genuine self-recursion through self/this receivers still trips the
+ * detector after the receiver-aware narrowing (#599). */
+TEST(complexity_self_receiver_still_recursive) {
+    /* Python: self.recur() — same object. */
+    CBMFileResult *r = extract("class C:\n"
+                               "    def recur(self, n):\n"
+                               "        if n > 0:\n"
+                               "            self.recur(n - 1)\n",
+                               CBM_LANG_PYTHON, "t", "self_recur.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "recur");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive);
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
+    cbm_free_result(r);
+
+    /* JS: this.step() — same object. */
+    r = extract("class C {\n"
+                "    step(n) {\n"
+                "        if (n > 0) { this.step(n - 1); }\n"
+                "    }\n"
+                "}\n",
+                CBM_LANG_JAVASCRIPT, "t", "this_step.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "step");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive);
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if (n > 0)` */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #599: chained receiver — self.obj.recur() inside recur targets self's FIELD
+ * obj, a different object. The whole receiver chain ("self.obj") must be
+ * compared, not just its first segment ("self"). */
+TEST(complexity_chained_receiver_not_self) {
+    CBMFileResult *r = extract("class C:\n"
+                               "    def recur(self, n):\n"
+                               "        self.obj.recur(n)\n",
+                               CBM_LANG_PYTHON, "t", "chained_recur.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "recur");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* self.obj is not self */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #599: Go method receiver — the enclosing def's own receiver identifier
+ * (`s` in `func (s *Store) save()`) is whitelisted dynamically from
+ * CBMDefinition.receiver, so s.save() still counts as self-recursion while
+ * s.backup.save() (a field's same-named method) does not. */
+TEST(complexity_go_method_receiver_self_recursion) {
+    CBMFileResult *r = extract("package p\n"
+                               "type Store struct{}\n"
+                               "func (s *Store) save(n int) {\n"
+                               "    if n > 0 {\n"
+                               "        s.save(n - 1)\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "store.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive); /* s.save() == receiver s → self */
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
+    cbm_free_result(r);
+
+    /* Same-named method on a field of the receiver: NOT self-recursion. */
+    r = extract("package p\n"
+                "type Store struct{ backup *Store }\n"
+                "func (s *Store) save(n int) {\n"
+                "    s.backup.save(n)\n"
+                "}\n",
+                CBM_LANG_GO, "t", "store_backup.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* s.backup is not s */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Deep chained member access + parameter count structure smells. */
 TEST(complexity_access_depth_and_params) {
     CBMFileResult *r = extract("package p\n"
@@ -3380,6 +3506,11 @@ SUITE(extraction) {
     RUN_TEST(complexity_linear_scan_in_loop);
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
+    RUN_TEST(complexity_super_only_not_recursive);
+    RUN_TEST(complexity_same_name_other_receiver_not_recursive);
+    RUN_TEST(complexity_self_receiver_still_recursive);
+    RUN_TEST(complexity_chained_receiver_not_self);
+    RUN_TEST(complexity_go_method_receiver_self_recursion);
     RUN_TEST(complexity_access_depth_and_params);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
 

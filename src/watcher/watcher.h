@@ -34,7 +34,8 @@ typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, voi
  * user_data is passed to index_fn. */
 cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *user_data);
 
-/* Free the watcher and all per-project state. NULL-safe. */
+/* Free the watcher and all per-project state. NULL-safe.
+ * Precondition: cbm_watcher_stop() + thread join must have completed. */
 void cbm_watcher_free(cbm_watcher_t *w);
 
 /* ── Watch list management ──────────────────────────────────────── */
@@ -68,5 +69,13 @@ int cbm_watcher_watch_count(cbm_watcher_t *w);
 
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
+
+/* Classify a stat() errno observed on a watched project root: returns true
+ * only for values that mean the root itself is gone (ENOENT, ENOTDIR) and
+ * may count toward stale-root pruning (#286). Any other failure (EACCES,
+ * EIO, transient mounts, macOS TCC revocation) must NOT count — the cached
+ * DB holds user-authored data and is unrecoverable once pruned. Exposed
+ * for direct unit testing with injected errno values. */
+bool cbm_watcher_root_missing_errno(int err);
 
 #endif /* CBM_WATCHER_H */

@@ -78,6 +78,67 @@ TEST(store_edge_dedup) {
     PASS();
 }
 
+/* #768 schema half: the edges UNIQUE constraint must discriminate IMPORTS
+ * edges by local_name so two named imports from the same specifier coexist
+ * as two rows, while re-inserting the SAME (src,tgt,IMPORTS,local_name)
+ * still upserts onto one row. Non-IMPORTS uniqueness is unchanged. */
+TEST(store_imports_edge_local_name_coexist) {
+    int64_t ids[2];
+    cbm_store_t *s = setup_store_with_nodes(2, ids);
+
+    cbm_edge_t ea = {.project = "test",
+                     .source_id = ids[0],
+                     .target_id = ids[1],
+                     .type = "IMPORTS",
+                     .properties_json = "{\"local_name\":\"A\"}"};
+    cbm_edge_t eb = {.project = "test",
+                     .source_id = ids[0],
+                     .target_id = ids[1],
+                     .type = "IMPORTS",
+                     .properties_json = "{\"local_name\":\"B\"}"};
+
+    int64_t ida = cbm_store_insert_edge(s, &ea);
+    int64_t idb = cbm_store_insert_edge(s, &eb);
+    ASSERT_GT(ida, 0);
+    ASSERT_GT(idb, 0);
+    ASSERT_NEQ(ida, idb); /* distinct local_name -> distinct rows */
+
+    /* Same (src,tgt,IMPORTS,local_name) again -> upsert onto the same row. */
+    int64_t ida_again = cbm_store_insert_edge(s, &ea);
+    ASSERT_EQ(ida_again, ida);
+
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    int rc = cbm_store_find_edges_by_type(s, "test", "IMPORTS", &edges, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"A\"") != NULL ||
+                strstr(edges[1].properties_json, "\"local_name\":\"A\"") != NULL);
+    ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"B\"") != NULL ||
+                strstr(edges[1].properties_json, "\"local_name\":\"B\"") != NULL);
+    cbm_store_free_edges(edges, count);
+
+    /* Non-IMPORTS dedup is unchanged: differing properties (no local_name)
+     * must still upsert onto one row, not fan out via a NULL discriminator. */
+    cbm_edge_t c1 = {.project = "test",
+                     .source_id = ids[0],
+                     .target_id = ids[1],
+                     .type = "CALLS",
+                     .properties_json = "{}"};
+    cbm_edge_t c2 = {.project = "test",
+                     .source_id = ids[0],
+                     .target_id = ids[1],
+                     .type = "CALLS",
+                     .properties_json = "{\"weight\":5}"};
+    int64_t idc1 = cbm_store_insert_edge(s, &c1);
+    int64_t idc2 = cbm_store_insert_edge(s, &c2);
+    ASSERT_GT(idc1, 0);
+    ASSERT_EQ(idc1, idc2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_edge_find_by_source_type) {
     int64_t ids[3];
     cbm_store_t *s = setup_store_with_nodes(3, ids);
@@ -478,10 +539,8 @@ TEST(store_edge_delete_by_project_preserves_others) {
     int64_t idC = cbm_store_upsert_node(s, &nc);
     int64_t idD = cbm_store_upsert_node(s, &nd);
 
-    cbm_edge_t e1 = {
-        .project = "alpha", .source_id = idA, .target_id = idB, .type = "CALLS"};
-    cbm_edge_t e2 = {
-        .project = "beta", .source_id = idC, .target_id = idD, .type = "CALLS"};
+    cbm_edge_t e1 = {.project = "alpha", .source_id = idA, .target_id = idB, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = "beta", .source_id = idC, .target_id = idD, .type = "CALLS"};
     cbm_store_insert_edge(s, &e1);
     cbm_store_insert_edge(s, &e2);
 
@@ -538,10 +597,7 @@ TEST(store_edge_long_type_string) {
     memset(long_type, 'X', 200);
     long_type[200] = '\0';
 
-    cbm_edge_t e = {.project = "test",
-                    .source_id = ids[0],
-                    .target_id = ids[1],
-                    .type = long_type};
+    cbm_edge_t e = {.project = "test", .source_id = ids[0], .target_id = ids[1], .type = long_type};
     int64_t eid = cbm_store_insert_edge(s, &e);
     ASSERT_GT(eid, 0);
 
@@ -581,6 +637,7 @@ TEST(store_edge_find_source_type_nonexistent) {
 SUITE(store_edges) {
     RUN_TEST(store_edge_insert_find);
     RUN_TEST(store_edge_dedup);
+    RUN_TEST(store_imports_edge_local_name_coexist);
     RUN_TEST(store_edge_find_by_source_type);
     RUN_TEST(store_edge_find_by_target_type);
     RUN_TEST(store_edge_find_by_type);

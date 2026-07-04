@@ -2441,11 +2441,11 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
 
     /* IS NULL / IS NOT NULL */
     if (strcmp(c->op, "IS NULL") == 0) {
-        result = (!actual || actual[0] == '\0');
+        result = (actual[0] == '\0');
         return c->negated ? !result : result;
     }
     if (strcmp(c->op, "IS NOT NULL") == 0) {
-        result = (actual && actual[0] != '\0');
+        result = (actual[0] != '\0');
         return c->negated ? !result : result;
     }
 

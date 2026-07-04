@@ -8,6 +8,7 @@
 src/foundation/compat_fs.c:popen:cbm_popen wrapper definition (POSIX)
 src/foundation/compat_fs.c:cbm_popen:cbm_popen function definition
 src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free subprocess execution
+src/foundation/subprocess.c:fork:cbm_run_posix — fork+execv for the crash/hang-isolating index worker (supervisor primitive; child execs immediately, no code runs in the forked image)
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────

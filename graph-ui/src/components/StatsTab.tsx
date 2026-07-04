@@ -378,21 +378,39 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
 /* ── Index Progress ─────────────────────────────────────── */
 
-function IndexProgress({ onDone }: { onDone: () => void }) {
+export function IndexProgress({ onDone }: { onDone: () => void }) {
   const t = useUiMessages();
-  const [jobs, setJobs] = useState<{ slot: number; status: string; path: string }[]>([]);
+  const [jobs, setJobs] = useState<{ slot: number; status: string; path: string; error?: string }[]>([]);
+  const [hasActive, setHasActive] = useState(true);
   useEffect(() => {
+    if (!hasActive) return;
     const poll = setInterval(async () => {
       try {
         const data = await (await fetch("/api/index-status")).json();
         setJobs(data);
-        if (data.length > 0 && data.every((j: { status: string }) => j.status !== "indexing")) onDone();
-      } catch { /* */ }
+        const stillIndexing = data.some((j: { status: string }) => j.status === "indexing");
+        /* Empty list = job not visible: the backend keeps finished jobs listed
+           as "done"/"error", so [] mid-index only happens on transient state
+           loss (e.g. server restart) — keep polling, don't treat as done. */
+        if (data.length > 0 && !stillIndexing) {
+          setHasActive(false);
+          const hasErrors = data.some((j: { status: string }) => j.status === "error");
+          if (!hasErrors) {
+            onDone();
+          }
+        }
+      } catch (error) {
+        console.error("[IndexProgress] Poll failed:", error);
+      }
     }, 2000);
     return () => clearInterval(poll);
-  }, [onDone]);
+  }, [onDone, hasActive]);
+
   const active = jobs.filter((j) => j.status === "indexing");
-  if (active.length === 0) return null;
+  const errors = jobs.filter((j) => j.status === "error");
+
+  if (active.length === 0 && errors.length === 0) return null;
+
   return (
     <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 mb-6">
       {active.map((j) => (
@@ -404,6 +422,26 @@ function IndexProgress({ onDone }: { onDone: () => void }) {
           </div>
         </div>
       ))}
+      {errors.map((j) => (
+        <div key={j.slot} className="flex items-start gap-3 mt-3 first:mt-0 p-3 rounded-lg border border-destructive/20 bg-destructive/5 text-destructive">
+          <span className="text-[14px]">⚠️</span>
+          <div className="flex-1 min-w-0">
+            <p className="text-[12px] font-semibold">{t.projects.indexingFailed}</p>
+            <p className="text-[11px] font-mono truncate">{j.path}</p>
+            {j.error && <p className="text-[10px] opacity-75 mt-1 font-mono">{j.error}</p>}
+          </div>
+        </div>
+      ))}
+      {errors.length > 0 && (
+        <div className="flex justify-end mt-3">
+          <button
+            onClick={onDone}
+            className="px-3 py-1 rounded bg-destructive/10 hover:bg-destructive/20 text-destructive text-[11px] font-medium transition-all"
+          >
+            {t.common.dismiss}
+          </button>
+        </div>
+      )}
     </div>
   );
 }

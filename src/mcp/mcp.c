@@ -54,12 +54,15 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include "mcp/index_supervisor.h"
 #include "foundation/str_util.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
 
 #ifdef _WIN32
+#include <direct.h>
+#include <io.h>
 #include <process.h>
 #define getpid _getpid
 #else
@@ -435,11 +438,15 @@ static const tool_def_t TOOLS[] = {
      "representative top_nodes, and the packages/edge_types that bind it) — use these to grasp "
      "the real architectural seams, which often cut across the folder layout. Optional path scopes "
      "analysis to nodes under that directory prefix (file_path).",
+     /* The aspects enum mirrors VALID_ASPECTS (see aspect_is_valid) — update both together. */
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
      "\"string\",\"description\":\"Optional directory prefix to scope architecture (e.g. "
      "apps/hoa)\"},"
-     "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
-     "}"},
+     "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"all\","
+     "\"overview\",\"structure\",\"dependencies\",\"routes\",\"languages\",\"packages\","
+     "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\"]},"
+     "\"description\":\"Aspects to include. 'all' = everything; 'overview' = compact summary "
+     "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}"},
 
     {"search_code", "Search code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
@@ -491,7 +498,8 @@ static const tool_def_t TOOLS[] = {
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
-     "\"object\"}},\"project\":{\"type\":"
+     "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
+     "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
 };
 
@@ -657,7 +665,7 @@ char *cbm_mcp_initialize_response(const char *params_json) {
 
     yyjson_mut_val *impl = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, impl, "name", "codebase-memory-mcp");
-    yyjson_mut_obj_add_str(doc, impl, "version", "0.10.0");
+    yyjson_mut_obj_add_str(doc, impl, "version", cbm_cli_get_version());
     yyjson_mut_obj_add_val(doc, root, "serverInfo", impl);
 
     yyjson_mut_val *caps = yyjson_mut_obj(doc);
@@ -720,6 +728,59 @@ char *cbm_mcp_get_string_arg(const char *args_json, const char *key) {
     return result;
 }
 
+static char *canonicalize_repo_path_if_exists(char *repo_path) {
+    if (!repo_path) {
+        return NULL;
+    }
+    bool root_syntax = true;
+    for (const char *p = repo_path; *p; p++) {
+        if (*p != '/' && *p != '\\' && *p != ':') {
+            root_syntax = false;
+            break;
+        }
+    }
+    if (root_syntax) {
+        return repo_path;
+    }
+
+    char real[CBM_SZ_4K];
+#ifdef _WIN32
+    if (_access(repo_path, 0) == 0 && _fullpath(real, repo_path, sizeof(real))) {
+        cbm_normalize_path_sep(real);
+        char *canonical = heap_strdup(real);
+        if (canonical) {
+            free(repo_path);
+            return canonical;
+        }
+    }
+#else
+    if (realpath(repo_path, real)) {
+        cbm_normalize_path_sep(real);
+        char *canonical = heap_strdup(real);
+        if (canonical) {
+            free(repo_path);
+            return canonical;
+        }
+    }
+#endif
+
+    return repo_path;
+}
+
+static char *normalize_project_arg(char *project) {
+    if (!project || (!strchr(project, '/') && !strchr(project, '\\'))) {
+        return project;
+    }
+
+    project = canonicalize_repo_path_if_exists(project);
+    char *normalized = cbm_project_name_from_path(project);
+    if (normalized) {
+        free(project);
+        return normalized;
+    }
+    return project;
+}
+
 /* Resolve the project argument, accepting the canonical "project" key plus the
  * aliases a caller naturally reaches for (#640): list_projects surfaces the
  * field as "name" and the not-found hint says "pass the project name", so
@@ -737,7 +798,7 @@ static char *get_project_arg(const char *args_json) {
     if (!p) {
         p = cbm_mcp_get_string_arg(args_json, "projectName");
     }
-    return p;
+    return normalize_project_arg(p);
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
@@ -1163,6 +1224,26 @@ static char *build_no_store_error(const char *project) {
         }                                                 \
     } while (0)
 
+static bool project_has_adr(cbm_store_t *store, const char *project, const char *root_path) {
+    if (store && project) {
+        cbm_adr_t adr;
+        memset(&adr, 0, sizeof(adr));
+        if (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK) {
+            cbm_store_adr_free(&adr);
+            return true;
+        }
+    }
+
+    if (!root_path) {
+        return false;
+    }
+
+    char adr_path[CBM_SZ_4K];
+    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", root_path);
+    struct stat adr_st;
+    return stat(adr_path, &adr_st) == 0;
+}
+
 /* ── Tool handler implementations ─────────────────────────────── */
 
 /* Return true if filename is a valid project .db file (not temp/internal).
@@ -1411,10 +1492,7 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     /* Check ADR presence */
     cbm_project_t proj_info = {0};
     if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
-        char adr_path[CBM_SZ_4K];
-        snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", proj_info.root_path);
-        struct stat adr_st;
-        bool adr_exists = (stat(adr_path, &adr_st) == 0);
+        bool adr_exists = project_has_adr(store, project, proj_info.root_path);
         yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
         if (!adr_exists) {
             yyjson_mut_obj_add_str(
@@ -2146,6 +2224,11 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     }
 
     cbm_pipeline_unlock();
+
+    if (srv->watcher) {
+        cbm_watcher_unwatch(srv->watcher, name);
+    }
+
     cbm_mem_collect(); /* return freed pages to OS after closing database */
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -2166,7 +2249,29 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
-/* Check if an aspect is requested (NULL aspects = all, or array contains "all" or the name). */
+/* Canonical list of valid aspect tokens for get_architecture. Single source
+ * of truth for the server-side validation (authoritative); the JSON-Schema
+ * enum in the TOOLS entry above is the advisory client-side mirror — update
+ * both together when the aspect set changes. */
+static const char *VALID_ASPECTS[] = {
+    "all",          "overview", "structure",  "dependencies", "routes",    "languages", "packages",
+    "entry_points", "hotspots", "boundaries", "layers",       "file_tree", "clusters",  NULL};
+
+static bool aspect_is_valid(const char *name) {
+    if (!name) {
+        return false;
+    }
+    for (int i = 0; VALID_ASPECTS[i]; i++) {
+        if (strcmp(name, VALID_ASPECTS[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Check if an aspect is requested. NULL aspects = all. The array can contain
+ * "all" (everything), "overview" (everything except file_tree — see
+ * cbm_store_arch_aspect_in_overview in store.c), or the aspect name itself. */
 static bool aspect_wanted(yyjson_doc *aspects_doc, yyjson_val *aspects_arr, const char *name) {
     if (!aspects_arr) {
         return true; /* no filter = all */
@@ -2176,7 +2281,16 @@ static bool aspect_wanted(yyjson_doc *aspects_doc, yyjson_val *aspects_arr, cons
     yyjson_val *val;
     while ((val = yyjson_arr_iter_next(&iter)) != NULL) {
         const char *s = yyjson_get_str(val);
-        if (s && (strcmp(s, "all") == 0 || strcmp(s, name) == 0)) {
+        if (!s) {
+            continue;
+        }
+        if (strcmp(s, "all") == 0) {
+            return true;
+        }
+        if (strcmp(s, "overview") == 0 && cbm_store_arch_aspect_in_overview(name)) {
+            return true;
+        }
+        if (strcmp(s, name) == 0) {
             return true;
         }
     }
@@ -2250,6 +2364,35 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             if (s && aspects_strs_count < MCP_COL_16) {
                 aspects_strs[aspects_strs_count++] = s;
             }
+        }
+    }
+
+    /* Server-side validation: reject unknown aspect tokens with an isError
+     * result listing the valid values. The JSON-Schema enum is advisory —
+     * many MCP clients do not validate arguments against tool schemas — so
+     * without this check a typo degraded to a silent near-empty payload. */
+    for (int i = 0; i < aspects_strs_count; i++) {
+        if (!aspect_is_valid(aspects_strs[i])) {
+            char valid_list[CBM_SZ_256];
+            size_t off = 0;
+            for (int j = 0; VALID_ASPECTS[j] && off < sizeof(valid_list); j++) {
+                int n = snprintf(valid_list + off, sizeof(valid_list) - off, "%s%s",
+                                 j > 0 ? ", " : "", VALID_ASPECTS[j]);
+                if (n < 0) {
+                    break;
+                }
+                off += (size_t)n;
+            }
+            char msg[CBM_SZ_512];
+            snprintf(msg, sizeof(msg), "Unknown aspect '%s'. Valid: %s.", aspects_strs[i],
+                     valid_list);
+            char *err = cbm_mcp_text_result(msg, true);
+            free(project);
+            free(scope_path);
+            if (aspects_doc) {
+                yyjson_doc_free(aspects_doc);
+            }
+            return err;
         }
     }
 
@@ -3134,13 +3277,96 @@ static void add_excluded_summary(yyjson_mut_doc *doc, yyjson_mut_val *root, char
     yyjson_mut_obj_add_val(doc, root, "excluded", excluded);
 }
 
+/* Cap on per-file skips embedded in the JSON response — keep it compact on
+ * large repos. The FULL, uncapped list always goes to the per-run logfile;
+ * the JSON carries "count" + "truncated" so nothing is silently hidden. */
+enum { INDEX_SKIPPED_FILE_CAP = 50 };
+
+/* Attach a summary of per-file skips (Stage 2 / Track B). Always emits a
+ * top-level "skipped_count" (0 on clean runs) so consumers can rely on it.
+ * When there are skips, also emits:
+ *   "skipped": {"files":[{path,reason,phase}..(<=50)], "count":N, "truncated":bool}
+ * and, if a per-run logfile was written, "logfile": "<path>".
+ * The run status stays "indexed" — a skipped file is the expected handled
+ * outcome, not a failure. errs[] is borrowed (copied into doc). */
+static void add_skipped_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                const cbm_file_error_t *errs, int count, const char *logfile) {
+    yyjson_mut_obj_add_int(doc, root, "skipped_count", count < 0 ? 0 : count);
+    if (!errs || count <= 0) {
+        return;
+    }
+    yyjson_mut_val *skipped = yyjson_mut_obj(doc);
+    yyjson_mut_val *files = yyjson_mut_arr(doc);
+    int shown = count < INDEX_SKIPPED_FILE_CAP ? count : INDEX_SKIPPED_FILE_CAP;
+    for (int i = 0; i < shown; i++) {
+        yyjson_mut_val *fe = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, fe, "path", errs[i].path ? errs[i].path : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "reason", errs[i].reason ? errs[i].reason : "");
+        yyjson_mut_obj_add_strcpy(doc, fe, "phase", errs[i].phase ? errs[i].phase : "");
+        yyjson_mut_arr_add_val(files, fe);
+    }
+    yyjson_mut_obj_add_val(doc, skipped, "files", files);
+    yyjson_mut_obj_add_int(doc, skipped, "count", count);
+    yyjson_mut_obj_add_bool(doc, skipped, "truncated", count > INDEX_SKIPPED_FILE_CAP);
+    yyjson_mut_obj_add_val(doc, root, "skipped", skipped);
+    if (logfile && logfile[0]) {
+        yyjson_mut_obj_add_strcpy(doc, root, "logfile", logfile);
+    }
+}
+
+/* Write the FULL (uncapped) skip list to a per-run logfile — ONLY when >=1 file
+ * was skipped (no logfile on a clean run). Location:
+ *   $CBM_INDEX_LOG (override) else <cache_dir>/logs/<project>-<epoch>.log
+ * Returns true and fills out_path on success. */
+static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs, int count,
+                               char *out_path, size_t out_sz) {
+    if (!errs || count <= 0) {
+        return false;
+    }
+    char path[CBM_SZ_1K];
+    const char *override = getenv("CBM_INDEX_LOG");
+    if (override && override[0]) {
+        snprintf(path, sizeof(path), "%s", override);
+    } else {
+        const char *cdir = cbm_resolve_cache_dir();
+        if (!cdir) {
+            return false;
+        }
+        char logdir[CBM_SZ_1K];
+        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        cbm_mkdir_p(logdir, 0755);
+        snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
+                 (long long)time(NULL));
+    }
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        cbm_log_warn("index.logfile_open_fail", "path", path);
+        return false;
+    }
+    (void)fprintf(f, "# codebase-memory-mcp index skip report\n");
+    (void)fprintf(f, "# project=%s skipped=%d\n", project ? project : "", count);
+    (void)fprintf(f, "# columns: phase\treason\tpath\n");
+    for (int i = 0; i < count; i++) {
+        (void)fprintf(f, "%s\t%s\t%s\n", errs[i].phase ? errs[i].phase : "",
+                      errs[i].reason ? errs[i].reason : "", errs[i].path ? errs[i].path : "");
+    }
+    (void)fclose(f);
+    if (out_path && out_sz) {
+        snprintf(out_path, out_sz, "%s", path);
+    }
+    return true;
+}
+
 /* Build the success portion of the index_repository response.
  * Returns true when status should be "degraded" (#334 plausibility gate). */
 static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
                                          yyjson_mut_val *root, const char *project_name,
                                          const char *repo_path, bool persistence, cbm_pipeline_t *p,
-                                         char **excluded_dirs, int excluded_count) {
+                                         char **excluded_dirs, int excluded_count,
+                                         const cbm_file_error_t *file_errors, int file_error_count,
+                                         const char *logfile) {
     add_excluded_summary(doc, root, excluded_dirs, excluded_count);
+    add_skipped_summary(doc, root, file_errors, file_error_count, logfile);
 
     int exp_nodes = -1;
     int exp_edges = -1;
@@ -3204,17 +3430,14 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
         }
     }
 
-    char adr_path[CBM_SZ_4K];
-    snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md", repo_path);
-    struct stat adr_st;
-    bool adr_exists = (stat(adr_path, &adr_st) == 0);
+    bool adr_exists = project_has_adr(store, project_name, repo_path);
     yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
     if (!adr_exists && !degraded) {
         yyjson_mut_obj_add_str(
             doc, root, "adr_hint",
             "Project indexed. Consider creating an Architecture Decision Record: "
             "explore the codebase with get_architecture(aspects=['all']), then use "
-            "manage_adr(mode='store') to persist architectural insights across sessions.");
+            "manage_adr(mode='update') to persist architectural insights across sessions.");
     }
 
     bool has_artifact = cbm_artifact_exists(repo_path);
@@ -3228,7 +3451,253 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
     return degraded;
 }
 
+/* Build the response for a worker that crashed/hung/failed without producing a
+ * result. The crash is already contained (this process survived); we report it
+ * rather than dying. Precise skip-and-continue (quarantine the culprit, index the
+ * rest) is layered on in the probe stage. */
+static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t outcome) {
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "status", "error");
+    yyjson_mut_obj_add_str(doc, root, "outcome", cbm_proc_outcome_str(outcome));
+    yyjson_mut_obj_add_str(
+        doc, root, "hint",
+        outcome == CBM_PROC_HANG
+            ? "Indexing worker timed out (a file made no progress). The worker was "
+              "terminated and the server survived. Re-run to retry."
+            : "Indexing worker crashed on a file. The crash was contained (the server "
+              "survived). Re-run to retry; a future release isolates the culprit file.");
+    if (repo_path) {
+        yyjson_mut_obj_add_strcpy(doc, root, "repo_path", repo_path);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(repo_path);
+    char *result = cbm_mcp_text_result(json, true);
+    free(json);
+    return result;
+}
+
+/* Drop the cached store so the next query reopens whatever the worker wrote (each
+ * worker is a fresh process that deletes + recreates the .db). */
+static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+        srv->store = NULL;
+    }
+    free(srv->current_project);
+    srv->current_project = NULL;
+}
+
+/* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
+ * (falls back to the CWD if the cache dir is unresolvable). Used for the crash-
+ * attribution marker and the quarantine list during the recovery re-run. */
+static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
+    const char *cdir = cbm_resolve_cache_dir();
+    if (cdir && cdir[0]) {
+        char logdir[CBM_SZ_1K];
+        snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
+        cbm_mkdir_p(logdir, 0755);
+        snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
+    } else {
+        snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
+    }
+}
+
+/* Read the single-line crash marker (the rel_path the worker was processing when
+ * it died). Returns a trimmed heap string (caller frees), or NULL when the marker
+ * is empty/unreadable (i.e. the crash could not be attributed to a file). */
+static char *supervisor_read_marker(const char *path) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    char buf[CBM_SZ_1K];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    (void)fclose(f);
+    buf[n] = '\0';
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r' || buf[len - 1] == ' ')) {
+        buf[--len] = '\0';
+    }
+    return len > 0 ? cbm_strdup(buf) : NULL;
+}
+
+/* Append one quarantine entry "rel\tphase\n" (phase = "crash"|"hang") to the
+ * quarantine list. The worker's loader parses this back and reports the skip's
+ * phase in skipped[]; a bare "rel" line is still tolerated there (defaults crash). */
+static bool supervisor_append_quarantine(const char *path, const char *rel, const char *phase) {
+    FILE *f = cbm_fopen(path, "ab");
+    if (!f) {
+        return false;
+    }
+    (void)fprintf(f, "%s\t%s\n", rel, phase);
+    (void)fclose(f);
+    return true;
+}
+
+/* Run index_repository in a supervised worker subprocess with skip-and-continue
+ * (Stage 3c). Returns the response string (caller frees):
+ *   - the worker's own response on a clean first run (the common path);
+ *   - after a crash/hang, the response from a clean single-threaded RECOVERY run
+ *     that quarantines the culprit file(s) — status="indexed" with them listed in
+ *     skipped[] as phase="crash"/"hang", and the good files indexed;
+ *   - a best-effort PARTIAL index (one final quarantine-only run) if the recovery
+ *     loop cannot converge but at least one file was quarantined;
+ *   - a contained-failure response only if even that cannot produce a clean run.
+ * Returns NULL only when the worker could not be spawned at all, so the caller
+ * degrades to the in-process path. */
+static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
+    supervisor_invalidate_store(srv);
+
+    /* First attempt: normal parallel run. */
+    cbm_index_worker_result_t wr;
+    int rc = cbm_index_spawn_worker(args, false, NULL, NULL, &wr);
+
+    if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        return NULL; /* degrade to in-process */
+    }
+    if (wr.outcome == CBM_PROC_CLEAN) {
+        /* Clean exit → transfer the worker's response (the common path). If the
+         * worker exited clean but wrote no response (a degenerate case, e.g. a
+         * self binary that does not act as an index worker), resp is NULL and the
+         * caller degrades to the in-process path — a clean run never needs the
+         * crash-recovery loop. */
+        char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
+        wr.response = NULL;
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        return resp;
+    }
+
+    /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the worker
+     * single-threaded with a per-file marker; each time it crashes/hangs the
+     * marker names the exact crasher, which we append to the quarantine file
+     * before re-spawning. A clean single-threaded run then indexes the good files
+     * and reports the quarantined ones as phase="crash" skips (via the ordinary
+     * Stage-2 skip plumbing — no JSON merge needed). */
+    cbm_proc_outcome_t last_outcome = wr.outcome;
+    cbm_index_worker_result_free(&wr);
+
+    char marker_path[CBM_SZ_1K];
+    char quarantine_path[CBM_SZ_1K];
+    supervisor_tmp_path(marker_path, sizeof(marker_path), ".marker");
+    supervisor_tmp_path(quarantine_path, sizeof(quarantine_path), ".quarantine");
+    (void)remove(marker_path);
+    /* Start the quarantine list empty (truncate any stale file). */
+    FILE *qinit = cbm_fopen(quarantine_path, "wb");
+    if (qinit) {
+        (void)fclose(qinit);
+    }
+
+    int cap = 100;
+    const char *cap_env = getenv("CBM_INDEX_MAX_RESTARTS");
+    if (cap_env && cap_env[0]) {
+        int v = atoi(cap_env);
+        if (v > 0) {
+            cap = v;
+        }
+    }
+
+    char *resp = NULL;
+    int quarantined = 0; /* files pinned + added to the quarantine list so far */
+    for (int i = 0; i < cap; i++) {
+        cbm_index_worker_result_t wr2;
+        int rc2 = cbm_index_spawn_worker(args, true, marker_path, quarantine_path, &wr2);
+        if (rc2 != 0) {
+            last_outcome = wr2.outcome;
+            cbm_index_worker_result_free(&wr2);
+            break; /* spawn failed mid-recovery — give up */
+        }
+        if (wr2.outcome == CBM_PROC_CLEAN && wr2.response) {
+            resp = wr2.response; /* transfer ownership to caller */
+            wr2.response = NULL;
+            cbm_index_worker_result_free(&wr2);
+            break; /* good files indexed; quarantined files reported as crash/hang */
+        }
+        if (wr2.outcome == CBM_PROC_CRASH || wr2.outcome == CBM_PROC_HANG) {
+            last_outcome = wr2.outcome;
+            cbm_index_worker_result_free(&wr2);
+            /* crash vs hang: the phase this file is quarantined under and reported
+             * as in skipped[]. A fault signal → "crash"; a no-progress kill →
+             * "hang". */
+            const char *phase = (last_outcome == CBM_PROC_HANG) ? "hang" : "crash";
+            /* Attribute the failure to the file the marker pinned and quarantine it.
+             * If the marker is empty/unreadable we cannot attribute it to a single
+             * file → stop and report a contained failure. */
+            char *crasher = supervisor_read_marker(marker_path);
+            if (!crasher) {
+                cbm_log_warn("index.supervisor.unattributable", "action", "give_up");
+                break;
+            }
+            if (!supervisor_append_quarantine(quarantine_path, crasher, phase)) {
+                cbm_log_warn("index.supervisor.quarantine_write_fail", "path", crasher);
+                free(crasher);
+                break;
+            }
+            quarantined++;
+            char attempt_buf[MCP_FIELD_SIZE];
+            snprintf(attempt_buf, sizeof(attempt_buf), "%d", i + 1);
+            cbm_log_warn("index.file_quarantined", "path", crasher, "outcome", phase, "attempt",
+                         attempt_buf);
+            free(crasher);
+            (void)remove(marker_path); /* fresh marker for the next re-run */
+            continue;
+        }
+        /* SPAWN_FAILED / nonzero exit / non-fault kill → not a crash we can
+         * attribute; stop and report a contained failure. */
+        last_outcome = wr2.outcome;
+        cbm_index_worker_result_free(&wr2);
+        break;
+    }
+
+    (void)remove(marker_path); /* marker no longer needed */
+
+    /* Terminal best-effort-partial: the loop exited WITHOUT a clean run (cap
+     * exhausted, or an unattributable failure) but at least one file was already
+     * quarantined. Try ONE final single-threaded spawn with the accumulated
+     * quarantine and NO marker — every known-bad file short-circuits, so a clean
+     * run yields a PARTIAL index (all good files indexed, all known crashers/hangs
+     * reported as skips) rather than a hard failure. Bounded by the same quiet-
+     * timeout, so it cannot itself hang. Rare given monotonic progress. */
+    if (!resp && quarantined > 0) {
+        cbm_index_worker_result_t wrp;
+        int rcp = cbm_index_spawn_worker(args, true, NULL, quarantine_path, &wrp);
+        if (rcp == 0 && wrp.outcome == CBM_PROC_CLEAN && wrp.response) {
+            resp = wrp.response; /* transfer ownership to caller */
+            wrp.response = NULL;
+            char qn[MCP_FIELD_SIZE];
+            snprintf(qn, sizeof(qn), "%d", quarantined);
+            cbm_log_error("index.supervisor.partial", "quarantined", qn, "outcome",
+                          cbm_proc_outcome_str(last_outcome));
+        }
+        cbm_index_worker_result_free(&wrp);
+    }
+
+    (void)remove(quarantine_path);
+    supervisor_invalidate_store(srv);
+
+    if (resp) {
+        return resp;
+    }
+    return build_worker_failure_response(args, last_outcome);
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
+     * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
+     * is set. On spawn failure, fall through to the in-process path (degrade). */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *supervised = index_run_supervised(srv, args);
+        if (supervised) {
+            return supervised;
+        }
+    }
+
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
@@ -3239,6 +3708,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(name_override);
         return cbm_mcp_text_result("repo_path is required", true);
     }
+
+    repo_path = canonicalize_repo_path_if_exists(repo_path);
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
@@ -3302,6 +3773,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     int excluded_count = 0;
     cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
 
+    /* Capture the per-file skip list (Stage 2 / Track B) while the pipeline
+     * still owns the strings; the response builder copies them into the doc. */
+    cbm_file_error_t *file_errors = NULL;
+    int file_error_count = 0;
+    cbm_pipeline_get_file_errors(p, &file_errors, &file_error_count);
+
     cbm_mem_collect(); /* return mimalloc pages to OS after large indexing */
 
     /* Invalidate cached store so next query reopens the fresh database */
@@ -3319,8 +3796,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "project", project_name);
 
     if (rc == 0) {
-        bool degraded = build_index_success_response(srv, doc, root, project_name, repo_path,
-                                                     persistence, p, excluded_dirs, excluded_count);
+        /* Write the per-run logfile ONLY when there were skips (no logfile on a
+         * clean run). The FULL list goes to the file; the JSON caps at 50. */
+        char logfile_path[CBM_SZ_1K];
+        logfile_path[0] = '\0';
+        bool has_logfile = write_skip_logfile(project_name, file_errors, file_error_count,
+                                              logfile_path, sizeof(logfile_path));
+        bool degraded = build_index_success_response(
+            srv, doc, root, project_name, repo_path, persistence, p, excluded_dirs, excluded_count,
+            file_errors, file_error_count, has_logfile ? logfile_path : NULL);
         yyjson_mut_obj_add_str(doc, root, "status", degraded ? "degraded" : "indexed");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
@@ -4262,9 +4746,19 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
     }
 }
 
-/* Write indexed file list for scoped grep. Returns true if scoped. */
+/* Write indexed file list for scoped grep. Returns true if scoped.
+ * When a path_filter is provided, apply it here — before grep — so large
+ * indexed projects do not scan files only for collect_grep_matches to discard
+ * them later. The predicate is IDENTICAL to the post-grep filter: the same
+ * compiled regex run against the same root-relative path (separators
+ * normalized on Windows first), so prefiltering can only skip files whose
+ * hits would be dropped anyway — results-preserving by construction.
+ * *out_written receives the number of records written (0 = the filter
+ * excluded every indexed file). */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  const char *filelist) {
+                                  const char *filelist, bool has_path_filter,
+                                  cbm_regex_t *path_regex, int *out_written) {
+    *out_written = 0;
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
         return false;
@@ -4277,8 +4771,17 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
     }
     FILE *fl = fopen(filelist, "wb");
     bool ok = false;
+    int written = 0;
     if (fl) {
         for (int fi = 0; fi < indexed_count; fi++) {
+            if (has_path_filter && path_regex) {
+#ifdef _WIN32
+                cbm_normalize_path_sep(indexed_files[fi]);
+#endif
+                if (cbm_regexec(path_regex, indexed_files[fi], 0, NULL, 0) != CBM_REG_OK) {
+                    continue;
+                }
+            }
             /* Write "<root>/<file>" piece-by-piece (no fixed-size buffer, so an
              * arbitrarily long absolute path cannot overflow). Forward slash join
              * so xargs doesn't treat Windows backslashes as escapes; binary mode
@@ -4295,6 +4798,7 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
 #else
             (void)fputc('\0', fl);
 #endif
+            written++;
         }
         (void)fclose(fl);
         ok = true;
@@ -4303,6 +4807,7 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
         free(indexed_files[fi]);
     }
     free(indexed_files);
+    *out_written = written;
     return ok;
 }
 
@@ -4526,33 +5031,47 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     char filelist[CBM_SZ_256];
     snprintf(filelist, sizeof(filelist), "%s.files", tmpfile);
     bool scoped = false;
+    int scoped_written = 0;
 
-    scoped = write_scoped_filelist(srv, project, root_path, filelist);
+    scoped = write_scoped_filelist(srv, project, root_path, filelist, has_path_filter,
+                                   has_path_filter ? &path_regex : NULL, &scoped_written);
 
-    char cmd[CBM_SZ_4K];
-    build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
+    /* Collect grep matches into array */
+    int gm_count = 0;
+    grep_match_t *gm = NULL;
+    if (scoped && scoped_written == 0) {
+        /* The path_filter excluded every indexed file — nothing to scan.
+         * Skip the grep subprocess: xargs on an empty filelist is
+         * platform-dependent (GNU execs grep once with no operands, BSD
+         * skips), and the post-grep filter would drop every hit anyway. */
+        gm = malloc(sizeof(grep_match_t)); /* empty set; freed below */
+        cbm_unlink(tmpfile);
+        cbm_unlink(filelist);
+    } else {
+        char cmd[CBM_SZ_4K];
+        build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist,
+                       root_path);
 
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+        FILE *fp = cbm_popen(cmd, "r");
+        if (!fp) {
+            cbm_unlink(tmpfile);
+            if (scoped) {
+                cbm_unlink(filelist);
+            }
+            free(root_path);
+            free(pattern);
+            free(project);
+            free(file_pattern);
+            return cbm_mcp_text_result("search failed", true);
+        }
+
+        gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter, &path_regex,
+                                  grep_limit, &gm_count);
+        cbm_pclose(fp);
         cbm_unlink(tmpfile);
         if (scoped) {
             cbm_unlink(filelist);
         }
-        free(root_path);
-        free(pattern);
-        free(project);
-        free(file_pattern);
-        return cbm_mcp_text_result("search failed", true);
-    }
-
-    /* Collect grep matches into array */
-    int gm_count = 0;
-    grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
-                                            &path_regex, grep_limit, &gm_count);
-    cbm_pclose(fp);
-    cbm_unlink(tmpfile);
-    if (scoped) {
-        cbm_unlink(filelist);
     }
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
@@ -4678,10 +5197,13 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
+        char *err = build_no_store_error(project);
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
         free(project);
         free(base_branch);
         free(scope);
-        return cbm_mcp_text_result("project not found", true);
+        return res;
     }
 
     if (!validate_search_path_arg(root_path)) {
@@ -4896,10 +5418,13 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
      * the UI are visible to each other (#256). */
     cbm_store_t *resolved = resolve_store(srv, project);
     if (!resolved) {
+        char *err = build_no_store_error(project);
+        char *res = cbm_mcp_text_result(err, true);
+        free(err);
         free(project);
         free(mode_str);
         free(content);
-        return cbm_mcp_text_result("project not found", true);
+        return res;
     }
 
     /* resolve_store opens file-backed projects READ-ONLY (query stores must
@@ -4915,10 +5440,13 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if (resolved_db_path) {
         owned_rw = cbm_store_open_path(resolved_db_path);
         if (!owned_rw) {
+            char *err = build_no_store_error(project);
+            char *res = cbm_mcp_text_result(err, true);
+            free(err);
             free(project);
             free(mode_str);
             free(content);
-            return cbm_mcp_text_result("project not found", true);
+            return res;
         }
         store = owned_rw;
     }
@@ -5467,8 +5995,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
     /* Phase 2: peek FILE* buffer */
     int saved_flags = fcntl(fd, F_GETFL);
     if (saved_flags < 0) {
-        /* fcntl failed — fall through to blocking poll */
-        pr = poll(&pfd, SKIP_ONE, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
+        /* fcntl failed — fall through to a short blocking poll (see the Phase-3
+         * note below on why the interval is bounded, not the full idle timeout) */
+        pr = poll(&pfd, SKIP_ONE, MCP_TIMEOUT_MS);
         if (pr < 0) {
             return CBM_NOT_FOUND;
         }
@@ -5488,8 +6017,15 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
             return CBM_NOT_FOUND; /* true EOF */
         }
         clearerr(in);
-        /* Phase 3: blocking poll */
-        pr = poll(&pfd, SKIP_ONE, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
+        /* Phase 3: blocking poll, bounded to a SHORT interval (not the full idle
+         * timeout). macOS poll()/select() do NOT report POLLIN/POLLHUP when a
+         * FIFO's last writer closes — only read() returns 0 there (verified). A
+         * 60s poll would therefore leave the server blocked up to a full idle
+         * timeout after stdin EOF (a client that closes the pipe would appear to
+         * hang). Waking every MCP_TIMEOUT_MS lets the Phase-2 read() above detect
+         * the EOF within ~1s. Idle-store eviction (threshold STORE_IDLE_TIMEOUT_S)
+         * is idempotent, so checking it on each short tick is harmless. */
+        pr = poll(&pfd, SKIP_ONE, MCP_TIMEOUT_MS);
         if (pr < 0) {
             return CBM_NOT_FOUND;
         }

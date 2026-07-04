@@ -333,6 +333,12 @@ bool cbm_store_arch_path_scoped(const char *path);
 /* When scoped, writes normalized directory prefix into norm_out. Returns false if unscoped. */
 bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz);
 
+/* True when architecture aspect `name` belongs to the "overview" subset:
+ * every aspect EXCEPT the large per-file listing (file_tree). Shared by both
+ * aspect gates — want_aspect (store.c) and aspect_wanted (mcp.c) — so the
+ * two sites cannot drift. */
+bool cbm_store_arch_aspect_in_overview(const char *name);
+
 /* Delete all nodes for a project (cascade deletes edges). */
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project);
 
