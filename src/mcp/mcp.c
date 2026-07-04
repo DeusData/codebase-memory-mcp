@@ -979,15 +979,17 @@ static const tool_def_t TOOLS[] = {
 
     {"query_graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
-     "aggregations, and cross-service analysis. Output is capped by default (configurable via "
-     "query_max_output_bytes config key). Set max_output_bytes=0 for unlimited or add LIMIT. "
+     "aggregations, and cross-service analysis. Row scan and output bytes are capped by default "
+     "(config keys query_max_rows and query_max_output_bytes). Set max_output_bytes=0 for "
+     "unlimited output bytes or add LIMIT. "
      "Dependency sub-project symbols (proj.dep.*) are tagged source:dependency; to rank your own "
      "project's symbols above them, ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to "
      "use the MCP server project derived from server CWD.\"},\"max_rows\":{\"type\":\"integer\","
-     "\"description\":\"Scan-level row limit (default: unlimited). Note: limits nodes scanned, "
-     "not rows returned. For output size, use max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
+     "\"description\":\"Scan-level row limit. Omit to use query_max_rows config. Set 0 to use "
+     "the implementation ceiling. Note: limits nodes scanned, not rows returned. For output size, "
+     "use max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
      "\"integer\",\"description\":\"Max response size in bytes (configurable via "
      "query_max_output_bytes config key). Set to 0 for unlimited. When exceeded, returns "
      "truncated=true with total_bytes and hint to add LIMIT.\"}},\"required\":[\"query\"]}"},
@@ -4532,7 +4534,10 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
-    int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
+    int cfg_max_rows = cbm_config_get_int(srv->config, CBM_CONFIG_QUERY_MAX_ROWS,
+                                          CBM_DEFAULT_QUERY_MAX_ROWS);
+    int max_rows = cbm_mcp_has_arg(args, "max_rows") ? cbm_mcp_get_int_arg(args, "max_rows", 0)
+                                                     : cfg_max_rows;
     int cfg_max_output = cbm_config_get_int(srv->config, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES,
                                             CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
     int max_output_bytes = cbm_mcp_get_int_arg(args, "max_output_bytes", cfg_max_output);
