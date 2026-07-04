@@ -7847,6 +7847,112 @@ int cbm_store_count_edges_scoped(cbm_store_t *s, const char *project, const char
     return count;
 }
 
+static int schema_collect_label_counts_from_stmt(cbm_store_t *s, sqlite3_stmt *stmt,
+                                                 cbm_schema_info_t *out,
+                                                 const char *error_context) {
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    cbm_label_count_t *arr = malloc((size_t)cap * sizeof(cbm_label_count_t));
+    if (!arr) {
+        store_set_error(s, "schema label counts out of memory");
+        return CBM_NOT_FOUND;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            int new_cap = cap * ST_GROWTH;
+            void *tmp = realloc(arr, (size_t)new_cap * sizeof(cbm_label_count_t));
+            if (!tmp) {
+                for (int i = 0; i < n; i++) {
+                    safe_str_free(&arr[i].label);
+                }
+                free(arr);
+                store_set_error(s, "schema label counts out of memory");
+                return CBM_NOT_FOUND;
+            }
+            arr = tmp;
+            cap = new_cap;
+        }
+        arr[n].label = heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        if (!arr[n].label) {
+            for (int i = 0; i < n; i++) {
+                safe_str_free(&arr[i].label);
+            }
+            free(arr);
+            store_set_error(s, "schema label counts out of memory");
+            return CBM_NOT_FOUND;
+        }
+        arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
+        arr[n].properties = NULL;
+        arr[n].property_count = 0;
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        for (int i = 0; i < n; i++) {
+            safe_str_free(&arr[i].label);
+        }
+        free(arr);
+        store_set_error_sqlite(s, error_context ? error_context : "schema label counts");
+        return CBM_NOT_FOUND;
+    }
+    out->node_labels = arr;
+    out->node_label_count = n;
+    return CBM_STORE_OK;
+}
+
+static int schema_collect_type_counts_from_stmt(cbm_store_t *s, sqlite3_stmt *stmt,
+                                                cbm_schema_info_t *out,
+                                                const char *error_context) {
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    cbm_type_count_t *arr = malloc((size_t)cap * sizeof(cbm_type_count_t));
+    if (!arr) {
+        store_set_error(s, "schema edge type counts out of memory");
+        return CBM_NOT_FOUND;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            int new_cap = cap * ST_GROWTH;
+            void *tmp = realloc(arr, (size_t)new_cap * sizeof(cbm_type_count_t));
+            if (!tmp) {
+                for (int i = 0; i < n; i++) {
+                    safe_str_free(&arr[i].type);
+                }
+                free(arr);
+                store_set_error(s, "schema edge type counts out of memory");
+                return CBM_NOT_FOUND;
+            }
+            arr = tmp;
+            cap = new_cap;
+        }
+        arr[n].type = heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        if (!arr[n].type) {
+            for (int i = 0; i < n; i++) {
+                safe_str_free(&arr[i].type);
+            }
+            free(arr);
+            store_set_error(s, "schema edge type counts out of memory");
+            return CBM_NOT_FOUND;
+        }
+        arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
+        arr[n].properties = NULL;
+        arr[n].property_count = 0;
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        for (int i = 0; i < n; i++) {
+            safe_str_free(&arr[i].type);
+        }
+        free(arr);
+        store_set_error_sqlite(s, error_context ? error_context : "schema edge type counts");
+        return CBM_NOT_FOUND;
+    }
+    out->edge_types = arr;
+    out->edge_type_count = n;
+    return CBM_STORE_OK;
+}
+
 /* with_props=false skips the per-label/per-type JSON property-key discovery:
  * those json_each() scans walk EVERY row of each label/type (minutes-scale on
  * multi-million-node graphs) and get_architecture only needs the counts. */
@@ -7870,37 +7976,11 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
         }
         bind_text(stmt, SKIP_ONE, project);
 
-        int cap = ST_INIT_CAP_8;
-        int n = 0;
-        cbm_label_count_t *arr = malloc(cap * sizeof(cbm_label_count_t));
-        if (!arr) {
-            sqlite3_finalize(stmt);
-            return CBM_NOT_FOUND;
-        }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            if (n >= cap) {
-                int new_cap = cap * ST_GROWTH;
-                void *tmp = realloc(arr, new_cap * sizeof(cbm_label_count_t));
-                if (!tmp) {
-                    for (int i = 0; i < n; i++) {
-                        safe_str_free(&arr[i].label);
-                    }
-                    free(arr);
-                    sqlite3_finalize(stmt);
-                    return CBM_NOT_FOUND;
-                }
-                arr = tmp;
-                cap = new_cap;
-            }
-            arr[n].label = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-            arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
-            arr[n].properties = NULL;
-            arr[n].property_count = 0;
-            n++;
-        }
+        int rc = schema_collect_label_counts_from_stmt(s, stmt, out, "schema labels");
         sqlite3_finalize(stmt);
-        out->node_labels = arr;
-        out->node_label_count = n;
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
     }
 
     /* Node label property keys: base columns + distinct JSON property keys per label */
@@ -7936,39 +8016,12 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
         }
         bind_text(stmt, SKIP_ONE, project);
 
-        int cap = ST_INIT_CAP_8;
-        int n = 0;
-        cbm_type_count_t *arr = malloc(cap * sizeof(cbm_type_count_t));
-        if (!arr) {
-            sqlite3_finalize(stmt);
-            cbm_store_schema_free(out);
-            return CBM_NOT_FOUND;
-        }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            if (n >= cap) {
-                int new_cap = cap * ST_GROWTH;
-                void *tmp = realloc(arr, new_cap * sizeof(cbm_type_count_t));
-                if (!tmp) {
-                    for (int i = 0; i < n; i++) {
-                        safe_str_free(&arr[i].type);
-                    }
-                    free(arr);
-                    sqlite3_finalize(stmt);
-                    cbm_store_schema_free(out);
-                    return CBM_NOT_FOUND;
-                }
-                arr = tmp;
-                cap = new_cap;
-            }
-            arr[n].type = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-            arr[n].count = sqlite3_column_int(stmt, SKIP_ONE);
-            arr[n].properties = NULL;
-            arr[n].property_count = 0;
-            n++;
-        }
+        int rc = schema_collect_type_counts_from_stmt(s, stmt, out, "schema edge types");
         sqlite3_finalize(stmt);
-        out->edge_types = arr;
-        out->edge_type_count = n;
+        if (rc != CBM_STORE_OK) {
+            cbm_store_schema_free(out);
+            return rc;
+        }
     }
 
     /* Edge type property keys: base columns + distinct JSON property keys per type */
@@ -7998,6 +8051,80 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
 
 int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_info_t *out) {
     return get_schema_impl(s, project, out, false);
+}
+
+int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project,
+                                             cbm_schema_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project || !project[0]) {
+        return CBM_NOT_FOUND;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "schema_overlay active CTE SQL truncated");
+        return CBM_NOT_FOUND;
+    }
+
+    char sql[ST_SQL_BUF];
+    int nsql = snprintf(sql, sizeof(sql),
+                        "%s"
+                        "SELECT label, COUNT(*) FROM active_nodes "
+                        "WHERE project = ?3 GROUP BY label ORDER BY COUNT(*) DESC, label ASC;",
+                        active_cte);
+    if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+        store_set_error(s, "schema_overlay label SQL truncated");
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        store_set_error_sqlite(s, "schema_overlay labels prepare");
+        return CBM_NOT_FOUND;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    int rc = schema_collect_label_counts_from_stmt(s, stmt, out, "schema_overlay labels");
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    nsql = snprintf(sql, sizeof(sql),
+                    "%s"
+                    "SELECT e.type, COUNT(*) FROM active_edges e "
+                    "JOIN active_nodes src ON src.qualified_name = e.source_qn "
+                    "JOIN active_nodes dst ON dst.qualified_name = e.target_qn "
+                    "WHERE src.project = ?3 AND dst.project = ?3 "
+                    "GROUP BY e.type ORDER BY COUNT(*) DESC, e.type ASC;",
+                    active_cte);
+    if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+        cbm_store_schema_free(out);
+        store_set_error(s, "schema_overlay edge type SQL truncated");
+        return CBM_NOT_FOUND;
+    }
+    stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        cbm_store_schema_free(out);
+        store_set_error_sqlite(s, "schema_overlay edge types prepare");
+        return CBM_NOT_FOUND;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    rc = schema_collect_type_counts_from_stmt(s, stmt, out, "schema_overlay edge types");
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_schema_free(out);
+    }
+    return rc;
 }
 
 int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
@@ -8031,37 +8158,11 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
         bind_text(stmt, SKIP_ONE, project);
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
 
-        int cap = ST_INIT_CAP_8;
-        int count = 0;
-        cbm_label_count_t *arr = malloc((size_t)cap * sizeof(cbm_label_count_t));
-        if (!arr) {
-            sqlite3_finalize(stmt);
-            return CBM_NOT_FOUND;
-        }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            if (count >= cap) {
-                int new_cap = cap * ST_GROWTH;
-                void *tmp = realloc(arr, (size_t)new_cap * sizeof(cbm_label_count_t));
-                if (!tmp) {
-                    for (int i = 0; i < count; i++) {
-                        safe_str_free(&arr[i].label);
-                    }
-                    free(arr);
-                    sqlite3_finalize(stmt);
-                    return CBM_NOT_FOUND;
-                }
-                arr = tmp;
-                cap = new_cap;
-            }
-            arr[count].label = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-            arr[count].count = sqlite3_column_int(stmt, SKIP_ONE);
-            arr[count].properties = NULL;
-            arr[count].property_count = 0;
-            count++;
-        }
+        int rc = schema_collect_label_counts_from_stmt(s, stmt, out, "schema scoped labels");
         sqlite3_finalize(stmt);
-        out->node_labels = arr;
-        out->node_label_count = count;
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
     }
 
     {
@@ -8083,39 +8184,12 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
         bind_text(stmt, SKIP_ONE, project);
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
 
-        int cap = ST_INIT_CAP_8;
-        int count = 0;
-        cbm_type_count_t *arr = malloc((size_t)cap * sizeof(cbm_type_count_t));
-        if (!arr) {
-            sqlite3_finalize(stmt);
-            cbm_store_schema_free(out);
-            return CBM_NOT_FOUND;
-        }
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            if (count >= cap) {
-                int new_cap = cap * ST_GROWTH;
-                void *tmp = realloc(arr, (size_t)new_cap * sizeof(cbm_type_count_t));
-                if (!tmp) {
-                    for (int i = 0; i < count; i++) {
-                        safe_str_free(&arr[i].type);
-                    }
-                    free(arr);
-                    sqlite3_finalize(stmt);
-                    cbm_store_schema_free(out);
-                    return CBM_NOT_FOUND;
-                }
-                arr = tmp;
-                cap = new_cap;
-            }
-            arr[count].type = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-            arr[count].count = sqlite3_column_int(stmt, SKIP_ONE);
-            arr[count].properties = NULL;
-            arr[count].property_count = 0;
-            count++;
-        }
+        int rc = schema_collect_type_counts_from_stmt(s, stmt, out, "schema scoped edge types");
         sqlite3_finalize(stmt);
-        out->edge_types = arr;
-        out->edge_type_count = count;
+        if (rc != CBM_STORE_OK) {
+            cbm_store_schema_free(out);
+            return rc;
+        }
     }
 
     return CBM_STORE_OK;

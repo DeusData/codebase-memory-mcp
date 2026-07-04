@@ -391,6 +391,39 @@ static void add_overlay_active_cypher_freshness(
         "active Cypher relationship views are available.");
 }
 
+static void add_overlay_active_schema_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    if (!summary || summary->active_file_tombstones <= 0) {
+        return;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_GRAPH);
+    yyjson_mut_val *active_sections = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_str(doc, active_sections, "node_labels");
+    yyjson_mut_arr_add_str(doc, active_sections, "edge_types");
+    yyjson_mut_obj_add_val(doc, freshness, "active_sections", active_sections);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary->overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary->active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary->canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary->overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
+                           summary->total_nodes_visible);
+    add_response_warning(
+        doc, root,
+        "codebase://schema used active overlay node and edge rows for node_labels and "
+        "edge_types; property-key discovery and relationship patterns are not included in this "
+        "resource.");
+}
+
 static void add_overlay_active_search_code_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary) {
@@ -9193,8 +9226,22 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
         return;
     }
 
+    cbm_store_overlay_node_view_summary_t overlay_summary = {0};
+    bool overlay_ready =
+        proj && cbm_store_get_overlay_node_view_summary(store, proj, &overlay_summary) ==
+                    CBM_STORE_OK &&
+        overlay_summary.active_file_tombstones > 0;
+    bool used_active_schema = false;
+    bool active_schema_failed = false;
+
     cbm_schema_info_t schema = {0};
-    cbm_store_get_schema(store, proj, &schema);
+    if (overlay_ready &&
+        cbm_store_get_schema_counts_overlay_view(store, proj, &schema) == CBM_STORE_OK) {
+        used_active_schema = true;
+    } else {
+        active_schema_failed = overlay_ready;
+        cbm_store_get_schema_counts(store, proj, &schema);
+    }
 
     yyjson_mut_val *label_arr = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.node_label_count; i++) {
@@ -9215,15 +9262,30 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "edge_types", type_arr);
     cbm_store_schema_free(&schema);
 
-    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
-        doc, root, store, proj,
-        "codebase://schema reads canonical graph schema counts; ready overlay rows are not "
-        "included until active schema resource views or compaction are available.");
+    bool overlay_limitation_reported = false;
+    if (used_active_schema) {
+        add_overlay_active_schema_freshness(doc, root, &overlay_summary);
+    } else {
+        overlay_limitation_reported = add_canonical_only_overlay_freshness(
+            doc, root, store, proj,
+            "codebase://schema reads canonical graph schema counts; ready overlay rows are not "
+            "included until active schema resource views or compaction are available.");
+        if (active_schema_failed && !overlay_limitation_reported) {
+            add_response_warning(
+                doc, root,
+                "codebase://schema could not read the active overlay schema view; canonical "
+                "schema counts were returned.");
+        }
+    }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        if (!overlay_limitation_reported) {
+        if (used_active_schema && dirty_pending > 0) {
+            add_response_warning(doc, root,
+                                 "codebase://schema used ready overlay rows, but pending dirty "
+                                 "files may still be absent until overlay or reindex completes.");
+        } else if (!used_active_schema && !overlay_limitation_reported) {
             add_response_warning(doc, root,
                                  "codebase://schema reads canonical graph schema counts; dirty "
                                  "file changes may be absent until overlay or reindex completes.");

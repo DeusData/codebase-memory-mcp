@@ -825,6 +825,8 @@ int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t 
  * discovery (json_each scans over every row) — for callers that only need
  * label/type counts, e.g. get_architecture. */
 int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
+int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project,
+                                             cbm_schema_info_t *out);
 int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
                                        cbm_schema_info_t *out);
 
