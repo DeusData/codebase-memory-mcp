@@ -349,6 +349,7 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
 #define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
 #define CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION "cross_file_node_qn_collision"
+#define CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR "header_type_impl_pair"
 
 /* Conservative default exact-delta caps. Larger affected sets fall back to the
  * containment path unless config opts into a benchmarked frontier size. */
