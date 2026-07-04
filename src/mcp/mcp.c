@@ -117,6 +117,7 @@ static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
 #define CBM_MCP_FRESHNESS_SCOPE_DIRTY_FILES "dirty_files"
 #define CBM_MCP_FRESHNESS_STALE_WITH_WARNING "stale_with_warning"
 #define CBM_MCP_FRESHNESS_READ_MODEL_KEY "read_model"
+#define CBM_MCP_FRESHNESS_READ_MODEL_CANONICAL_ONLY "canonical_only"
 #define CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES "overlay_active_nodes"
 #define CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_GRAPH "overlay_active_graph"
 #define CBM_MCP_EXACT_DELTA_KEY "exact_delta"
@@ -435,6 +436,47 @@ static void add_derived_freshness_warnings(yyjson_mut_doc *doc, yyjson_mut_val *
             doc, root, CBM_STORE_DERIVED_VIEW_NODE_DEGREE,
             "node_degree derived view is stale; precomputed degree data was not used.");
     }
+}
+
+static bool add_canonical_only_overlay_freshness(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                                 cbm_store_t *store, const char *project,
+                                                 const char *warning) {
+    if (!doc || !root || !store || !project || !project[0]) {
+        return false;
+    }
+    cbm_store_overlay_node_view_summary_t summary = {0};
+    if (cbm_store_get_overlay_node_view_summary(store, project, &summary) != CBM_STORE_OK ||
+        summary.active_file_tombstones <= 0) {
+        return false;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return false;
+    }
+    if (!yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY)) {
+        yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                               CBM_MCP_FRESHNESS_READ_MODEL_CANONICAL_ONLY);
+    }
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary.overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary.active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary.canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary.overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible", summary.total_nodes_visible);
+    add_response_warning(doc, root, warning);
+    return true;
+}
+
+static void add_canonical_only_read_model(yyjson_mut_doc *doc, yyjson_mut_val *root) {
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness || yyjson_mut_obj_get(freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY)) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_CANONICAL_ONLY);
 }
 
 static bool query_mentions_any(const char *query, const char *const *terms, int term_count) {
@@ -4445,13 +4487,22 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     add_query_graph_derived_warnings(doc, root, store, project, query, &result);
+    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
+        doc, root, store, project,
+        "query_graph reads canonical Cypher rows; ready overlay rows are not included until "
+        "active Cypher views or compaction are available.");
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_response_warning(doc, root,
-                             "query_graph reads canonical graph rows; dirty file changes may "
-                             "be absent until overlay or reindex completes.");
+        add_canonical_only_read_model(doc, root);
+        if (!overlay_limitation_reported) {
+            add_response_warning(doc, root,
+                                 "query_graph reads canonical graph rows; dirty file changes may "
+                                 "be absent until overlay or reindex completes.");
+        }
+    } else if (overlay_limitation_reported) {
+        add_canonical_only_read_model(doc, root);
     }
 
     /* columns */
@@ -4873,11 +4924,20 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
+    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
+        doc, root, store, project,
+        "get_architecture reads canonical graph summaries; ready overlay rows are not included "
+        "until active architecture views or compaction are available.");
     if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_response_warning(doc, root,
-                             "get_architecture reads canonical graph summaries; dirty file "
-                             "changes may be absent until overlay or reindex completes.");
+        add_canonical_only_read_model(doc, root);
+        if (!overlay_limitation_reported) {
+            add_response_warning(doc, root,
+                                 "get_architecture reads canonical graph summaries; dirty file "
+                                 "changes may be absent until overlay or reindex completes.");
+        }
+    } else if (overlay_limitation_reported) {
+        add_canonical_only_read_model(doc, root);
     }
 
     /* Node label summary */
