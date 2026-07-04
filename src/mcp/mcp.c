@@ -1530,6 +1530,16 @@ static void free_string_array(char **arr) {
     free(arr);
 }
 
+static void free_counted_string_array(char **arr, int count) {
+    if (!arr) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(arr[i]);
+    }
+    free(arr);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  MCP SERVER
  * ══════════════════════════════════════════════════════════════════ */
@@ -7094,14 +7104,9 @@ static bool build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool case_s
                      root_path, ci_flag, flag, tmpfile);
 #endif
     } else if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
-        if (file_pattern) {
-            n = snprintf(cmd, cmd_sz,
-                         "xargs grep -n%s %s --include='%s' -f '%s' < '%s' 2>/dev/null",
-                         ci_flag, flag, file_pattern, tmpfile, filelist);
-        } else {
-            n = snprintf(cmd, cmd_sz, "xargs grep -n%s %s -f '%s' < '%s' 2>/dev/null", ci_flag,
-                         flag, tmpfile, filelist);
-        }
+        (void)file_pattern;
+        n = snprintf(cmd, cmd_sz, "xargs -0 grep -Hn%s %s -f '%s' -- < '%s' 2>/dev/null",
+                     ci_flag, flag, tmpfile, filelist);
     } else {
         if (file_pattern) {
             n = snprintf(cmd, cmd_sz, "grep -rn%s %s --include='%s' -f '%s' '%s' 2>/dev/null",
@@ -7581,6 +7586,80 @@ static bool validate_search_args(const char *root_path, const char *file_pattern
     return true;
 }
 
+static bool search_code_file_pattern_matches(const char *file_pattern, const char *rel_path) {
+    if (!file_pattern || !file_pattern[0]) {
+        return true;
+    }
+    if (!rel_path) {
+        return false;
+    }
+    if (sqlite3_strglob(file_pattern, rel_path) == 0) {
+        return true;
+    }
+    const char *base = strrchr(rel_path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(rel_path, '\\');
+    if (!base || (backslash && backslash > base)) {
+        base = backslash;
+    }
+#endif
+    base = base ? base + SKIP_ONE : rel_path;
+    return sqlite3_strglob(file_pattern, base) == 0;
+}
+
+/* Write a NUL-separated absolute file list from indexed graph files.
+ * Returns true when an indexed file set existed, even if file_pattern matched
+ * zero files; that preserves upstream's "indexed scope first" behavior instead
+ * of falling through to an unbounded recursive scan. */
+static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project,
+                                  const char *root_path, const char *file_pattern,
+                                  const char *filelist) {
+    cbm_store_t *pre_store = resolve_store(srv, project);
+    if (!pre_store) {
+        return false;
+    }
+
+    char **indexed_files = NULL;
+    int indexed_count = 0;
+    int rc = cbm_store_list_files(pre_store, project, &indexed_files, &indexed_count);
+    if (rc != CBM_STORE_OK || indexed_count <= 0) {
+        free_counted_string_array(indexed_files, indexed_count);
+        return false;
+    }
+
+    FILE *fl = fopen(filelist, "wb");
+    if (!fl) {
+        free_counted_string_array(indexed_files, indexed_count);
+        return false;
+    }
+
+    bool ok = true;
+    for (int fi = 0; fi < indexed_count; fi++) {
+        const char *rel = indexed_files[fi];
+        if (!search_code_file_pattern_matches(file_pattern, rel)) {
+            continue;
+        }
+        char abs_path[CBM_PATH_MAX];
+        int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", root_path, rel ? rel : "");
+        if (n < 0 || (size_t)n >= sizeof(abs_path)) {
+            continue;
+        }
+        size_t len = strlen(abs_path);
+        if (fwrite(abs_path, SKIP_ONE, len, fl) != len || fputc('\0', fl) == EOF) {
+            ok = false;
+            break;
+        }
+    }
+    if (fclose(fl) != 0) {
+        ok = false;
+    }
+    free_counted_string_array(indexed_files, indexed_count);
+    if (!ok) {
+        cbm_unlink(filelist);
+    }
+    return ok;
+}
+
 static bool search_rel_path_is_safe(const char *rel_path) {
     if (!rel_path || !rel_path[0] || rel_path[0] == '/' || rel_path[0] == '\\') {
         return false;
@@ -7923,12 +8002,17 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         grep_target = grep_root;
     } else if (!file_pattern && search_code_git_worktree_available(root_path)) {
         scan_mode = SEARCH_CODE_SCAN_GIT_GREP;
+    } else if (write_scoped_filelist(srv, project, root_path, file_pattern, filelist)) {
+        scan_mode = SEARCH_CODE_SCAN_FILELIST_GREP;
     }
 
     char cmd[CBM_SZ_4K];
     if (!build_grep_cmd(cmd, sizeof(cmd), use_regex, case_sensitive, scan_mode, file_pattern,
                         tmpfile, filelist, grep_target)) {
         cbm_unlink(tmpfile);
+        if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
+            cbm_unlink(filelist);
+        }
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
@@ -8026,10 +8110,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     /* ── Phase 4: Context assembly (extracted helper) ─────────── */
 
-    const char *search_scope = has_exact_filter_path
-                                   ? "path_filter_exact"
-                                   : (scan_mode == SEARCH_CODE_SCAN_GIT_GREP ? "git_worktree"
-                                                                              : "project_recursive");
+    const char *search_scope = "project_recursive";
+    if (has_exact_filter_path) {
+        search_scope = "path_filter_exact";
+    } else if (scan_mode == SEARCH_CODE_SCAN_GIT_GREP) {
+        search_scope = "git_worktree";
+    } else if (scan_mode == SEARCH_CODE_SCAN_FILELIST_GREP) {
+        search_scope = "indexed_files";
+    }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     if (!get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready) &&
