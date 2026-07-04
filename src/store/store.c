@@ -7673,7 +7673,7 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
-enum { SCHEMA_MAX_JSON_KEYS = 50 };
+enum { SCHEMA_MAX_JSON_KEYS = 50, SCHEMA_REL_PATTERN_LIMIT = 50 };
 
 typedef struct {
     int index;
@@ -8014,6 +8014,77 @@ static int schema_collect_type_counts_from_stmt(cbm_store_t *s, sqlite3_stmt *st
     return CBM_STORE_OK;
 }
 
+static char *schema_format_rel_pattern(const char *src_label, const char *type,
+                                       const char *dst_label, int count) {
+    const char *src = safe_str(src_label);
+    const char *edge = safe_str(type);
+    const char *dst = safe_str(dst_label);
+    int needed = snprintf(NULL, 0, "(%s)-[%s]->(%s) [%dx]", src, edge, dst, count);
+    if (needed < 0) {
+        return NULL;
+    }
+    char *out = malloc((size_t)needed + 1);
+    if (!out) {
+        return NULL;
+    }
+    int written = snprintf(out, (size_t)needed + 1, "(%s)-[%s]->(%s) [%dx]", src, edge,
+                           dst, count);
+    if (written < 0 || written > needed) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+static int schema_collect_rel_patterns_from_stmt(cbm_store_t *s, sqlite3_stmt *stmt,
+                                                 cbm_schema_info_t *out,
+                                                 const char *error_context) {
+    int cap = ST_INIT_CAP_8;
+    int n = 0;
+    const char **arr = calloc((size_t)cap, sizeof(*arr));
+    if (!arr) {
+        store_set_error(s, "schema relationship patterns out of memory");
+        return CBM_NOT_FOUND;
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap &&
+            store_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                             "schema relationship patterns out of memory", true) !=
+                CBM_STORE_OK) {
+            for (int i = 0; i < n; i++) {
+                safe_str_free(&arr[i]);
+            }
+            free(arr);
+            return CBM_NOT_FOUND;
+        }
+        arr[n] = schema_format_rel_pattern((const char *)sqlite3_column_text(stmt, 0),
+                                           (const char *)sqlite3_column_text(stmt, SKIP_ONE),
+                                           (const char *)sqlite3_column_text(stmt, PAIR_LEN),
+                                           sqlite3_column_int(stmt, CBM_SZ_3));
+        if (!arr[n]) {
+            for (int i = 0; i < n; i++) {
+                safe_str_free(&arr[i]);
+            }
+            free(arr);
+            store_set_error(s, "schema relationship patterns out of memory");
+            return CBM_NOT_FOUND;
+        }
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        for (int i = 0; i < n; i++) {
+            safe_str_free(&arr[i]);
+        }
+        free(arr);
+        store_set_error_sqlite(s, error_context ? error_context : "schema relationship patterns");
+        return CBM_NOT_FOUND;
+    }
+    out->rel_patterns = arr;
+    out->rel_pattern_count = n;
+    return CBM_STORE_OK;
+}
+
 /* with_props=false skips the per-label/per-type JSON property-key discovery:
  * those json_each() scans walk EVERY row of each label/type (minutes-scale on
  * multi-million-node graphs) and get_architecture only needs the counts. */
@@ -8085,6 +8156,36 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
         bind_text(stmt, SKIP_ONE, project);
 
         int rc = schema_collect_type_counts_from_stmt(s, stmt, out, "schema edge types");
+        sqlite3_finalize(stmt);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_schema_free(out);
+            return rc;
+        }
+    }
+
+    {
+        const char *sql =
+            "SELECT src.label, e.type, dst.label, COUNT(*) "
+            "FROM edges e "
+            "JOIN nodes src ON src.id = e.source_id "
+            "JOIN nodes dst ON dst.id = e.target_id "
+            "WHERE e.project = ?1 AND src.project = ?1 AND dst.project = ?1 "
+            "GROUP BY src.label, e.type, dst.label "
+            "ORDER BY COUNT(*) DESC, src.label ASC, e.type ASC, dst.label ASC "
+            "LIMIT ?2;";
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+            if (stmt) {
+                sqlite3_finalize(stmt);
+            }
+            cbm_store_schema_free(out);
+            return CBM_NOT_FOUND;
+        }
+        bind_text(stmt, ST_COL_1, project);
+        sqlite3_bind_int(stmt, ST_COL_2, SCHEMA_REL_PATTERN_LIMIT);
+
+        int rc = schema_collect_rel_patterns_from_stmt(s, stmt, out,
+                                                       "schema relationship patterns");
         sqlite3_finalize(stmt);
         if (rc != CBM_STORE_OK) {
             cbm_store_schema_free(out);
@@ -8238,6 +8339,43 @@ static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_sche
         return rc;
     }
 
+    nsql = snprintf(sql, sizeof(sql),
+                    "%s"
+                    "SELECT src.label, e.type, dst.label, COUNT(*) "
+                    "FROM active_edges e "
+                    "JOIN active_nodes src ON src.qualified_name = e.source_qn "
+                    "JOIN active_nodes dst ON dst.qualified_name = e.target_qn "
+                    "WHERE src.project = ?3 AND dst.project = ?3 "
+                    "GROUP BY src.label, e.type, dst.label "
+                    "ORDER BY COUNT(*) DESC, src.label ASC, e.type ASC, dst.label ASC "
+                    "LIMIT ?4;",
+                    active_cte);
+    if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+        cbm_store_schema_free(out);
+        store_set_error(s, "schema_overlay relationship pattern SQL truncated");
+        return CBM_NOT_FOUND;
+    }
+    stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        cbm_store_schema_free(out);
+        store_set_error_sqlite(s, "schema_overlay relationship patterns prepare");
+        return CBM_NOT_FOUND;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    sqlite3_bind_int(stmt, ST_COL_4, SCHEMA_REL_PATTERN_LIMIT);
+    rc = schema_collect_rel_patterns_from_stmt(s, stmt, out,
+                                               "schema_overlay relationship patterns");
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK) {
+        cbm_store_schema_free(out);
+        return rc;
+    }
+
     if (with_props) {
         nsql = snprintf(sql, sizeof(sql),
                         "%s"
@@ -8345,6 +8483,39 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
 
         int rc = schema_collect_type_counts_from_stmt(s, stmt, out, "schema scoped edge types");
+        sqlite3_finalize(stmt);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_schema_free(out);
+            return rc;
+        }
+    }
+
+    {
+        const char *sql =
+            "SELECT ns.label, e.type, nt.label, COUNT(*) "
+            "FROM edges e "
+            "JOIN nodes ns ON ns.id = e.source_id "
+            "JOIN nodes nt ON nt.id = e.target_id "
+            "WHERE e.project = ?1 AND ns.project = ?1 AND nt.project = ?1 "
+            "AND (ns.file_path = ?2 OR ns.file_path LIKE ?3) "
+            "AND (nt.file_path = ?2 OR nt.file_path LIKE ?3) "
+            "GROUP BY ns.label, e.type, nt.label "
+            "ORDER BY COUNT(*) DESC, ns.label ASC, e.type ASC, nt.label ASC "
+            "LIMIT ?4;";
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+            if (stmt) {
+                sqlite3_finalize(stmt);
+            }
+            cbm_store_schema_free(out);
+            return CBM_NOT_FOUND;
+        }
+        bind_text(stmt, ST_COL_1, project);
+        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+        sqlite3_bind_int(stmt, ST_COL_4, SCHEMA_REL_PATTERN_LIMIT);
+
+        int rc = schema_collect_rel_patterns_from_stmt(s, stmt, out,
+                                                       "schema scoped relationship patterns");
         sqlite3_finalize(stmt);
         if (rc != CBM_STORE_OK) {
             cbm_store_schema_free(out);
