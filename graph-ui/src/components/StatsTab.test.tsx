@@ -66,7 +66,7 @@ describe("StatsTab index modal", () => {
     fireEvent.change(await screen.findByLabelText("Repository path"), {
       target: { value: "D:\\work\\信租风控通后端" },
     });
-    fireEvent.change(screen.getByLabelText("Project name"), {
+    fireEvent.change(screen.getByLabelText("Project ID (optional — permanent, cannot be renamed)"), {
       target: { value: "信租风控通后端" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Index This Folder" }));

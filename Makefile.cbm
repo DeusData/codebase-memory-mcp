@@ -483,6 +483,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_c_cpp.c \
     tests/repro/repro_lsp_go_py.c \
     tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 

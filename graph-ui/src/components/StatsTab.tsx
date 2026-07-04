@@ -315,6 +315,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
               onChange={(e) => setProjectName(e.target.value)}
               className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
             />
+            <span className="block text-[10px] text-foreground/25 mt-1">{t.index.projectNameHelp}</span>
           </label>
         </div>
 
