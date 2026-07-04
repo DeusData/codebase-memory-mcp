@@ -4343,49 +4343,72 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
         cbm_node_t *term = binding_get(b, patn->nodes[1].variable ? patn->nodes[1].variable : "");
         int match_count = 0;
         if (term) {
-            int type_count = rel->type_count > 0 ? rel->type_count : SKIP_ONE;
-            for (int ti = 0; ti < type_count && new_count < max_new; ti++) {
-                cbm_edge_t *edges = NULL;
-                int edge_count = 0;
-                if (rel->type_count > 0) {
-                    if (scan_targets) {
-                        cbm_store_find_edges_by_target_type(store, term->id, rel->types[ti], &edges,
-                                                            &edge_count);
+            bool used_active_overlay_edges = false;
+            if (b->use_active_overlay_edges && b->project && term->qualified_name &&
+                term->qualified_name[0]) {
+                used_active_overlay_edges = true;
+                bool rel_any = rel->direction && strcmp(rel->direction, "any") == 0;
+                int direction = rel_any ? CBM_STORE_EDGE_DIR_ANY
+                                        : (scan_targets ? CBM_STORE_EDGE_DIR_INBOUND
+                                                        : CBM_STORE_EDGE_DIR_OUTBOUND);
+                cbm_store_edge_node_t *rows = NULL;
+                int row_count = 0;
+                if (cbm_store_find_active_edge_nodes_by_qn(store, b->project, term->qualified_name,
+                                                           (const char **)rel->types,
+                                                           rel->type_count, direction, &rows,
+                                                           &row_count) == CBM_STORE_OK) {
+                    process_active_edge_nodes(rows, row_count, start_node, b, start_var,
+                                              rel->variable, new_bindings, &new_count, max_new,
+                                              &match_count);
+                }
+                cbm_store_free_edge_nodes(rows, row_count);
+            }
+            if (!used_active_overlay_edges) {
+                int type_count = rel->type_count > 0 ? rel->type_count : SKIP_ONE;
+                for (int ti = 0; ti < type_count && new_count < max_new; ti++) {
+                    cbm_edge_t *edges = NULL;
+                    int edge_count = 0;
+                    if (rel->type_count > 0) {
+                        if (scan_targets) {
+                            cbm_store_find_edges_by_target_type(store, term->id, rel->types[ti],
+                                                                &edges, &edge_count);
+                        } else {
+                            cbm_store_find_edges_by_source_type(store, term->id, rel->types[ti],
+                                                                &edges, &edge_count);
+                        }
+                    } else if (scan_targets) {
+                        cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count);
                     } else {
-                        cbm_store_find_edges_by_source_type(store, term->id, rel->types[ti], &edges,
-                                                            &edge_count);
+                        cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
                     }
-                } else if (scan_targets) {
-                    cbm_store_find_edges_by_target(store, term->id, &edges, &edge_count);
-                } else {
-                    cbm_store_find_edges_by_source(store, term->id, &edges, &edge_count);
-                }
-                for (int ei = 0; ei < edge_count && new_count < max_new; ei++) {
-                    int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
-                    cbm_node_t found = {0};
-                    if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
-                        continue;
-                    }
-                    if (start_node->label && !label_alt_matches(found.label, start_node->label)) {
+                    for (int ei = 0; ei < edge_count && new_count < max_new; ei++) {
+                        int64_t sid = scan_targets ? edges[ei].source_id : edges[ei].target_id;
+                        cbm_node_t found = {0};
+                        if (cbm_store_find_node_by_id(store, sid, &found) != CBM_STORE_OK) {
+                            continue;
+                        }
+                        if (start_node->label &&
+                            !label_alt_matches(found.label, start_node->label)) {
+                            node_fields_free(&found);
+                            continue;
+                        }
+                        if (!check_inline_props(&found, start_node->props, start_node->prop_count,
+                                                store)) {
+                            node_fields_free(&found);
+                            continue;
+                        }
+                        binding_t nb = {0};
+                        binding_copy(&nb, b);
+                        binding_set(&nb, start_var, &found);
+                        if (rel->variable) {
+                            binding_set_edge(&nb, rel->variable, &edges[ei]);
+                        }
                         node_fields_free(&found);
-                        continue;
+                        new_bindings[new_count++] = nb;
+                        match_count++;
                     }
-                    if (!check_inline_props(&found, start_node->props, start_node->prop_count,
-                                            store)) {
-                        node_fields_free(&found);
-                        continue;
-                    }
-                    binding_t nb = {0};
-                    binding_copy(&nb, b);
-                    binding_set(&nb, start_var, &found);
-                    if (rel->variable) {
-                        binding_set_edge(&nb, rel->variable, &edges[ei]);
-                    }
-                    node_fields_free(&found);
-                    new_bindings[new_count++] = nb;
-                    match_count++;
+                    cbm_store_free_edges(edges, edge_count);
                 }
-                cbm_store_free_edges(edges, edge_count);
             }
         }
         if (opt && match_count == 0 && new_count < max_new) {
@@ -4579,14 +4602,9 @@ static bool cypher_pattern_supports_active_relationships(const cbm_pattern_t *pa
 
 static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
     for (const cbm_query_t *cur = q; cur; cur = cur->union_next) {
-        int relationship_pattern_count = 0;
         for (int pi = 0; pi < cur->pattern_count; pi++) {
-            if (cur->patterns[pi].rel_count > 0) {
-                relationship_pattern_count++;
-                if (relationship_pattern_count > SKIP_ONE || cur->pattern_count > SKIP_ONE ||
-                    !cypher_pattern_supports_active_relationships(&cur->patterns[pi])) {
-                    return false;
-                }
+            if (!cypher_pattern_supports_active_relationships(&cur->patterns[pi])) {
+                return false;
             }
         }
         if (cypher_where_requires_canonical_edges(cur->where) ||

@@ -2141,6 +2141,58 @@ TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay) {
 
     free(inner);
     free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":151,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-rel-active\","
+             "\"query\":\"MATCH (f:Function) WHERE f.name = \\\"FreshSource\\\" "
+             "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) RETURN f.name, g.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "FreshSource"));
+    ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
+    ASSERT_NULL(strstr(inner, "OldSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":152,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-rel-active\","
+             "\"query\":\"MATCH (g:Function) WHERE g.name = \\\"OldTarget\\\" "
+             "OPTIONAL MATCH (f:Function)-[:CALLS]->(g) RETURN f.name, g.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "FreshSource"));
+    ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
+    ASSERT_NULL(strstr(inner, "OldSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":153,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-rel-active\","
+             "\"query\":\"MATCH (g:Function) WHERE g.name = \\\"OldTarget\\\" "
+             "OPTIONAL MATCH (f:Function)-[:IMPORTS]->(g) RETURN f.name, g.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "OldTarget"));
+    ASSERT_NULL(strstr(inner, "FreshSource"));
+    ASSERT_NULL(strstr(inner, "OldSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
+    free(inner);
+    free(resp);
+
     cbm_mcp_server_free(srv);
     PASS();
 }

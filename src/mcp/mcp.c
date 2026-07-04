@@ -387,7 +387,7 @@ static void add_overlay_active_cypher_freshness(
     add_response_warning(
         doc, root,
         "query_graph used active overlay node rows and active edge-derived predicates for this "
-        "Cypher query; variable-length, multi-pattern, and id() Cypher queries remain canonical.");
+        "Cypher query; variable-length and id() Cypher queries remain canonical.");
 }
 
 static void add_overlay_active_schema_freshness(
@@ -4783,7 +4783,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             doc, root, store, project,
             "query_graph reads canonical Cypher rows for this query shape; ready overlay rows are "
             "included only for node-only and fixed one-hop relationship Cypher queries until "
-            "broader active relationship binding or compaction is available.");
+            "variable-length active relationship binding or compaction is available.");
     }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
