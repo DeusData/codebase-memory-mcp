@@ -3572,6 +3572,41 @@ TEST(search_code_git_worktree_scope_includes_untracked_source) {
     PASS();
 }
 
+TEST(search_code_file_pattern_uses_indexed_scope_when_available) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char vendor_dir[512];
+    int n = snprintf(vendor_dir, sizeof(vendor_dir), "%s/project/vendor/generated", tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(vendor_dir));
+    ASSERT_EQ(th_mkdir_p(vendor_dir), 0);
+
+    char generated_path[512];
+    n = snprintf(generated_path, sizeof(generated_path), "%s/ignored.go", vendor_dir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(generated_path));
+    ASSERT_EQ(th_write_file(generated_path, "package generated\nfunc VendoredNeedle() {}\n"), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"VendoredNeedle\","
+                                   "\"file_pattern\":\"*.go\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_scope\":\"indexed_files\""));
+    ASSERT_NULL(strstr(inner, "VendoredNeedle"));
+    ASSERT_NULL(strstr(inner, "\"isError\":true"));
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -5224,6 +5259,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_ampersand_accepted_issue272);
     RUN_TEST(search_code_exact_path_filter_scopes_traversal);
     RUN_TEST(search_code_git_worktree_scope_includes_untracked_source);
+    RUN_TEST(search_code_file_pattern_uses_indexed_scope_when_available);
     RUN_TEST(tool_detect_changes_no_project);
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
