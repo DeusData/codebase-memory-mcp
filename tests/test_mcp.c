@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
+#include "../src/foundation/platform.h"
 #include "test_helpers.h"
 #include "test_framework.h"
 #include <cli/cli.h>
@@ -83,6 +84,106 @@ static int mcp_publish_delete_overlay_delta(cbm_store_t *store, const char *proj
                                     .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
                                     .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
     return cbm_store_publish_overlay_file_delta(store, &delta, overlay_generation);
+}
+
+static int mcp_project_db_path(char *out, size_t out_sz, const char *cache,
+                               const char *project) {
+    if (!out || out_sz == 0 || !cache || !project) {
+        return CBM_STORE_ERR;
+    }
+    int n = snprintf(out, out_sz, "%s/%s.db", cache, project);
+    if (n < 0 || (size_t)n >= out_sz) {
+        out[0] = '\0';
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static void mcp_unlink_db_sidecars(const char *db_path) {
+    if (!db_path || !db_path[0]) {
+        return;
+    }
+    cbm_unlink(db_path);
+    char sidecar[CBM_PATH_MAX];
+    int n = snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+    if (n >= 0 && (size_t)n < sizeof(sidecar)) {
+        cbm_unlink(sidecar);
+    }
+    n = snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+    if (n >= 0 && (size_t)n < sizeof(sidecar)) {
+        cbm_unlink(sidecar);
+    }
+}
+
+static void mcp_restore_cache_dir(char *saved_copy) {
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+}
+
+static int mcp_create_overlay_compaction_fixture(const char *cache, const char *project,
+                                                 char *db_path, size_t db_path_sz) {
+    int rc = mcp_project_db_path(db_path, db_path_sz, cache, project);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return CBM_STORE_ERR;
+    }
+
+    int64_t generation = 0;
+    rc = cbm_store_upsert_project(store, project, cache);
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation);
+    }
+    char main_qn[CBM_PATH_MAX];
+    char helper_qn[CBM_PATH_MAX];
+    int n = snprintf(main_qn, sizeof(main_qn), "%s.main.Old", project);
+    if (rc == CBM_STORE_OK && (n < 0 || (size_t)n >= sizeof(main_qn))) {
+        rc = CBM_STORE_ERR;
+    }
+    n = snprintf(helper_qn, sizeof(helper_qn), "%s.helper.Helper", project);
+    if (rc == CBM_STORE_OK && (n < 0 || (size_t)n >= sizeof(helper_qn))) {
+        rc = CBM_STORE_ERR;
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = mcp_publish_single_node_delta(store, project, generation, "main.go", "Old",
+                                           main_qn);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = mcp_publish_single_node_delta(store, project, generation, "helper.go", "Helper",
+                                           helper_qn);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_store_finish_index_generation(store, project, generation,
+                                               CBM_STORE_INDEX_STATUS_COMPLETE);
+    }
+
+    int64_t first_overlay = 0;
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_store_reserve_overlay_generation(store, project, generation, &first_overlay);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = mcp_publish_delete_overlay_delta(store, project, generation, first_overlay,
+                                              "main.go");
+    }
+
+    int64_t second_overlay = 0;
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_store_reserve_overlay_generation(store, project, generation, &second_overlay);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = mcp_publish_delete_overlay_delta(store, project, generation, second_overlay,
+                                              "helper.go");
+    }
+
+    cbm_store_close(store);
+    return rc;
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -3807,7 +3908,7 @@ TEST(tool_ingest_traces_empty) {
 }
 
 TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins) {
-    enum { BASE_GENERATION = 1, COMPACT_ONE_GENERATION = 1 };
+    enum { COMPACT_ONE_GENERATION = 1 };
     const char *project = "overlay-worker-project";
     char *cache_tmp = th_mktempdir("cbm_mcp_overlay_worker_cache");
     ASSERT_NOT_NULL(cache_tmp);
@@ -3820,44 +3921,9 @@ TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins) {
     cbm_setenv("CBM_CACHE_DIR", cache, 1);
 
     char db_path[CBM_PATH_MAX];
-    n = snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
-    ASSERT(n >= 0 && (size_t)n < sizeof(db_path));
-
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(store);
-    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
-
-    int64_t generation = 0;
-    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+    ASSERT_EQ(mcp_create_overlay_compaction_fixture(cache, project, db_path,
+                                                    sizeof(db_path)),
               CBM_STORE_OK);
-    ASSERT_EQ(generation, BASE_GENERATION);
-    ASSERT_EQ(mcp_publish_single_node_delta(store, project, generation, "main.go", "Old",
-                                            "overlay-worker-project.main.Old"),
-              CBM_STORE_OK);
-    ASSERT_EQ(mcp_publish_single_node_delta(store, project, generation, "helper.go",
-                                            "Helper",
-                                            "overlay-worker-project.helper.Helper"),
-              CBM_STORE_OK);
-    ASSERT_EQ(cbm_store_finish_index_generation(store, project, generation,
-                                                CBM_STORE_INDEX_STATUS_COMPLETE),
-              CBM_STORE_OK);
-
-    int64_t first_overlay = 0;
-    ASSERT_EQ(cbm_store_reserve_overlay_generation(store, project, BASE_GENERATION,
-                                                   &first_overlay),
-              CBM_STORE_OK);
-    ASSERT_EQ(mcp_publish_delete_overlay_delta(store, project, BASE_GENERATION,
-                                               first_overlay, "main.go"),
-              CBM_STORE_OK);
-
-    int64_t second_overlay = 0;
-    ASSERT_EQ(cbm_store_reserve_overlay_generation(store, project, BASE_GENERATION,
-                                                   &second_overlay),
-              CBM_STORE_OK);
-    ASSERT_EQ(mcp_publish_delete_overlay_delta(store, project, BASE_GENERATION,
-                                               second_overlay, "helper.go"),
-              CBM_STORE_OK);
-    cbm_store_close(store);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3870,7 +3936,7 @@ TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins) {
     ASSERT_EQ(compacted, 1);
     ASSERT_FALSE(cbm_mcp_server_overlay_compaction_active(srv));
 
-    store = cbm_store_open_path_query(db_path);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(store);
     ASSERT_EQ(mcp_store_node_qn_exists(store, project,
                                        "overlay-worker-project.main.Old"),
@@ -3894,22 +3960,105 @@ TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins) {
     cbm_store_close(store);
 
     cbm_mcp_server_free(srv);
-    cbm_unlink(db_path);
-    char sidecar[CBM_PATH_MAX];
-    n = snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
-    if (n >= 0 && (size_t)n < sizeof(sidecar)) {
-        cbm_unlink(sidecar);
-    }
-    n = snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
-    if (n >= 0 && (size_t)n < sizeof(sidecar)) {
-        cbm_unlink(sidecar);
-    }
-    if (saved_copy) {
-        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
-        free(saved_copy);
-    } else {
-        cbm_unsetenv("CBM_CACHE_DIR");
-    }
+    mcp_unlink_db_sidecars(db_path);
+    mcp_restore_cache_dir(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(mcp_overlay_compaction_worker_missing_db_does_not_create_store) {
+    const char *project = "overlay-missing-project";
+    char *cache_tmp = th_mktempdir("cbm_mcp_overlay_missing_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    int n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(db_path, sizeof(db_path), cache, project),
+              CBM_STORE_OK);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(
+        srv, project, CBM_STORE_COMPACT_ALL_GENERATIONS));
+
+    int compacted = -1;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(compacted, 0);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+
+    cbm_mcp_server_free(srv);
+    mcp_restore_cache_dir(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(mcp_overlay_compaction_worker_rejects_invalid_inputs) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char overlong_project[CBM_SZ_512];
+    memset(overlong_project, 'a', sizeof(overlong_project) - 1);
+    overlong_project[sizeof(overlong_project) - 1] = '\0';
+
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(NULL, "project", 1));
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(srv, NULL, 1));
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(srv, "", 1));
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(srv, "bad/project", 1));
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(srv, overlong_project, 1));
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(srv, "project", -1));
+
+    int compacted = -1;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted), CBM_STORE_OK);
+    ASSERT_EQ(compacted, 0);
+    ASSERT_FALSE(cbm_mcp_server_overlay_compaction_active(srv));
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(mcp_overlay_compaction_worker_free_joins_pending_worker) {
+    const char *project = "overlay-free-join-project";
+    char *cache_tmp = th_mktempdir("cbm_mcp_overlay_free_join_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    int n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_create_overlay_compaction_fixture(cache, project, db_path,
+                                                    sizeof(db_path)),
+              CBM_STORE_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(
+        srv, project, CBM_STORE_COMPACT_ALL_GENERATIONS));
+    cbm_mcp_server_free(srv);
+
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project,
+                                       "overlay-free-join-project.main.Old"),
+              0);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project,
+                                       "overlay-free-join-project.helper.Helper"),
+              0);
+    cbm_store_close(store);
+
+    mcp_unlink_db_sidecars(db_path);
+    mcp_restore_cache_dir(saved_copy);
     th_cleanup(cache);
     PASS();
 }
@@ -5414,6 +5563,9 @@ SUITE(mcp) {
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
     RUN_TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins);
+    RUN_TEST(mcp_overlay_compaction_worker_missing_db_does_not_create_store);
+    RUN_TEST(mcp_overlay_compaction_worker_rejects_invalid_inputs);
+    RUN_TEST(mcp_overlay_compaction_worker_free_joins_pending_worker);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);
