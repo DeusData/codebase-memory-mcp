@@ -746,65 +746,68 @@ static void free_seen_dir_key(const char *key, void *val, void *ud) {
 /* ── Pass 1: Structure ──────────────────────────────────────────── */
 
 /* Create Project, Folder/Package, and File nodes in the graph buffer. */
-/* Walk directory chain upward, creating Folder nodes and CONTAINS_FOLDER edges. */
+/* Create ancestor folders before child folders so nested containment edges are complete. */
 static void create_folder_chain(cbm_gbuf_t *gbuf, const char *project, const char *root_qn,
                                 const char *dir, CBMHashTable *seen_dirs) {
-    char *walk = cbm_strdup(dir);
-    if (!walk) {
+    if (!gbuf || !project || !dir || dir[0] == '\0') {
         return;
     }
-    while (walk[0] != '\0' && (!seen_dirs || !cbm_ht_get(seen_dirs, walk))) {
-        if (seen_dirs) {
-            char *seen_key = cbm_strdup(walk);
-            if (!seen_key) {
-                break;
-            }
-            cbm_ht_set(seen_dirs, seen_key, intptr_to_ptr(SKIP_ONE));
-        }
-        char *folder_qn = cbm_pipeline_fqn_folder(project, walk);
-        if (!folder_qn) {
-            break;
-        }
-        const char *dir_base = strrchr(walk, '/');
-        dir_base = dir_base ? dir_base + SKIP_ONE : walk;
-        cbm_gbuf_upsert_node(gbuf, "Folder", dir_base, folder_qn, walk, 0, 0, "{}");
 
-        char *pdir = cbm_strdup(walk);
-        if (!pdir) {
-            free(folder_qn);
-            break;
-        }
-        char *ps = strrchr(pdir, '/');
-        if (ps) {
-            *ps = '\0';
-        } else {
-            free(pdir);
-            pdir = cbm_strdup("");
-        }
-        const char *pqn;
-        char *pqn_heap = NULL;
-        if (pdir[0] == '\0') {
-            pqn = root_qn ? root_qn : project;
-        } else {
-            pqn_heap = cbm_pipeline_fqn_folder(project, pdir);
-            pqn = pqn_heap;
-        }
-        const cbm_gbuf_node_t *fn = cbm_gbuf_find_by_qn(gbuf, folder_qn);
-        const cbm_gbuf_node_t *pn = cbm_gbuf_find_by_qn(gbuf, pqn);
-        if (fn && pn) {
-            cbm_gbuf_insert_edge(gbuf, pn->id, fn->id, "CONTAINS_FOLDER", "{}");
-        }
-        free(folder_qn);
-        free(pqn_heap);
-        char *up = strrchr(walk, '/');
-        if (up) {
-            *up = '\0';
-        } else {
-            walk[0] = '\0';
-        }
-        free(pdir);
+    if (seen_dirs && cbm_ht_get(seen_dirs, dir)) {
+        return;
     }
-    free(walk);
+
+    char *parent_dir = cbm_strdup(dir);
+    if (!parent_dir) {
+        return;
+    }
+    char *slash = strrchr(parent_dir, '/');
+    if (slash) {
+        *slash = '\0';
+        create_folder_chain(gbuf, project, root_qn, parent_dir, seen_dirs);
+    } else {
+        parent_dir[0] = '\0';
+    }
+
+    if (seen_dirs && cbm_ht_get(seen_dirs, dir)) {
+        free(parent_dir);
+        return;
+    }
+
+    if (seen_dirs) {
+        char *seen_key = cbm_strdup(dir);
+        if (!seen_key) {
+            free(parent_dir);
+            return;
+        }
+        cbm_ht_set(seen_dirs, seen_key, intptr_to_ptr(SKIP_ONE));
+    }
+
+    char *folder_qn = cbm_pipeline_fqn_folder(project, dir);
+    if (!folder_qn) {
+        free(parent_dir);
+        return;
+    }
+    const char *dir_base = strrchr(dir, '/');
+    dir_base = dir_base ? dir_base + SKIP_ONE : dir;
+    cbm_gbuf_upsert_node(gbuf, "Folder", dir_base, folder_qn, dir, 0, 0, "{}");
+
+    const char *parent_qn = root_qn ? root_qn : project;
+    char *parent_qn_heap = NULL;
+    if (parent_dir[0] != '\0') {
+        parent_qn_heap = cbm_pipeline_fqn_folder(project, parent_dir);
+        parent_qn = parent_qn_heap;
+    }
+    const cbm_gbuf_node_t *folder_node = cbm_gbuf_find_by_qn(gbuf, folder_qn);
+    const cbm_gbuf_node_t *parent_node = parent_qn ? cbm_gbuf_find_by_qn(gbuf, parent_qn) : NULL;
+    if (folder_node && parent_node) {
+        cbm_gbuf_insert_edge(gbuf, parent_node->id, folder_node->id,
+                             CBM_PIPELINE_EDGE_CONTAINS_FOLDER, "{}");
+    }
+
+    free(parent_qn_heap);
+    free(folder_qn);
+    free(parent_dir);
 }
 
 int cbm_pipeline_ensure_file_structure(cbm_gbuf_t *gbuf, const char *project,

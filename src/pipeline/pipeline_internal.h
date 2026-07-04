@@ -338,6 +338,7 @@ typedef struct {
 } cbm_pipeline_file_delta_plan_t;
 
 #define CBM_PIPELINE_EDGE_CONTAINS_FILE "CONTAINS_FILE"
+#define CBM_PIPELINE_EDGE_CONTAINS_FOLDER "CONTAINS_FOLDER"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR "frontier_error"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
