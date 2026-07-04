@@ -48,6 +48,7 @@ SELF_DOGFOOD_CACHE_SUBDIR = "cache"
 PUBLISH_FULL = "full"
 PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
+PUBLISH_INCREMENTAL_OVERLAY = "incremental_overlay"
 PUBLISH_INCREMENTAL_CONTAINMENT = "incremental_containment"
 LOG_MARKER_PIPELINE_DONE = "pipeline.done"
 LOG_MARKER_INCREMENTAL_DONE = "incremental.done"
@@ -391,6 +392,7 @@ def is_incremental_publish_kind(publish_kind: str) -> bool:
     return publish_kind in {
         PUBLISH_INCREMENTAL_NOOP,
         PUBLISH_INCREMENTAL_EXACT,
+        PUBLISH_INCREMENTAL_OVERLAY,
         PUBLISH_INCREMENTAL_CONTAINMENT,
     }
 
@@ -485,6 +487,8 @@ def merge_exact_route_detail(
             detail["event"] = "fallback"
         elif publish_kind == PUBLISH_INCREMENTAL_EXACT:
             detail["event"] = "exact"
+        elif publish_kind == PUBLISH_INCREMENTAL_OVERLAY:
+            detail["event"] = "overlay"
         elif publish_kind == PUBLISH_INCREMENTAL_NOOP:
             detail["event"] = "noop"
     return detail

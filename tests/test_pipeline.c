@@ -8141,7 +8141,7 @@ static void cleanup_incremental_repo(void) {
 static cbm_config_t *incremental_test_config(const char *cache_dir) {
     cbm_config_t *cfg = cbm_config_open(cache_dir);
     if (cfg) {
-        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "always");
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS);
     }
     return cfg;
 }
@@ -8533,7 +8533,8 @@ static int pipeline_store_overlay_file_has_function(const char *db_path, const c
     return found;
 }
 
-static int pipeline_store_completed_generation_count(const char *db_path, const char *project) {
+static int pipeline_store_generation_status_count(const char *db_path, const char *project,
+                                                  const char *status) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
         return CBM_STORE_ERR;
@@ -8545,8 +8546,7 @@ static int pipeline_store_completed_generation_count(const char *db_path, const 
     int count = CBM_STORE_ERR;
     if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
         sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, CBM_STORE_INDEX_STATUS_COMPLETE, CBM_NOT_FOUND,
-                          SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, status, CBM_NOT_FOUND, SQLITE_TRANSIENT);
         sqlite3_bind_int64(stmt, 3, CBM_PIPELINE_COMPAT_GENERATION);
         if (sqlite3_step(stmt) == SQLITE_ROW) {
             count = sqlite3_column_int(stmt, 0);
@@ -8555,6 +8555,11 @@ static int pipeline_store_completed_generation_count(const char *db_path, const 
     sqlite3_finalize(stmt);
     cbm_store_close(s);
     return count;
+}
+
+static int pipeline_store_completed_generation_count(const char *db_path, const char *project) {
+    return pipeline_store_generation_status_count(db_path, project,
+                                                  CBM_STORE_INDEX_STATUS_COMPLETE);
 }
 
 static int pipeline_store_count_file_rows_sql(const char *db_path, const char *project,
@@ -10612,6 +10617,70 @@ TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation) 
     PASS();
 }
 
+TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayRunOnly"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func OverlayRunOnly() int {\n\treturn 77\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(pipeline_store_generation_status_count(g_incr_dbpath, project,
+                                                     CBM_STORE_INDEX_STATUS_RESERVED),
+              0);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayRunOnly"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "leaf.go",
+                                                    "OverlayRunOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -11495,6 +11564,8 @@ TEST(pipeline_publish_kind_names_are_stable) {
                   "incremental_noop");
     ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT),
                   "incremental_exact");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY),
+                  "incremental_overlay");
     ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT),
                   "incremental_containment");
     ASSERT_STR_EQ(cbm_pipeline_publish_kind_name((cbm_pipeline_publish_kind_t)999), "unknown");
@@ -11803,9 +11874,18 @@ TEST(config_registry_includes_mcp_timeout_knobs) {
 TEST(config_registry_includes_incremental_reindex_policy) {
     const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_REINDEX);
     ASSERT_NOT_NULL(entry);
-    ASSERT_STR_EQ(entry->default_val, "off");
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_REINDEX_OFF);
     ASSERT_STR_EQ(entry->category, "Indexing");
     ASSERT_STR_EQ(entry->range, "fast|always|off");
+    PASS();
+}
+
+TEST(config_registry_includes_overlay_publish_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_OVERLAY_PUBLISH);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_OVERLAY_PUBLISH_OFF);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "off|small_deltas");
     PASS();
 }
 
@@ -12497,6 +12577,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_batch_rejects_invalid_token_stride);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(config_registry_includes_overlay_publish_policy);
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
@@ -12763,6 +12844,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
+    RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);

@@ -925,6 +925,7 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
 void cbm_pipeline_set_graph_changed(cbm_pipeline_t *p, bool changed);
 void cbm_pipeline_set_publish_kind(cbm_pipeline_t *p, cbm_pipeline_publish_kind_t kind);
 void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason);
+bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p);
 void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
                                         int affected_paths, int published_paths);
 

@@ -3644,6 +3644,39 @@ int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
+int cbm_store_latest_complete_index_generation(cbm_store_t *s, const char *project,
+                                               int64_t *out_generation) {
+    if (out_generation) {
+        *out_generation = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out_generation) {
+        if (s) {
+            store_set_error(s, "latest_complete_index_generation: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    static const char sql[] =
+        "SELECT COALESCE(MAX(generation), 0) FROM index_generations "
+        "WHERE project = ?1 AND status = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "latest_complete_index_generation prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, CBM_STORE_INDEX_STATUS_COMPLETE);
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        *out_generation = sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "latest_complete_index_generation");
+    return CBM_STORE_ERR;
+}
+
 static bool store_index_finish_status_valid(const char *status) {
     return status && (strcmp(status, CBM_STORE_INDEX_STATUS_COMPLETE) == 0 ||
                       strcmp(status, CBM_STORE_INDEX_STATUS_FAILED) == 0);

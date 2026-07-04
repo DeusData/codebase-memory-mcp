@@ -2879,12 +2879,18 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Re-index if DB is older than N seconds (0=disabled)",
      "0-2592000",
      "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
-    {CBM_CONFIG_INCREMENTAL_REINDEX, "off", NULL, "Indexing",
+    {CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_OFF, NULL, "Indexing",
      "When to use the disk incremental reindex path",
      "fast|always|off",
      "'off' rebuilds atomically from scratch and is the default until disk incremental avoids full-graph "
      "work. 'fast' uses incremental only for fast-mode indexes. 'always' preserves the legacy route for "
      "benchmarking and canary tests."},
+    {CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_OFF, NULL, "Indexing",
+     "Foreground overlay publish policy for bounded incremental deltas",
+     "off|small_deltas",
+     "'off' preserves canonical publish behavior. 'small_deltas' is opt-in: eligible exact-delta "
+     "batches publish ready overlay rows without mutating canonical graph rows; a canonical full "
+     "reindex remains the repair/oracle path."},
     {CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
      CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS,
      NULL,
