@@ -9214,6 +9214,21 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", type_arr);
     cbm_store_schema_free(&schema);
+
+    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
+        doc, root, store, proj,
+        "codebase://schema reads canonical graph schema counts; ready overlay rows are not "
+        "included until active schema resource views or compaction are available.");
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        if (!overlay_limitation_reported) {
+            add_response_warning(doc, root,
+                                 "codebase://schema reads canonical graph schema counts; dirty "
+                                 "file changes may be absent until overlay or reindex completes.");
+        }
+    }
 }
 
 /* CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE defined in constants section at top of file */
