@@ -1830,6 +1830,14 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
               CBM_STORE_OK);
     ASSERT_EQ(active_function_count, 2);
     cbm_store_free_nodes(active_functions, active_function_count);
+    active_functions = NULL;
+    active_function_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label_overlay_view_limited(live, "test", NULL, 1,
+                                                                 &active_functions,
+                                                                 &active_function_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_function_count, 1);
+    cbm_store_free_nodes(active_functions, active_function_count);
 
     const char *edge_types[] = {"CALLS"};
     cbm_traverse_result_t active_trace = {0};

@@ -35,6 +35,7 @@ enum {
 
 #include <ctype.h>
 #include "foundation/compat_regex.h"
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -2807,6 +2808,7 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
 static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
                                cbm_node_pattern_t *first, cypher_node_scan_mode_t scan_mode,
                                cbm_node_t **out_nodes, int *out_count) {
+    int seed_limit = max_rows > INT_MAX / CYP_GROWTH_10 ? INT_MAX : max_rows * CYP_GROWTH_10;
     if (first->label && strchr(first->label, '|')) {
         scan_alternation_labels(store, project, first->label, scan_mode, out_nodes, out_count);
     } else if (first->label) {
@@ -2817,12 +2819,13 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_
             cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
         }
     } else if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-        cbm_store_find_nodes_by_label_overlay_view(store, project, NULL, out_nodes, out_count);
+        cbm_store_find_nodes_by_label_overlay_view_limited(store, project, NULL, seed_limit,
+                                                           out_nodes, out_count);
     } else {
         cbm_search_params_t params = {.project = project,
                                       .min_degree = CYP_FOUND_NONE,
                                       .max_degree = CYP_FOUND_NONE,
-                                      .limit = max_rows * CYP_GROWTH_10};
+                                      .limit = seed_limit};
         cbm_search_output_t sout = {0};
         cbm_store_search(store, &params, &sout);
         *out_count = sout.count;
