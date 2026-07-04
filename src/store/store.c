@@ -6370,8 +6370,8 @@ static bool search_overlay_needs_active_edges(const cbm_search_params_t *params)
             strcmp(params->sort_by, "linkrank") == 0);
 }
 
-static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges,
-                                           bool recursive) {
+int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges,
+                                       bool recursive) {
     int n = snprintf(buf, buf_sz,
                      "%s active_files AS ("
                      "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
@@ -6439,7 +6439,7 @@ int cbm_store_find_node_by_qn_overlay_view(cbm_store_t *s, const char *project,
     memset(out, 0, sizeof(*out));
 
     char active_cte[ST_SQL_BUF];
-    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
         CBM_STORE_OK) {
         store_set_error(s, "find_node_by_qn_overlay active CTE SQL truncated");
         return CBM_STORE_ERR;
@@ -6495,7 +6495,7 @@ int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *projec
     }
 
     char active_cte[ST_SQL_BUF];
-    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
         CBM_STORE_OK) {
         store_set_error(s, "find_nodes_by_name_overlay active CTE SQL truncated");
         return CBM_STORE_ERR;
@@ -6955,8 +6955,8 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
                      : "FROM active_nodes n";
 
     char active_cte[ST_SQL_BUF];
-    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), use_active_edges,
-                                        false) !=
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), use_active_edges,
+                                           false) !=
         CBM_STORE_OK) {
         store_set_error(s, "search_overlay_view active CTE SQL truncated");
         return CBM_STORE_ERR;
@@ -7373,7 +7373,7 @@ int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *
     const char *pagerank_order = use_pagerank ? "bfs.hop, pr_rank DESC" : "bfs.hop, n.name";
 
     char active_cte[ST_SQL_BUF];
-    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), true, true) !=
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, true) !=
         CBM_STORE_OK) {
         cbm_store_traverse_free(&result);
         store_set_error(s, "bfs_overlay active CTE SQL truncated");

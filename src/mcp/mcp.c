@@ -297,10 +297,10 @@ static void add_overlay_active_node_search_freshness(
         doc, root,
         uses_active_edges
             ? "search_graph graph mode used overlay active node and relationship rows; "
-              "include_connected uses active one-hop names when requested; FTS query mode "
-              "and trace results remain canonical until separately enabled."
-            : "search_graph graph mode used overlay active node rows; FTS query mode and "
-              "trace results remain canonical until separately enabled.");
+              "include_connected uses active one-hop names when requested; query mode and "
+              "trace_path also use active overlay rows where supported."
+            : "search_graph graph mode used overlay active node rows; query mode and "
+              "trace_path also use active overlay rows where supported.");
 }
 
 static void add_overlay_active_trace_freshness(
@@ -327,8 +327,37 @@ static void add_overlay_active_trace_freshness(
                            summary->total_nodes_visible);
     add_response_warning(doc, root,
                          "trace_path used overlay active node and relationship rows for a "
-                         "resolved start node; FTS query mode remains canonical until "
-                         "separately enabled.");
+                         "resolved start node; architecture summaries and search_code remain "
+                         "canonical until separately enabled.");
+}
+
+static void add_overlay_active_query_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    if (!summary || summary->active_file_tombstones <= 0) {
+        return;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary->overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary->active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary->canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary->overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
+                           summary->total_nodes_visible);
+    add_response_warning(
+        doc, root,
+        "search_graph query used active overlay node rows: canonical BM25 rows from visible "
+        "files plus changed-file overlay rows matched by node text; hidden canonical files "
+        "are suppressed.");
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -3052,6 +3081,24 @@ enum {
     BM25_BIND_INNER = 5,
     BM25_BIND_FILE = 6,
     BM25_SQL_AUTO_LEN = -1,
+    BM25_MAX_TERMS = 32,
+    BM25_MAX_TERM_BYTES = 256,
+    BM25_OVERLAY_BIND_STATUS = 1,
+    BM25_OVERLAY_BIND_TOMBSTONE_KIND = 2,
+    BM25_OVERLAY_BIND_QUERY = 3,
+    BM25_OVERLAY_BIND_PROJECT = 4,
+    BM25_OVERLAY_BIND_LIMIT = 5,
+    BM25_OVERLAY_BIND_OFFSET = 6,
+    BM25_OVERLAY_BIND_INNER = 7,
+    BM25_OVERLAY_BIND_FILE = 8,
+    BM25_OVERLAY_BIND_TERMS_FIRST = 9,
+    BM25_OVERLAY_COL_LABEL = 1,
+    BM25_OVERLAY_COL_NAME = 2,
+    BM25_OVERLAY_COL_QN = 3,
+    BM25_OVERLAY_COL_FILE = 4,
+    BM25_OVERLAY_COL_START = 5,
+    BM25_OVERLAY_COL_END = 6,
+    BM25_OVERLAY_COL_RANK = 7,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
      *   SELECT rowid, bm25() FROM nodes_fts WHERE MATCH ? ORDER BY bm25() LIMIT N
@@ -3060,6 +3107,13 @@ enum {
      * N = BM25_INNER_LIMIT rather than the full match set size. */
     BM25_INNER_LIMIT = 2000,
 };
+
+static const double BM25_OVERLAY_BASE_RANK = -100000.0;
+
+typedef struct {
+    char *items[BM25_MAX_TERMS];
+    int count;
+} bm25_terms_t;
 
 /* Module-local SQLITE_TRANSIENT wrapper to dodge performance-no-int-to-ptr.
  * See the matching helper in src/store/store.c for the same pattern. */
@@ -3071,43 +3125,92 @@ static sqlite3_destructor_type mcp_sqlite_transient(void) {
 }
 #define MCP_SQLITE_TRANSIENT (mcp_sqlite_transient())
 
-static int bm25_build_match(const char *query, char *out, size_t out_size) {
-    if (!query || !out || out_size < BM25_MIN_BUF) {
+static bool bm25_is_token_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_';
+}
+
+static void bm25_terms_free(bm25_terms_t *terms) {
+    if (!terms) {
+        return;
+    }
+    for (int i = 0; i < terms->count; i++) {
+        free(terms->items[i]);
+        terms->items[i] = NULL;
+    }
+    terms->count = 0;
+}
+
+static int bm25_collect_terms(const char *query, bm25_terms_t *terms) {
+    if (!query || !terms) {
         return 0;
     }
-    size_t pos = 0;
-    int tokens = 0;
+    memset(terms, 0, sizeof(*terms));
     const char *p = query;
     while (*p) {
-        while (*p && !((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                       (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && !bm25_is_token_char(*p)) {
             p++;
         }
         if (!*p) {
             break;
         }
         const char *tok_start = p;
-        while (*p && ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
-                      (*p >= '0' && *p <= '9') || *p == '_')) {
+        while (*p && bm25_is_token_char(*p)) {
             p++;
         }
         size_t tok_len = (size_t)(p - tok_start);
+        if (tok_len == 0 || tok_len > BM25_MAX_TERM_BYTES) {
+            continue;
+        }
+        if (terms->count >= BM25_MAX_TERMS) {
+            break;
+        }
+        char *term = malloc(tok_len + SKIP_ONE);
+        if (!term) {
+            bm25_terms_free(terms);
+            return CBM_STORE_ERR;
+        }
+        memcpy(term, tok_start, tok_len);
+        term[tok_len] = '\0';
+        terms->items[terms->count++] = term;
+    }
+    return terms->count;
+}
+
+static int bm25_build_match_from_terms(const bm25_terms_t *terms, char *out, size_t out_size) {
+    if (!terms || !out || out_size < BM25_MIN_BUF) {
+        return 0;
+    }
+    size_t pos = 0;
+    for (int i = 0; i < terms->count; i++) {
+        const char *term = terms->items[i];
+        size_t tok_len = term ? strlen(term) : 0;
         if (tok_len == 0) {
             continue;
         }
-        const char *sep = (tokens > 0) ? " OR " : "";
+        const char *sep = (pos > 0) ? " OR " : "";
         size_t sep_len = strlen(sep);
         if (pos + sep_len + tok_len + BM25_SEP_RESERVE >= out_size) {
             break; /* out of room — stop cleanly, keep what we have */
         }
         memcpy(out + pos, sep, sep_len);
         pos += sep_len;
-        memcpy(out + pos, tok_start, tok_len);
+        memcpy(out + pos, term, tok_len);
         pos += tok_len;
-        tokens++;
     }
     out[pos] = '\0';
-    return tokens;
+    return pos > 0 ? terms->count : 0;
+}
+
+static int bm25_build_match(const char *query, char *out, size_t out_size) {
+    bm25_terms_t terms = {0};
+    int term_count = bm25_collect_terms(query, &terms);
+    if (term_count <= 0) {
+        return 0;
+    }
+    int emitted = bm25_build_match_from_terms(&terms, out, out_size);
+    bm25_terms_free(&terms);
+    return emitted;
 }
 
 static char *bm25_file_pattern_like(const char *file_pattern) {
@@ -3128,6 +3231,285 @@ static char *bm25_file_pattern_like(const char *file_pattern) {
         }
     }
     return like;
+}
+
+static char *bm25_like_pattern_from_term(const char *term) {
+    if (!term) {
+        return NULL;
+    }
+    size_t escaped_len = MCP_SEPARATOR; /* leading and trailing '%' */
+    for (const char *p = term; *p; p++) {
+        escaped_len += (*p == '_' || *p == '%' || *p == '\\') ? MCP_SEPARATOR : SKIP_ONE;
+    }
+    char *pattern = malloc(escaped_len + SKIP_ONE);
+    if (!pattern) {
+        return NULL;
+    }
+    size_t pos = 0;
+    pattern[pos++] = '%';
+    for (const char *p = term; *p; p++) {
+        if (*p == '_' || *p == '%' || *p == '\\') {
+            pattern[pos++] = '\\';
+        }
+        pattern[pos++] = *p;
+    }
+    pattern[pos++] = '%';
+    pattern[pos] = '\0';
+    return pattern;
+}
+
+static int bm25_build_overlay_terms_clause(const bm25_terms_t *terms, char *out,
+                                           size_t out_size) {
+    if (!terms || !out || out_size == 0) {
+        return CBM_STORE_ERR;
+    }
+    out[0] = '\0';
+    size_t used = 0;
+    for (int i = 0; i < terms->count; i++) {
+        int bind_idx = BM25_OVERLAY_BIND_TERMS_FIRST + i;
+        char part[CBM_SZ_512];
+        int n = snprintf(part, sizeof(part),
+                         "%s(n.name LIKE ?%d ESCAPE '\\' "
+                         "OR n.qualified_name LIKE ?%d ESCAPE '\\' "
+                         "OR n.label LIKE ?%d ESCAPE '\\' "
+                         "OR n.file_path LIKE ?%d ESCAPE '\\')",
+                         i > 0 ? " OR " : "", bind_idx, bind_idx, bind_idx, bind_idx);
+        if (n < 0 || (size_t)n >= sizeof(part)) {
+            return CBM_STORE_ERR;
+        }
+        if (used + (size_t)n >= out_size) {
+            return CBM_STORE_ERR;
+        }
+        memcpy(out + used, part, (size_t)n);
+        used += (size_t)n;
+        out[used] = '\0';
+    }
+    return used > 0 ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+static int bm25_bind_overlay_query(sqlite3_stmt *stmt, const char *fts_query,
+                                   const char *project, int limit, int offset,
+                                   const char *file_like, const bm25_terms_t *terms) {
+    sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_STATUS, CBM_STORE_OVERLAY_STATUS_READY,
+                      BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_TOMBSTONE_KIND, CBM_STORE_OVERLAY_TOMBSTONE_FILE,
+                      BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_QUERY, fts_query, BM25_SQL_AUTO_LEN,
+                      MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_PROJECT, project, BM25_SQL_AUTO_LEN,
+                      MCP_SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, BM25_OVERLAY_BIND_LIMIT, limit > 0 ? limit : BM25_DEFAULT_LIMIT);
+    sqlite3_bind_int(stmt, BM25_OVERLAY_BIND_OFFSET, offset > 0 ? offset : 0);
+    sqlite3_bind_int(stmt, BM25_OVERLAY_BIND_INNER, BM25_INNER_LIMIT);
+    if (file_like) {
+        sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_FILE, file_like, BM25_SQL_AUTO_LEN,
+                          MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_OVERLAY_BIND_FILE);
+    }
+    for (int i = 0; terms && i < terms->count; i++) {
+        char *like = bm25_like_pattern_from_term(terms->items[i]);
+        if (!like) {
+            return CBM_STORE_ERR;
+        }
+        sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_TERMS_FIRST + i, like, BM25_SQL_AUTO_LEN,
+                          MCP_SQLITE_TRANSIENT);
+        free(like);
+    }
+    return CBM_STORE_OK;
+}
+
+/* Overlay-aware query mode keeps the canonical BM25 fast path for unchanged files,
+ * suppresses canonical rows hidden by active file tombstones, and unions in owned
+ * changed-file overlay rows by bounded node-text matching. */
+static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
+                                        const char *query, const char *file_pattern, int limit,
+                                        int offset,
+                                        const cbm_store_overlay_node_view_summary_t *summary) {
+    if (!summary || summary->active_file_tombstones <= 0) {
+        return NULL;
+    }
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db) {
+        return NULL;
+    }
+
+    bm25_terms_t terms = {0};
+    int term_count = bm25_collect_terms(query, &terms);
+    if (term_count <= 0) {
+        return NULL;
+    }
+    char fts_query[BM25_QUERY_BUF];
+    if (bm25_build_match_from_terms(&terms, fts_query, sizeof(fts_query)) <= 0) {
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+
+    char active_cte[CBM_SZ_8K];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    char overlay_terms_clause[CBM_SZ_8K];
+    if (bm25_build_overlay_terms_clause(&terms, overlay_terms_clause,
+                                        sizeof(overlay_terms_clause)) != CBM_STORE_OK) {
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    char *file_like = bm25_file_pattern_like(file_pattern);
+
+    char ranked_sql[CBM_SZ_16K];
+    int n = snprintf(
+        ranked_sql, sizeof(ranked_sql),
+        "%s"
+        ", ranked AS ("
+        "  SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, "
+        "         n.end_line, "
+        "         (fts.base_rank "
+        "          - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+        "                 WHEN n.label = 'Route' THEN 8.0 "
+        "                 WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
+        "                 ELSE 0.0 END) AS rank "
+        "  FROM ("
+        "      SELECT rowid, bm25(nodes_fts) AS base_rank"
+        "      FROM nodes_fts WHERE nodes_fts MATCH ?3"
+        "      ORDER BY base_rank LIMIT ?7"
+        "  ) fts "
+        "  JOIN active_nodes n ON n.id = fts.rowid "
+        "  WHERE n.project = ?4 "
+        "    AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        "    AND (?8 IS NULL OR n.file_path LIKE ?8) "
+        "  UNION ALL "
+        "  SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, "
+        "         n.end_line, "
+        "         (%.1f - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+        "                  WHEN n.label = 'Route' THEN 8.0 "
+        "                  WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
+        "                  ELSE 0.0 END) AS rank "
+        "  FROM active_nodes n "
+        "  WHERE n.id = %d AND n.project = ?4 "
+        "    AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        "    AND (?8 IS NULL OR n.file_path LIKE ?8) "
+        "    AND (%s)"
+        ") ",
+        active_cte, BM25_OVERLAY_BASE_RANK, CBM_STORE_NO_NODE_ID, overlay_terms_clause);
+    if (n < 0 || (size_t)n >= sizeof(ranked_sql)) {
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+
+    char sql[CBM_SZ_16K];
+    n = snprintf(sql, sizeof(sql),
+                 "%sSELECT id, label, name, qualified_name, file_path, start_line, end_line, "
+                 "rank FROM ranked ORDER BY rank, name, qualified_name LIMIT ?5 OFFSET ?6",
+                 ranked_sql);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+
+    char count_sql[CBM_SZ_16K];
+    n = snprintf(count_sql, sizeof(count_sql), "%sSELECT COUNT(*) FROM ranked", ranked_sql);
+    if (n < 0 || (size_t)n >= sizeof(count_sql)) {
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+
+    int total = 0;
+    sqlite3_stmt *cs = NULL;
+    if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) != SQLITE_OK) {
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    if (bm25_bind_overlay_query(cs, fts_query, project, limit, offset, file_like, &terms) !=
+        CBM_STORE_OK ||
+        sqlite3_step(cs) != SQLITE_ROW) {
+        sqlite3_finalize(cs);
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    total = sqlite3_column_int(cs, 0);
+    sqlite3_finalize(cs);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, BM25_SQL_AUTO_LEN, &stmt, NULL) != SQLITE_OK) {
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    if (bm25_bind_overlay_query(stmt, fts_query, project, limit, offset, file_like, &terms) !=
+        CBM_STORE_OK) {
+        sqlite3_finalize(stmt);
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        sqlite3_finalize(stmt);
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        sqlite3_finalize(stmt);
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "total", total);
+    yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
+    add_overlay_active_query_freshness(doc, root, summary);
+
+    yyjson_mut_val *results = yyjson_mut_arr(doc);
+    int emitted = 0;
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(
+            doc, item, "name", (const char *)sqlite3_column_text(stmt, BM25_OVERLAY_COL_NAME));
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                  (const char *)sqlite3_column_text(stmt, BM25_OVERLAY_COL_QN));
+        yyjson_mut_obj_add_strcpy(
+            doc, item, "label", (const char *)sqlite3_column_text(stmt, BM25_OVERLAY_COL_LABEL));
+        yyjson_mut_obj_add_strcpy(
+            doc, item, "file_path", (const char *)sqlite3_column_text(stmt, BM25_OVERLAY_COL_FILE));
+        yyjson_mut_obj_add_int(doc, item, "start_line",
+                               sqlite3_column_int(stmt, BM25_OVERLAY_COL_START));
+        yyjson_mut_obj_add_int(doc, item, "end_line",
+                               sqlite3_column_int(stmt, BM25_OVERLAY_COL_END));
+        yyjson_mut_obj_add_real(doc, item, "rank",
+                                sqlite3_column_double(stmt, BM25_OVERLAY_COL_RANK));
+        yyjson_mut_arr_add_val(results, item);
+        emitted++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        yyjson_mut_doc_free(doc);
+        sqlite3_finalize(stmt);
+        free(file_like);
+        bm25_terms_free(&terms);
+        return NULL;
+    }
+    sqlite3_finalize(stmt);
+    free(file_like);
+    bm25_terms_free(&terms);
+
+    yyjson_mut_obj_add_val(doc, root, "results", results);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", total > offset + emitted);
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return json;
 }
 
 /* Run the BM25 full-text search path and return the JSON result string.
@@ -3558,8 +3940,27 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                                                    CBM_MCP_DEFAULT_SEARCH_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
+        cbm_store_overlay_node_view_summary_t q_overlay_summary = {0};
+        bool q_overlay_ready =
+            project && project[0] &&
+            cbm_store_get_overlay_node_view_summary(store, project, &q_overlay_summary) ==
+                CBM_STORE_OK &&
+            q_overlay_summary.active_file_tombstones > 0;
+        char *bm25_json =
+            q_overlay_ready
+                ? bm25_search_overlay_active(store, project, query, q_file_pattern, q_limit,
+                                             q_offset, &q_overlay_summary)
+                : bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
         free(q_file_pattern);
+        if (q_overlay_ready && !bm25_json) {
+            free(query);
+            free(pe.value);
+            return cbm_mcp_text_result(
+                "{\"error\":\"search_graph query overlay read failed\","
+                "\"hint\":\"Retry after a full reindex or use graph-mode filters until the "
+                "overlay query path can be rebuilt.\"}",
+                true);
+        }
         if (bm25_json) {
             bool sq_type_error = false;
             char *composed_json =
@@ -4194,7 +4595,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         add_overlay_node_read_view_summary(
             doc, root, store, project,
             "index_status includes overlay_read_view counts, but nodes/edges are canonical counts "
-            "and search/trace results remain canonical until overlay-aware tools are enabled.");
+            "while overlay-aware tools may read active overlay rows.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "no_project");
     }
@@ -8773,7 +9174,7 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
     add_overlay_node_read_view_summary(
         doc, root, store, proj,
         "codebase://status includes overlay_read_view counts, but nodes/edges are canonical "
-        "counts and search/trace results remain canonical until overlay-aware tools are enabled.");
+        "counts while overlay-aware tools may read active overlay rows.");
 
     /* PageRank stats */
     struct sqlite3 *db = cbm_store_get_db(store);

@@ -756,6 +756,10 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
  * overlay for each changed file. Overlay rows use id=CBM_STORE_NO_NODE_ID. */
 int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *params,
                                   cbm_search_output_t *out);
+/* Build the active-overlay CTE prefix used by overlay read paths. This keeps
+ * MCP/store query modes on one tombstone + latest-ready-overlay definition. */
+int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges,
+                                       bool recursive);
 
 /* Free a search output's allocated memory. */
 void cbm_store_search_free(cbm_search_output_t *out);
