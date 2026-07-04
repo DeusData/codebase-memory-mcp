@@ -32,10 +32,27 @@ void cbm_index_set_worker_role(bool is_worker, const char *response_out);
 bool cbm_index_worker_active(void);
 const char *cbm_index_worker_response_out(void);
 
+/* Host marking (#845): the supervisor gate is OPT-IN per process. Only the real
+ * codebase-memory-mcp binary calls this (first thing in main(), before any
+ * subcommand dispatch, so MCP server + CLI + HTTP paths are all covered).
+ * EMBEDDERS of cbm_mcp_handle_tool (test binaries, future library users) never
+ * call it, so they index in-process by default. Without this gate the supervisor
+ * resolved the CURRENT executable and re-invoked it as
+ * `<self> cli --index-worker …` — a test binary ignores those args and re-runs
+ * its suites instead, producing recursive spawn chains (11-min hangs; kernel
+ * VM-map pressure during the 2026-07-04 host panics). */
+void cbm_index_supervisor_mark_host(void);
+
 /* True when handle_index_repository should wrap the run in a supervised child:
- * this process is not itself a worker AND the kill switch (CBM_INDEX_SUPERVISOR=0)
- * is not set. */
+ * this process called cbm_index_supervisor_mark_host() (i.e. it IS the real
+ * binary, not an embedder), is not itself a worker, AND the kill switch
+ * (CBM_INDEX_SUPERVISOR=0) is not set. */
 bool cbm_index_supervisor_should_wrap(void);
+
+/* TEST HOOK (#845): process-wide count of worker-spawn attempts, incremented on
+ * entry to cbm_index_spawn_worker. Embedder tests assert the count is unchanged
+ * across an index_repository call to prove indexing ran IN-PROCESS. */
+int cbm_index_supervisor_spawn_count(void);
 
 typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */

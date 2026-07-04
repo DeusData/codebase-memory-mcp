@@ -34,6 +34,19 @@
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
+/* True when a graph node is a structural directory container (Folder/Project)
+ * rather than a code node. In a directory-based-module language (Java/Go, see
+ * cbm_lang_module_is_dir) a file's module QN equals its directory QN, so an
+ * enclosing-scope lookup for a CLASS-LEVEL usage/call (enclosing_func_qn ==
+ * module_qn) resolves to the ONE Folder/Project node shared by every file in
+ * that package. Sourcing an edge there conflates all same-package files into a
+ * single source node with an arbitrary file_path (#787). Source-node finders
+ * must treat such a hit as a miss and fall back to the per-file File node. */
+static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
+}
+
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
 #define CBM_US_PER_SEC 1000000LL
@@ -431,6 +444,21 @@ char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *i
  * Each worker creates nodes in a per-worker gbuf, then merges into ctx->gbuf.
  * Caches CBMFileResult* in result_cache[file_idx] for reuse in Phase 3B/4.
  * shared_ids provides globally unique node/edge IDs across workers. */
+
+/* Source-retention tuning for cbm_parallel_extract_ex. Zero-valued byte caps
+ * mean "use the derived default" (RAM-fraction total, clamped to an absolute
+ * ceiling; modest per-file cap); CBM_RETAIN_TOTAL_MB / CBM_RETAIN_PER_FILE_MB
+ * override those. retain_sources_set=false keeps the default retain policy. */
+typedef struct {
+    bool retain_sources;
+    bool retain_sources_set; /* false keeps the default retain_sources policy */
+    size_t retain_total_budget_bytes;
+    size_t retain_per_file_max_bytes;
+} cbm_parallel_extract_opts_t;
+
+int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                            CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
+                            int worker_count, const cbm_parallel_extract_opts_t *opts);
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);

@@ -62,3 +62,7 @@ soak-results/
 
 # Local npm cache
 graph-ui/.npm-cache-local/
+
+# Python bytecode from tests/windows/ harness
+__pycache__/
+*.pyc

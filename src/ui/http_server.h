@@ -14,6 +14,7 @@
 #include <stddef.h>
 
 typedef struct cbm_http_server cbm_http_server_t;
+struct cbm_watcher;
 
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
@@ -38,6 +39,9 @@ int cbm_http_server_port(const cbm_http_server_t *srv);
 
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
+
+/* Set external watcher reference for UI project lifecycle actions. Not owned. */
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
 
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);

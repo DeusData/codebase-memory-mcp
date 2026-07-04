@@ -236,7 +236,9 @@ typedef struct {
     int loop_depth;                     // enclosing loop nesting at the call site
     int branch_depth;                   // enclosing branch nesting at the call site
     int start_line;                     // 1-based source line of the call (for def range-match)
-    bool is_method;                     // Perl-only: arrow/method call ($obj->m). Default false.
+    bool is_method;                     // method/member call with a non-self receiver. Perl:
+                                        // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                        // x.foo() whose receiver is not this/super. Default false.
 } CBMCall;
 
 typedef struct {

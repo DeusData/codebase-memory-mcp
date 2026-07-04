@@ -43,7 +43,27 @@ const char *cbm_index_worker_response_out(void) {
     return g_worker_response_out[0] ? g_worker_response_out : NULL;
 }
 
+/* Test hook (#845): counts spawn ATTEMPTS (entry to cbm_index_spawn_worker),
+ * including ones that fail to resolve the self binary — an embedder must never
+ * even try to spawn. */
+static int g_spawn_count = 0;
+
+int cbm_index_supervisor_spawn_count(void) {
+    return g_spawn_count;
+}
+
+/* #845: opt-in host mark — see the header. Set once from the real binary's
+ * main(); embedders never set it, so should_wrap() stays false for them. */
+static bool g_host_marked = false;
+
+void cbm_index_supervisor_mark_host(void) {
+    g_host_marked = true;
+}
+
 bool cbm_index_supervisor_should_wrap(void) {
+    if (!g_host_marked) {
+        return false; /* embedder (#845): never spawn `<self> cli --index-worker` */
+    }
     if (g_worker_active) {
         return false; /* I am the worker — run in-process, never re-supervise */
     }
@@ -115,6 +135,7 @@ static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffi
 
 int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
                            const char *quarantine_file, cbm_index_worker_result_t *result) {
+    g_spawn_count++; /* test hook (#845) — see cbm_index_supervisor_spawn_count */
     result->outcome = CBM_PROC_SPAWN_FAILED;
     result->exit_code = -1;
     result->term_signal = 0;

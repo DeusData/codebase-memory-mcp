@@ -75,6 +75,12 @@ echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
 bash "$ROOT/tests/test_parent_watchdog.sh"
 
+# Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
+# (`cli --index-worker …`) whose supervisor dies must self-exit instead of
+# indexing on as an orphan. Reuses the prod binary built in Step 5.
+echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
+bash "$ROOT/tests/test_worker_watchdog.sh"
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).

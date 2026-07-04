@@ -223,6 +223,14 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
+/* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
+ * drop (#592/#606): true only for TS/JS, only for a member call with a
+ * non-this/super receiver (is_method), and only when the match used a weak
+ * short-name strategy (suffix_match / unique_name / field_type_hint / fuzzy).
+ * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 

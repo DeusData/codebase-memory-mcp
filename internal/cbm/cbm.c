@@ -22,6 +22,19 @@
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
 #if defined(HAVE_LIBGIT2)
+#include <git2/version.h>
+#if defined(LIBGIT2_VERSION_CHECK)
+#if !LIBGIT2_VERSION_CHECK(1, 7, 0)
+#error "HAVE_LIBGIT2 requires libgit2 >= 1.7.0 for git_allocator"
+#endif
+#elif defined(LIBGIT2_VER_MAJOR) && defined(LIBGIT2_VER_MINOR) && defined(LIBGIT2_VER_REVISION)
+#if ((LIBGIT2_VER_MAJOR * 1000000) + (LIBGIT2_VER_MINOR * 10000) + (LIBGIT2_VER_REVISION * 100)) < \
+    1070000
+#error "HAVE_LIBGIT2 requires libgit2 >= 1.7.0 for git_allocator"
+#endif
+#else
+#error "HAVE_LIBGIT2 requires known libgit2 version macros for the >= 1.7.0 git_allocator guard"
+#endif
 #include <git2.h>           // git_libgit2_opts, GIT_OPT_SET_ALLOCATOR — bind libgit2 to mimalloc
 #include <git2/sys/alloc.h> // git_allocator — not pulled in by <git2.h> (it's a sys/ header)
 #endif
@@ -289,8 +302,8 @@ static void cbm_sqlite_memshutdown(void *appdata) {
 }
 
 #if defined(HAVE_LIBGIT2)
-/* libgit2 git_allocator backed by mimalloc. The struct (current libgit2) has
- * exactly three members: gmalloc(size_t,file,line), grealloc(ptr,size,file,line),
+/* libgit2 >= 1.7 git_allocator backed by mimalloc. The struct has exactly
+ * three members: gmalloc(size_t,file,line), grealloc(ptr,size,file,line),
  * gfree(ptr). The file/line args are ignored. */
 static void *cbm_git_malloc(size_t n, const char *file, int line) {
     (void)file;

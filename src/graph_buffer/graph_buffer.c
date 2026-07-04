@@ -635,25 +635,30 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     /* Check if node already exists */
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_qn, qualified_name);
     if (existing) {
+        /* Don't let a per-file "Module" def touch a structural directory node
+         * ("Project" root or "Folder"). In a directory-based-module language
+         * (Go/Java) a file's module_qn equals its directory QN: a root file →
+         * the project name (== the "Project" node's QN); a file in pkg/ →
+         * proj.pkg (== the "pkg/" Folder node's QN). Its always-emitted Module
+         * def collides here; the directory node is the package/module container
+         * and must keep its structural label AND its own name/file_path/range.
+         * Updating those in place set the shared node's file_path to whichever
+         * same-package file happened to be processed LAST (worker-order
+         * dependent) — the nondeterministic file attribution behind #787 — and
+         * left the Folder node exposed to delete-nodes-by-file on incremental
+         * reindex of that file. Skip the update entirely. (Both the sequential
+         * upsert and the parallel local-gbuf merge route through this function.) */
+        if (existing->label && label && strcmp(label, "Module") == 0 &&
+            (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
+            return existing->id;
+        }
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
          * label == existing->label), so the old value is replaced, never freed. */
         char *new_name = heap_strdup(name);
         char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
-        /* Don't let a per-file "Module" def downgrade a structural directory node
-         * ("Project" root or "Folder"). In a directory-based-module language
-         * (Go/Java) a file's module_qn equals its directory QN: a root file →
-         * the project name (== the "Project" node's QN); a file in pkg/ →
-         * proj.pkg (== the "pkg/" Folder node's QN). Its always-emitted Module
-         * def collides here; the directory node is the package/module container
-         * and must keep its structural label. (Both the sequential upsert and the
-         * parallel local-gbuf merge route through this function.) */
-        if (!(existing->label && label && strcmp(label, "Module") == 0 &&
-              (strcmp(existing->label, "Project") == 0 ||
-               strcmp(existing->label, "Folder") == 0))) {
-            existing->label = (char *)gb_intern(gb, label);
-        }
+        existing->label = (char *)gb_intern(gb, label);
         free(existing->name);
         existing->name = new_name;
         existing->file_path = (char *)gb_intern(gb, file_path);
@@ -1112,15 +1117,30 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
  * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
 static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                   const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
-    existing->label = (char *)gb_intern(dst, sn->label);
-    free(existing->name);
-    existing->name = heap_strdup(sn->name);
-    existing->file_path = (char *)gb_intern(dst, sn->file_path);
-    existing->start_line = sn->start_line;
-    existing->end_line = sn->end_line;
-    if (sn->properties_json) {
-        free(existing->properties_json);
-        existing->properties_json = heap_strdup(sn->properties_json);
+    /* Same guard as cbm_gbuf_upsert_node: a per-file "Module" def coming from a
+     * worker-local gbuf must not touch the structural directory node ("Project"
+     * root or "Folder") that shares its QN in a directory-based-module language
+     * (Java/Go). pass_structure seeds Folder/Project nodes on the MAIN gbuf
+     * before the parallel extract, so every worker's always-emitted Module def
+     * for that package collides here; unconditional "src wins" relabelled the
+     * directory node to Module and set its file_path to whichever worker merged
+     * LAST — the nondeterministic USAGE-source misattribution of #787. Keep the
+     * structural node intact; the ID remap below still redirects the worker's
+     * edges onto the canonical node. */
+    bool module_on_container =
+        existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
+        (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
+    if (!module_on_container) {
+        existing->label = (char *)gb_intern(dst, sn->label);
+        free(existing->name);
+        existing->name = heap_strdup(sn->name);
+        existing->file_path = (char *)gb_intern(dst, sn->file_path);
+        existing->start_line = sn->start_line;
+        existing->end_line = sn->end_line;
+        if (sn->properties_json) {
+            free(existing->properties_json);
+            existing->properties_json = heap_strdup(sn->properties_json);
+        }
     }
 
     if (sn->id != existing->id) {

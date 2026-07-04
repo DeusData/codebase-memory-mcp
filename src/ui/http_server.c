@@ -19,6 +19,7 @@
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include "watcher/watcher.h"
 #include "cli/cli.h"
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
@@ -31,6 +32,7 @@
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 
+#include <errno.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -114,6 +116,7 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 struct cbm_http_server {
     cbm_httpd_t *listener;
     cbm_mcp_server_t *mcp; /* own MCP server instance (read-only) */
+    struct cbm_watcher *watcher; /* external watcher ref (not owned) */
     atomic_int stop_flag;
     int port;
     bool listener_ok;
@@ -994,8 +997,15 @@ static void handle_index_status(cbm_http_conn_t *c) {
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
+static void unwatch_project(cbm_http_server_t *srv, const char *name) {
+    if (srv && srv->watcher) {
+        cbm_watcher_unwatch(srv->watcher, name);
+    }
+}
+
 /* DELETE /api/project?name=X — deletes the .db file */
-static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
+                                  const cbm_http_req_t *req) {
     char name[256] = {0};
     if (!cbm_http_query_param(req->query, "name", name, (int)sizeof(name)) || name[0] == '\0') {
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
@@ -1004,13 +1014,17 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
-
-    if (!cbm_file_exists(db_path)) {
+    if (db_path[0] == '\0') {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
     if (unlink(db_path) != 0) {
+        if (errno == ENOENT) {
+            unwatch_project(srv, name);
+            cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+            return;
+        }
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
     }
@@ -1022,6 +1036,7 @@ static void handle_delete_project(cbm_http_conn_t *c, const cbm_http_req_t *req)
     (void)unlink(wal_path);
     (void)unlink(shm_path);
 
+    unwatch_project(srv, name);
     cbm_log_info("ui.project.deleted", "name", name);
     cbm_http_replyf(c, 200, g_cors_json, "{\"deleted\":true}");
 }
@@ -1419,7 +1434,7 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
     /* DELETE /api/project → delete a project's .db file */
     if (is_delete && cbm_http_path_match(req->path, "/api/project*")) {
-        handle_delete_project(c, req);
+        handle_delete_project(srv, c, req);
         return;
     }
 
@@ -1583,5 +1598,11 @@ int cbm_http_server_port(const cbm_http_server_t *srv) {
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {
     if (srv && srv->listener_ok) {
         cbm_httpd_set_recv_deadline_ms(srv->listener, ms);
+    }
+}
+
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher) {
+    if (srv) {
+        srv->watcher = watcher;
     }
 }

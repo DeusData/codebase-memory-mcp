@@ -1869,6 +1869,35 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
  * first and one branch is lost (#495). Fold the cfg predicate into the QN so
  * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
  * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
+/* Rust: mark a function as a test when it carries a test attribute (#855).
+ * cbm's test detection is otherwise file-path-based (cbm_is_test_file:
+ * *_test.rs / test_*), so inline #[test]/#[tokio::test] functions inside a
+ * regular .rs file are indexed as ordinary Functions (is_test=false) and leak
+ * past the store.c `is_test != 1` filter into graph/agent context. The
+ * attribute_item text extract_decorators stores is the bracketed form
+ * ("#[test]", "#[tokio::test]", "#[tokio::test(...)]", ...). */
+static bool rust_def_is_test(const char *const *decorators) {
+    if (!decorators) {
+        return false;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        const char *d = decorators[i];
+        /* Path-qualified async/param test macros (substring match, robust to the
+         * optional argument list and the surrounding #[ ]). */
+        if (strstr(d, "tokio::test") || strstr(d, "async_std::test") ||
+            strstr(d, "actix_rt::test") || strstr(d, "test_case::case")) {
+            return true;
+        }
+        /* Bare #[test] / #[test(...)]: match the bracketed path exactly so we do
+         * NOT match the unrelated #[test_case::case] (handled above) or a
+         * hypothetical #[test_crate]. */
+        if (strstr(d, "#[test]") || strstr(d, "#[test(")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
                                            const char *const *decorators) {
     if (!decorators) {
@@ -3192,6 +3221,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
         def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.is_test = rust_def_is_test(def.decorators);
     }
 
     // Docstring

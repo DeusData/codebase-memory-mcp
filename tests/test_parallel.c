@@ -112,8 +112,10 @@ static cbm_gbuf_t *run_sequential(const char *project, const char *repo_path,
 
 /* ── Run parallel pipeline on files, returning gbuf ───────────────── */
 
-static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_file_info_t *files,
-                                int file_count, int worker_count) {
+static cbm_gbuf_t *run_parallel_with_extract_opts(const char *project, const char *repo_path,
+                                                  cbm_file_info_t *files, int file_count,
+                                                  int worker_count,
+                                                  const cbm_parallel_extract_opts_t *extract_opts) {
     cbm_gbuf_t *gbuf = cbm_gbuf_new(project, repo_path);
     cbm_registry_t *reg = cbm_registry_new();
     atomic_int cancelled;
@@ -131,10 +133,15 @@ static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_
     int64_t gbuf_next = cbm_gbuf_next_id(gbuf);
     atomic_init(&shared_ids, gbuf_next);
 
-    CBMFileResult **result_cache = calloc(file_count, sizeof(CBMFileResult *));
+    CBMFileResult **result_cache = calloc((size_t)file_count, sizeof(CBMFileResult *));
 
     cbm_init();
-    cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
+    if (extract_opts) {
+        cbm_parallel_extract_ex(&ctx, files, file_count, result_cache, &shared_ids, worker_count,
+                                extract_opts);
+    } else {
+        cbm_parallel_extract(&ctx, files, file_count, result_cache, &shared_ids, worker_count);
+    }
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_build_registry_from_cache(&ctx, files, file_count, result_cache);
@@ -173,6 +180,12 @@ static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_
 
     cbm_registry_free(reg);
     return gbuf;
+}
+
+static cbm_gbuf_t *run_parallel(const char *project, const char *repo_path, cbm_file_info_t *files,
+                                int file_count, int worker_count) {
+    return run_parallel_with_extract_opts(project, repo_path, files, file_count, worker_count,
+                                          NULL);
 }
 
 /* ── Parity Tests ─────────────────────────────────────────────────── */
@@ -741,8 +754,7 @@ TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
     int64_t nid = cbm_gbuf_upsert_node(tgbuf, "Method", "run", "proj.zeta.Helper.run",
                                        "zeta/helper.py", 1, 3, NULL);
     ASSERT_TRUE(nid != 0);
-    ASSERT_TRUE(cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", false) ==
-                NULL);
+    ASSERT_TRUE(cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", false) == NULL);
     const cbm_gbuf_node_t *jvm_hit =
         cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", true);
     ASSERT_NOT_NULL(jvm_hit);
@@ -884,6 +896,129 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+/* RED/GREEN A — the graph-quality guarantee behind the low-RAM retention cap.
+ *
+ * The fused cross-file LSP step re-parses each file's source to resolve calls
+ * whose receiver type lives in ANOTHER file (the per-file pass cannot). When
+ * the retention cap drops a file's source, that resolution MUST still happen
+ * via a bounded on-demand re-read; otherwise the cross-file CALLS edge is LOST.
+ *
+ * Fixture: a Java<->Kotlin pair with genuinely cross-language calls that only
+ * the cross-file LSP resolves — JavaCaller.call -> KotlinService.ping (Java ->
+ * Kotlin) and KotlinService.ping -> JavaService.pong (Kotlin -> Java). These
+ * carry the "lsp" strategy and do NOT exist without the cross-file source,
+ * unlike same-file or import-local Python calls which the per-file pass already
+ * resolves (so counting lsp edges on those cannot detect the fallback).
+ *
+ * Three scenarios asserted GREEN with the re-read fallback in place:
+ *   1. CONTROL   — default retention: both cross-file edges present. Proves the
+ *                  fixture genuinely produces them (non-vacuity guard).
+ *   2. NO-RETAIN — retain_sources=false: nothing retained -> edges survive only
+ *                  via the re-read fallback.
+ *   3. OVER-CAP  — per-file cap = 1 byte: every file dropped by the SIZE cap ->
+ *                  edges survive only via the re-read fallback.
+ * On main (no fallback) scenarios 2 and 3 LOSE both edges = RED; scenario 1
+ * stays present = the non-vacuity control. */
+TEST(parallel_cross_file_reread_preserves_unretained_edges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_xf_reread_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char jpath[512];
+    snprintf(jpath, sizeof(jpath), "%s/src/main/java/com/example/Example.java", tmpdir);
+    char jdir[512];
+    snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
+    cbm_mkdir_p(jdir, 0755);
+    FILE *jf = fopen(jpath, "w");
+    if (!jf) {
+        FAIL("fopen Example.java failed");
+    }
+    fprintf(jf, "package com.example;\n"
+                "\n"
+                "class JavaCaller {\n"
+                "    String call(KotlinService kotlinService) {\n"
+                "        return kotlinService.ping(new JavaService());\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "class JavaService {\n"
+                "    String pong() {\n"
+                "        return \"pong\";\n"
+                "    }\n"
+                "}\n");
+    fclose(jf);
+
+    char kpath[512];
+    snprintf(kpath, sizeof(kpath), "%s/src/main/kotlin/com/example/KotlinService.kt", tmpdir);
+    char kdir[512];
+    snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
+    cbm_mkdir_p(kdir, 0755);
+    FILE *kf = fopen(kpath, "w");
+    if (!kf) {
+        FAIL("fopen KotlinService.kt failed");
+    }
+    fprintf(kf, "package com.example\n"
+                "\n"
+                "class KotlinService {\n"
+                "    fun ping(javaService: JavaService): String {\n"
+                "        return javaService.pong()\n"
+                "    }\n"
+                "}\n");
+    fclose(kf);
+
+    cbm_file_info_t files[2] = {0};
+    files[0].path = jpath;
+    files[0].rel_path = (char *)"src/main/java/com/example/Example.java";
+    files[0].language = CBM_LANG_JAVA;
+    files[1].path = kpath;
+    files[1].rel_path = (char *)"src/main/kotlin/com/example/KotlinService.kt";
+    files[1].language = CBM_LANG_KOTLIN;
+
+    /* CONTROL (retained) + two drop scenarios that reach the cross-file edge
+     * only via the on-demand re-read: NO-RETAIN disables retention entirely;
+     * OVER-CAP sets a 1-byte per-file cap so every file is dropped by size. */
+    const cbm_parallel_extract_opts_t no_retain = {
+        .retain_sources = false,
+        .retain_sources_set = true,
+    };
+    const cbm_parallel_extract_opts_t over_cap = {
+        .retain_sources = true,
+        .retain_sources_set = true,
+        .retain_per_file_max_bytes = 1, /* 1 byte → every file dropped by the size cap */
+    };
+    const cbm_parallel_extract_opts_t *scenarios[3] = {NULL, &no_retain, &over_cap};
+
+    for (int s = 0; s < 3; s++) {
+        cbm_gbuf_t *gbuf = run_parallel_with_extract_opts("com", tmpdir, files, 2, 2, scenarios[s]);
+        ASSERT_NOT_NULL(gbuf);
+
+        const cbm_gbuf_edge_t *java_to_kotlin =
+            find_calls_edge_by_tails(gbuf, "JavaCaller.call", "KotlinService.ping");
+        const cbm_gbuf_edge_t *kotlin_to_java =
+            find_calls_edge_by_tails(gbuf, "KotlinService.ping", "JavaService.pong");
+
+        /* Both cross-file (Java↔Kotlin) CALLS edges must be present in EVERY
+         * scenario. In the drop scenarios (s=1,2) the caller's source is NOT
+         * retained, so these edges exist ONLY because resolve_worker re-reads
+         * the source on demand. Without that fallback (main) they are LOST. */
+        ASSERT_NOT_NULL(java_to_kotlin);
+        ASSERT_NOT_NULL(kotlin_to_java);
+        /* And they must come from the source-dependent cross-file LSP, not a
+         * source-free suffix heuristic — proving the re-read actually ran. */
+        ASSERT_NOT_NULL(java_to_kotlin->properties_json);
+        ASSERT_NOT_NULL(strstr(java_to_kotlin->properties_json, "\"strategy\":\"lsp"));
+        ASSERT_NOT_NULL(kotlin_to_java->properties_json);
+        ASSERT_NOT_NULL(strstr(kotlin_to_java->properties_json, "\"strategy\":\"lsp"));
+
+        cbm_gbuf_free(gbuf);
+    }
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* issue #294: gRPC service-name extraction must (a) preserve the canonical
  * proto service name (FooServiceClient → FooService, not Foo) and (b) only
  * match real stub/client types — ordinary receiver vars must NOT produce
@@ -941,6 +1076,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);

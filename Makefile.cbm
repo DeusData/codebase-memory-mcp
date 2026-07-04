@@ -35,12 +35,25 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 
 # ── Optional libgit2 (faster git history parsing) ────────────────
-# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent.
-LIBGIT2_CFLAGS := $(shell pkg-config --cflags libgit2 2>/dev/null)
-LIBGIT2_LIBS := $(shell pkg-config --libs libgit2 2>/dev/null)
-ifneq ($(LIBGIT2_LIBS),)
+# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent
+# or too old for the git_allocator ABI used by the production allocator bind.
+PKG_CONFIG ?= pkg-config
+LIBGIT2_MIN_VERSION := 1.7.0
+LIBGIT2_AVAILABLE := $(shell $(PKG_CONFIG) --atleast-version=$(LIBGIT2_MIN_VERSION) libgit2 >/dev/null 2>&1 && echo yes || echo no)
+
+ifeq ($(REQUIRE_LIBGIT2),1)
+ifneq ($(LIBGIT2_AVAILABLE),yes)
+LIBGIT2_VERSION := $(shell $(PKG_CONFIG) --modversion libgit2 2>/dev/null)
+$(error libgit2 >= $(LIBGIT2_MIN_VERSION) is required when REQUIRE_LIBGIT2=1; pkg-config found $(if $(LIBGIT2_VERSION),$(LIBGIT2_VERSION),none))
+endif
+endif
+
+ifeq ($(LIBGIT2_AVAILABLE),yes)
+LIBGIT2_CFLAGS := $(shell $(PKG_CONFIG) --cflags libgit2 2>/dev/null)
+LIBGIT2_LIBS := $(shell $(PKG_CONFIG) --libs libgit2 2>/dev/null)
 LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
 else
+LIBGIT2_CFLAGS =
 LIBGIT2_FLAGS =
 LIBGIT2_LIBS =
 endif
@@ -410,6 +423,10 @@ TEST_SECURITY_SRCS = tests/test_security.c
 
 TEST_YAML_SRCS = tests/test_yaml.c
 
+TEST_SEMANTIC_SRCS = tests/test_semantic.c
+TEST_AST_PROFILE_SRCS = tests/test_ast_profile.c
+TEST_SLAB_ALLOC_SRCS = tests/test_slab_alloc.c
+
 TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
@@ -449,6 +466,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_new_cypher_limit_zero.c \
     tests/repro/repro_issue363.c \
     tests/repro/repro_issue581.c \
+    tests/repro/repro_issue787.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
@@ -469,10 +487,11 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_c_cpp.c \
     tests/repro/repro_lsp_go_py.c \
     tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────

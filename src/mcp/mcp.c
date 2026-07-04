@@ -5632,6 +5632,30 @@ static void detect_session(cbm_mcp_server_t *srv) {
     }
 }
 
+/* auto_watch config: gates background watcher registration (default on).
+ * Multi-project users can contain a session to its own project with
+ * `config set auto_watch false`. */
+static bool auto_watch_enabled(cbm_mcp_server_t *srv) {
+    if (!srv->config) {
+        return true; /* default on */
+    }
+    return cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_WATCH, true);
+}
+
+/* Register the session project with the background watcher for ongoing
+ * change detection — unless auto_watch is disabled. */
+static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
+    if (!srv->watcher || srv->session_project[0] == '\0' || srv->session_root[0] == '\0') {
+        return;
+    }
+    if (!auto_watch_enabled(srv)) {
+        cbm_log_info("watcher.register.skipped", "reason", "auto_watch_off", "project",
+                     srv->session_project);
+        return;
+    }
+    cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
+}
+
 /* Background auto-index thread function */
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
@@ -5654,10 +5678,7 @@ static void *autoindex_thread(void *arg) {
 
     if (rc == 0) {
         cbm_log_info("autoindex.done", "project", srv->session_project);
-        /* Register with watcher for ongoing change detection */
-        if (srv->watcher) {
-            cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
-        }
+        register_watcher_if_enabled(srv);
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
     }
@@ -5680,9 +5701,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
             /* Already indexed → register watcher for change detection */
             cbm_log_info("autoindex.skip", "reason", "already_indexed", "project",
                          srv->session_project);
-            if (srv->watcher) {
-                cbm_watcher_watch(srv->watcher, srv->session_project, srv->session_root);
-            }
+            register_watcher_if_enabled(srv);
             return;
         }
     }

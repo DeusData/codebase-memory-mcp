@@ -179,25 +179,46 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const filterRef = useRef<HTMLInputElement>(null);
+  /* Path whose listing is currently shown. Lets the typed-path effect skip a
+   * redundant re-fetch after browse() sets currentPath itself. */
+  const lastBrowsedRef = useRef<string>("");
 
-  const browse = useCallback(async (path?: string) => {
-    setLoading(true);
+  const browse = useCallback(async (path?: string, opts?: { silent?: boolean }) => {
+    const silent = opts?.silent ?? false;
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const q = path ? `?path=${encodeURIComponent(path)}` : "";
       const res = await fetch(`/api/browse${q}`);
       const data = await res.json();
       if (data.error) throw new Error(data.error);
+      lastBrowsedRef.current = data.path ?? "";
       setCurrentPath(data.path ?? "");
       setDirs((data.dirs ?? []).sort());
       setRoots(data.roots ?? ["/"]);
       setParentPath(data.parent ?? "/");
-    } catch (e) { setError(e instanceof Error ? e.message : "Browse failed"); }
-    finally { setLoading(false); }
+    } catch (e) {
+      /* Silent (typed-path) refreshes keep the last good listing instead of
+       * flashing an error while the user is still typing a path. */
+      if (!silent) setError(e instanceof Error ? e.message : "Browse failed");
+    }
+    finally { if (!silent) setLoading(false); }
   }, []);
 
   useEffect(() => { browse(); }, [browse]);
   useEffect(() => { filterRef.current?.focus(); }, []);
+
+  /* Windows only: when the user types a drive path into the Repository path
+   * field, refresh the folder listing to match (debounced). On Windows, typing
+   * is the way to switch drives, and without this the breadcrumb and path box
+   * updated but the directory list stayed stale (e.g. typing "D:/" still showed
+   * the previous drive's folders). POSIX navigation is left unchanged. */
+  useEffect(() => {
+    if (!currentPath || currentPath === lastBrowsedRef.current) return;
+    if (!/^[A-Za-z]:/.test(currentPath.replace(/\\/g, "/"))) return;
+    const id = setTimeout(() => { void browse(currentPath, { silent: true }); }, 350);
+    return () => clearTimeout(id);
+  }, [currentPath, browse]);
 
   const filteredDirs = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -239,6 +260,30 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
   /* Breadcrumb segments */
   const displayPath = currentPath.replace(/\\/g, "/");
   const segments = displayPath.split("/").filter(Boolean);
+  /* A Windows drive path ("C:/Users/rap") has no unified "/" root — its first
+   * segment is the drive letter. Build crumb targets accordingly so clicking a
+   * segment navigates to a real directory instead of a bogus "/C:/..." path
+   * that the backend rejects as "not a directory". */
+  const isWinPath = /^[A-Za-z]:$/.test(segments[0] ?? "");
+  const crumbPath = (i: number): string => {
+    const parts = segments.slice(0, i + 1);
+    if (isWinPath) return parts.length === 1 ? `${parts[0]}/` : parts.join("/");
+    return "/" + parts.join("/");
+  };
+
+  /* Root/drive quick-jump buttons. On Windows the POSIX "/" root is meaningless
+   * — browsing it returns an empty listing — so drop it and offer drive roots
+   * instead. An older backend may not enumerate drives, so always include the
+   * current drive; other drives stay reachable by typing a path. */
+  const displayRoots = (() => {
+    if (!isWinPath) return roots;
+    const drives = Array.from(new Set(
+      roots.filter((r) => /^[A-Za-z]:[\\/]?$/.test(r)).map((r) => `${r[0].toUpperCase()}:/`),
+    ));
+    const curRoot = `${displayPath[0].toUpperCase()}:/`;
+    if (!drives.includes(curRoot)) drives.unshift(curRoot);
+    return drives;
+  })();
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
@@ -257,6 +302,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
               aria-label={t.index.repositoryPath}
               value={currentPath}
               onChange={(e) => setCurrentPath(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter" && /^[A-Za-z]:/.test(currentPath.replace(/\\/g, "/"))) { e.preventDefault(); void browse(currentPath); } }}
               className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground font-mono outline-none focus:border-primary/40"
             />
           </label>
@@ -269,6 +315,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
               onChange={(e) => setProjectName(e.target.value)}
               className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
             />
+            <span className="block text-[10px] text-foreground/25 mt-1">{t.index.projectNameHelp}</span>
           </label>
         </div>
 
@@ -282,7 +329,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
             className="flex-1 bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
           />
           <div className="flex items-center gap-1">
-            {roots.map((root) => (
+            {displayRoots.map((root) => (
               <button
                 key={root}
                 aria-label={t.index.browseRoot(root)}
@@ -297,12 +344,14 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
         {/* Breadcrumb */}
         <div className="px-5 py-2 border-y border-border/20 flex items-center gap-0.5 overflow-x-auto text-[11px] shrink-0">
-          <button onClick={() => browse("/")} className="text-primary/60 hover:text-primary shrink-0 transition-colors">/</button>
+          {!isWinPath && (
+            <button onClick={() => browse("/")} className="text-primary/60 hover:text-primary shrink-0 transition-colors">/</button>
+          )}
           {segments.map((seg, i) => (
             <span key={i} className="flex items-center gap-0.5 shrink-0">
-              <span className="text-foreground/15">/</span>
+              {(i > 0 || !isWinPath) && <span className="text-foreground/15">/</span>}
               <button
-                onClick={() => browse("/" + segments.slice(0, i + 1).join("/"))}
+                onClick={() => browse(crumbPath(i))}
                 className={`transition-colors ${i === segments.length - 1 ? "text-foreground/70 font-medium" : "text-primary/50 hover:text-primary"}`}
               >
                 {seg}

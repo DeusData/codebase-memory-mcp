@@ -742,6 +742,48 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+TEST(tsjs_suppress_drops_weak_method_matches) {
+    /* #592/#606: a TS/JS member call whose receiver the LSP could not type, that
+     * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
+     * The strategies that actually reach the guards are the registry's
+     * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
+     * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
+     * resolvers today) so a future wiring cannot silently reintroduce it. */
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "fuzzy"));
+    PASS();
+}
+
+TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
+    /* Keep every receiver-/import-aware strategy. Because the PARALLEL resolver
+     * runs lsp_* strategies through this same guard variable, an explicit
+     * drop-list must never touch them — asserting the lsp_* keeps here is the
+     * regression guard for the "kills lsp edges" failure mode. The keep set
+     * enumerates the resolver's non-weak strategies: registry
+     * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
+     * {callee_suffix, service_pattern}, and lsp_*. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "same_module"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_method"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_local"));
+    /* A bare call (is_method=false) is a free-function call → never suppressed. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "suffix_match"));
+    /* Non-TS/JS languages are never affected. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(false, true, "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, NULL));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, ""));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(registry) {
@@ -808,4 +850,6 @@ SUITE(registry) {
     RUN_TEST(perl_builtin_set_rejects_project_subs);
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    RUN_TEST(tsjs_suppress_drops_weak_method_matches);
+    RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
 }

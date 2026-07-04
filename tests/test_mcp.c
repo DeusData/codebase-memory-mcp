@@ -8,10 +8,13 @@
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <cli/cli.h>
+#include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
+#include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
@@ -23,6 +26,7 @@
 #define cbm_chdir _chdir
 #define cbm_getcwd _getcwd
 #else
+#include <sys/wait.h> /* waitpid — #845 fork+alarm harness */
 #include <unistd.h>
 #define cbm_chdir chdir
 #define cbm_getcwd getcwd
@@ -4033,6 +4037,256 @@ TEST(readonly_query_succeeds_on_readonly_fs) {
 #undef ROQ_PROJECT
 
 /* ══════════════════════════════════════════════════════════════════
+ *  #845 — supervisor gate must not wrap embedders of cbm_mcp_handle_tool
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Child-side check: index a tiny fixture and verify it ran IN-PROCESS.
+ * Distinct exit codes so the parent can report the exact failure mode. */
+enum {
+    IDX845_OK = 0,
+    IDX845_SPAWNED = 41,     /* a worker subprocess was spawned — the #845 bug */
+    IDX845_NO_RESULT = 42,   /* handle_tool returned NULL */
+    IDX845_NOT_INDEXED = 43, /* response lacks status=indexed */
+};
+
+static int idx845_index_inprocess_check(const char *repo_dir) {
+    int spawns_before = cbm_index_supervisor_spawn_count();
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return IDX845_NO_RESULT;
+    }
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_dir);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+
+    int code = IDX845_OK;
+    if (cbm_index_supervisor_spawn_count() != spawns_before) {
+        code = IDX845_SPAWNED;
+    } else if (!resp) {
+        code = IDX845_NO_RESULT;
+    } else if (!response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
+        code = IDX845_NOT_INDEXED;
+    }
+    free(resp);
+    cbm_mcp_server_free(srv);
+    return code;
+}
+
+TEST(index_supervisor_gate_requires_marked_host_issue845) {
+    /* #845: index_repository via cbm_mcp_handle_tool from an EMBEDDER (this test
+     * binary) must index IN-PROCESS even with CBM_INDEX_SUPERVISOR unset. The
+     * supervisor gate may only wrap a process that called
+     * cbm_index_supervisor_mark_host() — i.e. the real binary's main(). Before
+     * the fix, should_wrap() was true for ANY embedder: the gate resolved the
+     * CURRENT binary (this test runner!) and spawned
+     * '<test-runner> cli --index-worker index_repository …', which a test binary
+     * interprets as suite-filter args → it re-runs test suites in the child →
+     * recursive spawn chains (observed 11-min hangs; kernel VM-map load during
+     * the 2026-07-04 host panics).
+     *
+     * POSIX: run the call in a forked child under alarm(20) so the pre-fix
+     * recursive behaviour cannot hang the runner; the child reports via exit
+     * code. Windows: no fork — run in-process (safe once the gate is fixed; the
+     * pre-fix redness is demonstrated on POSIX). */
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idx845-repo-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idx845-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp_dir);
+        PASS();
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* The point of the guard: NO kill switch. The gate itself must keep an
+     * unmarked host in-process. Save + restore the ambient value. */
+    const char *saved_sv = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_sv_copy = saved_sv ? strdup(saved_sv) : NULL;
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("def main():\n    return 'ok'\n", fp);
+    fclose(fp);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+#ifdef _WIN32
+    code = idx845_index_inprocess_check(tmp_dir);
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(20); /* pre-fix spawn chain must die here, not hang the runner */
+        _exit(idx845_index_inprocess_check(tmp_dir));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+#endif
+
+    /* Restore env BEFORE asserting so a red run doesn't leak state. */
+    if (saved_sv_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_sv_copy, 1);
+        free(saved_sv_copy);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    char *project = cbm_project_name_from_path(tmp_dir);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    remove(src_path);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+
+    if (signalled) {
+        printf("    child killed by signal %d (alarm => recursive spawn chain hang)\n", sig);
+    } else if (code != IDX845_OK) {
+        printf("    child exit code %d (41=worker spawned, 42=no result, 43=not indexed)\n",
+               code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDX845_OK);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ *  AUTO_WATCH GATE  (distilled from PR #625)
+ *
+ *  Background watcher registration on session connect is gated by the
+ *  `auto_watch` config key (default TRUE = existing behavior).
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Drive the already-indexed connect path (initialize → maybe_auto_index →
+ * watcher registration) and return the resulting watch count.
+ * auto_watch_value: NULL leaves the key unset (exercises the default),
+ * otherwise the key is set to that value before initialize.
+ * Returns a negative code on fixture setup failure. */
+static int auto_watch_connect_watch_count(const char *auto_watch_value) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-autowatch-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        return -1;
+    }
+
+    char repodir[512];
+    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+    if (th_mkdir_p(repodir) != 0) {
+        th_rmtree(cache);
+        return -2;
+    }
+
+    /* Same derivation detect_session uses on the cwd — realpath-based, so
+     * the name matches even where /tmp is a symlink (macOS). */
+    char *project = cbm_project_name_from_path(repodir);
+    if (!project) {
+        th_rmtree(cache);
+        return -3;
+    }
+
+    /* Pre-create <cache>/<project>.db so maybe_auto_index takes the
+     * "already indexed" branch — the watcher-registration site under test. */
+    char db_path[1024];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    if (th_write_file(db_path, "") != 0) {
+        free(project);
+        th_rmtree(cache);
+        return -4;
+    }
+    free(project);
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_rmtree(cache);
+        return -5;
+    }
+
+    int count = -6;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    cbm_store_t *wstore = cbm_store_open_memory();
+    cbm_watcher_t *watcher = wstore ? cbm_watcher_new(wstore, NULL, NULL) : NULL;
+    if (cfg && watcher) {
+        if (auto_watch_value) {
+            cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, auto_watch_value);
+        }
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            cbm_mcp_server_set_watcher(srv, watcher);
+            cbm_mcp_server_set_config(srv, cfg);
+            char *resp = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+            free(resp);
+            count = cbm_watcher_watch_count(watcher);
+            cbm_mcp_server_free(srv);
+        }
+    }
+
+    if (watcher) {
+        cbm_watcher_free(watcher);
+    }
+    if (wstore) {
+        cbm_store_close(wstore);
+    }
+    if (cfg) {
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    return count;
+}
+
+/* Default (key unset) → watcher registered on connect. Guards the
+ * no-behavior-change promise of the auto_watch gate: existing users keep
+ * background auto-sync without touching config. */
+TEST(mcp_auto_watch_default_registers_watcher_on_connect) {
+    int count = auto_watch_connect_watch_count(NULL);
+    if (count < 0) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_EQ(count, 1);
+    PASS();
+}
+
+/* auto_watch=false → NO watcher registered on connect. RED on pre-gate code
+ * (registration was unconditional and the key did not exist). */
+TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
+    int count = auto_watch_connect_watch_count("false");
+    if (count < 0) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -4153,6 +4407,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
+    RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(tool_manage_adr_not_found_rich_error);
     RUN_TEST(tool_manage_adr_get_accepts_abs_path);
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
@@ -4206,4 +4461,8 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+
+    /* auto_watch gate (distilled from PR #625) */
+    RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
+    RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
 }

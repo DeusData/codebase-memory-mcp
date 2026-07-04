@@ -25,8 +25,10 @@
 /* ── Constants ────────────────────────────────────────────────── */
 
 #define DEFAULT_MAX_NODES 2000
-#define HARD_MAX_NODES 10000
+#define HARD_MAX_NODES 200000
 #define BH_THETA 1.2f
+#define OCTREE_MAX_DEPTH 26   /* stop subdividing coincident points (OOM guard) */
+#define OCTREE_MIN_HALF 1e-4f /* minimum octree cell half-size */
 
 /* Local optimization: gentle, preserves structure */
 #define LOCAL_REPULSION 8.0f
@@ -175,7 +177,8 @@ static void child_center(octree_node_t *n, int o, float *cx, float *cy, float *c
     *cy = n->oy + ((o & 2) ? q : -q);
     *cz = n->oz + ((o & 4) ? q : -q);
 }
-static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, float mass) {
+static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, float mass,
+                          int depth) {
     if (n->total_mass == 0.0f && n->body_index == -1) {
         n->body_index = idx;
         n->body_mass = mass;
@@ -183,6 +186,20 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         n->cy = y;
         n->cz = z;
         n->total_mass = mass;
+        return;
+    }
+    /* OOM guard: when bodies share (or nearly share) a position, subdivision
+     * never separates them, so half_size shrinks toward zero and we allocate
+     * octree cells without bound — the runaway that exhausted memory on large
+     * graphs. Once we hit the depth/size floor, stop splitting and fold the body
+     * into this cell as an aggregate (mass-weighted centroid). */
+    if (depth >= OCTREE_MAX_DEPTH || n->half_size < OCTREE_MIN_HALF) {
+        float nm = n->total_mass + mass;
+        n->cx = (n->cx * n->total_mass + x * mass) / nm;
+        n->cy = (n->cy * n->total_mass + y * mass) / nm;
+        n->cz = (n->cz * n->total_mass + z * mass) / nm;
+        n->total_mass = nm;
+        n->body_index = -1;
         return;
     }
     if (n->body_index >= 0) {
@@ -196,7 +213,7 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
             n->children[o] = octree_new(a, b, c, n->half_size * 0.5f);
         }
         if (n->children[o])
-            octree_insert(n->children[o], oi, ox, oy, oz, om);
+            octree_insert(n->children[o], oi, ox, oy, oz, om, depth + 1);
     }
     float nm = n->total_mass + mass;
     n->cx = (n->cx * n->total_mass + x * mass) / nm;
@@ -210,7 +227,7 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         n->children[o] = octree_new(a, b, c, n->half_size * 0.5f);
     }
     if (n->children[o])
-        octree_insert(n->children[o], idx, x, y, z, mass);
+        octree_insert(n->children[o], idx, x, y, z, mass, depth + 1);
 }
 static void octree_repulse(octree_node_t *n, float px, float py, float pz, float mm, int si,
                            float kr, float *fx, float *fy, float *fz) {
@@ -274,7 +291,7 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
         if (!root)
             break;
         for (int i = 0; i < n; i++)
-            octree_insert(root, i, b[i].x, b[i].y, b[i].z, b[i].mass);
+            octree_insert(root, i, b[i].x, b[i].y, b[i].z, b[i].mass, 0);
         for (int i = 0; i < n; i++)
             octree_repulse(root, b[i].x, b[i].y, b[i].z, b[i].mass, i, LOCAL_REPULSION, &b[i].fx,
                            &b[i].fy, &b[i].fz);

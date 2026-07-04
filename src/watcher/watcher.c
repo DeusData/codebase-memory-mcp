@@ -259,23 +259,24 @@ static void state_free(project_state_t *s) {
 
 /* Move a state onto the deferred-free list (caller holds projects_lock).
  * The state may still be referenced by a poll_once snapshot; poll_once
- * drains the list at the start of its next cycle. Falls back to an
- * immediate free only if growing the list fails. */
-static void defer_state_free(cbm_watcher_t *w, project_state_t *s) {
+ * drains the list at the start of its next cycle. Returns false when
+ * growing the list fails (OOM): the state is left untouched and the
+ * caller must keep it registered — freeing it immediately here could be
+ * a use-after-free against an in-flight poll snapshot. */
+static bool defer_state_free(cbm_watcher_t *w, project_state_t *s) {
     if (w->pending_free_count >= w->pending_free_cap) {
         int new_cap = w->pending_free_cap ? w->pending_free_cap * 2 : 8;
         project_state_t **tmp =
             realloc(w->pending_free, (size_t)new_cap * sizeof(project_state_t *));
-        if (tmp) {
-            w->pending_free = tmp;
-            w->pending_free_cap = new_cap;
+        if (!tmp) {
+            cbm_log_warn("watcher.unwatch.oom", "project", s->project_name);
+            return false;
         }
+        w->pending_free = tmp;
+        w->pending_free_cap = new_cap;
     }
-    if (w->pending_free_count < w->pending_free_cap) {
-        w->pending_free[w->pending_free_count++] = s;
-    } else {
-        state_free(s); /* realloc failed — fall back to immediate free */
-    }
+    w->pending_free[w->pending_free_count++] = s;
+    return true;
 }
 
 /* ── Stale-root pruning (#286) ──────────────────────────────────── */
@@ -444,12 +445,10 @@ void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     bool removed = false;
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *s = cbm_ht_get(w->projects, project_name);
-    if (s) {
+    if (s && defer_state_free(w, s)) {
+        /* The entry leaves the table only once its state is safely on
+         * the deferred-free list; on OOM the watch stays registered. */
         cbm_ht_delete(w->projects, project_name);
-        /* Defer free: the state may still be referenced by a poll_once
-         * snapshot taken before we acquired the lock.  poll_once will
-         * drain this list at the start of its next cycle. */
-        defer_state_free(w, s);
         removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);
@@ -548,12 +547,12 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     bool removed = false;
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *current = cbm_ht_get(w->projects, project_name);
-    if (current == s) {
+    /* Deferred free (same discipline as cbm_watcher_unwatch): this state
+     * is referenced by the poll_once snapshot iterating us. On OOM the
+     * watch stays registered and pruning retries on the next cycle. */
+    if (current == s && defer_state_free(w, s)) {
         delete_cached_project_db(project_name);
         cbm_ht_delete(w->projects, project_name);
-        /* Deferred free (same discipline as cbm_watcher_unwatch): this
-         * state is referenced by the poll_once snapshot iterating us. */
-        defer_state_free(w, s);
         removed = true;
     }
     cbm_mutex_unlock(&w->projects_lock);

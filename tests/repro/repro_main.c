@@ -26,6 +26,7 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
 
 /* Per-suite summary + filter. RUN_SUITE prints a one-line
  * "[SUITE] <name> P passed, F failed" report (greppable for which suites still
@@ -78,6 +79,7 @@ extern void suite_repro_issue221(void);
 extern void suite_repro_issue548(void);
 extern void suite_repro_issue363(void);
 extern void suite_repro_issue581(void);
+extern void suite_repro_issue787(void);
 /* NEW bugs found by the discovery sweep */
 extern void suite_repro_new_ts_class_field_arrow(void);
 extern void suite_repro_new_py_tuple_unpack(void);
@@ -105,10 +107,19 @@ extern void suite_repro_grammar_misc(void);
 extern void suite_repro_lsp_c_cpp(void);
 extern void suite_repro_lsp_go_py(void);
 extern void suite_repro_lsp_ts(void);
+/* TS cross-file inherited-method resolution gap (post-#840 probe flip) */
+extern void suite_repro_ts_inherited_method(void);
 extern void suite_repro_lsp_java_cs(void);
 extern void suite_repro_lsp_kt_php_rust(void);
 
 int main(void) {
+    /* #845 belt-and-suspenders: this binary EMBEDS cbm_mcp_handle_tool and its
+     * main() IGNORES argv — spawned as `<self> cli --index-worker …` it would
+     * re-run EVERY repro suite recursively (the observed 11-min hangs). The
+     * supervisor gate already ignores unmarked hosts; pin the kill switch too.
+     * A test that exercises the supervisor must explicitly re-enable it. */
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
     /* Unbuffered: a reproduction may crash/_exit (or a sanitizer may _exit on a
      * leak) before stdio flushes — keep every printed line so the summary and the
      * RED rows always reach the board even on an abnormal exit. */
@@ -152,6 +163,7 @@ int main(void) {
     RUN_SUITE(repro_new_cypher_limit_zero);
     RUN_SUITE(repro_issue363);
     RUN_SUITE(repro_issue581);
+    RUN_SUITE(repro_issue787);
     RUN_SUITE(repro_invariant_calls);
     RUN_SUITE(repro_invariant_graph);
     RUN_SUITE(repro_invariant_breadth);
@@ -172,6 +184,7 @@ int main(void) {
     RUN_SUITE(repro_lsp_c_cpp);
     RUN_SUITE(repro_lsp_go_py);
     RUN_SUITE(repro_lsp_ts);
+    RUN_SUITE(repro_ts_inherited_method);
     RUN_SUITE(repro_lsp_java_cs);
     RUN_SUITE(repro_lsp_kt_php_rust);
 

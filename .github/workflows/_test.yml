@@ -33,7 +33,7 @@ jobs:
           BROAD: ${{ inputs.broad_platforms }}
         run: |
           CORE_UNIX='[
-            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
+            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","libgit2":true},
             {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
             {"os":"macos-14","cc":"cc","cxx":"c++"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
@@ -79,10 +79,15 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ${{ matrix.libgit2 == true && 'libgit2-dev pkg-config' || '' }}
 
       - name: Test
-        run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        run: |
+          if [ "${{ matrix.libgit2 == true }}" = "true" ]; then
+            echo "REQUIRE_LIBGIT2=1"
+            pkg-config --modversion libgit2
+          fi
+          scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} ${{ matrix.libgit2 == true && 'REQUIRE_LIBGIT2=1' || '' }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
 
@@ -119,3 +124,43 @@ jobs:
         run: scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=' || '' }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+
+  # Windows product-surface regression guards. Distinct from test-windows above
+  # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
+  # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
+  # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
+  # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
+  # and the UI directory picker not enumerating drives (#548, roots field). The
+  # still-open narrow-argv repro (#423/#20) is opt-in and excluded via -GuardsOnly.
+  test-windows-guards:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            git
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build product binary with embedded UI
+        shell: msys2 {0}
+        # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
+        # guard's HTTP UI is available. Functional gate only (no sanitizers).
+        run: scripts/build.sh --with-ui CC=clang CXX=clang++
+
+      - name: Windows regression guards (#636/#357, #618, #548)
+        shell: pwsh
+        # -GuardsOnly runs the three green guards and gates on them; the runner
+        # runs indexing in-process (CBM_INDEX_SUPERVISOR=0) so a guard reflects the
+        # path/hook/drive fix under test, not the orthogonal index-worker spawn.
+        run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

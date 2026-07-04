@@ -328,6 +328,29 @@ static int run_cli(int argc, char **argv) {
     const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
     cbm_index_set_worker_role(index_worker, response_out);
 
+#ifndef _WIN32
+    /* #845: a supervised worker must not outlive its supervisor. If the parent
+     * dies without reaping us (agent killed, supervisor crashed), an orphaned
+     * worker would index on unsupervised — observed contributing to memory
+     * pressure during the 2026-07-04 host panics. Reuse the parent-death
+     * watchdog (safe outside server mode: on ppid change it only writes to
+     * stderr and _exit(0)s — no cleanup dependencies). Detached: the worker
+     * exits by returning from run_cli; exit() tears the thread down. Failure
+     * to start is non-fatal, same policy as the MCP-server watchdog. */
+    if (index_worker) {
+        static pid_t worker_initial_ppid; /* static: outlives run_cli for the thread */
+        worker_initial_ppid = getppid();
+        cbm_thread_t worker_watchdog_tid;
+        if (cbm_thread_create(&worker_watchdog_tid, PARENT_WATCHDOG_STACK_SIZE,
+                              parent_watchdog_thread, &worker_initial_ppid) == 0) {
+            (void)cbm_thread_detach(&worker_watchdog_tid);
+            cbm_log_info("worker.watchdog.start");
+        } else {
+            cbm_log_warn("worker.watchdog.unavailable", "reason", "thread_create_failed");
+        }
+    }
+#endif
+
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
         return SKIP_ONE;
@@ -563,6 +586,13 @@ int main(int argc, char **argv) {
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
     cbm_alloc_init();
+    /* #845: mark this process as the REAL binary so the index supervisor may
+     * wrap index_repository in a worker subprocess. Must run before any
+     * subcommand dispatch so MCP-server, CLI, and HTTP paths are all covered.
+     * Embedders of cbm_mcp_handle_tool (test binaries) never mark themselves,
+     * so they index in-process instead of re-invoking themselves as
+     * `<self> cli --index-worker …` (recursive suite re-runs / spawn chains). */
+    cbm_index_supervisor_mark_host();
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
     /* CBM_LOG_LEVEL support — distilled from #414 (closes #413). Apply before
@@ -676,6 +706,7 @@ int main(int argc, char **argv) {
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
+            cbm_http_server_set_watcher(g_http_server, g_watcher);
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
                 http_started = true;
             }

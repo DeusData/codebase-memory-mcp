@@ -327,13 +327,21 @@ static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const ch
 
 static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
-                                 const cbm_resolution_t *res, cbm_svc_kind_t svc) {
+                                 const cbm_resolution_t *res, cbm_svc_kind_t svc,
+                                 bool suppress_plain_calls) {
     const char *url_or_topic = call->first_string_arg;
     bool is_url = (url_or_topic && url_or_topic[0] != '\0' &&
                    (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
     bool is_topic = (url_or_topic && url_or_topic[0] != '\0' && svc == CBM_SVC_ASYNC &&
                      strlen(url_or_topic) > PAIR_LEN);
     if (!is_url && !is_topic) {
+        /* No URL/topic → this is not a real service call; the svc kind was a
+         * substring coincidence in the resolved QN (e.g. "SalesforceRestClient"
+         * matches the "RestClient" HTTP lib). Emit a plain CALLS edge — unless a
+         * weak TS/JS member-call match should be suppressed (#592/#606). */
+        if (suppress_plain_calls) {
+            return;
+        }
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
         char props[CBM_SZ_512];
@@ -368,17 +376,22 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
 }
 
 /* Classify a resolved call and emit the appropriate edge. */
+/* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
+ * match, #592/#606), the route/HTTP/ASYNC/CONFIG service classifications below
+ * still run — only the plain CALLS fall-through is skipped, so a fabricated
+ * project edge is dropped while every service edge stays main-identical. */
 static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                  const cbm_resolution_t *res, const char *module_qn,
-                                 const char **imp_keys, const char **imp_vals, int imp_count) {
+                                 const char **imp_keys, const char **imp_vals, int imp_count,
+                                 bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
         handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
         return;
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
-        emit_http_async_edge(ctx, call, source, target, res, svc);
+        emit_http_async_edge(ctx, call, source, target, res, svc, suppress_plain_calls);
         return;
     }
     if (svc == CBM_SVC_CONFIG) {
@@ -392,6 +405,9 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
                         call);
         return;
+    }
+    if (suppress_plain_calls) {
+        return; /* weak TS/JS member-call match with an unresolved receiver (#606) */
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
@@ -409,6 +425,12 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     const cbm_gbuf_node_t *src = NULL;
     if (enclosing_qn) {
         src = cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
+        /* A class-level call in a directory-module language carries the
+         * DIRECTORY module QN, which hits the shared Folder/Project node —
+         * attribute to this file's File node instead (#787). */
+        if (cbm_pipeline_node_is_dir_container(src)) {
+            src = NULL;
+        }
     }
     if (!src) {
         char *fqn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -444,7 +466,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                                 imp_vals, imp_count);
+                                 imp_vals, imp_count, false);
             return SKIP_ONE;
         }
     }
@@ -468,7 +490,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                         .confidence = PC_SVC_PATTERN_CONF,
                                         .strategy = "service_pattern",
                                         .candidate_count = 0};
-            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, csvc);
+            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, csvc, false);
             return SKIP_ONE;
         }
     }
@@ -496,7 +518,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                             .confidence = PC_SVC_PATTERN_CONF,
                                             .strategy = "service_pattern",
                                             .candidate_count = 0};
-                emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, esvc);
+                emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, esvc, false);
                 return SKIP_ONE;
             }
         }
@@ -516,6 +538,21 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
+    /* TS/JS/TSX weak-method suppression (#592/#606). A member call x.foo() only
+     * reaches the registry when the TS-LSP could not resolve the receiver type
+     * (the LSP block above already returned for type-resolved calls, including
+     * the "resolved but target out of gbuf" fall-through). Binding such a call
+     * by a weak short-name strategy fabricates an edge (`re.test()` -> a project
+     * `test`). Rather than drop it here — which would also skip the service
+     * bypasses below and emit_classified_edge's route/HTTP/CONFIG branches —
+     * defer to emit_classified_edge and suppress ONLY the plain-CALLS
+     * fall-through, so every service edge stays main-identical. res.strategy may
+     * be lsp_* here; the helper's explicit drop-list leaves lsp_* untouched. */
+    bool is_tsjs =
+        lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    bool tsjs_drop_plain_call =
+        cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
      * name ("requests"), but that library is not in the indexed tree so
@@ -531,7 +568,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                 (u[0] == '/' || strstr(u, "://") != NULL ||
                                  (svc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
         if (has_url_or_topic) {
-            emit_http_async_edge(ctx, call, source_node, NULL, &res, svc);
+            emit_http_async_edge(ctx, call, source_node, NULL, &res, svc, false);
             return SKIP_ONE;
         }
     }
@@ -541,7 +578,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
-                         imp_count);
+                         imp_count, tsjs_drop_plain_call);
     return SKIP_ONE;
 }
 

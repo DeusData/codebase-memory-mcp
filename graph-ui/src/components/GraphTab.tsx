@@ -31,7 +31,7 @@ interface GraphTabProps {
 
 export function formatGraphLimitNotice(data: GraphData | null): string | null {
   if (!data || data.total_nodes <= data.nodes.length) return null;
-  return `Showing ${data.nodes.length.toLocaleString()} of ${data.total_nodes.toLocaleString()} nodes. Use filters to narrow.`;
+  return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes. Use filters to narrow.`;
 }
 
 export function GraphTab({ project }: GraphTabProps) {
