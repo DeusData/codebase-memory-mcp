@@ -3027,6 +3027,23 @@ TEST(cli_config_registry_includes_dep_ranking_toggle) {
     PASS();
 }
 
+TEST(cli_config_registry_includes_query_max_rows) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_ROWS) == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_STR_EQ(found->default_val, CBM_DEFAULT_QUERY_MAX_ROWS_STR);
+    ASSERT_STR_EQ(found->range, "0-1000000");
+    ASSERT_NOT_NULL(strstr(found->description, "query_graph"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "upstream"));
+    PASS();
+}
+
 TEST(cli_config_registry_reindex_startup_guidance_is_precise) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -3364,13 +3381,14 @@ SUITE(cli) {
     /* Skill directive descriptions (1 test — group E) */
     RUN_TEST(cli_skill_descriptions_directive);
 
-    /* Config store (6 tests — group F) */
+    /* Config store and registry - group F */
     RUN_TEST(cli_config_open_close);
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_get_effective_env_overrides_db);
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
+    RUN_TEST(cli_config_registry_includes_query_max_rows);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
