@@ -688,6 +688,12 @@ int cbm_store_set_overlay_generation_status(cbm_store_t *s, const char *project,
                                             const char *status);
 int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
                                         const char *status, int *out_count);
+/* Atomically claim the oldest ready overlay generation for compaction by
+ * moving it from overlay_ready to compacting. Returns CBM_STORE_NOT_FOUND when
+ * no ready overlay generation exists for the project. */
+int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project,
+                                             int64_t *out_overlay_generation,
+                                             int64_t *out_base_generation);
 
 /* Publish one file's replacement facts into overlay storage. This does not
  * mutate canonical nodes/edges; active read paths decide later how to combine

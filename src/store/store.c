@@ -3985,6 +3985,97 @@ int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
     return CBM_STORE_ERR;
 }
 
+int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project,
+                                             int64_t *out_overlay_generation,
+                                             int64_t *out_base_generation) {
+    if (out_overlay_generation) {
+        *out_overlay_generation = 0;
+    }
+    if (out_base_generation) {
+        *out_base_generation = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out_overlay_generation ||
+        !out_base_generation) {
+        if (s) {
+            store_set_error(s, "claim_ready_overlay_generation: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    static const char select_sql[] =
+        "SELECT overlay_generation, base_generation FROM overlay_generations "
+        "WHERE project = ?1 AND status = ?2 "
+        "ORDER BY overlay_generation ASC LIMIT 1;";
+    if (sqlite3_prepare_v2(s->db, select_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "claim_ready_overlay_generation select prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_STATUS_READY);
+    rc = sqlite3_step(stmt);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "claim_ready_overlay_generation select");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+
+    int64_t overlay_generation = sqlite3_column_int64(stmt, 0);
+    int64_t base_generation = sqlite3_column_int64(stmt, ST_COL_1);
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+
+    static const char update_sql[] =
+        "UPDATE overlay_generations SET status = ?3, updated_at = ?4 "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND status = ?5;";
+    if (sqlite3_prepare_v2(s->db, update_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "claim_ready_overlay_generation update prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_STATUS_COMPACTING);
+    bind_text(stmt, ST_COL_4, ts);
+    bind_text(stmt, ST_COL_5, CBM_STORE_OVERLAY_STATUS_READY);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "claim_ready_overlay_generation update");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_changes(s->db) != 1) {
+        store_set_error(s, "claim_ready_overlay_generation: ready generation not found");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+
+    *out_overlay_generation = overlay_generation;
+    *out_base_generation = base_generation;
+    return CBM_STORE_OK;
+}
+
 static int store_resolve_node_id(cbm_store_t *s, const char *project, const char *qn,
                                  int64_t *out_id) {
     const char *qns[1] = {qn};
