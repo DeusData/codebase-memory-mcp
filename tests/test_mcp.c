@@ -2664,6 +2664,68 @@ TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches) {
     PASS();
 }
 
+TEST(search_code_uses_overlay_active_nodes_for_graph_annotations) {
+    enum { BASE_GENERATION = 1 };
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    char src_path[512];
+    int n = snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(src_path));
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fprintf(fp, "package main\n"
+                          "\n"
+                          "func FreshHandle() error {\n"
+                          "\treturn nil\n"
+                          "}\n"),
+              0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, "test-project", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh = {.project = "test-project",
+                        .label = "Function",
+                        .name = "FreshHandle",
+                        .qualified_name = "test-project.cmd.server.main.FreshHandle",
+                        .file_path = "main.go",
+                        .start_line = 3,
+                        .end_line = 5,
+                        .properties_json = "{\"signature\":\"func FreshHandle() error\"}"};
+    cbm_store_file_delta_t delta = {.project = "test-project",
+                                    .rel_path = "main.go",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &fresh,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"FreshHandle\",\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "FreshHandle"));
+    ASSERT_NOT_NULL(strstr(inner, "\"qualified_name\":\"test-project.cmd.server.main.FreshHandle\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":1"));
+    ASSERT_NULL(strstr(inner, "test-project.cmd.server.main.HandleRequest"));
+
+    free(inner);
+    free(resp);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(search_code_limit_zero_uses_config_default) {
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -4471,6 +4533,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches);
+    RUN_TEST(search_code_uses_overlay_active_nodes_for_graph_annotations);
     RUN_TEST(search_code_limit_zero_uses_config_default);
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
