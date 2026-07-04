@@ -643,6 +643,58 @@ TEST(tool_get_graph_schema_empty) {
     PASS();
 }
 
+TEST(tool_get_graph_schema_reports_ready_overlay_canonical_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "graph-schema-overlay";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/graph-schema-overlay"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "OldGraphSchema",
+                         .qualified_name = "graph.schema.OldGraphSchema",
+                         .file_path = "src/main.c",
+                         .properties_json = "{\"role\":\"old\"}"};
+    ASSERT_GT(cbm_store_upsert_node(st, &old_fn), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_class = {.project = proj,
+                              .label = "Class",
+                              .name = "FreshGraphSchema",
+                              .qualified_name = "graph.schema.FreshGraphSchema",
+                              .file_path = "src/main.c",
+                              .properties_json = "{\"role\":\"fresh\"}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &fresh_class,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_graph_schema\","
+             "\"arguments\":{\"project\":\"graph-schema-overlay\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"label\\\":\\\"Function\\\""));
+    ASSERT_NULL(strstr(resp, "\\\"label\\\":\\\"Class\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "get_graph_schema reads canonical schema counts"));
+    ASSERT_NOT_NULL(strstr(resp, "ready overlay rows are not included"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"canonical_only\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_unknown_tool) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -4991,6 +5043,7 @@ SUITE(mcp) {
     RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
     RUN_TEST(resolve_store_leaves_foreign_sqlite_db_untouched);
     RUN_TEST(tool_get_graph_schema_empty);
+    RUN_TEST(tool_get_graph_schema_reports_ready_overlay_canonical_only);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
