@@ -412,6 +412,72 @@ TEST(parallel_args_json_no_overflow) {
     PASS();
 }
 
+typedef struct {
+    int self_get_calls;
+} self_get_call_ctx_t;
+
+static void count_self_get_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
+    self_get_call_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    if (edge->source_id != edge->target_id) {
+        return;
+    }
+    if (edge->properties_json && strstr(edge->properties_json, "\"callee\":\"ec.get\"")) {
+        c->self_get_calls++;
+    }
+}
+
+static int count_extracted_calls_named(const CBMFileResult *result, const char *callee_name) {
+    int count = 0;
+    if (!result || !callee_name) {
+        return 0;
+    }
+    for (int i = 0; i < result->calls.count; i++) {
+        const char *got = result->calls.items[i].callee_name;
+        if (got && strcmp(got, callee_name) == 0) {
+            count++;
+        }
+    }
+    return count;
+}
+
+TEST(parallel_unresolved_route_suffix_does_not_emit_self_call) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_route_suffix_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    const char *source = "def FilterPanel(ec, e):\n"
+                         "    return ec.get(e.type)\n";
+    CBMFileResult *extracted =
+        cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "cbm_route_suffix",
+                         "app.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(extracted);
+    ASSERT_GT(count_extracted_calls_named(extracted, "ec.get"), 0);
+    cbm_free_result(extracted);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.py", dir);
+    ASSERT_EQ(th_write_file(path, source), 0);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *gbuf = run_parallel("cbm_route_suffix", dir, files, 1, 1);
+    ASSERT_NOT_NULL(gbuf);
+
+    self_get_call_ctx_t c = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_self_get_call_edges, &c);
+    ASSERT_EQ(c.self_get_calls, 0);
+
+    cbm_gbuf_free(gbuf);
+    th_rmtree(dir);
+    PASS();
+}
+
 /* ── Production pipeline worker-count parity ─────────────────────── */
 
 enum {
@@ -1127,6 +1193,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_full_pipeline_worker_count_parity_64_files);
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
+    RUN_TEST(parallel_unresolved_route_suffix_does_not_emit_self_call);
 
     /* Cleanup shared state */
     parity_teardown();
