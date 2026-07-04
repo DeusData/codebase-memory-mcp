@@ -2587,6 +2587,55 @@ TEST(tool_get_architecture_uses_overlay_active_file_summaries) {
     PASS();
 }
 
+TEST(resource_architecture_reports_ready_overlay_canonical_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "resource-arch-overlay";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/resource-arch-overlay"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "OldResourceArch",
+                         .qualified_name = "resource.arch.OldResourceArch",
+                         .file_path = "src/main.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &old_fn), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_fn = {.project = proj,
+                           .label = "Function",
+                           .name = "FreshResourceArch",
+                           .qualified_name = "resource.arch.FreshResourceArch",
+                           .file_path = "src/main.c",
+                           .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &fresh_fn,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":99,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://architecture\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"contents\""));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://architecture reads canonical graph summaries"));
+    ASSERT_NOT_NULL(strstr(resp, "ready overlay rows are not included"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"canonical_only\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -4937,6 +4986,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_uses_overlay_active_entry_points);
     RUN_TEST(tool_get_architecture_uses_overlay_active_routes);
     RUN_TEST(tool_get_architecture_uses_overlay_active_file_summaries);
+    RUN_TEST(resource_architecture_reports_ready_overlay_canonical_only);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

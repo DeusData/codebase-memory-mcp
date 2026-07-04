@@ -9321,13 +9321,19 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
     int edges = cbm_store_count_edges(store, proj);
     yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
+    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
+        doc, root, store, proj,
+        "codebase://architecture reads canonical graph summaries; ready overlay rows are not "
+        "included until active architecture resource views or compaction are available.");
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_response_warning(doc, root,
-                             "codebase://architecture reads canonical graph summaries; dirty "
-                             "file changes may be absent until overlay or reindex completes.");
+        if (!overlay_limitation_reported) {
+            add_response_warning(doc, root,
+                                 "codebase://architecture reads canonical graph summaries; dirty "
+                                 "file changes may be absent until overlay or reindex completes.");
+        }
     }
 
     /* Key functions by PageRank (top 10), with config-driven exclude patterns */
