@@ -547,6 +547,14 @@ static int init_schema(cbm_store_t *s) {
         "  error TEXT DEFAULT '',"
         "  PRIMARY KEY (project, overlay_generation)"
         ");"
+        "CREATE TABLE IF NOT EXISTS overlay_compaction_claims ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  claimed_at TEXT NOT NULL,"
+        "  PRIMARY KEY (project, overlay_generation),"
+        "  FOREIGN KEY(project, overlay_generation) REFERENCES "
+        "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
+        ");"
         "CREATE TABLE IF NOT EXISTS overlay_nodes ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -782,6 +790,8 @@ static int create_user_indexes(cbm_store_t *s) {
         "  ON dirty_files(project, status);"
         "CREATE INDEX IF NOT EXISTS idx_overlay_generations_status"
         "  ON overlay_generations(project, status, overlay_generation);"
+        "CREATE INDEX IF NOT EXISTS idx_overlay_compaction_claims_project"
+        "  ON overlay_compaction_claims(project, claimed_at, overlay_generation);"
         "CREATE INDEX IF NOT EXISTS idx_overlay_nodes_project_gen"
         "  ON overlay_nodes(project, overlay_generation, rel_path);"
         "CREATE INDEX IF NOT EXISTS idx_overlay_nodes_project_gen_qn"
@@ -4011,6 +4021,9 @@ int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project
     static const char select_sql[] =
         "SELECT overlay_generation, base_generation FROM overlay_generations "
         "WHERE project = ?1 AND status = ?2 "
+        "AND NOT EXISTS (SELECT 1 FROM overlay_compaction_claims c "
+        "                WHERE c.project = overlay_generations.project "
+        "                  AND c.overlay_generation = overlay_generations.overlay_generation) "
         "ORDER BY overlay_generation ASC LIMIT 1;";
     if (sqlite3_prepare_v2(s->db, select_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "claim_ready_overlay_generation select prepare");
@@ -4037,11 +4050,11 @@ int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project
     sqlite3_finalize(stmt);
     stmt = NULL;
 
-    static const char update_sql[] =
-        "UPDATE overlay_generations SET status = ?3, updated_at = ?4 "
-        "WHERE project = ?1 AND overlay_generation = ?2 AND status = ?5;";
-    if (sqlite3_prepare_v2(s->db, update_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "claim_ready_overlay_generation update prepare");
+    static const char insert_sql[] =
+        "INSERT INTO overlay_compaction_claims (project, overlay_generation, claimed_at) "
+        "VALUES (?1, ?2, ?3);";
+    if (sqlite3_prepare_v2(s->db, insert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "claim_ready_overlay_generation insert prepare");
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
@@ -4049,20 +4062,13 @@ int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project
     iso_now(ts, sizeof(ts));
     bind_text(stmt, ST_COL_1, project);
     sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
-    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_STATUS_COMPACTING);
-    bind_text(stmt, ST_COL_4, ts);
-    bind_text(stmt, ST_COL_5, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_3, ts);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
-        store_set_error_sqlite(s, "claim_ready_overlay_generation update");
+        store_set_error_sqlite(s, "claim_ready_overlay_generation insert");
         (void)cbm_store_rollback(s);
-        return CBM_STORE_ERR;
-    }
-    if (sqlite3_changes(s->db) != 1) {
-        store_set_error(s, "claim_ready_overlay_generation: ready generation not found");
-        (void)cbm_store_rollback(s);
-        return CBM_STORE_NOT_FOUND;
+        return rc == SQLITE_CONSTRAINT ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
     }
 
     rc = cbm_store_commit(s);
@@ -4076,14 +4082,14 @@ int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project
     return CBM_STORE_OK;
 }
 
-int cbm_store_recover_compacting_overlay_generations(cbm_store_t *s, const char *project,
-                                                     int *out_recovered) {
+int cbm_store_recover_overlay_compaction_claims(cbm_store_t *s, const char *project,
+                                                int *out_recovered) {
     if (out_recovered) {
         *out_recovered = 0;
     }
     if (!s || !s->db || !project || !project[0] || !out_recovered) {
         if (s) {
-            store_set_error(s, "recover_compacting_overlay_generations: invalid argument");
+            store_set_error(s, "recover_overlay_compaction_claims: invalid argument");
         }
         return CBM_STORE_ERR;
     }
@@ -4094,24 +4100,17 @@ int cbm_store_recover_compacting_overlay_generations(cbm_store_t *s, const char 
     }
 
     sqlite3_stmt *stmt = NULL;
-    static const char sql[] =
-        "UPDATE overlay_generations SET status = ?3, updated_at = ?4 "
-        "WHERE project = ?1 AND status = ?2;";
+    static const char sql[] = "DELETE FROM overlay_compaction_claims WHERE project = ?1;";
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "recover_compacting_overlay_generations prepare");
+        store_set_error_sqlite(s, "recover_overlay_compaction_claims prepare");
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
-    char ts[CBM_SZ_64];
-    iso_now(ts, sizeof(ts));
     bind_text(stmt, ST_COL_1, project);
-    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_STATUS_COMPACTING);
-    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_STATUS_READY);
-    bind_text(stmt, ST_COL_4, ts);
     rc = sqlite3_step(stmt);
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) {
-        store_set_error_sqlite(s, "recover_compacting_overlay_generations");
+        store_set_error_sqlite(s, "recover_overlay_compaction_claims");
         (void)cbm_store_rollback(s);
         return CBM_STORE_ERR;
     }
