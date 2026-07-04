@@ -505,8 +505,9 @@ static bool add_overlay_active_architecture_freshness(
         warning && warning[0]
             ? warning
             : "get_architecture used active overlay node rows for sections listed in "
-              "freshness.active_sections; counts and derived summaries remain canonical "
-              "or stale until active architecture views or compaction are available.");
+              "freshness.active_sections; counts, relationship_patterns, and other "
+              "derived summaries remain canonical or stale until active architecture "
+              "views or compaction are available.");
     return true;
 }
 
