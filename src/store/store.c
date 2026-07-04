@@ -4078,6 +4078,42 @@ static int store_overlay_nodes_fts_delete_by_file(cbm_store_t *s, const char *pr
     return CBM_STORE_OK;
 }
 
+static int store_overlay_nodes_fts_delete_superseded_file(cbm_store_t *s, const char *project,
+                                                          int64_t keep_overlay_generation,
+                                                          const char *rel_path) {
+    static const char sql[] =
+        "INSERT INTO " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "(" CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        ", rowid, name, qualified_name, label, file_path) "
+        "SELECT 'delete', n.id, cbm_camel_split(n.name), n.qualified_name, n.label, n.file_path "
+        "FROM overlay_nodes n "
+        "JOIN overlay_generations g "
+        "  ON g.project = n.project AND g.overlay_generation = n.overlay_generation "
+        "WHERE n.project = ?1 AND n.rel_path = ?2 AND n.overlay_generation < ?3 "
+        "  AND g.status = ?4 "
+        "  AND EXISTS (SELECT 1 FROM " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "              WHERE rowid = n.id);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_overlay_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "overlay_nodes_fts_delete_superseded_file");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    sqlite3_bind_int64(stmt, ST_COL_3, keep_overlay_generation);
+    bind_text(stmt, ST_COL_4, CBM_STORE_OVERLAY_STATUS_READY);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_nodes_fts_delete_superseded_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int store_overlay_nodes_fts_insert_node(cbm_store_t *s, int64_t overlay_node_id,
                                                const cbm_node_t *node) {
     static const char sql[] =
@@ -4915,6 +4951,86 @@ static int store_overlay_delete_file_rows_body(cbm_store_t *s, const char *proje
     return CBM_STORE_OK;
 }
 
+static int store_overlay_delete_empty_ready_generations_body(cbm_store_t *s, const char *project,
+                                                            int64_t before_overlay_generation) {
+    static const char sql[] =
+        "DELETE FROM overlay_generations "
+        "WHERE project = ?1 AND status = ?2 AND overlay_generation < ?3 "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_nodes n "
+        "                  WHERE n.project = overlay_generations.project "
+        "                    AND n.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_edges e "
+        "                  WHERE e.project = overlay_generations.project "
+        "                    AND e.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_tombstones t "
+        "                  WHERE t.project = overlay_generations.project "
+        "                    AND t.overlay_generation = overlay_generations.overlay_generation);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_delete_empty_ready_generations prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_STATUS_READY);
+    sqlite3_bind_int64(stmt, ST_COL_3, before_overlay_generation);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_delete_empty_ready_generations");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_delete_superseded_file_rows_body(cbm_store_t *s, const char *project,
+                                                          int64_t keep_overlay_generation,
+                                                          const char *rel_path) {
+    int rc = store_overlay_nodes_fts_delete_superseded_file(s, project, keep_overlay_generation,
+                                                            rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    static const char *const delete_sql[] = {
+        "DELETE FROM overlay_edges WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_edges.project "
+        "              AND g.overlay_generation = overlay_edges.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_nodes WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_nodes.project "
+        "              AND g.overlay_generation = overlay_nodes.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_tombstones WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_tombstones.project "
+        "              AND g.overlay_generation = overlay_tombstones.overlay_generation "
+        "              AND g.status = ?4);",
+    };
+    enum { DELETE_SQL_COUNT = (int)(sizeof(delete_sql) / sizeof(delete_sql[0])) };
+    for (int i = 0; i < DELETE_SQL_COUNT; i++) {
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, delete_sql[i], CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "overlay_delete_superseded_file_rows prepare");
+            return CBM_STORE_ERR;
+        }
+        bind_text(stmt, ST_COL_1, project);
+        bind_text(stmt, ST_COL_2, rel_path);
+        sqlite3_bind_int64(stmt, ST_COL_3, keep_overlay_generation);
+        bind_text(stmt, ST_COL_4, CBM_STORE_OVERLAY_STATUS_READY);
+        rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "overlay_delete_superseded_file_rows");
+            return CBM_STORE_ERR;
+        }
+    }
+    return store_overlay_delete_empty_ready_generations_body(s, project, keep_overlay_generation);
+}
+
 static int store_overlay_generation_publishable_body(cbm_store_t *s, const char *project,
                                                      int64_t overlay_generation) {
     static const char sql[] = "SELECT status FROM overlay_generations "
@@ -5161,6 +5277,15 @@ int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = deltas[i];
+        rc = store_overlay_delete_superseded_file_rows_body(s, delta->project, overlay_generation,
+                                                            delta->rel_path);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
     }
     rc = cbm_store_commit(s);
     if (rc != CBM_STORE_OK) {
