@@ -393,11 +393,12 @@ static void add_overlay_active_search_code_freshness(
 
 static bool add_overlay_active_architecture_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store, const char *project,
-    bool include_entry_points, bool include_routes) {
+    bool include_languages, bool include_entry_points, bool include_routes,
+    bool include_file_tree) {
     if (!doc || !root || !store || !project || !project[0]) {
         return false;
     }
-    if (!include_entry_points && !include_routes) {
+    if (!include_languages && !include_entry_points && !include_routes && !include_file_tree) {
         return false;
     }
     cbm_store_overlay_node_view_summary_t summary = {0};
@@ -412,11 +413,17 @@ static bool add_overlay_active_architecture_freshness(
     yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
                            CBM_MCP_FRESHNESS_READ_MODEL_MIXED_ACTIVE_NODES);
     yyjson_mut_val *active_sections = yyjson_mut_arr(doc);
+    if (include_languages) {
+        yyjson_mut_arr_add_str(doc, active_sections, "languages");
+    }
     if (include_entry_points) {
         yyjson_mut_arr_add_str(doc, active_sections, "entry_points");
     }
     if (include_routes) {
         yyjson_mut_arr_add_str(doc, active_sections, "routes");
+    }
+    if (include_file_tree) {
+        yyjson_mut_arr_add_str(doc, active_sections, "file_tree");
     }
     yyjson_mut_obj_add_val(doc, freshness, "active_sections", active_sections);
     yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
@@ -428,19 +435,10 @@ static bool add_overlay_active_architecture_freshness(
     yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
                            summary.overlay_owned_nodes_visible);
     yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible", summary.total_nodes_visible);
-    add_response_warning(
-        doc, root,
-        include_entry_points && include_routes
-            ? "get_architecture used active overlay node rows for entry_points and routes; "
-              "counts and derived summaries remain canonical or stale until active architecture "
-              "views or compaction are available."
-            : include_routes
-                  ? "get_architecture used active overlay node rows for routes; counts and "
-                    "derived summaries remain canonical or stale until active architecture views "
-                    "or compaction are available."
-                  : "get_architecture used active overlay node rows for entry_points; counts and "
-                    "derived summaries remain canonical or stale until active architecture views "
-                    "or compaction are available.");
+    add_response_warning(doc, root,
+                         "get_architecture used active overlay node rows for sections listed in "
+                         "freshness.active_sections; counts and derived summaries remain canonical "
+                         "or stale until active architecture views or compaction are available.");
     return true;
 }
 
@@ -4978,12 +4976,16 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
+    bool active_languages_requested = aspect_wanted(aspects_doc, aspects_arr, "languages");
     bool active_entry_points_requested = aspect_wanted(aspects_doc, aspects_arr, "entry_points");
     bool active_routes_requested = aspect_wanted(aspects_doc, aspects_arr, "routes");
+    bool active_file_tree_requested = aspect_wanted(aspects_doc, aspects_arr, "file_tree");
     bool active_architecture_reported =
         add_overlay_active_architecture_freshness(doc, root, store, project,
+                                                  active_languages_requested,
                                                   active_entry_points_requested,
-                                                  active_routes_requested);
+                                                  active_routes_requested,
+                                                  active_file_tree_requested);
     bool overlay_limitation_reported =
         !active_architecture_reported &&
         add_canonical_only_overlay_freshness(

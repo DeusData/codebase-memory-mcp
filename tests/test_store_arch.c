@@ -343,6 +343,72 @@ TEST(arch_languages) {
     PASS();
 }
 
+TEST(arch_file_summaries_use_overlay_active_tombstones) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "overlay-files", "/tmp/overlay-files"), CBM_STORE_OK);
+
+    cbm_node_t stale_file = {.project = "overlay-files",
+                             .label = "File",
+                             .name = "stale.py",
+                             .qualified_name = "overlay-files.src.stale",
+                             .file_path = "src/stale.py",
+                             .properties_json = "{}"};
+    cbm_node_t live_file = {.project = "overlay-files",
+                            .label = "File",
+                            .name = "live.go",
+                            .qualified_name = "overlay-files.src.live",
+                            .file_path = "src/live.go",
+                            .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &stale_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &live_file), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "overlay-files", 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_store_file_delta_t delete_delta = {.project = "overlay-files",
+                                           .rel_path = "src/stale.py",
+                                           .generation = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delete_delta, overlay_generation),
+              CBM_STORE_OK);
+
+    const char *aspects[] = {"languages", "file_tree"};
+    cbm_architecture_info_t info = {0};
+    ASSERT_EQ(cbm_store_get_architecture_scoped(s, "overlay-files", "src", aspects, 2, &info, 0,
+                                                1.0),
+              CBM_STORE_OK);
+
+    int go_count = 0;
+    int py_count = 0;
+    for (int i = 0; i < info.language_count; i++) {
+        if (strcmp(info.languages[i].language, "Go") == 0) {
+            go_count = info.languages[i].file_count;
+        }
+        if (strcmp(info.languages[i].language, "Python") == 0) {
+            py_count = info.languages[i].file_count;
+        }
+    }
+    ASSERT_EQ(go_count, 1);
+    ASSERT_EQ(py_count, 0);
+
+    bool saw_live = false;
+    bool saw_stale = false;
+    for (int i = 0; i < info.file_tree_count; i++) {
+        if (strcmp(info.file_tree[i].path, "src/live.go") == 0) {
+            saw_live = true;
+        }
+        if (strcmp(info.file_tree[i].path, "src/stale.py") == 0) {
+            saw_stale = true;
+        }
+    }
+    ASSERT_TRUE(saw_live);
+    ASSERT_TRUE(!saw_stale);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_routes) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_node_t infra_url = {
@@ -1707,6 +1773,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
+    RUN_TEST(arch_file_summaries_use_overlay_active_tombstones);
     RUN_TEST(arch_routes);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_boundaries);
