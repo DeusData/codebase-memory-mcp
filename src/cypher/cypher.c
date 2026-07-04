@@ -2923,6 +2923,43 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
     }
 }
 
+static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count,
+                                      const cbm_node_pattern_t *target_node, binding_t *b,
+                                      const char *to_var, const char *rel_var,
+                                      binding_t *new_bindings, int *new_count, int max_new,
+                                      int *match_count) {
+    cbm_node_t *bound_to = binding_get(b, to_var);
+    const char *bound_to_qn =
+        bound_to && bound_to->qualified_name && bound_to->qualified_name[0]
+            ? bound_to->qualified_name
+            : NULL;
+    int64_t bound_to_id = bound_to ? bound_to->id : 0;
+    for (int ri = 0; ri < row_count && *new_count < max_new; ri++) {
+        cbm_node_t *found = &rows[ri].node;
+        if (bound_to_qn) {
+            if (!found->qualified_name || strcmp(bound_to_qn, found->qualified_name) != 0) {
+                continue;
+            }
+        } else if (bound_to && found->id != bound_to_id) {
+            continue;
+        }
+        if (target_node->label && !label_alt_matches(found->label, target_node->label)) {
+            continue;
+        }
+        if (!check_inline_props(found, target_node->props, target_node->prop_count, b->store)) {
+            continue;
+        }
+        binding_t nb = {0};
+        binding_copy(&nb, b);
+        binding_set(&nb, to_var, found);
+        if (rel_var) {
+            binding_set_edge(&nb, rel_var, &rows[ri].edge);
+        }
+        new_bindings[(*new_count)++] = nb;
+        (*match_count)++;
+    }
+}
+
 /* Expand variable-length relationship via BFS */
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
@@ -2960,6 +2997,24 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     bool is_inbound = rel->direction && strcmp(rel->direction, "inbound") == 0;
     bool is_any = rel->direction && strcmp(rel->direction, "any") == 0;
     const char *rel_var = rel->variable;
+
+    if (b->use_active_overlay_edges && b->project && src->qualified_name &&
+        src->qualified_name[0]) {
+        int direction = is_inbound ? CBM_STORE_EDGE_DIR_INBOUND
+                                   : (is_any ? CBM_STORE_EDGE_DIR_ANY
+                                             : CBM_STORE_EDGE_DIR_OUTBOUND);
+        cbm_store_edge_node_t *rows = NULL;
+        int row_count = 0;
+        if (cbm_store_find_active_edge_nodes_by_qn(store, b->project, src->qualified_name,
+                                                   (const char **)rel->types, rel->type_count,
+                                                   direction, &rows, &row_count) ==
+            CBM_STORE_OK) {
+            process_active_edge_nodes(rows, row_count, target_node, b, to_var, rel_var,
+                                      new_bindings, new_count, max_new, match_count);
+        }
+        cbm_store_free_edge_nodes(rows, row_count);
+        return;
+    }
 
     if (rel->type_count > 0) {
         for (int ti = 0; ti < rel->type_count; ti++) {
@@ -4511,11 +4566,27 @@ static bool cypher_return_requires_canonical_edges(const cbm_return_clause_t *re
     return false;
 }
 
+static bool cypher_pattern_supports_active_relationships(const cbm_pattern_t *pat) {
+    if (!pat || pat->rel_count == 0) {
+        return true;
+    }
+    if (pat->rel_count != SKIP_ONE) {
+        return false;
+    }
+    const cbm_rel_pattern_t *rel = &pat->rels[0];
+    return rel->min_hops == SKIP_ONE && rel->max_hops == SKIP_ONE;
+}
+
 static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
     for (const cbm_query_t *cur = q; cur; cur = cur->union_next) {
+        int relationship_pattern_count = 0;
         for (int pi = 0; pi < cur->pattern_count; pi++) {
             if (cur->patterns[pi].rel_count > 0) {
-                return false;
+                relationship_pattern_count++;
+                if (relationship_pattern_count > SKIP_ONE || cur->pattern_count > SKIP_ONE ||
+                    !cypher_pattern_supports_active_relationships(&cur->patterns[pi])) {
+                    return false;
+                }
             }
         }
         if (cypher_where_requires_canonical_edges(cur->where) ||
