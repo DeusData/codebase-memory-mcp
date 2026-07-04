@@ -723,6 +723,12 @@ int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
                                                const cbm_store_file_delta_t *const *deltas,
                                                int delta_count,
                                                int64_t overlay_generation);
+/* Publish additive overlay facts without file tombstones. Canonical rows for
+ * the same rel_path remain visible; callers must pass only facts that are safe
+ * to layer on top of the base graph. */
+int cbm_store_publish_overlay_file_delta_additions_batch(
+    cbm_store_t *s, const cbm_store_file_delta_t *const *deltas, int delta_count,
+    int64_t overlay_generation);
 int cbm_store_compact_overlay_generation(cbm_store_t *s, const char *project,
                                          int64_t overlay_generation,
                                          int64_t index_generation);
