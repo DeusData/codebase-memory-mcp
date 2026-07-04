@@ -694,6 +694,10 @@ int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
 int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project,
                                              int64_t *out_overlay_generation,
                                              int64_t *out_base_generation);
+/* Requeue compacting overlay generations after process restart or confirmed
+ * worker shutdown. Callers must not run this while a compactor is active. */
+int cbm_store_recover_compacting_overlay_generations(cbm_store_t *s, const char *project,
+                                                     int *out_recovered);
 
 /* Publish one file's replacement facts into overlay storage. This does not
  * mutate canonical nodes/edges; active read paths decide later how to combine

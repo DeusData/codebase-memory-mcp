@@ -4076,6 +4076,56 @@ int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project
     return CBM_STORE_OK;
 }
 
+int cbm_store_recover_compacting_overlay_generations(cbm_store_t *s, const char *project,
+                                                     int *out_recovered) {
+    if (out_recovered) {
+        *out_recovered = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out_recovered) {
+        if (s) {
+            store_set_error(s, "recover_compacting_overlay_generations: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    static const char sql[] =
+        "UPDATE overlay_generations SET status = ?3, updated_at = ?4 "
+        "WHERE project = ?1 AND status = ?2;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "recover_compacting_overlay_generations prepare");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_STATUS_COMPACTING);
+    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_4, ts);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "recover_compacting_overlay_generations");
+        (void)cbm_store_rollback(s);
+        return CBM_STORE_ERR;
+    }
+    int recovered = sqlite3_changes(s->db);
+
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    *out_recovered = recovered;
+    return CBM_STORE_OK;
+}
+
 static int store_resolve_node_id(cbm_store_t *s, const char *project, const char *qn,
                                  int64_t *out_id) {
     const char *qns[1] = {qn};

@@ -1373,6 +1373,63 @@ TEST(store_claim_ready_overlay_generation_ignores_nonready_and_validates_outputs
     PASS();
 }
 
+TEST(store_recover_compacting_overlay_generations_requeues_abandoned_claims) {
+    enum { BASE_GENERATION = 5, SENTINEL = 42 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t compacting = 0;
+    int64_t failed = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &compacting),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &failed),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", compacting,
+                                                      CBM_STORE_OVERLAY_STATUS_READY),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", failed,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED),
+              CBM_STORE_OK);
+
+    int64_t claimed = 0;
+    int64_t base = 0;
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, &base),
+              CBM_STORE_OK);
+    ASSERT_EQ(claimed, compacting);
+    ASSERT_EQ(base, BASE_GENERATION);
+
+    int recovered = SENTINEL;
+    ASSERT_EQ(cbm_store_recover_compacting_overlay_generations(s, "test", &recovered),
+              CBM_STORE_OK);
+    ASSERT_EQ(recovered, 1);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", compacting, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_READY),
+              1);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", failed, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_FAILED),
+              1);
+
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, &base),
+              CBM_STORE_OK);
+    ASSERT_EQ(claimed, compacting);
+
+    recovered = SENTINEL;
+    ASSERT_EQ(cbm_store_recover_compacting_overlay_generations(s, "test", &recovered),
+              CBM_STORE_OK);
+    ASSERT_EQ(recovered, 1);
+    recovered = SENTINEL;
+    ASSERT_EQ(cbm_store_recover_compacting_overlay_generations(s, "missing", &recovered),
+              CBM_STORE_OK);
+    ASSERT_EQ(recovered, 0);
+    ASSERT_EQ(cbm_store_recover_compacting_overlay_generations(s, "test", NULL),
+              CBM_STORE_ERR);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_overlay_file_delta_publish_rows_and_tombstone) {
     enum { BASE_GENERATION = 3 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -5345,6 +5402,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_generation_rejects_invalid_inputs);
     RUN_TEST(store_claim_ready_overlay_generation_claims_oldest_once);
     RUN_TEST(store_claim_ready_overlay_generation_ignores_nonready_and_validates_outputs);
+    RUN_TEST(store_recover_compacting_overlay_generations_requeues_abandoned_claims);
     RUN_TEST(store_overlay_file_delta_publish_rows_and_tombstone);
     RUN_TEST(store_delete_project_clears_overlay_fts);
     RUN_TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows);
