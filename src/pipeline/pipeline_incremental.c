@@ -17,6 +17,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "store/store.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -88,6 +89,31 @@ static bool incr_changed_all_c_family_headers(const cbm_file_info_t *changed_fil
         }
     }
     return true;
+}
+
+static bool incr_language_has_scoped_overlay_parity(CBMLanguage lang) {
+    switch (lang) {
+    case CBM_LANG_GO:
+    case CBM_LANG_C:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CUDA:
+        return true;
+    default:
+        return !cbm_pxc_has_cross_lsp(lang);
+    }
+}
+
+static bool incr_changed_has_scoped_overlay_gap(const cbm_file_info_t *changed_files,
+                                                int changed_count) {
+    if (!changed_files || changed_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        if (!incr_language_has_scoped_overlay_parity(changed_files[i].language)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool incr_file_delta_has_type_like_node(const cbm_pipeline_file_delta_t *delta) {
@@ -1585,6 +1611,11 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST || changed_count > max_affected_paths) {
         return CBM_STORE_OK;
     }
+    if (incr_changed_has_scoped_overlay_gap(changed_files, changed_count)) {
+        cbm_pipeline_set_publish_reason(p, "overlay_scoped_lsp_gap");
+        cbm_log_info("incremental.overlay.fallback", "reason", "scoped_lsp_gap");
+        return CBM_STORE_OK;
+    }
     bool c_header_batch = changed_count > 1 &&
                           incr_changed_all_c_family_headers(changed_files, changed_count);
     bool mixed_header_batch = changed_count > 1 && !c_header_batch &&
@@ -2121,7 +2152,8 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     bool overlay_publish_already_failed =
         prior_reason && strcmp(prior_reason, "overlay_publish_error") == 0;
     bool header_overlay_unsafe = incr_changed_contains_c_family_header(changed_files, changed_count);
-    if (!graph_noop_candidate && !header_overlay_unsafe &&
+    bool scoped_overlay_gap = incr_changed_has_scoped_overlay_gap(changed_files, changed_count);
+    if (!graph_noop_candidate && !header_overlay_unsafe && !scoped_overlay_gap &&
         cbm_pipeline_overlay_publish_small_deltas(p) &&
         !overlay_publish_already_failed) {
         int64_t base_generation = 0;
@@ -2449,6 +2481,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_close(store);
         cbm_log_info("incremental.fallback", "reason",
                      CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE, "scope", "c_family_header");
+        return CBM_NOT_FOUND;
+    }
+    if (strcmp(exact_reason ? exact_reason : "",
+               CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE) == 0 &&
+        incr_changed_has_scoped_overlay_gap(changed_files, ci)) {
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.fallback", "reason", "scoped_lsp_gap", "exact_reason",
+                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
         return CBM_NOT_FOUND;
     }
 

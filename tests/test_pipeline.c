@@ -7632,6 +7632,67 @@ TEST(registry_confidence_suffix_match) {
     PASS();
 }
 
+TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Function", "caller", "proj.app.caller", "app.py", 1, 10,
+                             "{}");
+    int64_t suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.fastapi.routing.APIRoute.__init__", "routing.py", 1,
+        10, "{}");
+    int64_t second_suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.other.Route.__init__", "other.py", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(suffix_target_id, 0);
+    ASSERT_GT(second_suffix_target_id, 0);
+    cbm_registry_add(reg, "__init__", "proj.fastapi.routing.APIRoute.__init__", "Method");
+    cbm_registry_add(reg, "__init__", "proj.other.Route.__init__", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "super().__init__",
+                    .enclosing_func_qn = "proj.app.caller",
+                    .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMResolvedCall resolved = {.caller_qn = "proj.app.caller",
+                                .callee_qn = "starlette.routing.Route.__init__",
+                                .strategy = "lsp_type_dispatch",
+                                .confidence = 0.95f};
+    cbm_resolvedcall_push(&result.resolved_calls, &result.arena, resolved);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/app.py",
+                                 .rel_path = "app.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
@@ -11618,6 +11679,83 @@ TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
     PASS();
 }
 
+TEST(incremental_overlay_publish_python_scoped_lsp_gap_falls_back) {
+    enum { PIPELINE_EXACT_ONE_PATH = 1 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/app.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "def helper():\n"
+                            "    return 1\n"),
+              0);
+    char consumer_path[CBM_PATH_MAX];
+    n = snprintf(consumer_path, sizeof(consumer_path), "%s/consumer.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(consumer_path));
+    ASSERT_EQ(th_write_file(consumer_path,
+                            "from app import helper\n\n"
+                            "def use_helper():\n"
+                            "    return helper()\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_ONE_PATH);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(path,
+                            "def helper():\n"
+                            "    return 2\n\n"
+                            "def py_overlay_gap_marker():\n"
+                            "    return helper()\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs,
+                  "msg=incremental.fallback reason=scoped_lsp_gap "
+                  "exact_reason=frontier_too_large") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "Python scoped-LSP fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -13770,13 +13908,17 @@ TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive) {
     cbm_gbuf_t *gb = cbm_gbuf_new("cx-scope-rec", "/tmp/cx-scope-rec");
     ASSERT_NOT_NULL(gb);
 
-    const char *props =
+    const char *changed_props =
         "{\"loop_depth\":1,\"transitive_loop_depth\":3,\"self_recursive\":false,"
         "\"recursive\":true}";
     int64_t changed =
         cbm_gbuf_upsert_node(gb, "Function", "changed", "cx.changed", "changed.go", 1, 4,
-                             props);
+                             changed_props);
+    int64_t unchanged =
+        cbm_gbuf_upsert_node(gb, "Function", "unchanged", "cx.unchanged", "unchanged.go", 1, 4,
+                             changed_props);
     ASSERT_GT(changed, 0);
+    ASSERT_GT(unchanged, 0);
 
     atomic_int cancelled = 0;
     cbm_pipeline_ctx_t ctx = {
@@ -13789,10 +13931,15 @@ TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive) {
     cbm_pipeline_pass_complexity_for_paths(&ctx, scope, (int)(sizeof(scope) / sizeof(scope[0])));
 
     const cbm_gbuf_node_t *changed_node = cbm_gbuf_find_by_qn(gb, "cx.changed");
+    const cbm_gbuf_node_t *unchanged_node = cbm_gbuf_find_by_qn(gb, "cx.unchanged");
     ASSERT_NOT_NULL(changed_node);
+    ASSERT_NOT_NULL(unchanged_node);
     ASSERT_NOT_NULL(changed_node->properties_json);
-    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"transitive_loop_depth\":3"));
-    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"recursive\":true"));
+    ASSERT_NOT_NULL(unchanged_node->properties_json);
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"transitive_loop_depth\":1"));
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"recursive\":false"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"transitive_loop_depth\":3"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"recursive\":true"));
 
     cbm_gbuf_free(gb);
     PASS();
@@ -14119,6 +14266,7 @@ SUITE(pipeline) {
     RUN_TEST(registry_confidence_same_module);
     RUN_TEST(registry_confidence_unique_name);
     RUN_TEST(registry_confidence_suffix_match);
+    RUN_TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
     RUN_TEST(registry_negative_import_rejects);
@@ -14170,6 +14318,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
+    RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_falls_back);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
