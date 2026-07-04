@@ -10294,7 +10294,7 @@ TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_vis
     PASS();
 }
 
-TEST(incremental_c_header_uses_exact_frontier_overlay_for_active_edges) {
+TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof) {
     enum {
         PIPELINE_C_HEADER_OVERLAY_MAX_AFFECTED = CBM_SZ_16,
         PIPELINE_C_HEADER_AFFECTED_FRONTIER =
@@ -10344,27 +10344,27 @@ TEST(incremental_c_header_uses_exact_frontier_overlay_for_active_edges) {
                          PIPELINE_C_HEADER_AFFECTED_FRONTIER);
     ASSERT(log_n >= 0 && (size_t)log_n < sizeof(frontier_log));
     ASSERT(strstr(logs, frontier_log) != NULL);
-    char overlay_log[CBM_SZ_128];
-    log_n = snprintf(overlay_log, sizeof(overlay_log),
-                     "msg=incremental.overlay.done files=%d",
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
+    char done_log[CBM_SZ_128];
+    log_n = snprintf(done_log, sizeof(done_log), "msg=incremental.exact.done files=%d",
                      PIPELINE_C_HEADER_AFFECTED_FRONTIER);
-    ASSERT(log_n >= 0 && (size_t)log_n < sizeof(overlay_log));
-    ASSERT(strstr(logs, overlay_log) != NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
-    ASSERT(!cbm_pipeline_graph_changed(p));
+    ASSERT(log_n >= 0 && (size_t)log_n < sizeof(done_log));
+    ASSERT(strstr(logs, done_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT(cbm_pipeline_graph_changed(p));
     cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
     ASSERT_EQ(stats.changed_paths, CBM_SZ_2);
     ASSERT_EQ(stats.affected_paths, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
     ASSERT_EQ(stats.published_paths, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
     cbm_pipeline_free(p);
 
-    int dirty_pending = -1;
-    int dirty_overlay_ready = -1;
-    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
-                                          &dirty_overlay_ready),
-              CBM_STORE_OK);
-    ASSERT_EQ(dirty_pending, 0);
-    ASSERT_EQ(dirty_overlay_ready, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C header exact update differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
 
     free(project);
     cbm_config_close(cfg);
@@ -13846,7 +13846,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
     RUN_TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_visible);
-    RUN_TEST(incremental_c_header_uses_exact_frontier_overlay_for_active_edges);
+    RUN_TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
