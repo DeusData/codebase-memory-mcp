@@ -1797,6 +1797,16 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     ASSERT_STR_EQ(active.results[0].connected_names[0], "stable");
     ASSERT_STR_EQ(active.results[1].connected_names[0], "new_main");
 
+    const char *edge_types[] = {"CALLS"};
+    cbm_traverse_result_t active_trace = {0};
+    ASSERT_EQ(cbm_store_bfs_overlay_view(live, "test", "test.new_main", "outbound",
+                                         edge_types, 1, 1, 10, &active_trace),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_trace.visited_count, 1);
+    ASSERT_STR_EQ(active_trace.root.name, "new_main");
+    ASSERT_STR_EQ(active_trace.visited[0].node.name, "stable");
+    cbm_store_traverse_free(&active_trace);
+
     cbm_store_search_free(&active);
     cbm_store_search_free(&expected);
     cbm_store_close(live);
