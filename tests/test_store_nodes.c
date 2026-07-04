@@ -1856,6 +1856,95 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     PASS();
 }
 
+TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
+    enum { BASE_GENERATION = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t old_main = {.project = "test",
+                           .label = "Function",
+                           .name = "old_main",
+                           .qualified_name = "test.old_main",
+                           .file_path = "main.go",
+                           .properties_json = "{}"};
+    cbm_node_t stable = {.project = "test",
+                         .label = "Class",
+                         .name = "stable",
+                         .qualified_name = "test.stable",
+                         .file_path = "stable.go",
+                         .properties_json = "{}"};
+    int64_t old_main_id = cbm_store_upsert_node(s, &old_main);
+    int64_t stable_id = cbm_store_upsert_node(s, &stable);
+    ASSERT_GT(old_main_id, 0);
+    ASSERT_GT(stable_id, 0);
+    cbm_edge_t old_edge = {.project = "test",
+                           .source_id = old_main_id,
+                           .target_id = stable_id,
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &old_edge), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t new_main = {.project = "test",
+                           .label = "Route",
+                           .name = "/fresh",
+                           .qualified_name = "test.route.fresh",
+                           .file_path = "main.go",
+                           .properties_json = "{}"};
+    cbm_store_delta_edge_t new_edge = {.source_qn = "test.route.fresh",
+                                       .target_qn = "test.stable",
+                                       .type = "HANDLES",
+                                       .properties_json = "{}",
+                                       .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "main.go",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &new_main,
+                                    .node_count = 1,
+                                    .edges = &new_edge,
+                                    .edge_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    cbm_schema_info_t schema = {0};
+    ASSERT_EQ(cbm_store_get_schema_counts_overlay_view(s, "test", &schema), CBM_STORE_OK);
+    ASSERT_EQ(schema.node_label_count, 2);
+    ASSERT_EQ(schema.edge_type_count, 1);
+    int route_count = CBM_NOT_FOUND;
+    int class_count = CBM_NOT_FOUND;
+    int function_count = CBM_NOT_FOUND;
+    for (int i = 0; i < schema.node_label_count; i++) {
+        if (strcmp(schema.node_labels[i].label, "Route") == 0) {
+            route_count = schema.node_labels[i].count;
+        } else if (strcmp(schema.node_labels[i].label, "Class") == 0) {
+            class_count = schema.node_labels[i].count;
+        } else if (strcmp(schema.node_labels[i].label, "Function") == 0) {
+            function_count = schema.node_labels[i].count;
+        }
+    }
+    int handles_count = CBM_NOT_FOUND;
+    int calls_count = CBM_NOT_FOUND;
+    for (int i = 0; i < schema.edge_type_count; i++) {
+        if (strcmp(schema.edge_types[i].type, "HANDLES") == 0) {
+            handles_count = schema.edge_types[i].count;
+        } else if (strcmp(schema.edge_types[i].type, "CALLS") == 0) {
+            calls_count = schema.edge_types[i].count;
+        }
+    }
+    ASSERT_EQ(route_count, 1);
+    ASSERT_EQ(class_count, 1);
+    ASSERT_EQ(function_count, CBM_NOT_FOUND);
+    ASSERT_EQ(handles_count, 1);
+    ASSERT_EQ(calls_count, CBM_NOT_FOUND);
+    cbm_store_schema_free(&schema);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_owner_metadata_crud) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -4596,6 +4685,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search);
     RUN_TEST(store_search_overlay_view_matches_full_rebuild_oracle);
     RUN_TEST(store_search_overlay_view_uses_active_relationship_edges);
+    RUN_TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_rebuild_file_delta_owners_derives_from_graph);
     RUN_TEST(store_import_export_metadata_crud);

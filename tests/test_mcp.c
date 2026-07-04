@@ -2636,7 +2636,7 @@ TEST(resource_architecture_reports_ready_overlay_canonical_only) {
     PASS();
 }
 
-TEST(resource_schema_reports_ready_overlay_canonical_only) {
+TEST(resource_schema_uses_ready_overlay_counts) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -2675,11 +2675,11 @@ TEST(resource_schema_reports_ready_overlay_canonical_only) {
              "\"params\":{\"uri\":\"codebase://schema\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"contents\""));
-    ASSERT_NOT_NULL(strstr(resp, "\\\"label\\\":\\\"Function\\\""));
-    ASSERT_NULL(strstr(resp, "\\\"label\\\":\\\"Class\\\""));
-    ASSERT_NOT_NULL(strstr(resp, "codebase://schema reads canonical graph schema counts"));
-    ASSERT_NOT_NULL(strstr(resp, "ready overlay rows are not included"));
-    ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"canonical_only\\\""));
+    ASSERT_NULL(strstr(resp, "\\\"label\\\":\\\"Function\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"label\\\":\\\"Class\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "codebase://schema used active overlay node and edge rows"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"overlay_active_graph\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"active_sections\\\":[\\\"node_labels\\\",\\\"edge_types\\\"]"));
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
 
     free(resp);
@@ -5038,7 +5038,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_uses_overlay_active_routes);
     RUN_TEST(tool_get_architecture_uses_overlay_active_file_summaries);
     RUN_TEST(resource_architecture_reports_ready_overlay_canonical_only);
-    RUN_TEST(resource_schema_reports_ready_overlay_canonical_only);
+    RUN_TEST(resource_schema_uses_ready_overlay_counts);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
