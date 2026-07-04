@@ -3457,6 +3457,11 @@ static int bm25_build_match(const char *query, char *out, size_t out_size) {
     return emitted;
 }
 
+static bool bm25_query_has_terms(const char *query) {
+    char fts_query[BM25_QUERY_BUF];
+    return bm25_build_match(query, fts_query, sizeof(fts_query)) > 0;
+}
+
 static char *bm25_file_pattern_like(const char *file_pattern) {
     if (!file_pattern) {
         return NULL;
@@ -4190,13 +4195,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_store_get_overlay_node_view_summary(store, project, &q_overlay_summary) ==
                 CBM_STORE_OK &&
             q_overlay_summary.active_file_tombstones > 0;
+        bool q_has_terms = !q_overlay_ready || bm25_query_has_terms(query);
         char *bm25_json =
             q_overlay_ready
                 ? bm25_search_overlay_active(store, project, query, q_file_pattern, q_limit,
                                              q_offset, &q_overlay_summary)
                 : bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
         free(q_file_pattern);
-        if (q_overlay_ready && !bm25_json) {
+        if (q_overlay_ready && q_has_terms && !bm25_json) {
             free(query);
             free(pe.value);
             return cbm_mcp_text_result(

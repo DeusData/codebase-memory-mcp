@@ -1310,6 +1310,55 @@ TEST(tool_search_graph_query_uses_overlay_active_rows) {
     PASS();
 }
 
+TEST(tool_search_graph_overlay_tokenless_query_uses_graph_filters) {
+    enum { BASE_GENERATION = 1 };
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "fts-overlay-tokenless";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/fts-overlay-tokenless"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh = {.project = proj,
+                        .label = "Function",
+                        .name = "tokenlessOverlayMarker",
+                        .qualified_name = "fts-overlay-tokenless.fresh",
+                        .file_path = "src/status.c",
+                        .start_line = 7,
+                        .end_line = 9,
+                        .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/status.c",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &fresh,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":558,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-overlay-tokenless\",\"query\":\"!!!\","
+             "\"name_pattern\":\"tokenlessOverlayMarker\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "search_graph query overlay read failed"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "tokenlessOverlayMarker"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -5116,6 +5165,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_uses_overlay_active_rows);
+    RUN_TEST(tool_search_graph_overlay_tokenless_query_uses_graph_filters);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
