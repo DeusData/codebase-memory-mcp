@@ -8509,6 +8509,30 @@ static int pipeline_store_dirty_counts(const char *db_path, const char *project,
     return rc;
 }
 
+static int pipeline_store_overlay_file_has_function(const char *db_path, const char *project,
+                                                    const char *rel_path, const char *name) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return 0;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int found = 0;
+    if (cbm_store_find_nodes_by_file_overlay_view(s, project, rel_path, &nodes, &count) ==
+        CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            if (nodes[i].label && strcmp(nodes[i].label, "Function") == 0 && nodes[i].name &&
+                strcmp(nodes[i].name, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        cbm_store_free_nodes(nodes, count);
+    }
+    cbm_store_close(s);
+    return found;
+}
+
 static int pipeline_store_completed_generation_count(const char *db_path, const char *project) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
     if (!s) {
@@ -10508,6 +10532,79 @@ TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go)
 
     cbm_pipeline_file_delta_free(&deltas[0]);
     cbm_pipeline_file_delta_free(&deltas[1]);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayOnly"));
+
+    char helper_path[CBM_PATH_MAX];
+    int n = snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(helper_path));
+    ASSERT_EQ(th_write_file(helper_path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"overlay\"\n}\n\n"
+                            "func OverlayOnly() int {\n\treturn 21\n}\n"),
+              0);
+
+    cbm_file_info_t changed = {
+        .path = helper_path,
+        .rel_path = "helper.go",
+        .language = CBM_LANG_GO,
+    };
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             &changed, 1, &scratch, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_pipeline_publish_overlay_file_delta_batch(
+                  store, deltas, 1, CBM_PIPELINE_COMPAT_GENERATION,
+                  CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_GT(overlay_generation, 0);
+    cbm_store_close(store);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayOnly"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "helper.go",
+                                                    "OverlayOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    cbm_pipeline_file_delta_free(&delta);
     cbm_gbuf_free(scratch);
     free(project);
     cbm_config_close(cfg);
@@ -12665,6 +12762,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_arg_url_route_change_matches_parallel_full_rebuild);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
+    RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);

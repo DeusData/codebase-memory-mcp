@@ -5064,48 +5064,66 @@ static int store_overlay_insert_edges_body(cbm_store_t *s,
     return CBM_STORE_OK;
 }
 
-int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
-                                         const cbm_store_file_delta_t *delta,
-                                         int64_t overlay_generation) {
-    if (!s || !s->db || overlay_generation <= 0 || !store_file_delta_shape_valid(delta)) {
+int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *const *deltas,
+                                               int delta_count,
+                                               int64_t overlay_generation) {
+    if (!s || !s->db || overlay_generation <= 0 || !deltas || delta_count <= 0) {
         if (s) {
             store_set_error(s, "publish_overlay_file_delta: invalid argument");
         }
         return CBM_STORE_ERR;
+    }
+    const char *project = NULL;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = deltas[i];
+        if (!store_file_delta_shape_valid(delta)) {
+            store_set_error(s, "publish_overlay_file_delta: invalid argument");
+            return CBM_STORE_ERR;
+        }
+        if (!project) {
+            project = delta->project;
+        } else if (strcmp(project, delta->project) != 0) {
+            store_set_error(s, "publish_overlay_file_delta: mixed project batch");
+            return CBM_STORE_ERR;
+        }
     }
 
     int rc = cbm_store_begin(s);
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    rc = store_overlay_generation_publishable_body(s, delta->project, overlay_generation);
+    rc = store_overlay_generation_publishable_body(s, project, overlay_generation);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
         return rc;
     }
-    rc = store_overlay_delete_file_rows_body(s, delta->project, overlay_generation,
-                                             delta->rel_path);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = deltas[i];
+        rc = store_overlay_delete_file_rows_body(s, delta->project, overlay_generation,
+                                                 delta->rel_path);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+        rc = store_overlay_insert_file_tombstone_body(s, delta->project, overlay_generation,
+                                                      delta->rel_path);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+        rc = store_overlay_insert_nodes_body(s, delta, overlay_generation);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
+        rc = store_overlay_insert_edges_body(s, delta, overlay_generation);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
     }
-    rc = store_overlay_insert_file_tombstone_body(s, delta->project, overlay_generation,
-                                                  delta->rel_path);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = store_overlay_insert_nodes_body(s, delta, overlay_generation);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = store_overlay_insert_edges_body(s, delta, overlay_generation);
-    if (rc != CBM_STORE_OK) {
-        (void)cbm_store_rollback(s);
-        return rc;
-    }
-    rc = store_set_overlay_generation_status_body(s, delta->project, overlay_generation,
+    rc = store_set_overlay_generation_status_body(s, project, overlay_generation,
                                                   CBM_STORE_OVERLAY_STATUS_READY);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_rollback(s);
@@ -5117,6 +5135,13 @@ int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
         return rc;
     }
     return CBM_STORE_OK;
+}
+
+int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
+                                         const cbm_store_file_delta_t *delta,
+                                         int64_t overlay_generation) {
+    const cbm_store_file_delta_t *deltas[] = {delta};
+    return cbm_store_publish_overlay_file_delta_batch(s, deltas, 1, overlay_generation);
 }
 
 int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,

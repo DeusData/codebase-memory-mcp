@@ -1458,6 +1458,87 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
     return CBM_STORE_OK;
 }
 
+int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                  const cbm_pipeline_file_delta_t *const *deltas,
+                                                  int delta_count, int64_t base_generation,
+                                                  const char *dirty_source,
+                                                  int64_t *out_overlay_generation) {
+    if (out_overlay_generation) {
+        *out_overlay_generation = 0;
+    }
+    if (!store || !deltas || delta_count <= 0 || base_generation < 0 ||
+        !out_overlay_generation) {
+        return CBM_STORE_ERR;
+    }
+
+    const char *project = NULL;
+    for (int i = 0; i < delta_count; i++) {
+        if (!deltas[i] || !deltas[i]->delta.project || !deltas[i]->delta.rel_path) {
+            return CBM_STORE_ERR;
+        }
+        if (!project) {
+            project = deltas[i]->delta.project;
+        } else if (strcmp(project, deltas[i]->delta.project) != 0) {
+            return CBM_STORE_ERR;
+        }
+    }
+
+    int64_t overlay_generation = 0;
+    int rc = cbm_store_reserve_overlay_generation(store, project, base_generation,
+                                                  &overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    const cbm_store_file_delta_t **store_deltas =
+        malloc((size_t)delta_count * sizeof(*store_deltas));
+    if (!store_deltas) {
+        (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        store_deltas[i] = &deltas[i]->delta;
+    }
+
+    rc = cbm_store_publish_overlay_file_delta_batch(store, store_deltas, delta_count,
+                                                    overlay_generation);
+    free(store_deltas);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED);
+        return rc;
+    }
+
+    const char *source = dirty_source ? dirty_source : CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX;
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_pipeline_file_delta_t *delta = deltas[i];
+        const cbm_file_state_t *file_state = delta->delta.file_state;
+        const cbm_file_hash_t *file_hash = delta->delta.file_hash;
+        cbm_dirty_file_state_t dirty = {
+            .project = delta->delta.project,
+            .rel_path = delta->delta.rel_path,
+            .observed_hash = file_state && file_state->content_hash
+                                 ? file_state->content_hash
+                                 : (file_hash && file_hash->sha256 ? file_hash->sha256 : ""),
+            .observed_mtime_ns = file_state ? file_state->mtime_ns
+                                : (file_hash ? file_hash->mtime_ns : 0),
+            .observed_size = file_state ? file_state->size : (file_hash ? file_hash->size : 0),
+            .observed_generation = overlay_generation,
+            .source = source,
+            .status = CBM_STORE_DIRTY_STATUS_OVERLAY_READY,
+        };
+        if (cbm_store_upsert_dirty_file(store, &dirty) != CBM_STORE_OK) {
+            (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                          CBM_STORE_OVERLAY_STATUS_FAILED);
+            return CBM_STORE_ERR;
+        }
+    }
+
+    *out_overlay_generation = overlay_generation;
+    return CBM_STORE_OK;
+}
+
 void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan) {
     if (!plan) {
         return;

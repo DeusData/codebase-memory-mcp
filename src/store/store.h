@@ -690,6 +690,10 @@ int cbm_store_count_overlay_generations(cbm_store_t *s, const char *project,
 int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
                                          const cbm_store_file_delta_t *delta,
                                          int64_t overlay_generation);
+int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *const *deltas,
+                                               int delta_count,
+                                               int64_t overlay_generation);
 
 typedef struct {
     int overlay_ready_generations;
