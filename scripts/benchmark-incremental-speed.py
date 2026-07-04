@@ -50,6 +50,10 @@ PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
 PUBLISH_INCREMENTAL_OVERLAY = "incremental_overlay"
 PUBLISH_INCREMENTAL_CONTAINMENT = "incremental_containment"
+OVERLAY_STATUS_READY = "overlay_ready"  # CBM_STORE_OVERLAY_STATUS_READY
+OVERLAY_TOMBSTONE_FILE = "file"  # CBM_STORE_OVERLAY_TOMBSTONE_FILE
+OVERLAY_TOMBSTONE_ACTIVE = 1  # STORE_OVERLAY_TOMBSTONE_ACTIVE
+OVERLAY_ROW_OWNED = 1  # STORE_OVERLAY_ROW_OWNED
 LOG_MARKER_PIPELINE_DONE = "pipeline.done"
 LOG_MARKER_INCREMENTAL_DONE = "incremental.done"
 LOG_MARKER_EXACT_DONE = "incremental.exact.done"
@@ -806,14 +810,45 @@ def decode_sqlite_text(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
-def canonical_query_rows(db_path: Path, project: str, sql: str) -> list[str]:
+def query_rows(db_path: Path, sql: str, params: tuple[Any, ...]) -> list[str]:
     con = sqlite3.connect(str(db_path))
     con.text_factory = decode_sqlite_text
     try:
-        rows = [str(row[0]) for row in con.execute(sql, (project,))]
+        rows = [str(row[0]) for row in con.execute(sql, params)]
     finally:
         con.close()
     return rows
+
+
+def canonical_query_rows(db_path: Path, project: str, sql: str) -> list[str]:
+    return query_rows(db_path, sql, (project,))
+
+
+def compare_query_rows(
+    left_db: Path,
+    right_db: Path,
+    kind: str,
+    left_sql: str,
+    left_params: tuple[Any, ...],
+    right_sql: str,
+    right_params: tuple[Any, ...],
+) -> dict[str, Any]:
+    left = query_rows(left_db, left_sql, left_params)
+    right = query_rows(right_db, right_sql, right_params)
+    if left != right:
+        left_set = set(left)
+        right_set = set(right)
+        left_only = next((row for row in left if row not in right_set), None)
+        right_only = next((row for row in right if row not in left_set), None)
+        return {
+            "equal": False,
+            "kind": kind,
+            "left_count": len(left),
+            "right_count": len(right),
+            "left_only": left_only,
+            "right_only": right_only,
+        }
+    return {"equal": True}
 
 
 CANONICAL_NODES_SQL = (
@@ -867,6 +902,98 @@ CANONICAL_HASHES_SQL = (
     "size FROM file_hashes WHERE project = ?1 ORDER BY rel_path"
 )
 
+ACTIVE_OVERLAY_CTE_SQL = (
+    "WITH active_files AS ("
+    "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
+    "  FROM overlay_tombstones t"
+    "  JOIN overlay_generations g"
+    "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
+    "  WHERE g.status = ?1 AND t.entity_kind = ?2 AND t.active = ?3 AND t.project = ?4"
+    "  GROUP BY t.project, t.rel_path"
+    "), active_nodes AS ("
+    "  SELECT n.project, n.label, n.name, n.qualified_name, n.file_path,"
+    "         n.start_line, n.end_line, n.properties"
+    "  FROM nodes n"
+    "  WHERE n.project = ?4"
+    "    AND NOT EXISTS (SELECT 1 FROM active_files af"
+    "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
+    "  UNION ALL"
+    "  SELECT n.project, n.label, n.name, n.qualified_name, n.file_path,"
+    "         n.start_line, n.end_line, n.properties"
+    "  FROM overlay_nodes n"
+    "  JOIN active_files af"
+    "    ON af.project = n.project AND af.rel_path = n.rel_path"
+    "   AND af.overlay_generation = n.overlay_generation"
+    "  WHERE n.owned = ?5"
+    "), active_edges AS ("
+    "  SELECT e.project, s.qualified_name AS source_qn, t.qualified_name AS target_qn,"
+    "         e.type, e.properties"
+    "  FROM edges e"
+    "  JOIN nodes s ON s.id = e.source_id"
+    "  JOIN nodes t ON t.id = e.target_id"
+    "  WHERE e.project = ?4"
+    "    AND NOT EXISTS (SELECT 1 FROM active_files af"
+    "                    WHERE af.project = s.project AND af.rel_path = s.file_path)"
+    "    AND NOT EXISTS (SELECT 1 FROM active_files af"
+    "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
+    "  UNION ALL"
+    "  SELECT e.project, e.source_qn, e.target_qn, e.type, e.properties"
+    "  FROM overlay_edges e"
+    "  JOIN active_files af"
+    "    ON af.project = e.project AND af.rel_path = e.rel_path"
+    "   AND af.overlay_generation = e.overlay_generation"
+    "  WHERE e.owned = ?5"
+    ") "
+)
+
+ACTIVE_OVERLAY_NODES_SQL = (
+    ACTIVE_OVERLAY_CTE_SQL
+    + "SELECT quote(label) || char(9) || quote(name) || char(9) || "
+    "quote(qualified_name) || char(9) || quote(coalesce(file_path,'')) || char(9) || "
+    "start_line || char(9) || end_line || char(9) || "
+    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(n.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '') "
+    "FROM active_nodes n WHERE project = ?4 "
+    "ORDER BY label, name, qualified_name, coalesce(file_path,''), start_line, end_line, "
+    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(n.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '')"
+)
+
+ACTIVE_OVERLAY_EDGES_SQL = (
+    ACTIVE_OVERLAY_CTE_SQL
+    + "SELECT quote(s.label) || char(9) || quote(s.qualified_name) || char(9) || "
+    "quote(coalesce(s.file_path,'')) || char(9) || s.start_line || char(9) || "
+    "s.end_line || char(9) || quote(t.label) || char(9) || quote(t.qualified_name) || "
+    "char(9) || quote(coalesce(t.file_path,'')) || char(9) || t.start_line || char(9) || "
+    "t.end_line || char(9) || quote(e.type) || char(9) || "
+    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(e.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '') "
+    "FROM active_edges e "
+    "JOIN active_nodes s ON s.project = e.project AND s.qualified_name = e.source_qn "
+    "JOIN active_nodes t ON t.project = e.project AND t.qualified_name = e.target_qn "
+    "WHERE e.project = ?4 "
+    "ORDER BY s.label, s.qualified_name, coalesce(s.file_path,''), s.start_line, s.end_line, "
+    "t.label, t.qualified_name, coalesce(t.file_path,''), t.start_line, t.end_line, "
+    "e.type, COALESCE((SELECT group_concat(item, char(30)) FROM ("
+    "SELECT quote(je.key) || '=' || je.type || '=' || "
+    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+    "FROM json_each(e.properties) AS je "
+    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+    ")), '')"
+)
+
 
 def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
     for kind, sql in (
@@ -874,28 +1001,51 @@ def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict
         ("canonical edges", CANONICAL_EDGES_SQL),
         ("file hashes", CANONICAL_HASHES_SQL),
     ):
-        left = canonical_query_rows(left_db, project, sql)
-        right = canonical_query_rows(right_db, project, sql)
-        if left != right:
-            left_set = set(left)
-            right_set = set(right)
-            left_only = next((row for row in left if row not in right_set), None)
-            right_only = next((row for row in right if row not in left_set), None)
-            return {
-                "equal": False,
-                "kind": kind,
-                "left_count": len(left),
-                "right_count": len(right),
-                "left_only": left_only,
-                "right_only": right_only,
-            }
+        result = compare_query_rows(left_db, right_db, kind, sql, (project,), sql, (project,))
+        if not result["equal"]:
+            return result
+    return {"equal": True}
+
+
+def compare_active_overlay_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
+    left_params = (
+        OVERLAY_STATUS_READY,
+        OVERLAY_TOMBSTONE_FILE,
+        OVERLAY_TOMBSTONE_ACTIVE,
+        project,
+        OVERLAY_ROW_OWNED,
+    )
+    for kind, left_sql, right_sql in (
+        ("active overlay nodes", ACTIVE_OVERLAY_NODES_SQL, CANONICAL_NODES_SQL),
+        ("active overlay edges", ACTIVE_OVERLAY_EDGES_SQL, CANONICAL_EDGES_SQL),
+    ):
+        result = compare_query_rows(
+            left_db, right_db, kind, left_sql, left_params, right_sql, (project,)
+        )
+        if not result["equal"]:
+            return result
     return {"equal": True}
 
 
 def graph_gate_for_publish_kind(
-    canonical: dict[str, Any], publish_kind: str | None, oracle_passed: bool | None = None
+    canonical: dict[str, Any],
+    publish_kind: str | None,
+    oracle_passed: bool | None = None,
+    active_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_equal = bool(canonical.get("equal"))
+    active_overlay_equal = bool(active_overlay and active_overlay.get("equal"))
+    if publish_kind == PUBLISH_INCREMENTAL_OVERLAY and active_overlay is not None:
+        return {
+            "passed": active_overlay_equal,
+            "policy": "overlay_active_graph",
+            "canonical_equal": canonical_equal,
+            "active_overlay_equal": active_overlay_equal,
+            "reason": (
+                "overlay publish leaves canonical rows unchanged; validate active overlay "
+                "nodes and edges against a fresh full graph"
+            ),
+        }
     if publish_kind == PUBLISH_INCREMENTAL_OVERLAY and oracle_passed is not None:
         return {
             "passed": bool(oracle_passed),
@@ -1250,8 +1400,14 @@ def run_matrix_case(
     canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
     incremental_reason = incremental.get("exact_reason")
     publish_kind = incremental.get("publish_kind")
+    active_overlay = None
+    if publish_kind == PUBLISH_INCREMENTAL_OVERLAY:
+        active_overlay = compare_active_overlay_graph(incremental_snapshot, full_db, project)
+    graph_gate = graph_gate_for_publish_kind(
+        canonical, str(publish_kind or ""), active_overlay=active_overlay
+    )
     explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
-    passed = bool(canonical.get("equal")) and explicit_route
+    passed = bool(graph_gate.get("passed")) and explicit_route
     speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
     return {
         "scenario": scenario,
@@ -1262,6 +1418,8 @@ def run_matrix_case(
         "incremental": incremental,
         "fresh_fast_full_after_change": full_rebuild,
         "canonical_graph": canonical,
+        "active_overlay_graph": active_overlay,
+        "graph_gate": graph_gate,
         "explicit_exact_or_fallback": explicit_route,
         "explicit_incremental_route": explicit_route,
         "exact_reason": incremental_reason,
@@ -1381,10 +1539,16 @@ def run_self_dogfood_case(
         canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
         publish_kind = incremental.get("publish_kind")
         incremental_reason = incremental.get("exact_reason")
+        active_overlay = None
+        if publish_kind == PUBLISH_INCREMENTAL_OVERLAY:
+            active_overlay = compare_active_overlay_graph(incremental_snapshot, full_db, project)
         explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
         speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
         graph_gate = graph_gate_for_publish_kind(
-            canonical, str(publish_kind or ""), bool(oracles.get("passed"))
+            canonical,
+            str(publish_kind or ""),
+            bool(oracles.get("passed")),
+            active_overlay=active_overlay,
         )
         passed = bool(graph_gate.get("passed")) and explicit_route and bool(oracles.get("passed"))
         result = {
@@ -1397,6 +1561,7 @@ def run_self_dogfood_case(
             "incremental": incremental,
             "fresh_fast_full_after_change": full_rebuild,
             "canonical_graph": canonical,
+            "active_overlay_graph": active_overlay,
             "graph_gate": graph_gate,
             "oracles": oracles,
             "explicit_incremental_route": explicit_route,
