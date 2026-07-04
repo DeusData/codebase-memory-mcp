@@ -4196,6 +4196,7 @@ enum {
     IDX832_SERVER_FAIL = 54,
 };
 
+#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
 static int idx832_supervised_route_check(const char *repo_dir) {
     /* Become a supervisor host with the kill switch OFF — exactly the real MCP
      * server's state. Done in the FORKED CHILD only (see the harness) so the
@@ -4248,6 +4249,7 @@ static int idx832_supervised_route_check(const char *repo_dir) {
     free(project);
     return code;
 }
+#endif /* !_WIN32 */
 
 TEST(index_bg_paths_route_through_supervisor_issue832) {
 #ifdef _WIN32
@@ -4472,6 +4474,7 @@ enum {
     IDX853_BAD_COUNT = 64,          /* unexpected watch_count (<0 or >1) */
 };
 
+#ifndef _WIN32 /* helper used only by the POSIX fork harness below */
 static int idx853_supervised_autowatch_check(const char *repo_dir, const char *cache_dir) {
     /* Become a supervisor host with the kill switch OFF — the real prod MCP
      * server's state. Done in the FORKED CHILD only (see harness) so the parent
@@ -4545,6 +4548,7 @@ static int idx853_supervised_autowatch_check(const char *repo_dir, const char *c
     cbm_config_close(cfg);
     return code;
 }
+#endif /* !_WIN32 */
 
 TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853) {
 #ifdef _WIN32
