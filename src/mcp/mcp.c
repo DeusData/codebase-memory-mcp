@@ -360,6 +360,35 @@ static void add_overlay_active_query_freshness(
         "are suppressed.");
 }
 
+static void add_overlay_active_search_code_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    if (!summary || summary->active_file_tombstones <= 0) {
+        return;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary->overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary->active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary->canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary->overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
+                           summary->total_nodes_visible);
+    add_response_warning(
+        doc, root,
+        "search_code read live source files and used active overlay node rows for graph "
+        "annotations where ready; raw matches remain live-source-only when no graph node "
+        "contains the match line.");
+}
+
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                            cbm_pipeline_exact_delta_stats_t stats) {
     if (!doc || !root || (stats.changed_paths < 0 && stats.affected_paths < 0 &&
@@ -6963,7 +6992,8 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
                                     int context_lines, const char *root_path,
                                     bool warn_literal_pipe, uint64_t elapsed_ms,
                                     const char *search_scope, int dirty_pending,
-                                    int dirty_overlay_ready, const char *dirty_warning) {
+                                    int dirty_overlay_ready, const char *dirty_warning,
+                                    const cbm_store_overlay_node_view_summary_t *overlay_summary) {
     enum {
         MODE_COMPACT = 0,
         MODE_FULL = 1,
@@ -7057,6 +7087,7 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     }
     cbm_mcp_add_dirty_file_freshness_counts(doc, root_obj, dirty_pending, dirty_overlay_ready,
                                             dirty_warning);
+    add_overlay_active_search_code_freshness(doc, root_obj, overlay_summary);
 
     char *json = yy_doc_to_str(doc);
     if (json) {
@@ -7157,10 +7188,29 @@ static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
 }
 
 /* Add a grep hit to the search result set (merge into existing or create new). */
+static bool search_result_matches_node(const search_result_t *r, const cbm_node_t *n) {
+    if (!r || !n) {
+        return false;
+    }
+    if (n->id > CBM_STORE_NO_NODE_ID) {
+        return r->node_id == n->id;
+    }
+    if (r->node_id != CBM_STORE_NO_NODE_ID) {
+        return false;
+    }
+    const char *qn = n->qualified_name ? n->qualified_name : "";
+    if (qn[0] && strcmp(r->qualified_name, qn) == 0) {
+        return true;
+    }
+    const char *name = n->name ? n->name : "";
+    const char *file = n->file_path ? n->file_path : "";
+    return qn[0] == '\0' && strcmp(r->node_name, name) == 0 && strcmp(r->file, file) == 0;
+}
+
 static void add_to_search_results(search_result_t **sr, int *sr_count, int *sr_cap, cbm_node_t *n,
                                   int line) {
     for (int j = 0; j < *sr_count; j++) {
-        if ((*sr)[j].node_id == n->id) {
+        if (search_result_matches_node(&(*sr)[j], n)) {
             if ((*sr)[j].match_count < CBM_SZ_64) {
                 (*sr)[j].match_lines[(*sr)[j].match_count++] = line;
             }
@@ -7220,7 +7270,8 @@ static void free_file_nodes(cbm_node_t *nodes, int count) {
 /* Classify all grep matches file-by-file into search results and raw hits. */
 static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *store,
                                    const char *project, search_result_t **sr, int *sr_count,
-                                   int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap) {
+                                   int *sr_cap, grep_match_t **raw, int *raw_count, int *raw_cap,
+                                   bool use_overlay_view) {
     qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
     int i = 0;
     while (i < gm_count) {
@@ -7232,7 +7283,13 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
         cbm_node_t *file_nodes = NULL;
         int file_node_count = 0;
         if (store) {
-            cbm_store_find_nodes_by_file(store, project, cur_file, &file_nodes, &file_node_count);
+            if (use_overlay_view) {
+                cbm_store_find_nodes_by_file_overlay_view(store, project, cur_file, &file_nodes,
+                                                          &file_node_count);
+            } else {
+                cbm_store_find_nodes_by_file(store, project, cur_file, &file_nodes,
+                                             &file_node_count);
+            }
         }
         for (int mi = file_start; mi < i; mi++) {
             classify_grep_hit(&gm[mi], file_nodes, file_node_count, sr, sr_count, sr_cap, raw,
@@ -7690,8 +7747,15 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     /* Sort matches by file path for contiguous per-file processing */
     qsort(gm, gm_count, sizeof(grep_match_t), (int (*)(const void *, const void *))strcmp);
 
+    cbm_store_overlay_node_view_summary_t overlay_summary = {0};
+    bool overlay_ready_for_code =
+        store && project && project[0] &&
+        cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
+            CBM_STORE_OK &&
+        overlay_summary.active_file_tombstones > 0;
+
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
-                           &raw_cap);
+                           &raw_cap, overlay_ready_for_code);
 
     /* Phase 3: batch degree query — ONE query for all results instead of 2×N */
     if (store && sr_count > 0) {
@@ -7737,9 +7801,14 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         assemble_search_output(sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines,
                                root_path, pat_has_pipe && !use_regex, cbm_now_ms() - search_t0,
                                search_scope, dirty_pending, dirty_overlay_ready,
-                               "search_code reads live source files, but graph annotations use "
-                               "canonical graph rows; dirty file graph metadata may be absent "
-                               "until overlay or reindex completes.");
+                               overlay_ready_for_code
+                                   ? "search_code reads live source files and uses active overlay "
+                                     "graph annotations where ready; pending dirty files may still "
+                                     "lack graph metadata until overlay or reindex completes."
+                                   : "search_code reads live source files, but graph annotations use "
+                                     "canonical graph rows; dirty file graph metadata may be absent "
+                                     "until overlay or reindex completes.",
+                               overlay_ready_for_code ? &overlay_summary : NULL);
     free(gm);
     free(sr);
     free(raw);
