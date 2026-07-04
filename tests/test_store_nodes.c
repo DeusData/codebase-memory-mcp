@@ -179,6 +179,33 @@ static int store_count_overlay_owned_rows(cbm_store_t *s, store_test_overlay_tab
     return count;
 }
 
+static int store_count_overlay_fts_matches(cbm_store_t *s, const char *project,
+                                           int64_t overlay_generation, const char *rel_path,
+                                           const char *query) {
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_STORE_ERR;
+    sqlite3 *db = cbm_store_get_db(s);
+    const char *sql =
+        "SELECT COUNT(*) FROM " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        " JOIN overlay_nodes n"
+        "   ON n.id = " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY ".rowid"
+        " WHERE " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY " MATCH ?1"
+        "   AND n.project = ?2 AND n.overlay_generation = ?3 AND n.rel_path = ?4";
+    if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) !=
+                   SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, query, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, project, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    sqlite3_bind_int64(stmt, 3, overlay_generation);
+    sqlite3_bind_text(stmt, 4, rel_path, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 static int store_count_metadata_owners(cbm_store_t *s, int edge, const char *project,
                                        const char *rel_path) {
     sqlite3_stmt *stmt = NULL;
@@ -1258,6 +1285,9 @@ TEST(store_overlay_file_delta_publish_rows_and_tombstone) {
     ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
                                        overlay_generation, "main.go"),
               1);
+    ASSERT_EQ(store_count_overlay_fts_matches(s, "test", overlay_generation, "main.go",
+                                              "helper"),
+              1);
 
     int count = -1;
     ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", CBM_STORE_OVERLAY_STATUS_READY,
@@ -1276,6 +1306,36 @@ TEST(store_overlay_file_delta_publish_rows_and_tombstone) {
               1);
     ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
                                        overlay_generation, "main.go"),
+              1);
+    ASSERT_EQ(store_count_overlay_fts_matches(s, "test", overlay_generation, "main.go",
+                                              "helper"),
+              1);
+
+    cbm_node_t replacement_nodes[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "replacement",
+         .qualified_name = "test.replacement",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+    };
+    cbm_store_file_delta_t replacement_delta = {.project = "test",
+                                                .rel_path = "main.go",
+                                                .generation = BASE_GENERATION,
+                                                .context_nodes = context_nodes,
+                                                .context_node_count = 1,
+                                                .nodes = replacement_nodes,
+                                                .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &replacement_delta, overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_NODES, "test", overlay_generation,
+                                       "main.go"),
+              2);
+    ASSERT_EQ(store_count_overlay_fts_matches(s, "test", overlay_generation, "main.go",
+                                              "helper"),
+              0);
+    ASSERT_EQ(store_count_overlay_fts_matches(s, "test", overlay_generation, "main.go",
+                                              "replacement"),
               1);
 
     cbm_node_t helper_nodes[] = {

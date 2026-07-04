@@ -3335,7 +3335,6 @@ enum {
     BM25_OVERLAY_BIND_OFFSET = 6,
     BM25_OVERLAY_BIND_INNER = 7,
     BM25_OVERLAY_BIND_FILE = 8,
-    BM25_OVERLAY_BIND_TERMS_FIRST = 9,
     BM25_OVERLAY_COL_LABEL = 1,
     BM25_OVERLAY_COL_NAME = 2,
     BM25_OVERLAY_COL_QN = 3,
@@ -3482,63 +3481,9 @@ static char *bm25_file_pattern_like(const char *file_pattern) {
     return like;
 }
 
-static char *bm25_like_pattern_from_term(const char *term) {
-    if (!term) {
-        return NULL;
-    }
-    size_t escaped_len = MCP_SEPARATOR; /* leading and trailing '%' */
-    for (const char *p = term; *p; p++) {
-        escaped_len += (*p == '_' || *p == '%' || *p == '\\') ? MCP_SEPARATOR : SKIP_ONE;
-    }
-    char *pattern = malloc(escaped_len + SKIP_ONE);
-    if (!pattern) {
-        return NULL;
-    }
-    size_t pos = 0;
-    pattern[pos++] = '%';
-    for (const char *p = term; *p; p++) {
-        if (*p == '_' || *p == '%' || *p == '\\') {
-            pattern[pos++] = '\\';
-        }
-        pattern[pos++] = *p;
-    }
-    pattern[pos++] = '%';
-    pattern[pos] = '\0';
-    return pattern;
-}
-
-static int bm25_build_overlay_terms_clause(const bm25_terms_t *terms, char *out,
-                                           size_t out_size) {
-    if (!terms || !out || out_size == 0) {
-        return CBM_STORE_ERR;
-    }
-    out[0] = '\0';
-    size_t used = 0;
-    for (int i = 0; i < terms->count; i++) {
-        int bind_idx = BM25_OVERLAY_BIND_TERMS_FIRST + i;
-        char part[CBM_SZ_512];
-        int n = snprintf(part, sizeof(part),
-                         "%s(n.name LIKE ?%d ESCAPE '\\' "
-                         "OR n.qualified_name LIKE ?%d ESCAPE '\\' "
-                         "OR n.label LIKE ?%d ESCAPE '\\' "
-                         "OR n.file_path LIKE ?%d ESCAPE '\\')",
-                         i > 0 ? " OR " : "", bind_idx, bind_idx, bind_idx, bind_idx);
-        if (n < 0 || (size_t)n >= sizeof(part)) {
-            return CBM_STORE_ERR;
-        }
-        if (used + (size_t)n >= out_size) {
-            return CBM_STORE_ERR;
-        }
-        memcpy(out + used, part, (size_t)n);
-        used += (size_t)n;
-        out[used] = '\0';
-    }
-    return used > 0 ? CBM_STORE_OK : CBM_STORE_ERR;
-}
-
 static int bm25_bind_overlay_query(sqlite3_stmt *stmt, const char *fts_query,
                                    const char *project, int limit, int offset,
-                                   const char *file_like, const bm25_terms_t *terms) {
+                                   const char *file_like) {
     sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_STATUS, CBM_STORE_OVERLAY_STATUS_READY,
                       BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_TOMBSTONE_KIND, CBM_STORE_OVERLAY_TOMBSTONE_FILE,
@@ -3555,15 +3500,6 @@ static int bm25_bind_overlay_query(sqlite3_stmt *stmt, const char *fts_query,
                           MCP_SQLITE_TRANSIENT);
     } else {
         sqlite3_bind_null(stmt, BM25_OVERLAY_BIND_FILE);
-    }
-    for (int i = 0; terms && i < terms->count; i++) {
-        char *like = bm25_like_pattern_from_term(terms->items[i]);
-        if (!like) {
-            return CBM_STORE_ERR;
-        }
-        sqlite3_bind_text(stmt, BM25_OVERLAY_BIND_TERMS_FIRST + i, like, BM25_SQL_AUTO_LEN,
-                          MCP_SQLITE_TRANSIENT);
-        free(like);
     }
     return CBM_STORE_OK;
 }
@@ -3600,12 +3536,6 @@ static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
         bm25_terms_free(&terms);
         return NULL;
     }
-    char overlay_terms_clause[CBM_SZ_8K];
-    if (bm25_build_overlay_terms_clause(&terms, overlay_terms_clause,
-                                        sizeof(overlay_terms_clause)) != CBM_STORE_OK) {
-        bm25_terms_free(&terms);
-        return NULL;
-    }
     char *file_like = bm25_file_pattern_like(file_pattern);
 
     char ranked_sql[CBM_SZ_16K];
@@ -3630,19 +3560,28 @@ static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
         "    AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
         "    AND (?8 IS NULL OR n.file_path LIKE ?8) "
         "  UNION ALL "
-        "  SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, "
+        "  SELECT %d AS id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, "
         "         n.end_line, "
-        "         (%.1f - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+        "         (fts.overlay_rank + %.1f "
+        "          - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "                  WHEN n.label = 'Route' THEN 8.0 "
         "                  WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
         "                  ELSE 0.0 END) AS rank "
-        "  FROM active_nodes n "
-        "  WHERE n.id = %d AND n.project = ?4 "
+        "  FROM ("
+        "      SELECT rowid, bm25(" CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY ") AS overlay_rank"
+        "      FROM " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "      WHERE " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY " MATCH ?3"
+        "      ORDER BY overlay_rank LIMIT ?7"
+        "  ) fts "
+        "  JOIN overlay_nodes n ON n.id = fts.rowid "
+        "  JOIN active_files af"
+        "    ON af.project = n.project AND af.rel_path = n.rel_path"
+        "   AND af.overlay_generation = n.overlay_generation "
+        "  WHERE n.project = ?4 AND n.owned != 0 "
         "    AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
         "    AND (?8 IS NULL OR n.file_path LIKE ?8) "
-        "    AND (%s)"
         ") ",
-        active_cte, BM25_OVERLAY_BASE_RANK, CBM_STORE_NO_NODE_ID, overlay_terms_clause);
+        active_cte, CBM_STORE_NO_NODE_ID, BM25_OVERLAY_BASE_RANK);
     if (n < 0 || (size_t)n >= sizeof(ranked_sql)) {
         free(file_like);
         bm25_terms_free(&terms);
@@ -3675,8 +3614,7 @@ static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
         bm25_terms_free(&terms);
         return NULL;
     }
-    if (bm25_bind_overlay_query(cs, fts_query, project, limit, offset, file_like, &terms) !=
-        CBM_STORE_OK ||
+    if (bm25_bind_overlay_query(cs, fts_query, project, limit, offset, file_like) != CBM_STORE_OK ||
         sqlite3_step(cs) != SQLITE_ROW) {
         sqlite3_finalize(cs);
         free(file_like);
@@ -3692,7 +3630,7 @@ static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
         bm25_terms_free(&terms);
         return NULL;
     }
-    if (bm25_bind_overlay_query(stmt, fts_query, project, limit, offset, file_like, &terms) !=
+    if (bm25_bind_overlay_query(stmt, fts_query, project, limit, offset, file_like) !=
         CBM_STORE_OK) {
         sqlite3_finalize(stmt);
         free(file_like);
