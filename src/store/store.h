@@ -83,6 +83,11 @@ typedef struct {
 } cbm_edge_t;
 
 typedef struct {
+    cbm_node_t node;
+    cbm_edge_t edge;
+} cbm_store_edge_node_t;
+
+typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
@@ -206,6 +211,17 @@ int cbm_store_active_node_degree_by_qn(cbm_store_t *s, const char *project,
 int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
                                        const char *qualified_name, const char *edge_type,
                                        int direction, bool *out_exists);
+/* Expand one-hop active-overlay edges from qualified_name. direction must be
+ * CBM_STORE_EDGE_DIR_OUTBOUND, CBM_STORE_EDGE_DIR_INBOUND, or
+ * CBM_STORE_EDGE_DIR_ANY. Returned node is the opposite endpoint in the active
+ * node view; returned edge keeps source/target ids from that same active view.
+ * Caller must free with cbm_store_free_edge_nodes(). */
+int cbm_store_find_active_edge_nodes_by_qn(cbm_store_t *s, const char *project,
+                                           const char *qualified_name,
+                                           const char **edge_types, int edge_type_count,
+                                           int direction, cbm_store_edge_node_t **out,
+                                           int *count);
+void cbm_store_free_edge_nodes(cbm_store_edge_node_t *rows, int count);
 
 /* Get distinct file paths for a project. Caller must free each out[i] and out itself.
  * Returns CBM_STORE_OK or CBM_STORE_ERR. */

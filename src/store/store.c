@@ -7396,6 +7396,171 @@ int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
     return CBM_STORE_OK;
 }
 
+int cbm_store_find_active_edge_nodes_by_qn(cbm_store_t *s, const char *project,
+                                           const char *qualified_name,
+                                           const char **edge_types, int edge_type_count,
+                                           int direction, cbm_store_edge_node_t **out,
+                                           int *count) {
+    enum {
+        ACTIVE_EDGE_NODE_EDGE_ID_COL = 9,
+        ACTIVE_EDGE_NODE_EDGE_PROJECT_COL = 10,
+        ACTIVE_EDGE_NODE_SOURCE_ID_COL = 11,
+        ACTIVE_EDGE_NODE_TARGET_ID_COL = 12,
+        ACTIVE_EDGE_NODE_TYPE_COL = 13,
+        ACTIVE_EDGE_NODE_PROPS_COL = 14
+    };
+
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project || !qualified_name ||
+        (direction != CBM_STORE_EDGE_DIR_OUTBOUND && direction != CBM_STORE_EDGE_DIR_INBOUND &&
+         direction != CBM_STORE_EDGE_DIR_ANY)) {
+        if (s) {
+            store_set_error(s, "find_active_edge_nodes_by_qn: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "find_active_edge_nodes_by_qn active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    char type_clause[CBM_SZ_512] = "";
+    int bind_type_count = 0;
+    if (edge_type_count > 0) {
+        char placeholders[CBM_SZ_256];
+        if (store_build_edge_type_placeholders(placeholders, sizeof(placeholders), ST_COL_5,
+                                               edge_type_count, &bind_type_count) !=
+            CBM_STORE_OK) {
+            store_set_error(s, "find_active_edge_nodes_by_qn edge type clause too large");
+            return CBM_STORE_ERR;
+        }
+        int clause_n = snprintf(type_clause, sizeof(type_clause), " AND e.type IN (%s)",
+                                placeholders);
+        if (clause_n < 0 || (size_t)clause_n >= sizeof(type_clause)) {
+            store_set_error(s, "find_active_edge_nodes_by_qn type SQL truncated");
+            return CBM_STORE_ERR;
+        }
+    }
+
+    const char *where_dir = NULL;
+    const char *other_qn = NULL;
+    if (direction == CBM_STORE_EDGE_DIR_OUTBOUND) {
+        where_dir = "src.qualified_name = ?4";
+        other_qn = "dst.qualified_name";
+    } else if (direction == CBM_STORE_EDGE_DIR_INBOUND) {
+        where_dir = "dst.qualified_name = ?4";
+        other_qn = "src.qualified_name";
+    } else {
+        where_dir = "(src.qualified_name = ?4 OR dst.qualified_name = ?4)";
+        other_qn = "CASE WHEN src.qualified_name = ?4 THEN dst.qualified_name "
+                   "ELSE src.qualified_name END";
+    }
+
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT other.id, other.project, other.label, other.name, "
+                     "other.qualified_name, other.file_path, other.start_line, other.end_line, "
+                     "other.properties, %d, ?3, src.id, dst.id, e.type, e.properties "
+                     "FROM active_edges e "
+                     "JOIN active_nodes src ON src.project = ?3 AND src.qualified_name = e.source_qn "
+                     "JOIN active_nodes dst ON dst.project = ?3 AND dst.qualified_name = e.target_qn "
+                     "JOIN active_nodes other ON other.project = ?3 AND other.qualified_name = %s "
+                     "WHERE %s%s "
+                     "ORDER BY other.qualified_name, e.type",
+                     active_cte, CBM_STORE_NO_NODE_ID, other_qn, where_dir, type_clause);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "find_active_edge_nodes_by_qn SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_active_edge_nodes_by_qn prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, qualified_name);
+    if (edge_type_count > 0) {
+        store_bind_edge_types(stmt, ST_COL_5, edge_types, edge_type_count, bind_type_count);
+    }
+
+    int cap = ST_INIT_CAP_16;
+    int row_count = 0;
+    cbm_store_edge_node_t *rows = calloc((size_t)cap, sizeof(*rows));
+    if (!rows) {
+        sqlite3_finalize(stmt);
+        store_set_error(s, "find_active_edge_nodes_by_qn out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (row_count >= cap) {
+            if (store_grow_array(s, (void **)&rows, &cap, sizeof(*rows),
+                                 "find_active_edge_nodes_by_qn out of memory", true) !=
+                CBM_STORE_OK) {
+                *out = rows;
+                *count = row_count;
+                cbm_store_free_edge_nodes(rows, row_count);
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
+        }
+        if (scan_node(s, stmt, &rows[row_count].node) != CBM_STORE_OK) {
+            *out = rows;
+            *count = row_count + 1;
+            cbm_store_free_edge_nodes(rows, row_count + 1);
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        rows[row_count].edge.id = sqlite3_column_int64(stmt, ACTIVE_EDGE_NODE_EDGE_ID_COL);
+        rows[row_count].edge.project =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(
+                stmt, ACTIVE_EDGE_NODE_EDGE_PROJECT_COL)));
+        rows[row_count].edge.source_id =
+            sqlite3_column_int64(stmt, ACTIVE_EDGE_NODE_SOURCE_ID_COL);
+        rows[row_count].edge.target_id =
+            sqlite3_column_int64(stmt, ACTIVE_EDGE_NODE_TARGET_ID_COL);
+        rows[row_count].edge.type =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, ACTIVE_EDGE_NODE_TYPE_COL)));
+        rows[row_count].edge.properties_json =
+            heap_strdup(safe_props((const char *)sqlite3_column_text(stmt,
+                                                                     ACTIVE_EDGE_NODE_PROPS_COL)));
+        if (!rows[row_count].edge.project || !rows[row_count].edge.type ||
+            !rows[row_count].edge.properties_json) {
+            *out = rows;
+            *count = row_count + 1;
+            cbm_store_free_edge_nodes(rows, row_count + 1);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "find_active_edge_nodes_by_qn edge out of memory");
+            return CBM_STORE_ERR;
+        }
+        row_count++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        *out = rows;
+        *count = row_count;
+        cbm_store_free_edge_nodes(rows, row_count);
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "find_active_edge_nodes_by_qn step");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    *out = rows;
+    *count = row_count;
+    return CBM_STORE_OK;
+}
+
 /* ── List distinct file paths ────────────────────────────────── */
 
 int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count) {
@@ -14125,6 +14290,19 @@ void cbm_store_free_edges(cbm_edge_t *edges, int count) {
         safe_str_free(&edges[i].properties_json);
     }
     free(edges);
+}
+
+void cbm_store_free_edge_nodes(cbm_store_edge_node_t *rows, int count) {
+    if (!rows) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_node_free_fields(&rows[i].node);
+        safe_str_free(&rows[i].edge.project);
+        safe_str_free(&rows[i].edge.type);
+        safe_str_free(&rows[i].edge.properties_json);
+    }
+    free(rows);
 }
 
 void cbm_project_free_fields(cbm_project_t *p) {
