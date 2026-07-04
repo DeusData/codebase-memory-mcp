@@ -1426,6 +1426,192 @@ static int incr_expand_regular_changed_frontier(cbm_store_t *store, const char *
     return CBM_STORE_OK;
 }
 
+static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
+                                         const char *project, cbm_file_info_t *changed_files,
+                                         int changed_count, int deleted_count,
+                                         const char *pass_fingerprint, int *applied) {
+    if (applied) {
+        *applied = 0;
+    }
+    if (!p || !store || !project || !changed_files || changed_count <= 0 ||
+        !pass_fingerprint || !applied) {
+        return CBM_STORE_OK;
+    }
+    if (!cbm_pipeline_overlay_publish_small_deltas(p) || deleted_count != 0 ||
+        changed_count > cbm_pipeline_exact_max_changed_paths(p) ||
+        cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
+        changed_count > cbm_pipeline_exact_max_affected_paths(p)) {
+        return CBM_STORE_OK;
+    }
+
+    int rc = CBM_STORE_OK;
+    const char **changed_paths = NULL;
+    cbm_gbuf_t *scratch = NULL;
+    cbm_registry_t *registry = NULL;
+    cbm_path_alias_collection_t *path_aliases = NULL;
+    cbm_pipeline_file_delta_t *deltas = NULL;
+    const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
+    CBMFileResult **result_cache = NULL;
+    int64_t base_generation = 0;
+    int64_t overlay_generation = 0;
+
+    changed_paths = malloc((size_t)changed_count * sizeof(*changed_paths));
+    deltas = calloc((size_t)changed_count, sizeof(*deltas));
+    delta_ptrs = malloc((size_t)changed_count * sizeof(*delta_ptrs));
+    result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
+    scratch = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
+    registry = cbm_registry_new();
+    if (!changed_paths || !deltas || !delta_ptrs || !result_cache || !scratch || !registry) {
+        cbm_pipeline_set_publish_reason(p, "overlay_alloc");
+        cbm_log_info("incremental.overlay.fallback", "reason", "alloc");
+        goto cleanup;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        if (!changed_files[i].rel_path) {
+            cbm_pipeline_set_publish_reason(p, "missing_rel_path");
+            cbm_log_info("incremental.overlay.fallback", "reason", "missing_rel_path");
+            goto cleanup;
+        }
+        changed_paths[i] = changed_files[i].rel_path;
+    }
+
+    CBM_PROF_START(t_overlay_seed);
+    rc = cbm_pipeline_seed_file_delta_scratch_from_store(
+        store, scratch, registry, project, changed_paths, changed_count);
+    CBM_PROF_END_N("incremental_overlay", "1_seed_scratch", t_overlay_seed, changed_count);
+    if (rc != CBM_STORE_OK) {
+        cbm_pipeline_set_publish_reason(p, "overlay_scratch_seed");
+        cbm_log_info("incremental.overlay.fallback", "reason", "scratch_seed", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+
+    path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = project,
+        .repo_path = cbm_pipeline_repo_path(p),
+        .gbuf = scratch,
+        .registry = registry,
+        .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .mode = cbm_pipeline_get_mode(p),
+        .similarity_threshold = cbm_pipeline_similarity_threshold(p),
+        .httplink_min_confidence = cbm_pipeline_httplink_min_confidence(p),
+        .semantic_threshold = cbm_pipeline_semantic_threshold(p),
+        .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
+        .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
+        .path_aliases = path_aliases,
+        .result_cache = result_cache,
+        .store_backed_node_lookup = store,
+        .store_backed_changed_paths = changed_paths,
+        .store_backed_changed_path_count = changed_count,
+    };
+
+    const char *structure_root_qn = incremental_structure_root_qn(scratch, project);
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
+                                                changed_files[i].rel_path, NULL);
+        if (rc != 0) {
+            cbm_pipeline_set_publish_reason(p, "overlay_ensure_structure");
+            cbm_log_info("incremental.overlay.fallback", "reason", "ensure_structure", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+    }
+
+    rc = run_extract_resolve(&ctx, changed_files, changed_count);
+    if (rc != 0) {
+        cbm_pipeline_set_publish_reason(p, "overlay_extract_resolve");
+        cbm_log_info("incremental.overlay.fallback", "reason", "extract_resolve", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    rc = cbm_pipeline_pass_k8s(&ctx, changed_files, changed_count);
+    if (rc != 0) {
+        cbm_pipeline_set_publish_reason(p, "overlay_k8s");
+        cbm_log_info("incremental.overlay.fallback", "reason", "k8s", "rc", itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    rc = run_postpasses(&ctx, changed_files, changed_count, project);
+    if (rc != 0) {
+        cbm_pipeline_set_publish_reason(p, "overlay_postpasses");
+        cbm_log_info("incremental.overlay.fallback", "reason", "postpasses", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    cbm_pipeline_pass_complexity_for_paths(&ctx, changed_paths, changed_count);
+    rc = cbm_pipeline_pass_httplinks(&ctx);
+    if (rc != 0) {
+        cbm_pipeline_set_publish_reason(p, "overlay_httplinks");
+        cbm_log_info("incremental.overlay.fallback", "reason", "httplinks", "rc",
+                     itoa_buf_incr(rc));
+        goto cleanup;
+    }
+    cbm_pipeline_pass_normalize(scratch);
+
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_files[i].rel_path,
+                                                     CBM_PIPELINE_COMPAT_GENERATION, &deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            cbm_pipeline_set_publish_reason(p, "overlay_build_delta");
+            cbm_log_info("incremental.overlay.fallback", "reason", "build_delta", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        rc = cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&deltas[i],
+                                                                      &changed_files[i],
+                                                                      pass_fingerprint);
+        if (rc != CBM_STORE_OK) {
+            cbm_pipeline_set_publish_reason(p, "overlay_metadata");
+            cbm_log_info("incremental.overlay.fallback", "reason", "metadata", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        int preserved = 0;
+        rc = cbm_pipeline_file_delta_add_preserved_inbound_edges(store, &deltas[i], &preserved);
+        if (rc != CBM_STORE_OK) {
+            cbm_pipeline_set_publish_reason(p, "overlay_preserve_inbound");
+            cbm_log_info("incremental.overlay.fallback", "reason", "preserve_inbound", "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        delta_ptrs[i] = &deltas[i];
+    }
+
+    rc = cbm_store_latest_complete_index_generation(store, project, &base_generation);
+    if (rc == CBM_STORE_OK) {
+        CBM_PROF_START(t_overlay_publish);
+        rc = cbm_pipeline_publish_overlay_file_delta_batch(
+            store, delta_ptrs, changed_count, base_generation,
+            CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation);
+        CBM_PROF_END_N("incremental_overlay", "2_publish_overlay", t_overlay_publish,
+                       changed_count);
+    }
+    if (rc == CBM_STORE_OK && overlay_generation > 0) {
+        cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
+                                          cbm_store_count_edges(store, project));
+        cbm_pipeline_set_graph_changed(p, false);
+        cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+        cbm_pipeline_set_publish_reason(p, NULL);
+        cbm_pipeline_set_exact_delta_stats(p, changed_count, changed_count, changed_count);
+        cbm_log_info("incremental.overlay.done", "files", itoa_buf_incr(changed_count));
+        *applied = 1;
+        goto cleanup;
+    }
+    cbm_pipeline_set_publish_reason(p, "overlay_publish_error");
+    cbm_log_warn("incremental.overlay.fallback", "reason", "publish_error", "rc",
+                 itoa_buf_incr(rc));
+
+cleanup:
+    free(delta_ptrs);
+    incr_free_file_deltas(deltas, changed_count);
+    incr_free_result_cache(result_cache, changed_count);
+    cbm_path_alias_collection_free(path_aliases);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    free(changed_paths);
+    return CBM_STORE_OK;
+}
+
 static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, const char *db_path,
                                        const char *project, cbm_file_info_t *changed_files,
                                        int changed_count, cbm_file_info_t *all_files,
@@ -1681,7 +1867,11 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         cbm_pipeline_file_delta_plan_free(&plan);
     }
 
-    if (!graph_noop_candidate && cbm_pipeline_overlay_publish_small_deltas(p)) {
+    const char *prior_reason = cbm_pipeline_publish_reason(p);
+    bool overlay_publish_already_failed =
+        prior_reason && strcmp(prior_reason, "overlay_publish_error") == 0;
+    if (!graph_noop_candidate && cbm_pipeline_overlay_publish_small_deltas(p) &&
+        !overlay_publish_already_failed) {
         int64_t base_generation = 0;
         int64_t overlay_generation = 0;
         rc = cbm_store_latest_complete_index_generation(store, project, &base_generation);
@@ -1972,6 +2162,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
             cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_exact_delete");
         }
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+        return 0;
+    }
+
+    (void)incr_try_overlay_upsert_route(p, store, project, changed_files, ci, cls.deleted_count,
+                                        pass_fingerprint, &exact_applied);
+    if (exact_applied) {
         incr_classification_free(&cls);
         cbm_store_close(store);
         cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));

@@ -8721,6 +8721,44 @@ static int pipeline_store_dirty_counts(const char *db_path, const char *project,
     return rc;
 }
 
+static bool pipeline_store_overlay_call_connected(const char *db_path, const char *project,
+                                                  const char *source_name,
+                                                  const char *target_name) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return false;
+    }
+    cbm_node_t *sources = NULL;
+    int source_count = 0;
+    bool found = false;
+    if (cbm_store_find_nodes_by_name_overlay_view(s, project, source_name, &sources,
+                                                  &source_count) == CBM_STORE_OK) {
+        const char *edge_types[] = {"CALLS"};
+        for (int i = 0; i < source_count && !found; i++) {
+            if (!sources[i].qualified_name) {
+                continue;
+            }
+            cbm_traverse_result_t trace = {0};
+            if (cbm_store_bfs_overlay_view(s, project, sources[i].qualified_name, "outbound",
+                                           edge_types, 1, 1, CBM_SZ_64, &trace) !=
+                CBM_STORE_OK) {
+                continue;
+            }
+            for (int j = 0; j < trace.visited_count; j++) {
+                if (trace.visited[j].node.name &&
+                    strcmp(trace.visited[j].node.name, target_name) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            cbm_store_traverse_free(&trace);
+        }
+    }
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_close(s);
+    return found;
+}
+
 static int pipeline_store_overlay_file_function_count(const char *db_path, const char *project,
                                                       const char *rel_path, const char *name) {
     cbm_store_t *s = cbm_store_open_path_query(db_path);
@@ -10900,6 +10938,60 @@ TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
     ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayRunOnly"));
     ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "leaf.go",
                                                     "OverlayRunOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_overlay_call_connected(g_incr_dbpath, project, "CallerA", "Leaf"));
+
+    ASSERT_EQ(write_incremental_leaf_file(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_overlay_call_connected(g_incr_dbpath, project, "CallerA", "Leaf"));
     int dirty_pending = -1;
     int dirty_overlay_ready = -1;
     ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
@@ -13358,6 +13450,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
+    RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
     RUN_TEST(incremental_overlay_publish_failure_falls_back_to_canonical_exact);
