@@ -386,9 +386,9 @@ static void add_overlay_active_cypher_freshness(
                            summary->total_nodes_visible);
     add_response_warning(
         doc, root,
-        "query_graph used active overlay node rows for this node-only Cypher query; "
-        "relationship, EXISTS, and degree-derived Cypher queries remain canonical until "
-        "active Cypher relationship views are available.");
+        "query_graph used active overlay node rows and active edge-derived predicates for this "
+        "node-only Cypher query; relationship-pattern and id() Cypher queries remain canonical "
+        "until active Cypher relationship binding is available.");
 }
 
 static void add_overlay_active_schema_freshness(
@@ -4783,7 +4783,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         overlay_limitation_reported = add_canonical_only_overlay_freshness(
             doc, root, store, project,
             "query_graph reads canonical Cypher rows for this query shape; ready overlay rows are "
-            "included only for node-only Cypher queries until active relationship views or "
+            "included only for node-only Cypher queries until active relationship binding or "
             "compaction are available.");
     }
     int dirty_pending = 0;

@@ -188,8 +188,24 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
 int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
                                       cbm_node_t **out, int *count);
 
+/* Edge direction constants used by qn-keyed active-overlay edge helpers. */
+#define CBM_STORE_EDGE_DIR_OUTBOUND 0
+#define CBM_STORE_EDGE_DIR_INBOUND 1
+#define CBM_STORE_EDGE_DIR_ANY 2
+
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
+/* Active-overlay equivalent of cbm_store_node_degree(), keyed by qualified name
+ * because overlay nodes do not have canonical node ids. Counts all active edge
+ * types except INHERITS to match cbm_store_node_degree(). */
+int cbm_store_active_node_degree_by_qn(cbm_store_t *s, const char *project,
+                                       const char *qualified_name, int *in_deg,
+                                       int *out_deg);
+/* True when an active-overlay edge exists for qualified_name in the requested
+ * direction. direction must be CBM_STORE_EDGE_DIR_*. edge_type may be NULL. */
+int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
+                                       const char *qualified_name, const char *edge_type,
+                                       int direction, bool *out_exists);
 
 /* Get distinct file paths for a project. Caller must free each out[i] and out itself.
  * Returns CBM_STORE_OK or CBM_STORE_ERR. */
