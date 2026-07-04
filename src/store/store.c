@@ -8399,29 +8399,76 @@ static int arch_entry_points(cbm_store_t *s, const char *project, const char *pa
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
     char sqlbuf[ST_SQL_BUF];
-    const char *base = "SELECT name, qualified_name, file_path FROM nodes "
-                       "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
-                       "AND (json_extract(properties, '$.is_test') IS NULL OR "
-                       "json_extract(properties, '$.is_test') != 1) "
-                       "AND file_path NOT LIKE '%test%'";
-    int nsql = scoped ? snprintf(sqlbuf, sizeof(sqlbuf), "%s%s LIMIT ?4", base,
-                                 arch_path_scope_sql())
-                      : snprintf(sqlbuf, sizeof(sqlbuf), "%s LIMIT ?2", base);
-    if (nsql <= 0 || (size_t)nsql >= sizeof(sqlbuf)) {
-        store_set_error(s, "arch_entry_points SQL truncated");
-        return CBM_STORE_ERR;
+    cbm_store_overlay_node_view_summary_t overlay_summary = {0};
+    bool use_active_nodes =
+        cbm_store_get_overlay_node_view_summary(s, project, &overlay_summary) == CBM_STORE_OK &&
+        overlay_summary.active_file_tombstones > 0;
+    const char *base =
+        use_active_nodes
+            ? "SELECT name, qualified_name, file_path FROM active_nodes "
+              "WHERE project=?3 AND json_extract(properties, '$.is_entry_point') = 1 "
+              "AND (json_extract(properties, '$.is_test') IS NULL OR "
+              "json_extract(properties, '$.is_test') != 1) "
+              "AND file_path NOT LIKE '%test%'"
+            : "SELECT name, qualified_name, file_path FROM nodes "
+              "WHERE project=?1 AND json_extract(properties, '$.is_entry_point') = 1 "
+              "AND (json_extract(properties, '$.is_test') IS NULL OR "
+              "json_extract(properties, '$.is_test') != 1) "
+              "AND file_path NOT LIKE '%test%'";
+    if (use_active_nodes) {
+        char active_cte[ST_SQL_BUF];
+        if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+            CBM_STORE_OK) {
+            store_set_error(s, "arch_entry_points active CTE SQL truncated");
+            return CBM_STORE_ERR;
+        }
+        int nsql_prefix =
+            snprintf(sqlbuf, sizeof(sqlbuf), "%s %s", active_cte, base);
+        if (nsql_prefix <= 0 || (size_t)nsql_prefix >= sizeof(sqlbuf)) {
+            store_set_error(s, "arch_entry_points active SQL truncated");
+            return CBM_STORE_ERR;
+        }
+        size_t used = (size_t)nsql_prefix;
+        int nsql_tail = scoped
+                            ? snprintf(sqlbuf + used, sizeof(sqlbuf) - used, "%s LIMIT ?6",
+                                       arch_path_scope_sql())
+                            : snprintf(sqlbuf + used, sizeof(sqlbuf) - used, " LIMIT ?4");
+        if (nsql_tail <= 0 || used + (size_t)nsql_tail >= sizeof(sqlbuf)) {
+            store_set_error(s, "arch_entry_points active SQL truncated");
+            return CBM_STORE_ERR;
+        }
+    } else {
+        int nsql = scoped ? snprintf(sqlbuf, sizeof(sqlbuf), "%s%s LIMIT ?4", base,
+                                     arch_path_scope_sql())
+                          : snprintf(sqlbuf, sizeof(sqlbuf), "%s LIMIT ?2", base);
+        if (nsql <= 0 || (size_t)nsql >= sizeof(sqlbuf)) {
+            store_set_error(s, "arch_entry_points SQL truncated");
+            return CBM_STORE_ERR;
+        }
     }
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sqlbuf, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "arch_entry_points");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    if (scoped) {
-        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
-        sqlite3_bind_int(stmt, ST_COL_4, ST_ARCH_ENTRY_POINT_LIMIT);
+    if (use_active_nodes) {
+        bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+        bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+        bind_text(stmt, ST_COL_3, project);
+        if (scoped) {
+            arch_bind_path_scope(stmt, ST_COL_4, ST_COL_5, norm, like);
+            sqlite3_bind_int(stmt, ST_COL_6, ST_ARCH_ENTRY_POINT_LIMIT);
+        } else {
+            sqlite3_bind_int(stmt, ST_COL_4, ST_ARCH_ENTRY_POINT_LIMIT);
+        }
     } else {
-        sqlite3_bind_int(stmt, ST_COL_2, ST_ARCH_ENTRY_POINT_LIMIT);
+        bind_text(stmt, ST_COL_1, project);
+        if (scoped) {
+            arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+            sqlite3_bind_int(stmt, ST_COL_4, ST_ARCH_ENTRY_POINT_LIMIT);
+        } else {
+            sqlite3_bind_int(stmt, ST_COL_2, ST_ARCH_ENTRY_POINT_LIMIT);
+        }
     }
 
     int cap = ST_INIT_CAP_8;
