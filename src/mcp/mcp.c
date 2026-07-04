@@ -526,6 +526,13 @@ static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *
     if (stats.affected_paths >= 0) {
         yyjson_mut_obj_add_int(doc, exact, "affected_paths", stats.affected_paths);
     }
+    if (stats.affected_paths_limit >= 0) {
+        yyjson_mut_obj_add_int(doc, exact, "affected_paths_limit",
+                               stats.affected_paths_limit);
+    }
+    if (stats.affected_paths_truncated) {
+        yyjson_mut_obj_add_bool(doc, exact, "affected_paths_truncated", true);
+    }
     if (stats.published_paths >= 0) {
         yyjson_mut_obj_add_int(doc, exact, "published_paths", stats.published_paths);
     }

@@ -965,6 +965,10 @@ bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p);
 bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_t *p);
 void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
                                         int affected_paths, int published_paths);
+void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
+                                                   int affected_paths, int published_paths,
+                                                   int affected_paths_limit,
+                                                   bool affected_paths_truncated);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

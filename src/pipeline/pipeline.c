@@ -217,6 +217,8 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->exact_delta_stats.changed_paths = -1;
     p->exact_delta_stats.affected_paths = -1;
     p->exact_delta_stats.published_paths = -1;
+    p->exact_delta_stats.affected_paths_limit = -1;
+    p->exact_delta_stats.affected_paths_truncated = false;
     atomic_init(&p->cancelled, 0);
 
     return p;
@@ -639,7 +641,7 @@ bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_
 }
 
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p) {
-    static const cbm_pipeline_exact_delta_stats_t empty_stats = {-1, -1, -1};
+    static const cbm_pipeline_exact_delta_stats_t empty_stats = {-1, -1, -1, -1, false};
     return p ? p->exact_delta_stats : empty_stats;
 }
 
@@ -685,12 +687,22 @@ void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason) {
 
 void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
                                         int affected_paths, int published_paths) {
+    cbm_pipeline_set_exact_delta_stats_with_limit(p, changed_paths, affected_paths,
+                                                  published_paths, -1, false);
+}
+
+void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
+                                                   int affected_paths, int published_paths,
+                                                   int affected_paths_limit,
+                                                   bool affected_paths_truncated) {
     if (!p) {
         return;
     }
     p->exact_delta_stats.changed_paths = changed_paths;
     p->exact_delta_stats.affected_paths = affected_paths;
     p->exact_delta_stats.published_paths = published_paths;
+    p->exact_delta_stats.affected_paths_limit = affected_paths_limit;
+    p->exact_delta_stats.affected_paths_truncated = affected_paths_truncated;
 }
 
 static bool resolve_db_path_buf(const cbm_pipeline_t *p, char *path, size_t path_sz) {
