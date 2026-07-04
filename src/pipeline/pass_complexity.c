@@ -148,7 +148,7 @@ typedef struct {
  * recursion discovered from CALLS cycles. */
 static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_depth,
                              int *stored_tld, bool *recursive, cbm_gbuf_node_t **nptr,
-                             int64_t maxid) {
+                             int64_t maxid, bool use_stored_derived) {
     const cbm_gbuf_node_t **nodes = NULL;
     int count = 0;
     if (cbm_gbuf_find_by_label(gb, label, &nodes, &count) != 0) {
@@ -160,7 +160,9 @@ static void seed_loop_depths(const cbm_gbuf_t *gb, const char *label, int *loop_
             loop_depth[n->id] = json_get_int(n->properties_json, "loop_depth", 0);
             stored_tld[n->id] =
                 json_get_int(n->properties_json, "transitive_loop_depth", CBM_NOT_FOUND);
-            recursive[n->id] = json_get_bool(n->properties_json, "self_recursive");
+            recursive[n->id] = json_get_bool(n->properties_json, "self_recursive") ||
+                               (use_stored_derived &&
+                                json_get_bool(n->properties_json, "recursive"));
             nptr[n->id] = (cbm_gbuf_node_t *)n;
         }
     }
@@ -391,8 +393,10 @@ static void pass_complexity_impl(cbm_pipeline_ctx_t *ctx, const char *const *pat
         component[id] = CBM_NOT_FOUND;
     }
 
-    seed_loop_depths(gb, "Function", loop_depth, stored_tld, recursive, nptr, maxid);
-    seed_loop_depths(gb, "Method", loop_depth, stored_tld, recursive, nptr, maxid);
+    seed_loop_depths(gb, "Function", loop_depth, stored_tld, recursive, nptr, maxid,
+                     use_stored_tld);
+    seed_loop_depths(gb, "Method", loop_depth, stored_tld, recursive, nptr, maxid,
+                     use_stored_tld);
     int component_count = mark_recursive_sccs(gb, nptr, recursive, component, maxid);
     if (component_count <= 0) {
         free(loop_depth);
