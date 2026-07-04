@@ -1435,13 +1435,12 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST || changed_count > max_affected_paths) {
         return CBM_STORE_OK;
     }
-    if (incr_changed_contains_c_family_header(changed_files, changed_count)) {
-        /* Header imports can create new inbound active edges from unchanged
-         * source files. Keep the conservative exact/full route until the
-         * overlay frontier can prove active-edge parity against a fresh graph. */
+    if (changed_count > 1 && incr_changed_contains_c_family_header(changed_files, changed_count)) {
+        /* Multi-file header batches can require importer and second-level
+         * caller expansion. Keep those on the exact/full path; single-header
+         * overlays are validated through the active overlay graph gate. */
         return CBM_STORE_OK;
     }
-
     int rc = CBM_STORE_OK;
     const char **changed_paths = NULL;
     cbm_gbuf_t *scratch = NULL;
