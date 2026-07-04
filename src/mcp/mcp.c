@@ -459,7 +459,7 @@ static void add_overlay_active_search_code_freshness(
 static bool add_overlay_active_architecture_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store, const char *project,
     bool include_languages, bool include_entry_points, bool include_routes,
-    bool include_file_tree) {
+    bool include_file_tree, const char *warning) {
     if (!doc || !root || !store || !project || !project[0]) {
         return false;
     }
@@ -500,10 +500,13 @@ static bool add_overlay_active_architecture_freshness(
     yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
                            summary.overlay_owned_nodes_visible);
     yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible", summary.total_nodes_visible);
-    add_response_warning(doc, root,
-                         "get_architecture used active overlay node rows for sections listed in "
-                         "freshness.active_sections; counts and derived summaries remain canonical "
-                         "or stale until active architecture views or compaction are available.");
+    add_response_warning(
+        doc, root,
+        warning && warning[0]
+            ? warning
+            : "get_architecture used active overlay node rows for sections listed in "
+              "freshness.active_sections; counts and derived summaries remain canonical "
+              "or stale until active architecture views or compaction are available.");
     return true;
 }
 
@@ -5006,6 +5009,62 @@ static void append_cross_repo_summary(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
 }
 
+static void add_architecture_languages_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                            const cbm_architecture_info_t *arch) {
+    if (!arch || arch->language_count <= 0) {
+        return;
+    }
+    yyjson_mut_val *langs = yyjson_mut_arr(doc);
+    for (int i = 0; i < arch->language_count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "language",
+                                  arch->languages[i].language ? arch->languages[i].language : "");
+        yyjson_mut_obj_add_int(doc, item, "file_count", arch->languages[i].file_count);
+        yyjson_mut_arr_add_val(langs, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "languages", langs);
+}
+
+static void add_architecture_entry_points_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                               const cbm_architecture_info_t *arch) {
+    if (!arch || arch->entry_point_count <= 0) {
+        return;
+    }
+    yyjson_mut_val *eps = yyjson_mut_arr(doc);
+    for (int i = 0; i < arch->entry_point_count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "name",
+                                  arch->entry_points[i].name ? arch->entry_points[i].name : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "qualified_name",
+                                  arch->entry_points[i].qualified_name
+                                      ? arch->entry_points[i].qualified_name
+                                      : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "file",
+                                  arch->entry_points[i].file ? arch->entry_points[i].file : "");
+        yyjson_mut_arr_add_val(eps, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
+}
+
+static void add_architecture_routes_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
+                                         const cbm_architecture_info_t *arch) {
+    if (!arch || arch->route_count <= 0) {
+        return;
+    }
+    yyjson_mut_val *routes = yyjson_mut_arr(doc);
+    for (int i = 0; i < arch->route_count; i++) {
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, item, "method",
+                                  arch->routes[i].method ? arch->routes[i].method : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "path",
+                                  arch->routes[i].path ? arch->routes[i].path : "");
+        yyjson_mut_obj_add_strcpy(doc, item, "handler",
+                                  arch->routes[i].handler ? arch->routes[i].handler : "");
+        yyjson_mut_arr_add_val(routes, item);
+    }
+    yyjson_mut_obj_add_val(doc, root, "routes", routes);
+}
+
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
     project_expand_t pe = {0};
@@ -5126,7 +5185,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                                                   active_languages_requested,
                                                   active_entry_points_requested,
                                                   active_routes_requested,
-                                                  active_file_tree_requested);
+                                                  active_file_tree_requested, NULL);
     bool overlay_limitation_reported =
         !active_architecture_reported &&
         add_canonical_only_overlay_freshness(
@@ -5243,17 +5302,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Languages */
-    if (arch.language_count > 0) {
-        yyjson_mut_val *langs = yyjson_mut_arr(doc);
-        for (int i = 0; i < arch.language_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "language",
-                                   arch.languages[i].language ? arch.languages[i].language : "");
-            yyjson_mut_obj_add_int(doc, item, "file_count", arch.languages[i].file_count);
-            yyjson_mut_arr_add_val(langs, item);
-        }
-        yyjson_mut_obj_add_val(doc, root, "languages", langs);
-    }
+    add_architecture_languages_json(doc, root, &arch);
 
     /* Packages */
     if (arch.package_count > 0) {
@@ -5271,37 +5320,10 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Entry points */
-    if (arch.entry_point_count > 0) {
-        yyjson_mut_val *eps = yyjson_mut_arr(doc);
-        for (int i = 0; i < arch.entry_point_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "name",
-                                   arch.entry_points[i].name ? arch.entry_points[i].name : "");
-            yyjson_mut_obj_add_str(
-                doc, item, "qualified_name",
-                arch.entry_points[i].qualified_name ? arch.entry_points[i].qualified_name : "");
-            yyjson_mut_obj_add_str(doc, item, "file",
-                                   arch.entry_points[i].file ? arch.entry_points[i].file : "");
-            yyjson_mut_arr_add_val(eps, item);
-        }
-        yyjson_mut_obj_add_val(doc, root, "entry_points", eps);
-    }
+    add_architecture_entry_points_json(doc, root, &arch);
 
     /* HTTP routes */
-    if (arch.route_count > 0) {
-        yyjson_mut_val *routes = yyjson_mut_arr(doc);
-        for (int i = 0; i < arch.route_count; i++) {
-            yyjson_mut_val *item = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_str(doc, item, "method",
-                                   arch.routes[i].method ? arch.routes[i].method : "");
-            yyjson_mut_obj_add_str(doc, item, "path",
-                                   arch.routes[i].path ? arch.routes[i].path : "");
-            yyjson_mut_obj_add_str(doc, item, "handler",
-                                   arch.routes[i].handler ? arch.routes[i].handler : "");
-            yyjson_mut_arr_add_val(routes, item);
-        }
-        yyjson_mut_obj_add_val(doc, root, "routes", routes);
-    }
+    add_architecture_routes_json(doc, root, &arch);
 
     /* Hotspots */
     if (arch.hotspot_count > 0) {
@@ -9455,18 +9477,50 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
     int edges = cbm_store_count_edges(store, proj);
     yyjson_mut_obj_add_int(doc, root, "total_nodes", nodes);
     yyjson_mut_obj_add_int(doc, root, "total_edges", edges);
-    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
-        doc, root, store, proj,
-        "codebase://architecture reads canonical graph summaries; ready overlay rows are not "
-        "included until active architecture resource views or compaction are available.");
+
+    const char *resource_aspects[] = {"languages", "entry_points", "routes"};
+    cbm_architecture_info_t arch = {0};
+    bool arch_loaded = proj && proj[0] &&
+                       cbm_store_get_architecture(
+                           store, proj, resource_aspects,
+                           (int)(sizeof(resource_aspects) / sizeof(resource_aspects[0])), &arch, 0,
+                           1.0) == CBM_STORE_OK;
+    if (arch_loaded) {
+        add_architecture_languages_json(doc, root, &arch);
+        add_architecture_entry_points_json(doc, root, &arch);
+        add_architecture_routes_json(doc, root, &arch);
+    } else if (proj && proj[0]) {
+        add_response_warning(doc, root,
+                             "codebase://architecture omitted active summary sections because "
+                             "architecture summary queries failed.");
+    }
+
+    bool active_architecture_reported =
+        arch_loaded &&
+        add_overlay_active_architecture_freshness(
+            doc, root, store, proj, true, true, true, false,
+            "codebase://architecture used active overlay node rows for languages, entry_points, "
+            "and routes; total_nodes, total_edges, key_functions, and relationship_patterns "
+            "remain canonical or stale until active views or compaction are available.");
+    bool overlay_limitation_reported =
+        !active_architecture_reported &&
+        add_canonical_only_overlay_freshness(
+            doc, root, store, proj,
+            "codebase://architecture reads canonical graph summaries; ready overlay rows are not "
+            "included until active architecture resource views or compaction are available.");
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     if (get_dirty_file_counts(store, proj, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
         if (!overlay_limitation_reported) {
-            add_response_warning(doc, root,
-                                 "codebase://architecture reads canonical graph summaries; dirty "
-                                 "file changes may be absent until overlay or reindex completes.");
+            add_response_warning(
+                doc, root,
+                active_architecture_reported
+                    ? "codebase://architecture used active overlay node rows for summary sections; "
+                      "dirty file changes outside ready overlays may still be absent from canonical "
+                      "summaries until overlay or reindex completes."
+                    : "codebase://architecture reads canonical graph summaries; dirty file changes "
+                      "may be absent until overlay or reindex completes.");
         }
     }
 
@@ -9481,7 +9535,9 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
             : 25;
         char *sql = build_key_functions_sql(excl_csv, NULL, kf_limit);
         sqlite3_stmt *stmt = NULL;
-        if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        if (!sql) {
+            add_response_warning(doc, root, "key_functions omitted: out of memory building SQL");
+        } else if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
             sqlite3_bind_text(stmt, 1, proj, -1, SQLITE_TRANSIENT);
             yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
             while (sqlite3_step(stmt) == SQLITE_ROW) {
@@ -9516,6 +9572,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", rp_arr);
     }
     cbm_store_schema_free(&schema);
+    cbm_store_architecture_free(&arch);
 }
 
 /* Build status resource content. */
