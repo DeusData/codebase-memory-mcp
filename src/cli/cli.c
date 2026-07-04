@@ -2891,6 +2891,22 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "'off' preserves canonical publish behavior. 'small_deltas' is opt-in: eligible exact-delta "
      "batches publish ready overlay rows without mutating canonical graph rows; a canonical full "
      "reindex remains the repair/oracle path."},
+    {CBM_CONFIG_OVERLAY_COMPACTION_POLICY,
+     CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL,
+     NULL,
+     "Indexing",
+     "Background overlay compaction trigger policy",
+     "manual|after_publish",
+     "'manual' never starts compaction automatically. 'after_publish' starts one bounded worker "
+     "only after index_repository successfully publishes an incremental_overlay result."},
+    {CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS,
+     CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS,
+     NULL,
+     "Indexing",
+     "Max overlay generations compacted by one automatic worker pass",
+     "1-256",
+     "Bounds after_publish maintenance. Keep low for foreground responsiveness; raise only after "
+     "benchmarks show compaction backlog is the limiting factor."},
     {CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
      CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS,
      NULL,

@@ -110,6 +110,12 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_OVERLAY_PUBLISH "overlay_publish"
 #define CBM_CONFIG_OVERLAY_PUBLISH_OFF "off"
 #define CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS "small_deltas"
+#define CBM_CONFIG_OVERLAY_COMPACTION_POLICY "overlay_compaction_policy"
+#define CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL "manual"
+#define CBM_CONFIG_OVERLAY_COMPACTION_POLICY_AFTER_PUBLISH "after_publish"
+#define CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS "overlay_compaction_max_generations"
+#define CBM_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS 1
+#define CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS "1"
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS "incremental_exact_max_changed_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS "incremental_exact_max_affected_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS "2"

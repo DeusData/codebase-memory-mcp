@@ -55,6 +55,16 @@ static int mcp_store_node_qn_exists(cbm_store_t *store, const char *project,
     return rc == CBM_STORE_OK ? 1 : 0;
 }
 
+static int mcp_store_node_name_count(cbm_store_t *store, const char *project,
+                                     const char *name) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_name(store, project, name, &nodes, &count);
+    int result = rc == CBM_STORE_OK ? count : 0;
+    cbm_store_free_nodes(nodes, count);
+    return result;
+}
+
 static int mcp_publish_single_node_delta(cbm_store_t *store, const char *project,
                                          int64_t generation, const char *rel_path,
                                          const char *name, const char *qualified_name) {
@@ -3227,6 +3237,120 @@ TEST(tool_index_repository_auto_dep_limit_arg_caps_deps) {
     PASS();
 }
 
+TEST(tool_index_repository_after_publish_starts_overlay_compaction_worker) {
+    char *repo_tmp = th_mktempdir("cbm_mcp_overlay_trigger_repo");
+    ASSERT_NOT_NULL(repo_tmp);
+    char repo[CBM_PATH_MAX];
+    int n = snprintf(repo, sizeof(repo), "%s", repo_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(repo));
+
+    char *cache_tmp = th_mktempdir("cbm_mcp_overlay_trigger_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX,
+                             CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_COMPACTION_POLICY,
+                             CBM_CONFIG_OVERLAY_COMPACTION_POLICY_AFTER_PUBLISH),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS,
+                             CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS),
+              0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "go.mod"), "module example.com/overlaytrigger\n\n"
+                                                     "go 1.22\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "main.go"),
+                            "package main\n\nfunc main() {\n\tHelper()\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "helper.go"),
+                            "package main\n\nfunc Helper() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char req[CBM_SZ_4K];
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\"}}}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    free(resp);
+
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "helper.go"),
+                            "package main\n\nfunc Helper() int {\n\treturn 2\n}\n\n"
+                            "func OverlayTriggerOnly() int {\n\treturn 44\n}\n"),
+              0);
+
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_repository\","
+                 "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\"}}}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"publish_kind\":\"incremental_overlay\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_compaction_policy\":\"after_publish\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_compaction_max_generations\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_compaction_started\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_compaction_status\":\"started\""));
+    free(inner);
+    free(resp);
+
+    int compacted = -1;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted), CBM_STORE_OK);
+    ASSERT_EQ(compacted, 1);
+
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(db_path, sizeof(db_path), cache, project),
+              CBM_STORE_OK);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_store_overlay_node_view_summary_t summary = {0};
+    ASSERT_EQ(cbm_store_get_overlay_node_view_summary(store, project, &summary),
+              CBM_STORE_OK);
+    ASSERT_EQ(summary.overlay_ready_generations, 0);
+    int pending = -1;
+    int overlay_ready = -1;
+    ASSERT_EQ(cbm_store_count_dirty_files(store, project, &pending, &overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(pending, 0);
+    ASSERT_EQ(overlay_ready, 0);
+    ASSERT_EQ(mcp_store_node_name_count(store, project, "OverlayTriggerOnly"), 1);
+    cbm_store_close(store);
+
+    free(project);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    mcp_restore_cache_dir(saved_copy);
+    th_cleanup(repo);
+    th_cleanup(cache);
+    PASS();
+}
+
 TEST(tool_index_repository_reports_incremental_containment_reason) {
     char *repo_tmp = th_mktempdir("cbm_mcp_publish_reason_repo");
     if (!repo_tmp) {
@@ -5541,6 +5665,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_repository_missing_path);
     RUN_TEST(tool_index_repository_auto_index_deps_arg_disables_deps);
     RUN_TEST(tool_index_repository_auto_dep_limit_arg_caps_deps);
+    RUN_TEST(tool_index_repository_after_publish_starts_overlay_compaction_worker);
     RUN_TEST(tool_index_repository_reports_incremental_containment_reason);
     RUN_TEST(tool_get_code_snippet_missing_qn);
     RUN_TEST(tool_get_code_snippet_not_found);
