@@ -23,6 +23,7 @@
 #include <foundation/log.h>
 #include <foundation/mem.h>
 #include <foundation/platform.h>
+#include <foundation/str_util.h>
 /* Forward decl (foundation/platform.c): honors CBM_CACHE_DIR so the test reads
  * the index from the same dir the pipeline writes it (needed for isolation). */
 const char *cbm_resolve_cache_dir(void);
@@ -61,6 +62,12 @@ enum {
 };
 
 static const char *INCR_TEST_ARTIFACT_ENV = "CBM_TEST_ARTIFACT_DIR";
+static const char *INCR_TEST_FASTAPI_REPO_ENV = "CBM_TEST_FASTAPI_REPO";
+static const char *INCR_TEST_FASTAPI_CACHE_ENV = "CBM_TEST_FASTAPI_CACHE";
+static const char *INCR_TEST_FASTAPI_URL = "https://github.com/fastapi/fastapi.git";
+static const char *INCR_TEST_FASTAPI_TAG = "0.99.1";
+static const char *INCR_TEST_FASTAPI_COMMIT = "dd4e78ca7b09abdf0d4646fe4697316c021a8b2e";
+static const char *INCR_TEST_FASTAPI_DEFAULT_CACHE_NAME = "cbm-test-fastapi-0.99.1-cache";
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -364,6 +371,163 @@ static int count_by_label(const char *label) {
     return total;
 }
 
+static int incr_join_path(char *out, size_t out_sz, const char *base, const char *rel) {
+    if (!out || out_sz == 0 || !base || !base[0] || !rel || !rel[0]) {
+        return -1;
+    }
+    int n = snprintf(out, out_sz, "%s/%s", base, rel);
+    return (n >= 0 && (size_t)n < out_sz) ? 0 : -1;
+}
+
+static bool incr_shell_path_ok(const char *path) {
+    return path && path[0] && cbm_validate_shell_arg(path);
+}
+
+static bool incr_fastapi_fixture_has_required_files(const char *repo) {
+    char path[CBM_SZ_1K];
+    if (incr_join_path(path, sizeof(path), repo, "fastapi/applications.py") != 0 ||
+        !cbm_file_exists(path)) {
+        return false;
+    }
+    if (incr_join_path(path, sizeof(path), repo, "tests/test_application.py") != 0 ||
+        !cbm_file_exists(path)) {
+        return false;
+    }
+    if (incr_join_path(path, sizeof(path), repo, "docs/en/docs/release-notes.md") != 0 ||
+        !cbm_file_exists(path)) {
+        return false;
+    }
+    return true;
+}
+
+static bool incr_fastapi_fixture_at_expected_commit(const char *repo) {
+    if (!incr_shell_path_ok(repo)) {
+        return false;
+    }
+    char cmd[CBM_SZ_1K];
+    int n = snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse --verify HEAD 2>/dev/null", repo);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return false;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    char head[CBM_SZ_128] = {0};
+    bool ok = fgets(head, sizeof(head), fp) != NULL;
+    (void)cbm_pclose(fp);
+    if (!ok) {
+        return false;
+    }
+    head[strcspn(head, "\r\n")] = '\0';
+    return strcmp(head, INCR_TEST_FASTAPI_COMMIT) == 0;
+}
+
+static bool incr_fastapi_fixture_valid(const char *repo) {
+    return incr_fastapi_fixture_has_required_files(repo) &&
+           incr_fastapi_fixture_at_expected_commit(repo);
+}
+
+static int incr_clone_fastapi_fixture_from(const char *source) {
+    if (!incr_shell_path_ok(source) || !incr_shell_path_ok(g_repodir)) {
+        return -1;
+    }
+    char cmd[CBM_SZ_2K];
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git clone --quiet --no-hardlinks '%s' '%s' 2>&1", source,
+                     g_repodir);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    int rc = system(cmd);
+    if (rc != 0) {
+        return rc;
+    }
+    if (getenv("CI")) {
+        n = snprintf(cmd, sizeof(cmd),
+                     "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' "
+                     "2>&1",
+                     g_repodir);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            return -1;
+        }
+        rc = system(cmd);
+    }
+    return rc;
+}
+
+static int incr_clone_fastapi_fixture_from_network(const char *dest, bool sparse_on_ci) {
+    if (!incr_shell_path_ok(dest)) {
+        return -1;
+    }
+    char cmd[CBM_SZ_2K];
+    int n = 0;
+    if (sparse_on_ci && getenv("CI")) {
+        n = snprintf(cmd, sizeof(cmd),
+                     "git clone --depth=1 --branch %s --quiet --filter=blob:none --sparse "
+                     "%s '%s' 2>&1 && cd '%s' && git sparse-checkout set --no-cone '/*' "
+                     "'!/docs' '!/tests' 2>&1",
+                     INCR_TEST_FASTAPI_TAG, INCR_TEST_FASTAPI_URL, dest, dest);
+    } else {
+        n = snprintf(cmd, sizeof(cmd), "git clone --depth=1 --branch %s --quiet %s '%s' 2>&1",
+                     INCR_TEST_FASTAPI_TAG, INCR_TEST_FASTAPI_URL, dest);
+    }
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    return system(cmd);
+}
+
+static const char *incr_fastapi_cache_path(char *buf, size_t buf_sz) {
+    const char *cache = cbm_safe_getenv(INCR_TEST_FASTAPI_CACHE_ENV, buf, buf_sz, NULL);
+    if (cache && cache[0]) {
+        return cache;
+    }
+    int n = snprintf(buf, buf_sz, "%s/%s", cbm_tmpdir(), INCR_TEST_FASTAPI_DEFAULT_CACHE_NAME);
+    return (n >= 0 && (size_t)n < buf_sz) ? buf : NULL;
+}
+
+static int incr_prepare_managed_fastapi_cache(const char *cache) {
+    if (!incr_shell_path_ok(cache)) {
+        return -1;
+    }
+    if (incr_fastapi_fixture_valid(cache)) {
+        return 0;
+    }
+
+    th_rmtree(cache);
+    int rc = incr_clone_fastapi_fixture_from_network(cache, false);
+    if (rc != 0) {
+        th_rmtree(cache);
+        return rc;
+    }
+    if (!incr_fastapi_fixture_valid(cache)) {
+        th_rmtree(cache);
+        return -1;
+    }
+    return 0;
+}
+
+static int incr_clone_fastapi_fixture(void) {
+    char source_buf[CBM_SZ_1K];
+    const char *source = cbm_safe_getenv(INCR_TEST_FASTAPI_REPO_ENV, source_buf,
+                                         sizeof(source_buf), NULL);
+    if (source && source[0] && incr_fastapi_fixture_valid(source)) {
+        printf("  using FastAPI fixture source: %s\n", source);
+        return incr_clone_fastapi_fixture_from(source);
+    }
+
+    char cache_buf[CBM_SZ_1K];
+    const char *cache = incr_fastapi_cache_path(cache_buf, sizeof(cache_buf));
+    int rc = incr_prepare_managed_fastapi_cache(cache);
+    if (rc == 0) {
+        printf("  using FastAPI fixture cache: %s\n", cache);
+        return incr_clone_fastapi_fixture_from(cache);
+    }
+
+    return incr_clone_fastapi_fixture_from_network(g_repodir, true);
+}
+
 /* ── Setup / Teardown ─────────────────────────────────────────────── */
 
 static int incremental_setup(void) {
@@ -373,24 +537,9 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
-    /* On CI, use sparse checkout to skip docs/ and tests/ (~62% of files).
-     * Cuts indexing time roughly in half on slow shared runners. */
-    char cmd[1024];
-    if (getenv("CI")) {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet --filter=blob:none "
-                 "--sparse https://github.com/fastapi/fastapi.git '%s' 2>&1 && "
-                 "cd '%s' && git sparse-checkout set --no-cone '/*' '!/docs' '!/tests' 2>&1",
-                 g_repodir, g_repodir);
-    } else {
-        snprintf(cmd, sizeof(cmd),
-                 "git clone --depth=1 --branch 0.99.1 --quiet "
-                 "https://github.com/fastapi/fastapi.git '%s' 2>&1",
-                 g_repodir);
-    }
-    int rc = system(cmd);
+    int rc = incr_clone_fastapi_fixture();
     if (rc != 0) {
-        printf("  clone failed (rc=%d) — network offline?\n", rc);
+        printf("  FastAPI fixture setup failed (rc=%d) — cache invalid and network offline?\n", rc);
         return -1;
     }
 
