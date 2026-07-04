@@ -63,16 +63,8 @@ static void free_mode_skipped(cbm_file_hash_t *ms, int count);
 static void free_deleted_paths(char **deleted, int count);
 
 static bool incr_is_c_family_header(CBMLanguage lang, const char *rel_path) {
+    (void)lang;
     if (!rel_path) {
-        return false;
-    }
-    switch (lang) {
-    case CBM_LANG_C:
-    case CBM_LANG_CPP:
-    case CBM_LANG_CUDA:
-    case CBM_LANG_OBJC:
-        break;
-    default:
         return false;
     }
     return cbm_str_ends_with(rel_path, ".h") || cbm_str_ends_with(rel_path, ".hh") ||
@@ -1437,10 +1429,16 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         !pass_fingerprint || !applied) {
         return CBM_STORE_OK;
     }
+    int max_affected_paths = cbm_pipeline_exact_max_affected_paths(p);
     if (!cbm_pipeline_overlay_publish_small_deltas(p) || deleted_count != 0 ||
         changed_count > cbm_pipeline_exact_max_changed_paths(p) ||
-        cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
-        changed_count > cbm_pipeline_exact_max_affected_paths(p)) {
+        cbm_pipeline_get_mode(p) < CBM_MODE_FAST || changed_count > max_affected_paths) {
+        return CBM_STORE_OK;
+    }
+    if (incr_changed_contains_c_family_header(changed_files, changed_count)) {
+        /* Header imports can create new inbound active edges from unchanged
+         * source files. Keep the conservative exact/full route until the
+         * overlay frontier can prove active-edge parity against a fresh graph. */
         return CBM_STORE_OK;
     }
 
@@ -1885,7 +1883,9 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     const char *prior_reason = cbm_pipeline_publish_reason(p);
     bool overlay_publish_already_failed =
         prior_reason && strcmp(prior_reason, "overlay_publish_error") == 0;
-    if (!graph_noop_candidate && cbm_pipeline_overlay_publish_small_deltas(p) &&
+    bool header_overlay_unsafe = incr_changed_contains_c_family_header(changed_files, changed_count);
+    if (!graph_noop_candidate && !header_overlay_unsafe &&
+        cbm_pipeline_overlay_publish_small_deltas(p) &&
         !overlay_publish_already_failed) {
         int64_t base_generation = 0;
         int64_t overlay_generation = 0;

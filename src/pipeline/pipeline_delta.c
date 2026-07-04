@@ -904,8 +904,12 @@ int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
             return rc;
         }
         const char *node_file = node->file_path ? node->file_path : delta->delta.rel_path;
+        bool source_span_selectable =
+            cbm_label_uses_source_span_selection(existing.label) ||
+            cbm_label_uses_source_span_selection(node->label);
         bool collision = existing.file_path && node_file &&
-                         !delta_field_matches(existing.file_path, node_file);
+                         !delta_field_matches(existing.file_path, node_file) &&
+                         !source_span_selectable;
         cbm_node_free_fields(&existing);
         if (collision) {
             *out_collision = true;
@@ -1318,6 +1322,51 @@ static int delta_plan_append_frontier(cbm_pipeline_file_delta_plan_t *plan, char
     return CBM_STORE_OK;
 }
 
+static int delta_collect_batch_affected_paths(cbm_store_t *store,
+                                              const cbm_pipeline_file_delta_t *const *deltas,
+                                              int delta_count,
+                                              cbm_pipeline_file_delta_plan_t *out) {
+    if (!store || !deltas || delta_count <= 0 || !out) {
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta_count; i++) {
+        const cbm_store_file_delta_t *delta = deltas[i] ? &deltas[i]->delta : NULL;
+        if (!delta || !delta->project || !delta->rel_path) {
+            return CBM_STORE_ERR;
+        }
+        const char **new_export_qns = NULL;
+        if (delta->export_count > 0) {
+            new_export_qns = malloc((size_t)delta->export_count * sizeof(*new_export_qns));
+            if (!new_export_qns) {
+                return CBM_STORE_ERR;
+            }
+            for (int j = 0; j < delta->export_count; j++) {
+                new_export_qns[j] = delta->exports[j].qualified_name;
+            }
+        }
+
+        char **paths = NULL;
+        int path_count = 0;
+        int rc = cbm_store_list_file_delta_affected_paths(
+            store, delta->project, delta->rel_path, new_export_qns, delta->export_count, &paths,
+            &path_count);
+        free(new_export_qns);
+        if (rc != CBM_STORE_OK ||
+            delta_plan_append_frontier(out, paths, path_count) != CBM_STORE_OK) {
+            for (int j = 0; j < path_count; j++) {
+                free(paths[j]);
+            }
+            free(paths);
+            return CBM_STORE_ERR;
+        }
+        for (int j = 0; j < path_count; j++) {
+            free(paths[j]);
+        }
+        free(paths);
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_delta_t *delta,
                                  int max_affected_paths, cbm_pipeline_file_delta_plan_t *out) {
     if (!out) {
@@ -1445,43 +1494,13 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
         }
     }
 
-    for (int i = 0; i < delta_count; i++) {
-        const cbm_store_file_delta_t *delta = &deltas[i]->delta;
-        const char **new_export_qns = NULL;
-        if (delta->export_count > 0) {
-            new_export_qns = malloc((size_t)delta->export_count * sizeof(*new_export_qns));
-            if (!new_export_qns) {
-                delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
-                return CBM_STORE_OK;
-            }
-            for (int j = 0; j < delta->export_count; j++) {
-                new_export_qns[j] = delta->exports[j].qualified_name;
-            }
-        }
-
-        char **paths = NULL;
-        int path_count = 0;
-        int rc = cbm_store_list_file_delta_affected_paths(
-            store, delta->project, delta->rel_path, new_export_qns, delta->export_count, &paths,
-            &path_count);
-        free(new_export_qns);
-        if (rc != CBM_STORE_OK ||
-            delta_plan_append_frontier(out, paths, path_count) != CBM_STORE_OK) {
-            for (int j = 0; j < path_count; j++) {
-                free(paths[j]);
-            }
-            free(paths);
-            delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
-            return CBM_STORE_OK;
-        }
-        for (int j = 0; j < path_count; j++) {
-            free(paths[j]);
-        }
-        free(paths);
-        if (out->affected_count > max_affected_paths) {
-            delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
-            return CBM_STORE_OK;
-        }
+    if (delta_collect_batch_affected_paths(store, deltas, delta_count, out) != CBM_STORE_OK) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
+        return CBM_STORE_OK;
+    }
+    if (out->affected_count > max_affected_paths) {
+        delta_plan_set_fallback(out, cbm_delta_reason_frontier_too_large);
+        return CBM_STORE_OK;
     }
 
     out->route = CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE;

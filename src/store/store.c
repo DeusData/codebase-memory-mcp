@@ -67,6 +67,7 @@ enum {
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "store/store.h"
+#include "cbm.h"
 #include "service_patterns.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -1025,6 +1026,16 @@ static void sqlite_iregexp(sqlite3_context *ctx, int argc, sqlite3_value **argv)
     sqlite3_result_int(ctx, cbm_regexec(re, text, 0, NULL, 0) == 0 ? SKIP_ONE : 0);
 }
 
+static void sqlite_cbm_source_span_label(sqlite3_context *ctx, int argc,
+                                         sqlite3_value **argv) {
+    if (argc != SKIP_ONE || sqlite3_value_type(argv[0]) == SQLITE_NULL) {
+        sqlite3_result_int(ctx, 0);
+        return;
+    }
+    const char *label = (const char *)sqlite3_value_text(argv[0]);
+    sqlite3_result_int(ctx, cbm_label_uses_source_span_selection(label) ? SKIP_ONE : 0);
+}
+
 /* Cosine similarity between two int8 BLOB vectors.
  * Returns float in [-1, 1].  Used for vector search at query time. */
 static void sqlite_cosine_i8(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
@@ -1111,6 +1122,10 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     /* camelCase splitter for FTS5 BM25 indexing */
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
+    /* Shared node-QN collision selector for active overlay read views. */
+    sqlite3_create_function(s->db, "cbm_source_span_label", SKIP_ONE,
+                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_cbm_source_span_label, NULL, NULL);
 
     if (configure_pragmas(s, in_memory) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
         create_user_indexes(s) != CBM_STORE_OK) {
@@ -1169,6 +1184,9 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
                             NULL, sqlite_cosine_i8, NULL, NULL);
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_source_span_label", SKIP_ONE,
+                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL,
+                            sqlite_cbm_source_span_label, NULL, NULL);
 
     if (configure_pragmas(s, false) != CBM_STORE_OK) {
         sqlite3_close(s->db);
@@ -7876,20 +7894,46 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                      "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
                      "  WHERE g.status = ?1 AND t.entity_kind = ?2 AND t.active = %d"
                      "  GROUP BY t.project, t.rel_path"
-                     "), active_nodes AS ("
-                     "  SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
-                     "         n.start_line, n.end_line, n.properties"
+                     "), active_node_candidates AS ("
+                     "  SELECT 0 AS overlay_row, n.id, n.project, n.label, n.name,"
+                     "         n.qualified_name, n.file_path, n.start_line, n.end_line,"
+                     "         n.properties"
                      "  FROM nodes n"
                      "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
                      "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
                      "  UNION ALL"
-                     "  SELECT %d AS id, n.project, n.label, n.name, n.qualified_name, n.file_path,"
-                     "         n.start_line, n.end_line, n.properties"
+                     "  SELECT 1 AS overlay_row, %d AS id, n.project, n.label, n.name,"
+                     "         n.qualified_name, n.file_path, n.start_line, n.end_line,"
+                     "         n.properties"
                      "  FROM overlay_nodes n"
                      "  JOIN active_files af"
                      "    ON af.project = n.project AND af.rel_path = n.rel_path"
                      "   AND af.overlay_generation = n.overlay_generation"
                      "  WHERE n.owned = %d"
+                     "), active_nodes AS ("
+                     "  SELECT id, project, label, name, qualified_name, file_path, start_line,"
+                     "         end_line, properties"
+                     "  FROM ("
+                     "    SELECT c.*, ROW_NUMBER() OVER ("
+                     "      PARTITION BY c.project, c.qualified_name"
+                     "      ORDER BY cbm_source_span_label(c.label) DESC,"
+                     "               CASE WHEN cbm_source_span_label(c.label) = 1"
+                     "                    THEN CASE WHEN c.file_path <> '' THEN 1 ELSE 0 END"
+                     "                    ELSE c.overlay_row END DESC,"
+                     "               CASE WHEN cbm_source_span_label(c.label) = 1"
+                     "                         AND c.start_line > 0 AND c.end_line >= c.start_line"
+                     "                    THEN c.end_line - c.start_line + 1 ELSE 0 END DESC,"
+                     "               CASE WHEN cbm_source_span_label(c.label) = 1"
+                     "                    THEN c.start_line ELSE 0 END ASC,"
+                     "               CASE WHEN cbm_source_span_label(c.label) = 1"
+                     "                    THEN c.end_line ELSE 0 END DESC,"
+                     "               CASE WHEN cbm_source_span_label(c.label) = 1"
+                     "                    THEN c.file_path ELSE '' END ASC,"
+                     "               c.overlay_row DESC"
+                     "    ) AS rn"
+                     "    FROM active_node_candidates c"
+                     "  ) ranked_nodes"
+                     "  WHERE rn = 1"
                      ")",
                      recursive ? "WITH RECURSIVE" : "WITH", STORE_OVERLAY_TOMBSTONE_ACTIVE,
                      CBM_STORE_NO_NODE_ID,
