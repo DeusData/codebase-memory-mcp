@@ -442,6 +442,9 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
 bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
+int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst);
+int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src,
+                                 cbm_store_delta_edge_t *dst);
 int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
     cbm_store_t *store, const cbm_pipeline_file_delta_t *delta, bool *out_collision);
 int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
@@ -473,6 +476,9 @@ int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
                                                   int delta_count, int64_t base_generation,
                                                   const char *dirty_source,
                                                   int64_t *out_overlay_generation);
+int cbm_pipeline_publish_overlay_file_delta_additions_batch(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas, int delta_count,
+    int64_t base_generation, const char *dirty_source, int64_t *out_overlay_generation);
 void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
 
 /* Seed a scratch graph with persisted unchanged nodes needed by import and

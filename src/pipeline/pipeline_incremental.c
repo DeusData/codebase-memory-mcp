@@ -133,6 +133,103 @@ static bool incr_header_overlay_has_type_impl_pair(const cbm_file_info_t *file,
     return incr_file_delta_has_type_like_node(delta) && incr_same_stem_impl_exists(file->path);
 }
 
+static bool incr_delta_node_qn_present(const cbm_node_t *nodes, int count, const char *qn) {
+    if (!nodes || count <= 0 || !qn) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].qualified_name && strcmp(nodes[i].qualified_name, qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void incr_free_additive_delta(cbm_pipeline_file_delta_t *delta) {
+    cbm_pipeline_file_delta_free(delta);
+}
+
+static int incr_build_additive_delta(const cbm_pipeline_file_delta_t *src,
+                                     cbm_pipeline_file_delta_t *out) {
+    if (!src || !out || src->change_kind != CBM_PIPELINE_DELTA_CHANGE_UPSERT) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    out->delta = (cbm_store_file_delta_t){
+        .project = src->delta.project,
+        .rel_path = src->delta.rel_path,
+        .generation = src->delta.generation,
+        .file_hash = src->delta.file_hash,
+        .file_state = src->delta.file_state,
+        .derived_view_name = src->delta.derived_view_name,
+        .derived_status = src->delta.derived_status,
+    };
+    out->change_kind = src->change_kind;
+
+    if (src->delta.node_count > 0) {
+        out->nodes = calloc((size_t)src->delta.node_count, sizeof(*out->nodes));
+        if (!out->nodes) {
+            return CBM_STORE_ERR;
+        }
+    }
+    for (int i = 0; i < src->delta.node_count; i++) {
+        const cbm_node_t *node = &src->delta.nodes[i];
+        int rc = cbm_pipeline_copy_delta_node(node, &out->nodes[out->delta.node_count]);
+        if (rc != CBM_STORE_OK) {
+            incr_free_additive_delta(out);
+            return rc;
+        }
+        out->delta.node_count++;
+    }
+
+    if (out->delta.node_count == 0) {
+        incr_free_additive_delta(out);
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (src->delta.edge_count > 0) {
+        out->edges = calloc((size_t)src->delta.edge_count, sizeof(*out->edges));
+        if (!out->edges) {
+            incr_free_additive_delta(out);
+            return CBM_STORE_ERR;
+        }
+    }
+    for (int i = 0; i < src->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &src->delta.edges[i];
+        if (!incr_delta_node_qn_present(out->nodes, out->delta.node_count, edge->source_qn) &&
+            !incr_delta_node_qn_present(out->nodes, out->delta.node_count, edge->target_qn)) {
+            continue;
+        }
+        int rc = cbm_pipeline_copy_delta_edge(edge, &out->edges[out->delta.edge_count]);
+        if (rc != CBM_STORE_OK) {
+            incr_free_additive_delta(out);
+            return rc;
+        }
+        out->delta.edge_count++;
+    }
+
+    if (src->delta.export_count > 0) {
+        out->exports = calloc((size_t)src->delta.export_count, sizeof(*out->exports));
+        if (!out->exports) {
+            incr_free_additive_delta(out);
+            return CBM_STORE_ERR;
+        }
+    }
+    for (int i = 0; i < src->delta.export_count; i++) {
+        const char *qn = src->delta.exports[i].qualified_name;
+        out->exports[out->delta.export_count].qualified_name = cbm_strdup(qn ? qn : "");
+        if (!out->exports[out->delta.export_count].qualified_name) {
+            incr_free_additive_delta(out);
+            return CBM_STORE_ERR;
+        }
+        out->delta.export_count++;
+    }
+
+    out->delta.nodes = out->nodes;
+    out->delta.edges = out->edges;
+    out->delta.exports = out->exports;
+    return CBM_STORE_OK;
+}
+
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored metadata.
@@ -1483,10 +1580,8 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST || changed_count > max_affected_paths) {
         return CBM_STORE_OK;
     }
+    bool additive_header_overlay = false;
     if (changed_count > 1 && incr_changed_contains_c_family_header(changed_files, changed_count)) {
-        /* Multi-file header batches can require importer and second-level
-         * caller expansion. Keep those on the exact/full path; single-header
-         * overlays are validated through the active overlay graph gate. */
         return CBM_STORE_OK;
     }
     int rc = CBM_STORE_OK;
@@ -1495,18 +1590,23 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
     cbm_pipeline_file_delta_t *deltas = NULL;
+    cbm_pipeline_file_delta_t *additive_deltas = NULL;
     const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
+    const cbm_pipeline_file_delta_t **additive_delta_ptrs = NULL;
     CBMFileResult **result_cache = NULL;
     int64_t base_generation = 0;
     int64_t overlay_generation = 0;
 
     changed_paths = malloc((size_t)changed_count * sizeof(*changed_paths));
     deltas = calloc((size_t)changed_count, sizeof(*deltas));
+    additive_deltas = calloc((size_t)changed_count, sizeof(*additive_deltas));
     delta_ptrs = malloc((size_t)changed_count * sizeof(*delta_ptrs));
+    additive_delta_ptrs = malloc((size_t)changed_count * sizeof(*additive_delta_ptrs));
     result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
     scratch = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
     registry = cbm_registry_new();
-    if (!changed_paths || !deltas || !delta_ptrs || !result_cache || !scratch || !registry) {
+    if (!changed_paths || !deltas || !additive_deltas || !delta_ptrs || !additive_delta_ptrs ||
+        !result_cache || !scratch || !registry) {
         cbm_pipeline_set_publish_reason(p, "overlay_alloc");
         cbm_log_info("incremental.overlay.fallback", "reason", "alloc");
         goto cleanup;
@@ -1612,43 +1712,61 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
             goto cleanup;
         }
         if (incr_header_overlay_has_type_impl_pair(&changed_files[i], &deltas[i])) {
-            cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR);
-            cbm_log_info("incremental.overlay.fallback", "reason",
-                         CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR);
-            goto cleanup;
+            additive_header_overlay = true;
         }
-        int preserved = 0;
-        rc = cbm_pipeline_file_delta_add_preserved_inbound_edges(store, &deltas[i], &preserved);
-        if (rc != CBM_STORE_OK) {
-            cbm_pipeline_set_publish_reason(p, "overlay_preserve_inbound");
-            cbm_log_info("incremental.overlay.fallback", "reason", "preserve_inbound", "rc",
-                         itoa_buf_incr(rc));
-            goto cleanup;
+        if (!additive_header_overlay) {
+            int preserved = 0;
+            rc = cbm_pipeline_file_delta_add_preserved_inbound_edges(store, &deltas[i], &preserved);
+            if (rc != CBM_STORE_OK) {
+                cbm_pipeline_set_publish_reason(p, "overlay_preserve_inbound");
+                cbm_log_info("incremental.overlay.fallback", "reason", "preserve_inbound", "rc",
+                             itoa_buf_incr(rc));
+                goto cleanup;
+            }
         }
         delta_ptrs[i] = &deltas[i];
     }
 
-    for (int i = 0; i < changed_count; i++) {
-        bool collision = false;
-        rc = cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, &deltas[i],
-                                                                      &collision);
-        if (rc != CBM_STORE_OK || collision) {
-            const char *reason =
-                collision ? CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION
-                          : CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
-            cbm_pipeline_set_publish_reason(p, reason);
-            cbm_log_info("incremental.overlay.fallback", "reason", reason, "rc",
-                         itoa_buf_incr(rc));
-            goto cleanup;
+    if (additive_header_overlay) {
+        for (int i = 0; i < changed_count; i++) {
+            rc = incr_build_additive_delta(&deltas[i], &additive_deltas[i]);
+            if (rc != CBM_STORE_OK) {
+                const char *reason = rc == CBM_STORE_NOT_FOUND ? "overlay_no_additive_facts"
+                                                               : "overlay_additive_filter";
+                cbm_pipeline_set_publish_reason(p, reason);
+                cbm_log_info("incremental.overlay.fallback", "reason", reason, "rc",
+                             itoa_buf_incr(rc));
+                goto cleanup;
+            }
+            additive_delta_ptrs[i] = &additive_deltas[i];
+        }
+    } else {
+        for (int i = 0; i < changed_count; i++) {
+            bool collision = false;
+            rc = cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, &deltas[i],
+                                                                          &collision);
+            if (rc != CBM_STORE_OK || collision) {
+                const char *reason =
+                    collision ? CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION
+                              : CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
+                cbm_pipeline_set_publish_reason(p, reason);
+                cbm_log_info("incremental.overlay.fallback", "reason", reason, "rc",
+                             itoa_buf_incr(rc));
+                goto cleanup;
+            }
         }
     }
 
     rc = cbm_store_latest_complete_index_generation(store, project, &base_generation);
     if (rc == CBM_STORE_OK) {
         CBM_PROF_START(t_overlay_publish);
-        rc = cbm_pipeline_publish_overlay_file_delta_batch(
-            store, delta_ptrs, changed_count, base_generation,
-            CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation);
+        rc = additive_header_overlay
+                 ? cbm_pipeline_publish_overlay_file_delta_additions_batch(
+                       store, additive_delta_ptrs, changed_count, base_generation,
+                       CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation)
+                 : cbm_pipeline_publish_overlay_file_delta_batch(
+                       store, delta_ptrs, changed_count, base_generation,
+                       CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation);
         CBM_PROF_END_N("incremental_overlay", "2_publish_overlay", t_overlay_publish,
                        changed_count);
     }
@@ -1668,7 +1786,9 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
                  itoa_buf_incr(rc));
 
 cleanup:
+    free(additive_delta_ptrs);
     free(delta_ptrs);
+    incr_free_file_deltas(additive_deltas, changed_count);
     incr_free_file_deltas(deltas, changed_count);
     incr_free_result_cache(result_cache, changed_count);
     cbm_path_alias_collection_free(path_aliases);
@@ -1937,7 +2057,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     bool overlay_publish_already_failed =
         prior_reason && strcmp(prior_reason, "overlay_publish_error") == 0;
     bool header_overlay_unsafe = incr_changed_contains_c_family_header(changed_files, changed_count);
-    if (!graph_noop_candidate && !header_overlay_unsafe &&
+    if (!graph_noop_candidate &&
         cbm_pipeline_overlay_publish_small_deltas(p) &&
         !overlay_publish_already_failed) {
         int64_t base_generation = 0;
@@ -1945,9 +2065,13 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         rc = cbm_store_latest_complete_index_generation(store, project, &base_generation);
         if (rc == CBM_STORE_OK) {
             CBM_PROF_START(t_overlay_publish);
-            rc = cbm_pipeline_publish_overlay_file_delta_batch(
-                store, delta_ptrs, delta_count, base_generation,
-                CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation);
+            rc = header_overlay_unsafe
+                     ? cbm_pipeline_publish_overlay_file_delta_additions_batch(
+                           store, delta_ptrs, delta_count, base_generation,
+                           CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation)
+                     : cbm_pipeline_publish_overlay_file_delta_batch(
+                           store, delta_ptrs, delta_count, base_generation,
+                           CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation);
             CBM_PROF_END_N("incremental_exact", "11_publish_overlay", t_overlay_publish,
                            delta_count);
         }
