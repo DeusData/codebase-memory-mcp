@@ -152,6 +152,11 @@ bool cbm_label_is_type_like(const char *label) {
                      strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0);
 }
 
+bool cbm_label_uses_source_span_selection(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     cbm_label_is_type_like(label) || strcmp(label, "Module") == 0);
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

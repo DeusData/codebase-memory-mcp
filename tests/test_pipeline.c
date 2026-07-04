@@ -42,7 +42,7 @@ static char g_tmpdir[256];
 
 enum { PIPELINE_TEST_OVERLONG_DB_PATH = CBM_PATH_MAX + CBM_SZ_128 };
 
-static char g_pipeline_log_capture[CBM_SZ_16K];
+static char g_pipeline_log_capture[CBM_SZ_64K];
 static CBMLogLevel g_pipeline_prev_log_level = CBM_LOG_INFO;
 
 static void pipeline_capture_log_sink(const char *line) {
@@ -3680,8 +3680,28 @@ TEST(pipeline_file_delta_detects_cross_file_node_qn_collision) {
     bool collision = false;
     ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
               CBM_STORE_OK);
+    ASSERT_FALSE(collision);
+
+    cbm_node_t existing_var = {.project = "test",
+                               .label = "Variable",
+                               .name = "thing",
+                               .qualified_name = "test.src.store.store.thing",
+                               .file_path = "src/store/store.c",
+                               .start_line = 1,
+                               .end_line = 1,
+                               .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &existing_var), 0);
+    delta_node.label = "Variable";
+    delta_node.name = "thing";
+    delta_node.qualified_name = "test.src.store.store.thing";
+    collision = false;
+    ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
+              CBM_STORE_OK);
     ASSERT_TRUE(collision);
 
+    delta_node.label = "Class";
+    delta_node.name = "Thing";
+    delta_node.qualified_name = "test.src.store.store.Thing";
     delta_node.file_path = "src/store/store.c";
     collision = true;
     ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
@@ -8521,7 +8541,6 @@ static int write_incremental_frontier_fixture(int leaf_value) {
 }
 
 enum { PIPELINE_INCR_C_HEADER_IMPORTER_COUNT = CBM_SZ_4 };
-
 static int write_incremental_c_header_frontier_fixture(int marker) {
     char path[CBM_PATH_MAX];
     char body[CBM_SZ_1K];
@@ -8568,6 +8587,66 @@ static int write_incremental_c_header_frontier_fixture(int marker) {
         }
     }
     return 0;
+}
+
+static int write_incremental_c_header_second_level_callers(void) {
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_512];
+    for (int i = 0; i < PIPELINE_INCR_C_HEADER_IMPORTER_COUNT; i++) {
+        int n = snprintf(path, sizeof(path), "%s/caller_%d.c", g_incr_tmpdir, i);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            return -1;
+        }
+        n = snprintf(body, sizeof(body),
+                     "int caller_%d(void) {\n"
+                     "    return consumer_%d();\n"
+                     "}\n",
+                     i, i);
+        if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int write_incremental_c_header_extra_export(int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/shared.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "#ifndef SHARED_H\n"
+                 "#define SHARED_H\n"
+                 "#define SHARED_MARKER %d\n"
+                 "int shared_value(void);\n"
+                 "int shared_extra(void);\n"
+                 "#endif\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_c_header_impl_marker(int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/shared.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "#include \"shared.h\"\n\n"
+                 "int shared_value(void) {\n"
+                 "    return SHARED_MARKER + %d;\n"
+                 "}\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
 }
 
 static int write_incremental_arg_url_route_file(const char *route_path, int marker) {
@@ -10028,7 +10107,7 @@ TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
     cbm_pipeline_free(p);
     ASSERT_NOT_NULL(project);
 
-    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_SZ_2), 0);
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
 
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
@@ -10066,6 +10145,82 @@ TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "C header full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_c_header_uses_exact_not_overlay_until_active_edges_are_exact) {
+    enum {
+        PIPELINE_C_HEADER_OVERLAY_MAX_AFFECTED = CBM_SZ_16,
+        PIPELINE_C_HEADER_AFFECTED_FRONTIER =
+            CBM_SZ_2 + (PIPELINE_INCR_C_HEADER_IMPORTER_COUNT * CBM_SZ_2),
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+    ASSERT_EQ(write_incremental_c_header_second_level_callers(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d",
+                     PIPELINE_C_HEADER_OVERLAY_MAX_AFFECTED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+    ASSERT_EQ(write_incremental_c_header_impl_marker(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    if (strstr(logs, "msg=incremental.overlay.done files=") != NULL) {
+        FAIL(logs);
+    }
+    ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
+    char frontier_log[CBM_SZ_128];
+    int log_n = snprintf(frontier_log, sizeof(frontier_log),
+                         "msg=incremental.exact.frontier changed=2 expanded=%d",
+                         PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    ASSERT(log_n >= 0 && (size_t)log_n < sizeof(frontier_log));
+    ASSERT(strstr(logs, frontier_log) != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT(cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, CBM_SZ_2);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    ASSERT_EQ(stats.published_paths, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C header exact update differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -13514,6 +13669,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
+    RUN_TEST(incremental_c_header_uses_exact_not_overlay_until_active_edges_are_exact);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);

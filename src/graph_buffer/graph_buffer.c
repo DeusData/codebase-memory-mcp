@@ -24,6 +24,7 @@ enum {
     GB_DEDUP_LOOKAHEAD = 1,  /* compare current with next element */
 };
 #include "graph_buffer/graph_buffer.h"
+#include "cbm.h"
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
 #include "sqlite_writer.h"
@@ -769,11 +770,7 @@ static bool uses_deterministic_source_hint(const char *label) {
 }
 
 static bool uses_source_span_selection(const char *label) {
-    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
-                     strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
-                     strcmp(label, "Trait") == 0 || strcmp(label, "Type") == 0 ||
-                     strcmp(label, "Module") == 0);
+    return cbm_label_uses_source_span_selection(label);
 }
 
 static int source_span_lines(int start_line, int end_line) {

@@ -572,6 +572,9 @@ int cbm_macro_extraction_enabled(void);
 // True for labels that describe user-defined types and can be registry targets.
 bool cbm_label_is_type_like(const char *label);
 
+// True for definition labels where duplicate QNs should keep the richest source span.
+bool cbm_label_uses_source_span_selection(const char *label);
+
 // Growable array push functions (arena-allocated, no individual free needed).
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def);
 void cbm_calls_push(CBMCallArray *arr, CBMArena *a, CBMCall call);

@@ -54,6 +54,19 @@ OVERLAY_STATUS_READY = "overlay_ready"  # CBM_STORE_OVERLAY_STATUS_READY
 OVERLAY_TOMBSTONE_FILE = "file"  # CBM_STORE_OVERLAY_TOMBSTONE_FILE
 OVERLAY_TOMBSTONE_ACTIVE = 1  # STORE_OVERLAY_TOMBSTONE_ACTIVE
 OVERLAY_ROW_OWNED = 1  # STORE_OVERLAY_ROW_OWNED
+SOURCE_SPAN_LABELS = frozenset(
+    {
+        "Function",
+        "Method",
+        "Class",
+        "Struct",
+        "Interface",
+        "Enum",
+        "Type",
+        "Trait",
+        "Module",
+    }
+)
 LOG_MARKER_PIPELINE_DONE = "pipeline.done"
 LOG_MARKER_INCREMENTAL_DONE = "incremental.done"
 LOG_MARKER_EXACT_DONE = "incremental.exact.done"
@@ -810,9 +823,14 @@ def decode_sqlite_text(data: bytes) -> str:
     return data.decode("utf-8", "surrogateescape")
 
 
+def sqlite_cbm_source_span_label(label: str | None) -> int:
+    return int(label in SOURCE_SPAN_LABELS)
+
+
 def query_rows(db_path: Path, sql: str, params: tuple[Any, ...]) -> list[str]:
     con = sqlite3.connect(str(db_path))
     con.text_factory = decode_sqlite_text
+    con.create_function("cbm_source_span_label", 1, sqlite_cbm_source_span_label)
     try:
         rows = [str(row[0]) for row in con.execute(sql, params)]
     finally:
@@ -910,21 +928,41 @@ ACTIVE_OVERLAY_CTE_SQL = (
     "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
     "  WHERE g.status = ?1 AND t.entity_kind = ?2 AND t.active = ?3 AND t.project = ?4"
     "  GROUP BY t.project, t.rel_path"
-    "), active_nodes AS ("
-    "  SELECT n.project, n.label, n.name, n.qualified_name, n.file_path,"
+    "), active_node_candidates AS ("
+    "  SELECT 0 AS overlay_row, n.project, n.label, n.name, n.qualified_name, n.file_path,"
     "         n.start_line, n.end_line, n.properties"
     "  FROM nodes n"
     "  WHERE n.project = ?4"
     "    AND NOT EXISTS (SELECT 1 FROM active_files af"
     "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
     "  UNION ALL"
-    "  SELECT n.project, n.label, n.name, n.qualified_name, n.file_path,"
+    "  SELECT 1 AS overlay_row, n.project, n.label, n.name, n.qualified_name, n.file_path,"
     "         n.start_line, n.end_line, n.properties"
     "  FROM overlay_nodes n"
     "  JOIN active_files af"
     "    ON af.project = n.project AND af.rel_path = n.rel_path"
     "   AND af.overlay_generation = n.overlay_generation"
     "  WHERE n.owned = ?5"
+    "), active_nodes AS ("
+    "  SELECT project, label, name, qualified_name, file_path, start_line, end_line, properties"
+    "  FROM ("
+    "    SELECT c.*, ROW_NUMBER() OVER ("
+    "      PARTITION BY c.project, c.qualified_name"
+    "      ORDER BY cbm_source_span_label(c.label) DESC,"
+    "               CASE WHEN cbm_source_span_label(c.label) = 1"
+    "                    THEN CASE WHEN c.file_path <> '' THEN 1 ELSE 0 END"
+    "                    ELSE c.overlay_row END DESC,"
+    "               CASE WHEN cbm_source_span_label(c.label) = 1"
+    "                         AND c.start_line > 0 AND c.end_line >= c.start_line"
+    "                    THEN c.end_line - c.start_line + 1 ELSE 0 END DESC,"
+    "               CASE WHEN cbm_source_span_label(c.label) = 1 THEN c.start_line ELSE 0 END ASC,"
+    "               CASE WHEN cbm_source_span_label(c.label) = 1 THEN c.end_line ELSE 0 END DESC,"
+    "               CASE WHEN cbm_source_span_label(c.label) = 1 THEN c.file_path ELSE '' END ASC,"
+    "               c.overlay_row DESC"
+    "    ) AS rn"
+    "    FROM active_node_candidates c"
+    "  ) ranked_nodes"
+    "  WHERE rn = 1"
     "), active_edges AS ("
     "  SELECT e.project, s.qualified_name AS source_qn, t.qualified_name AS target_qn,"
     "         e.type, e.properties"

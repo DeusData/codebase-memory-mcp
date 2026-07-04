@@ -2384,6 +2384,80 @@ TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows) {
     PASS();
 }
 
+TEST(store_active_overlay_qn_view_uses_source_span_selection) {
+    enum { BASE_GENERATION = 7 };
+    const char *project = "test";
+    const char *qn = "test.src.store.store.cbm_store";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t source = {.project = project,
+                         .label = "Class",
+                         .name = "cbm_store",
+                         .qualified_name = qn,
+                         .file_path = "src/store/store.c",
+                         .start_line = 146,
+                         .end_line = 211,
+                         .properties_json = "{\"docstring\":\"source\"}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &source), 0);
+
+    int64_t header_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, project, BASE_GENERATION,
+                                                   &header_overlay),
+              CBM_STORE_OK);
+    cbm_node_t header_node = {.project = project,
+                              .label = "Class",
+                              .name = "cbm_store",
+                              .qualified_name = qn,
+                              .file_path = "src/store/store.h",
+                              .start_line = 19,
+                              .end_line = 19,
+                              .properties_json = "{}"};
+    cbm_store_file_delta_t header_delta = {.project = project,
+                                           .rel_path = "src/store/store.h",
+                                           .generation = BASE_GENERATION,
+                                           .nodes = &header_node,
+                                           .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &header_delta, header_overlay),
+              CBM_STORE_OK);
+
+    cbm_node_t found = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn_overlay_view(s, project, qn, &found), CBM_STORE_OK);
+    ASSERT_STR_EQ(found.file_path, "src/store/store.c");
+    ASSERT_EQ(found.start_line, 146);
+    cbm_node_free_fields(&found);
+
+    int64_t source_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, project, BASE_GENERATION,
+                                                   &source_overlay),
+              CBM_STORE_OK);
+    cbm_node_t richer_source = {.project = project,
+                                .label = "Class",
+                                .name = "cbm_store",
+                                .qualified_name = qn,
+                                .file_path = "src/store/store.c",
+                                .start_line = 1,
+                                .end_line = 300,
+                                .properties_json = "{\"docstring\":\"overlay\"}"};
+    cbm_store_file_delta_t source_delta = {.project = project,
+                                           .rel_path = "src/store/store.c",
+                                           .generation = BASE_GENERATION,
+                                           .nodes = &richer_source,
+                                           .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &source_delta, source_overlay),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_store_find_node_by_qn_overlay_view(s, project, qn, &found), CBM_STORE_OK);
+    ASSERT_STR_EQ(found.file_path, "src/store/store.c");
+    ASSERT_EQ(found.start_line, 1);
+    ASSERT_EQ(found.end_line, 300);
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -5545,6 +5619,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_compact_overlay_generation_promotes_delete_only_tombstone);
     RUN_TEST(store_compact_ready_overlay_generations_respects_batch_limit);
     RUN_TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows);
+    RUN_TEST(store_active_overlay_qn_view_uses_source_span_selection);
     RUN_TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search);
     RUN_TEST(store_search_overlay_view_matches_full_rebuild_oracle);
     RUN_TEST(store_search_overlay_view_uses_active_relationship_edges);
