@@ -239,6 +239,24 @@ static int exec_sql(cbm_store_t *s, const char *sql) {
     return CBM_STORE_OK;
 }
 
+static bool store_fts_unavailable(cbm_store_t *s, const char *table_name) {
+    const char *msg = (s && s->db) ? sqlite3_errmsg(s->db) : NULL;
+    if (!msg || !table_name || !table_name[0]) {
+        return false;
+    }
+    char needle[CBM_SZ_128];
+    int n = snprintf(needle, sizeof(needle), "no such table: %s", table_name);
+    return n >= 0 && (size_t)n < sizeof(needle) && strstr(msg, needle) != NULL;
+}
+
+static bool store_nodes_fts_unavailable(cbm_store_t *s) {
+    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS);
+}
+
+static bool store_overlay_nodes_fts_unavailable(cbm_store_t *s) {
+    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY);
+}
+
 /* Safe string: returns "" if NULL. */
 static const char *safe_str(const char *s) {
     return s ? s : "";
@@ -1518,7 +1536,40 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     return CBM_STORE_OK;
 }
 
+static int store_overlay_nodes_fts_delete_by_project(cbm_store_t *s, const char *project) {
+    static const char sql[] =
+        "INSERT INTO " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "(" CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        ", rowid, name, qualified_name, label, file_path) "
+        "SELECT 'delete', id, cbm_camel_split(name), qualified_name, label, file_path "
+        "FROM overlay_nodes "
+        "WHERE project = ?1 "
+        "  AND EXISTS (SELECT 1 FROM " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "              WHERE rowid = overlay_nodes.id);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_overlay_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "overlay_nodes_fts_delete_by_project");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_nodes_fts_delete_by_project");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_delete_project(cbm_store_t *s, const char *name) {
+    int rc = store_overlay_nodes_fts_delete_by_project(s, name);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_delete_project, "DELETE FROM projects WHERE name = ?1;");
     if (!stmt) {
@@ -1526,7 +1577,7 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
     }
 
     bind_text(stmt, SKIP_ONE, name);
-    int rc = sqlite3_step(stmt);
+    rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "delete_project");
         return CBM_STORE_ERR;
@@ -3849,24 +3900,6 @@ static int store_resolve_node_id(cbm_store_t *s, const char *project, const char
         *out_id = ids[0];
     }
     return CBM_STORE_OK;
-}
-
-static bool store_fts_unavailable(cbm_store_t *s, const char *table_name) {
-    const char *msg = (s && s->db) ? sqlite3_errmsg(s->db) : NULL;
-    if (!msg || !table_name || !table_name[0]) {
-        return false;
-    }
-    char needle[CBM_SZ_128];
-    int n = snprintf(needle, sizeof(needle), "no such table: %s", table_name);
-    return n >= 0 && (size_t)n < sizeof(needle) && strstr(msg, needle) != NULL;
-}
-
-static bool store_nodes_fts_unavailable(cbm_store_t *s) {
-    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS);
-}
-
-static bool store_overlay_nodes_fts_unavailable(cbm_store_t *s) {
-    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY);
 }
 
 int cbm_store_rebuild_nodes_fts(cbm_store_t *s) {

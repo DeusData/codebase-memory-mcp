@@ -206,6 +206,25 @@ static int store_count_overlay_fts_matches(cbm_store_t *s, const char *project,
     return count;
 }
 
+static int store_count_overlay_fts_raw_matches(cbm_store_t *s, const char *query) {
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_STORE_ERR;
+    sqlite3 *db = cbm_store_get_db(s);
+    const char *sql =
+        "SELECT COUNT(*) FROM " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        " WHERE " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY " MATCH ?1";
+    if (!db || sqlite3_prepare_v2(db, sql, STORE_TEST_SQLITE_AUTO_LEN, &stmt, NULL) !=
+                   SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_text(stmt, 1, query, STORE_TEST_SQLITE_AUTO_LEN, SQLITE_STATIC);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        count = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 static int store_count_metadata_owners(cbm_store_t *s, int edge, const char *project,
                                        const char *rel_path) {
     sqlite3_stmt *stmt = NULL;
@@ -1363,6 +1382,45 @@ TEST(store_overlay_file_delta_publish_rows_and_tombstone) {
                                              STORE_TEST_OVERLAY_ROW_CONTEXT),
               1);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_delete_project_clears_overlay_fts) {
+    enum { BASE_GENERATION = 3 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+
+    cbm_node_t nodes[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "needle_symbol",
+         .qualified_name = "test.needle_symbol",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+    };
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "main.go",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = nodes,
+                                    .node_count = 1};
+
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation), CBM_STORE_OK);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "needle"), 1);
+
+    ASSERT_EQ(cbm_store_delete_project(s, "test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "needle"), 0);
+
+    int count = -1;
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", NULL, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
     cbm_store_close(s);
     PASS();
 }
@@ -4789,6 +4847,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_generation_reservation_status_and_counts);
     RUN_TEST(store_overlay_generation_rejects_invalid_inputs);
     RUN_TEST(store_overlay_file_delta_publish_rows_and_tombstone);
+    RUN_TEST(store_delete_project_clears_overlay_fts);
     RUN_TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows);
     RUN_TEST(store_overlay_file_delta_publish_rejects_failed_generation);
     RUN_TEST(store_overlay_node_view_summary_counts_latest_ready_overlay);
