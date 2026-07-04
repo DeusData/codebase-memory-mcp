@@ -4191,6 +4191,41 @@ int cbm_store_compact_next_overlay_generation(cbm_store_t *s, const char *projec
     return CBM_STORE_OK;
 }
 
+int cbm_store_compact_ready_overlay_generations(cbm_store_t *s, const char *project,
+                                                int max_generations,
+                                                int *out_compacted) {
+    if (out_compacted) {
+        *out_compacted = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out_compacted ||
+        max_generations < CBM_STORE_COMPACT_ALL_GENERATIONS) {
+        if (s) {
+            store_set_error(s, "compact_ready_overlay_generations: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int compacted = 0;
+    while (max_generations == CBM_STORE_COMPACT_ALL_GENERATIONS ||
+           compacted < max_generations) {
+        int64_t overlay_generation = 0;
+        int64_t index_generation = 0;
+        int rc = cbm_store_compact_next_overlay_generation(s, project, &overlay_generation,
+                                                           &index_generation);
+        if (rc == CBM_STORE_NOT_FOUND) {
+            break;
+        }
+        if (rc != CBM_STORE_OK) {
+            *out_compacted = compacted;
+            return rc;
+        }
+        compacted++;
+    }
+
+    *out_compacted = compacted;
+    return CBM_STORE_OK;
+}
+
 static int store_resolve_node_id(cbm_store_t *s, const char *project, const char *qn,
                                  int64_t *out_id) {
     const char *qns[1] = {qn};
