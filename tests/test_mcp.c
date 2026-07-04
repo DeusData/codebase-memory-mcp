@@ -1465,7 +1465,62 @@ TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only) {
     ASSERT_NOT_NULL(strstr(inner, "QueryStillVisible"));
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "query_graph reads canonical graph rows"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
     ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_reports_ready_overlay_as_canonical_only) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "query-overlay-canonical-only";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-overlay-canonical-only"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "OldVisibleInCypher",
+                         .qualified_name = "query.overlay.OldVisibleInCypher",
+                         .file_path = "src/main.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &old_fn), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t new_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "FreshHiddenFromCypher",
+                         .qualified_name = "query.overlay.FreshHiddenFromCypher",
+                         .file_path = "src/main.c",
+                         .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &new_fn,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":149,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-canonical-only\","
+             "\"query\":\"MATCH (f:Function) RETURN f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "OldVisibleInCypher"));
+    ASSERT_NULL(strstr(inner, "FreshHiddenFromCypher"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "ready overlay rows are not included"));
 
     free(inner);
     free(resp);
@@ -2168,6 +2223,7 @@ TEST(tool_get_architecture_reports_dirty_metadata_as_canonical_only) {
     ASSERT_NOT_NULL(strstr(inner, "Run"));
     ASSERT_NOT_NULL(strstr(inner, "\"warnings\""));
     ASSERT_NOT_NULL(strstr(inner, "get_architecture reads canonical graph summaries"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
     ASSERT_TRUE(has_dirty_freshness_counts(inner, 1, 0));
 
     free(inner);
@@ -4498,6 +4554,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
     RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);
+    RUN_TEST(tool_query_graph_reports_ready_overlay_as_canonical_only);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);
