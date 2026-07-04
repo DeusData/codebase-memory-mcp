@@ -1335,8 +1335,10 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     /* Also detect route registration by callee name suffix alone (handles unresolved
      * local variables like app.include_router where QN resolution fails). */
+    bool suffix_only_route_reg = false;
     if (svc == CBM_SVC_NONE && cbm_service_pattern_route_method(call->callee_name) != NULL) {
         svc = CBM_SVC_ROUTE_REG;
+        suffix_only_route_reg = true;
     }
 
     /* Detect gRPC stub method calls by resolved QN.
@@ -1359,7 +1361,12 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);
             return;
         }
-        /* No path found — fall through to normal CALLS edge */
+        if (suffix_only_route_reg) {
+            return;
+        }
+        /* A resolved route-registration API with no route literal is still a
+         * normal call to that API. The suffix-only unresolved fallback has no
+         * real target and must not fabricate a source-to-source CALLS edge. */
     }
 
     bool has_url = (arg && arg[0] != '\0' && (arg[0] == '/' || strstr(arg, "://") != NULL));
