@@ -1673,9 +1673,27 @@ static bool cbm_mcp_auto_index_enabled(cbm_mcp_server_t *srv) {
 
 static bool cbm_mcp_incremental_metadata_enabled(cbm_mcp_server_t *srv) {
     const char *policy =
-        srv && srv->config ? cbm_config_get(srv->config, CBM_CONFIG_INCREMENTAL_REINDEX, "off")
-                           : "off";
-    return policy && strcmp(policy, "off") != 0;
+        srv && srv->config
+            ? cbm_config_get(srv->config, CBM_CONFIG_INCREMENTAL_REINDEX,
+                             CBM_CONFIG_INCREMENTAL_REINDEX_OFF)
+            : CBM_CONFIG_INCREMENTAL_REINDEX_OFF;
+    return policy && strcmp(policy, CBM_CONFIG_INCREMENTAL_REINDEX_OFF) != 0;
+}
+
+static bool cbm_mcp_overlay_compaction_after_publish(cbm_mcp_server_t *srv) {
+    const char *policy =
+        srv && srv->config
+            ? cbm_config_get(srv->config, CBM_CONFIG_OVERLAY_COMPACTION_POLICY,
+                             CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL)
+            : CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL;
+    return policy &&
+           strcmp(policy, CBM_CONFIG_OVERLAY_COMPACTION_POLICY_AFTER_PUBLISH) == 0;
+}
+
+static int cbm_mcp_overlay_compaction_max_generations(cbm_mcp_server_t *srv) {
+    return cbm_mcp_config_int_clamped(srv, CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS,
+                                      CBM_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS, 1,
+                                      CBM_SZ_256);
 }
 
 static int cbm_mcp_effective_auto_dep_limit(cbm_mcp_server_t *srv, const char *args_json) {
@@ -6432,6 +6450,24 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             }
             CBM_PROF_END("index_repository", "adr_check", prof_index_adr);
         }
+    }
+
+    if (rc == 0 && publish_kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY &&
+        cbm_mcp_overlay_compaction_after_publish(srv)) {
+        int compact_max = cbm_mcp_overlay_compaction_max_generations(srv);
+        bool started =
+            cbm_mcp_server_start_overlay_compaction(srv, project_name, compact_max);
+        yyjson_mut_obj_add_str(doc, root, "overlay_compaction_policy",
+                               CBM_CONFIG_OVERLAY_COMPACTION_POLICY_AFTER_PUBLISH);
+        yyjson_mut_obj_add_int(doc, root, "overlay_compaction_max_generations",
+                               compact_max);
+        yyjson_mut_obj_add_bool(doc, root, "overlay_compaction_started", started);
+        const char *compact_status =
+            started ? "started"
+                    : (cbm_mcp_server_overlay_compaction_active(srv) ? "already_running"
+                                                                      : "not_started");
+        yyjson_mut_obj_add_str(doc, root, "overlay_compaction_status",
+                               compact_status);
     }
 
     yyjson_mut_obj_add_str(doc, root, "status", rc == 0 ? "indexed" : "error");

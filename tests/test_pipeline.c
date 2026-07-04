@@ -12169,6 +12169,24 @@ TEST(config_registry_includes_overlay_publish_policy) {
     PASS();
 }
 
+TEST(config_registry_includes_overlay_compaction_policy) {
+    const cbm_config_entry_t *policy =
+        find_config_entry(CBM_CONFIG_OVERLAY_COMPACTION_POLICY);
+    ASSERT_NOT_NULL(policy);
+    ASSERT_STR_EQ(policy->default_val, CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL);
+    ASSERT_STR_EQ(policy->category, "Indexing");
+    ASSERT_STR_EQ(policy->range, "manual|after_publish");
+
+    const cbm_config_entry_t *max_generations =
+        find_config_entry(CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS);
+    ASSERT_NOT_NULL(max_generations);
+    ASSERT_STR_EQ(max_generations->default_val,
+                  CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS);
+    ASSERT_STR_EQ(max_generations->category, "Indexing");
+    ASSERT_STR_EQ(max_generations->range, "1-256");
+    PASS();
+}
+
 TEST(config_registry_includes_incremental_exact_frontier_caps) {
     const cbm_config_entry_t *changed =
         find_config_entry(CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS);
@@ -12858,6 +12876,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(config_registry_includes_overlay_publish_policy);
+    RUN_TEST(config_registry_includes_overlay_compaction_policy);
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
