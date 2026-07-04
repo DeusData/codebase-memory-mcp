@@ -13320,6 +13320,38 @@ TEST(pipeline_complexity_scoped_writeback_keeps_unchanged_nodes) {
     PASS();
 }
 
+TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("cx-scope-rec", "/tmp/cx-scope-rec");
+    ASSERT_NOT_NULL(gb);
+
+    const char *props =
+        "{\"loop_depth\":1,\"transitive_loop_depth\":3,\"self_recursive\":false,"
+        "\"recursive\":true}";
+    int64_t changed =
+        cbm_gbuf_upsert_node(gb, "Function", "changed", "cx.changed", "changed.go", 1, 4,
+                             props);
+    ASSERT_GT(changed, 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "cx-scope-rec",
+        .repo_path = "/tmp/cx-scope-rec",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    const char *scope[] = {"changed.go"};
+    cbm_pipeline_pass_complexity_for_paths(&ctx, scope, (int)(sizeof(scope) / sizeof(scope[0])));
+
+    const cbm_gbuf_node_t *changed_node = cbm_gbuf_find_by_qn(gb, "cx.changed");
+    ASSERT_NOT_NULL(changed_node);
+    ASSERT_NOT_NULL(changed_node->properties_json);
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"transitive_loop_depth\":3"));
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"recursive\":true"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* Regression for #334: the plausibility gate compares committed (extracted)
  * node count against persisted rows. committed_nodes must be captured BEFORE
  * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
@@ -13485,6 +13517,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
     RUN_TEST(pipeline_complexity_scc_tld_is_deterministic);
     RUN_TEST(pipeline_complexity_scoped_writeback_keeps_unchanged_nodes);
+    RUN_TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
