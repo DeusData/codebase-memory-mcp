@@ -1288,6 +1288,91 @@ TEST(store_overlay_generation_rejects_invalid_inputs) {
     PASS();
 }
 
+TEST(store_claim_ready_overlay_generation_claims_oldest_once) {
+    enum { BASE_GENERATION = 9 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t first = 0;
+    int64_t second = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &first),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION + 1,
+                                                   &second),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", first,
+                                                      CBM_STORE_OVERLAY_STATUS_READY),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", second,
+                                                      CBM_STORE_OVERLAY_STATUS_READY),
+              CBM_STORE_OK);
+
+    int64_t claimed = 0;
+    int64_t base = 0;
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, &base),
+              CBM_STORE_OK);
+    ASSERT_EQ(claimed, first);
+    ASSERT_EQ(base, BASE_GENERATION);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", first, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_COMPACTING),
+              1);
+
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, &base),
+              CBM_STORE_OK);
+    ASSERT_EQ(claimed, second);
+    ASSERT_EQ(base, BASE_GENERATION + 1);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", second, BASE_GENERATION + 1,
+                                                 CBM_STORE_OVERLAY_STATUS_COMPACTING),
+              1);
+
+    claimed = -1;
+    base = -1;
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, &base),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(claimed, 0);
+    ASSERT_EQ(base, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_claim_ready_overlay_generation_ignores_nonready_and_validates_outputs) {
+    enum { BASE_GENERATION = 3, SENTINEL = 42 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t reserved = 0;
+    int64_t failed = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &reserved),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &failed),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_overlay_generation_status(s, "test", failed,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED),
+              CBM_STORE_OK);
+
+    int64_t claimed = SENTINEL;
+    int64_t base = SENTINEL;
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, &base),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(claimed, 0);
+    ASSERT_EQ(base, 0);
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", NULL, &base),
+              CBM_STORE_ERR);
+    ASSERT_EQ(base, 0);
+    claimed = SENTINEL;
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed, NULL),
+              CBM_STORE_ERR);
+    ASSERT_EQ(claimed, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_overlay_file_delta_publish_rows_and_tombstone) {
     enum { BASE_GENERATION = 3 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -1874,6 +1959,13 @@ TEST(store_compact_overlay_generation_promotes_metadata_and_cleans_overlay) {
     ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
               CBM_STORE_OK);
     ASSERT_EQ(generation, COMPACT_GENERATION);
+    int64_t claimed_overlay = 0;
+    int64_t claimed_base = 0;
+    ASSERT_EQ(cbm_store_claim_ready_overlay_generation(s, "test", &claimed_overlay,
+                                                       &claimed_base),
+              CBM_STORE_OK);
+    ASSERT_EQ(claimed_overlay, overlay_generation);
+    ASSERT_EQ(claimed_base, BASE_GENERATION);
     ASSERT_EQ(cbm_store_compact_overlay_generation(s, "test", overlay_generation, generation),
               CBM_STORE_OK);
 
@@ -5251,6 +5343,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_index_generation_finish_failed_and_invalid_status);
     RUN_TEST(store_overlay_generation_reservation_status_and_counts);
     RUN_TEST(store_overlay_generation_rejects_invalid_inputs);
+    RUN_TEST(store_claim_ready_overlay_generation_claims_oldest_once);
+    RUN_TEST(store_claim_ready_overlay_generation_ignores_nonready_and_validates_outputs);
     RUN_TEST(store_overlay_file_delta_publish_rows_and_tombstone);
     RUN_TEST(store_delete_project_clears_overlay_fts);
     RUN_TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows);
