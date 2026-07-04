@@ -4592,12 +4592,12 @@ static bool cypher_is_degree_prop(const char *prop) {
     return prop && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0);
 }
 
-static bool cypher_where_requires_canonical_edges(const cbm_where_clause_t *where) {
+static bool cypher_where_requires_canonical_identity(const cbm_where_clause_t *where) {
     (void)where;
     return false;
 }
 
-static bool cypher_return_requires_canonical_edges(const cbm_return_clause_t *ret) {
+static bool cypher_return_requires_canonical_identity(const cbm_return_clause_t *ret) {
     if (!ret) {
         return false;
     }
@@ -4606,6 +4606,8 @@ static bool cypher_return_requires_canonical_edges(const cbm_return_clause_t *re
         return false;
     }
     for (int i = 0; i < ret->count; i++) {
+        /* Overlay rows do not have stable canonical node/edge ids until
+         * compaction, so id() keeps the query on the canonical read model. */
         if (ret->items[i].func && strcmp(ret->items[i].func, "id") == 0) {
             return true;
         }
@@ -4638,10 +4640,10 @@ static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
                 return false;
             }
         }
-        if (cypher_where_requires_canonical_edges(cur->where) ||
-            cypher_where_requires_canonical_edges(cur->post_with_where) ||
-            cypher_return_requires_canonical_edges(cur->with_clause) ||
-            cypher_return_requires_canonical_edges(cur->ret)) {
+        if (cypher_where_requires_canonical_identity(cur->where) ||
+            cypher_where_requires_canonical_identity(cur->post_with_where) ||
+            cypher_return_requires_canonical_identity(cur->with_clause) ||
+            cypher_return_requires_canonical_identity(cur->ret)) {
             return false;
         }
     }
