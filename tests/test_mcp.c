@@ -2667,7 +2667,7 @@ TEST(tool_get_architecture_uses_overlay_active_file_summaries) {
     PASS();
 }
 
-TEST(resource_architecture_reports_ready_overlay_canonical_only) {
+TEST(resource_architecture_uses_ready_overlay_summaries) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -2681,23 +2681,47 @@ TEST(resource_architecture_reports_ready_overlay_canonical_only) {
                          .label = "Function",
                          .name = "OldResourceArch",
                          .qualified_name = "resource.arch.OldResourceArch",
-                         .file_path = "src/main.c"};
+                         .file_path = "src/main.c",
+                         .properties_json = "{\"is_entry_point\":true}"};
     ASSERT_GT(cbm_store_upsert_node(st, &old_fn), 0);
+    cbm_node_t old_route = {.project = proj,
+                            .label = "Route",
+                            .name = "/old-resource-route",
+                            .qualified_name = "resource.arch.old_route",
+                            .file_path = "src/main.c",
+                            .properties_json =
+                                "{\"method\":\"GET\",\"path\":\"/old-resource-route\"}"};
+    ASSERT_GT(cbm_store_upsert_node(st, &old_route), 0);
 
     int64_t overlay_generation = 0;
     ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
               CBM_STORE_OK);
-    cbm_node_t fresh_fn = {.project = proj,
-                           .label = "Function",
-                           .name = "FreshResourceArch",
-                           .qualified_name = "resource.arch.FreshResourceArch",
-                           .file_path = "src/main.c",
-                           .properties_json = "{}"};
+    cbm_node_t fresh_nodes[] = {
+        {.project = proj,
+         .label = "Function",
+         .name = "FreshResourceArch",
+         .qualified_name = "resource.arch.FreshResourceArch",
+         .file_path = "src/main.c",
+         .properties_json = "{\"is_entry_point\":true}"},
+        {.project = proj,
+         .label = "Route",
+         .name = "/fresh-resource-route",
+         .qualified_name = "resource.arch.fresh_route",
+         .file_path = "src/main.c",
+         .properties_json = "{\"method\":\"POST\",\"path\":\"/fresh-resource-route\"}"},
+        {.project = proj,
+         .label = "File",
+         .name = "src/main.c",
+         .qualified_name = "resource.arch.src.main",
+         .file_path = "src/main.c",
+         .properties_json = "{}"},
+    };
     cbm_store_file_delta_t delta = {.project = proj,
                                     .rel_path = "src/main.c",
                                     .generation = 1,
-                                    .nodes = &fresh_fn,
-                                    .node_count = 1};
+                                    .nodes = fresh_nodes,
+                                    .node_count =
+                                        (int)(sizeof(fresh_nodes) / sizeof(fresh_nodes[0]))};
     ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
               CBM_STORE_OK);
 
@@ -2706,10 +2730,17 @@ TEST(resource_architecture_reports_ready_overlay_canonical_only) {
              "\"params\":{\"uri\":\"codebase://architecture\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"contents\""));
-    ASSERT_NOT_NULL(strstr(resp, "codebase://architecture reads canonical graph summaries"));
-    ASSERT_NOT_NULL(strstr(resp, "ready overlay rows are not included"));
-    ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"canonical_only\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "FreshResourceArch"));
+    ASSERT_NULL(strstr(resp, "OldResourceArch"));
+    ASSERT_NOT_NULL(strstr(resp, "/fresh-resource-route"));
+    ASSERT_NULL(strstr(resp, "/old-resource-route"));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"languages\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"entry_points\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"routes\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"mixed_active_nodes_canonical_summaries\\\""));
+    ASSERT_NOT_NULL(strstr(resp, "\\\"active_sections\\\":[\\\"languages\\\",\\\"entry_points\\\",\\\"routes\\\"]"));
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "total_nodes, total_edges, key_functions, and relationship_patterns"));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -5118,7 +5149,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_uses_overlay_active_entry_points);
     RUN_TEST(tool_get_architecture_uses_overlay_active_routes);
     RUN_TEST(tool_get_architecture_uses_overlay_active_file_summaries);
-    RUN_TEST(resource_architecture_reports_ready_overlay_canonical_only);
+    RUN_TEST(resource_architecture_uses_ready_overlay_summaries);
     RUN_TEST(resource_schema_uses_ready_overlay_counts);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
