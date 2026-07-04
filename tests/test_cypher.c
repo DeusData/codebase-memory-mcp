@@ -603,6 +603,53 @@ TEST(cypher_func_id) {
     PASS();
 }
 
+TEST(cypher_active_overlay_id_query_uses_canonical_identity) {
+    cbm_store_t *s = setup_cypher_store();
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_fn = {.project = "test",
+                           .label = "Function",
+                           .name = "FreshIdSource",
+                           .qualified_name = "test.FreshIdSource",
+                           .file_path = "handler.go"};
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "handler.go",
+                                    .generation = 1,
+                                    .nodes = &fresh_fn,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    cbm_cypher_result_t active = {0};
+    bool used_active = false;
+    int rc = cbm_cypher_execute_active_nodes(
+        s, "MATCH (f:Function) WHERE f.name = \"FreshIdSource\" RETURN f.name", "test", 0,
+        &active, &used_active);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(used_active);
+    ASSERT_EQ(active.row_count, 1);
+    ASSERT_STR_EQ(active.rows[0][0], "FreshIdSource");
+    cbm_cypher_result_free(&active);
+
+    cbm_cypher_result_t id_result = {0};
+    used_active = true;
+    rc = cbm_cypher_execute_active_nodes(
+        s, "MATCH (f:Function) RETURN id(f), f.name LIMIT 10", "test", 0, &id_result,
+        &used_active);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(!used_active);
+    ASSERT_EQ(id_result.row_count, 4);
+    for (int i = 0; i < id_result.row_count; i++) {
+        ASSERT_STR_NEQ(id_result.rows[i][1], "FreshIdSource");
+    }
+    cbm_cypher_result_free(&id_result);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_func_keys) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2627,6 +2674,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_func_labels);
     RUN_TEST(cypher_func_type);
     RUN_TEST(cypher_func_id);
+    RUN_TEST(cypher_active_overlay_id_query_uses_canonical_identity);
     RUN_TEST(cypher_func_keys);
     RUN_TEST(cypher_func_properties);
     RUN_TEST(cypher_func_tointeger_tofloat);
