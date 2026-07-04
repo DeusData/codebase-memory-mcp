@@ -362,6 +362,35 @@ static void add_overlay_active_query_freshness(
         "are suppressed.");
 }
 
+static void add_overlay_active_cypher_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    if (!summary || summary->active_file_tombstones <= 0) {
+        return;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary->overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary->active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary->canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary->overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
+                           summary->total_nodes_visible);
+    add_response_warning(
+        doc, root,
+        "query_graph used active overlay node rows for this node-only Cypher query; "
+        "relationship, EXISTS, and degree-derived Cypher queries remain canonical until "
+        "active Cypher relationship views are available.");
+}
+
 static void add_overlay_active_search_code_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary) {
@@ -4523,8 +4552,17 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
+    cbm_store_overlay_node_view_summary_t overlay_summary = {0};
+    bool overlay_ready =
+        project && cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
+                       CBM_STORE_OK &&
+        overlay_summary.active_file_tombstones > 0;
+    bool used_active_cypher_nodes = false;
     cbm_cypher_result_t result = {0};
-    int rc = cbm_cypher_execute(store, query, project, max_rows, &result);
+    int rc = overlay_ready ? cbm_cypher_execute_active_nodes(store, query, project, max_rows,
+                                                             &result,
+                                                             &used_active_cypher_nodes)
+                           : cbm_cypher_execute(store, query, project, max_rows, &result);
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
@@ -4539,19 +4577,31 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     add_query_graph_derived_warnings(doc, root, store, project, query, &result);
-    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
-        doc, root, store, project,
-        "query_graph reads canonical Cypher rows; ready overlay rows are not included until "
-        "active Cypher views or compaction are available.");
+    bool overlay_limitation_reported = false;
+    if (used_active_cypher_nodes) {
+        add_overlay_active_cypher_freshness(doc, root, &overlay_summary);
+    } else {
+        overlay_limitation_reported = add_canonical_only_overlay_freshness(
+            doc, root, store, project,
+            "query_graph reads canonical Cypher rows for this query shape; ready overlay rows are "
+            "included only for node-only Cypher queries until active relationship views or "
+            "compaction are available.");
+    }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_canonical_only_read_model(doc, root);
-        if (!overlay_limitation_reported) {
+        if (!used_active_cypher_nodes) {
+            add_canonical_only_read_model(doc, root);
+        }
+        if (!used_active_cypher_nodes && !overlay_limitation_reported) {
             add_response_warning(doc, root,
                                  "query_graph reads canonical graph rows; dirty file changes may "
                                  "be absent until overlay or reindex completes.");
+        } else if (used_active_cypher_nodes && dirty_pending > 0) {
+            add_response_warning(doc, root,
+                                 "query_graph used ready overlay node rows, but pending dirty "
+                                 "files may still be absent until overlay or reindex completes.");
         }
     } else if (overlay_limitation_reported) {
         add_canonical_only_read_model(doc, root);

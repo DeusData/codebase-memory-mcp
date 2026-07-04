@@ -1474,7 +1474,7 @@ TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only) {
     PASS();
 }
 
-TEST(tool_query_graph_reports_ready_overlay_as_canonical_only) {
+TEST(tool_query_graph_uses_ready_overlay_for_node_only_query) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -1516,11 +1516,77 @@ TEST(tool_query_graph_reports_ready_overlay_as_canonical_only) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "OldVisibleInCypher"));
-    ASSERT_NULL(strstr(inner, "FreshHiddenFromCypher"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
+    ASSERT_NULL(strstr(inner, "OldVisibleInCypher"));
+    ASSERT_NOT_NULL(strstr(inner, "FreshHiddenFromCypher"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
     ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":1"));
-    ASSERT_NOT_NULL(strstr(inner, "ready overlay rows are not included"));
+    ASSERT_NOT_NULL(strstr(inner, "node-only Cypher query"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "query-overlay-rel-canonical";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-overlay-rel-canonical"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_src = {.project = proj,
+                          .label = "Function",
+                          .name = "OldSource",
+                          .qualified_name = "query.overlay.OldSource",
+                          .file_path = "src/main.c"};
+    cbm_node_t old_dst = {.project = proj,
+                          .label = "Function",
+                          .name = "OldTarget",
+                          .qualified_name = "query.overlay.OldTarget",
+                          .file_path = "src/target.c"};
+    int64_t old_src_id = cbm_store_upsert_node(st, &old_src);
+    int64_t old_dst_id = cbm_store_upsert_node(st, &old_dst);
+    ASSERT_GT(old_src_id, 0);
+    ASSERT_GT(old_dst_id, 0);
+    cbm_edge_t old_edge = {.project = proj,
+                           .source_id = old_src_id,
+                           .target_id = old_dst_id,
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &old_edge), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t new_src = {.project = proj,
+                          .label = "Function",
+                          .name = "FreshSource",
+                          .qualified_name = "query.overlay.FreshSource",
+                          .file_path = "src/main.c",
+                          .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &new_src,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":150,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-rel-canonical\","
+             "\"query\":\"MATCH (f:Function)-[:CALLS]->(g:Function) RETURN f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "OldSource"));
+    ASSERT_NULL(strstr(inner, "FreshSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
+    ASSERT_NOT_NULL(strstr(inner, "node-only Cypher queries"));
 
     free(inner);
     free(resp);
@@ -4726,7 +4792,8 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
     RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);
-    RUN_TEST(tool_query_graph_reports_ready_overlay_as_canonical_only);
+    RUN_TEST(tool_query_graph_uses_ready_overlay_for_node_only_query);
+    RUN_TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);

@@ -457,6 +457,10 @@ int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_
 /* Find nodes by label. */
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count);
+/* Active overlay node read view for project + optional label.
+ * label == NULL returns all active nodes for the project. */
+int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *project,
+                                               const char *label, cbm_node_t **out, int *count);
 
 /* Visit lightweight node identity rows for a label without allocating full
  * cbm_node_t values. Callback strings are borrowed until the next callback. */

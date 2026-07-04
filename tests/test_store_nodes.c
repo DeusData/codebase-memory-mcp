@@ -1813,6 +1813,24 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     ASSERT_EQ(active_name_count, 0);
     cbm_store_free_nodes(active_names, active_name_count);
 
+    cbm_node_t *active_functions = NULL;
+    int active_function_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label_overlay_view(live, "test", "Function",
+                                                         &active_functions,
+                                                         &active_function_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_function_count, 2);
+    ASSERT_STR_EQ(active_functions[0].name, "new_main");
+    ASSERT_STR_EQ(active_functions[1].name, "stable");
+    cbm_store_free_nodes(active_functions, active_function_count);
+    active_functions = NULL;
+    active_function_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label_overlay_view(live, "test", NULL, &active_functions,
+                                                         &active_function_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(active_function_count, 2);
+    cbm_store_free_nodes(active_functions, active_function_count);
+
     const char *edge_types[] = {"CALLS"};
     cbm_traverse_result_t active_trace = {0};
     ASSERT_EQ(cbm_store_bfs_overlay_view(live, "test", "test.new_main", "outbound",
