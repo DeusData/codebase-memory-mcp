@@ -198,7 +198,9 @@ void cbm_pipeline_unlock(void);
 /* ── FQN helpers (used by passes and external callers) ──────────── */
 
 /* Compute a qualified name: project.dir.parts.name
- * Strips extension, converts / to ., drops __init__ and index.
+ * Strips extension, converts / to ., drops __init__ and index for symbols.
+ * File-node QNs (`name == "__file__"`) keep the filename extension so same-stem
+ * source/header/template files remain distinct graph nodes.
  * Caller must free() the returned string. */
 char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name);
 

@@ -221,6 +221,16 @@ TEST(fqn_compute_spec_ext) {
     PASS();
 }
 
+TEST(fqn_compute_file_nodes_keep_extension_identity) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/ui/http_server.c", "__file__"),
+               "proj.src.ui.http_server.c.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "src/ui/http_server.h", "__file__"),
+               "proj.src.ui.http_server.h.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "pkg/__init__.py", "__file__"),
+               "proj.pkg.__init__.py.__file__");
+    PASS();
+}
+
 /* ── Leading / trailing slashes ───────────────────────────────── */
 
 TEST(fqn_compute_leading_slash) {
@@ -531,6 +541,7 @@ SUITE(fqn) {
     /* fqn_compute: multiple extensions */
     RUN_TEST(fqn_compute_double_ext);
     RUN_TEST(fqn_compute_spec_ext);
+    RUN_TEST(fqn_compute_file_nodes_keep_extension_identity);
 
     /* fqn_compute: leading / trailing slashes */
     RUN_TEST(fqn_compute_leading_slash);

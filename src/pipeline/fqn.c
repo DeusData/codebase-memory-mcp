@@ -17,6 +17,7 @@
 /* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
 #define FQN_MAX_PATH_SEGS 254
 #define FQN_MAX_DIR_SEGS 255
+#define FQN_FILE_NODE_NAME "__file__"
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
@@ -104,14 +105,19 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 
     char *path = strdup(rel_path ? rel_path : "");
     cbm_normalize_path_sep(path);
-    strip_file_extension(path);
+    bool is_file_node = name && strcmp(name, FQN_FILE_NODE_NAME) == 0;
+    if (!is_file_node) {
+        strip_file_extension(path);
+    }
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
     segments[seg_count++] = project;
     seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
 
-    strip_init_or_index(segments, &seg_count, name);
+    if (!is_file_node) {
+        strip_init_or_index(segments, &seg_count, name);
+    }
 
     if (name && name[0] != '\0') {
         segments[seg_count++] = name;
