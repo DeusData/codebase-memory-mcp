@@ -834,6 +834,7 @@ TEST(cli_remove_old_monolithic_skill) {
 
 TEST(cli_skill_files_content) {
     /* Consolidated skill: all 4 former skills merged into one. */
+    cbm_set_cli_skill_mode(false);
     const cbm_skill_t *sk = cbm_get_skills();
     ASSERT_EQ(CBM_SKILL_COUNT, 1);
     ASSERT(strcmp(sk[0].name, "codebase-memory") == 0);
@@ -859,6 +860,19 @@ TEST(cli_skill_files_content) {
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
 
+    PASS();
+}
+
+TEST(cli_skill_mode_cli_content) {
+    cbm_set_cli_skill_mode(true);
+    const cbm_skill_t *sk = cbm_get_skills();
+    ASSERT_EQ(CBM_SKILL_COUNT, 1);
+    ASSERT(strcmp(sk[0].name, "codebase-memory") == 0);
+    ASSERT(strstr(sk[0].content, "codebase-memory-mcp cli <tool>") != NULL);
+    ASSERT(strstr(sk[0].content, "CLI first and only") != NULL);
+    ASSERT(strstr(sk[0].content, "14 MCP Tools") == NULL);
+
+    cbm_set_cli_skill_mode(false);
     PASS();
 }
 
@@ -9728,7 +9742,7 @@ SUITE(cli) {
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
 
-    /* Skill management (7 tests — install_test.go) */
+    /* Skill management (8 tests — install_test.go) */
     RUN_TEST(cli_skill_creation);
     RUN_TEST(cli_skill_idempotent);
     RUN_TEST(cli_skill_force_overwrite);
@@ -9739,6 +9753,7 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_removes_skills);
     RUN_TEST(cli_remove_old_monolithic_skill);
     RUN_TEST(cli_skill_files_content);
+    RUN_TEST(cli_skill_mode_cli_content);
     RUN_TEST(cli_codex_instructions);
 
     /* Editor MCP: Cursor/Windsurf/Gemini (5 tests — install_test.go) */

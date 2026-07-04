@@ -5036,6 +5036,33 @@ TEST(mcp_server_run_rapid_messages) {
     fclose(in_fp);
     PASS();
 }
+
+TEST(mcp_server_run_idle_timeout_exits_without_eof) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(3);
+    int rc = cbm_mcp_server_run_with_idle_timeout(srv, in_fp, out_fp, 1);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+
+    ASSERT_EQ(rc, 0);
+
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    close(fds[1]);
+    PASS();
+}
 #endif /* !_WIN32 */
 
 /* Issue #235: passing an unrecognised project name to a tool crashed the
@@ -7109,6 +7136,7 @@ SUITE(mcp) {
     /* Poll/getline FILE* buffering fix */
 #ifndef _WIN32
     RUN_TEST(mcp_server_run_rapid_messages);
+    RUN_TEST(mcp_server_run_idle_timeout_exits_without_eof);
 #endif
 
     /* Snippet resolution (port of snippet_test.go) */

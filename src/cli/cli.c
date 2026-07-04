@@ -489,7 +489,7 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 /* Consolidated from 4 separate skills into 1 with progressive disclosure.
  * This embedded version is the single source of truth for the CLI installer.
  * Based on PR #81 by @gdilla — factual corrections applied. */
-static const char skill_content[] =
+static const char mcp_skill_content[] =
     "---\n"
     "name: codebase-memory\n"
     "description: Use the codebase knowledge graph for structural code queries. "
@@ -598,6 +598,66 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
 
+static const char cli_skill_content[] =
+    "---\n"
+    "name: codebase-memory\n"
+    "description: Use the codebase-memory-mcp binary through bash CLI commands for "
+    "codebase exploration, architecture, tracing, quality, and graph queries. CLI mode is "
+    "the only mechanism for this skill; do not use MCP tools unless the user explicitly asks.\n"
+    "---\n"
+    "\n"
+    "# Codebase Memory — CLI Skill\n"
+    "\n"
+    "Use `codebase-memory-mcp` as a normal executable. Do not rely on a permanent MCP "
+    "connection. Run each request through bash:\n"
+    "\n"
+    "```bash\n"
+    "codebase-memory-mcp cli <tool> '<json arguments>'\n"
+    "```\n"
+    "\n"
+    "## First checks\n"
+    "```bash\n"
+    "command -v codebase-memory-mcp\n"
+    "codebase-memory-mcp --version\n"
+    "codebase-memory-mcp cli list_projects '{}'\n"
+    "```\n"
+    "\n"
+    "If binary is missing, install binary-only, not MCP config:\n"
+    "```bash\n"
+    "curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --skip-config\n"
+    "```\n"
+    "\n"
+    "## Project workflow\n"
+    "1. `list_projects` through CLI.\n"
+    "2. If current repo is absent, run `index_repository`.\n"
+    "3. Use `search_graph` before reading files.\n"
+    "4. Use `get_code_snippet` for exact source after finding `qualified_name`.\n"
+    "\n"
+    "Safe JSON pattern:\n"
+    "```bash\n"
+    "project=PROJECT\n"
+    "json=$(jq -nc --arg project \"$project\" --arg q \"auth handler\" '{project:$project,query:$q,limit:20}')\n"
+    "codebase-memory-mcp cli search_graph \"$json\"\n"
+    "```\n"
+    "\n"
+    "## Common commands\n"
+    "```bash\n"
+    "codebase-memory-mcp cli index_repository '{\"repo_path\":\"/path/to/repo\",\"name\":\"my-project\",\"mode\":\"moderate\"}'\n"
+    "codebase-memory-mcp cli search_graph '{\"project\":\"PROJECT\",\"query\":\"update settings\",\"limit\":20}'\n"
+    "codebase-memory-mcp cli search_graph '{\"project\":\"PROJECT\",\"label\":\"Route\",\"limit\":100}'\n"
+    "codebase-memory-mcp cli get_code_snippet '{\"project\":\"PROJECT\",\"qualified_name\":\"pkg/orders.ProcessOrder\",\"include_neighbors\":true}'\n"
+    "codebase-memory-mcp cli trace_path '{\"project\":\"PROJECT\",\"function_name\":\"ProcessOrder\",\"direction\":\"both\",\"depth\":3}'\n"
+    "codebase-memory-mcp cli get_architecture '{\"project\":\"PROJECT\",\"aspects\":[\"packages\",\"dependencies\",\"clusters\"]}'\n"
+    "codebase-memory-mcp cli query_graph '{\"project\":\"PROJECT\",\"query\":\"MATCH (f:Function) RETURN f.qualified_name LIMIT 20\",\"max_rows\":20}'\n"
+    "```\n"
+    "\n"
+    "## Rules\n"
+    "- CLI first and only for this skill.\n"
+    "- Use `jq` for JSON creation and summarizing large outputs.\n"
+    "- Save large raw outputs to `/tmp/cbm-*.json`.\n"
+    "- Fall back to file search only for non-indexed files or exact literals missing from graph.\n"
+    "- Ask before `delete_project`, `uninstall`, or global config mutation.\n";
+
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
     "\n"
@@ -621,9 +681,16 @@ static const char *old_skill_names[] = {
 };
 enum { OLD_SKILL_COUNT = 4 };
 
-static const cbm_skill_t skills[CBM_SKILL_COUNT] = {
-    {"codebase-memory", skill_content},
+static bool g_cli_skill_mode = false;
+
+static cbm_skill_t skills[CBM_SKILL_COUNT] = {
+    {"codebase-memory", mcp_skill_content},
 };
+
+void cbm_set_cli_skill_mode(bool enabled) {
+    g_cli_skill_mode = enabled;
+    skills[0].content = enabled ? cli_skill_content : mcp_skill_content;
+}
 
 const cbm_skill_t *cbm_get_skills(void) {
     return skills;
@@ -5650,6 +5717,9 @@ static void install_claude_code_config(const char *home, const char *binary_path
                 .dialect = CBM_GRAPH_DIALECT_CLAUDE,
             },
             dry_run);
+        if (g_cli_skill_mode) {
+            return;
+        }
         snprintf(p, sizeof(p), "%s/.claude.json", user_root);
         plan_record("Claude Code", "mcp_config", p);
         snprintf(p, sizeof(p), "%s/settings.json", config_dir);
@@ -5679,6 +5749,11 @@ static void install_claude_code_config(const char *home, const char *binary_path
 
     if (cbm_remove_old_monolithic_skill(skills_dir, dry_run)) {
         printf("  removed old monolithic skill\n");
+    }
+
+    if (g_cli_skill_mode) {
+        printf("  skill-mode: cli (MCP configs/hooks skipped)\n");
+        return;
     }
 
     /* ~/.claude/.mcp.json is not a documented Claude Code MCP location.
@@ -7317,6 +7392,12 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
     if (agents.claude_code) {
         install_claude_code_config(home, binary_path, force, dry_run);
     }
+    if (g_cli_skill_mode) {
+        if (!agents.claude_code && !g_install_plan) {
+            printf("skill-mode: cli requested, but no Claude Code skills directory was detected.\n");
+        }
+        return;
+    }
     install_cli_agent_configs(&agents, home, binary_path, force, dry_run);
     install_editor_agent_configs(&agents, home, binary_path, force, dry_run);
     install_additional_agent_configs(&agents, home, binary_path, force, dry_run);
@@ -7481,6 +7562,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "type", "agent.install.plan.v1");
+    yyjson_mut_obj_add_str(doc, root, "skill_mode", g_cli_skill_mode ? "cli" : "mcp");
 
     yyjson_mut_val *agents = yyjson_mut_arr(doc);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -7534,7 +7616,9 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
-    yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
+    yyjson_mut_obj_add_str(doc, root, "next_safe_command",
+                           g_cli_skill_mode ? "codebase-memory-mcp install -y --skill-mode=cli"
+                                            : "codebase-memory-mcp install -y --skill-mode=mcp");
 
     char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL);
     yyjson_mut_doc_free(doc);
@@ -7548,6 +7632,7 @@ int cbm_cmd_install(int argc, char **argv) {
     bool force = false;
     bool plan = false;
     bool reset_indexes = false;
+    bool cli_skill_mode = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -7563,7 +7648,14 @@ int cbm_cmd_install(int argc, char **argv) {
         if (strcmp(argv[i], "--reset-indexes") == 0) {
             reset_indexes = true;
         }
+        if (strcmp(argv[i], "--skill-mode=cli") == 0 || strcmp(argv[i], "--cli-skill") == 0) {
+            cli_skill_mode = true;
+        }
+        if (strcmp(argv[i], "--skill-mode=mcp") == 0) {
+            cli_skill_mode = false;
+        }
     }
+    cbm_set_cli_skill_mode(cli_skill_mode);
 
     const char *home = cbm_get_home_dir();
     if (!home) {
@@ -7587,7 +7679,8 @@ int cbm_cmd_install(int argc, char **argv) {
         return 0;
     }
 
-    printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
+    printf("codebase-memory-mcp install %s\n", CBM_VERSION);
+    printf("skill-mode: %s\n\n", cli_skill_mode ? "cli" : "mcp");
 
     /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
      * the old prompt-and-delete behaviour. The helper returns 0 only when the

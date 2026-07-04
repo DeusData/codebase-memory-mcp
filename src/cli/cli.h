@@ -87,6 +87,9 @@ typedef struct {
 /* Get the array of skill definitions. */
 const cbm_skill_t *cbm_get_skills(void);
 
+/* Select installed skill content. false = MCP tool skill (default), true = CLI-only skill. */
+void cbm_set_cli_skill_mode(bool enabled);
+
 /* Install skills to skills_dir (e.g. ~/.claude/skills/).
  * If force is true, overwrite existing skills.
  * Returns count of skills written. */

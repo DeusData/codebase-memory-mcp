@@ -9781,7 +9781,7 @@ static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *o
 #ifndef _WIN32
 /* Unix 3-phase poll: non-blocking fd check, FILE* buffer peek, blocking poll.
  * Returns: 1 = data ready, 0 = timeout (evicted idle stores), -1 = error/EOF. */
-static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
+static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in, int timeout_s) {
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
     int pr = poll(&pfd, SKIP_ONE, 0); /* Phase 1: non-blocking */
 
@@ -9802,7 +9802,7 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
             return CBM_NOT_FOUND;
         }
         if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            cbm_mcp_server_evict_idle(srv, timeout_s);
             return 0;
         }
         return SKIP_ONE;
@@ -9830,7 +9830,7 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
             return CBM_NOT_FOUND;
         }
         if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            cbm_mcp_server_evict_idle(srv, timeout_s);
             return 0;
         }
         return SKIP_ONE;
@@ -9844,9 +9844,15 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
 /* ── Event loop ───────────────────────────────────────────────── */
 
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
+    return cbm_mcp_server_run_with_idle_timeout(srv, in, out, 0);
+}
+
+int cbm_mcp_server_run_with_idle_timeout(cbm_mcp_server_t *srv, FILE *in, FILE *out,
+                                         int idle_timeout_s) {
     char *line = NULL;
     size_t cap = 0;
     int fd = cbm_fileno(in);
+    int poll_timeout_s = idle_timeout_s > 0 ? idle_timeout_s : STORE_IDLE_TIMEOUT_S;
 
     for (;;) {
         /* Poll with idle timeout so we can evict unused stores between requests.
@@ -9870,20 +9876,28 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
 #ifdef _WIN32
         /* Windows: WaitForSingleObject on stdin handle */
         HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
-        DWORD wr = WaitForSingleObject(hStdin, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
+        DWORD wr = WaitForSingleObject(hStdin, poll_timeout_s * MCP_TIMEOUT_MS);
         if (wr == WAIT_FAILED) {
             break;
         }
         if (wr == WAIT_TIMEOUT) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
+            cbm_mcp_server_evict_idle(srv, poll_timeout_s);
+            if (idle_timeout_s > 0) {
+                cbm_log_int(CBM_LOG_INFO, "server.idle_timeout", "seconds", idle_timeout_s);
+                break;
+            }
             continue;
         }
 #else
-        int pr = poll_for_input_unix(srv, fd, in);
+        int pr = poll_for_input_unix(srv, fd, in, poll_timeout_s);
         if (pr < 0) {
             break;
         }
         if (pr == 0) {
+            if (idle_timeout_s > 0) {
+                cbm_log_int(CBM_LOG_INFO, "server.idle_timeout", "seconds", idle_timeout_s);
+                break;
+            }
             continue; /* timeout — idle stores evicted */
         }
 #endif

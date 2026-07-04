@@ -127,6 +127,14 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
 
+/* Run the MCP stdio loop with an optional whole-server idle timeout. When
+ * idle_timeout_s > 0 and no request arrives for that many seconds, the loop
+ * exits cleanly. This is useful for skill/CLI launchers that do not keep a
+ * permanent MCP client connection open. idle_timeout_s <= 0 preserves the
+ * default long-running server behavior. */
+int cbm_mcp_server_run_with_idle_timeout(cbm_mcp_server_t *srv, FILE *in, FILE *out,
+                                         int idle_timeout_s);
+
 /* Process a single JSON-RPC request line and return the response.
  * Returns heap-allocated JSON response string, or NULL for notifications. */
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
