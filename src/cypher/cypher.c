@@ -2968,7 +2968,7 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     int max_depth = rel->max_hops > 0 ? rel->max_hops : CYP_MAX_DEPTH;
     const char *dir = rel->direction ? rel->direction : "outbound";
     if (b->use_active_overlay_edges && b->project && src->qualified_name &&
-        src->qualified_name[0] && strcmp(dir, "any") != 0) {
+        src->qualified_name[0]) {
         int max_results = max_new - *new_count;
         if (max_results <= 0) {
             return;
@@ -4628,11 +4628,7 @@ static bool cypher_pattern_supports_active_relationships(const cbm_pattern_t *pa
     if (pat->rel_count != SKIP_ONE) {
         return false;
     }
-    const cbm_rel_pattern_t *rel = &pat->rels[0];
-    if (rel->min_hops == SKIP_ONE && rel->max_hops == SKIP_ONE) {
-        return true;
-    }
-    return !rel->direction || strcmp(rel->direction, "any") != 0;
+    return true;
 }
 
 static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {

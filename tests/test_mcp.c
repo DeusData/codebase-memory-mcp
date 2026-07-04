@@ -2277,10 +2277,11 @@ TEST(tool_query_graph_uses_active_variable_length_relationship_query_with_ready_
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "OldVarSource"));
-    ASSERT_NULL(strstr(inner, "FreshVarSource"));
-    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
-    ASSERT_NOT_NULL(strstr(inner, "directed variable-length"));
+    ASSERT_NOT_NULL(strstr(inner, "FreshVarSource"));
+    ASSERT_NOT_NULL(strstr(inner, "OldVarTarget"));
+    ASSERT_NULL(strstr(inner, "OldVarSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
 
     free(inner);
     free(resp);
@@ -2417,7 +2418,7 @@ TEST(tool_query_graph_keeps_id_query_canonical_with_ready_overlay) {
     ASSERT_NOT_NULL(strstr(inner, "OldIdSource"));
     ASSERT_NULL(strstr(inner, "FreshIdSource"));
     ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
-    ASSERT_NOT_NULL(strstr(inner, "directed variable-length"));
+    ASSERT_NOT_NULL(strstr(inner, "id() semantics"));
 
     free(inner);
     free(resp);
