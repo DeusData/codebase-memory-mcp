@@ -2136,13 +2136,13 @@ TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay) {
     PASS();
 }
 
-TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay) {
+TEST(tool_query_graph_uses_active_edges_for_degree_and_exists) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     ASSERT_NOT_NULL(st);
-    const char *proj = "query-overlay-derived-canonical";
-    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-overlay-derived-canonical"),
+    const char *proj = "query-overlay-active-edge-derived";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-overlay-active-edge-derived"),
               CBM_STORE_OK);
     cbm_mcp_server_set_project(srv, proj);
 
@@ -2152,6 +2152,12 @@ TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay) {
                          .qualified_name = "query.overlay.OldDerivedSource",
                          .file_path = "src/main.c"};
     ASSERT_GT(cbm_store_upsert_node(st, &old_fn), 0);
+    cbm_node_t stable_target = {.project = proj,
+                                .label = "Function",
+                                .name = "StableTarget",
+                                .qualified_name = "query.overlay.StableTarget",
+                                .file_path = "src/target.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &stable_target), 0);
 
     int64_t overlay_generation = 0;
     ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
@@ -2162,6 +2168,84 @@ TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay) {
                          .qualified_name = "query.overlay.FreshDerivedSource",
                          .file_path = "src/main.c",
                          .properties_json = "{}"};
+    cbm_store_delta_edge_t fresh_edge = {.source_qn = "query.overlay.FreshDerivedSource",
+                                         .target_qn = "query.overlay.StableTarget",
+                                         .type = "CALLS",
+                                         .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &new_fn,
+                                    .node_count = 1,
+                                    .edges = &fresh_edge,
+                                    .edge_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":151,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-active-edge-derived\","
+             "\"query\":\"MATCH (f:Function) WHERE f.name = \\\"FreshDerivedSource\\\" "
+             "RETURN f.out_degree, f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "FreshDerivedSource"));
+    ASSERT_NULL(strstr(inner, "OldDerivedSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"1\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":153,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-active-edge-derived\","
+             "\"query\":\"MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } "
+             "RETURN f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "FreshDerivedSource"));
+    ASSERT_NULL(strstr(inner, "OldDerivedSource"));
+    ASSERT_NULL(strstr(inner, "StableTarget"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_keeps_id_query_canonical_with_ready_overlay) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "query-overlay-id-canonical";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-overlay-id-canonical"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "OldIdSource",
+                         .qualified_name = "query.overlay.OldIdSource",
+                         .file_path = "src/main.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &old_fn), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t new_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "FreshIdSource",
+                         .qualified_name = "query.overlay.FreshIdSource",
+                         .file_path = "src/main.c",
+                         .properties_json = "{}"};
     cbm_store_file_delta_t delta = {.project = proj,
                                     .rel_path = "src/main.c",
                                     .generation = 1,
@@ -2170,32 +2254,21 @@ TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay) {
     ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
               CBM_STORE_OK);
 
-    const char *queries[] = {
-        "MATCH (f:Function) RETURN id(f), f.name LIMIT 5",
-        "MATCH (f:Function) RETURN f.out_degree, f.name LIMIT 5",
-        "MATCH (f:Function) WHERE NOT EXISTS { (f)-[:CALLS]->() } RETURN f.name LIMIT 5"};
-    for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
-        char req[CBM_SZ_4K];
-        int n = snprintf(req, sizeof(req),
-                         "{\"jsonrpc\":\"2.0\",\"id\":151,\"method\":\"tools/call\","
-                         "\"params\":{\"name\":\"query_graph\","
-                         "\"arguments\":{\"project\":\"query-overlay-derived-canonical\","
-                         "\"query\":\"%s\"}}}",
-                         queries[i]);
-        ASSERT(n >= 0 && (size_t)n < sizeof(req));
-        char *resp = cbm_mcp_server_handle(srv, req);
-        ASSERT_NOT_NULL(resp);
-        char *inner = extract_text_content(resp);
-        ASSERT_NOT_NULL(inner);
-        ASSERT_NOT_NULL(strstr(inner, "OldDerivedSource"));
-        ASSERT_NULL(strstr(inner, "FreshDerivedSource"));
-        ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
-        ASSERT_NOT_NULL(strstr(inner, "node-only Cypher queries"));
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":154,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-id-canonical\","
+             "\"query\":\"MATCH (f:Function) RETURN id(f), f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "OldIdSource"));
+    ASSERT_NULL(strstr(inner, "FreshIdSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
+    ASSERT_NOT_NULL(strstr(inner, "active relationship binding"));
 
-        free(inner);
-        free(resp);
-    }
-
+    free(inner);
+    free(resp);
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -5842,7 +5915,8 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_uses_ready_overlay_for_node_only_query);
     RUN_TEST(tool_query_graph_uses_additive_overlay_without_tombstone);
     RUN_TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay);
-    RUN_TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay);
+    RUN_TEST(tool_query_graph_uses_active_edges_for_degree_and_exists);
+    RUN_TEST(tool_query_graph_keeps_id_query_canonical_with_ready_overlay);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);

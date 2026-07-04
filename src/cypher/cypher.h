@@ -317,7 +317,8 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
                        cbm_cypher_result_t *out);
 
 /* Execute with the active overlay node read view when the query is node-only.
- * Relationship, EXISTS, and degree-derived queries fall back to canonical rows.
+ * Single-node degree properties and EXISTS predicates use active overlay edges.
+ * Relationship patterns and id() still fall back to canonical rows.
  * used_active_nodes is set true only when active node scans were used. */
 int cbm_cypher_execute_active_nodes(cbm_store_t *store, const char *query, const char *project,
                                     int max_rows, cbm_cypher_result_t *out,

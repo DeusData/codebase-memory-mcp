@@ -7277,6 +7277,125 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
     }
 }
 
+static int active_edge_count_by_qn(cbm_store_t *s, const char *project,
+                                   const char *qualified_name, const char *edge_type,
+                                   int direction, int *out_count) {
+    if (!out_count) {
+        return CBM_STORE_ERR;
+    }
+    *out_count = 0;
+    if (!s || !s->db || !project || !qualified_name ||
+        (direction != CBM_STORE_EDGE_DIR_OUTBOUND && direction != CBM_STORE_EDGE_DIR_INBOUND &&
+         direction != CBM_STORE_EDGE_DIR_ANY)) {
+        if (s) {
+            store_set_error(s, "active_edge_count_by_qn: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "active_edge_count_by_qn active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    const char *join_cond = NULL;
+    if (direction == CBM_STORE_EDGE_DIR_OUTBOUND) {
+        join_cond = "n.qualified_name = e.source_qn";
+    } else if (direction == CBM_STORE_EDGE_DIR_INBOUND) {
+        join_cond = "n.qualified_name = e.target_qn";
+    } else {
+        join_cond = "(n.qualified_name = e.source_qn OR n.qualified_name = e.target_qn)";
+    }
+    bool has_type = edge_type && edge_type[0] != '\0';
+
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT COUNT(*) "
+                     "FROM active_edges e "
+                     "JOIN active_nodes n ON %s "
+                     "WHERE n.project = ?3 AND n.qualified_name = ?4 "
+                     "  AND e.type != 'INHERITS'%s",
+                     active_cte, join_cond, has_type ? " AND e.type = ?5" : "");
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "active_edge_count_by_qn SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "active_edge_count_by_qn prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, qualified_name);
+    if (has_type) {
+        bind_text(stmt, ST_COL_5, edge_type);
+    }
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        *out_count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "active_edge_count_by_qn step");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+int cbm_store_active_node_degree_by_qn(cbm_store_t *s, const char *project,
+                                       const char *qualified_name, int *in_deg,
+                                       int *out_deg) {
+    if (in_deg) {
+        *in_deg = 0;
+    }
+    if (out_deg) {
+        *out_deg = 0;
+    }
+    if (!in_deg || !out_deg) {
+        return CBM_STORE_ERR;
+    }
+    int in_count = 0;
+    int out_count = 0;
+    int rc = active_edge_count_by_qn(s, project, qualified_name, NULL,
+                                     CBM_STORE_EDGE_DIR_INBOUND, &in_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = active_edge_count_by_qn(s, project, qualified_name, NULL,
+                                 CBM_STORE_EDGE_DIR_OUTBOUND, &out_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    *in_deg = in_count;
+    *out_deg = out_count;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_active_edge_exists_by_qn(cbm_store_t *s, const char *project,
+                                       const char *qualified_name, const char *edge_type,
+                                       int direction, bool *out_exists) {
+    if (!out_exists) {
+        return CBM_STORE_ERR;
+    }
+    *out_exists = false;
+    int count = 0;
+    int rc = active_edge_count_by_qn(s, project, qualified_name, edge_type, direction, &count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    *out_exists = count > 0;
+    return CBM_STORE_OK;
+}
+
 /* ── List distinct file paths ────────────────────────────────── */
 
 int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count) {

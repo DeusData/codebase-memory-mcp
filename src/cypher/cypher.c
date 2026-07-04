@@ -2041,6 +2041,8 @@ typedef struct {
     cbm_edge_t edge_vars[CYP_MAX_EDGE_VARS];       /* edge data */
     int edge_var_count;
     cbm_store_t *store; /* for computing in_degree/out_degree on demand */
+    const char *project; /* borrowed project filter for active overlay qn-keyed lookups */
+    bool use_active_overlay_edges;
 } binding_t;
 
 /* Return a string field from a node by property name.  NULL-safe. */
@@ -2068,7 +2070,8 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
 static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
-static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store) {
+static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store,
+                             const char *project, bool use_active_overlay_edges) {
     if (!n || !prop) {
         return "";
     }
@@ -2095,12 +2098,17 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         snprintf(out, CBM_SZ_512, "%d", n->end_line);
         return out;
     }
-    /* Virtual computed properties: in_degree/out_degree via CALLS edges.
-     * Enables Cypher dead-code detection: WHERE n.in_degree = '0'. */
+    /* Virtual computed properties: in_degree/out_degree via the same
+     * all-but-INHERITS edge contract as cbm_store_node_degree(). */
     if (store && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0)) {
         int in_deg = 0;
         int out_deg = 0;
-        cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
+        if (use_active_overlay_edges && project && n->qualified_name && n->qualified_name[0]) {
+            (void)cbm_store_active_node_degree_by_qn(store, project, n->qualified_name, &in_deg,
+                                                     &out_deg);
+        } else {
+            cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
+        }
         int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
         snprintf(out, CBM_SZ_512, "%d", val);
         return out;
@@ -2308,6 +2316,8 @@ static void binding_copy(binding_t *dst, const binding_t *src) {
         edge_deep_copy(&dst->edge_vars[i], &src->edge_vars[i]);
     }
     dst->store = src->store;
+    dst->project = src->project;
+    dst->use_active_overlay_edges = src->use_active_overlay_edges;
 }
 
 /* Deep-copy a node into a binding (binding owns the strings) */
@@ -2339,7 +2349,7 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
         return NULL; /* unbound variable */
     }
     if (c->property) {
-        return node_prop(n, c->property, b->store);
+        return node_prop(n, c->property, b->store, b->project, b->use_active_overlay_edges);
     }
     /* Bare alias (e.g. post-WITH virtual var) — use node name directly */
     return n->name ? n->name : "";
@@ -2407,27 +2417,41 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         cbm_node_t *n = binding_get(b, c->variable);
         bool result = false;
         if (n && b->store) {
-            cbm_edge_t *edges = NULL;
-            int cnt = 0;
-            if (c->exists_dir != 1) { /* outbound or any */
-                if (c->value) {
-                    cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges, &cnt);
-                } else {
-                    cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
+            if (b->use_active_overlay_edges && b->project && n->qualified_name &&
+                n->qualified_name[0]) {
+                int dir = c->exists_dir == CBM_STORE_EDGE_DIR_INBOUND
+                              ? CBM_STORE_EDGE_DIR_INBOUND
+                              : (c->exists_dir == CBM_STORE_EDGE_DIR_ANY
+                                     ? CBM_STORE_EDGE_DIR_ANY
+                                     : CBM_STORE_EDGE_DIR_OUTBOUND);
+                (void)cbm_store_active_edge_exists_by_qn(b->store, b->project,
+                                                         n->qualified_name, c->value, dir,
+                                                         &result);
+            } else {
+                cbm_edge_t *edges = NULL;
+                int cnt = 0;
+                if (c->exists_dir != CBM_STORE_EDGE_DIR_INBOUND) { /* outbound or any */
+                    if (c->value) {
+                        cbm_store_find_edges_by_source_type(b->store, n->id, c->value, &edges,
+                                                            &cnt);
+                    } else {
+                        cbm_store_find_edges_by_source(b->store, n->id, &edges, &cnt);
+                    }
+                    result = cnt > 0;
+                    cbm_store_free_edges(edges, cnt);
                 }
-                result = cnt > 0;
-                cbm_store_free_edges(edges, cnt);
-            }
-            if (!result && c->exists_dir != 0) { /* inbound or any */
-                edges = NULL;
-                cnt = 0;
-                if (c->value) {
-                    cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges, &cnt);
-                } else {
-                    cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
+                if (!result && c->exists_dir != CBM_STORE_EDGE_DIR_OUTBOUND) { /* inbound or any */
+                    edges = NULL;
+                    cnt = 0;
+                    if (c->value) {
+                        cbm_store_find_edges_by_target_type(b->store, n->id, c->value, &edges,
+                                                            &cnt);
+                    } else {
+                        cbm_store_find_edges_by_target(b->store, n->id, &edges, &cnt);
+                    }
+                    result = cnt > 0;
+                    cbm_store_free_edges(edges, cnt);
                 }
-                result = cnt > 0;
-                cbm_store_free_edges(edges, cnt);
             }
         }
         return c->negated ? !result : result;
@@ -2527,7 +2551,7 @@ static bool looks_like_regex(const char *s) {
 static bool check_inline_props(const cbm_node_t *n, const cbm_prop_filter_t *props, int count,
                                cbm_store_t *store) {
     for (int i = 0; i < count; i++) {
-        const char *actual = node_prop(n, props[i].key, store);
+        const char *actual = node_prop(n, props[i].key, store, NULL, false);
         if (looks_like_regex(props[i].value)) {
             cbm_regex_t re;
             if (cbm_regcomp(&re, props[i].value, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
@@ -2623,7 +2647,7 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
     cbm_node_t *n = binding_get(b, var);
     if (n) {
         if (prop) {
-            return node_prop(n, prop, b->store);
+            return node_prop(n, prop, b->store, b->project, b->use_active_overlay_edges);
         }
         return n->name ? n->name : "";
     }
@@ -4411,6 +4435,8 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         binding_t b = {0};
         b.store = store;
+        b.project = project;
+        b.use_active_overlay_edges = scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY;
         binding_set(&b, var_name, &scanned[i]);
         bool pass = !q->where || eval_where(q->where, &b);
         if (pass) {
@@ -4456,31 +4482,8 @@ static bool cypher_is_degree_prop(const char *prop) {
     return prop && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0);
 }
 
-static bool cypher_expr_requires_canonical_edges(const cbm_expr_t *expr) {
-    if (!expr) {
-        return false;
-    }
-    if (expr->type == EXPR_CONDITION) {
-        return (expr->cond.op && strcmp(expr->cond.op, "EXISTS") == 0) ||
-               cypher_is_degree_prop(expr->cond.property);
-    }
-    return cypher_expr_requires_canonical_edges(expr->left) ||
-           cypher_expr_requires_canonical_edges(expr->right);
-}
-
 static bool cypher_where_requires_canonical_edges(const cbm_where_clause_t *where) {
-    if (!where) {
-        return false;
-    }
-    if (cypher_expr_requires_canonical_edges(where->root)) {
-        return true;
-    }
-    for (int i = 0; i < where->count; i++) {
-        if ((where->conditions[i].op && strcmp(where->conditions[i].op, "EXISTS") == 0) ||
-            cypher_is_degree_prop(where->conditions[i].property)) {
-            return true;
-        }
-    }
+    (void)where;
     return false;
 }
 
@@ -4490,25 +4493,18 @@ static bool cypher_return_requires_canonical_edges(const cbm_return_clause_t *re
     }
     if (ret->order_by &&
         (strstr(ret->order_by, ".in_degree") || strstr(ret->order_by, ".out_degree"))) {
-        return true;
+        return false;
     }
     for (int i = 0; i < ret->count; i++) {
         if (ret->items[i].func && strcmp(ret->items[i].func, "id") == 0) {
             return true;
         }
-        if (ret->items[i].kase) {
-            for (int b = 0; b < ret->items[i].kase->branch_count; b++) {
-                if (cypher_expr_requires_canonical_edges(ret->items[i].kase->branches[b].when_expr)) {
-                    return true;
-                }
-            }
-        }
         if (cypher_is_degree_prop(ret->items[i].property)) {
-            return true;
+            continue;
         }
         for (int a = 0; a < ret->items[i].arg_count; a++) {
             if (cypher_is_degree_prop(ret->items[i].args[a].property)) {
-                return true;
+                continue;
             }
         }
     }
