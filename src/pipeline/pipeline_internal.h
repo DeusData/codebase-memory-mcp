@@ -350,6 +350,7 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
 #define CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION "cross_file_node_qn_collision"
 #define CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR "header_type_impl_pair"
+#define CBM_PIPELINE_DELTA_REASON_ADDITIVE_SUBSET_REQUIRED "additive_subset_required"
 
 /* Conservative default exact-delta caps. Larger affected sets fall back to the
  * containment path unless config opts into a benchmarked frontier size. */
@@ -441,6 +442,7 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
+bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path);
 bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
 int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst);
 int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src,

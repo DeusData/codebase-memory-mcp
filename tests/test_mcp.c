@@ -1538,6 +1538,81 @@ TEST(tool_search_graph_query_uses_overlay_active_rows) {
     PASS();
 }
 
+TEST(tool_search_graph_query_uses_additive_overlay_without_tombstone) {
+    enum { BASE_GENERATION = 1 };
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "fts-overlay-additive";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/fts-overlay-additive"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "stableadditivemarker",
+                                         "fts-overlay-additive.stable",
+                                         "include/shared.h"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh = {.project = proj,
+                        .label = "Function",
+                        .name = "freshadditivemarker",
+                        .qualified_name = "fts-overlay-additive.fresh",
+                        .file_path = "include/shared.h",
+                        .start_line = 7,
+                        .end_line = 9,
+                        .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "include/shared.h",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &fresh,
+                                    .node_count = 1};
+    const cbm_store_file_delta_t *deltas[] = {&delta};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta_additions_batch(st, deltas, 1,
+                                                                   overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":558,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-overlay-additive\","
+             "\"query\":\"freshadditivemarker\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_owned_nodes_visible\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "freshadditivemarker"));
+    ASSERT_NULL(strstr(inner, "stableadditivemarker"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":559,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-overlay-additive\","
+             "\"query\":\"stableadditivemarker\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "stableadditivemarker"));
+    ASSERT_NULL(strstr(inner, "freshadditivemarker"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_overlay_tokenless_query_uses_graph_filters) {
     enum { BASE_GENERATION = 1 };
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -1933,6 +2008,61 @@ TEST(tool_query_graph_uses_ready_overlay_for_node_only_query) {
     ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
     ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":1"));
     ASSERT_NOT_NULL(strstr(inner, "node-only Cypher query"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_uses_additive_overlay_without_tombstone) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "query-overlay-additive";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-overlay-additive"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t stable_fn = {.project = proj,
+                            .label = "Function",
+                            .name = "StableVisibleInCypher",
+                            .qualified_name = "query.overlay.StableVisibleInCypher",
+                            .file_path = "include/shared.h"};
+    ASSERT_GT(cbm_store_upsert_node(st, &stable_fn), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_fn = {.project = proj,
+                           .label = "Function",
+                           .name = "FreshAdditiveCypher",
+                           .qualified_name = "query.overlay.FreshAdditiveCypher",
+                           .file_path = "include/shared.h",
+                           .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "include/shared.h",
+                                    .generation = 1,
+                                    .nodes = &fresh_fn,
+                                    .node_count = 1};
+    const cbm_store_file_delta_t *deltas[] = {&delta};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta_additions_batch(st, deltas, 1,
+                                                                   overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":152,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-additive\","
+             "\"query\":\"MATCH (f:Function) RETURN f.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "StableVisibleInCypher"));
+    ASSERT_NOT_NULL(strstr(inner, "FreshAdditiveCypher"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"active_file_tombstones\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_owned_nodes_visible\":1"));
 
     free(inner);
     free(resp);
@@ -5699,6 +5829,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_uses_overlay_active_rows);
+    RUN_TEST(tool_search_graph_query_uses_additive_overlay_without_tombstone);
     RUN_TEST(tool_search_graph_overlay_tokenless_query_uses_graph_filters);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
@@ -5709,6 +5840,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
     RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_query_graph_uses_ready_overlay_for_node_only_query);
+    RUN_TEST(tool_query_graph_uses_additive_overlay_without_tombstone);
     RUN_TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay);
     RUN_TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);

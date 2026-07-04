@@ -2,6 +2,7 @@
 
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/str_util.h"
 
 #include <inttypes.h>
 #include <limits.h>
@@ -16,7 +17,9 @@
 #include "xxhash/xxhash.h"
 
 static const char cbm_delta_edge_imports[] = "IMPORTS";
+static const char cbm_delta_edge_usage[] = "USAGE";
 static const char cbm_delta_edge_contains_file[] = CBM_PIPELINE_EDGE_CONTAINS_FILE;
+static const char cbm_delta_label_module[] = "Module";
 static const char cbm_delta_file_hash_legacy_empty[] = "";
 static const char cbm_delta_prop_is_exported[] = "is_exported";
 static const char cbm_delta_pass_fingerprint_v1[] = "pipeline-file-delta-v1";
@@ -74,6 +77,14 @@ typedef struct {
 
 static char *delta_strdup(const char *s) {
     return cbm_strdup(s ? s : "");
+}
+
+bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path) {
+    (void)lang;
+    return rel_path && (cbm_str_ends_with(rel_path, ".h") || cbm_str_ends_with(rel_path, ".hh") ||
+                        cbm_str_ends_with(rel_path, ".hpp") ||
+                        cbm_str_ends_with(rel_path, ".hxx") ||
+                        cbm_str_ends_with(rel_path, ".cuh"));
 }
 
 const char *cbm_pipeline_file_delta_pass_fingerprint(void) {
@@ -503,6 +514,7 @@ static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
         return;
     }
     bool source_owned = delta_same_path(src->file_path, ctx->rel_path);
+    bool target_owned = delta_same_path(tgt->file_path, ctx->rel_path);
     bool source_context = delta_node_is_structure_context(src, ctx->rel_path);
     bool target_context = delta_node_is_structure_context(tgt, ctx->rel_path);
     bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) &&
@@ -513,11 +525,16 @@ static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     bool regenerated_file_structure = !source_owned &&
                                       strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
                                       target_is_changed_file;
+    bool target_owned_usage =
+        !source_owned && target_owned &&
+        cbm_pipeline_is_c_family_header(CBM_LANG_COUNT, ctx->rel_path) && src->label &&
+        strcmp(src->label, cbm_delta_label_module) == 0 &&
+        strcmp(edge->type, cbm_delta_edge_usage) == 0;
     if (context_structure_edge) {
         ctx->rc = delta_append_context_edge(ctx, src, tgt, edge);
         return;
     }
-    if (!source_owned && !regenerated_file_structure) {
+    if (!source_owned && !regenerated_file_structure && !target_owned_usage) {
         return;
     }
     ctx->rc = delta_append_edge(ctx, src, tgt, edge);

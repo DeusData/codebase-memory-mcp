@@ -3985,6 +3985,58 @@ TEST(store_file_delta_graph_noop_refreshes_metadata_only) {
     PASS();
 }
 
+TEST(store_file_delta_preserves_owned_graph_detects_additive_subset) {
+    enum { BASE_GENERATION = 1, DELTA_GENERATION = 2 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(store_publish_helper_file_delta(s, BASE_GENERATION), CBM_STORE_OK);
+
+    cbm_node_t additive_nodes[2] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "Helper",
+         .qualified_name = "test.helper.Helper",
+         .file_path = "helper.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "Added",
+         .qualified_name = "test.helper.Added",
+         .file_path = "helper.go",
+         .properties_json = "{}"}};
+    cbm_store_file_delta_t additive_delta = {.project = "test",
+                                             .rel_path = "helper.go",
+                                             .generation = DELTA_GENERATION,
+                                             .nodes = additive_nodes,
+                                             .node_count = 2};
+    const cbm_store_file_delta_t *additive_deltas[] = {&additive_delta};
+    bool preserves = false;
+    ASSERT_EQ(cbm_store_file_delta_batch_preserves_owned_graph(s, additive_deltas, 1,
+                                                               &preserves),
+              CBM_STORE_OK);
+    ASSERT_TRUE(preserves);
+
+    cbm_node_t replacement_nodes[1] = {{.project = "test",
+                                        .label = "Function",
+                                        .name = "Added",
+                                        .qualified_name = "test.helper.Added",
+                                        .file_path = "helper.go",
+                                        .properties_json = "{}"}};
+    cbm_store_file_delta_t replacement_delta = additive_delta;
+    replacement_delta.nodes = replacement_nodes;
+    replacement_delta.node_count = 1;
+    const cbm_store_file_delta_t *replacement_deltas[] = {&replacement_delta};
+    preserves = true;
+    ASSERT_EQ(cbm_store_file_delta_batch_preserves_owned_graph(s, replacement_deltas, 1,
+                                                               &preserves),
+              CBM_STORE_OK);
+    ASSERT_FALSE(preserves);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_file_delta_publish_failure_finishes_generation_failed) {
     enum { BASE_GENERATION = 1, FAILED_GENERATION = 2 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -5797,6 +5849,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_publish_rolls_back_on_failure);
     RUN_TEST(store_file_delta_publish_matches_fresh_final_graph);
     RUN_TEST(store_file_delta_graph_noop_refreshes_metadata_only);
+    RUN_TEST(store_file_delta_preserves_owned_graph_detects_additive_subset);
     RUN_TEST(store_file_delta_publish_failure_finishes_generation_failed);
     RUN_TEST(store_file_delta_publish_multifile_generation);
     RUN_TEST(store_file_delta_batch_publish_rolls_back_all_files);
