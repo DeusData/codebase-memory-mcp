@@ -2076,19 +2076,41 @@ bool cbm_mcp_server_start_overlay_compaction(cbm_mcp_server_t *srv, const char *
         return false;
     }
 
-    cbm_mutex_lock(&srv->overlay_compaction_lock);
-    if (srv->overlay_compaction_started) {
+    bool reaped_finished_worker = false;
+    for (;;) {
+        cbm_mutex_lock(&srv->overlay_compaction_lock);
+        if (!srv->overlay_compaction_started) {
+            int n = snprintf(srv->overlay_compaction_project,
+                             sizeof(srv->overlay_compaction_project), "%s", project);
+            if (n < 0 || (size_t)n >= sizeof(srv->overlay_compaction_project)) {
+                cbm_mutex_unlock(&srv->overlay_compaction_lock);
+                return false;
+            }
+            srv->overlay_compaction_max_generations = max_generations;
+            srv->overlay_compaction_rc = CBM_STORE_ERR;
+            srv->overlay_compaction_compacted = 0;
+            srv->overlay_compaction_finished = false;
+            srv->overlay_compaction_started = true;
+            cbm_mutex_unlock(&srv->overlay_compaction_lock);
+            break;
+        }
+        bool finished = srv->overlay_compaction_finished;
         cbm_mutex_unlock(&srv->overlay_compaction_lock);
-        return false;
+        if (!finished || reaped_finished_worker) {
+            return false;
+        }
+        int compacted = 0;
+        int join_rc = cbm_mcp_server_join_overlay_compaction(srv, &compacted);
+        if (join_rc != CBM_STORE_OK) {
+            char rc_buf[CBM_SZ_32];
+            char compacted_buf[CBM_SZ_32];
+            snprintf(rc_buf, sizeof(rc_buf), "%d", join_rc);
+            snprintf(compacted_buf, sizeof(compacted_buf), "%d", compacted);
+            cbm_log_warn("overlay_compaction.reap_failed", "rc", rc_buf, "compacted",
+                         compacted_buf);
+        }
+        reaped_finished_worker = true;
     }
-    snprintf(srv->overlay_compaction_project, sizeof(srv->overlay_compaction_project), "%s",
-             project);
-    srv->overlay_compaction_max_generations = max_generations;
-    srv->overlay_compaction_rc = CBM_STORE_ERR;
-    srv->overlay_compaction_compacted = 0;
-    srv->overlay_compaction_finished = false;
-    srv->overlay_compaction_started = true;
-    cbm_mutex_unlock(&srv->overlay_compaction_lock);
 
     if (cbm_thread_create(&srv->overlay_compaction_tid, 0, overlay_compaction_thread,
                           srv) != 0) {
