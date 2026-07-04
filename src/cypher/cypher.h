@@ -318,8 +318,9 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
 
 /* Execute with the active overlay read view when the query shape is supported.
  * Single-node degree properties, EXISTS predicates, and fixed one-hop
- * relationship patterns use active overlay edges. Variable-length relationship
- * queries and id() still fall back to canonical rows.
+ * relationship patterns use active overlay edges. Directed variable-length
+ * relationship queries use active overlay traversal; id() still falls back to
+ * canonical rows.
  * used_active_nodes is set true only when active node scans were used. */
 int cbm_cypher_execute_active_nodes(cbm_store_t *store, const char *query, const char *project,
                                     int max_rows, cbm_cypher_result_t *out,

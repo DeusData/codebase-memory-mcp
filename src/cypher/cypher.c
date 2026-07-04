@@ -2966,8 +2966,40 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               const char *to_var, binding_t *new_bindings, int *new_count,
                               int max_new, int *match_count) {
     int max_depth = rel->max_hops > 0 ? rel->max_hops : CYP_MAX_DEPTH;
-    cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
+    if (b->use_active_overlay_edges && b->project && src->qualified_name &&
+        src->qualified_name[0] && strcmp(dir, "any") != 0) {
+        int max_results = max_new - *new_count;
+        if (max_results <= 0) {
+            return;
+        }
+        cbm_traverse_result_t tr = {0};
+        if (cbm_store_bfs_overlay_view(store, b->project, src->qualified_name, dir,
+                                       (const char **)rel->types, rel->type_count, max_depth,
+                                       max_results, &tr) == CBM_STORE_OK) {
+            for (int v = 0; v < tr.visited_count && *new_count < max_new; v++) {
+                cbm_node_hop_t *hop = &tr.visited[v];
+                if (hop->hop < rel->min_hops) {
+                    continue;
+                }
+                if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {
+                    continue;
+                }
+                if (!check_inline_props(&hop->node, target_node->props, target_node->prop_count,
+                                        store)) {
+                    continue;
+                }
+                binding_t nb = {0};
+                binding_copy(&nb, b);
+                binding_set(&nb, to_var, &hop->node);
+                new_bindings[(*new_count)++] = nb;
+                (*match_count)++;
+            }
+        }
+        cbm_store_traverse_free(&tr);
+        return;
+    }
+    cbm_traverse_result_t tr = {0};
     cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
     for (int v = 0; v < tr.visited_count && *new_count < max_new; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
@@ -4597,7 +4629,10 @@ static bool cypher_pattern_supports_active_relationships(const cbm_pattern_t *pa
         return false;
     }
     const cbm_rel_pattern_t *rel = &pat->rels[0];
-    return rel->min_hops == SKIP_ONE && rel->max_hops == SKIP_ONE;
+    if (rel->min_hops == SKIP_ONE && rel->max_hops == SKIP_ONE) {
+        return true;
+    }
+    return !rel->direction || strcmp(rel->direction, "any") != 0;
 }
 
 static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
