@@ -1082,6 +1082,33 @@ static int incr_try_exact_delete_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
     cbm_pipeline_file_delta_plan_free(&plan);
 
+    if (cbm_pipeline_overlay_publish_small_deltas(p)) {
+        int64_t base_generation = 0;
+        int64_t overlay_generation = 0;
+        rc = cbm_store_latest_complete_index_generation(store, project, &base_generation);
+        if (rc == CBM_STORE_OK) {
+            CBM_PROF_START(t_overlay_publish);
+            rc = cbm_pipeline_publish_overlay_file_delta_batch(
+                store, delta_ptrs, CBM_INCR_DELETE_DELTA_COUNT, base_generation,
+                CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation);
+            CBM_PROF_END_N("incremental_exact", "1_delete_publish_overlay", t_overlay_publish,
+                           CBM_INCR_DELETE_DELTA_COUNT);
+        }
+        if (rc == CBM_STORE_OK && overlay_generation > 0) {
+            cbm_pipeline_set_committed_counts(p, cbm_store_count_nodes(store, project),
+                                              cbm_store_count_edges(store, project));
+            cbm_pipeline_set_graph_changed(p, false);
+            cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+            cbm_pipeline_set_publish_reason(p, NULL);
+            cbm_pipeline_set_exact_delta_stats(p, deleted_count, deleted_count, deleted_count);
+            cbm_log_info("incremental.overlay.done", "files", "1");
+            *applied = 1;
+            return CBM_STORE_OK;
+        }
+        cbm_log_warn("incremental.overlay.fallback", "reason", "publish_error", "rc",
+                     itoa_buf_incr(rc));
+    }
+
     int64_t generation = 0;
     rc = cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation);
     if (rc != CBM_STORE_OK || generation <= 0) {
@@ -1951,7 +1978,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     (void)incr_try_exact_delete_route(p, store, db_path, project, cls.deleted, cls.deleted_count,
                                       ci, &exact_applied);
     if (exact_applied) {
-        if (incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
+        if (cbm_pipeline_publish_kind(p) != CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY &&
+            incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
             cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_exact_delete");
         }
         incr_classification_free(&cls);
