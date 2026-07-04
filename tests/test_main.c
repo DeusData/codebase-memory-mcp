@@ -13,6 +13,40 @@ int tf_skip_count = 0;
 #include <stdbool.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include <stdint.h>
+#include <stdlib.h>
+/* Hidden re-exec mode for the cbm_popen handle-isolation regression test
+ * (tests/test_httpd.c). Invoked as: test-runner __handle_probe <handle> <magic>.
+ * Reports, via exit code, whether a marker file handle created inheritable by
+ * the parent was actually inherited into this (grand)child:
+ *   exit 1 = marker handle is readable here → it LEAKED across the spawn
+ *   exit 0 = marker handle is not present   → spawn correctly isolated it
+ * Windows preserves handle values across inheritance, so the parent's handle
+ * value refers to the same object here iff it was inherited. */
+static int th_handle_probe(int argc, char **argv) {
+    if (argc < 4) {
+        return 0;
+    }
+    HANDLE h = (HANDLE)(intptr_t)_strtoi64(argv[2], NULL, 10);
+    unsigned char want[16], got[16];
+    for (int i = 0; i < 16; i++) {
+        unsigned v = 0;
+        if (sscanf(argv[3] + i * 2, "%2x", &v) != 1) {
+            return 0;
+        }
+        want[i] = (unsigned char)v;
+    }
+    SetFilePointer(h, 0, NULL, FILE_BEGIN);
+    DWORD nread = 0;
+    if (ReadFile(h, got, 16, &nread, NULL) && nread == 16 && memcmp(got, want, 16) == 0) {
+        return 1; /* marker readable → the handle was leaked into this child */
+    }
+    return 0;
+}
+#endif
+
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 
@@ -133,6 +167,12 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    /* Hidden probe mode — must run before any suite output (see th_handle_probe). */
+    if (argc >= 2 && strcmp(argv[1], "__handle_probe") == 0) {
+        return th_handle_probe(argc, argv);
+    }
+#endif
     g_suite_argc = argc;
     g_suite_argv = argv;
     printf("\n  codebase-memory-mcp  C test suite\n");

@@ -17,6 +17,7 @@
 #include "../src/foundation/platform.h"
 #include "../src/cli/cli.h"
 #include "../src/ui/http_server.h"
+#include "git/git_context.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "ui/httpd.h"
@@ -419,6 +420,51 @@ static void th_server_stop(th_server_t *ts) {
     cbm_http_server_free(ts->srv);
 }
 
+/* ── Watchdog: turn a hang into a hard failure ─────────────────── */
+
+/* A deadlocked git child cannot be recovered in-process, so a "must not hang"
+ * guard needs a watchdog thread that force-fails the whole run if the operation
+ * under test does not signal completion within a generous window. On a healthy
+ * build the flag is set long before the window elapses and the watchdog is a
+ * no-op. */
+typedef struct {
+    volatile int done;
+    int timeout_ms;
+    const char *what;
+} th_watchdog_t;
+
+static void *th_watchdog_fn(void *arg) {
+    th_watchdog_t *wd = (th_watchdog_t *)arg;
+    int waited = 0;
+    while (waited < wd->timeout_ms) {
+        cbm_usleep(100 * 1000);
+        waited += 100;
+        if (wd->done)
+            return NULL;
+    }
+    if (!wd->done) {
+        fprintf(stderr,
+                "\n  FATAL: watchdog fired after %dms — %s hung "
+                "(handle-inheritance deadlock, issue #798)\n",
+                wd->timeout_ms, wd->what);
+        fflush(stderr);
+        _exit(99); /* _exit, not exit: don't run atexit handlers from a wedged process */
+    }
+    return NULL;
+}
+
+/* Probe for a usable git on PATH. Called BEFORE the UI server starts (no socket
+ * handles exist yet), so this cbm_popen can never trip the #798 deadlock. */
+static int th_git_available(void) {
+    FILE *fp = cbm_popen("git --version", "r");
+    if (!fp)
+        return 0;
+    char buf[128];
+    char *got = fgets(buf, sizeof(buf), fp);
+    cbm_pclose(fp);
+    return got && strncmp(buf, "git version", 11) == 0;
+}
+
 TEST(ui_server_unknown_path_404) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -682,6 +728,190 @@ TEST(ui_server_stop_joins_cleanly) {
     PASS();
 }
 
+/* ── Regression: #798 — cbm_popen must not leak handles into the git child ──
+ *
+ * Root cause: on Windows the UI HTTP server calls WSAStartup and holds
+ * listening/AFD socket handles. list_projects resolves git context per project
+ * (add_git_context_json → cbm_git_context_resolve → git_capture → cbm_popen).
+ * The CRT _popen spawns via CreateProcess(bInheritHandles=TRUE), leaking EVERY
+ * inheritable handle — including those AFD handles — into git-for-Windows, whose
+ * MSYS/Cygwin startup classifies each inherited handle with NtQueryObject and
+ * DEADLOCKS on a socket/AFD handle. The single-threaded UI server then wedges
+ * and the web UI hangs forever. The fix reimplements cbm_popen to inherit ONLY
+ * the stdout pipe (STARTUPINFOEX + PROC_THREAD_ATTRIBUTE_HANDLE_LIST).
+ *
+ * Guard strategy — two layers, because the *deadlock* is environment-sensitive:
+ * whether NtQueryObject actually hangs depends on the git-for-Windows/MSYS
+ * runtime and the AFD provider, so a git-based test cannot be relied on to go
+ * RED everywhere (verified: it does NOT reproduce on every dev machine, and the
+ * Linux CI has no such sockets at all). So the load-bearing guard tests the
+ * fix's *contract* directly and deterministically —
+ * cbm_popen_isolates_inheritable_handle below asserts no foreign inheritable
+ * handle crosses into the child, which goes RED on any Windows without the fix.
+ *
+ * The two tests here are end-to-end liveness invariants: they enforce "git
+ * context resolves / list_projects responds while the UI server holds live
+ * sockets, under a watchdog." They pass with or without the fix on git builds
+ * that don't exhibit the NtQueryObject hang, but they catch #798 on the affected
+ * builds and guard against any future hang regression in this path. (Same
+ * pattern as the environment-sensitive guards in test_git_context.c.)
+ *
+ * A real repo is unnecessary — resolving any existing directory spawns
+ * `git -C <dir> rev-parse …`, exercising the exact cbm_popen shell-out;
+ * that also sidesteps the Windows CI shell's inability to `git init` via
+ * system(). On POSIX popen() already sets O_CLOEXEC, so this is a sanity check
+ * there. */
+TEST(ui_server_git_context_under_live_sockets_no_hang) {
+    /* Probe git before any socket exists — safe, cannot deadlock. */
+    if (!th_git_available())
+        SKIP_PLATFORM("git not on PATH — cannot exercise the git shell-out");
+
+    char *tmp = th_mktempdir("cbm_ui798");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
+
+    /* Bring up the real UI server — this allocates the AFD/socket handles that
+     * the unfixed cbm_popen would leak into git. */
+    th_server_t ts;
+    if (th_server_start(&ts) != 0) {
+        th_rmtree(tmp);
+        FAIL("th_server_start failed");
+    }
+
+    th_watchdog_t wd = {0, 30000, "cbm_git_context_resolve under live UI sockets"};
+    cbm_thread_t wdt;
+    if (cbm_thread_create(&wdt, 0, th_watchdog_fn, &wd) != 0) {
+        th_server_stop(&ts);
+        th_rmtree(tmp);
+        FAIL("watchdog thread create failed");
+    }
+
+    /* The exact per-project resolve list_projects runs. Without the fix this
+     * spawns git with the AFD handles inherited → NtQueryObject deadlock → never
+     * returns → watchdog force-fails the process. */
+    cbm_git_context_t ctx = {0};
+    int rc = cbm_git_context_resolve(tmp, &ctx);
+
+    wd.done = 1; /* disarm before the watchdog window elapses */
+    cbm_thread_join(&wdt);
+
+    int returned = (rc == 0); /* resolve reached its return without hanging */
+    cbm_git_context_free(&ctx);
+    th_server_stop(&ts);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(returned, 1);
+    PASS();
+}
+
+/* End-to-end companion: the actual endpoint Martin named must answer under UI
+ * mode. Drives POST /rpc list_projects against the live server under a watchdog
+ * and asserts a 200 within the window. With projects present in the store this
+ * also walks the per-project git shell-out end-to-end; with an empty store it
+ * still proves the endpoint stays responsive under UI mode. */
+TEST(ui_server_rpc_list_projects_responds) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    th_watchdog_t wd = {0, 30000, "POST /rpc list_projects"};
+    cbm_thread_t wdt;
+    ASSERT_EQ(cbm_thread_create(&wdt, 0, th_watchdog_fn, &wd), 0);
+
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                       "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
+    char req[512];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    char resp[8192];
+    int n = th_http(port, req, resp, sizeof(resp));
+
+    wd.done = 1;
+    cbm_thread_join(&wdt);
+    th_server_stop(&ts);
+
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    PASS();
+}
+
+/* Deterministic contract guard for the #798 fix: cbm_popen must NOT let a
+ * foreign inheritable handle cross into the child it spawns. This is the exact
+ * property whose absence caused the deadlock (git inheriting an AFD handle), but
+ * it is tested directly — independent of whether the local git-for-Windows build
+ * actually hangs on NtQueryObject — so it goes RED on any Windows build without
+ * the fix and GREEN with it.
+ *
+ * Mechanism: create a marker file, opened inheritable, holding a known 16-byte
+ * magic. Spawn — through cbm_popen, i.e. the real fixed spawn path — a re-exec
+ * of this test binary in its hidden __handle_probe mode. Windows preserves
+ * handle values across inheritance, so the child can test whether the parent's
+ * handle value is a valid, readable copy of the marker. Without the fix _popen
+ * leaks the marker (via cmd.exe) into the probe → it reads the magic → exit 1.
+ * With the fix only the stdout pipe is inherited → the probe cannot read it →
+ * exit 0. cbm_pclose surfaces that exit code. */
+TEST(cbm_popen_isolates_inheritable_handle) {
+#ifndef _WIN32
+    SKIP_PLATFORM("cbm_popen handle isolation is Windows-specific (POSIX popen uses O_CLOEXEC)");
+#else
+    char self[1024];
+    if (GetModuleFileNameA(NULL, self, sizeof(self)) == 0)
+        FAIL("GetModuleFileNameA failed");
+
+    char *tmp = th_mktempdir("cbm_leak798");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL");
+    char marker[1024];
+    snprintf(marker, sizeof(marker), "%s\\marker.bin", tmp);
+
+    static const unsigned char MAGIC[16] = {0xC0, 0xFF, 0xEE, 0x42, 0xDE, 0xAD, 0xBE, 0xEF,
+                                             0x13, 0x37, 0xA5, 0x5A, 0x0B, 0xAD, 0xF0, 0x0D};
+    char magic_hex[33];
+    for (int i = 0; i < 16; i++)
+        snprintf(magic_hex + i * 2, 3, "%02x", MAGIC[i]);
+
+    /* Inheritable so the UNFIXED _popen would leak it; the fix must exclude it. */
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
+    HANDLE h = CreateFileA(marker, GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        th_rmtree(tmp);
+        FAIL("CreateFileA marker failed");
+    }
+    DWORD wrote = 0;
+    WriteFile(h, MAGIC, 16, &wrote, NULL);
+    FlushFileBuffers(h);
+
+    /* Double-outer-quote form so cmd.exe parses a possibly-spaced exe path. */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "\"\"%s\" __handle_probe %lld %s\"", self,
+             (long long)(intptr_t)h, magic_hex);
+
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        CloseHandle(h);
+        th_rmtree(tmp);
+        FAIL("cbm_popen returned NULL");
+    }
+    char sink[256];
+    while (fgets(sink, sizeof(sink), fp)) {
+        /* probe writes nothing to stdout; drain defensively */
+    }
+    int leaked = cbm_pclose(fp); /* 1 iff the probe could read our marker */
+
+    CloseHandle(h);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(leaked, 0);
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
@@ -722,4 +952,9 @@ SUITE(httpd) {
     RUN_TEST(ui_server_slow_request_hits_deadline);
     RUN_TEST(ui_server_access_log_redacts_query);
     RUN_TEST(ui_server_stop_joins_cleanly);
+
+    /* Regression #798: cbm_popen must not leak handles into the git child */
+    RUN_TEST(cbm_popen_isolates_inheritable_handle);
+    RUN_TEST(ui_server_git_context_under_live_sockets_no_hang);
+    RUN_TEST(ui_server_rpc_list_projects_responds);
 }
