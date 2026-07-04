@@ -35,6 +35,8 @@ static const char cbm_delta_reason_missing_existing_ownership[] = "missing_exist
 static const char cbm_delta_reason_missing_file_metadata[] = "missing_file_metadata";
 static const char cbm_delta_reason_preflight_error[] = CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
 static const char cbm_delta_reason_publish_error[] = "publish_error";
+static const char cbm_delta_reason_cross_file_node_qn_collision[] =
+    CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION;
 static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_full";
 static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge_endpoint";
 static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
@@ -875,6 +877,60 @@ static bool delta_existing_or_insert_ownership_supported(
     return true;
 }
 
+int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *delta, bool *out_collision) {
+    if (out_collision) {
+        *out_collision = false;
+    }
+    if (!store || !delta || !delta->delta.project || !delta->delta.rel_path || !out_collision) {
+        return CBM_STORE_ERR;
+    }
+    if (delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        return CBM_STORE_OK;
+    }
+    for (int i = 0; i < delta->delta.node_count; i++) {
+        const cbm_node_t *node = &delta->delta.nodes[i];
+        if (!node->qualified_name || node->qualified_name[0] == '\0') {
+            continue;
+        }
+        cbm_node_t existing = {0};
+        int rc = cbm_store_find_node_by_qn(store, delta->delta.project, node->qualified_name,
+                                           &existing);
+        if (rc == CBM_STORE_NOT_FOUND) {
+            continue;
+        }
+        if (rc != CBM_STORE_OK) {
+            cbm_node_free_fields(&existing);
+            return rc;
+        }
+        const char *node_file = node->file_path ? node->file_path : delta->delta.rel_path;
+        bool collision = existing.file_path && node_file &&
+                         !delta_field_matches(existing.file_path, node_file);
+        cbm_node_free_fields(&existing);
+        if (collision) {
+            *out_collision = true;
+            return CBM_STORE_OK;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static bool delta_cross_file_node_qns_supported(cbm_store_t *store,
+                                                const cbm_pipeline_file_delta_t *delta,
+                                                cbm_pipeline_file_delta_plan_t *plan) {
+    bool collision = false;
+    int rc = cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, delta, &collision);
+    if (rc != CBM_STORE_OK) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_preflight_error);
+        return false;
+    }
+    if (collision) {
+        delta_plan_set_fallback(plan, cbm_delta_reason_cross_file_node_qn_collision);
+        return false;
+    }
+    return true;
+}
+
 static bool delta_path_in_batch(const char *path, const cbm_pipeline_file_delta_t *const *deltas,
                                 int delta_count) {
     if (!path || !*path || !deltas) {
@@ -1279,6 +1335,9 @@ int cbm_pipeline_plan_file_delta(cbm_store_t *store, const cbm_pipeline_file_del
     if (!delta_existing_or_insert_ownership_supported(store, delta, out)) {
         return CBM_STORE_OK;
     }
+    if (!delta_cross_file_node_qns_supported(store, delta, out)) {
+        return CBM_STORE_OK;
+    }
     enum { CBM_DELTA_SINGLE_COUNT = 1 };
     const cbm_pipeline_file_delta_t *single_delta[] = {delta};
     if (!delta_inbound_edges_supported(store, delta, single_delta, CBM_DELTA_SINGLE_COUNT, out)) {
@@ -1366,6 +1425,9 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
             return CBM_STORE_OK;
         }
         if (!delta_existing_or_insert_ownership_supported(store, delta, out)) {
+            return CBM_STORE_OK;
+        }
+        if (!delta_cross_file_node_qns_supported(store, delta, out)) {
             return CBM_STORE_OK;
         }
         if (!delta_inbound_edges_supported(store, delta, deltas, delta_count, out)) {
@@ -1562,6 +1624,12 @@ int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
             project = deltas[i]->delta.project;
         } else if (strcmp(project, deltas[i]->delta.project) != 0) {
             return CBM_STORE_ERR;
+        }
+        bool collision = false;
+        int rc =
+            cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, deltas[i], &collision);
+        if (rc != CBM_STORE_OK || collision) {
+            return rc == CBM_STORE_OK ? CBM_STORE_NOT_FOUND : rc;
         }
     }
 

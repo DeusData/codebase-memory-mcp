@@ -348,6 +348,7 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
 #define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
 #define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
+#define CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION "cross_file_node_qn_collision"
 
 /* Conservative default exact-delta caps. Larger affected sets fall back to the
  * containment path unless config opts into a benchmarked frontier size. */
@@ -440,6 +441,8 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
 bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
+int cbm_pipeline_file_delta_has_cross_file_node_qn_collision(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *delta, bool *out_collision);
 int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
                                                         cbm_pipeline_file_delta_t *delta,
                                                         int *out_added);

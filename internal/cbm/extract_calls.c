@@ -1144,6 +1144,14 @@ static char *gotemplate_string_child(CBMArena *a, TSNode parent, const char *sou
     return (char *)v;
 }
 
+static TSNode find_call_arguments_node(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        args = cbm_find_child_by_kind(node, "argument_list");
+    }
+    return args;
+}
+
 // Resolve a Go-template / Helm call to the referenced named template:
 //   {{ template "x" . }}            -> template_action, name is a string child
 //   {{ include "x" . }}             -> function_call(include), name is first string arg
@@ -1163,10 +1171,7 @@ static char *gotemplate_callee(CBMArena *a, TSNode node, const char *source) {
                        strcmp(fname, "tpl") != 0)) {
             return NULL;
         }
-        TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
-        if (ts_node_is_null(args)) {
-            args = cbm_find_child_by_kind(node, "argument_list");
-        }
+        TSNode args = find_call_arguments_node(node);
         if (ts_node_is_null(args)) {
             return NULL;
         }
@@ -1713,7 +1718,7 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                 call.is_method = true;
             }
 
-            TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            TSNode args = find_call_arguments_node(node);
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
                 if (call.first_string_arg && call.first_string_arg[0] == '/') {

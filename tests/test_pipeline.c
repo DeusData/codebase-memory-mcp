@@ -2011,9 +2011,10 @@ static int pipeline_dump_store_file_to_file(const char *src_path, const char *de
     return rc;
 }
 
-static bool pipeline_store_has_edge_between_qns(const char *db_path, const char *project,
-                                                const char *source_qn, const char *type,
-                                                const char *target_qn) {
+static bool pipeline_store_edge_between_qns_matches(const char *db_path, const char *project,
+                                                    const char *source_qn, const char *type,
+                                                    const char *target_qn,
+                                                    const char *props_needle) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
         return false;
@@ -2029,7 +2030,9 @@ static bool pipeline_store_has_edge_between_qns(const char *db_path, const char 
         if (cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &edge_count) ==
             CBM_STORE_OK) {
             for (int i = 0; i < edge_count; i++) {
-                if (edges[i].target_id == tgt.id) {
+                if (edges[i].target_id == tgt.id &&
+                    (!props_needle || (edges[i].properties_json &&
+                                       strstr(edges[i].properties_json, props_needle)))) {
                     found = true;
                     break;
                 }
@@ -2038,8 +2041,17 @@ static bool pipeline_store_has_edge_between_qns(const char *db_path, const char 
         }
     }
 
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
     cbm_store_close(s);
     return found;
+}
+
+static bool pipeline_store_has_edge_between_qns(const char *db_path, const char *project,
+                                                const char *source_qn, const char *type,
+                                                const char *target_qn) {
+    return pipeline_store_edge_between_qns_matches(db_path, project, source_qn, type, target_qn,
+                                                   NULL);
 }
 
 static void pipeline_restore_workers_env(bool had_workers, const char *saved_workers) {
@@ -2497,8 +2509,19 @@ TEST(pipeline_parallel_env_access_matches_sequential) {
 
     files[0] = "src/env.c";
     contents[0] = "#include <stdlib.h>\n\n"
+                  "const char *cbm_safe_getenv(const char *key, char *buf, unsigned long cap, "
+                  "void *err) {\n"
+                  "    (void)buf;\n"
+                  "    (void)cap;\n"
+                  "    (void)err;\n"
+                  "    return key;\n"
+                  "}\n\n"
                   "const char *load_temp(void) {\n"
                   "    return getenv(\"CBM_TEST_PARALLEL_ENV\");\n"
+                  "}\n\n"
+                  "const char *load_home(void) {\n"
+                  "    char buf[32];\n"
+                  "    return cbm_safe_getenv(\"HOME\", buf, sizeof(buf), NULL);\n"
                   "}\n";
     for (int i = 0; i < FILLER_FILE_COUNT; i++) {
         int rn = snprintf(filler_files[i], sizeof(filler_files[i]), "fillers/filler_%02d.c", i);
@@ -2548,6 +2571,16 @@ TEST(pipeline_parallel_env_access_matches_sequential) {
                                                     env_qn));
     ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, source_qn, "CONFIGURES",
                                                     env_qn));
+    char call_target_qn[CBM_SZ_512];
+    n = snprintf(call_target_qn, sizeof(call_target_qn), "%s.src.env.cbm_safe_getenv", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(call_target_qn));
+    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(seq_db, project, source_qn,
+                                                        "CONFIGURES", call_target_qn,
+                                                        "\"args\":["));
+    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(par_db, project, source_qn,
+                                                        "CONFIGURES", call_target_qn,
+                                                        "\"args\":["));
 
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = cbm_test_compare_canonical_graphs(seq_db, par_db, project, diff_err,
@@ -3612,6 +3645,51 @@ static int pipeline_delta_store_qn_exists(cbm_store_t *s, const char *project, c
         return 1;
     }
     return 0;
+}
+
+TEST(pipeline_file_delta_detects_cross_file_node_qn_collision) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t existing = {.project = "test",
+                           .label = "Class",
+                           .name = "Thing",
+                           .qualified_name = "test.src.store.store.Thing",
+                           .file_path = "src/store/store.c",
+                           .start_line = 1,
+                           .end_line = 4,
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &existing), 0);
+
+    cbm_node_t delta_node = {.project = "test",
+                             .label = "Class",
+                             .name = "Thing",
+                             .qualified_name = "test.src.store.store.Thing",
+                             .file_path = "src/store/store.h",
+                             .start_line = 1,
+                             .end_line = 1,
+                             .properties_json = "{}"};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "src/store/store.h", .node_count = 1},
+        .nodes = &delta_node,
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_UPSERT,
+    };
+    delta.delta.nodes = &delta_node;
+
+    bool collision = false;
+    ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
+              CBM_STORE_OK);
+    ASSERT_TRUE(collision);
+
+    delta_node.file_path = "src/store/store.c";
+    collision = true;
+    ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
+              CBM_STORE_OK);
+    ASSERT_FALSE(collision);
+
+    cbm_store_close(s);
+    PASS();
 }
 
 static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta,
@@ -13186,6 +13264,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
     RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
+    RUN_TEST(pipeline_file_delta_detects_cross_file_node_qn_collision);
     RUN_TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
