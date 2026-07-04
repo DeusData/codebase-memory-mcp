@@ -2452,12 +2452,9 @@ TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential) {
     ASSERT_GT(n, 0);
     ASSERT_LT((size_t)n, sizeof(target_qn));
 
-    char base_file_qn[CBM_SZ_512];
     char openapi_module_qn[CBM_SZ_512];
-    n = snprintf(base_file_qn, sizeof(base_file_qn), "%s.fastapi.security.base.__file__",
-                 project);
-    ASSERT_GT(n, 0);
-    ASSERT_LT((size_t)n, sizeof(base_file_qn));
+    char *base_file_qn = cbm_pipeline_fqn_compute(project, "fastapi/security/base.py", "__file__");
+    ASSERT_NOT_NULL(base_file_qn);
     n = snprintf(openapi_module_qn, sizeof(openapi_module_qn), "%s.fastapi.openapi.models",
                  project);
     ASSERT_GT(n, 0);
@@ -2472,6 +2469,7 @@ TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential) {
     ASSERT_TRUE(
         pipeline_store_has_edge_between_qns(par_db, project, src_qn, "INHERITS", target_qn));
 
+    free(base_file_qn);
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = cbm_test_compare_canonical_graphs(seq_db, par_db, project, diff_err,
                                                     sizeof(diff_err));
@@ -9116,8 +9114,8 @@ TEST(import_edge_helper_escapes_local_name_once) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
 
-    int64_t source_file =
-        cbm_gbuf_upsert_node(gb, "File", "main.py", "proj.main.__file__", "main.py", 1, 1, "{}");
+    int64_t source_file = cbm_gbuf_upsert_node(gb, "File", "main.py",
+                                               "proj.main.py.__file__", "main.py", 1, 1, "{}");
     int64_t target_fn =
         cbm_gbuf_upsert_node(gb, "Function", "factory", "proj.pkg.factory", "pkg.py", 1, 1, "{}");
     ASSERT_GT(source_file, 0);
@@ -9170,8 +9168,8 @@ TEST(import_edge_helper_preserves_long_local_name) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
 
-    int64_t source_file =
-        cbm_gbuf_upsert_node(gb, "File", "main.py", "proj.main.__file__", "main.py", 1, 1, "{}");
+    int64_t source_file = cbm_gbuf_upsert_node(gb, "File", "main.py",
+                                               "proj.main.py.__file__", "main.py", 1, 1, "{}");
     int64_t target_fn =
         cbm_gbuf_upsert_node(gb, "Function", "factory", "proj.pkg.factory", "pkg.py", 1, 1, "{}");
     ASSERT_GT(source_file, 0);
@@ -9212,14 +9210,15 @@ TEST(import_map_from_edges_follows_package_reexport) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
 
-    int64_t source_file =
-        cbm_gbuf_upsert_node(gb, "File", "main.py", "proj.app.main.__file__", "app/main.py", 1,
-                             1, "{}");
+    int64_t source_file = cbm_gbuf_upsert_node(gb, "File", "main.py",
+                                               "proj.app.main.py.__file__", "app/main.py", 1,
+                                               1, "{}");
     int64_t package_module =
         cbm_gbuf_upsert_node(gb, "Folder", "fastapi", "proj.fastapi", "fastapi", 1,
                              1, "{}");
-    int64_t package_file = cbm_gbuf_upsert_node(gb, "File", "__init__.py", "proj.fastapi.__file__",
-                                                "fastapi/__init__.py", 1, 1, "{}");
+    int64_t package_file =
+        cbm_gbuf_upsert_node(gb, "File", "__init__.py", "proj.fastapi.__init__.py.__file__",
+                             "fastapi/__init__.py", 1, 1, "{}");
     int64_t wrong_header = cbm_gbuf_upsert_node(gb, "Class", "Header",
                                                 "proj.fastapi.openapi.models.Header",
                                                 "fastapi/openapi/models.py", 1, 1, "{}");

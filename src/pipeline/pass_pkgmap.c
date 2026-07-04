@@ -1572,7 +1572,44 @@ static const cbm_gbuf_node_t *find_file_node_for_module_qn(const cbm_gbuf_t *gbu
     if (n <= 0 || (size_t)n >= sizeof(file_qn)) {
         return NULL;
     }
-    return cbm_gbuf_find_by_qn(gbuf, file_qn);
+    const cbm_gbuf_node_t *exact = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    if (exact) {
+        return exact;
+    }
+
+    char qn_prefix[PKGMAP_PATH_BUF];
+    n = snprintf(qn_prefix, sizeof(qn_prefix), "%s.", module_qn);
+    if (n <= 0 || (size_t)n >= sizeof(qn_prefix)) {
+        return NULL;
+    }
+
+    const cbm_gbuf_node_t **files = NULL;
+    int file_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "File", &files, &file_count) != 0 || !files) {
+        return NULL;
+    }
+
+    static const char file_qn_suffix[] = ".__file__";
+    const cbm_gbuf_node_t *best = NULL;
+    size_t best_len = 0;
+    bool best_ambiguous = false;
+    for (int i = 0; i < file_count; i++) {
+        const cbm_gbuf_node_t *node = files[i];
+        const char *qn = node ? node->qualified_name : NULL;
+        if (!qn || !cbm_str_starts_with(qn, qn_prefix) ||
+            !cbm_str_ends_with(qn, file_qn_suffix)) {
+            continue;
+        }
+        size_t qn_len = strlen(qn);
+        if (!best || qn_len < best_len) {
+            best = node;
+            best_len = qn_len;
+            best_ambiguous = false;
+        } else if (qn_len == best_len && best) {
+            best_ambiguous = true;
+        }
+    }
+    return best_ambiguous ? NULL : best;
 }
 
 static const cbm_gbuf_node_t *resolve_reexported_symbol(cbm_pipeline_ctx_t *ctx,
