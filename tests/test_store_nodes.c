@@ -1877,6 +1877,70 @@ TEST(store_overlay_node_view_summary_counts_latest_ready_overlay) {
     PASS();
 }
 
+TEST(store_overlay_additions_keep_canonical_file_rows_visible) {
+    enum { BASE_GENERATION = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t stable = {.project = "test",
+                         .label = "Function",
+                         .name = "stable",
+                         .qualified_name = "test.stable",
+                         .file_path = "main.h",
+                         .start_line = 1,
+                         .end_line = 3,
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &stable), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t added = {.project = "test",
+                        .label = "Function",
+                        .name = "added",
+                        .qualified_name = "test.added",
+                        .file_path = "main.h",
+                        .start_line = 5,
+                        .end_line = 7,
+                        .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "main.h",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &added,
+                                    .node_count = 1};
+    const cbm_store_file_delta_t *deltas[] = {&delta};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta_additions_batch(s, deltas, 1,
+                                                                   overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
+                                       overlay_generation, "main.h"),
+              0);
+
+    cbm_store_overlay_node_view_summary_t summary = {0};
+    ASSERT_EQ(cbm_store_get_overlay_node_view_summary(s, "test", &summary), CBM_STORE_OK);
+    ASSERT_EQ(summary.overlay_ready_generations, 1);
+    ASSERT_EQ(summary.active_file_tombstones, 0);
+    ASSERT_EQ(summary.canonical_nodes_visible, 1);
+    ASSERT_EQ(summary.overlay_owned_nodes_visible, 1);
+    ASSERT_EQ(summary.total_nodes_visible, 2);
+
+    cbm_node_t found = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn_overlay_view(s, "test", "test.stable", &found),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(found.file_path, "main.h");
+    cbm_node_free_fields(&found);
+    ASSERT_EQ(cbm_store_find_node_by_qn_overlay_view(s, "test", "test.added", &found),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(found.file_path, "main.h");
+    ASSERT_EQ(found.start_line, 5);
+    cbm_node_free_fields(&found);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_overlay_publish_prunes_superseded_file_rows_and_fts) {
     enum { BASE_GENERATION = 1 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -5702,6 +5766,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_file_delta_batch_rolls_back_all_files);
     RUN_TEST(store_overlay_file_delta_publish_rejects_failed_generation);
     RUN_TEST(store_overlay_node_view_summary_counts_latest_ready_overlay);
+    RUN_TEST(store_overlay_additions_keep_canonical_file_rows_visible);
     RUN_TEST(store_overlay_publish_prunes_superseded_file_rows_and_fts);
     RUN_TEST(store_compact_overlay_generation_promotes_metadata_and_cleans_overlay);
     RUN_TEST(store_compact_overlay_generation_promotes_delete_only_tombstone);

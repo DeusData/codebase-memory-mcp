@@ -5770,10 +5770,11 @@ static int store_overlay_insert_metadata_body(cbm_store_t *s,
     return store_overlay_insert_delta_meta_body(s, delta, overlay_generation);
 }
 
-int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
-                                               const cbm_store_file_delta_t *const *deltas,
-                                               int delta_count,
-                                               int64_t overlay_generation) {
+static int store_publish_overlay_file_delta_batch(cbm_store_t *s,
+                                                  const cbm_store_file_delta_t *const *deltas,
+                                                  int delta_count,
+                                                  int64_t overlay_generation,
+                                                  bool replace_files) {
     if (!s || !s->db || overlay_generation <= 0 || !deltas || delta_count <= 0) {
         if (s) {
             store_set_error(s, "publish_overlay_file_delta: invalid argument");
@@ -5812,11 +5813,13 @@ int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
             (void)cbm_store_rollback(s);
             return rc;
         }
-        rc = store_overlay_insert_file_tombstone_body(s, delta->project, overlay_generation,
-                                                      delta->rel_path);
-        if (rc != CBM_STORE_OK) {
-            (void)cbm_store_rollback(s);
-            return rc;
+        if (replace_files) {
+            rc = store_overlay_insert_file_tombstone_body(s, delta->project, overlay_generation,
+                                                          delta->rel_path);
+            if (rc != CBM_STORE_OK) {
+                (void)cbm_store_rollback(s);
+                return rc;
+            }
         }
         rc = store_overlay_insert_nodes_body(s, delta, overlay_generation);
         if (rc != CBM_STORE_OK) {
@@ -5855,6 +5858,19 @@ int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
         return rc;
     }
     return CBM_STORE_OK;
+}
+
+int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *const *deltas,
+                                               int delta_count,
+                                               int64_t overlay_generation) {
+    return store_publish_overlay_file_delta_batch(s, deltas, delta_count, overlay_generation, true);
+}
+
+int cbm_store_publish_overlay_file_delta_additions_batch(
+    cbm_store_t *s, const cbm_store_file_delta_t *const *deltas, int delta_count,
+    int64_t overlay_generation) {
+    return store_publish_overlay_file_delta_batch(s, deltas, delta_count, overlay_generation, false);
 }
 
 int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
@@ -6503,7 +6519,29 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
     }
 
     static const char sql[] =
-        "WITH active_files AS ("
+        "WITH active_overlay_files AS ("
+        "  SELECT rel_path, MAX(overlay_generation) AS overlay_generation"
+        "  FROM ("
+        "    SELECT n.rel_path, n.overlay_generation"
+        "    FROM overlay_nodes n"
+        "    JOIN overlay_generations g"
+        "      ON g.project = n.project AND g.overlay_generation = n.overlay_generation"
+        "    WHERE n.project = ?1 AND g.status = ?2"
+        "    UNION"
+        "    SELECT e.rel_path, e.overlay_generation"
+        "    FROM overlay_edges e"
+        "    JOIN overlay_generations g"
+        "      ON g.project = e.project AND g.overlay_generation = e.overlay_generation"
+        "    WHERE e.project = ?1 AND g.status = ?2"
+        "    UNION"
+        "    SELECT t.rel_path, t.overlay_generation"
+        "    FROM overlay_tombstones t"
+        "    JOIN overlay_generations g"
+        "      ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
+        "    WHERE t.project = ?1 AND g.status = ?2 AND t.active = ?4"
+        "  ) overlay_files"
+        "  GROUP BY rel_path"
+        "), active_file_tombstones AS ("
         "  SELECT t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
         "  FROM overlay_tombstones t"
         "  JOIN overlay_generations g"
@@ -6514,13 +6552,13 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
         "SELECT "
         "  (SELECT COUNT(*) FROM overlay_generations g"
         "    WHERE g.project = ?1 AND g.status = ?2) AS ready_generations,"
-        "  (SELECT COUNT(*) FROM active_files) AS active_files,"
+        "  (SELECT COUNT(*) FROM active_file_tombstones) AS active_files,"
         "  (SELECT COUNT(*) FROM nodes n"
         "    WHERE n.project = ?1"
-        "      AND NOT EXISTS (SELECT 1 FROM active_files af"
+        "      AND NOT EXISTS (SELECT 1 FROM active_file_tombstones af"
         "                      WHERE af.rel_path = n.file_path)) AS canonical_visible,"
         "  (SELECT COUNT(*) FROM overlay_nodes n"
-        "    JOIN active_files af"
+        "    JOIN active_overlay_files af"
         "      ON af.rel_path = n.rel_path AND af.overlay_generation = n.overlay_generation"
         "    WHERE n.project = ?1 AND n.owned = ?5) AS overlay_visible;";
 
@@ -7887,7 +7925,29 @@ static bool search_overlay_needs_active_edges(const cbm_search_params_t *params)
 int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges,
                                        bool recursive) {
     int n = snprintf(buf, buf_sz,
-                     "%s active_files AS ("
+                     "%s active_overlay_files AS ("
+                     "  SELECT project, rel_path, MAX(overlay_generation) AS overlay_generation"
+                     "  FROM ("
+                     "    SELECT n.project, n.rel_path, n.overlay_generation"
+                     "    FROM overlay_nodes n"
+                     "    JOIN overlay_generations g"
+                     "      ON g.project = n.project AND g.overlay_generation = n.overlay_generation"
+                     "    WHERE g.status = ?1"
+                     "    UNION"
+                     "    SELECT e.project, e.rel_path, e.overlay_generation"
+                     "    FROM overlay_edges e"
+                     "    JOIN overlay_generations g"
+                     "      ON g.project = e.project AND g.overlay_generation = e.overlay_generation"
+                     "    WHERE g.status = ?1"
+                     "    UNION"
+                     "    SELECT t.project, t.rel_path, t.overlay_generation"
+                     "    FROM overlay_tombstones t"
+                     "    JOIN overlay_generations g"
+                     "      ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
+                     "    WHERE g.status = ?1 AND t.active = %d"
+                     "  ) overlay_files"
+                     "  GROUP BY project, rel_path"
+                     "), active_file_tombstones AS ("
                      "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
                      "  FROM overlay_tombstones t"
                      "  JOIN overlay_generations g"
@@ -7899,14 +7959,14 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                      "         n.qualified_name, n.file_path, n.start_line, n.end_line,"
                      "         n.properties"
                      "  FROM nodes n"
-                     "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
+                     "  WHERE NOT EXISTS (SELECT 1 FROM active_file_tombstones af"
                      "                    WHERE af.project = n.project AND af.rel_path = n.file_path)"
                      "  UNION ALL"
                      "  SELECT 1 AS overlay_row, %d AS id, n.project, n.label, n.name,"
                      "         n.qualified_name, n.file_path, n.start_line, n.end_line,"
                      "         n.properties"
                      "  FROM overlay_nodes n"
-                     "  JOIN active_files af"
+                     "  JOIN active_overlay_files af"
                      "    ON af.project = n.project AND af.rel_path = n.rel_path"
                      "   AND af.overlay_generation = n.overlay_generation"
                      "  WHERE n.owned = %d"
@@ -7936,7 +7996,7 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                      "  WHERE rn = 1"
                      ")",
                      recursive ? "WITH RECURSIVE" : "WITH", STORE_OVERLAY_TOMBSTONE_ACTIVE,
-                     CBM_STORE_NO_NODE_ID,
+                     STORE_OVERLAY_TOMBSTONE_ACTIVE, CBM_STORE_NO_NODE_ID,
                      STORE_OVERLAY_ROW_OWNED);
     if (n < 0 || (size_t)n >= buf_sz) {
         return CBM_STORE_ERR;
@@ -7955,14 +8015,14 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                  "  FROM edges e"
                  "  JOIN nodes s ON s.id = e.source_id"
                  "  JOIN nodes t ON t.id = e.target_id"
-                 "  WHERE NOT EXISTS (SELECT 1 FROM active_files af"
+                 "  WHERE NOT EXISTS (SELECT 1 FROM active_file_tombstones af"
                  "                    WHERE af.project = s.project AND af.rel_path = s.file_path)"
-                 "    AND NOT EXISTS (SELECT 1 FROM active_files af"
+                 "    AND NOT EXISTS (SELECT 1 FROM active_file_tombstones af"
                  "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
                  "  UNION"
                  "  SELECT e.source_qn, e.target_qn, e.type, e.properties"
                  "  FROM overlay_edges e"
-                 "  JOIN active_files af"
+                 "  JOIN active_overlay_files af"
                  "    ON af.project = e.project AND af.rel_path = e.rel_path"
                  "   AND af.overlay_generation = e.overlay_generation"
                  "  WHERE e.owned = %d"
