@@ -45,6 +45,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_OVERLAY_STATUS_COMPACTING "compacting"
 #define CBM_STORE_OVERLAY_STATUS_COMPACTED "compacted"
 #define CBM_STORE_OVERLAY_STATUS_FAILED "failed"
+#define CBM_STORE_COMPACT_ALL_GENERATIONS 0
 #define CBM_STORE_OVERLAY_TOMBSTONE_FILE "file"
 #define CBM_STORE_DERIVED_GENERATION_UNKNOWN 0
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
@@ -703,6 +704,13 @@ int cbm_store_recover_overlay_compaction_claims(cbm_store_t *s, const char *proj
 int cbm_store_compact_next_overlay_generation(cbm_store_t *s, const char *project,
                                               int64_t *out_overlay_generation,
                                               int64_t *out_index_generation);
+/* Compact ready overlay generations by repeatedly calling compact_next.
+ * max_generations=CBM_STORE_COMPACT_ALL_GENERATIONS drains all currently ready
+ * work; positive values cap how many generations this API call compacts.
+ * Returns OK with out_compacted=0 when no work is ready. */
+int cbm_store_compact_ready_overlay_generations(cbm_store_t *s, const char *project,
+                                                int max_generations,
+                                                int *out_compacted);
 
 /* Publish one file's replacement facts into overlay storage. This does not
  * mutate canonical nodes/edges; active read paths decide later how to combine
