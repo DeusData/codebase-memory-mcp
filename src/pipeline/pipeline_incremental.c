@@ -38,8 +38,6 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 
 /* ── Timing helper (same as pipeline.c) ──────────────────────────── */
 
-static const char cbm_incr_test_env_disabled[] = "0";
-
 /* Fork renames this elapsed_ms_incr (vs pipeline.c's elapsed_ms) to avoid an
  * ODR/duplicate-symbol collision when both TUs are linked into the same binary. */
 static double elapsed_ms_incr(struct timespec start) {
@@ -63,14 +61,6 @@ static const char *itoa_buf_incr(int v) {
 
 static void free_mode_skipped(cbm_file_hash_t *ms, int count);
 static void free_deleted_paths(char **deleted, int count);
-
-static bool incr_test_fail_phase_enabled(const char *phase) {
-    char buf[CBM_SZ_64];
-    const char *val =
-        cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
-    return val && val[0] != '\0' && strcmp(val, cbm_incr_test_env_disabled) != 0 &&
-           phase && strcmp(val, phase) == 0;
-}
 
 static bool incr_is_c_family_header(CBMLanguage lang, const char *rel_path) {
     if (!rel_path) {
@@ -270,7 +260,7 @@ static int find_deleted_files(const char *repo_path, cbm_file_info_t *files, int
     }
 
     int rc = CBM_STORE_OK;
-    if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED)) {
+    if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED)) {
         cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED,
                       "rc", itoa_buf_incr(CBM_STORE_ERR));
         rc = CBM_STORE_ERR;
@@ -720,7 +710,7 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
     int current_failed = 0;
     int ms_failed = 0;
 
-    if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST)) {
+    if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST)) {
         cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST, "rc",
                       itoa_buf_incr(CBM_STORE_ERR));
         return CBM_STORE_ERR;
@@ -840,7 +830,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         CBMFileResult **cache = (CBMFileResult **)calloc(ci, sizeof(CBMFileResult *));
         if (cache) {
             int rc = 0;
-            if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_EXTRACT)) {
+            if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_EXTRACT)) {
                 cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_EXTRACT, "rc",
                               itoa_buf_incr(CBM_NOT_FOUND));
                 incr_free_result_cache(cache, ci);
@@ -857,7 +847,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
                 return rc;
             }
 
-            if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_REGISTRY)) {
+            if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_REGISTRY)) {
                 cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_REGISTRY, "rc",
                               itoa_buf_incr(CBM_NOT_FOUND));
                 incr_free_result_cache(cache, ci);
@@ -885,7 +875,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
              * still fires; cross-file resolution is deferred to the
              * next full re-index. Pass NULL/0/NULL to make the fused
              * step in resolve_worker a no-op. */
-            if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_RESOLVE)) {
+            if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_RESOLVE)) {
                 cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_RESOLVE, "rc",
                               itoa_buf_incr(CBM_NOT_FOUND));
                 incr_free_result_cache(cache, ci);
@@ -2162,7 +2152,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
     if (pipeline_rc == 0) {
-        if (incr_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_POSTPASS)) {
+        if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_POSTPASS)) {
             cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_POSTPASS, "rc",
                           itoa_buf_incr(CBM_NOT_FOUND));
             pipeline_rc = CBM_NOT_FOUND;

@@ -1489,6 +1489,11 @@ int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
     if (rc != CBM_STORE_OK) {
         return rc;
     }
+    if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH)) {
+        (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
+                                                      CBM_STORE_OVERLAY_STATUS_FAILED);
+        return CBM_STORE_ERR;
+    }
 
     const cbm_store_file_delta_t **store_deltas =
         malloc((size_t)delta_count * sizeof(*store_deltas));
