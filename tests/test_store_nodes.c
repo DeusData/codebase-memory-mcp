@@ -3001,7 +3001,7 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
                                  .source_id = same_stem_module_id,
                                  .target_id = same_stem_h_fn_id,
                                  .type = "CALLS",
-                                 .properties_json = "{}"};
+                                 .properties_json = "{\"confidence\":0.75}"};
     int64_t same_stem_call_id = cbm_store_insert_edge(s, &same_stem_call);
     ASSERT_GT(same_stem_call_id, 0);
 
@@ -3071,6 +3071,7 @@ TEST(store_rebuild_file_delta_owners_derives_from_graph) {
     ASSERT_STR_EQ(inbound[0].source_qn, "test.src.pipeline.pipeline");
     ASSERT_STR_EQ(inbound[0].target_qn, "test.src.pipeline.pipeline.cbm_pipeline_mode");
     ASSERT_STR_EQ(inbound[0].type, "CALLS");
+    ASSERT_STR_EQ(inbound[0].properties_json, "{\"confidence\":0.75}");
     ASSERT_STR_EQ(inbound[0].source_rel_path, "src/pipeline/pipeline.c");
     ASSERT_STR_EQ(inbound[0].target_rel_path, "src/pipeline/pipeline.h");
     ASSERT_STR_EQ(inbound[0].edge_rel_path, "src/pipeline/pipeline.c");

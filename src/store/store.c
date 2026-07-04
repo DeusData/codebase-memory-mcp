@@ -3020,6 +3020,7 @@ void cbm_store_free_inbound_edges(cbm_store_inbound_edge_t *edges, int count) {
         free(edges[i].source_qn);
         free(edges[i].target_qn);
         free(edges[i].type);
+        free(edges[i].properties_json);
         free(edges[i].source_rel_path);
         free(edges[i].target_rel_path);
         free(edges[i].edge_rel_path);
@@ -3061,7 +3062,7 @@ int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
     }
 
     const char *sql =
-        "SELECT src.qualified_name, tgt.qualified_name, e.type, "
+        "SELECT src.qualified_name, tgt.qualified_name, e.type, COALESCE(e.properties, '{}'), "
         "       COALESCE(src_owner.rel_path, ''), COALESCE(tgt_owner.rel_path, ''), "
         "       COALESCE(edge_owner.rel_path, '') "
         "FROM edges e "
@@ -3101,11 +3102,12 @@ int cbm_store_list_file_delta_inbound_edges(cbm_store_t *s, const char *project,
         edge->source_qn = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         edge->target_qn = heap_strdup((const char *)sqlite3_column_text(stmt, 1));
         edge->type = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
-        edge->source_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
-        edge->target_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
-        edge->edge_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 5));
-        if (!edge->source_qn || !edge->target_qn || !edge->type || !edge->source_rel_path ||
-            !edge->target_rel_path || !edge->edge_rel_path) {
+        edge->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, 3));
+        edge->source_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 4));
+        edge->target_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 5));
+        edge->edge_rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 6));
+        if (!edge->source_qn || !edge->target_qn || !edge->type || !edge->properties_json ||
+            !edge->source_rel_path || !edge->target_rel_path || !edge->edge_rel_path) {
             rc = CBM_STORE_ERR;
             break;
         }

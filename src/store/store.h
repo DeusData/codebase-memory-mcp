@@ -140,6 +140,7 @@ typedef struct {
     char *source_qn;
     char *target_qn;
     char *type;
+    char *properties_json;
     char *source_rel_path; /* empty when source node has no owner metadata */
     char *target_rel_path;
     char *edge_rel_path; /* empty when the inbound edge has no owner metadata */

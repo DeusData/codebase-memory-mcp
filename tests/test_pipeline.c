@@ -3567,6 +3567,20 @@ static const cbm_store_delta_edge_t *pipeline_delta_find_edge(const cbm_pipeline
     return NULL;
 }
 
+static const cbm_store_delta_edge_t *pipeline_delta_find_edge_by_qn(
+    const cbm_pipeline_file_delta_t *delta, const char *source_qn, const char *target_qn,
+    const char *type) {
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &delta->edges[i];
+        if (edge->source_qn && edge->target_qn && edge->type &&
+            strcmp(edge->source_qn, source_qn) == 0 &&
+            strcmp(edge->target_qn, target_qn) == 0 && strcmp(edge->type, type) == 0) {
+            return edge;
+        }
+    }
+    return NULL;
+}
+
 static const cbm_store_import_ref_t *pipeline_delta_first_import(
     const cbm_pipeline_file_delta_t *delta) {
     return delta->delta.import_count > 0 ? &delta->imports[0] : NULL;
@@ -4006,6 +4020,81 @@ TEST(pipeline_file_delta_descriptor_from_gbuf) {
 
     cbm_pipeline_file_delta_free(&delta);
     cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay) {
+    const char *project = "test";
+    const char *target_rel = "target.go";
+    const char *caller_rel = "caller.go";
+    const char *target_qn = "test.target.Handle";
+    const char *stale_qn = "test.target.Legacy";
+    const char *caller_qn = "test.caller.Call";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    int64_t target_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, target_rel, target_qn);
+    int64_t stale_id = pipeline_delta_seed_existing_ownership_id(s, project, target_rel, stale_qn);
+    int64_t caller_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, caller_rel, caller_qn);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(stale_id, 0);
+    ASSERT_GT(caller_id, 0);
+
+    cbm_edge_t call_edge = {.project = (char *)project,
+                            .source_id = caller_id,
+                            .target_id = target_id,
+                            .type = "CALLS",
+                            .properties_json = "{\"confidence\":0.9}"};
+    cbm_edge_t stale_edge = {.project = (char *)project,
+                             .source_id = caller_id,
+                             .target_id = stale_id,
+                             .type = "CALLS",
+                             .properties_json = "{\"stale\":true}"};
+    cbm_edge_t recomputed_edge = {.project = (char *)project,
+                                  .source_id = caller_id,
+                                  .target_id = target_id,
+                                  .type = CBM_PIPELINE_EDGE_SIMILAR_TO,
+                                  .properties_json = "{\"score\":1.0}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &call_edge), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &stale_edge), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &recomputed_edge), 0);
+    ASSERT_EQ(cbm_store_rebuild_file_delta_owners(s, project, 1), CBM_STORE_OK);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "Handle", target_qn, target_rel, 3, 7,
+                                   "{\"is_exported\":true}"),
+              0);
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, project, target_rel, 1, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.delta.edge_count, 0);
+
+    int added = -1;
+    ASSERT_EQ(cbm_pipeline_file_delta_add_preserved_inbound_edges(s, &delta, &added),
+              CBM_STORE_OK);
+    ASSERT_EQ(added, 1);
+    ASSERT_EQ(delta.delta.edge_count, 1);
+    const cbm_store_delta_edge_t *preserved =
+        pipeline_delta_find_edge_by_qn(&delta, caller_qn, target_qn, "CALLS");
+    ASSERT_NOT_NULL(preserved);
+    ASSERT_STR_EQ(preserved->properties_json, "{\"confidence\":0.9}");
+    ASSERT_NULL(pipeline_delta_find_edge_by_qn(&delta, caller_qn, stale_qn, "CALLS"));
+    ASSERT_NULL(
+        pipeline_delta_find_edge_by_qn(&delta, caller_qn, target_qn, CBM_PIPELINE_EDGE_SIMILAR_TO));
+
+    added = -1;
+    ASSERT_EQ(cbm_pipeline_file_delta_add_preserved_inbound_edges(s, &delta, &added),
+              CBM_STORE_OK);
+    ASSERT_EQ(added, 0);
+    ASSERT_EQ(delta.delta.edge_count, 1);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -13006,6 +13095,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
     RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
+    RUN_TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint);

@@ -833,6 +833,13 @@ static bool delta_derived_view_supported(const cbm_store_file_delta_t *delta) {
                      strcmp(delta->derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS) == 0);
 }
 
+bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type) {
+    return type && (strcmp(type, CBM_PIPELINE_EDGE_SIMILAR_TO) == 0 ||
+                    strcmp(type, CBM_PIPELINE_EDGE_SEMANTICALLY_RELATED) == 0 ||
+                    strcmp(type, CBM_PIPELINE_EDGE_FILE_CHANGES_WITH) == 0 ||
+                    strcmp(type, CBM_PIPELINE_EDGE_DATA_FLOWS) == 0);
+}
+
 static bool delta_existing_or_insert_ownership_supported(
     cbm_store_t *store, const cbm_pipeline_file_delta_t *file_delta,
     cbm_pipeline_file_delta_plan_t *plan) {
@@ -965,6 +972,81 @@ static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const cha
         }
     }
     return false;
+}
+
+static int delta_append_preserved_inbound_edge(cbm_pipeline_file_delta_t *delta,
+                                               const cbm_store_inbound_edge_t *edge) {
+    if (!delta || !edge || !edge->source_qn || !edge->target_qn || !edge->type) {
+        return CBM_STORE_ERR;
+    }
+    if (delta->delta.edge_count >= INT_MAX) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_delta_edge_t *next =
+        realloc(delta->edges, (size_t)(delta->delta.edge_count + 1) * sizeof(*next));
+    if (!next) {
+        return CBM_STORE_ERR;
+    }
+    delta->edges = next;
+    delta->delta.edges = next;
+    cbm_store_delta_edge_t row = {
+        .source_qn = delta_strdup(edge->source_qn),
+        .target_qn = delta_strdup(edge->target_qn),
+        .type = delta_strdup(edge->type),
+        .properties_json = delta_strdup(edge->properties_json ? edge->properties_json : "{}"),
+        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!row.source_qn || !row.target_qn || !row.type || !row.properties_json) {
+        delta_edge_free_fields(&row);
+        return CBM_STORE_ERR;
+    }
+    delta->edges[delta->delta.edge_count++] = row;
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
+                                                        cbm_pipeline_file_delta_t *delta,
+                                                        int *out_added) {
+    if (out_added) {
+        *out_added = 0;
+    }
+    if (!store || !delta || !delta->delta.project || !delta->delta.rel_path) {
+        return CBM_STORE_ERR;
+    }
+    if (delta->change_kind != CBM_PIPELINE_DELTA_CHANGE_UPSERT) {
+        return CBM_STORE_OK;
+    }
+
+    cbm_store_inbound_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_store_list_file_delta_inbound_edges(store, delta->delta.project,
+                                                     delta->delta.rel_path, &edges, &edge_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    const cbm_pipeline_file_delta_t *single_delta[] = {delta};
+    int added = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_store_inbound_edge_t *edge = &edges[i];
+        if (cbm_pipeline_delta_edge_type_is_recomputed(edge->type) ||
+            !delta_node_qn_present(&delta->delta, edge->target_qn) ||
+            delta_batch_contains_edge(single_delta, 1, edge->source_qn, edge->target_qn,
+                                      edge->type)) {
+            continue;
+        }
+        rc = delta_append_preserved_inbound_edge(delta, edge);
+        if (rc != CBM_STORE_OK) {
+            cbm_store_free_inbound_edges(edges, edge_count);
+            return rc;
+        }
+        added++;
+    }
+    cbm_store_free_inbound_edges(edges, edge_count);
+    if (out_added) {
+        *out_added = added;
+    }
+    return CBM_STORE_OK;
 }
 
 static bool delta_qn_list_contains(const char **qns, int count, const char *qn) {
