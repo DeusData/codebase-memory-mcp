@@ -31,6 +31,16 @@
  */
 wchar_t *cbm_build_cmdline(const char *const *argv);
 
+/*
+ * Test hook for the isolated popen path (#798): returns 1 when the most
+ * recent cbm_popen(..., "r") stream was produced by the isolated
+ * CreateProcessW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST spawn, 0 otherwise
+ * (e.g. a non-read mode routed to _popen, or a failed isolated spawn).
+ * Not synchronized across threads; intended for single-threaded test
+ * assertions only.
+ */
+int cbm_popen_last_was_isolated(void);
+
 #endif /* _WIN32 */
 
 #endif /* CBM_FOUNDATION_COMPAT_FS_INTERNAL_H */

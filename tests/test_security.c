@@ -517,6 +517,47 @@ TEST(exec_no_shell_win_null_argv_returns_error) {
     PASS();
 }
 
+/* ──────────────────────────────────────────────────────────────────
+ *  WINDOWS ISOLATED POPEN (handle-inheritance fix for #798)
+ *
+ *  Regression guard for the UI hang: _popen spawns children with
+ *  bInheritHandles=TRUE, leaking every inheritable handle (listening
+ *  sockets, Winsock/AFD helpers) into git-for-Windows, whose MSYS2
+ *  runtime hangs classifying them via NtQueryObject. cbm_popen must
+ *  instead spawn via CreateProcessW + PROC_THREAD_ATTRIBUTE_HANDLE_LIST.
+ *
+ *  On windows-latest CI (real git-for-Windows) these prove:
+ *    - the returned stream came from the isolated spawn, not _popen
+ *      (cbm_popen_last_was_isolated test hook) — a revert to raw _popen
+ *      turns the hook 0 and fails the guard;
+ *    - stdout and the child exit code round-trip through
+ *      cbm_popen/cbm_pclose.
+ *  NOT proven here: the full UI repro (listening socket + MSYS2 handle
+ *  walk under a single-threaded server) — follow-up harness.
+ * ────────────────────────────────────────────────────────────────── */
+
+TEST(popen_isolated_git_version_round_trip) {
+    FILE *fp = cbm_popen("git --version", "r");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(cbm_popen_last_was_isolated(), 1);
+    char line[256];
+    line[0] = '\0';
+    ASSERT_NOT_NULL(fgets(line, sizeof(line), fp));
+    ASSERT(strncmp(line, "git version", strlen("git version")) == 0);
+    ASSERT_EQ(cbm_pclose(fp), 0);
+    PASS();
+}
+
+TEST(popen_isolated_propagates_exit_code) {
+    /* Runs under `cmd.exe /c`, so a bare `exit 7` is the child exit code;
+     * cbm_pclose must surface it via GetExitCodeProcess. */
+    FILE *fp = cbm_popen("exit 7", "r");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(cbm_popen_last_was_isolated(), 1);
+    ASSERT_EQ(cbm_pclose(fp), 7);
+    PASS();
+}
+
 #endif /* _WIN32 */
 
 /* ══════════════════════════════════════════════════════════════════
@@ -585,5 +626,8 @@ SUITE(security) {
     RUN_TEST(exec_no_shell_win_exit_zero);
     RUN_TEST(exec_no_shell_win_captures_exit_code);
     RUN_TEST(exec_no_shell_win_null_argv_returns_error);
+    /* Isolated popen — handle-inheritance regression guard for #798 */
+    RUN_TEST(popen_isolated_git_version_round_trip);
+    RUN_TEST(popen_isolated_propagates_exit_code);
 #endif
 }
