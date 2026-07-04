@@ -15,6 +15,7 @@
 #include "discover/discover.h"
 #include "foundation/hash_table.h"
 #include "foundation/str_util.h"
+#include "foundation/platform.h"
 #include "cbm.h"
 #include "service_patterns.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
@@ -189,12 +190,23 @@ static inline void cbm_pipeline_close_call_edge_props(char *props, size_t props_
 /* Test-only incremental fault injection. Values name internal phases and are
  * intentionally not user configuration. */
 #define CBM_TEST_FAIL_INCREMENTAL_PHASE "CBM_TEST_FAIL_INCREMENTAL_PHASE"
+#define CBM_TEST_FAIL_INCREMENTAL_DISABLED "0"
 #define CBM_TEST_FAIL_INCREMENTAL_EXTRACT "incr_extract"
 #define CBM_TEST_FAIL_INCREMENTAL_REGISTRY "incr_registry"
 #define CBM_TEST_FAIL_INCREMENTAL_RESOLVE "incr_resolve"
 #define CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED "classify_deleted"
 #define CBM_TEST_FAIL_INCREMENTAL_POSTPASS "postpass"
 #define CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST "hash_persist"
+#define CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH "overlay_publish"
+
+static inline bool cbm_pipeline_test_fail_phase_enabled(const char *phase) {
+    char buf[CBM_SZ_64];
+    const char *val =
+        cbm_safe_getenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' &&
+           strcmp(val, CBM_TEST_FAIL_INCREMENTAL_DISABLED) != 0 && phase &&
+           strcmp(val, phase) == 0;
+}
 
 /* ── Pipeline context (internal) ─────────────────────────────────── */
 

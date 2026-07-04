@@ -8568,6 +8568,21 @@ static int pipeline_store_completed_generation_count(const char *db_path, const 
                                                   CBM_STORE_INDEX_STATUS_COMPLETE);
 }
 
+static int pipeline_store_overlay_generation_status_count(const char *db_path,
+                                                          const char *project,
+                                                          const char *status) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int count = CBM_STORE_ERR;
+    if (cbm_store_count_overlay_generations(s, project, status, &count) != CBM_STORE_OK) {
+        count = CBM_STORE_ERR;
+    }
+    cbm_store_close(s);
+    return count;
+}
+
 static int pipeline_store_count_file_rows_sql(const char *db_path, const char *project,
                                               const char *rel_path, const char *sql,
                                               int *out_count) {
@@ -10814,6 +10829,71 @@ TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent) {
     PASS();
 }
 
+TEST(incremental_overlay_publish_failure_falls_back_to_canonical_exact) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayFailureOnly"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func OverlayFailureOnly() int {\n\treturn 88\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH, 1);
+    int run_rc = cbm_pipeline_run(p);
+    pipeline_env_restore(&fail_env);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT(cbm_pipeline_graph_changed(p));
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(pipeline_store_overlay_generation_status_count(
+                  g_incr_dbpath, project, CBM_STORE_OVERLAY_STATUS_FAILED),
+              1);
+    ASSERT_EQ(pipeline_store_overlay_generation_status_count(
+                  g_incr_dbpath, project, CBM_STORE_OVERLAY_STATUS_READY),
+              0);
+    ASSERT_EQ(pipeline_store_generation_status_count(g_incr_dbpath, project,
+                                                     CBM_STORE_INDEX_STATUS_RESERVED),
+              0);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayFailureOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -12980,6 +13060,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
+    RUN_TEST(incremental_overlay_publish_failure_falls_back_to_canonical_exact);
     RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
     RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
     RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
