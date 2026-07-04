@@ -4125,6 +4125,72 @@ int cbm_store_recover_overlay_compaction_claims(cbm_store_t *s, const char *proj
     return CBM_STORE_OK;
 }
 
+static int store_release_overlay_compaction_claim(cbm_store_t *s, const char *project,
+                                                  int64_t overlay_generation) {
+    static const char sql[] =
+        "DELETE FROM overlay_compaction_claims WHERE project = ?1 AND overlay_generation = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "release_overlay_compaction_claim prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "release_overlay_compaction_claim");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_compact_next_overlay_generation(cbm_store_t *s, const char *project,
+                                              int64_t *out_overlay_generation,
+                                              int64_t *out_index_generation) {
+    if (out_overlay_generation) {
+        *out_overlay_generation = 0;
+    }
+    if (out_index_generation) {
+        *out_index_generation = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out_overlay_generation ||
+        !out_index_generation) {
+        if (s) {
+            store_set_error(s, "compact_next_overlay_generation: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    int64_t overlay_generation = 0;
+    int64_t base_generation = 0;
+    int rc = cbm_store_claim_ready_overlay_generation(s, project, &overlay_generation,
+                                                      &base_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    int64_t index_generation = 0;
+    rc = cbm_store_reserve_index_generation(s, project, NULL, NULL, &index_generation);
+    if (rc != CBM_STORE_OK) {
+        (void)store_release_overlay_compaction_claim(s, project, overlay_generation);
+        return rc;
+    }
+
+    rc = cbm_store_compact_overlay_generation(s, project, overlay_generation, index_generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_finish_index_generation(s, project, index_generation,
+                                                CBM_STORE_INDEX_STATUS_FAILED);
+        (void)store_release_overlay_compaction_claim(s, project, overlay_generation);
+        return rc;
+    }
+
+    (void)base_generation;
+    *out_overlay_generation = overlay_generation;
+    *out_index_generation = index_generation;
+    return CBM_STORE_OK;
+}
+
 static int store_resolve_node_id(cbm_store_t *s, const char *project, const char *qn,
                                  int64_t *out_id) {
     const char *qns[1] = {qn};
