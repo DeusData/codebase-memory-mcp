@@ -1729,7 +1729,7 @@ TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay) {
     PASS();
 }
 
-TEST(tool_query_graph_keeps_id_and_degree_queries_canonical_with_ready_overlay) {
+TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -1763,8 +1763,10 @@ TEST(tool_query_graph_keeps_id_and_degree_queries_canonical_with_ready_overlay) 
     ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
               CBM_STORE_OK);
 
-    const char *queries[] = {"MATCH (f:Function) RETURN id(f), f.name LIMIT 5",
-                             "MATCH (f:Function) RETURN f.out_degree, f.name LIMIT 5"};
+    const char *queries[] = {
+        "MATCH (f:Function) RETURN id(f), f.name LIMIT 5",
+        "MATCH (f:Function) RETURN f.out_degree, f.name LIMIT 5",
+        "MATCH (f:Function) WHERE NOT EXISTS { (f)-[:CALLS]->() } RETURN f.name LIMIT 5"};
     for (size_t i = 0; i < sizeof(queries) / sizeof(queries[0]); i++) {
         char req[CBM_SZ_4K];
         int n = snprintf(req, sizeof(req),
@@ -5124,7 +5126,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_query_graph_uses_ready_overlay_for_node_only_query);
     RUN_TEST(tool_query_graph_keeps_relationship_query_canonical_with_ready_overlay);
-    RUN_TEST(tool_query_graph_keeps_id_and_degree_queries_canonical_with_ready_overlay);
+    RUN_TEST(tool_query_graph_keeps_edge_derived_queries_canonical_with_ready_overlay);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
     RUN_TEST(tool_query_graph_warns_on_stale_semantic_edges);
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);
