@@ -85,6 +85,54 @@ static bool incr_changed_contains_c_family_header(const cbm_file_info_t *changed
     return false;
 }
 
+static bool incr_file_delta_has_type_like_node(const cbm_pipeline_file_delta_t *delta) {
+    if (!delta || delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
+        return false;
+    }
+    for (int i = 0; i < delta->delta.node_count; i++) {
+        const cbm_node_t *node = &delta->delta.nodes[i];
+        if (cbm_label_is_type_like(node->label)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool incr_same_stem_impl_exists(const char *path) {
+    static const char *const impl_exts[] = {".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".cu"};
+    if (!path || !path[0]) {
+        return false;
+    }
+    const char *dot = strrchr(path, '.');
+    if (!dot || dot == path) {
+        return false;
+    }
+    size_t stem_len = (size_t)(dot - path);
+    if (stem_len >= CBM_PATH_MAX || stem_len > (size_t)INT_MAX) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(impl_exts) / sizeof(impl_exts[0]); i++) {
+        char candidate[CBM_PATH_MAX];
+        int n = snprintf(candidate, sizeof(candidate), "%.*s%s", (int)stem_len, path,
+                         impl_exts[i]);
+        if (n < 0 || (size_t)n >= sizeof(candidate)) {
+            continue;
+        }
+        if (cbm_file_exists(candidate)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool incr_header_overlay_has_type_impl_pair(const cbm_file_info_t *file,
+                                                   const cbm_pipeline_file_delta_t *delta) {
+    if (!file || !incr_is_c_family_header(file->language, file->rel_path)) {
+        return false;
+    }
+    return incr_file_delta_has_type_like_node(delta) && incr_same_stem_impl_exists(file->path);
+}
+
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored metadata.
@@ -1561,6 +1609,12 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
             cbm_pipeline_set_publish_reason(p, "overlay_metadata");
             cbm_log_info("incremental.overlay.fallback", "reason", "metadata", "rc",
                          itoa_buf_incr(rc));
+            goto cleanup;
+        }
+        if (incr_header_overlay_has_type_impl_pair(&changed_files[i], &deltas[i])) {
+            cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR);
+            cbm_log_info("incremental.overlay.fallback", "reason",
+                         CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR);
             goto cleanup;
         }
         int preserved = 0;

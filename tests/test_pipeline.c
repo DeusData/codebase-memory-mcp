@@ -10212,6 +10212,73 @@ TEST(incremental_overlay_publish_single_c_header_uses_active_overlay) {
     PASS();
 }
 
+TEST(incremental_overlay_single_c_header_type_impl_pair_falls_back) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char header_path[CBM_PATH_MAX];
+    char source_path[CBM_PATH_MAX];
+    int n = snprintf(header_path, sizeof(header_path), "%s/paired.h", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(header_path));
+    n = snprintf(source_path, sizeof(source_path), "%s/paired.c", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(source_path));
+    ASSERT_EQ(th_write_file(header_path,
+                            "#ifndef PAIRED_H\n"
+                            "#define PAIRED_H\n"
+                            "typedef struct Paired Paired;\n"
+                            "int paired_value(Paired *p);\n"
+                            "#endif\n"),
+              0);
+    ASSERT_EQ(th_write_file(source_path,
+                            "#include \"paired.h\"\n\n"
+                            "struct Paired {\n"
+                            "    int value;\n"
+                            "};\n\n"
+                            "int paired_value(Paired *p) {\n"
+                            "    return p ? p->value : 0;\n"
+                            "}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(th_write_file(header_path,
+                            "#ifndef PAIRED_H\n"
+                            "#define PAIRED_H\n"
+                            "typedef struct Paired Paired;\n"
+                            "int paired_value(Paired *p);\n"
+                            "static int paired_extra(void) {\n"
+                            "    return 7;\n"
+                            "}\n"
+                            "#endif\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.fallback reason="
+                        CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_c_header_uses_exact_not_overlay_until_active_edges_are_exact) {
     enum {
         PIPELINE_C_HEADER_OVERLAY_MAX_AFFECTED = CBM_SZ_16,
@@ -13761,6 +13828,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
+    RUN_TEST(incremental_overlay_single_c_header_type_impl_pair_falls_back);
     RUN_TEST(incremental_c_header_uses_exact_not_overlay_until_active_edges_are_exact);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
