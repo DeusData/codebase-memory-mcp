@@ -1161,6 +1161,75 @@ TEST(tool_search_graph_query_sees_file_delta_fts_updates) {
     PASS();
 }
 
+TEST(tool_search_graph_query_uses_overlay_active_rows) {
+    enum { BASE_GENERATION = 1 };
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "fts-overlay";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/fts-overlay"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    ASSERT_TRUE(mcp_test_upsert_fts_node(st, proj, "Function", "obsoleteoverlay",
+                                         "fts-overlay.obsolete", "src/status.c"));
+    ASSERT_EQ(mcp_test_rebuild_nodes_fts(st), CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh = {.project = proj,
+                        .label = "Function",
+                        .name = "freshoverlaymarker",
+                        .qualified_name = "fts-overlay.fresh",
+                        .file_path = "src/status.c",
+                        .start_line = 7,
+                        .end_line = 9,
+                        .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/status.c",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &fresh,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":556,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-overlay\",\"query\":\"freshoverlaymarker\","
+             "\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "freshoverlaymarker"));
+    ASSERT_NULL(strstr(inner, "obsoleteoverlay"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":557,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"fts-overlay\",\"query\":\"obsoleteoverlay\","
+             "\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NULL(strstr(inner, "obsoleteoverlay"));
+    ASSERT_NULL(strstr(inner, "freshoverlaymarker"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -1641,7 +1710,7 @@ TEST(tool_index_status_reports_overlay_read_view_counts) {
     ASSERT_NOT_NULL(strstr(inner, "\"canonical_nodes_visible\":1"));
     ASSERT_NOT_NULL(strstr(inner, "\"overlay_owned_nodes_visible\":1"));
     ASSERT_NOT_NULL(strstr(inner, "\"total_nodes_visible\":2"));
-    ASSERT_NOT_NULL(strstr(inner, "search/trace results remain canonical"));
+    ASSERT_NOT_NULL(strstr(inner, "overlay-aware tools may read active overlay rows"));
 
     free(inner);
     free(resp);
@@ -4359,6 +4428,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_uses_overlay_active_relationship_rows);
     RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
+    RUN_TEST(tool_search_graph_query_uses_overlay_active_rows);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
