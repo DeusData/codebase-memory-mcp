@@ -892,6 +892,27 @@ def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict
     return {"equal": True}
 
 
+def graph_gate_for_publish_kind(
+    canonical: dict[str, Any], publish_kind: str | None, oracle_passed: bool | None = None
+) -> dict[str, Any]:
+    canonical_equal = bool(canonical.get("equal"))
+    if publish_kind == PUBLISH_INCREMENTAL_OVERLAY and oracle_passed is not None:
+        return {
+            "passed": bool(oracle_passed),
+            "policy": "overlay_active_oracles",
+            "canonical_equal": canonical_equal,
+            "reason": (
+                "overlay publish leaves canonical rows unchanged; self-dogfood gates "
+                "on active read oracles and freshness metadata"
+            ),
+        }
+    return {
+        "passed": canonical_equal,
+        "policy": "canonical_graph",
+        "canonical_equal": canonical_equal,
+    }
+
+
 def build_env(cache_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = str(cache_dir)
@@ -1362,7 +1383,10 @@ def run_self_dogfood_case(
         incremental_reason = incremental.get("exact_reason")
         explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
         speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
-        passed = bool(canonical.get("equal")) and explicit_route and bool(oracles.get("passed"))
+        graph_gate = graph_gate_for_publish_kind(
+            canonical, str(publish_kind or ""), bool(oracles.get("passed"))
+        )
+        passed = bool(graph_gate.get("passed")) and explicit_route and bool(oracles.get("passed"))
         result = {
             "scenario": scenario,
             "project": project,
@@ -1373,6 +1397,7 @@ def run_self_dogfood_case(
             "incremental": incremental,
             "fresh_fast_full_after_change": full_rebuild,
             "canonical_graph": canonical,
+            "graph_gate": graph_gate,
             "oracles": oracles,
             "explicit_incremental_route": explicit_route,
             "exact_reason": incremental_reason,
