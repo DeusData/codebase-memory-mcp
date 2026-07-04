@@ -3073,6 +3073,23 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
         cbm_project_free_fields(&proj_info);
     }
 
+    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
+        doc, root, store, project,
+        "get_graph_schema reads canonical schema counts and property keys; ready overlay rows are "
+        "not included until active schema property views or compaction are available.");
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
+        add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
+        add_canonical_only_read_model(doc, root);
+        if (!overlay_limitation_reported) {
+            add_response_warning(
+                doc, root,
+                "get_graph_schema reads canonical schema counts and property keys; dirty file "
+                "changes may be absent until overlay or reindex completes.");
+        }
+    }
+
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     cbm_store_schema_free(&schema);
