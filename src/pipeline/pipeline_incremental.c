@@ -1577,6 +1577,21 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         delta_ptrs[i] = &deltas[i];
     }
 
+    for (int i = 0; i < changed_count; i++) {
+        bool collision = false;
+        rc = cbm_pipeline_file_delta_has_cross_file_node_qn_collision(store, &deltas[i],
+                                                                      &collision);
+        if (rc != CBM_STORE_OK || collision) {
+            const char *reason =
+                collision ? CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION
+                          : CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR;
+            cbm_pipeline_set_publish_reason(p, reason);
+            cbm_log_info("incremental.overlay.fallback", "reason", reason, "rc",
+                         itoa_buf_incr(rc));
+            goto cleanup;
+        }
+    }
+
     rc = cbm_store_latest_complete_index_generation(store, project, &base_generation);
     if (rc == CBM_STORE_OK) {
         CBM_PROF_START(t_overlay_publish);

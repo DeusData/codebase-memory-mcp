@@ -121,16 +121,17 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     }
 }
 
-/* Insert an edge, using the shared CALLS finalizer so sequential containment
- * and parallel full indexing serialize call-site args/line identically. Keep
- * this restricted to CALLS: route/config edge props feed full-only predump
- * passes, so altering them desyncs full vs incremental indexing. */
+/* Insert a call-site edge through the shared finalizer so sequential and
+ * parallel indexing serialize call args identically. Only plain CALLS carries
+ * line metadata; service/config edges use args for derived route/data-flow
+ * passes but keep their existing edge-specific fields as the stable contract. */
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
                             char *props, size_t cap, const CBMCall *call) {
-    if (call && strcmp(type, "CALLS") == 0) {
+    if (call) {
         size_t len = strlen(props);
         if (len >= SKIP_ONE && props[len - SKIP_ONE] == '}') {
-            cbm_pipeline_close_call_edge_props(props, cap, len - SKIP_ONE, call, true);
+            bool include_line = type && strcmp(type, "CALLS") == 0;
+            cbm_pipeline_close_call_edge_props(props, cap, len - SKIP_ONE, call, include_line);
         }
     }
     cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
