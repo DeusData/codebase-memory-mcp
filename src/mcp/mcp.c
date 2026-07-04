@@ -391,9 +391,13 @@ static void add_overlay_active_search_code_freshness(
         "contains the match line.");
 }
 
-static bool add_overlay_active_architecture_entry_points_freshness(
-    yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store, const char *project) {
+static bool add_overlay_active_architecture_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store, const char *project,
+    bool include_entry_points, bool include_routes) {
     if (!doc || !root || !store || !project || !project[0]) {
+        return false;
+    }
+    if (!include_entry_points && !include_routes) {
         return false;
     }
     cbm_store_overlay_node_view_summary_t summary = {0};
@@ -408,7 +412,12 @@ static bool add_overlay_active_architecture_entry_points_freshness(
     yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
                            CBM_MCP_FRESHNESS_READ_MODEL_MIXED_ACTIVE_NODES);
     yyjson_mut_val *active_sections = yyjson_mut_arr(doc);
-    yyjson_mut_arr_add_str(doc, active_sections, "entry_points");
+    if (include_entry_points) {
+        yyjson_mut_arr_add_str(doc, active_sections, "entry_points");
+    }
+    if (include_routes) {
+        yyjson_mut_arr_add_str(doc, active_sections, "routes");
+    }
     yyjson_mut_obj_add_val(doc, freshness, "active_sections", active_sections);
     yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
                            summary.overlay_ready_generations);
@@ -421,9 +430,17 @@ static bool add_overlay_active_architecture_entry_points_freshness(
     yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible", summary.total_nodes_visible);
     add_response_warning(
         doc, root,
-        "get_architecture used active overlay node rows for entry_points; counts and derived "
-        "summaries remain canonical or stale until active architecture views or compaction are "
-        "available.");
+        include_entry_points && include_routes
+            ? "get_architecture used active overlay node rows for entry_points and routes; "
+              "counts and derived summaries remain canonical or stale until active architecture "
+              "views or compaction are available."
+            : include_routes
+                  ? "get_architecture used active overlay node rows for routes; counts and "
+                    "derived summaries remain canonical or stale until active architecture views "
+                    "or compaction are available."
+                  : "get_architecture used active overlay node rows for entry_points; counts and "
+                    "derived summaries remain canonical or stale until active architecture views "
+                    "or compaction are available.");
     return true;
 }
 
@@ -4962,27 +4979,29 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     bool active_entry_points_requested = aspect_wanted(aspects_doc, aspects_arr, "entry_points");
-    bool active_entry_points_reported =
-        active_entry_points_requested &&
-        add_overlay_active_architecture_entry_points_freshness(doc, root, store, project);
+    bool active_routes_requested = aspect_wanted(aspects_doc, aspects_arr, "routes");
+    bool active_architecture_reported =
+        add_overlay_active_architecture_freshness(doc, root, store, project,
+                                                  active_entry_points_requested,
+                                                  active_routes_requested);
     bool overlay_limitation_reported =
-        !active_entry_points_reported &&
+        !active_architecture_reported &&
         add_canonical_only_overlay_freshness(
             doc, root, store, project,
             "get_architecture reads canonical graph summaries; ready overlay rows are not "
             "included until active architecture views or compaction are available.");
     if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        if (!active_entry_points_reported) {
+        if (!active_architecture_reported) {
             add_canonical_only_read_model(doc, root);
         }
         if (!overlay_limitation_reported) {
             add_response_warning(
                 doc, root,
-                active_entry_points_reported
-                    ? "get_architecture used active overlay node rows for entry_points; dirty "
-                      "file changes outside ready overlays may still be absent from canonical "
-                      "summaries until overlay or reindex completes."
+                active_architecture_reported
+                    ? "get_architecture used active overlay node rows for requested sections; "
+                      "dirty file changes outside ready overlays may still be absent from "
+                      "canonical summaries until overlay or reindex completes."
                     : "get_architecture reads canonical graph summaries; dirty file changes may "
                       "be absent until overlay or reindex completes.");
         }
