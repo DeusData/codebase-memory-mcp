@@ -458,6 +458,8 @@ Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported function
 
 Layered: hardcoded patterns (`.git`, `node_modules`, etc.) → `.gitignore` hierarchy → `.cbmignore` (project-specific, gitignore syntax). Symlinks are always skipped.
 
+See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syntax, precedence across the ignore layers, and negation semantics.
+
 ## Configuration
 
 ```bash

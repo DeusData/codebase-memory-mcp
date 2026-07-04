@@ -361,6 +361,75 @@ TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731) {
     PASS();
 }
 
+/* Guard for PR #560 (schema enum): the get_architecture aspects items schema
+ * must carry an enum of the valid tokens — including the new "overview" —
+ * mirroring VALID_ASPECTS in mcp.c. Parsed structurally like
+ * mcp_ingest_traces_items_disallow_additional_properties_issue731. */
+TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_NOT_NULL(root);
+    yyjson_val *tools = yyjson_obj_get(root, "tools");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_TRUE(yyjson_is_arr(tools));
+
+    yyjson_val *tool;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *get_arch = NULL;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        yyjson_val *name = yyjson_obj_get(tool, "name");
+        if (name && yyjson_is_str(name) && strcmp(yyjson_get_str(name), "get_architecture") == 0) {
+            get_arch = tool;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(get_arch);
+
+    yyjson_val *input_schema = yyjson_obj_get(get_arch, "inputSchema");
+    ASSERT_NOT_NULL(input_schema);
+    yyjson_val *properties = yyjson_obj_get(input_schema, "properties");
+    ASSERT_NOT_NULL(properties);
+    yyjson_val *aspects = yyjson_obj_get(properties, "aspects");
+    ASSERT_NOT_NULL(aspects);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(aspects, "type")), "array");
+    yyjson_val *items = yyjson_obj_get(aspects, "items");
+    ASSERT_NOT_NULL(items);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(items, "type")), "string");
+    yyjson_val *enum_arr = yyjson_obj_get(items, "enum");
+    ASSERT_NOT_NULL(enum_arr);
+    ASSERT_TRUE(yyjson_is_arr(enum_arr));
+
+    /* The enum must be exactly the valid-token set — no more, no less. */
+    static const char *expected[] = {"all",        "overview",   "structure", "dependencies",
+                                     "routes",     "languages",  "packages",  "entry_points",
+                                     "hotspots",   "boundaries", "layers",    "file_tree",
+                                     "clusters"};
+    size_t expected_count = sizeof(expected) / sizeof(expected[0]);
+    ASSERT_EQ(yyjson_arr_size(enum_arr), expected_count);
+    for (size_t i = 0; i < expected_count; i++) {
+        bool found = false;
+        yyjson_val *ev;
+        yyjson_arr_iter eiter;
+        yyjson_arr_iter_init(enum_arr, &eiter);
+        while ((ev = yyjson_arr_iter_next(&eiter)) != NULL) {
+            if (yyjson_is_str(ev) && strcmp(yyjson_get_str(ev), expected[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        ASSERT_TRUE(found);
+    }
+
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
 TEST(mcp_text_result) {
     char *json = cbm_mcp_text_result("{\"total\":5}", false);
     ASSERT_NOT_NULL(json);
@@ -1113,6 +1182,106 @@ TEST(tool_get_architecture_emits_populated_sections) {
     ASSERT_NOT_NULL(strstr(inner, "main"));
 
     free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Distills PR #560 (overview subset): "overview" must expand to a compact
+ * subset — every aspect EXCEPT file_tree. Before the fix, "overview" was not
+ * registered in either aspect gate (want_aspect in store.c, aspect_wanted in
+ * mcp.c), so aspects=["overview"] silently degraded to just
+ * {total_nodes,total_edges}. RED on unfixed code: no "entry_points" key. */
+TEST(tool_get_architecture_overview_compact_subset_pr560) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch560";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/arch560");
+
+    cbm_node_t main_fn = {0};
+    main_fn.project = proj;
+    main_fn.label = "Function";
+    main_fn.name = "main";
+    main_fn.qualified_name = "arch560.cmd.main";
+    main_fn.file_path = "cmd/main.go";
+    main_fn.start_line = 1;
+    main_fn.end_line = 3;
+    main_fn.properties_json = "{\"is_entry_point\":true}";
+    ASSERT_GT(cbm_store_upsert_node(st, &main_fn), 0);
+
+    /* A File node so the file_tree aspect has real content — makes the
+     * "overview drops file_tree" assertion below non-vacuous. */
+    cbm_node_t file_node = {.project = proj,
+                            .label = "File",
+                            .name = "main.go",
+                            .qualified_name = "arch560.cmd.main.go",
+                            .file_path = "cmd/main.go"};
+    ASSERT_GT(cbm_store_upsert_node(st, &file_node), 0);
+
+    /* Sanity: with "all", both entry_points and file_tree surface. */
+    char *resp_all = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":560,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch560\",\"aspects\":[\"all\"]}}}");
+    ASSERT_NOT_NULL(resp_all);
+    char *inner_all = extract_text_content(resp_all);
+    ASSERT_NOT_NULL(inner_all);
+    ASSERT_NOT_NULL(strstr(inner_all, "\"entry_points\""));
+    ASSERT_NOT_NULL(strstr(inner_all, "\"file_tree\""));
+    free(inner_all);
+    free(resp_all);
+
+    /* "overview": substantive content (entry_points, node_labels) but NO
+     * file_tree section. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":561,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch560\",\"aspects\":[\"overview\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"node_labels\""));
+    ASSERT_NULL(strstr(inner, "\"file_tree\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Distills PR #560 (server-side validation): unknown aspect tokens must be
+ * rejected with an isError result listing the valid values. Before the fix
+ * the JSON-Schema accepted any string and both aspect gates simply never
+ * matched, so a typo like "bogus_aspect" produced a silent near-empty payload
+ * with isError:false. RED on unfixed code: no isError, no "Unknown aspect". */
+TEST(tool_get_architecture_rejects_unknown_aspect_pr560) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "arch560v";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/arch560v");
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":562,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"get_architecture\","
+             "\"arguments\":{\"project\":\"arch560v\",\"aspects\":[\"bogus_aspect\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "Unknown aspect 'bogus_aspect'"));
+    /* The error must teach the valid vocabulary, including the new token. */
+    ASSERT_NOT_NULL(strstr(resp, "overview"));
+    ASSERT_NOT_NULL(strstr(resp, "file_tree"));
+
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -3896,6 +4065,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
+    RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
     RUN_TEST(mcp_text_result);
     RUN_TEST(mcp_text_result_skips_structured_content_for_plain_text);
     RUN_TEST(mcp_cancel_matches_request_id);
@@ -3957,6 +4127,8 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
+    RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
+    RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_get_architecture_path_scoping);

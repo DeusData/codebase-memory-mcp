@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # env.sh — Shared environment detection for all build scripts.
 #
 # Sourced by test.sh, build.sh, lint.sh. Not meant to run standalone.

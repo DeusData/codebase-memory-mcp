@@ -4725,7 +4725,7 @@ TEST(envscan_secret_value_exclusion) {
     write_temp_file(
         tmpdir, "deploy.sh",
         "#!/bin/bash\n"
-        "export GH_URL=\"https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com/repo\"\n"
+        "export GH_URL=\"https://ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE@github.com/repo\"\n"
         "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
 
     cbm_env_binding_t bindings[32];

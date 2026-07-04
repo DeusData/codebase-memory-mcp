@@ -59,3 +59,6 @@ soak-results/
 
 # LSP originality-check reference cache (scripts/check-lsp-originality.sh)
 .lsp-refs/
+
+# Local npm cache
+graph-ui/.npm-cache-local/

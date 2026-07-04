@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Local CI — test all platforms before pushing.
 #
 # Coverage:
