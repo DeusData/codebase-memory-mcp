@@ -80,6 +80,11 @@ typedef enum {
     CBM_OVERLAY_PUBLISH_SMALL_DELTAS,
 } cbm_overlay_publish_policy_t;
 
+typedef enum {
+    CBM_INCREMENTAL_DERIVED_REFRESH_EAGER = 0,
+    CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT,
+} cbm_incremental_derived_refresh_policy_t;
+
 void cbm_pipeline_lock(void) {
     while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
         struct timespec ts = {0, CBM_PIPELINE_LOCK_RETRY_NS};
@@ -108,6 +113,7 @@ struct cbm_pipeline {
     double lsp_confidence_floor;
     cbm_incremental_reindex_policy_t incremental_reindex;
     cbm_overlay_publish_policy_t overlay_publish;
+    cbm_incremental_derived_refresh_policy_t incremental_derived_refresh;
     int exact_delta_max_changed_paths;
     int exact_delta_max_affected_paths;
     atomic_int cancelled;
@@ -199,6 +205,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->lsp_confidence_floor = 0.0;
     p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     p->overlay_publish = CBM_OVERLAY_PUBLISH_OFF;
+    p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_EAGER;
     p->exact_delta_max_changed_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
     p->exact_delta_max_affected_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
     p->persistence = false;
@@ -351,6 +358,15 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
                 strcmp(overlay_publish, CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS) == 0
             ? CBM_OVERLAY_PUBLISH_SMALL_DELTAS
             : CBM_OVERLAY_PUBLISH_OFF;
+
+    const char *derived_refresh = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                                                 CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER);
+    p->incremental_derived_refresh =
+        derived_refresh &&
+                strcmp(derived_refresh,
+                       CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT) == 0
+            ? CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT
+            : CBM_INCREMENTAL_DERIVED_REFRESH_EAGER;
 
     int max_changed = cbm_config_get_int(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
                                          p->exact_delta_max_changed_paths);
@@ -616,6 +632,10 @@ const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p) {
 
 bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p) {
     return p && p->overlay_publish == CBM_OVERLAY_PUBLISH_SMALL_DELTAS;
+}
+
+bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_t *p) {
+    return p && p->incremental_derived_refresh == CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT;
 }
 
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p) {

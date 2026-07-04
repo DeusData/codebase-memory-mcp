@@ -2923,6 +2923,16 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "1-100000",
      "Default is conservative. Raise only with canonical-graph benchmarks for your workload; larger "
      "frontiers can approach full-rebuild cost."},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER,
+     NULL,
+     "Indexing",
+     "When exact incremental publishes may defer global semantic/similarity edge refresh",
+     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "|"
+     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT,
+     "'eager' preserves full/moderate publish freshness. 'stale_on_exact' lets small exact "
+     "incremental graph deltas publish after marking semantic_edges stale; semantic/similarity "
+     "queries warn until an eager index run or full reindex rebuilds those global edges."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
      "Default max results for search_graph/search_code",

@@ -120,6 +120,9 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS "incremental_exact_max_affected_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS "2"
 #define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS "4"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH "incremental_derived_refresh"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "eager"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT "stale_on_exact"
 
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */

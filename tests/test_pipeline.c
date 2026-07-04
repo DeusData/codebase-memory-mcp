@@ -10596,6 +10596,57 @@ TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact) {
     PASS();
 }
 
+TEST(incremental_full_stale_on_exact_defers_global_derived_refresh) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_leaf_file_with_extra(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
+    ASSERT(strstr(logs, "pass=incr_similarity") == NULL);
+    ASSERT(strstr(logs, "pass=incr_semantic_edges") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project,
+                                                CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
+    cbm_store_close(s);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build) {
     enum { PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8 };
     if (setup_incremental_repo() != 0) {
@@ -12737,6 +12788,7 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
     ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
     ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
+    ASSERT_FALSE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
 
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
@@ -13041,6 +13093,17 @@ TEST(config_registry_includes_incremental_exact_frontier_caps) {
     ASSERT_STR_EQ(affected->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS);
     ASSERT_STR_EQ(affected->category, "Indexing");
     ASSERT_STR_EQ(affected->range, "1-100000");
+    PASS();
+}
+
+TEST(config_registry_includes_incremental_derived_refresh_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact");
+    ASSERT_NOT_NULL(strstr(entry->guidance,
+                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT));
     PASS();
 }
 
@@ -13750,6 +13813,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_overlay_publish_policy);
     RUN_TEST(config_registry_includes_overlay_compaction_policy);
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
+    RUN_TEST(config_registry_includes_incremental_derived_refresh_policy);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
     RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
@@ -14012,6 +14076,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved);
     RUN_TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
+    RUN_TEST(incremental_full_stale_on_exact_defers_global_derived_refresh);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);

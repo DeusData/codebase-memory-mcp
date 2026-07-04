@@ -1082,7 +1082,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
 
 /* Run post-extraction passes (tests, decorator tags, configlink). */
 static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
-                          const char *project) {
+                          const char *project, bool refresh_global_semantic_edges) {
     struct timespec t;
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1110,7 +1110,7 @@ static int run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_file
                  itoa_buf_incr((int)elapsed_ms_incr(t)));
 
     /* SIMILAR_TO + SEMANTICALLY_RELATED edges only in moderate/full modes */
-    if (cbm_pipeline_mode_builds_global_semantic_edges(ctx->mode)) {
+    if (refresh_global_semantic_edges && cbm_pipeline_mode_builds_global_semantic_edges(ctx->mode)) {
         /* These passes recompute global derived edge sets over the loaded graph.
          * Clear the previous run's rows first; otherwise repeated incremental
          * updates keep stale pairs whose node ids changed during purge/reparse. */
@@ -1688,7 +1688,7 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         cbm_log_info("incremental.overlay.fallback", "reason", "k8s", "rc", itoa_buf_incr(rc));
         goto cleanup;
     }
-    rc = run_postpasses(&ctx, changed_files, changed_count, project);
+    rc = run_postpasses(&ctx, changed_files, changed_count, project, true);
     if (rc != 0) {
         cbm_pipeline_set_publish_reason(p, "overlay_postpasses");
         cbm_log_info("incremental.overlay.fallback", "reason", "postpasses", "rc",
@@ -1840,14 +1840,18 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     int max_affected_paths = cbm_pipeline_exact_max_affected_paths(p);
     int input_path_count = changed_count + deleted_count;
     cbm_pipeline_set_exact_delta_stats(p, input_path_count, -1, -1);
+    bool exact_deferred_global_derived =
+        cbm_pipeline_get_mode(p) < CBM_MODE_FAST &&
+        cbm_pipeline_incremental_derived_refresh_stale_on_exact(p);
     if (deleted_count < 0 || changed_count > max_changed_paths ||
-        cbm_pipeline_get_mode(p) < CBM_MODE_FAST ||
+        (cbm_pipeline_get_mode(p) < CBM_MODE_FAST && !exact_deferred_global_derived) ||
         input_path_count > max_affected_paths) {
         const char *reason =
             changed_count > max_changed_paths
                 ? "changed_batch_too_large"
-                : (cbm_pipeline_get_mode(p) < CBM_MODE_FAST ? "global_derived_edges"
-                                                            : CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
+                : (input_path_count > max_affected_paths
+                       ? CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE
+                       : "global_derived_edges");
         cbm_pipeline_set_publish_reason(p, reason);
         cbm_log_info("incremental.exact.skip", "reason", reason);
         return CBM_STORE_OK;
@@ -1994,7 +1998,8 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         goto cleanup;
     }
     CBM_PROF_START(t_exact_postpasses);
-    rc = run_postpasses(&ctx, exact_files, exact_count, project);
+    rc = run_postpasses(&ctx, exact_files, exact_count, project,
+                        !exact_deferred_global_derived);
     CBM_PROF_END_N("incremental_exact", "5_postpasses", t_exact_postpasses, exact_count);
     if (rc != 0) {
         cbm_pipeline_set_publish_reason(p, "postpasses");
@@ -2570,7 +2575,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                           itoa_buf_incr(CBM_NOT_FOUND));
             pipeline_rc = CBM_NOT_FOUND;
         } else {
-            pipeline_rc = run_postpasses(&ctx, changed_files, ci, project);
+            pipeline_rc = run_postpasses(&ctx, changed_files, ci, project, true);
         }
     }
 
