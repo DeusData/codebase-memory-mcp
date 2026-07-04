@@ -262,7 +262,7 @@ typedef struct {
     const char *order_by;  /* "variable.property" or "COUNT(var)" or alias */
     const char *order_dir; /* "ASC" or "DESC", NULL = default */
     int skip;              /* SKIP N, 0 = none */
-    int limit;             /* 0 = default */
+    int limit;             /* -1 = no LIMIT clause; 0 = explicit LIMIT 0 */
 } cbm_return_clause_t;
 
 /* Full query AST */
@@ -310,7 +310,7 @@ typedef struct {
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.
- * max_rows: limit on output rows (0 = use virtual ceiling of 100k).
+ * max_rows: limit on output rows (0 = use the implementation ceiling).
  * project: project name filter (NULL = all projects).
  * Returns -1 on error (check out->error for message). */
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
