@@ -1885,6 +1885,12 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
                            .properties_json = "{\"old_edge\":true}"};
     ASSERT_GT(cbm_store_insert_edge(s, &old_edge), 0);
 
+    cbm_schema_info_t schema = {0};
+    ASSERT_EQ(cbm_store_get_schema_counts(s, "test", &schema), CBM_STORE_OK);
+    ASSERT_EQ(schema.rel_pattern_count, 1);
+    ASSERT_STR_EQ(schema.rel_patterns[0], "(Function)-[CALLS]->(Class) [1x]");
+    cbm_store_schema_free(&schema);
+
     int64_t overlay_generation = 0;
     ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
                                                    &overlay_generation),
@@ -1910,7 +1916,6 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
     ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delta, overlay_generation),
               CBM_STORE_OK);
 
-    cbm_schema_info_t schema = {0};
     ASSERT_EQ(cbm_store_get_schema_counts_overlay_view(s, "test", &schema), CBM_STORE_OK);
     ASSERT_EQ(schema.node_label_count, 2);
     ASSERT_EQ(schema.edge_type_count, 1);
@@ -1940,6 +1945,8 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
     ASSERT_EQ(function_count, CBM_NOT_FOUND);
     ASSERT_EQ(handles_count, 1);
     ASSERT_EQ(calls_count, CBM_NOT_FOUND);
+    ASSERT_EQ(schema.rel_pattern_count, 1);
+    ASSERT_STR_EQ(schema.rel_patterns[0], "(Route)-[HANDLES]->(Class) [1x]");
     cbm_store_schema_free(&schema);
 
     ASSERT_EQ(cbm_store_get_schema_overlay_view(s, "test", &schema), CBM_STORE_OK);
@@ -1981,6 +1988,8 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
     ASSERT(!saw_old_node_prop);
     ASSERT(saw_fresh_edge_prop);
     ASSERT(!saw_old_edge_prop);
+    ASSERT_EQ(schema.rel_pattern_count, 1);
+    ASSERT_STR_EQ(schema.rel_patterns[0], "(Route)-[HANDLES]->(Class) [1x]");
     cbm_store_schema_free(&schema);
 
     cbm_store_close(s);
