@@ -327,8 +327,8 @@ static void add_overlay_active_trace_freshness(
                            summary->total_nodes_visible);
     add_response_warning(doc, root,
                          "trace_path used overlay active node and relationship rows for a "
-                         "qualified_name trace; function_name resolution and FTS query mode "
-                         "remain canonical until separately enabled.");
+                         "resolved start node; FTS query mode remains canonical until "
+                         "separately enabled.");
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -4991,7 +4991,7 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     const char *effective_direction = direction ? direction : "both";
     cbm_store_overlay_node_view_summary_t overlay_summary = {0};
     bool overlay_ready_for_trace =
-        qn_input && project && project[0] &&
+        (qn_input || func_name) && project && project[0] &&
         cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
             CBM_STORE_OK &&
         overlay_summary.active_file_tombstones > 0;
@@ -5000,27 +5000,16 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_node_t *qn_node = NULL;
     if (qn_input && store) {
         cbm_node_t qn_tmp = {0};
-        if (cbm_store_find_node_by_qn(store, project, qn_input, &qn_tmp) == 0 && qn_tmp.id > 0) {
+        int qn_rc = overlay_ready_for_trace
+                        ? cbm_store_find_node_by_qn_overlay_view(store, project, qn_input,
+                                                                 &qn_tmp)
+                        : cbm_store_find_node_by_qn(store, project, qn_input, &qn_tmp);
+        if (qn_rc == CBM_STORE_OK) {
             qn_node = calloc(1, sizeof(cbm_node_t));
             if (qn_node) {
                 *qn_node = qn_tmp;  /* shallow copy; ownership of heap fields transferred */
             } else {
                 free_node_contents(&qn_tmp);  /* OOM: free fields to avoid leak */
-            }
-        }
-    }
-    if (!qn_node && overlay_ready_for_trace) {
-        qn_node = calloc(1, sizeof(cbm_node_t));
-        if (qn_node) {
-            qn_node->id = CBM_STORE_NO_NODE_ID;
-            qn_node->project = heap_strdup(project);
-            qn_node->qualified_name = heap_strdup(qn_input);
-            const char *last_dot = strrchr(qn_input, '.');
-            qn_node->name = heap_strdup(last_dot && last_dot[1] ? last_dot + 1 : qn_input);
-            if (!qn_node->project || !qn_node->qualified_name || !qn_node->name) {
-                free_node_contents(qn_node);
-                free(qn_node);
-                qn_node = NULL;
             }
         }
     }
@@ -5033,8 +5022,13 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
         nodes = qn_node;
         node_count = 1;
     } else {
-        cbm_store_find_nodes_by_name(store, project,
-            func_name ? func_name : (qn_input ? qn_input : ""), &nodes, &node_count);
+        if (overlay_ready_for_trace) {
+            cbm_store_find_nodes_by_name_overlay_view(store, project,
+                func_name ? func_name : (qn_input ? qn_input : ""), &nodes, &node_count);
+        } else {
+            cbm_store_find_nodes_by_name(store, project,
+                func_name ? func_name : (qn_input ? qn_input : ""), &nodes, &node_count);
+        }
     }
 
     if (node_count == 0 && func_name) {
@@ -5050,16 +5044,24 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
         sp.min_degree = -1;
         sp.max_degree = -1;
         cbm_search_output_t sout = {0};
-        if (cbm_store_search(store, &sp, &sout) == 0 && sout.count > 0) {
+        int search_rc = overlay_ready_for_trace ? cbm_store_search_overlay_view(store, &sp, &sout)
+                                                : cbm_store_search(store, &sp, &sout);
+        if (search_rc == 0 && sout.count > 0) {
             const char *found_project = sout.results[0].node.project;
             /* Free the empty allocation from the first exact-name lookup before
              * overwriting nodes/node_count with the fallback result. */
             cbm_store_free_nodes(nodes, node_count);
             nodes = NULL;
             node_count = 0;
-            cbm_store_find_nodes_by_name(store,
-                                         found_project ? found_project : project,
-                                         sout.results[0].node.name, &nodes, &node_count);
+            if (overlay_ready_for_trace) {
+                cbm_store_find_nodes_by_name_overlay_view(
+                    store, found_project ? found_project : project,
+                    sout.results[0].node.name, &nodes, &node_count);
+            } else {
+                cbm_store_find_nodes_by_name(store,
+                                             found_project ? found_project : project,
+                                             sout.results[0].node.name, &nodes, &node_count);
+            }
         }
         cbm_store_search_free(&sout);
     }
@@ -5189,7 +5191,7 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     cbm_traverse_result_t tr_out = {0};
     cbm_traverse_result_t tr_in = {0};
     bool overlay_trace_requested =
-        overlay_ready_for_trace && qn_input && nodes[sel].qualified_name &&
+        overlay_ready_for_trace && nodes[sel].qualified_name &&
         nodes[sel].qualified_name[0];
     bool overlay_trace_succeeded = false;
 

@@ -6431,6 +6431,103 @@ static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool includ
     return CBM_STORE_OK;
 }
 
+int cbm_store_find_node_by_qn_overlay_view(cbm_store_t *s, const char *project,
+                                           const char *qn, cbm_node_t *out) {
+    if (!s || !s->db || !project || !qn || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+
+    char active_cte[ST_SQL_BUF];
+    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "find_node_by_qn_overlay active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                     "n.file_path, n.start_line, n.end_line, n.properties "
+                     "FROM active_nodes n "
+                     "WHERE n.project = ?3 AND n.qualified_name = ?4 "
+                     "LIMIT 1",
+                     active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "find_node_by_qn_overlay SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_node_by_qn_overlay prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, qn);
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        int rc = scan_node(s, stmt, out);
+        sqlite3_finalize(stmt);
+        return rc;
+    }
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "find_node_by_qn_overlay step");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_NOT_FOUND;
+}
+
+int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *project,
+                                              const char *name, cbm_node_t **out,
+                                              int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project || !name) {
+        return CBM_STORE_ERR;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "find_nodes_by_name_overlay active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                     "n.file_path, n.start_line, n.end_line, n.properties "
+                     "FROM active_nodes n "
+                     "WHERE n.project = ?3 AND n.name = ?4 "
+                     "ORDER BY n.qualified_name",
+                     active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "find_nodes_by_name_overlay SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_nodes_by_name_overlay prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, name);
+    int rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_name_overlay", out, count);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 static int search_overlay_collect_connected_names(cbm_store_t *s, const char *active_cte,
                                                   const cbm_search_params_t *params,
                                                   const char *qualified_name,
@@ -7245,52 +7342,10 @@ int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *
     }
 
     cbm_traverse_result_t result = {0};
-    char root_cte[ST_SQL_BUF];
-    if (search_build_active_overlay_cte(root_cte, sizeof(root_cte), false, false) !=
-        CBM_STORE_OK) {
-        store_set_error(s, "bfs_overlay root CTE SQL truncated");
-        return CBM_STORE_ERR;
+    int rc = cbm_store_find_node_by_qn_overlay_view(s, project, start_qn, &result.root);
+    if (rc != CBM_STORE_OK) {
+        return rc;
     }
-    char root_sql[ST_SQL_BUF];
-    int root_n = snprintf(
-        root_sql, sizeof(root_sql),
-        "%s"
-        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-        "n.file_path, n.start_line, n.end_line, n.properties "
-        "FROM active_nodes n "
-        "WHERE n.project = ?3 AND n.qualified_name = ?4 "
-        "LIMIT 1",
-        root_cte);
-    if (root_n < 0 || (size_t)root_n >= sizeof(root_sql)) {
-        store_set_error(s, "bfs_overlay root SQL truncated");
-        return CBM_STORE_ERR;
-    }
-
-    sqlite3_stmt *root_stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, root_sql, CBM_NOT_FOUND, &root_stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "bfs_overlay root prepare");
-        return CBM_STORE_ERR;
-    }
-    bind_text(root_stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
-    bind_text(root_stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
-    bind_text(root_stmt, ST_COL_3, project);
-    bind_text(root_stmt, ST_COL_4, start_qn);
-    int root_step = sqlite3_step(root_stmt);
-    if (root_step == SQLITE_ROW) {
-        if (scan_node(s, root_stmt, &result.root) != CBM_STORE_OK) {
-            sqlite3_finalize(root_stmt);
-            cbm_store_traverse_free(&result);
-            return CBM_STORE_ERR;
-        }
-    } else if (root_step == SQLITE_DONE) {
-        sqlite3_finalize(root_stmt);
-        return CBM_STORE_NOT_FOUND;
-    } else {
-        store_set_error_sqlite(s, "bfs_overlay root step");
-        sqlite3_finalize(root_stmt);
-        return CBM_STORE_ERR;
-    }
-    sqlite3_finalize(root_stmt);
 
     const char *freshness_project =
         result.root.project && result.root.project[0] ? result.root.project : project;
