@@ -1897,19 +1897,29 @@ TEST(store_overlay_additions_keep_canonical_file_rows_visible) {
     ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
                                                    &overlay_generation),
               CBM_STORE_OK);
-    cbm_node_t added = {.project = "test",
-                        .label = "Function",
-                        .name = "added",
-                        .qualified_name = "test.added",
-                        .file_path = "main.h",
-                        .start_line = 5,
-                        .end_line = 7,
-                        .properties_json = "{}"};
+    cbm_node_t overlay_nodes[] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "stable",
+         .qualified_name = "test.stable",
+         .file_path = "main.h",
+         .start_line = 1,
+         .end_line = 6,
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "added",
+         .qualified_name = "test.added",
+         .file_path = "main.h",
+         .start_line = 8,
+         .end_line = 10,
+         .properties_json = "{}"},
+    };
     cbm_store_file_delta_t delta = {.project = "test",
                                     .rel_path = "main.h",
                                     .generation = BASE_GENERATION,
-                                    .nodes = &added,
-                                    .node_count = 1};
+                                    .nodes = overlay_nodes,
+                                    .node_count = 2};
     const cbm_store_file_delta_t *deltas[] = {&delta};
     ASSERT_EQ(cbm_store_publish_overlay_file_delta_additions_batch(s, deltas, 1,
                                                                    overlay_generation),
@@ -1922,19 +1932,20 @@ TEST(store_overlay_additions_keep_canonical_file_rows_visible) {
     ASSERT_EQ(cbm_store_get_overlay_node_view_summary(s, "test", &summary), CBM_STORE_OK);
     ASSERT_EQ(summary.overlay_ready_generations, 1);
     ASSERT_EQ(summary.active_file_tombstones, 0);
-    ASSERT_EQ(summary.canonical_nodes_visible, 1);
-    ASSERT_EQ(summary.overlay_owned_nodes_visible, 1);
+    ASSERT_EQ(summary.canonical_nodes_visible, 0);
+    ASSERT_EQ(summary.overlay_owned_nodes_visible, 2);
     ASSERT_EQ(summary.total_nodes_visible, 2);
 
     cbm_node_t found = {0};
     ASSERT_EQ(cbm_store_find_node_by_qn_overlay_view(s, "test", "test.stable", &found),
               CBM_STORE_OK);
     ASSERT_STR_EQ(found.file_path, "main.h");
+    ASSERT_EQ(found.end_line, 6);
     cbm_node_free_fields(&found);
     ASSERT_EQ(cbm_store_find_node_by_qn_overlay_view(s, "test", "test.added", &found),
               CBM_STORE_OK);
     ASSERT_STR_EQ(found.file_path, "main.h");
-    ASSERT_EQ(found.start_line, 5);
+    ASSERT_EQ(found.start_line, 8);
     cbm_node_free_fields(&found);
 
     cbm_store_close(s);

@@ -6518,60 +6518,39 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
         return CBM_STORE_ERR;
     }
 
-    static const char sql[] =
-        "WITH active_overlay_files AS ("
-        "  SELECT rel_path, MAX(overlay_generation) AS overlay_generation"
-        "  FROM ("
-        "    SELECT n.rel_path, n.overlay_generation"
-        "    FROM overlay_nodes n"
-        "    JOIN overlay_generations g"
-        "      ON g.project = n.project AND g.overlay_generation = n.overlay_generation"
-        "    WHERE n.project = ?1 AND g.status = ?2"
-        "    UNION"
-        "    SELECT e.rel_path, e.overlay_generation"
-        "    FROM overlay_edges e"
-        "    JOIN overlay_generations g"
-        "      ON g.project = e.project AND g.overlay_generation = e.overlay_generation"
-        "    WHERE e.project = ?1 AND g.status = ?2"
-        "    UNION"
-        "    SELECT t.rel_path, t.overlay_generation"
-        "    FROM overlay_tombstones t"
-        "    JOIN overlay_generations g"
-        "      ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
-        "    WHERE t.project = ?1 AND g.status = ?2 AND t.active = ?4"
-        "  ) overlay_files"
-        "  GROUP BY rel_path"
-        "), active_file_tombstones AS ("
-        "  SELECT t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
-        "  FROM overlay_tombstones t"
-        "  JOIN overlay_generations g"
-        "    ON g.project = t.project AND g.overlay_generation = t.overlay_generation"
-        "  WHERE t.project = ?1 AND g.status = ?2 AND t.entity_kind = ?3 AND t.active = ?4"
-        "  GROUP BY t.rel_path"
-        ")"
-        "SELECT "
-        "  (SELECT COUNT(*) FROM overlay_generations g"
-        "    WHERE g.project = ?1 AND g.status = ?2) AS ready_generations,"
-        "  (SELECT COUNT(*) FROM active_file_tombstones) AS active_files,"
-        "  (SELECT COUNT(*) FROM nodes n"
-        "    WHERE n.project = ?1"
-        "      AND NOT EXISTS (SELECT 1 FROM active_file_tombstones af"
-        "                      WHERE af.rel_path = n.file_path)) AS canonical_visible,"
-        "  (SELECT COUNT(*) FROM overlay_nodes n"
-        "    JOIN active_overlay_files af"
-        "      ON af.rel_path = n.rel_path AND af.overlay_generation = n.overlay_generation"
-        "    WHERE n.project = ?1 AND n.owned = ?5) AS overlay_visible;";
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "overlay_node_view_summary active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT "
+                     "  (SELECT COUNT(*) FROM overlay_generations g"
+                     "    WHERE g.project = ?3 AND g.status = ?1) AS ready_generations,"
+                     "  (SELECT COUNT(*) FROM active_file_tombstones af"
+                     "    WHERE af.project = ?3) AS active_files,"
+                     "  (SELECT COUNT(*) FROM active_nodes n"
+                     "    WHERE n.project = ?3 AND n.id <> ?4) AS canonical_visible,"
+                     "  (SELECT COUNT(*) FROM active_nodes n"
+                     "    WHERE n.project = ?3 AND n.id = ?4) AS overlay_visible;",
+                     active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "overlay_node_view_summary SQL truncated");
+        return CBM_STORE_ERR;
+    }
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "overlay_node_view_summary prepare");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, ST_COL_1, project);
-    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_STATUS_READY);
-    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
-    sqlite3_bind_int(stmt, ST_COL_4, STORE_OVERLAY_TOMBSTONE_ACTIVE);
-    sqlite3_bind_int(stmt, ST_COL_5, STORE_OVERLAY_ROW_OWNED);
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    sqlite3_bind_int64(stmt, ST_COL_4, CBM_STORE_NO_NODE_ID);
 
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
@@ -6588,49 +6567,6 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
 
     sqlite3_finalize(stmt);
     return CBM_STORE_OK;
-}
-
-static int store_latest_ready_overlay_for_file(cbm_store_t *s, const char *project,
-                                               const char *file_path,
-                                               int64_t *out_overlay_generation) {
-    if (out_overlay_generation) {
-        *out_overlay_generation = 0;
-    }
-    if (!s || !s->db || !project || !project[0] || !file_path || !file_path[0] ||
-        !out_overlay_generation) {
-        if (s) {
-            store_set_error(s, "latest_ready_overlay_for_file: invalid argument");
-        }
-        return CBM_STORE_ERR;
-    }
-    static const char sql[] =
-        "SELECT MAX(t.overlay_generation) "
-        "FROM overlay_tombstones t "
-        "JOIN overlay_generations g "
-        "  ON g.project = t.project AND g.overlay_generation = t.overlay_generation "
-        "WHERE t.project = ?1 AND t.rel_path = ?2 AND g.status = ?3 "
-        "  AND t.entity_kind = ?4 AND t.active = ?5;";
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        store_set_error_sqlite(s, "latest_ready_overlay_for_file prepare");
-        return CBM_STORE_ERR;
-    }
-    bind_text(stmt, ST_COL_1, project);
-    bind_text(stmt, ST_COL_2, file_path);
-    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_STATUS_READY);
-    bind_text(stmt, ST_COL_4, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
-    sqlite3_bind_int(stmt, ST_COL_5, STORE_OVERLAY_TOMBSTONE_ACTIVE);
-    int rc = sqlite3_step(stmt);
-    if (rc == SQLITE_ROW) {
-        if (sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
-            *out_overlay_generation = sqlite3_column_int64(stmt, 0);
-        }
-        sqlite3_finalize(stmt);
-        return CBM_STORE_OK;
-    }
-    sqlite3_finalize(stmt);
-    store_set_error_sqlite(s, "latest_ready_overlay_for_file");
-    return CBM_STORE_ERR;
 }
 
 int cbm_store_find_nodes_by_file_overlay_view(cbm_store_t *s, const char *project,
@@ -6650,31 +6586,35 @@ int cbm_store_find_nodes_by_file_overlay_view(cbm_store_t *s, const char *projec
         return CBM_STORE_ERR;
     }
 
-    int64_t overlay_generation = 0;
-    int rc = store_latest_ready_overlay_for_file(s, project, file_path, &overlay_generation);
-    if (rc != CBM_STORE_OK) {
-        return rc;
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "find_nodes_by_file_overlay active CTE SQL truncated");
+        return CBM_STORE_ERR;
     }
-    if (overlay_generation <= 0) {
-        return cbm_store_find_nodes_by_file(s, project, file_path, out, count);
+    char sql[ST_SQL_BUF];
+    int n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                     "n.file_path, n.start_line, n.end_line, n.properties "
+                     "FROM active_nodes n "
+                     "WHERE n.project = ?3 AND n.file_path = ?4 "
+                     "ORDER BY n.name, n.qualified_name;",
+                     active_cte);
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "find_nodes_by_file_overlay SQL truncated");
+        return CBM_STORE_ERR;
     }
-
-    static const char sql[] =
-        "SELECT ?4 AS id, project, label, name, qualified_name, file_path, start_line, end_line, "
-        "properties FROM overlay_nodes "
-        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3 AND owned = ?5 "
-        "ORDER BY name, qualified_name;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "find_nodes_by_file_overlay_view prepare");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, ST_COL_1, project);
-    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
-    bind_text(stmt, ST_COL_3, file_path);
-    sqlite3_bind_int64(stmt, ST_COL_4, CBM_STORE_NO_NODE_ID);
-    sqlite3_bind_int(stmt, ST_COL_5, STORE_OVERLAY_ROW_OWNED);
-    rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_file_overlay_view", out, count);
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    bind_text(stmt, ST_COL_4, file_path);
+    int rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_file_overlay_view", out, count);
     sqlite3_finalize(stmt);
     return rc;
 }

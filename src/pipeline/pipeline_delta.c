@@ -277,6 +277,48 @@ static void delta_edge_free_fields(cbm_store_delta_edge_t *edge) {
     *edge = (cbm_store_delta_edge_t){0};
 }
 
+int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst) {
+    if (!src || !dst) {
+        return CBM_STORE_ERR;
+    }
+    *dst = (cbm_node_t){
+        .id = CBM_STORE_NO_NODE_ID,
+        .project = delta_strdup(src->project),
+        .label = delta_strdup(src->label),
+        .name = delta_strdup(src->name),
+        .qualified_name = delta_strdup(src->qualified_name),
+        .file_path = delta_strdup(src->file_path),
+        .start_line = src->start_line,
+        .end_line = src->end_line,
+        .properties_json = delta_strdup(src->properties_json ? src->properties_json : "{}"),
+    };
+    if (!dst->project || !dst->label || !dst->name || !dst->qualified_name ||
+        !dst->file_path || !dst->properties_json) {
+        cbm_node_free_fields(dst);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src,
+                                 cbm_store_delta_edge_t *dst) {
+    if (!src || !dst) {
+        return CBM_STORE_ERR;
+    }
+    *dst = (cbm_store_delta_edge_t){
+        .source_qn = delta_strdup(src->source_qn),
+        .target_qn = delta_strdup(src->target_qn),
+        .type = delta_strdup(src->type),
+        .properties_json = delta_strdup(src->properties_json ? src->properties_json : "{}"),
+        .derived_kind = src->derived_kind ? src->derived_kind : CBM_STORE_DERIVED_KIND_DIRECT,
+    };
+    if (!dst->source_qn || !dst->target_qn || !dst->type || !dst->properties_json) {
+        delta_edge_free_fields(dst);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static void delta_import_free_fields(cbm_store_import_ref_t *import) {
     if (!import) {
         return;
@@ -293,23 +335,19 @@ static int delta_append_node(cbm_delta_build_ctx_t *ctx, const cbm_gbuf_node_t *
             CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_node_t row = {
-        .id = CBM_STORE_NO_NODE_ID,
-        .project = delta_strdup(ctx->project),
-        .label = delta_strdup(node->label),
-        .name = delta_strdup(node->name),
-        .qualified_name = delta_strdup(node->qualified_name),
-        .file_path = delta_strdup(node->file_path),
-        .start_line = node->start_line,
-        .end_line = node->end_line,
-        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}"),
-    };
-    if (!row.project || !row.label || !row.name || !row.qualified_name || !row.file_path ||
-        !row.properties_json) {
-        cbm_node_free_fields(&row);
+    cbm_node_t row = {.project = ctx->project,
+                      .label = node->label,
+                      .name = node->name,
+                      .qualified_name = node->qualified_name,
+                      .file_path = node->file_path,
+                      .start_line = node->start_line,
+                      .end_line = node->end_line,
+                      .properties_json = node->properties_json};
+    if (cbm_pipeline_copy_delta_node(&row, &ctx->out->nodes[ctx->out->delta.node_count]) !=
+        CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    ctx->out->nodes[ctx->out->delta.node_count++] = row;
+    ctx->out->delta.node_count++;
     return CBM_STORE_OK;
 }
 
@@ -338,23 +376,20 @@ static int delta_append_context_node(cbm_delta_build_ctx_t *ctx,
                    sizeof(*ctx->out->context_nodes)) != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    cbm_node_t row = {
-        .id = CBM_STORE_NO_NODE_ID,
-        .project = delta_strdup(ctx->project),
-        .label = delta_strdup(node->label),
-        .name = delta_strdup(node->name),
-        .qualified_name = delta_strdup(node->qualified_name),
-        .file_path = delta_strdup(node->file_path),
-        .start_line = node->start_line,
-        .end_line = node->end_line,
-        .properties_json = delta_strdup(node->properties_json ? node->properties_json : "{}"),
-    };
-    if (!row.project || !row.label || !row.name || !row.qualified_name || !row.file_path ||
-        !row.properties_json) {
-        cbm_node_free_fields(&row);
+    cbm_node_t row = {.project = ctx->project,
+                      .label = node->label,
+                      .name = node->name,
+                      .qualified_name = node->qualified_name,
+                      .file_path = node->file_path,
+                      .start_line = node->start_line,
+                      .end_line = node->end_line,
+                      .properties_json = node->properties_json};
+    if (cbm_pipeline_copy_delta_node(
+            &row, &ctx->out->context_nodes[ctx->out->delta.context_node_count]) !=
+        CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
-    ctx->out->context_nodes[ctx->out->delta.context_node_count++] = row;
+    ctx->out->delta.context_node_count++;
     return CBM_STORE_OK;
 }
 
@@ -1621,11 +1656,12 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
     return CBM_STORE_OK;
 }
 
-int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
-                                                  const cbm_pipeline_file_delta_t *const *deltas,
-                                                  int delta_count, int64_t base_generation,
-                                                  const char *dirty_source,
-                                                  int64_t *out_overlay_generation) {
+static int pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                     const cbm_pipeline_file_delta_t *const *deltas,
+                                                     int delta_count, int64_t base_generation,
+                                                     const char *dirty_source,
+                                                     int64_t *out_overlay_generation,
+                                                     bool replace_files) {
     if (out_overlay_generation) {
         *out_overlay_generation = 0;
     }
@@ -1675,8 +1711,11 @@ int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
         store_deltas[i] = &deltas[i]->delta;
     }
 
-    rc = cbm_store_publish_overlay_file_delta_batch(store, store_deltas, delta_count,
-                                                    overlay_generation);
+    rc = replace_files ? cbm_store_publish_overlay_file_delta_batch(store, store_deltas,
+                                                                    delta_count,
+                                                                    overlay_generation)
+                       : cbm_store_publish_overlay_file_delta_additions_batch(
+                             store, store_deltas, delta_count, overlay_generation);
     free(store_deltas);
     if (rc != CBM_STORE_OK) {
         (void)cbm_store_set_overlay_generation_status(store, project, overlay_generation,
@@ -1711,6 +1750,22 @@ int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
 
     *out_overlay_generation = overlay_generation;
     return CBM_STORE_OK;
+}
+
+int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                  const cbm_pipeline_file_delta_t *const *deltas,
+                                                  int delta_count, int64_t base_generation,
+                                                  const char *dirty_source,
+                                                  int64_t *out_overlay_generation) {
+    return pipeline_publish_overlay_file_delta_batch(store, deltas, delta_count, base_generation,
+                                                     dirty_source, out_overlay_generation, true);
+}
+
+int cbm_pipeline_publish_overlay_file_delta_additions_batch(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas, int delta_count,
+    int64_t base_generation, const char *dirty_source, int64_t *out_overlay_generation) {
+    return pipeline_publish_overlay_file_delta_batch(store, deltas, delta_count, base_generation,
+                                                     dirty_source, out_overlay_generation, false);
 }
 
 void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan) {
