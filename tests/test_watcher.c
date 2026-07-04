@@ -34,6 +34,15 @@ static const char *wt_path(char *buf, size_t n, const char *dir, const char *rel
     return buf;
 }
 
+static bool wt_path_list_contains(char **paths, int count, const char *needle) {
+    for (int i = 0; i < count; i++) {
+        if (paths[i] && strcmp(paths[i], needle) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool wt_mktempdir(char *buf, size_t n, const char *prefix) {
     char *path = th_mktempdir(prefix);
     if (!path) {
@@ -258,6 +267,30 @@ TEST(git_snapshot_clean_and_dirty_repo) {
     PASS();
 }
 
+TEST(git_status_paths_tracks_rename_current_and_previous_path) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_gitpaths_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "old.go"),
+                                 "package main\n\nfunc Old() {}\n"); }
+    wt_git(tmpdir, "add old.go");
+    wt_git(tmpdir, "commit -q -m init");
+
+    ASSERT_EQ(wt_git(tmpdir, "mv old.go new.go"), 0);
+    char **paths = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_git_status_paths(tmpdir, &paths, &count), 0);
+    ASSERT_TRUE(wt_path_list_contains(paths, count, "new.go"));
+    ASSERT_TRUE(wt_path_list_contains(paths, count, "old.go"));
+    cbm_git_status_paths_free(paths, count);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL WITH REAL GIT REPO
  * ══════════════════════════════════════════════════════════════════ */
@@ -270,6 +303,14 @@ static int index_callback(const char *name, const char *path, void *ud) {
     (void)ud;
     index_call_count++;
     return 0;
+}
+
+static int failing_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    index_call_count++;
+    return CBM_NOT_FOUND;
 }
 
 typedef struct {
@@ -528,6 +569,52 @@ TEST(watcher_detects_dirty_worktree) {
     ASSERT_EQ(index_call_count, 1);
 
     /* Cleanup */
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_marks_dirty_file_before_failed_index_callback) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dirty_ledger_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.go"),
+                                 "package main\n\nfunc Old() {}\n"); }
+    wt_git(tmpdir, "add file.go");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "dirty-ledger-repo", tmpdir), CBM_STORE_OK);
+    cbm_watcher_t *w = cbm_watcher_new(store, failing_index_callback, NULL);
+    ASSERT_NOT_NULL(w);
+
+    cbm_watcher_watch(w, "dirty-ledger-repo", tmpdir);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.go"), "\nfunc NewDirty() {}\n");
+    }
+
+    cbm_watcher_touch(w, "dirty-ledger-repo");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    int pending = -1;
+    int overlay_ready = -1;
+    ASSERT_EQ(cbm_store_count_dirty_files(store, "dirty-ledger-repo", &pending,
+                                          &overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(pending, 1);
+    ASSERT_EQ(overlay_ready, 0);
+
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
@@ -2033,6 +2120,7 @@ SUITE(watcher) {
     RUN_TEST(git_snapshot_rejects_overlong_path);
     RUN_TEST(git_snapshot_non_git_path);
     RUN_TEST(git_snapshot_clean_and_dirty_repo);
+    RUN_TEST(git_status_paths_tracks_rename_current_and_previous_path);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);
@@ -2043,6 +2131,7 @@ SUITE(watcher) {
     /* Git change detection */
     RUN_TEST(watcher_detects_git_commit);
     RUN_TEST(watcher_detects_dirty_worktree);
+    RUN_TEST(watcher_marks_dirty_file_before_failed_index_callback);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_multiple_projects);

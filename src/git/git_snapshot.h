@@ -27,5 +27,7 @@ typedef struct {
 
 bool cbm_git_snapshot_path_supported(const char *repo_path);
 int cbm_git_snapshot_read(const char *repo_path, unsigned flags, cbm_git_snapshot_t *out);
+int cbm_git_status_paths(const char *repo_path, char ***out_paths, int *out_count);
+void cbm_git_status_paths_free(char **paths, int count);
 
 #endif

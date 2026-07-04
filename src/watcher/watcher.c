@@ -471,6 +471,54 @@ static bool watcher_snapshot_current(cbm_watcher_t *w, const project_snapshot_t 
     return current;
 }
 
+static bool watcher_store_has_project(cbm_store_t *store, const char *project_name) {
+    if (!store || !project_name) {
+        return false;
+    }
+    cbm_project_t project = {0};
+    int rc = cbm_store_get_project(store, project_name, &project);
+    if (rc == CBM_STORE_OK) {
+        cbm_project_free_fields(&project);
+        return true;
+    }
+    if (rc != CBM_STORE_NOT_FOUND) {
+        cbm_log_warn("watcher.dirty_ledger.warn", "project", project_name, "phase",
+                     "get_project");
+    }
+    return false;
+}
+
+static void watcher_mark_dirty_paths(cbm_watcher_t *w, const project_snapshot_t *s) {
+    if (!w || !w->store || !s || !s->project_name || !s->root_path) {
+        return;
+    }
+    if (!watcher_store_has_project(w->store, s->project_name)) {
+        return;
+    }
+    char **paths = NULL;
+    int path_count = 0;
+    if (cbm_git_status_paths(s->root_path, &paths, &path_count) != 0) {
+        cbm_log_warn("watcher.dirty_ledger.warn", "project", s->project_name, "phase",
+                     "git_status_paths");
+        return;
+    }
+    for (int i = 0; i < path_count; i++) {
+        cbm_dirty_file_state_t dirty = {
+            .project = s->project_name,
+            .rel_path = paths[i],
+            .observed_hash = s->last_dirty_hash,
+            .observed_generation = 0,
+            .source = CBM_STORE_DIRTY_SOURCE_WATCHER,
+            .status = CBM_STORE_DIRTY_STATUS_PENDING,
+        };
+        if (cbm_store_upsert_dirty_file(w->store, &dirty) != CBM_STORE_OK) {
+            cbm_log_warn("watcher.dirty_ledger.warn", "project", s->project_name, "phase",
+                         "upsert_dirty_file");
+        }
+    }
+    cbm_git_status_paths_free(paths, path_count);
+}
+
 /* Context for poll_once foreach callback */
 typedef struct {
     cbm_watcher_t *w;
@@ -514,6 +562,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
     cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
+    watcher_mark_dirty_paths(ctx->w, s);
     if (ctx->w->index_fn) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
