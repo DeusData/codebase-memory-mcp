@@ -53,4 +53,13 @@ bool cbm_artifact_exists(const char *repo_path);
  * Returns NULL if artifact doesn't exist or has no commit field. */
 char *cbm_artifact_commit(const char *repo_path);
 
+/* After a successful import of a trusted clean-basis artifact, re-stamp
+ * file_hashes rows for files whose content is unchanged between the artifact's
+ * commit and the local working tree, using local stat() values.
+ * Returns the number of rows re-stamped, or -1 when reconciliation was skipped
+ * (no git / untrusted metadata / unknown commit / any uncertainty).
+ * Best-effort: never fails the import. */
+int cbm_artifact_reconcile_hashes(const char *repo_path, const char *cache_db_path,
+                                  const char *project_name);
+
 #endif /* CBM_ARTIFACT_H */

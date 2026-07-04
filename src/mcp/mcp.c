@@ -3246,7 +3246,13 @@ static void try_artifact_bootstrap(const char *project_name, const char *repo_pa
     project_db_path(project_name, db_buf, sizeof(db_buf));
     if (cbm_file_size(db_buf) < 0 && cbm_artifact_exists(repo_path)) {
         cbm_log_info("index.artifact_bootstrap", "project", project_name);
-        cbm_artifact_import(repo_path, db_buf);
+        if (cbm_artifact_import(repo_path, db_buf) == 0) {
+            /* Reconcile imported (foreign-mtime) hash rows against the local
+             * working tree so the first incremental run classifies by actual
+             * git diff instead of re-parsing ~everything. Best-effort: a -1
+             * return leaves rows foreign and falls back to today's behavior. */
+            (void)cbm_artifact_reconcile_hashes(repo_path, db_buf, project_name);
+        }
     }
 }
 
