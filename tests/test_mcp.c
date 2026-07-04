@@ -4524,6 +4524,62 @@ TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins) {
     PASS();
 }
 
+TEST(mcp_overlay_compaction_worker_reaps_finished_before_next_start) {
+    enum {
+        COMPACT_ONE_GENERATION = 1,
+        WAIT_ATTEMPTS = CBM_SZ_1K,
+        WAIT_SLEEP_US = (int)(CBM_USEC_PER_SEC / CBM_MSEC_PER_SEC),
+    };
+    const char *project = "overlay-reap-project";
+    char *cache_tmp = th_mktempdir("cbm_mcp_overlay_reap_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    int n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_create_overlay_compaction_fixture(cache, project, db_path,
+                                                    sizeof(db_path)),
+              CBM_STORE_OK);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(srv, project,
+                                                        COMPACT_ONE_GENERATION));
+    for (int attempt = 0; attempt < WAIT_ATTEMPTS; attempt++) {
+        if (!cbm_mcp_server_overlay_compaction_active(srv)) {
+            break;
+        }
+        cbm_usleep(WAIT_SLEEP_US);
+    }
+    ASSERT_FALSE(cbm_mcp_server_overlay_compaction_active(srv));
+
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(
+        srv, project, CBM_STORE_COMPACT_ALL_GENERATIONS));
+    int compacted = -1;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted), CBM_STORE_OK);
+    ASSERT_EQ(compacted, 1);
+
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project, "overlay-reap-project.main.Old"),
+              0);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project,
+                                       "overlay-reap-project.helper.Helper"),
+              0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_free(srv);
+    mcp_unlink_db_sidecars(db_path);
+    mcp_restore_cache_dir(saved_copy);
+    th_cleanup(cache);
+    PASS();
+}
+
 TEST(mcp_overlay_compaction_worker_missing_db_does_not_create_store) {
     const char *project = "overlay-missing-project";
     char *cache_tmp = th_mktempdir("cbm_mcp_overlay_missing_cache");
@@ -6127,6 +6183,7 @@ SUITE(mcp) {
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
     RUN_TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins);
+    RUN_TEST(mcp_overlay_compaction_worker_reaps_finished_before_next_start);
     RUN_TEST(mcp_overlay_compaction_worker_missing_db_does_not_create_store);
     RUN_TEST(mcp_overlay_compaction_worker_rejects_invalid_inputs);
     RUN_TEST(mcp_overlay_compaction_worker_free_joins_pending_worker);
