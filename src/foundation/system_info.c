@@ -298,7 +298,8 @@ int cbm_default_worker_count(bool initial) {
     cbm_system_info_t info = cbm_system_info();
     if (initial) {
         /* Use all cores for initial indexing — user is waiting */
-        return info.total_cores;
+        int cap = info.total_cores > 8 ? 8 : info.total_cores;
+        return cap;
     }
     /* Incremental: leave headroom for user's apps */
     int workers = info.perf_cores - SKIP_ONE;
