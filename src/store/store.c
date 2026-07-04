@@ -25,6 +25,7 @@ enum {
     ST_COL_8 = 8,
     ST_COL_9 = 9,
     ST_COL_10 = 10,
+    ST_COL_11 = 11,
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
@@ -587,6 +588,63 @@ static int init_schema(cbm_store_t *s) {
         "  FOREIGN KEY(project, overlay_generation) REFERENCES "
         "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
         ");"
+        "CREATE TABLE IF NOT EXISTS overlay_file_hashes ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  sha256 TEXT NOT NULL,"
+        "  mtime_ns INTEGER NOT NULL DEFAULT 0,"
+        "  size INTEGER NOT NULL DEFAULT 0,"
+        "  PRIMARY KEY (project, overlay_generation, rel_path),"
+        "  FOREIGN KEY(project, overlay_generation) REFERENCES "
+        "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
+        ");"
+        "CREATE TABLE IF NOT EXISTS overlay_file_state ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  content_hash TEXT NOT NULL,"
+        "  git_oid TEXT DEFAULT '',"
+        "  mtime_ns INTEGER NOT NULL DEFAULT 0,"
+        "  size INTEGER NOT NULL DEFAULT 0,"
+        "  language TEXT DEFAULT '',"
+        "  pass_fingerprint TEXT DEFAULT '',"
+        "  generation INTEGER NOT NULL DEFAULT 0,"
+        "  indexed_at TEXT NOT NULL,"
+        "  PRIMARY KEY (project, overlay_generation, rel_path),"
+        "  FOREIGN KEY(project, overlay_generation) REFERENCES "
+        "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
+        ");"
+        "CREATE TABLE IF NOT EXISTS overlay_symbol_exports ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  qualified_name TEXT NOT NULL,"
+        "  PRIMARY KEY (project, overlay_generation, rel_path, qualified_name),"
+        "  FOREIGN KEY(project, overlay_generation) REFERENCES "
+        "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
+        ");"
+        "CREATE TABLE IF NOT EXISTS overlay_import_refs ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  import_text TEXT NOT NULL,"
+        "  local_name TEXT NOT NULL DEFAULT '',"
+        "  target_qn TEXT DEFAULT '',"
+        "  PRIMARY KEY (project, overlay_generation, rel_path, import_text, local_name),"
+        "  FOREIGN KEY(project, overlay_generation) REFERENCES "
+        "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
+        ");"
+        "CREATE TABLE IF NOT EXISTS overlay_delta_meta ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  overlay_generation INTEGER NOT NULL,"
+        "  rel_path TEXT NOT NULL,"
+        "  derived_view_name TEXT DEFAULT '',"
+        "  derived_status TEXT DEFAULT '',"
+        "  PRIMARY KEY (project, overlay_generation, rel_path),"
+        "  FOREIGN KEY(project, overlay_generation) REFERENCES "
+        "overlay_generations(project, overlay_generation) ON DELETE CASCADE"
+        ");"
         "CREATE TABLE IF NOT EXISTS file_state ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
         "  rel_path TEXT NOT NULL,"
@@ -731,7 +789,15 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_overlay_edges_project_gen"
         "  ON overlay_edges(project, overlay_generation, rel_path);"
         "CREATE INDEX IF NOT EXISTS idx_overlay_tombstones_project_gen"
-        "  ON overlay_tombstones(project, overlay_generation, rel_path, entity_kind);";
+        "  ON overlay_tombstones(project, overlay_generation, rel_path, entity_kind);"
+        "CREATE INDEX IF NOT EXISTS idx_overlay_file_state_project_gen"
+        "  ON overlay_file_state(project, overlay_generation, rel_path);"
+        "CREATE INDEX IF NOT EXISTS idx_overlay_import_refs_target"
+        "  ON overlay_import_refs(project, target_qn);"
+        "CREATE INDEX IF NOT EXISTS idx_overlay_symbol_exports_path"
+        "  ON overlay_symbol_exports(project, overlay_generation, rel_path);"
+        "CREATE INDEX IF NOT EXISTS idx_overlay_delta_meta_project_gen"
+        "  ON overlay_delta_meta(project, overlay_generation, rel_path);";
     /* NOTE: a partial expression index on json_extract(properties,'$.is_entry_point')
      * was tried for arch_entry_points and REVERTED: json_extract in an index WHERE
      * aborts CREATE INDEX (and thus store open) on any row whose properties JSON is
@@ -4930,6 +4996,16 @@ static int store_overlay_delete_file_rows_body(cbm_store_t *s, const char *proje
         "AND rel_path = ?3;",
         "DELETE FROM overlay_tombstones WHERE project = ?1 AND overlay_generation = ?2 "
         "AND rel_path = ?3;",
+        "DELETE FROM overlay_file_hashes WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3;",
+        "DELETE FROM overlay_file_state WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3;",
+        "DELETE FROM overlay_symbol_exports WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3;",
+        "DELETE FROM overlay_import_refs WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3;",
+        "DELETE FROM overlay_delta_meta WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3;",
     };
     enum { DELETE_SQL_COUNT = (int)(sizeof(delete_sql) / sizeof(delete_sql[0])) };
     for (int i = 0; i < DELETE_SQL_COUNT; i++) {
@@ -4964,7 +5040,22 @@ static int store_overlay_delete_empty_ready_generations_body(cbm_store_t *s, con
         "                    AND e.overlay_generation = overlay_generations.overlay_generation) "
         "  AND NOT EXISTS (SELECT 1 FROM overlay_tombstones t "
         "                  WHERE t.project = overlay_generations.project "
-        "                    AND t.overlay_generation = overlay_generations.overlay_generation);";
+        "                    AND t.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_file_hashes h "
+        "                  WHERE h.project = overlay_generations.project "
+        "                    AND h.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_file_state fs "
+        "                  WHERE fs.project = overlay_generations.project "
+        "                    AND fs.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_symbol_exports x "
+        "                  WHERE x.project = overlay_generations.project "
+        "                    AND x.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_import_refs r "
+        "                  WHERE r.project = overlay_generations.project "
+        "                    AND r.overlay_generation = overlay_generations.overlay_generation) "
+        "  AND NOT EXISTS (SELECT 1 FROM overlay_delta_meta m "
+        "                  WHERE m.project = overlay_generations.project "
+        "                    AND m.overlay_generation = overlay_generations.overlay_generation);";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "overlay_delete_empty_ready_generations prepare");
@@ -5008,6 +5099,36 @@ static int store_overlay_delete_superseded_file_rows_body(cbm_store_t *s, const 
         "AND EXISTS (SELECT 1 FROM overlay_generations g "
         "            WHERE g.project = overlay_tombstones.project "
         "              AND g.overlay_generation = overlay_tombstones.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_file_hashes WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_file_hashes.project "
+        "              AND g.overlay_generation = overlay_file_hashes.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_file_state WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_file_state.project "
+        "              AND g.overlay_generation = overlay_file_state.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_symbol_exports WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_symbol_exports.project "
+        "              AND g.overlay_generation = overlay_symbol_exports.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_import_refs WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_import_refs.project "
+        "              AND g.overlay_generation = overlay_import_refs.overlay_generation "
+        "              AND g.status = ?4);",
+        "DELETE FROM overlay_delta_meta WHERE project = ?1 AND rel_path = ?2 "
+        "AND overlay_generation < ?3 "
+        "AND EXISTS (SELECT 1 FROM overlay_generations g "
+        "            WHERE g.project = overlay_delta_meta.project "
+        "              AND g.overlay_generation = overlay_delta_meta.overlay_generation "
         "              AND g.status = ?4);",
     };
     enum { DELETE_SQL_COUNT = (int)(sizeof(delete_sql) / sizeof(delete_sql[0])) };
@@ -5213,6 +5334,181 @@ static int store_overlay_insert_edges_body(cbm_store_t *s,
     return CBM_STORE_OK;
 }
 
+static int store_overlay_insert_file_hash_body(cbm_store_t *s,
+                                               const cbm_store_file_delta_t *delta,
+                                               int64_t overlay_generation) {
+    if (!delta->file_hash) {
+        return CBM_STORE_OK;
+    }
+    static const char sql[] =
+        "INSERT INTO overlay_file_hashes (project, overlay_generation, rel_path, sha256, "
+        "mtime_ns, size) VALUES (?1, ?2, ?3, ?4, ?5, ?6);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_insert_file_hash prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, delta->rel_path);
+    bind_text(stmt, ST_COL_4, delta->file_hash->sha256);
+    sqlite3_bind_int64(stmt, ST_COL_5, delta->file_hash->mtime_ns);
+    sqlite3_bind_int64(stmt, ST_COL_6, delta->file_hash->size);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_insert_file_hash");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_insert_file_state_body(cbm_store_t *s,
+                                                const cbm_store_file_delta_t *delta,
+                                                int64_t overlay_generation) {
+    if (!delta->file_state) {
+        return CBM_STORE_OK;
+    }
+    static const char sql[] =
+        "INSERT INTO overlay_file_state (project, overlay_generation, rel_path, content_hash, "
+        "git_oid, mtime_ns, size, language, pass_fingerprint, generation, indexed_at) "
+        "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_insert_file_state prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, delta->rel_path);
+    bind_text(stmt, ST_COL_4, delta->file_state->content_hash);
+    bind_text(stmt, ST_COL_5, safe_str(delta->file_state->git_oid));
+    sqlite3_bind_int64(stmt, ST_COL_6, delta->file_state->mtime_ns);
+    sqlite3_bind_int64(stmt, ST_COL_7, delta->file_state->size);
+    bind_text(stmt, ST_COL_8, safe_str(delta->file_state->language));
+    bind_text(stmt, ST_COL_9, safe_str(delta->file_state->pass_fingerprint));
+    sqlite3_bind_int64(stmt, ST_COL_10, delta->file_state->generation);
+    bind_text(stmt, ST_COL_11, delta->file_state->indexed_at);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_insert_file_state");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_insert_symbol_exports_body(cbm_store_t *s,
+                                                    const cbm_store_file_delta_t *delta,
+                                                    int64_t overlay_generation) {
+    if (delta->export_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    static const char sql[] =
+        "INSERT INTO overlay_symbol_exports (project, overlay_generation, rel_path, "
+        "qualified_name) VALUES (?1, ?2, ?3, ?4);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_insert_symbol_exports prepare");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta->export_count; i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        bind_text(stmt, ST_COL_1, delta->project);
+        sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+        bind_text(stmt, ST_COL_3, delta->rel_path);
+        bind_text(stmt, ST_COL_4, delta->exports[i].qualified_name);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "overlay_insert_symbol_export");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_insert_import_refs_body(cbm_store_t *s,
+                                                 const cbm_store_file_delta_t *delta,
+                                                 int64_t overlay_generation) {
+    if (delta->import_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    static const char sql[] =
+        "INSERT INTO overlay_import_refs (project, overlay_generation, rel_path, import_text, "
+        "local_name, target_qn) VALUES (?1, ?2, ?3, ?4, ?5, ?6);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_insert_import_refs prepare");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < delta->import_count; i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        bind_text(stmt, ST_COL_1, delta->project);
+        sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+        bind_text(stmt, ST_COL_3, delta->rel_path);
+        bind_text(stmt, ST_COL_4, delta->imports[i].import_text);
+        bind_text(stmt, ST_COL_5, safe_str(delta->imports[i].local_name));
+        bind_text(stmt, ST_COL_6, safe_str(delta->imports[i].target_qn));
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "overlay_insert_import_ref");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_insert_delta_meta_body(cbm_store_t *s,
+                                                const cbm_store_file_delta_t *delta,
+                                                int64_t overlay_generation) {
+    static const char sql[] =
+        "INSERT INTO overlay_delta_meta (project, overlay_generation, rel_path, "
+        "derived_view_name, derived_status) VALUES (?1, ?2, ?3, ?4, ?5);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_insert_delta_meta prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, delta->rel_path);
+    bind_text(stmt, ST_COL_4, safe_str(delta->derived_view_name));
+    bind_text(stmt, ST_COL_5, safe_str(delta->derived_status));
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_insert_delta_meta");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_insert_metadata_body(cbm_store_t *s,
+                                              const cbm_store_file_delta_t *delta,
+                                              int64_t overlay_generation) {
+    int rc = store_overlay_insert_file_hash_body(s, delta, overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_insert_file_state_body(s, delta, overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_insert_symbol_exports_body(s, delta, overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_insert_import_refs_body(s, delta, overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return store_overlay_insert_delta_meta_body(s, delta, overlay_generation);
+}
+
 int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
                                                const cbm_store_file_delta_t *const *deltas,
                                                int delta_count,
@@ -5271,6 +5567,11 @@ int cbm_store_publish_overlay_file_delta_batch(cbm_store_t *s,
             (void)cbm_store_rollback(s);
             return rc;
         }
+        rc = store_overlay_insert_metadata_body(s, delta, overlay_generation);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            return rc;
+        }
     }
     rc = store_set_overlay_generation_status_body(s, project, overlay_generation,
                                                   CBM_STORE_OVERLAY_STATUS_READY);
@@ -5300,6 +5601,632 @@ int cbm_store_publish_overlay_file_delta(cbm_store_t *s,
                                          int64_t overlay_generation) {
     const cbm_store_file_delta_t *deltas[] = {delta};
     return cbm_store_publish_overlay_file_delta_batch(s, deltas, 1, overlay_generation);
+}
+
+typedef struct {
+    cbm_store_file_delta_t delta;
+    cbm_file_hash_t file_hash;
+    cbm_file_state_t file_state;
+    cbm_node_t *context_nodes;
+    cbm_node_t *nodes;
+    cbm_store_delta_edge_t *context_edges;
+    cbm_store_delta_edge_t *edges;
+    cbm_store_symbol_export_t *exports;
+    cbm_store_import_ref_t *imports;
+} store_overlay_loaded_delta_t;
+
+static char *store_column_strdup(sqlite3_stmt *stmt, int col) {
+    const char *text = (const char *)sqlite3_column_text(stmt, col);
+    return heap_strdup(text ? text : "");
+}
+
+static void store_free_delta_edges(cbm_store_delta_edge_t *edges, int count) {
+    if (!edges) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&edges[i].source_qn);
+        safe_str_free(&edges[i].target_qn);
+        safe_str_free(&edges[i].type);
+        safe_str_free(&edges[i].properties_json);
+        safe_str_free(&edges[i].derived_kind);
+    }
+    free(edges);
+}
+
+static void store_free_import_refs(cbm_store_import_ref_t *imports, int count) {
+    if (!imports) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&imports[i].import_text);
+        safe_str_free(&imports[i].local_name);
+        safe_str_free(&imports[i].target_qn);
+    }
+    free(imports);
+}
+
+static void store_overlay_loaded_delta_free(store_overlay_loaded_delta_t *loaded) {
+    if (!loaded) {
+        return;
+    }
+    cbm_store_free_nodes(loaded->context_nodes, loaded->delta.context_node_count);
+    cbm_store_free_nodes(loaded->nodes, loaded->delta.node_count);
+    store_free_delta_edges(loaded->context_edges, loaded->delta.context_edge_count);
+    store_free_delta_edges(loaded->edges, loaded->delta.edge_count);
+    for (int i = 0; i < loaded->delta.export_count; i++) {
+        safe_str_free(&loaded->exports[i].qualified_name);
+    }
+    store_free_import_refs(loaded->imports, loaded->delta.import_count);
+    cbm_store_file_state_free_fields(&loaded->file_state);
+    safe_str_free(&loaded->file_hash.project);
+    safe_str_free(&loaded->file_hash.rel_path);
+    safe_str_free(&loaded->file_hash.sha256);
+    safe_str_free(&loaded->delta.project);
+    safe_str_free(&loaded->delta.rel_path);
+    safe_str_free(&loaded->delta.derived_view_name);
+    safe_str_free(&loaded->delta.derived_status);
+    free(loaded->exports);
+    memset(loaded, 0, sizeof(*loaded));
+}
+
+static int store_overlay_load_paths(cbm_store_t *s, const char *project,
+                                    int64_t overlay_generation, char ***out_paths,
+                                    int *out_count) {
+    if (out_paths) {
+        *out_paths = NULL;
+    }
+    if (out_count) {
+        *out_count = 0;
+    }
+    static const char sql[] =
+        "SELECT rel_path FROM overlay_tombstones "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND entity_kind = ?3 "
+        "ORDER BY rel_path;";
+    sqlite3_stmt *stmt = NULL;
+    if (!out_paths || !out_count ||
+        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_load_paths prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    int rc = store_collect_text_column(s, stmt, "overlay_load_paths", out_paths, out_count);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+static int store_overlay_count_owned_file_rows(cbm_store_t *s, const char *sql,
+                                               const char *project,
+                                               int64_t overlay_generation,
+                                               const char *rel_path, int owned,
+                                               int *out_count) {
+    sqlite3_stmt *stmt = NULL;
+    if (!out_count ||
+        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_count_owned_file_rows prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, rel_path);
+    sqlite3_bind_int(stmt, ST_COL_4, owned);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        *out_count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "overlay_count_owned_file_rows");
+    return CBM_STORE_ERR;
+}
+
+static int store_overlay_count_path_rows(cbm_store_t *s, const char *sql, const char *project,
+                                         int64_t overlay_generation, const char *rel_path,
+                                         int *out_count) {
+    sqlite3_stmt *stmt = NULL;
+    if (!out_count ||
+        sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_count_path_rows prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, rel_path);
+    int step = sqlite3_step(stmt);
+    if (step == SQLITE_ROW) {
+        *out_count = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    store_set_error_sqlite(s, "overlay_count_path_rows");
+    return CBM_STORE_ERR;
+}
+
+static int store_overlay_load_nodes(cbm_store_t *s, store_overlay_loaded_delta_t *loaded,
+                                    int64_t overlay_generation, bool owned) {
+    static const char count_sql[] =
+        "SELECT COUNT(*) FROM overlay_nodes WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3 AND owned = ?4;";
+    int count = 0;
+    int rc = store_overlay_count_owned_file_rows(s, count_sql, loaded->delta.project,
+                                                 overlay_generation, loaded->delta.rel_path,
+                                                 owned ? STORE_OVERLAY_ROW_OWNED
+                                                       : STORE_OVERLAY_ROW_CONTEXT,
+                                                 &count);
+    if (rc != CBM_STORE_OK || count <= 0) {
+        return rc;
+    }
+    cbm_node_t *nodes = calloc((size_t)count, sizeof(*nodes));
+    if (!nodes) {
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] =
+        "SELECT label, name, qualified_name, file_path, start_line, end_line, properties "
+        "FROM overlay_nodes WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3 AND owned = ?4 ORDER BY id;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        free(nodes);
+        store_set_error_sqlite(s, "overlay_load_nodes prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    sqlite3_bind_int(stmt, ST_COL_4,
+                     owned ? STORE_OVERLAY_ROW_OWNED : STORE_OVERLAY_ROW_CONTEXT);
+    int idx = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && idx < count) {
+        nodes[idx].project = heap_strdup(loaded->delta.project);
+        nodes[idx].label = store_column_strdup(stmt, 0);
+        nodes[idx].name = store_column_strdup(stmt, ST_COL_1);
+        nodes[idx].qualified_name = store_column_strdup(stmt, ST_COL_2);
+        nodes[idx].file_path = store_column_strdup(stmt, ST_COL_3);
+        nodes[idx].start_line = sqlite3_column_int(stmt, ST_COL_4);
+        nodes[idx].end_line = sqlite3_column_int(stmt, ST_COL_5);
+        nodes[idx].properties_json = store_column_strdup(stmt, ST_COL_6);
+        if (!nodes[idx].project || !nodes[idx].label || !nodes[idx].name ||
+            !nodes[idx].qualified_name || !nodes[idx].file_path ||
+            !nodes[idx].properties_json) {
+            sqlite3_finalize(stmt);
+            cbm_store_free_nodes(nodes, idx + 1);
+            store_set_error(s, "overlay_load_nodes out of memory");
+            return CBM_STORE_ERR;
+        }
+        idx++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE || idx != count) {
+        cbm_store_free_nodes(nodes, idx);
+        return CBM_STORE_ERR;
+    }
+    if (owned) {
+        loaded->nodes = nodes;
+        loaded->delta.nodes = nodes;
+        loaded->delta.node_count = count;
+    } else {
+        loaded->context_nodes = nodes;
+        loaded->delta.context_nodes = nodes;
+        loaded->delta.context_node_count = count;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_load_edges(cbm_store_t *s, store_overlay_loaded_delta_t *loaded,
+                                    int64_t overlay_generation, bool owned) {
+    static const char count_sql[] =
+        "SELECT COUNT(*) FROM overlay_edges WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3 AND owned = ?4;";
+    int count = 0;
+    int rc = store_overlay_count_owned_file_rows(s, count_sql, loaded->delta.project,
+                                                 overlay_generation, loaded->delta.rel_path,
+                                                 owned ? STORE_OVERLAY_ROW_OWNED
+                                                       : STORE_OVERLAY_ROW_CONTEXT,
+                                                 &count);
+    if (rc != CBM_STORE_OK || count <= 0) {
+        return rc;
+    }
+    cbm_store_delta_edge_t *edges = calloc((size_t)count, sizeof(*edges));
+    if (!edges) {
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] =
+        "SELECT source_qn, target_qn, type, properties, derived_kind "
+        "FROM overlay_edges WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3 AND owned = ?4 ORDER BY id;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        free(edges);
+        store_set_error_sqlite(s, "overlay_load_edges prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    sqlite3_bind_int(stmt, ST_COL_4,
+                     owned ? STORE_OVERLAY_ROW_OWNED : STORE_OVERLAY_ROW_CONTEXT);
+    int idx = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && idx < count) {
+        edges[idx].source_qn = store_column_strdup(stmt, 0);
+        edges[idx].target_qn = store_column_strdup(stmt, ST_COL_1);
+        edges[idx].type = store_column_strdup(stmt, ST_COL_2);
+        edges[idx].properties_json = store_column_strdup(stmt, ST_COL_3);
+        edges[idx].derived_kind = store_column_strdup(stmt, ST_COL_4);
+        if (!edges[idx].source_qn || !edges[idx].target_qn || !edges[idx].type ||
+            !edges[idx].properties_json || !edges[idx].derived_kind) {
+            sqlite3_finalize(stmt);
+            store_free_delta_edges(edges, idx + 1);
+            store_set_error(s, "overlay_load_edges out of memory");
+            return CBM_STORE_ERR;
+        }
+        idx++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE || idx != count) {
+        store_free_delta_edges(edges, idx);
+        return CBM_STORE_ERR;
+    }
+    if (owned) {
+        loaded->edges = edges;
+        loaded->delta.edges = edges;
+        loaded->delta.edge_count = count;
+    } else {
+        loaded->context_edges = edges;
+        loaded->delta.context_edges = edges;
+        loaded->delta.context_edge_count = count;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_load_hash_state_meta(cbm_store_t *s,
+                                              store_overlay_loaded_delta_t *loaded,
+                                              int64_t overlay_generation,
+                                              int64_t index_generation) {
+    sqlite3_stmt *stmt = NULL;
+    static const char hash_sql[] =
+        "SELECT sha256, mtime_ns, size FROM overlay_file_hashes "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3;";
+    if (sqlite3_prepare_v2(s->db, hash_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_load_hash prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        loaded->file_hash.project = heap_strdup(loaded->delta.project);
+        loaded->file_hash.rel_path = heap_strdup(loaded->delta.rel_path);
+        loaded->file_hash.sha256 = store_column_strdup(stmt, 0);
+        loaded->file_hash.mtime_ns = sqlite3_column_int64(stmt, ST_COL_1);
+        loaded->file_hash.size = sqlite3_column_int64(stmt, ST_COL_2);
+        if (!loaded->file_hash.project || !loaded->file_hash.rel_path ||
+            !loaded->file_hash.sha256) {
+            sqlite3_finalize(stmt);
+            store_set_error(s, "overlay_load_hash out of memory");
+            return CBM_STORE_ERR;
+        }
+        loaded->delta.file_hash = &loaded->file_hash;
+    }
+    sqlite3_finalize(stmt);
+
+    static const char state_sql[] =
+        "SELECT content_hash, git_oid, mtime_ns, size, language, pass_fingerprint, indexed_at "
+        "FROM overlay_file_state WHERE project = ?1 AND overlay_generation = ?2 "
+        "AND rel_path = ?3;";
+    if (sqlite3_prepare_v2(s->db, state_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_load_state prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        loaded->file_state.project = heap_strdup(loaded->delta.project);
+        loaded->file_state.rel_path = heap_strdup(loaded->delta.rel_path);
+        loaded->file_state.content_hash = store_column_strdup(stmt, 0);
+        loaded->file_state.git_oid = store_column_strdup(stmt, ST_COL_1);
+        loaded->file_state.mtime_ns = sqlite3_column_int64(stmt, ST_COL_2);
+        loaded->file_state.size = sqlite3_column_int64(stmt, ST_COL_3);
+        loaded->file_state.language = store_column_strdup(stmt, ST_COL_4);
+        loaded->file_state.pass_fingerprint = store_column_strdup(stmt, ST_COL_5);
+        loaded->file_state.generation = index_generation;
+        loaded->file_state.indexed_at = store_column_strdup(stmt, ST_COL_6);
+        if (!loaded->file_state.project || !loaded->file_state.rel_path ||
+            !loaded->file_state.content_hash || !loaded->file_state.git_oid ||
+            !loaded->file_state.language || !loaded->file_state.pass_fingerprint ||
+            !loaded->file_state.indexed_at) {
+            sqlite3_finalize(stmt);
+            store_set_error(s, "overlay_load_state out of memory");
+            return CBM_STORE_ERR;
+        }
+        loaded->delta.file_state = &loaded->file_state;
+    }
+    sqlite3_finalize(stmt);
+
+    static const char meta_sql[] =
+        "SELECT derived_view_name, derived_status FROM overlay_delta_meta "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3;";
+    if (sqlite3_prepare_v2(s->db, meta_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_load_delta_meta prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        loaded->delta.derived_view_name = store_column_strdup(stmt, 0);
+        loaded->delta.derived_status = store_column_strdup(stmt, ST_COL_1);
+        if (!loaded->delta.derived_view_name || !loaded->delta.derived_status) {
+            sqlite3_finalize(stmt);
+            store_set_error(s, "overlay_load_delta_meta out of memory");
+            return CBM_STORE_ERR;
+        }
+        if (loaded->delta.derived_view_name && loaded->delta.derived_view_name[0] == '\0') {
+            safe_str_free(&loaded->delta.derived_view_name);
+        }
+        if (loaded->delta.derived_status && loaded->delta.derived_status[0] == '\0') {
+            safe_str_free(&loaded->delta.derived_status);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_load_exports(cbm_store_t *s, store_overlay_loaded_delta_t *loaded,
+                                      int64_t overlay_generation) {
+    char **items = NULL;
+    int count = 0;
+    static const char sql[] =
+        "SELECT qualified_name FROM overlay_symbol_exports "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3 "
+        "ORDER BY qualified_name;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "overlay_load_exports prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    int rc = store_collect_text_column(s, stmt, "overlay_load_exports", &items, &count);
+    sqlite3_finalize(stmt);
+    if (rc != CBM_STORE_OK || count <= 0) {
+        store_free_text_array(items, count);
+        return rc;
+    }
+    cbm_store_symbol_export_t *exports = calloc((size_t)count, sizeof(*exports));
+    if (!exports) {
+        store_free_text_array(items, count);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < count; i++) {
+        exports[i].qualified_name = items[i];
+        exports[i].node_id = CBM_STORE_NO_NODE_ID;
+    }
+    free(items);
+    loaded->exports = exports;
+    loaded->delta.exports = exports;
+    loaded->delta.export_count = count;
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_load_imports(cbm_store_t *s, store_overlay_loaded_delta_t *loaded,
+                                      int64_t overlay_generation) {
+    static const char count_sql[] =
+        "SELECT COUNT(*) FROM overlay_import_refs WHERE project = ?1 "
+        "AND overlay_generation = ?2 AND rel_path = ?3;";
+    int count = 0;
+    int rc = store_overlay_count_path_rows(s, count_sql, loaded->delta.project,
+                                           overlay_generation, loaded->delta.rel_path, &count);
+    if (rc != CBM_STORE_OK || count <= 0) {
+        return rc;
+    }
+    cbm_store_import_ref_t *imports = calloc((size_t)count, sizeof(*imports));
+    if (!imports) {
+        return CBM_STORE_ERR;
+    }
+    static const char sql[] =
+        "SELECT import_text, local_name, target_qn FROM overlay_import_refs "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3 "
+        "ORDER BY import_text, local_name;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        free(imports);
+        store_set_error_sqlite(s, "overlay_load_imports prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, loaded->delta.project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, loaded->delta.rel_path);
+    int idx = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW && idx < count) {
+        imports[idx].import_text = store_column_strdup(stmt, 0);
+        imports[idx].local_name = store_column_strdup(stmt, ST_COL_1);
+        imports[idx].target_qn = store_column_strdup(stmt, ST_COL_2);
+        if (!imports[idx].import_text || !imports[idx].local_name || !imports[idx].target_qn) {
+            sqlite3_finalize(stmt);
+            store_free_import_refs(imports, idx + 1);
+            store_set_error(s, "overlay_load_imports out of memory");
+            return CBM_STORE_ERR;
+        }
+        idx++;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE || idx != count) {
+        store_free_import_refs(imports, idx);
+        return CBM_STORE_ERR;
+    }
+    loaded->imports = imports;
+    loaded->delta.imports = imports;
+    loaded->delta.import_count = count;
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_load_delta(cbm_store_t *s, const char *project,
+                                    int64_t overlay_generation, const char *rel_path,
+                                    int64_t index_generation,
+                                    store_overlay_loaded_delta_t *loaded) {
+    memset(loaded, 0, sizeof(*loaded));
+    loaded->delta.project = heap_strdup(project);
+    loaded->delta.rel_path = heap_strdup(rel_path);
+    loaded->delta.generation = index_generation;
+    if (!loaded->delta.project || !loaded->delta.rel_path) {
+        return CBM_STORE_ERR;
+    }
+    int rc = store_overlay_load_hash_state_meta(s, loaded, overlay_generation, index_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_load_nodes(s, loaded, overlay_generation, false);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_load_nodes(s, loaded, overlay_generation, true);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_load_edges(s, loaded, overlay_generation, false);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_load_edges(s, loaded, overlay_generation, true);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_overlay_load_exports(s, loaded, overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return store_overlay_load_imports(s, loaded, overlay_generation);
+}
+
+static int store_delete_overlay_generation_body(cbm_store_t *s, const char *project,
+                                                int64_t overlay_generation) {
+    static const char sql[] =
+        "DELETE FROM overlay_generations WHERE project = ?1 AND overlay_generation = ?2;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "delete_overlay_generation prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "delete_overlay_generation");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_compact_overlay_generation(cbm_store_t *s, const char *project,
+                                         int64_t overlay_generation,
+                                         int64_t index_generation) {
+    if (!s || !s->db || !project || !project[0] || overlay_generation <= 0 ||
+        index_generation <= 0) {
+        if (s) {
+            store_set_error(s, "compact_overlay_generation: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+    char **paths = NULL;
+    int path_count = 0;
+    int rc = store_overlay_load_paths(s, project, overlay_generation, &paths, &path_count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    if (path_count <= 0) {
+        store_free_text_array(paths, path_count);
+        store_set_error(s, "compact_overlay_generation: no file rows");
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    store_overlay_loaded_delta_t *loaded = calloc((size_t)path_count, sizeof(*loaded));
+    const cbm_store_file_delta_t **upserts = calloc((size_t)path_count, sizeof(*upserts));
+    if (!loaded || !upserts) {
+        free(loaded);
+        free(upserts);
+        store_free_text_array(paths, path_count);
+        return CBM_STORE_ERR;
+    }
+    int upsert_count = 0;
+    for (int i = 0; i < path_count; i++) {
+        rc = store_overlay_load_delta(s, project, overlay_generation, paths[i], index_generation,
+                                      &loaded[i]);
+        if (rc != CBM_STORE_OK) {
+            goto cleanup;
+        }
+        if (loaded[i].delta.node_count > 0 || loaded[i].delta.edge_count > 0 ||
+            loaded[i].delta.context_node_count > 0 || loaded[i].delta.context_edge_count > 0) {
+            upserts[upsert_count++] = &loaded[i].delta;
+        }
+    }
+
+    rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        goto cleanup;
+    }
+    for (int i = 0; i < path_count; i++) {
+        rc = store_delete_file_delta_body(s, project, paths[i], index_generation,
+                                          loaded[i].delta.derived_view_name);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            goto cleanup;
+        }
+    }
+    if (upsert_count > 0) {
+        rc = store_publish_file_delta_batch_body(s, upserts, upsert_count);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            goto cleanup;
+        }
+    }
+    rc = store_mark_graph_derived_views_stale_body(s, project, index_generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        goto cleanup;
+    }
+    rc = store_finish_index_generation_body(s, project, index_generation,
+                                            CBM_STORE_INDEX_STATUS_COMPLETE);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        goto cleanup;
+    }
+    for (int i = 0; i < path_count; i++) {
+        rc = store_overlay_delete_file_rows_body(s, project, overlay_generation, paths[i]);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            goto cleanup;
+        }
+        rc = cbm_store_clear_dirty_file(s, project, paths[i]);
+        if (rc != CBM_STORE_OK) {
+            (void)cbm_store_rollback(s);
+            goto cleanup;
+        }
+    }
+    rc = store_delete_overlay_generation_body(s, project, overlay_generation);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        goto cleanup;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+    }
+
+cleanup:
+    for (int i = 0; i < path_count; i++) {
+        store_overlay_loaded_delta_free(&loaded[i]);
+    }
+    free(loaded);
+    free(upserts);
+    store_free_text_array(paths, path_count);
+    return rc;
 }
 
 int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
