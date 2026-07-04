@@ -1528,6 +1528,21 @@ TEST(cypher_apply_limit) {
     ASSERT_EQ(r.row_count, 30);
     cbm_cypher_result_free(&r);
 
+    /* LIMIT 0 is an explicit empty result, not the no-limit sentinel. */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 0", "lim", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
+    /* WITH has a separate skip/limit path and must preserve the same semantics. */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) WITH f LIMIT 0 RETURN f.name", "lim", 0,
+                            &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+
     cbm_store_close(s);
     PASS();
 }
@@ -2308,6 +2323,23 @@ TEST(cypher_exec_optional_match_has_result) {
     PASS();
 }
 
+TEST(cypher_exec_optional_match_bound_terminal_no_callers) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) "
+                                "OPTIONAL MATCH (c:Function)-[:CALLS]->(f) "
+                                "WHERE c IS NULL "
+                                "RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_multi_match) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2671,6 +2703,7 @@ SUITE(cypher) {
     /* Phase 7: OPTIONAL MATCH + multiple MATCH */
     RUN_TEST(cypher_exec_optional_match_no_result);
     RUN_TEST(cypher_exec_optional_match_has_result);
+    RUN_TEST(cypher_exec_optional_match_bound_terminal_no_callers);
     RUN_TEST(cypher_exec_multi_match);
     RUN_TEST(cypher_parse_optional_match);
     RUN_TEST(cypher_parse_multi_match);
