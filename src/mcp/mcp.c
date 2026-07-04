@@ -118,6 +118,7 @@ static void add_response_warning(yyjson_mut_doc *doc, yyjson_mut_val *root, cons
 #define CBM_MCP_FRESHNESS_STALE_WITH_WARNING "stale_with_warning"
 #define CBM_MCP_FRESHNESS_READ_MODEL_KEY "read_model"
 #define CBM_MCP_FRESHNESS_READ_MODEL_CANONICAL_ONLY "canonical_only"
+#define CBM_MCP_FRESHNESS_READ_MODEL_MIXED_ACTIVE_NODES "mixed_active_nodes_canonical_summaries"
 #define CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_NODES "overlay_active_nodes"
 #define CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_GRAPH "overlay_active_graph"
 #define CBM_MCP_EXACT_DELTA_KEY "exact_delta"
@@ -388,6 +389,42 @@ static void add_overlay_active_search_code_freshness(
         "search_code read live source files and used active overlay node rows for graph "
         "annotations where ready; raw matches remain live-source-only when no graph node "
         "contains the match line.");
+}
+
+static bool add_overlay_active_architecture_entry_points_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store, const char *project) {
+    if (!doc || !root || !store || !project || !project[0]) {
+        return false;
+    }
+    cbm_store_overlay_node_view_summary_t summary = {0};
+    if (cbm_store_get_overlay_node_view_summary(store, project, &summary) != CBM_STORE_OK ||
+        summary.active_file_tombstones <= 0) {
+        return false;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return false;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_MIXED_ACTIVE_NODES);
+    yyjson_mut_val *active_sections = yyjson_mut_arr(doc);
+    yyjson_mut_arr_add_str(doc, active_sections, "entry_points");
+    yyjson_mut_obj_add_val(doc, freshness, "active_sections", active_sections);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary.overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary.active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary.canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary.overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible", summary.total_nodes_visible);
+    add_response_warning(
+        doc, root,
+        "get_architecture used active overlay node rows for entry_points; counts and derived "
+        "summaries remain canonical or stale until active architecture views or compaction are "
+        "available.");
+    return true;
 }
 
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
@@ -4924,17 +4961,30 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     }
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
-    bool overlay_limitation_reported = add_canonical_only_overlay_freshness(
-        doc, root, store, project,
-        "get_architecture reads canonical graph summaries; ready overlay rows are not included "
-        "until active architecture views or compaction are available.");
+    bool active_entry_points_requested = aspect_wanted(aspects_doc, aspects_arr, "entry_points");
+    bool active_entry_points_reported =
+        active_entry_points_requested &&
+        add_overlay_active_architecture_entry_points_freshness(doc, root, store, project);
+    bool overlay_limitation_reported =
+        !active_entry_points_reported &&
+        add_canonical_only_overlay_freshness(
+            doc, root, store, project,
+            "get_architecture reads canonical graph summaries; ready overlay rows are not "
+            "included until active architecture views or compaction are available.");
     if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_canonical_only_read_model(doc, root);
+        if (!active_entry_points_reported) {
+            add_canonical_only_read_model(doc, root);
+        }
         if (!overlay_limitation_reported) {
-            add_response_warning(doc, root,
-                                 "get_architecture reads canonical graph summaries; dirty file "
-                                 "changes may be absent until overlay or reindex completes.");
+            add_response_warning(
+                doc, root,
+                active_entry_points_reported
+                    ? "get_architecture used active overlay node rows for entry_points; dirty "
+                      "file changes outside ready overlays may still be absent from canonical "
+                      "summaries until overlay or reindex completes."
+                    : "get_architecture reads canonical graph summaries; dirty file changes may "
+                      "be absent until overlay or reindex completes.");
         }
     } else if (overlay_limitation_reported) {
         add_canonical_only_read_model(doc, root);
