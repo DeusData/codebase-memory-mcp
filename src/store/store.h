@@ -698,6 +698,11 @@ int cbm_store_claim_ready_overlay_generation(cbm_store_t *s, const char *project
  * shutdown. Callers must not run this while a compactor is active. */
 int cbm_store_recover_overlay_compaction_claims(cbm_store_t *s, const char *project,
                                                 int *out_recovered);
+/* Claim and compact one ready overlay generation into a new canonical
+ * generation. Returns CBM_STORE_NOT_FOUND when no claimable overlay exists. */
+int cbm_store_compact_next_overlay_generation(cbm_store_t *s, const char *project,
+                                              int64_t *out_overlay_generation,
+                                              int64_t *out_index_generation);
 
 /* Publish one file's replacement facts into overlay storage. This does not
  * mutate canonical nodes/edges; active read paths decide later how to combine

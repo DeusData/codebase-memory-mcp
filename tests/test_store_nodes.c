@@ -1434,6 +1434,24 @@ TEST(store_recover_overlay_compaction_claims_releases_abandoned_claims) {
     PASS();
 }
 
+TEST(store_compact_next_overlay_generation_returns_not_found_without_ready_overlay) {
+    enum { SENTINEL = 42 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t overlay_generation = SENTINEL;
+    int64_t index_generation = SENTINEL;
+    ASSERT_EQ(cbm_store_compact_next_overlay_generation(s, "test", &overlay_generation,
+                                                        &index_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(overlay_generation, 0);
+    ASSERT_EQ(index_generation, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_overlay_file_delta_publish_rows_and_tombstone) {
     enum { BASE_GENERATION = 3 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -2141,11 +2159,13 @@ TEST(store_compact_overlay_generation_promotes_delete_only_tombstone) {
                                     .status = CBM_STORE_DIRTY_STATUS_OVERLAY_READY};
     ASSERT_EQ(cbm_store_upsert_dirty_file(s, &dirty), CBM_STORE_OK);
 
-    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+    int64_t compacted_overlay = 0;
+    int64_t compact_generation = 0;
+    ASSERT_EQ(cbm_store_compact_next_overlay_generation(s, "test", &compacted_overlay,
+                                                        &compact_generation),
               CBM_STORE_OK);
-    ASSERT_EQ(generation, COMPACT_GENERATION);
-    ASSERT_EQ(cbm_store_compact_overlay_generation(s, "test", overlay_generation, generation),
-              CBM_STORE_OK);
+    ASSERT_EQ(compacted_overlay, overlay_generation);
+    ASSERT_EQ(compact_generation, COMPACT_GENERATION);
 
     ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.Old"), 0);
     ASSERT_EQ(store_node_qn_exists(s, "test", "test.helper.Helper"), 1);
@@ -5431,6 +5451,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_claim_ready_overlay_generation_claims_oldest_once);
     RUN_TEST(store_claim_ready_overlay_generation_ignores_nonready_and_validates_outputs);
     RUN_TEST(store_recover_overlay_compaction_claims_releases_abandoned_claims);
+    RUN_TEST(store_compact_next_overlay_generation_returns_not_found_without_ready_overlay);
     RUN_TEST(store_overlay_file_delta_publish_rows_and_tombstone);
     RUN_TEST(store_delete_project_clears_overlay_fts);
     RUN_TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows);
