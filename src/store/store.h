@@ -668,6 +668,11 @@ int cbm_store_reserve_index_generation(cbm_store_t *s, const char *project,
                                        const char *config_fingerprint,
                                        int64_t *out_generation);
 
+/* Return the latest complete canonical generation for a project, or 0 when the
+ * project only has the compatibility/full-replacement generation. */
+int cbm_store_latest_complete_index_generation(cbm_store_t *s, const char *project,
+                                               int64_t *out_generation);
+
 /* Finish a previously reserved generation as complete or failed. */
 int cbm_store_finish_index_generation(cbm_store_t *s, const char *project, int64_t generation,
                                       const char *status);

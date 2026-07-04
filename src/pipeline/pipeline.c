@@ -75,6 +75,11 @@ typedef enum {
     CBM_INCREMENTAL_REINDEX_OFF,
 } cbm_incremental_reindex_policy_t;
 
+typedef enum {
+    CBM_OVERLAY_PUBLISH_OFF = 0,
+    CBM_OVERLAY_PUBLISH_SMALL_DELTAS,
+} cbm_overlay_publish_policy_t;
+
 void cbm_pipeline_lock(void) {
     while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
         struct timespec ts = {0, CBM_PIPELINE_LOCK_RETRY_NS};
@@ -102,6 +107,7 @@ struct cbm_pipeline {
     double githistory_min_coupling;
     double lsp_confidence_floor;
     cbm_incremental_reindex_policy_t incremental_reindex;
+    cbm_overlay_publish_policy_t overlay_publish;
     int exact_delta_max_changed_paths;
     int exact_delta_max_affected_paths;
     atomic_int cancelled;
@@ -192,6 +198,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->githistory_min_coupling = 0.0;
     p->lsp_confidence_floor = 0.0;
     p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
+    p->overlay_publish = CBM_OVERLAY_PUBLISH_OFF;
     p->exact_delta_max_changed_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
     p->exact_delta_max_affected_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
     p->persistence = false;
@@ -327,14 +334,23 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
         cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
     }
 
-    const char *incremental = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "off");
-    if (incremental && strcmp(incremental, "always") == 0) {
+    const char *incremental =
+        cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_OFF);
+    if (incremental && strcmp(incremental, CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS) == 0) {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_ALWAYS;
-    } else if (incremental && strcmp(incremental, "fast") == 0) {
+    } else if (incremental && strcmp(incremental, CBM_CONFIG_INCREMENTAL_REINDEX_FAST) == 0) {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST;
     } else {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     }
+
+    const char *overlay_publish =
+        cbm_config_get(cfg, CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_OFF);
+    p->overlay_publish =
+        overlay_publish &&
+                strcmp(overlay_publish, CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS) == 0
+            ? CBM_OVERLAY_PUBLISH_SMALL_DELTAS
+            : CBM_OVERLAY_PUBLISH_OFF;
 
     int max_changed = cbm_config_get_int(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
                                          p->exact_delta_max_changed_paths);
@@ -598,6 +614,10 @@ const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p) {
     return p ? p->publish_reason : NULL;
 }
 
+bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p) {
+    return p && p->overlay_publish == CBM_OVERLAY_PUBLISH_SMALL_DELTAS;
+}
+
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p) {
     static const cbm_pipeline_exact_delta_stats_t empty_stats = {-1, -1, -1};
     return p ? p->exact_delta_stats : empty_stats;
@@ -613,6 +633,8 @@ const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind) {
         return "incremental_noop";
     case CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT:
         return "incremental_exact";
+    case CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY:
+        return "incremental_overlay";
     case CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT:
         return "incremental_containment";
     default:

@@ -1125,6 +1125,51 @@ TEST(store_index_generation_finish_complete) {
     PASS();
 }
 
+TEST(store_latest_complete_index_generation_ignores_reserved_and_failed) {
+    enum { FIRST_GENERATION = 1, SECOND_GENERATION = 2, THIRD_GENERATION = 3 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t latest = -1;
+    ASSERT_EQ(cbm_store_latest_complete_index_generation(s, "test", &latest), CBM_STORE_OK);
+    ASSERT_EQ(latest, 0);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FIRST_GENERATION);
+    ASSERT_EQ(cbm_store_latest_complete_index_generation(s, "test", &latest), CBM_STORE_OK);
+    ASSERT_EQ(latest, 0);
+
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_latest_complete_index_generation(s, "test", &latest), CBM_STORE_OK);
+    ASSERT_EQ(latest, FIRST_GENERATION);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, SECOND_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_FAILED),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_latest_complete_index_generation(s, "test", &latest), CBM_STORE_OK);
+    ASSERT_EQ(latest, FIRST_GENERATION);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, "test", NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, THIRD_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, "test", generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_latest_complete_index_generation(s, "test", &latest), CBM_STORE_OK);
+    ASSERT_EQ(latest, THIRD_GENERATION);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_index_generation_finish_failed_and_invalid_status) {
     enum { FIRST_GENERATION = 1 };
     const char *invalid_status = "invalid-status";
@@ -4895,6 +4940,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_index_generation_reservation_monotonic);
     RUN_TEST(store_index_generation_reservation_requires_project);
     RUN_TEST(store_index_generation_finish_complete);
+    RUN_TEST(store_latest_complete_index_generation_ignores_reserved_and_failed);
     RUN_TEST(store_index_generation_finish_failed_and_invalid_status);
     RUN_TEST(store_overlay_generation_reservation_status_and_counts);
     RUN_TEST(store_overlay_generation_rejects_invalid_inputs);

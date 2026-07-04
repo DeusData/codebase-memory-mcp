@@ -48,6 +48,7 @@ typedef enum {
     CBM_PIPELINE_PUBLISH_FULL,
     CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP,
     CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY,
     CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT,
 } cbm_pipeline_publish_kind_t;
 
@@ -103,6 +104,12 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
 #define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
 #define CBM_CONFIG_INCREMENTAL_REINDEX "incremental_reindex"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_OFF "off"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_FAST "fast"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS "always"
+#define CBM_CONFIG_OVERLAY_PUBLISH "overlay_publish"
+#define CBM_CONFIG_OVERLAY_PUBLISH_OFF "off"
+#define CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS "small_deltas"
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS "incremental_exact_max_changed_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS "incremental_exact_max_affected_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS "2"
