@@ -1549,6 +1549,7 @@ static void notify_resources_updated(cbm_mcp_server_t *srv);
 static void send_notification(cbm_mcp_server_t *srv, const char *method);
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit);
 static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms);
+static void *overlay_compaction_thread(void *arg);
 
 struct cbm_mcp_server {
     cbm_store_t *store;             /* currently open project store (or NULL) */
@@ -1576,6 +1577,14 @@ struct cbm_mcp_server {
     bool hidden_tools_revealed; /* true after _hidden_tools requests real tools/list exposure */
     FILE *out_stream;          /* protocol output stream for notifications (set in server_run) */
     bool out_content_length_framed; /* true while handling Content-Length-framed requests */
+    cbm_mutex_t overlay_compaction_lock;
+    cbm_thread_t overlay_compaction_tid;
+    bool overlay_compaction_started;
+    bool overlay_compaction_finished;
+    char overlay_compaction_project[CBM_SZ_256];
+    int overlay_compaction_max_generations;
+    int overlay_compaction_rc;
+    int overlay_compaction_compacted;
 
     /* Active pipeline tracking for cancellation support */
     _Atomic(cbm_pipeline_t *) active_pipeline; /* non-NULL while index_repository runs */
@@ -1871,6 +1880,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     }
     srv->owns_store = true;
 
+    cbm_mutex_init(&srv->overlay_compaction_lock);
     return srv;
 }
 
@@ -1903,6 +1913,50 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
+int cbm_mcp_server_join_overlay_compaction(cbm_mcp_server_t *srv, int *out_compacted) {
+    if (out_compacted) {
+        *out_compacted = 0;
+    }
+    if (!srv) {
+        return CBM_STORE_ERR;
+    }
+
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    bool should_join = srv->overlay_compaction_started;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+    if (!should_join) {
+        return CBM_STORE_OK;
+    }
+
+    int join_rc = cbm_thread_join(&srv->overlay_compaction_tid);
+
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    int worker_rc = srv->overlay_compaction_rc;
+    int compacted = srv->overlay_compaction_compacted;
+    srv->overlay_compaction_started = false;
+    srv->overlay_compaction_finished = false;
+    srv->overlay_compaction_project[0] = '\0';
+    srv->overlay_compaction_max_generations = CBM_STORE_COMPACT_ALL_GENERATIONS;
+    srv->overlay_compaction_rc = CBM_STORE_OK;
+    srv->overlay_compaction_compacted = 0;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+
+    if (out_compacted) {
+        *out_compacted = compacted;
+    }
+    return join_rc == 0 ? worker_rc : CBM_STORE_ERR;
+}
+
+bool cbm_mcp_server_overlay_compaction_active(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return false;
+    }
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    bool active = srv->overlay_compaction_started && !srv->overlay_compaction_finished;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+    return active;
+}
+
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
@@ -1913,6 +1967,8 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
     }
+    (void)cbm_mcp_server_join_overlay_compaction(srv, NULL);
+    cbm_mutex_destroy(&srv->overlay_compaction_lock);
     cbm_mutex_destroy(&srv->update_notice_lock);
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
@@ -1987,6 +2043,82 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
         }
     }
     return buf;
+}
+
+bool cbm_mcp_server_start_overlay_compaction(cbm_mcp_server_t *srv, const char *project,
+                                             int max_generations) {
+    if (!srv || !project || !project[0] ||
+        max_generations < CBM_STORE_COMPACT_ALL_GENERATIONS) {
+        return false;
+    }
+    size_t project_len = strlen(project);
+    if (project_len == 0 || project_len >= sizeof(srv->overlay_compaction_project)) {
+        return false;
+    }
+    if (!cbm_validate_project_name(project)) {
+        return false;
+    }
+
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    if (srv->overlay_compaction_started) {
+        cbm_mutex_unlock(&srv->overlay_compaction_lock);
+        return false;
+    }
+    snprintf(srv->overlay_compaction_project, sizeof(srv->overlay_compaction_project), "%s",
+             project);
+    srv->overlay_compaction_max_generations = max_generations;
+    srv->overlay_compaction_rc = CBM_STORE_ERR;
+    srv->overlay_compaction_compacted = 0;
+    srv->overlay_compaction_finished = false;
+    srv->overlay_compaction_started = true;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+
+    if (cbm_thread_create(&srv->overlay_compaction_tid, 0, overlay_compaction_thread,
+                          srv) != 0) {
+        cbm_mutex_lock(&srv->overlay_compaction_lock);
+        srv->overlay_compaction_started = false;
+        srv->overlay_compaction_finished = false;
+        srv->overlay_compaction_project[0] = '\0';
+        srv->overlay_compaction_max_generations = CBM_STORE_COMPACT_ALL_GENERATIONS;
+        srv->overlay_compaction_rc = CBM_STORE_ERR;
+        srv->overlay_compaction_compacted = 0;
+        cbm_mutex_unlock(&srv->overlay_compaction_lock);
+        return false;
+    }
+    return true;
+}
+
+static void *overlay_compaction_thread(void *arg) {
+    cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
+    char project[CBM_SZ_256];
+    int max_generations = CBM_STORE_COMPACT_ALL_GENERATIONS;
+
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    snprintf(project, sizeof(project), "%s", srv->overlay_compaction_project);
+    max_generations = srv->overlay_compaction_max_generations;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+
+    int rc = CBM_STORE_ERR;
+    int compacted = 0;
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+    if (path[0]) {
+        cbm_store_t *store = cbm_store_open_path_query(path);
+        if (store) {
+            rc = cbm_store_compact_ready_overlay_generations(store, project, max_generations,
+                                                             &compacted);
+            cbm_store_close(store);
+        } else {
+            rc = CBM_STORE_NOT_FOUND;
+        }
+    }
+
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    srv->overlay_compaction_rc = rc;
+    srv->overlay_compaction_compacted = compacted;
+    srv->overlay_compaction_finished = true;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+    return NULL;
 }
 
 /* ── QN project extraction ─────────────────────────────────────── */
