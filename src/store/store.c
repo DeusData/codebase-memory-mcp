@@ -6528,8 +6528,9 @@ int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *projec
     return rc;
 }
 
-int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *project,
-                                               const char *label, cbm_node_t **out, int *count) {
+int cbm_store_find_nodes_by_label_overlay_view_limited(cbm_store_t *s, const char *project,
+                                                       const char *label, int limit,
+                                                       cbm_node_t **out, int *count) {
     if (!out || !count) {
         return CBM_STORE_ERR;
     }
@@ -6538,6 +6539,7 @@ int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *proje
     if (!s || !s->db || !project) {
         return CBM_STORE_ERR;
     }
+    bool use_limit = limit > 0;
 
     char active_cte[ST_SQL_BUF];
     if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
@@ -6555,8 +6557,8 @@ int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *proje
                      "n.file_path, n.start_line, n.end_line, n.properties "
                      "FROM active_nodes n "
                      "WHERE n.project = ?3 AND n.label = ?4 "
-                     "ORDER BY n.qualified_name",
-                     active_cte);
+                     "ORDER BY n.qualified_name%s",
+                     active_cte, use_limit ? " LIMIT ?5" : "");
     } else {
         n = snprintf(sql, sizeof(sql),
                      "%s"
@@ -6564,8 +6566,8 @@ int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *proje
                      "n.file_path, n.start_line, n.end_line, n.properties "
                      "FROM active_nodes n "
                      "WHERE n.project = ?3 "
-                     "ORDER BY n.qualified_name",
-                     active_cte);
+                     "ORDER BY n.qualified_name%s",
+                     active_cte, use_limit ? " LIMIT ?4" : "");
     }
     if (n < 0 || (size_t)n >= sizeof(sql)) {
         store_set_error(s, "find_nodes_by_label_overlay SQL truncated");
@@ -6582,11 +6584,21 @@ int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *proje
     bind_text(stmt, ST_COL_3, project);
     if (label) {
         bind_text(stmt, ST_COL_4, label);
+        if (use_limit) {
+            sqlite3_bind_int(stmt, ST_COL_5, limit);
+        }
+    } else if (use_limit) {
+        sqlite3_bind_int(stmt, ST_COL_4, limit);
     }
 
     int rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_label_overlay", out, count);
     sqlite3_finalize(stmt);
     return rc;
+}
+
+int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *project,
+                                               const char *label, cbm_node_t **out, int *count) {
+    return cbm_store_find_nodes_by_label_overlay_view_limited(s, project, label, 0, out, count);
 }
 
 static int search_overlay_collect_connected_names(cbm_store_t *s, const char *active_cte,
