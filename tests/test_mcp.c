@@ -1261,6 +1261,84 @@ TEST(tool_search_graph_uses_overlay_active_relationship_rows) {
     PASS();
 }
 
+TEST(tool_search_graph_uses_overlay_active_inbound_relationship_rows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "search-overlay-inbound";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/search-overlay-inbound"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_target = {.project = proj,
+                             .label = "Function",
+                             .name = "old_target",
+                             .qualified_name = "search.inbound.old_target",
+                             .file_path = "target.c",
+                             .properties_json = "{}"};
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "search.inbound.caller",
+                         .file_path = "caller.c",
+                         .properties_json = "{}"};
+    int64_t old_target_id = cbm_store_upsert_node(st, &old_target);
+    int64_t caller_id = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(old_target_id, 0);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t old_edge = {.project = proj,
+                           .source_id = caller_id,
+                           .target_id = old_target_id,
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &old_edge), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t new_target = {.project = proj,
+                             .label = "Function",
+                             .name = "new_target",
+                             .qualified_name = "search.inbound.new_target",
+                             .file_path = "target.c",
+                             .properties_json = "{}"};
+    cbm_store_delta_edge_t preserved_inbound = {
+        .source_qn = "search.inbound.caller",
+        .target_qn = "search.inbound.new_target",
+        .type = "CALLS",
+        .properties_json = "{}",
+        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "target.c",
+                                    .generation = 1,
+                                    .nodes = &new_target,
+                                    .node_count = 1,
+                                    .edges = &preserved_inbound,
+                                    .edge_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":152,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_graph\","
+                                   "\"arguments\":{\"project\":\"search-overlay-inbound\","
+                                   "\"relationship\":\"CALLS\",\"sort_by\":\"name\","
+                                   "\"include_connected\":true,\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "caller"));
+    ASSERT_NOT_NULL(strstr(inner, "new_target"));
+    ASSERT_NULL(strstr(inner, "old_target"));
+    ASSERT_NOT_NULL(strstr(inner, "\"connected_names\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_graph\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 static bool mcp_test_upsert_fts_node(cbm_store_t *st, const char *project, const char *label,
                                      const char *name, const char *qualified_name,
                                      const char *file_path) {
@@ -5617,6 +5695,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_reports_dirty_metadata_without_hiding_canonical_rows);
     RUN_TEST(tool_search_graph_uses_overlay_active_node_rows);
     RUN_TEST(tool_search_graph_uses_overlay_active_relationship_rows);
+    RUN_TEST(tool_search_graph_uses_overlay_active_inbound_relationship_rows);
     RUN_TEST(tool_search_graph_query_reports_dirty_metadata_without_hiding_results);
     RUN_TEST(tool_search_graph_query_sees_file_delta_fts_updates);
     RUN_TEST(tool_search_graph_query_uses_overlay_active_rows);
