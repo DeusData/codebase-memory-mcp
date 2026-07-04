@@ -995,6 +995,38 @@ TEST(tool_search_graph_uses_overlay_active_relationship_rows) {
 
     free(inner);
     free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":150,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\","
+             "\"arguments\":{\"project\":\"search-overlay-relationship\","
+             "\"function_name\":\"new_main\","
+             "\"direction\":\"outbound\",\"depth\":1}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "stable"));
+    ASSERT_NULL(strstr(inner, "old_main"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_graph\""));
+    ASSERT_NOT_NULL(strstr(inner, "trace_path used overlay active node and relationship rows"));
+
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":151,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\","
+             "\"arguments\":{\"project\":\"search-overlay-relationship\","
+             "\"qualified_name\":\"search.relationship.missing\","
+             "\"direction\":\"outbound\",\"depth\":1}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "function not found for qualified_name"));
+    ASSERT_NULL(strstr(inner, "\"read_model\":\"overlay_active_graph\""));
+
+    free(inner);
+    free(resp);
     cbm_mcp_server_free(srv);
     PASS();
 }
