@@ -2485,6 +2485,85 @@ TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential) {
     PASS();
 }
 
+TEST(pipeline_parallel_env_access_matches_sequential) {
+    enum {
+        FILLER_FILE_COUNT = 52,
+        FILE_COUNT = FILLER_FILE_COUNT + 1,
+        SEQUENTIAL_WORKERS = 1,
+        PARALLEL_WORKERS = 4
+    };
+    const char *files[FILE_COUNT];
+    const char *contents[FILE_COUNT];
+    char filler_files[FILLER_FILE_COUNT][CBM_SZ_64];
+    char filler_bodies[FILLER_FILE_COUNT][CBM_SZ_128];
+
+    files[0] = "src/env.c";
+    contents[0] = "#include <stdlib.h>\n\n"
+                  "const char *load_temp(void) {\n"
+                  "    return getenv(\"CBM_TEST_PARALLEL_ENV\");\n"
+                  "}\n";
+    for (int i = 0; i < FILLER_FILE_COUNT; i++) {
+        int rn = snprintf(filler_files[i], sizeof(filler_files[i]), "fillers/filler_%02d.c", i);
+        int bn = snprintf(filler_bodies[i], sizeof(filler_bodies[i]),
+                          "int filler_%02d(void) {\n    return %d;\n}\n", i, i);
+        ASSERT_GT(rn, 0);
+        ASSERT_LT((size_t)rn, sizeof(filler_files[i]));
+        ASSERT_GT(bn, 0);
+        ASSERT_LT((size_t)bn, sizeof(filler_bodies[i]));
+        files[i + 1] = filler_files[i];
+        contents[i + 1] = filler_bodies[i];
+    }
+
+    if (setup_lang_repo(files, contents, FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+
+    char seq_db[CBM_SZ_512];
+    char par_db[CBM_SZ_512];
+    int n = snprintf(seq_db, sizeof(seq_db), "%s/env-seq.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(seq_db));
+    n = snprintf(par_db, sizeof(par_db), "%s/env-par.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(par_db));
+
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers),
+                                       NULL) != NULL;
+
+    char *project = NULL;
+    int seq_rc =
+        pipeline_run_with_worker_count(g_lang_tmpdir, seq_db, SEQUENTIAL_WORKERS, &project);
+    int par_rc = pipeline_run_with_worker_count(g_lang_tmpdir, par_db, PARALLEL_WORKERS, NULL);
+    pipeline_restore_workers_env(had_workers, saved_workers);
+    ASSERT_EQ(seq_rc, 0);
+    ASSERT_EQ(par_rc, 0);
+    ASSERT_NOT_NULL(project);
+
+    char source_qn[CBM_SZ_512];
+    n = snprintf(source_qn, sizeof(source_qn), "%s.src.env", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source_qn));
+    const char *env_qn = "__env__CBM_TEST_PARALLEL_ENV";
+
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, source_qn, "CONFIGURES",
+                                                    env_qn));
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, source_qn, "CONFIGURES",
+                                                    env_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = cbm_test_compare_canonical_graphs(seq_db, par_db, project, diff_err,
+                                                    sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [parallel:env-access-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_parallel_channel_edges_target_channels) {
     enum { FILLER_FILE_COUNT = 52, PARALLEL_WORKERS = 4 };
     const char *files[] = {"app/main.py"};
@@ -13022,6 +13101,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
     RUN_TEST(pipeline_incremental_reexport_target_matches_full);
     RUN_TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential);
+    RUN_TEST(pipeline_parallel_env_access_matches_sequential);
     RUN_TEST(pipeline_parallel_channel_edges_target_channels);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);

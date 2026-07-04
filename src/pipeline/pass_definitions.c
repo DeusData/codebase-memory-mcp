@@ -371,8 +371,8 @@ static void create_channel_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
  * env key and link the enclosing function (or the file node) CONFIGURES-> it,
  * so environment-driven configuration is visible even when the accessor is a
  * stdlib symbol that never resolves to an in-graph callee. */
-static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                          const char *rel) {
+int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result, const char *rel) {
     int count = 0;
     char *file_qn = NULL;
     const cbm_gbuf_node_t *file_node = NULL;
@@ -491,7 +491,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * map is available without the cache (single-file scope). */
             total_imports += cbm_pipeline_create_import_edges_for_file(ctx, result, rel, NULL);
             create_channel_edges_for_file(ctx, result, rel);
-            create_env_configures_for_file(ctx, result, rel);
+            cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
         }
     }
@@ -524,7 +524,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             total_imports += cbm_pipeline_create_import_edges_for_file(
                 ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
-            create_env_configures_for_file(ctx, result, files[i].rel_path);
+            cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
         if (owns_local_cache) {
