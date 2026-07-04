@@ -902,6 +902,11 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
     } else {
         int rc = 0;
         cbm_log_info("incremental.mode", "mode", "sequential", "changed", itoa_buf_incr(ci));
+        if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_EXTRACT)) {
+            cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_EXTRACT, "rc",
+                          itoa_buf_incr(CBM_NOT_FOUND));
+            return CBM_NOT_FOUND;
+        }
         rc = cbm_pipeline_pass_definitions(ctx, changed_files, ci);
         if (rc != 0) {
             cbm_log_error("incremental.err", "phase", "incr_definitions", "rc",
