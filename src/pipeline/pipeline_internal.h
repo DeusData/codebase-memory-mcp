@@ -440,6 +440,11 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
                                         const cbm_pipeline_file_delta_t *const *deltas,
                                         int delta_count, int max_affected_paths,
                                         cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
+                                                  const cbm_pipeline_file_delta_t *const *deltas,
+                                                  int delta_count, int64_t base_generation,
+                                                  const char *dirty_source,
+                                                  int64_t *out_overlay_generation);
 void cbm_pipeline_file_delta_plan_free(cbm_pipeline_file_delta_plan_t *plan);
 
 /* Seed a scratch graph with persisted unchanged nodes needed by import and

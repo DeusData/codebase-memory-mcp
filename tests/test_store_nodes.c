@@ -1469,6 +1469,58 @@ TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows) {
     PASS();
 }
 
+TEST(store_overlay_file_delta_batch_rolls_back_all_files) {
+    enum { BASE_GENERATION = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+
+    cbm_node_t good_node = {.project = "test",
+                            .label = "Function",
+                            .name = "good",
+                            .qualified_name = "test.good",
+                            .file_path = "good.go",
+                            .properties_json = "{}"};
+    cbm_store_file_delta_t good_delta = {.project = "test",
+                                         .rel_path = "good.go",
+                                         .generation = BASE_GENERATION,
+                                         .nodes = &good_node,
+                                         .node_count = 1};
+    cbm_node_t bad_node = {.project = "test",
+                           .label = "Function",
+                           .name = "bad",
+                           .qualified_name = NULL,
+                           .file_path = "bad.go",
+                           .properties_json = "{}"};
+    cbm_store_file_delta_t bad_delta = {.project = "test",
+                                        .rel_path = "bad.go",
+                                        .generation = BASE_GENERATION,
+                                        .nodes = &bad_node,
+                                        .node_count = 1};
+    const cbm_store_file_delta_t *deltas[] = {&good_delta, &bad_delta};
+
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta_batch(s, deltas, CBM_SZ_2,
+                                                         overlay_generation),
+              CBM_STORE_ERR);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_NODES, "test", overlay_generation,
+                                       "good.go"),
+              0);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
+                                       overlay_generation, "good.go"),
+              0);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", overlay_generation, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_RESERVED),
+              1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_overlay_file_delta_publish_rejects_failed_generation) {
     enum { BASE_GENERATION = 1 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -4849,6 +4901,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_file_delta_publish_rows_and_tombstone);
     RUN_TEST(store_delete_project_clears_overlay_fts);
     RUN_TEST(store_overlay_file_delta_publish_rejects_invalid_delta_without_rows);
+    RUN_TEST(store_overlay_file_delta_batch_rolls_back_all_files);
     RUN_TEST(store_overlay_file_delta_publish_rejects_failed_generation);
     RUN_TEST(store_overlay_node_view_summary_counts_latest_ready_overlay);
     RUN_TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows);
