@@ -4119,6 +4119,38 @@ TEST(pipeline_file_delta_descriptor_from_gbuf) {
     PASS();
 }
 
+TEST(pipeline_file_delta_owns_target_header_usage_edges) {
+    const char *project = "proj";
+    const char *header_rel = "src/store/store.h";
+    const char *source_module_qn = "proj.src.store.store";
+    const char *target_qn = "proj.src.store.store.NewHeaderSymbol";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "Module", "store", source_module_qn,
+                                             "src/store/store.c", 1, 100, "{}");
+    int64_t target_id =
+        cbm_gbuf_upsert_node(gb, "Function", "NewHeaderSymbol", target_qn, header_rel, 12,
+                             14, "{\"is_exported\":true}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, source_id, target_id, "USAGE",
+                                   "{\"callee\":\"NewHeaderSymbol\"}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, project, header_rel, 3, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *usage =
+        pipeline_delta_find_edge_by_qn(&delta, source_module_qn, target_qn, "USAGE");
+    ASSERT_NOT_NULL(usage);
+    ASSERT_STR_EQ(usage->properties_json, "{\"callee\":\"NewHeaderSymbol\"}");
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay) {
     const char *project = "test";
     const char *target_rel = "target.go";
@@ -8651,6 +8683,70 @@ static int write_incremental_c_header_impl_marker(int marker) {
     return th_write_file(path, body);
 }
 
+static int write_incremental_two_header_additive_fixture(int alpha_marker, int beta_marker,
+                                                         bool include_extra) {
+    enum {
+        PIPELINE_ALPHA_EXTRA_RETURN = 101,
+        PIPELINE_BETA_EXTRA_RETURN = 202,
+    };
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_1K];
+    char alpha_extra[CBM_SZ_128] = "";
+    char beta_extra[CBM_SZ_128] = "";
+    if (include_extra) {
+        int extra_n = snprintf(alpha_extra, sizeof(alpha_extra),
+                               "static int alpha_added(void) {\n"
+                               "    return %d;\n"
+                               "}\n",
+                               PIPELINE_ALPHA_EXTRA_RETURN);
+        if (extra_n < 0 || (size_t)extra_n >= sizeof(alpha_extra)) {
+            return -1;
+        }
+        extra_n = snprintf(beta_extra, sizeof(beta_extra),
+                           "static int beta_added(void) {\n"
+                           "    return %d;\n"
+                           "}\n",
+                           PIPELINE_BETA_EXTRA_RETURN);
+        if (extra_n < 0 || (size_t)extra_n >= sizeof(beta_extra)) {
+            return -1;
+        }
+    }
+    int n = snprintf(path, sizeof(path), "%s/alpha.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    n = snprintf(body, sizeof(body),
+                 "#ifndef ALPHA_H\n"
+                 "#define ALPHA_H\n"
+                 "static int alpha_existing(void) {\n"
+                 "    return %d;\n"
+                 "}\n"
+                 "%s"
+                 "#endif\n",
+                 alpha_marker, alpha_extra);
+    if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+        return -1;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/beta.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    n = snprintf(body, sizeof(body),
+                 "#ifndef BETA_H\n"
+                 "#define BETA_H\n"
+                 "static int beta_existing(void) {\n"
+                 "    return %d;\n"
+                 "}\n"
+                 "%s"
+                 "#endif\n",
+                 beta_marker, beta_extra);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
 static int write_incremental_arg_url_route_file(const char *route_path, int marker) {
     char path[CBM_PATH_MAX];
     int n = snprintf(path, sizeof(path), "%s/http_routes.c", g_incr_tmpdir);
@@ -10287,6 +10383,72 @@ TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_vis
               CBM_STORE_OK);
     ASSERT_EQ(dirty_pending, 0);
     ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved) {
+    enum {
+        PIPELINE_C_HEADER_BATCH_CHANGED = CBM_SZ_2,
+        PIPELINE_C_HEADER_BATCH_AFFECTED_CAP = CBM_SZ_8,
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_two_header_additive_fixture(CBM_ALLOC_ONE, CBM_SZ_2, false),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_C_HEADER_BATCH_CHANGED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value), 0);
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_C_HEADER_BATCH_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_two_header_additive_fixture(CBM_ALLOC_ONE, CBM_SZ_2, true),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=2") != NULL);
+    ASSERT(strstr(logs, CBM_PIPELINE_DELTA_REASON_ADDITIVE_SUBSET_REQUIRED) == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, PIPELINE_C_HEADER_BATCH_CHANGED);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_C_HEADER_BATCH_CHANGED);
+    ASSERT_EQ(stats.published_paths, PIPELINE_C_HEADER_BATCH_CHANGED);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "alpha_added"));
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "beta_added"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "alpha.h",
+                                                    "alpha_added"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "beta.h",
+                                                    "beta_added"));
 
     free(project);
     cbm_config_close(cfg);
@@ -13594,6 +13756,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
     RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
     RUN_TEST(pipeline_file_delta_detects_cross_file_node_qn_collision);
+    RUN_TEST(pipeline_file_delta_owns_target_header_usage_edges);
     RUN_TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
@@ -13846,6 +14009,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
     RUN_TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_visible);
+    RUN_TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved);
     RUN_TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);

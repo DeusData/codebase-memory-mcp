@@ -741,6 +741,13 @@ typedef struct {
     int total_nodes_visible;
 } cbm_store_overlay_node_view_summary_t;
 
+static inline bool
+cbm_store_overlay_node_view_has_ready_rows(
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    return summary && (summary->active_file_tombstones > 0 ||
+                       summary->overlay_owned_nodes_visible > 0);
+}
+
 /* Summarize the current node read view as canonical nodes minus files with a
  * ready overlay tombstone plus owned nodes from the latest ready overlay per file.
  * This is a read-only helper; it does not change canonical query behavior. */
@@ -785,6 +792,12 @@ int cbm_store_apply_file_delta_batch_complete(cbm_store_t *s,
 int cbm_store_file_delta_batch_graph_equal(cbm_store_t *s,
                                            const cbm_store_file_delta_t *const *deltas,
                                            int delta_count, bool *out_equal);
+/* True when every existing canonical node identity and edge fact owned by each
+ * delta file is still present in the new delta. This is the safety proof for
+ * additive overlays that keep canonical rows visible. */
+int cbm_store_file_delta_batch_preserves_owned_graph(cbm_store_t *s,
+                                                    const cbm_store_file_delta_t *const *deltas,
+                                                    int delta_count, bool *out_preserves);
 int cbm_store_refresh_file_delta_metadata_batch_complete(
     cbm_store_t *s, const cbm_store_file_delta_t *const *deltas, int delta_count);
 

@@ -246,7 +246,7 @@ static void add_overlay_node_read_view_summary(yyjson_mut_doc *doc, yyjson_mut_v
     }
     cbm_store_overlay_node_view_summary_t summary = {0};
     if (cbm_store_get_overlay_node_view_summary(store, project, &summary) != CBM_STORE_OK ||
-        summary.active_file_tombstones <= 0) {
+        !cbm_store_overlay_node_view_has_ready_rows(&summary)) {
         return;
     }
     yyjson_mut_val *view = yyjson_mut_obj(doc);
@@ -274,7 +274,7 @@ static void add_overlay_node_read_view_summary(yyjson_mut_doc *doc, yyjson_mut_v
 static void add_overlay_active_node_search_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary, bool uses_active_edges) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -308,7 +308,7 @@ static void add_overlay_active_node_search_freshness(
 static void add_overlay_active_trace_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -336,7 +336,7 @@ static void add_overlay_active_trace_freshness(
 static void add_overlay_active_query_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -365,7 +365,7 @@ static void add_overlay_active_query_freshness(
 static void add_overlay_active_cypher_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -395,7 +395,7 @@ static void add_overlay_active_schema_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary, bool include_properties,
     const char *warning) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -430,7 +430,7 @@ static void add_overlay_active_schema_freshness(
 static void add_overlay_active_search_code_freshness(
     yyjson_mut_doc *doc, yyjson_mut_val *root,
     const cbm_store_overlay_node_view_summary_t *summary) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -468,7 +468,7 @@ static bool add_overlay_active_architecture_freshness(
     }
     cbm_store_overlay_node_view_summary_t summary = {0};
     if (cbm_store_get_overlay_node_view_summary(store, project, &summary) != CBM_STORE_OK ||
-        summary.active_file_tombstones <= 0) {
+        !cbm_store_overlay_node_view_has_ready_rows(&summary)) {
         return false;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -567,7 +567,7 @@ static bool add_canonical_only_overlay_freshness(yyjson_mut_doc *doc, yyjson_mut
     }
     cbm_store_overlay_node_view_summary_t summary = {0};
     if (cbm_store_get_overlay_node_view_summary(store, project, &summary) != CBM_STORE_OK ||
-        summary.active_file_tombstones <= 0) {
+        !cbm_store_overlay_node_view_has_ready_rows(&summary)) {
         return false;
     }
     yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
@@ -3190,7 +3190,7 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_overlay_node_view_summary_t overlay_summary = {0};
     bool overlay_ready =
         cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) == CBM_STORE_OK &&
-        overlay_summary.active_file_tombstones > 0;
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
     bool used_active_schema = false;
     bool active_schema_failed = false;
 
@@ -3671,7 +3671,7 @@ static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
                                         const char *query, const char *file_pattern, int limit,
                                         int offset,
                                         const cbm_store_overlay_node_view_summary_t *summary) {
-    if (!summary || summary->active_file_tombstones <= 0) {
+    if (!cbm_store_overlay_node_view_has_ready_rows(summary)) {
         return NULL;
     }
     sqlite3 *db = cbm_store_get_db(store);
@@ -3734,7 +3734,7 @@ static char *bm25_search_overlay_active(cbm_store_t *store, const char *project,
         "      ORDER BY overlay_rank LIMIT ?7"
         "  ) fts "
         "  JOIN overlay_nodes n ON n.id = fts.rowid "
-        "  JOIN active_files af"
+        "  JOIN active_overlay_files af"
         "    ON af.project = n.project AND af.rel_path = n.rel_path"
         "   AND af.overlay_generation = n.overlay_generation "
         "  WHERE n.project = ?4 AND n.owned != 0 "
@@ -4292,7 +4292,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             project && project[0] &&
             cbm_store_get_overlay_node_view_summary(store, project, &q_overlay_summary) ==
                 CBM_STORE_OK &&
-            q_overlay_summary.active_file_tombstones > 0;
+            cbm_store_overlay_node_view_has_ready_rows(&q_overlay_summary);
         bool q_has_terms = !q_overlay_ready || bm25_query_has_terms(query);
         char *bm25_json =
             q_overlay_ready
@@ -4528,7 +4528,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         project && project[0] &&
         cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
             CBM_STORE_OK &&
-        overlay_summary.active_file_tombstones > 0;
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
     bool overlay_active_edges_requested =
         relationship || include_connected || exclude_entry_points ||
         min_degree >= 0 || max_degree >= 0 ||
@@ -4755,7 +4755,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     bool overlay_ready =
         project && cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
                        CBM_STORE_OK &&
-        overlay_summary.active_file_tombstones > 0;
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
     bool used_active_cypher_nodes = false;
     cbm_cypher_result_t result = {0};
     int rc = overlay_ready ? cbm_cypher_execute_active_nodes(store, query, project, max_rows,
@@ -5823,7 +5823,7 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
         (qn_input || func_name) && project && project[0] &&
         cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
             CBM_STORE_OK &&
-        overlay_summary.active_file_tombstones > 0;
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
 
     /* QN-first lookup: if qualified_name provided, resolve to node directly */
     cbm_node_t *qn_node = NULL;
@@ -8170,7 +8170,8 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         grep_target = grep_root;
     } else if (!file_pattern && search_code_git_worktree_available(root_path)) {
         scan_mode = SEARCH_CODE_SCAN_GIT_GREP;
-    } else if (write_scoped_filelist(srv, project, root_path, file_pattern, filelist)) {
+    } else if (file_pattern &&
+               write_scoped_filelist(srv, project, root_path, file_pattern, filelist)) {
         scan_mode = SEARCH_CODE_SCAN_FILELIST_GREP;
     }
 
@@ -8243,7 +8244,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         store && project && project[0] &&
         cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
             CBM_STORE_OK &&
-        overlay_summary.active_file_tombstones > 0;
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
 
     classify_all_grep_hits(gm, gm_count, store, project, &sr, &sr_count, &sr_cap, &raw, &raw_count,
                            &raw_cap, overlay_ready_for_code);
@@ -9506,7 +9507,7 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
     bool overlay_ready =
         proj && cbm_store_get_overlay_node_view_summary(store, proj, &overlay_summary) ==
                     CBM_STORE_OK &&
-        overlay_summary.active_file_tombstones > 0;
+        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
     bool used_active_schema = false;
     bool active_schema_failed = false;
 
