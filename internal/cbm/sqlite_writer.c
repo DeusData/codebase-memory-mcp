@@ -738,7 +738,7 @@ static uint8_t *build_node_record(const CBMDumpNode *n, int *out_len) {
 }
 
 // Build an edges table record: (id, project, source_id, target_id, type, properties)
-// url_path_gen is a VIRTUAL generated column — NOT stored in the record.
+// url_path_gen and local_name_gen are VIRTUAL generated columns — NOT stored in the record.
 static uint8_t *build_edge_record(const CBMDumpEdge *e, int *out_len) {
     RecordBuilder r;
     rec_init(&r);
@@ -993,16 +993,17 @@ static uint8_t *build_index_entry_text_int_text_rowid(const char *t1, int64_t va
     return cell;
 }
 
-// Build UNIQUE index entry for (text, text) + rowid (e.g., nodes unique(project, qualified_name))
-// Build UNIQUE index entry for (int64, int64, text) + rowid (edges unique(source_id, target_id,
-// type))
-static uint8_t *build_index_entry_unique_2int_text_rowid(int64_t v1, int64_t v2, const char *text,
-                                                         int64_t rowid, int *out_len) {
+// Build UNIQUE index entry for (int64, int64, text, text) + rowid — edges
+// unique(source_id, target_id, type, local_name_gen) (#768).
+static uint8_t *build_index_entry_unique_2int_2text_rowid(int64_t v1, int64_t v2, const char *text,
+                                                          const char *text2, int64_t rowid,
+                                                          int *out_len) {
     RecordBuilder r;
     rec_init(&r);
     rec_add_int(&r, v1);
     rec_add_int(&r, v2);
     rec_add_text(&r, text);
+    rec_add_text(&r, text2);
     rec_add_int(&r, rowid);
     int payload_len = 0;
     uint8_t *payload = rec_finalize(&r, &payload_len);
@@ -1515,7 +1516,7 @@ static int cmp_edge_by_url_path(const void *a, const void *b) {
     return cmp_i64(g_sort_edges[ia].id, g_sort_edges[ib].id);
 }
 
-// autoindex_edges_1: UNIQUE(source_id, target_id, type) + rowid
+// autoindex_edges_1: UNIQUE(source_id, target_id, type, local_name_gen) + rowid (#768)
 static int cmp_edge_by_src_tgt_type(const void *a, const void *b) {
     int ia = *(const int *)a;
     int ib = *(const int *)b;
@@ -1528,6 +1529,10 @@ static int cmp_edge_by_src_tgt_type(const void *a, const void *b) {
         return c;
     }
     c = strcmp(safe_str(g_sort_edges[ia].type), safe_str(g_sort_edges[ib].type));
+    if (c) {
+        return c;
+    }
+    c = strcmp(safe_str(g_sort_edges[ia].local_name), safe_str(g_sort_edges[ib].local_name));
     if (c) {
         return c;
     }
@@ -1567,8 +1572,8 @@ static uint8_t *ecell_proj_source_type(const CBMDumpEdge *e, int *out_len) {
     return build_index_entry_text_int_text_rowid(e->project, e->source_id, e->type, e->id, out_len);
 }
 static uint8_t *ecell_src_tgt_type(const CBMDumpEdge *e, int *out_len) {
-    return build_index_entry_unique_2int_text_rowid(e->source_id, e->target_id, e->type, e->id,
-                                                    out_len);
+    return build_index_entry_unique_2int_2text_rowid(e->source_id, e->target_id, e->type,
+                                                     safe_str(e->local_name), e->id, out_len);
 }
 static uint8_t *ecell_url_path(const CBMDumpEdge *e, int *out_len) {
     const char *url = (e->url_path && e->url_path[0] != '\0') ? e->url_path : NULL;
@@ -2135,13 +2140,20 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "CREATE INDEX idx_nodes_name ON nodes(project, name)"},
         {"index", "idx_nodes_file", "nodes", idx_nodes_file_root,
          "CREATE INDEX idx_nodes_file ON nodes(project, file_path)"},
+        // local_name_gen + widened UNIQUE (#768): must stay semantically
+        // identical to init_schema in src/store/store.c, and the hand-built
+        // sqlite_autoindex_edges_1 (cmp_edge_by_src_tgt_type +
+        // ecell_src_tgt_type) must produce exactly the values SQLite computes
+        // for local_name_gen, or integrity_check fails on the dumped DB.
         {"table", "edges", "edges", edges_root,
          "CREATE TABLE edges (\n\t\tid INTEGER PRIMARY KEY AUTOINCREMENT,\n\t\tproject TEXT NOT "
          "NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tsource_id INTEGER NOT NULL "
          "REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES "
          "nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT "
          "'{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS "
-         "(json_extract(properties,'$.url_path')),\n\t\tUNIQUE(source_id, target_id, type)\n\t)"},
+         "(json_extract(properties,'$.url_path')),\n\t\tlocal_name_gen TEXT GENERATED ALWAYS AS "
+         "(CASE WHEN type='IMPORTS' THEN coalesce(json_extract(properties,'$.local_name'),'') "
+         "ELSE '' END),\n\t\tUNIQUE(source_id, target_id, type, local_name_gen)\n\t)"},
         {"index", "sqlite_autoindex_edges_1", "edges", autoindex_edges_root, NULL},
         {"index", "idx_edges_source", "edges", idx_edges_source_root,
          "CREATE INDEX idx_edges_source ON edges(source_id, type)"},

@@ -17,6 +17,7 @@ export const messages = {
       saving: "Saving...",
       delete: "Delete",
       noMatches: "No matches",
+      dismiss: "Dismiss",
     },
     graph: {
       selectedLabel: "Graph",
@@ -37,6 +38,7 @@ export const messages = {
       healthCorrupt: "Database unhealthy",
       healthChecking: "Checking...",
       indexingInProgress: "Indexing in progress",
+      indexingFailed: "Indexing failed",
     },
     index: {
       newIndex: "New Index",
@@ -86,6 +88,7 @@ export const messages = {
       saving: "保存中...",
       delete: "删除",
       noMatches: "无匹配结果",
+      dismiss: "关闭",
     },
     graph: {
       selectedLabel: "图谱",
@@ -106,6 +109,7 @@ export const messages = {
       healthCorrupt: "数据库异常",
       healthChecking: "检查中...",
       indexingInProgress: "正在索引",
+      indexingFailed: "索引失败",
     },
     index: {
       newIndex: "新建索引",

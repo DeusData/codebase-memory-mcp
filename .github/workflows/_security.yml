@@ -51,8 +51,8 @@ jobs:
           CURRENT_SHA="${{ github.event.pull_request.head.sha || github.sha }}"
           echo "Waiting for CodeQL to complete on $CURRENT_SHA..."
           for attempt in $(seq 1 90); do
-            LATEST=$(gh api repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?per_page=5 \
-              --jq '.workflow_runs[] | select(.head_sha == "'"$CURRENT_SHA"'") | "\(.conclusion) \(.status)"' 2>/dev/null | head -1 || echo "")
+            LATEST=$(gh api "repos/${{ github.repository }}/actions/workflows/codeql.yml/runs?head_sha=$CURRENT_SHA&per_page=1" \
+              --jq '.workflow_runs[] | "\(.conclusion) \(.status)"' 2>/dev/null | head -1 || echo "")
             if [ -z "$LATEST" ]; then
               echo "  $attempt/90: no run yet..."; sleep 30; continue
             fi

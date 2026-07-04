@@ -211,21 +211,13 @@ export function GraphTab({ project }: GraphTabProps) {
     );
   }
 
-  if (!data || !filteredData || filteredData.nodes.length === 0) {
+  /* No data, or the project genuinely has no nodes — there are no filters to
+     interact with, so show a plain full-screen message. The "all filtered out"
+     case is handled inside the layout below so the filter sidebar stays put. */
+  if (!data || !filteredData || data.nodes.length === 0) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <p className="text-white/30 text-sm mb-3">
-            {data && filteredData?.nodes.length === 0
-              ? "All nodes filtered out"
-              : "No nodes in this project"}
-          </p>
-          {data && filteredData?.nodes.length === 0 && (
-            <Button size="sm" onClick={enableAll}>
-              Reset Filters
-            </Button>
-          )}
-        </div>
+        <p className="text-white/30 text-sm">No nodes in this project</p>
       </div>
     );
   }
@@ -267,65 +259,78 @@ export function GraphTab({ project }: GraphTabProps) {
 
       {/* Graph area */}
       <div className="flex-1 relative overflow-hidden">
-        <ErrorBoundary>
-          <GraphScene
-            data={filteredData}
-            highlightedIds={highlightedIds}
-            cameraTarget={cameraTarget}
-            showLabels={showLabels}
-            onNodeClick={handleNodeClick}
-          />
-        </ErrorBoundary>
+        {filteredData.nodes.length === 0 ? (
+          <div className="flex items-center justify-center h-full">
+            <div className="text-center">
+              <p className="text-white/30 text-sm mb-3">All nodes filtered out</p>
+              <Button size="sm" onClick={enableAll}>
+                Reset Filters
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <ErrorBoundary>
+              <GraphScene
+                data={filteredData}
+                highlightedIds={highlightedIds}
+                cameraTarget={cameraTarget}
+                showLabels={showLabels}
+                onNodeClick={handleNodeClick}
+              />
+            </ErrorBoundary>
 
-        {/* HUD */}
-        <div className="absolute top-4 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
-          <p>
-            {filteredData.nodes.length.toLocaleString()} nodes /{" "}
-            {filteredData.edges.length.toLocaleString()} edges
-          </p>
-          {data.nodes.length > filteredData.nodes.length && (
-            <p className="text-white/25 mt-0.5">
-              filtered from {data.nodes.length.toLocaleString()}
-            </p>
-          )}
-          {limitNotice && (
-            <p className="text-amber-300/80 mt-0.5">{limitNotice}</p>
-          )}
-          {highlightedIds && highlightedIds.size > 0 && (
-            <p className="text-cyan-400/50 mt-0.5">
-              {highlightedIds.size} selected
-            </p>
-          )}
-        </div>
+            {/* HUD */}
+            <div className="absolute top-4 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
+              <p>
+                {filteredData.nodes.length.toLocaleString()} nodes /{" "}
+                {filteredData.edges.length.toLocaleString()} edges
+              </p>
+              {data.nodes.length > filteredData.nodes.length && (
+                <p className="text-white/25 mt-0.5">
+                  filtered from {data.nodes.length.toLocaleString()}
+                </p>
+              )}
+              {limitNotice && (
+                <p className="text-amber-300/80 mt-0.5">{limitNotice}</p>
+              )}
+              {highlightedIds && highlightedIds.size > 0 && (
+                <p className="text-cyan-400/50 mt-0.5">
+                  {highlightedIds.size} selected
+                </p>
+              )}
+            </div>
 
-        <div className="absolute top-4 right-4 flex gap-2">
-          {highlightedIds && (
-            <Button
-              size="sm"
-              onClick={() => {
-                setHighlightedIds(null);
-                setSelectedPath(null);
-                setSelectedNode(null);
-                setCameraTarget(null);
-              }}
-            >
-              Clear
-            </Button>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setHighlightedIds(null);
-              setSelectedPath(null);
-              setSelectedNode(null);
-              setCameraTarget(null);
-              fetchOverview(project);
-            }}
-          >
-            Refresh
-          </Button>
-        </div>
+            <div className="absolute top-4 right-4 flex gap-2">
+              {highlightedIds && (
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setHighlightedIds(null);
+                    setSelectedPath(null);
+                    setSelectedNode(null);
+                    setCameraTarget(null);
+                  }}
+                >
+                  Clear
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setHighlightedIds(null);
+                  setSelectedPath(null);
+                  setSelectedNode(null);
+                  setCameraTarget(null);
+                  fetchOverview(project);
+                }}
+              >
+                Refresh
+              </Button>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Right detail panel — resizable */}

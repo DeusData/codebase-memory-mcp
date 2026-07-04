@@ -321,6 +321,12 @@ int cbm_cmd_config(int argc, char **argv);
  * path returns 0 with no stdout output. */
 int cbm_cmd_hook_augment(void);
 
+/* True for an absolute path the augmenter can walk up: POSIX "/..." or a
+ * Windows drive root — "X:/..." or a bare "X:" (callers normalize '\\' to '/'
+ * first). Exposed for tests — regression coverage for the Windows drive-letter
+ * no-op (#618). */
+bool cbm_hook_path_is_abs(const char *path);
+
 /* Build the agent.install.plan.v1 install receipt for <home> (issue #388):
  * a machine-readable JSON list of the config/instruction/hook files `install`
  * would write, produced WITHOUT mutating anything. Returns a heap JSON string

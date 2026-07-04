@@ -15,6 +15,7 @@
  */
 #include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "mcp/mcp.h"
+#include "mcp/index_supervisor.h"
 #include "watcher/watcher.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
@@ -37,6 +38,7 @@ enum {
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
@@ -50,6 +52,9 @@ enum {
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #ifndef CBM_VERSION
 #define CBM_VERSION "dev"
@@ -120,9 +125,9 @@ static void *parent_watchdog_thread(void *arg) {
         /* initial_ppid > 1 guards against an already-orphaned start (ppid==1),
          * where a changing ppid carries no signal. */
         if (initial_ppid > 1 && getppid() != initial_ppid) {
-            cbm_log_warn("parent.exited", "reason", "ppid_changed");
-            request_shutdown();
-            exit(0);
+            static const char msg[] = "level=warn msg=parent.exited reason=ppid_changed\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            _exit(0);
         }
     }
     return NULL;
@@ -228,6 +233,25 @@ static bool cli_strip_flag(int *argc, char **argv, const char *flag) {
     return false;
 }
 
+/* Strip a flag AND its following value from argv, returning the value (a pointer
+ * into the original argv strings, valid for the process lifetime) or NULL if the
+ * flag is absent. */
+static const char *cli_strip_flag_value(int *argc, char **argv, const char *flag) {
+    for (int i = 0; i < *argc; i++) {
+        if (strcmp(argv[i], flag) != 0) {
+            continue;
+        }
+        const char *value = (i + SKIP_ONE < *argc) ? argv[i + SKIP_ONE] : NULL;
+        int remove_count = value ? 2 : 1;
+        for (int j = i; j < *argc - remove_count; j++) {
+            argv[j] = argv[j + remove_count];
+        }
+        *argc -= remove_count;
+        return value;
+    }
+    return NULL;
+}
+
 /* Portable "is fd a terminal?" — _isatty on Windows, isatty on POSIX. */
 #ifdef _WIN32
 #define cli_isatty(fd) _isatty(fd)
@@ -296,6 +320,14 @@ static int run_cli(int argc, char **argv) {
     bool progress = cli_strip_flag(&argc, argv, "--progress");
     bool raw_json = cli_strip_flag(&argc, argv, "--json");
 
+    /* Supervisor worker role: when this process was spawned as a supervised index
+     * worker, run indexing in-process (never re-supervise) and write the result to
+     * the given file for the parent to read back. Stripped here so the tool
+     * dispatch below sees only the tool name + its args. */
+    bool index_worker = cli_strip_flag(&argc, argv, "--index-worker");
+    const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
+    cbm_index_set_worker_role(index_worker, response_out);
+
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
         return SKIP_ONE;
@@ -343,7 +375,13 @@ static int run_cli(int argc, char **argv) {
         }
         args_json = heap_args;
     } else if (rem_argc >= SKIP_ONE && cli_first_nonspace_is_brace(rem_argv[0])) {
-        /* raw-JSON back-compat: cli <tool> '{"k":"v"}' */
+        /* raw-JSON back-compat: cli <tool> '{"k":"v"}' (deprecated path). Warn on
+         * STDERR only — stdout must stay clean JSON for piping. */
+        (void)fprintf(stderr,
+                      "warning: passing raw JSON to 'cli %s' is deprecated and "
+                      "will be removed in a future release; use flags (run 'cli "
+                      "%s --help'), --args-file <path>, or piped stdin.\n",
+                      tool_name, tool_name);
         args_json = rem_argv[0];
     } else if (rem_argc >= SKIP_ONE && strncmp(rem_argv[0], "--", 2) == 0) {
         /* flag form: cli <tool> --flag value --bare-bool ... */
@@ -384,6 +422,16 @@ static int run_cli(int argc, char **argv) {
     int exit_code = 0;
 
     if (result) {
+        /* Supervised worker: hand the full result string to the parent via the
+         * response file before printing (parent reads it back on a clean exit). */
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            FILE *rf = cbm_fopen(ro, "wb");
+            if (rf) {
+                (void)fputs(result, rf);
+                (void)fclose(rf);
+            }
+        }
         if (raw_json) {
             printf("%s\n", result);
         } else {
@@ -515,6 +563,7 @@ int main(int argc, char **argv) {
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
     cbm_alloc_init();
+    cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
     /* CBM_LOG_LEVEL support — distilled from #414 (closes #413). Apply before
      * the first log statement so the configured level governs all output. */

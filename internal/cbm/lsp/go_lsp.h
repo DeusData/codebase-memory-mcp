@@ -26,6 +26,10 @@ typedef struct {
     // Output: resolved calls accumulate here
     CBMResolvedCallArray* resolved_calls;
 
+    // AST-walk recursion depth for resolve_calls_in_node (guards stack overflow
+    // on deeply-nested/cyclic files; see cbm_lsp_max_walk_depth). Zero via memset.
+    int walk_depth;
+
     // Debug mode (CBM_LSP_DEBUG env)
     bool debug;
 } GoLSPContext;
@@ -82,6 +86,7 @@ typedef struct {
     const char* method_names_str; // "|"-separated method names for interfaces (e.g. "Get|Put|Delete")
     bool is_interface;
     CBMLanguage lang;           // language of the file that defined this — used by Tier 2 per-language registry build to filter all_defs
+    const char* namespace_name; // declared namespace/package for source-root-independent JVM filtering
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

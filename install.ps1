@@ -131,11 +131,13 @@ if ($SkipConfig) {
 } else {
     Write-Host ""
     Write-Host "Configuring coding agents..."
-    try {
-        & $Dest install -y 2>&1 | Write-Host
-    } catch {
-        Write-Host "Agent configuration failed (non-fatal)."
-        Write-Host "Run manually: codebase-memory-mcp install"
+    & $Dest install -y 2>&1 | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "error: agent configuration failed (exit code $LASTEXITCODE)" -ForegroundColor Red
+        Write-Host "The binary was installed, but no coding agents were configured."
+        Write-Host "Run manually to configure: `"$Dest`" install"
+        exit 1
     }
 }
 

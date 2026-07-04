@@ -806,7 +806,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
-    cbm_path_alias_collection_t *path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    /* Discovery exclusions (gitignore + skip dirs) captured by the run that
+     * routed here. Borrowed from the pipeline so the auxiliary repo walks
+     * (pkgmap via merge_pkg_entries, path aliases) skip excluded subtrees on
+     * incremental runs too — same borrow as the full path (#792/#804). */
+    char **excluded_dirs = NULL;
+    int excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
+
+    cbm_path_alias_collection_t *path_aliases =
+        cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
 
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -814,8 +823,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = path_aliases,
+        .excluded_dirs = excluded_dirs,
+        .excluded_count = excluded_count,
     };
 
     for (int i = 0; i < ci; i++) {

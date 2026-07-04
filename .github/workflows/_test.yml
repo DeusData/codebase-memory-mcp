@@ -33,7 +33,7 @@ jobs:
           BROAD: ${{ inputs.broad_platforms }}
         run: |
           CORE_UNIX='[
-            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
+            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","libgit2":true},
             {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
             {"os":"macos-14","cc":"cc","cxx":"c++"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
@@ -79,10 +79,15 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ${{ matrix.libgit2 == true && 'libgit2-dev pkg-config' || '' }}
 
       - name: Test
-        run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        run: |
+          if [ "${{ matrix.libgit2 == true }}" = "true" ]; then
+            echo "REQUIRE_LIBGIT2=1"
+            pkg-config --modversion libgit2
+          fi
+          scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} ${{ matrix.libgit2 == true && 'REQUIRE_LIBGIT2=1' || '' }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
 

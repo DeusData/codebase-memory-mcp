@@ -22,6 +22,8 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
 #include "service_patterns.h"
@@ -43,7 +45,7 @@ static bool pc_module_is_dir(CBMLanguage lang) {
 
 /* Read entire file into heap-allocated buffer. Caller must free(). */
 static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
@@ -52,7 +54,7 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
         (void)fclose(f);
         return NULL;
     }
@@ -426,11 +428,13 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* LSP-resolved calls take precedence over registry-textual matching. */
-    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call);
+    /* LSP-resolved calls take precedence over registry-textual matching.
+     * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
+    bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
+    const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution(lsp_calls, call, allow_tail);
     if (lsp) {
         const cbm_gbuf_node_t *target_node =
-            cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn);
+            cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, lsp->callee_qn, allow_tail);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical

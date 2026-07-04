@@ -14,6 +14,7 @@
 #include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/yaml.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -1361,6 +1362,47 @@ TEST(cli_extract_binary_from_zip_invalid) {
     PASS();
 }
 
+TEST(cli_extract_binary_from_zip_rejects_truncated_deflate_size_over_int_max) {
+    const char *filename = "codebase-memory-mcp";
+    const unsigned char deflated[] = {0xAB, 0x00, 0x00}; /* raw DEFLATE for "x" */
+    size_t name_len = strlen(filename);
+    size_t zip_len = 30 + name_len + sizeof(deflated);
+    unsigned char *zip = calloc(1, zip_len);
+    ASSERT_NOT_NULL(zip);
+
+    uint32_t comp_size = 0xFFFF0000U;
+    uint32_t uncomp_size = 1U;
+    zip[0] = 0x50;
+    zip[1] = 0x4B;
+    zip[2] = 0x03;
+    zip[3] = 0x04;
+    zip[8] = 8;
+    zip[9] = 0;
+    zip[18] = (unsigned char)(comp_size & 0xFF);
+    zip[19] = (unsigned char)((comp_size >> 8) & 0xFF);
+    zip[20] = (unsigned char)((comp_size >> 16) & 0xFF);
+    zip[21] = (unsigned char)((comp_size >> 24) & 0xFF);
+    zip[22] = (unsigned char)(uncomp_size & 0xFF);
+    zip[23] = (unsigned char)((uncomp_size >> 8) & 0xFF);
+    zip[24] = (unsigned char)((uncomp_size >> 16) & 0xFF);
+    zip[25] = (unsigned char)((uncomp_size >> 24) & 0xFF);
+    zip[26] = (unsigned char)(name_len & 0xFF);
+    zip[27] = (unsigned char)((name_len >> 8) & 0xFF);
+    memcpy(zip + 30, filename, name_len);
+    memcpy(zip + 30 + name_len, deflated, sizeof(deflated));
+
+    int out_len = 0;
+    unsigned char *extracted = cbm_extract_binary_from_zip(zip, (int)zip_len, &out_len);
+    if (extracted) {
+        free(extracted);
+        free(zip);
+        FAIL("accepted a truncated deflated zip entry with a wrapped compressed size");
+    }
+    ASSERT_EQ(out_len, 0);
+    free(zip);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Skill dry-run tests
  * ═══════════════════════════════════════════════════════════════════ */
@@ -2361,6 +2403,26 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     PASS();
 }
 
+/* issue #618: hook-augment was a structural no-op on Windows because its path
+ * guards required POSIX-style '/'-prefixed absolute paths, so a drive-letter
+ * cwd (C:/repo) was rejected before any search_graph query. The predicate must
+ * accept POSIX and Windows drive roots alike (callers normalize '\\' to '/'). */
+TEST(cli_hook_augment_path_is_abs) {
+    /* POSIX absolute (unchanged behavior) */
+    ASSERT(cbm_hook_path_is_abs("/home/u/proj"));
+    /* Windows drive roots — the #618 regression */
+    ASSERT(cbm_hook_path_is_abs("C:/Users/me/proj"));
+    ASSERT(cbm_hook_path_is_abs("C:/"));
+    ASSERT(cbm_hook_path_is_abs("C:"));
+    ASSERT(cbm_hook_path_is_abs("d:/lowercase/drive"));
+    /* Not absolute → augmenter no-ops cleanly */
+    ASSERT(!cbm_hook_path_is_abs("relative/path"));
+    ASSERT(!cbm_hook_path_is_abs("proj"));
+    ASSERT(!cbm_hook_path_is_abs(""));
+    ASSERT(!cbm_hook_path_is_abs(NULL));
+    PASS();
+}
+
 TEST(cli_upsert_claude_hook_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-XXXXXX");
@@ -2961,6 +3023,7 @@ SUITE(cli) {
     RUN_TEST(cli_extract_binary_from_zip_not_found);
     RUN_TEST(cli_extract_binary_from_zip_path_traversal);
     RUN_TEST(cli_extract_binary_from_zip_invalid);
+    RUN_TEST(cli_extract_binary_from_zip_rejects_truncated_deflate_size_over_int_max);
 
     /* Dry-run lifecycle (2 tests) */
     RUN_TEST(cli_install_dry_run);
@@ -3025,6 +3088,7 @@ SUITE(cli) {
 
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
+    RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_upsert_claude_hook_replace);

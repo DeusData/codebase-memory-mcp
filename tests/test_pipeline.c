@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
+#include "sqlite3.h" /* vendored/sqlite3 — PRAGMA integrity_check on dumped DBs */
 
 /* ── Helper: create temp test repo with known layout ───────────── */
 
@@ -1686,6 +1687,61 @@ TEST(pipeline_python_project) {
     cbm_store_find_nodes_by_label(s, proj, "Method", &methods, &mc);
     ASSERT_GTE(mc, 1); /* transform */
     cbm_store_free_nodes(methods, mc);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* #768 end-to-end: `import { A, B } from './lib'` must survive the REAL
+ * pipeline (extract -> gbuf dedup -> raw SQLite dump) as TWO IMPORTS edges
+ * with distinct local_name — and the dumped DB must satisfy its own schema.
+ * With only the graph-buffer half of the fix, both edges reach the dump but
+ * violate an unwidened UNIQUE(source_id,target_id,type), which PRAGMA
+ * integrity_check flags as a non-unique autoindex entry. */
+TEST(pipeline_imports_multi_symbol_edges) {
+    const char *files[] = {"consumer.ts", "lib.ts"};
+    const char *contents[] = {
+        "import { A, B } from './lib';\n\nexport function useBoth() {\n  return A() + B();\n}\n",
+        "export function A() {\n  return 1;\n}\nexport function B() {\n  return 2;\n}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* The dumped DB must pass SQLite's own full integrity check — this is
+     * what catches a buffer-only fix shipping DBs that violate their own
+     * UNIQUE constraint. */
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db, &raw), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    sqlite3_prepare_v2(raw, "PRAGMA integrity_check", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    const char *integrity = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_STR_EQ(integrity, "ok");
+    sqlite3_finalize(stmt);
+    sqlite3_close(raw);
+
+    /* Both named imports must be queryable as separate IMPORTS edges. */
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, proj, "IMPORTS", &edges, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"A\"") != NULL ||
+                strstr(edges[1].properties_json, "\"local_name\":\"A\"") != NULL);
+    ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"B\"") != NULL ||
+                strstr(edges[1].properties_json, "\"local_name\":\"B\"") != NULL);
+    cbm_store_free_edges(edges, count);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -4669,7 +4725,7 @@ TEST(envscan_secret_value_exclusion) {
     write_temp_file(
         tmpdir, "deploy.sh",
         "#!/bin/bash\n"
-        "export GH_URL=\"https://ghp_abcdefghijklmnopqrstuvwxyz1234567890@github.com/repo\"\n"
+        "export GH_URL=\"https://ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE@github.com/repo\"\n"
         "export NORMAL_ENDPOINT=\"https://api.example.com/orders\"\n");
 
     cbm_env_binding_t bindings[32];
@@ -4784,6 +4840,129 @@ TEST(envscan_non_url_values_skipped) {
     int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
 
     ASSERT_EQ(count, 0);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ── Discovery-exclusion plumbing in auxiliary repo walks (#792) ── */
+
+/* Boundary semantics of the shared exclusion predicate: anchored at the
+ * repo root, matches the excluded dir itself and its subtree, but never
+ * sibling names sharing a prefix. Regression guard for issue #792. */
+TEST(pipeline_relpath_excluded_boundary) {
+    char *excluded[] = {(char *)"vendor_big", (char *)"packages/big"};
+
+    /* Exact match and subtree paths are excluded. */
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("vendor_big", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("vendor_big/lib/package.json", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("packages/big", excluded, 2));
+    ASSERT_TRUE(cbm_pipeline_relpath_is_excluded("packages/big/src/x.ts", excluded, 2));
+
+    /* Sibling names sharing the prefix are NOT excluded ('/'-boundary). */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_bigger", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("packages/bigger/x.ts", excluded, 2));
+
+    /* Exclusions are root-anchored prefixes, not substring matches. */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("src/vendor_big/x.c", excluded, 2));
+
+    /* NULL / empty safety. */
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded(NULL, excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("", excluded, 2));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", NULL, 0));
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", excluded, 0));
+    char *with_empty[] = {(char *)""};
+    ASSERT_FALSE(cbm_pipeline_relpath_is_excluded("vendor_big", with_empty, 1));
+    PASS();
+}
+
+/* Helper: does the entries array contain a package with this name? */
+static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+/* The pkgmap repo walk must honor discovery exclusions (issue #792: a
+ * gitignored huge subtree kept the pkgmap walk busy for 15 minutes).
+ * Control run first (no exclusions → BOTH manifests parsed) so the
+ * exclusion assertion below cannot pass vacuously. */
+TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_excl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/packages", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/packages/app", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor_big", tmpdir);
+    cbm_mkdir(dir);
+    snprintf(dir, sizeof(dir), "%s/vendor_big/lib", tmpdir);
+    cbm_mkdir(dir);
+
+    write_temp_file(tmpdir, "packages/app/package.json",
+                    "{\"name\":\"@org/app\",\"main\":\"index.js\"}\n");
+    write_temp_file(tmpdir, "vendor_big/lib/package.json",
+                    "{\"name\":\"@org/vendored\",\"main\":\"index.js\"}\n");
+
+    /* Control: NULL exclusion list — the walk reaches and parses BOTH
+     * manifests (proves the excluded one is reachable + parseable). */
+    cbm_pkg_entries_t control;
+    cbm_pkg_entries_init(&control);
+    cbm_pkgmap_scan_repo(tmpdir, &control, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&control, "@org/app"));
+    ASSERT_TRUE(pkg_entries_has_name(&control, "@org/vendored"));
+    cbm_pkg_entries_free(&control);
+
+    /* With vendor_big excluded (as discovery reports for a gitignored
+     * subtree): the walk must not descend into it. */
+    char *excluded[] = {(char *)"vendor_big"};
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, excluded, 1);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "@org/app"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "@org/vendored"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The env-URL walk must honor discovery exclusions the same way (#792).
+ * Control run first via the NULL-exclusion wrapper so the exclusion
+ * assertion cannot pass vacuously. */
+TEST(envscan_walk_honors_discovery_exclusions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_excl_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/big_generated", tmpdir);
+    cbm_mkdir(dir);
+
+    write_temp_file(tmpdir, "deploy.sh",
+                    "#!/bin/bash\nexport CONTROL_URL=\"https://api.example.com/v1\"\n");
+    write_temp_file(tmpdir, "big_generated/env.sh",
+                    "#!/bin/bash\nexport EXCLUDED_URL=\"https://excluded.example.com/v1\"\n");
+
+    /* Control: the NULL-exclusion wrapper sees both bindings. */
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 32);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "EXCLUDED_URL"));
+
+    /* With big_generated excluded, its binding must disappear. */
+    char *excluded[] = {(char *)"big_generated"};
+    count = cbm_scan_project_env_urls_excluded(tmpdir, bindings, 32, excluded, 1);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_TRUE(find_binding_by_key(bindings, count, "EXCLUDED_URL") == NULL);
 
     th_rmtree(tmpdir);
     PASS();
@@ -6197,6 +6376,7 @@ SUITE(pipeline) {
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
+    RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_go_type_classification);
@@ -6307,6 +6487,10 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
     RUN_TEST(envscan_non_url_values_skipped);
+    /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
+    RUN_TEST(pipeline_relpath_excluded_boundary);
+    RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
+    RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
     RUN_TEST(registry_fuzzy_nonexistent);

@@ -16,6 +16,7 @@
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <string.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -65,6 +66,10 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
+    cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
+                               * (Stage 2 / Track B). May be NULL on paths that
+                               * don't record; cbm_pipeline_add_file_error is
+                               * NULL-safe. */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
 
     /* Extraction result cache (sequential pipeline optimization).
@@ -77,7 +82,29 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
+    char **excluded_dirs;
+    int excluded_count;
 } cbm_pipeline_ctx_t;
+
+static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
+                                                   int excluded_count) {
+    if (!rel_path || rel_path[0] == '\0' || !excluded_dirs || excluded_count <= 0) {
+        return 0;
+    }
+    for (int i = 0; i < excluded_count; i++) {
+        const char *excluded = excluded_dirs[i];
+        if (!excluded || excluded[0] == '\0') {
+            continue;
+        }
+        size_t n = strlen(excluded);
+        if (strncmp(rel_path, excluded, n) == 0 && (rel_path[n] == '\0' || rel_path[n] == '/')) {
+            return SKIP_ONE;
+        }
+    }
+    return 0;
+}
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
@@ -127,9 +154,11 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                                const char *project_name);
 
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
-int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries);
+int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
+                         int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name);
+                                         int file_count, const char *project_name,
+                                         char **excluded_dirs, int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
                                           const char *project_name);
 
@@ -526,8 +555,14 @@ typedef struct {
 /* Scan a project directory for environment variable assignments with URL values.
  * Walks the filesystem, scans Dockerfiles, shell scripts, .env, YAML, TOML,
  * Terraform, and .properties files. Filters out secrets.
- * Returns number of bindings written to out (up to max_out). */
+ * Returns number of bindings written to out (up to max_out).
+ * NOTE: this walker currently has no production callers — it is exercised
+ * only by tests. The _excluded variant honors discovery exclusions for
+ * consistency with the pkgmap/path-alias walks (#792); the plain variant
+ * scans unexcluded (NULL exclusion list). */
 int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
+int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
+                                       char **excluded_dirs, int excluded_count);
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 

@@ -49,8 +49,11 @@ static inline void *intptr_to_ptr(intptr_t v) {
 
 /* ── Internal types ──────────────────────────────────────────────── */
 
-/* Edge key for dedup hash table — composite key as string "srcID:tgtID:type" */
-#define EDGE_KEY_BUF CBM_SZ_128
+/* Edge key for dedup hash table — composite key as string "srcID:tgtID:type",
+ * plus ":local_name" for IMPORTS edges (#768). 256 bytes fit two int64s, the
+ * type and a ~200-char local_name verbatim; longer local_names are re-keyed
+ * with a hash of the full name in make_edge_key (never silently truncated). */
+#define EDGE_KEY_BUF CBM_SZ_256
 
 /* Per-type or per-key edge list stored in hash tables as values */
 typedef CBM_DYN_ARRAY(const cbm_gbuf_edge_t *) edge_ptr_array_t;
@@ -135,7 +138,52 @@ static void make_id_key(char *buf, size_t bufsz, int64_t id) {
     snprintf(buf, bufsz, "%lld", (long long)id);
 }
 
-static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type) {
+/* FNV-1a 64-bit over a byte slice — for re-keying oversized local_names. */
+static uint64_t fnv1a64(const char *s, size_t len) {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* IMPORTS edges carry exactly one imported symbol's local_name (#768): two
+ * named imports from the same specifier resolve to the same (source,
+ * target) pair but are distinct symbols. Key on local_name too so the
+ * second import doesn't dedup-collide with and overwrite the first —
+ * every pass that walks IMPORTS edges (pass_calls.c, pass_usages.c,
+ * pass_semantic.c, pass_lsp_cross.c) expects one local_name per edge, so
+ * losing an edge here silently breaks cross-file call resolution for
+ * whichever symbol got dropped, not just "who imports X" queries. Other
+ * edge types keep the plain (source,target,type) key: collapsing repeat
+ * edges of the same type between the same two nodes (e.g. multiple call
+ * sites) into one is the existing, intended dedup behavior there.
+ *
+ * A local_name too long for the key buffer is re-keyed with an FNV-1a hash
+ * of the FULL name instead of being truncated — a truncated key would
+ * collide two long names sharing a prefix and silently drop an edge again.
+ * The hash key is prefixed with byte 0x01, which cannot appear in the raw
+ * JSON slice (control characters must be \u-escaped in JSON), so hash keys
+ * can never collide with verbatim keys. */
+static void make_edge_key(char *buf, size_t bufsz, int64_t src, int64_t tgt, const char *type,
+                          const char *properties_json) {
+    if (properties_json && strcmp(type, "IMPORTS") == 0) {
+        static const char local_name_key[] = "\"local_name\":\"";
+        const char *ln = strstr(properties_json, local_name_key);
+        if (ln) {
+            ln += sizeof(local_name_key) - 1;
+            const char *end = strchr(ln, '"');
+            size_t ln_len = end ? (size_t)(end - ln) : strlen(ln);
+            int n = snprintf(buf, bufsz, "%lld:%lld:%s:%.*s", (long long)src, (long long)tgt, type,
+                             (int)ln_len, ln);
+            if (n < 0 || (size_t)n >= bufsz) {
+                snprintf(buf, bufsz, "%lld:%lld:%s:\x01%016llx", (long long)src, (long long)tgt,
+                         type, (unsigned long long)fnv1a64(ln, ln_len));
+            }
+            return;
+        }
+    }
     snprintf(buf, bufsz, "%lld:%lld:%s", (long long)src, (long long)tgt, type);
 }
 
@@ -244,7 +292,7 @@ static void remove_node_from_ptr_array(node_ptr_array_t *arr, int64_t node_id) {
 static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
 
-    make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type);
+    make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type, e->properties_json);
     const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
     cbm_ht_delete(gb->edge_by_key, key);
     free((void *)ekey);
@@ -919,7 +967,7 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     /* Check for dedup */
     char key[EDGE_KEY_BUF];
-    make_edge_key(key, sizeof(key), source_id, target_id, type);
+    make_edge_key(key, sizeof(key), source_id, target_id, type, properties_json);
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
@@ -1032,7 +1080,8 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         if (strcmp(e->type, type) == 0) {
             char key[EDGE_KEY_BUF];
-            make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type);
+            make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
+                          e->properties_json);
             const char *ekey = cbm_ht_get_key(gb->edge_by_key, key);
             cbm_ht_delete(gb->edge_by_key, key);
             free((void *)ekey);
@@ -1182,15 +1231,16 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
 
 /* ── Dump / Flush ────────────────────────────────────────────────── */
 
-/* Extract url_path value from a properties JSON string.
+/* Extract a string property from a properties JSON string.
  * Returns heap-allocated string or NULL. Caller must free.
- * Parses real JSON: the dump writer feeds this value into idx_edges_url_path,
- * whose backing column is GENERATED AS json_extract(properties,'$.url_path').
+ * Parses real JSON: the dump writer feeds these values into indexes whose
+ * backing columns are GENERATED AS json_extract(properties,'$.<key>').
  * Naive byte slicing returned the ESCAPED text (and cut at embedded \\")
  * while json_extract yields the unescaped value — the mismatch left rows
- * "missing from index idx_edges_url_path" under PRAGMA integrity_check. */
-static char *extract_url_path(const char *props) {
-    if (!props || !strstr(props, "\"url_path\"")) {
+ * "missing from index idx_edges_url_path" under PRAGMA integrity_check.
+ * key_quoted ("\"key\"") is a fast pre-filter to skip the JSON parse. */
+static char *extract_prop_string(const char *props, const char *key_quoted, const char *key) {
+    if (!props || !strstr(props, key_quoted)) {
         return NULL;
     }
     yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
@@ -1198,13 +1248,23 @@ static char *extract_url_path(const char *props) {
         return NULL;
     }
     char *out = NULL;
-    yyjson_val *v = yyjson_obj_get(yyjson_doc_get_root(doc), "url_path");
+    yyjson_val *v = yyjson_obj_get(yyjson_doc_get_root(doc), key);
     if (v && yyjson_is_str(v)) {
         const char *sv = yyjson_get_str(v);
         out = cbm_strndup(sv, strlen(sv));
     }
     yyjson_doc_free(doc);
     return out;
+}
+
+static char *extract_url_path(const char *props) {
+    return extract_prop_string(props, "\"url_path\"", "url_path");
+}
+
+/* local_name feeds the hand-built sqlite_autoindex_edges_1 — its backing
+ * column local_name_gen is GENERATED only for IMPORTS edges (#768). */
+static char *extract_local_name(const char *props) {
+    return extract_prop_string(props, "\"local_name\"", "local_name");
 }
 
 /* Remap a temp edge ID to its final sequential ID, or 0 if out of range. */
@@ -1265,9 +1325,11 @@ static CBMDumpNode *build_dump_nodes(cbm_gbuf_t *gb, int live_count, int64_t *te
     return dump_nodes;
 }
 
-/* Build dump-ready edge array with remapped IDs. Returns url_paths via out param. */
+/* Build dump-ready edge array with remapped IDs. Returns url_paths and
+ * local_names (heap string arrays owned by the caller) via out params. */
 static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_final,
-                                     int64_t max_temp_id, int *out_count, char ***out_url_paths) {
+                                     int64_t max_temp_id, int *out_count, char ***out_url_paths,
+                                     char ***out_local_names) {
     /* Count valid edges (both endpoints resolved) */
     int valid_edges = 0;
     for (int i = 0; i < gb->edges.count; i++) {
@@ -1281,6 +1343,7 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
     CBMDumpEdge *dump_edges =
         malloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE) * sizeof(CBMDumpEdge));
     char **url_paths = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
+    char **local_names = calloc((size_t)(valid_edges > 0 ? valid_edges : SKIP_ONE), sizeof(char *));
     int idx = 0;
 
     for (int i = 0; i < gb->edges.count; i++) {
@@ -1294,6 +1357,12 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
         char *url_path = extract_url_path(e->properties_json);
         url_paths[idx] = url_path;
 
+        /* IMPORTS only — mirrors the local_name_gen CASE in the edges DDL. */
+        char *local_name = (e->type && strcmp(e->type, "IMPORTS") == 0)
+                               ? extract_local_name(e->properties_json)
+                               : NULL;
+        local_names[idx] = local_name;
+
         const char *props = e->properties_json ? e->properties_json : "{}";
         dump_edges[idx] = (CBMDumpEdge){
             .id = idx + SKIP_ONE,
@@ -1303,12 +1372,14 @@ static CBMDumpEdge *build_dump_edges(cbm_gbuf_t *gb, const int64_t *temp_to_fina
             .type = e->type,
             .properties = props,
             .url_path = url_path ? url_path : "",
+            .local_name = local_name ? local_name : "",
         };
         idx++;
     }
 
     *out_count = idx;
     *out_url_paths = url_paths;
+    *out_local_names = local_names;
     return dump_edges;
 }
 
@@ -1360,12 +1431,15 @@ static void log_dump_summary(int node_count, int edge_count) {
     cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
 }
 
-static void free_dump_resources(char **url_paths, int edge_count, CBMDumpEdge *dump_edges,
-                                CBMDumpNode *dump_nodes, int64_t *temp_to_final) {
+static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
+                                CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
+                                int64_t *temp_to_final) {
     for (int i = 0; i < edge_count; i++) {
         free(url_paths[i]);
+        free(local_names[i]);
     }
     free(url_paths);
+    free(local_names);
     free(dump_edges);
     free(dump_nodes);
     free(temp_to_final);
@@ -1469,10 +1543,12 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
 
     int edge_idx = 0;
     char **url_paths = NULL;
+    char **local_names = NULL;
     CBMDumpEdge *dump_edges = NULL;
     if (rc == 0) {
         CBM_PROF_START(t_build_edges);
-        dump_edges = build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths);
+        dump_edges =
+            build_dump_edges(gb, temp_to_final, max_temp_id, &edge_idx, &url_paths, &local_names);
         CBM_PROF_END_N("dump", "3_build_dump_edges", t_build_edges, edge_idx);
         release_and_remap_vectors(gb, temp_to_final, max_temp_id);
     }
@@ -1489,7 +1565,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     }
 
     log_dump_summary(node_idx, edge_idx);
-    free_dump_resources(url_paths, edge_idx, dump_edges, dump_nodes, temp_to_final);
+    free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     free(src_nodes);
     return rc;
 }

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # clean.sh — Remove ALL build artifacts, caches, and generated files.
 #
 # Usage: scripts/clean.sh

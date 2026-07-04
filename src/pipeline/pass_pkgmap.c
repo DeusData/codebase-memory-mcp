@@ -33,7 +33,7 @@
 
 /* Read an entire file into a malloc'd buffer. Returns NULL on failure. */
 static char *pkgmap_read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
@@ -845,7 +845,7 @@ static bool pkgmap_is_reparse_point(const char *abs_path) {
  * it hang. On Windows we additionally skip reparse points before
  * descending as a best-effort early-out. */
 static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_entries_t *entries,
-                           int depth) {
+                           int depth, char **excluded_dirs, int excluded_count) {
     if (depth >= PKGMAP_WALK_MAX_DEPTH) {
         cbm_log_info("pkgmap.walk", "depth_cap", rel_dir && rel_dir[0] ? rel_dir : ".");
         return 0;
@@ -874,7 +874,8 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
             continue;
         }
         if (S_ISDIR(st.st_mode)) {
-            if (cbm_should_skip_dir(name, CBM_MODE_FULL)) {
+            if (cbm_should_skip_dir(name, CBM_MODE_FULL) ||
+                cbm_pipeline_relpath_is_excluded(rel_path, excluded_dirs, excluded_count)) {
                 continue;
             }
 #ifdef _WIN32
@@ -886,7 +887,8 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
                 continue;
             }
 #endif
-            parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1);
+            parsed += pkgmap_walk_dir(abs_path, rel_path, entries, depth + 1, excluded_dirs,
+                                      excluded_count);
             continue;
         }
         if (!S_ISREG(st.st_mode)) {
@@ -920,11 +922,12 @@ static int pkgmap_walk_dir(const char *abs_dir, const char *rel_dir, cbm_pkg_ent
  * Windows reparse points, so it cannot hang on directory junctions.
  * This is what lets bare workspace imports (e.g. "@org/pkg" declared in
  * an ignored package.json) resolve on Windows as well as POSIX. */
-int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries) {
+int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
+                         int excluded_count) {
     if (!repo_path || !entries) {
         return 0;
     }
-    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0);
+    int parsed = pkgmap_walk_dir(repo_path, "", entries, 0, excluded_dirs, excluded_count);
     cbm_log_info("pkgmap.scan_repo", "manifests", pkgmap_itoa(parsed));
     return parsed;
 }
@@ -961,7 +964,8 @@ CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file
  * (the canonical case: package.json, which is in IGNORED_JSON_FILES).
  * Falls back to the files[]-only behaviour if repo_path is NULL. */
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name) {
+                                         int file_count, const char *project_name,
+                                         char **excluded_dirs, int excluded_count) {
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
 
@@ -985,7 +989,7 @@ CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_i
         free(source);
     }
 
-    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries);
+    int from_walk = cbm_pkgmap_scan_repo(repo_path, &entries, excluded_dirs, excluded_count);
     cbm_log_info("pkgmap.scan", "manifests_from_files", pkgmap_itoa(from_files),
                  "manifests_from_walk", pkgmap_itoa(from_walk), "entries",
                  pkgmap_itoa(entries.count));
@@ -1328,8 +1332,9 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
         }
         const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
         free(qn);
-        if (n && (!source_file_qn || !n->qualified_name ||
-                  strcmp(n->qualified_name, source_file_qn) != 0)) {
+        if (n && import_targetable_label(n->label) &&
+            (!source_file_qn || !n->qualified_name ||
+             strcmp(n->qualified_name, source_file_qn) != 0)) {
             found = n;
             break;
         }
@@ -1347,7 +1352,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return NULL;
     }
 
-    /* Strategy 1: module-path resolution → existing node (Python/TS/Go). */
+    /* Strategy 1: module-path resolution → existing node (Python/TS/Go).
+     * No label filter here: directory-module languages (Go/Java packages)
+     * legitimately resolve straight to a Folder node -- that's the intended,
+     * correct import target, not a collision. The Folder-collision problem
+     * (#767) only shows up downstream, in Strategy 4's retry-with-truncated-
+     * path loop, which re-enters resolve_module with a DIFFERENT, shortened
+     * string that the original import never named. */
     char *target_qn = cbm_pipeline_resolve_module(ctx, source_rel, imp->module_path);
     const cbm_gbuf_node_t *target = target_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, target_qn) : NULL;
     free(target_qn);
@@ -1571,8 +1582,9 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                 char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, work);
                 const cbm_gbuf_node_t *n = rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
                 free(rqn);
-                if (n && (!source_file_qn || !n->qualified_name ||
-                          strcmp(n->qualified_name, source_file_qn) != 0)) {
+                if (n && import_targetable_label(n->label) &&
+                    (!source_file_qn || !n->qualified_name ||
+                     strcmp(n->qualified_name, source_file_qn) != 0)) {
                     return n;
                 }
                 char *sl = strrchr(work, '/');

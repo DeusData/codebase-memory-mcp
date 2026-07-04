@@ -786,7 +786,11 @@ static void *index_thread_fn(void *arg) {
 
     /* Build command line for CreateProcess */
     char cmdline[2048];
-    snprintf(cmdline, sizeof(cmdline), "\"%s\" cli index_repository \"%s\"", bin, json_arg);
+    /* --index-worker: this http_server spawn is already the crash-isolation layer,
+     * so the child runs indexing in-process rather than spawning its own supervisor
+     * (avoids redundant process nesting). */
+    snprintf(cmdline, sizeof(cmdline), "\"%s\" cli --index-worker index_repository \"%s\"", bin,
+             json_arg);
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
@@ -854,7 +858,7 @@ static void *index_thread_fn(void *arg) {
         FILE *lf = freopen(log_file, "w", stderr);
         (void)lf;
         freopen("/dev/null", "w", stdout);
-        execl(bin, bin, "cli", "index_repository", json_arg, (char *)NULL);
+        execl(bin, bin, "cli", "--index-worker", "index_repository", json_arg, (char *)NULL);
         _exit(127);
     }
 

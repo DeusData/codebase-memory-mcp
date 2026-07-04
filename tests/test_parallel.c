@@ -12,6 +12,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/worker_pool.h"
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
@@ -529,6 +530,227 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
+static const char *class_method_tail(const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    const char *last = strrchr(qn, '.');
+    if (!last || last == qn) {
+        return NULL;
+    }
+    const char *second = last;
+    while (second > qn) {
+        second--;
+        if (*second == '.') {
+            return second == qn ? qn : second + 1;
+        }
+    }
+    return qn;
+}
+
+static const cbm_gbuf_node_t *find_unique_callable_node_by_tail(const cbm_gbuf_t *gbuf,
+                                                                const char *tail) {
+    const char *method = tail ? strrchr(tail, '.') : NULL;
+    method = method ? method + 1 : tail;
+    if (!gbuf || !tail || !method) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **nodes = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_by_name(gbuf, method, &nodes, &count) != 0) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *match = NULL;
+    for (int i = 0; i < count; i++) {
+        const cbm_gbuf_node_t *node = nodes[i];
+        if (!node || !node->label || !node->qualified_name) {
+            continue;
+        }
+        if (strcmp(node->label, "Method") != 0 && strcmp(node->label, "Function") != 0) {
+            continue;
+        }
+        const char *node_tail = class_method_tail(node->qualified_name);
+        if (!node_tail || strcmp(node_tail, tail) != 0) {
+            continue;
+        }
+        if (match) {
+            return NULL;
+        }
+        match = node;
+    }
+    return match;
+}
+
+static const cbm_gbuf_edge_t *find_calls_edge_by_tails(const cbm_gbuf_t *gbuf,
+                                                       const char *source_tail,
+                                                       const char *target_tail) {
+    const cbm_gbuf_node_t *source = find_unique_callable_node_by_tail(gbuf, source_tail);
+    const cbm_gbuf_node_t *target = find_unique_callable_node_by_tail(gbuf, target_tail);
+    if (!source || !target) {
+        return NULL;
+    }
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gbuf, source->id, "CALLS", &edges, &count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        if (edges[i] && edges[i]->target_id == target->id) {
+            return edges[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_jvm_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char jpath[512];
+    snprintf(jpath, sizeof(jpath), "%s/src/main/java/com/example/Example.java", tmpdir);
+    char jdir[512];
+    snprintf(jdir, sizeof(jdir), "%s/src/main/java/com/example", tmpdir);
+    cbm_mkdir_p(jdir, 0755);
+    FILE *jf = fopen(jpath, "w");
+    if (!jf) {
+        FAIL("fopen example.java failed");
+    }
+    fprintf(jf, "package com.example;\n"
+                "\n"
+                "class JavaCaller {\n"
+                "    String call(KotlinService kotlinService) {\n"
+                "        return kotlinService.ping(new JavaService());\n"
+                "    }\n"
+                "}\n"
+                "\n"
+                "class JavaService {\n"
+                "    String pong() {\n"
+                "        return \"pong\";\n"
+                "    }\n"
+                "}\n");
+    fclose(jf);
+
+    char kpath[512];
+    snprintf(kpath, sizeof(kpath), "%s/src/main/kotlin/com/example/KotlinService.kt", tmpdir);
+    char kdir[512];
+    snprintf(kdir, sizeof(kdir), "%s/src/main/kotlin/com/example", tmpdir);
+    cbm_mkdir_p(kdir, 0755);
+    FILE *kf = fopen(kpath, "w");
+    if (!kf) {
+        unlink(jpath);
+        rmdir(tmpdir);
+        FAIL("fopen example.kt failed");
+    }
+    fprintf(kf, "package com.example\n"
+                "\n"
+                "class KotlinService {\n"
+                "    fun ping(javaService: JavaService): String {\n"
+                "        return javaService.pong()\n"
+                "    }\n"
+                "}\n");
+    fclose(kf);
+
+    cbm_file_info_t files[2] = {0};
+    files[0].path = jpath;
+    files[0].rel_path = (char *)"src/main/java/com/example/Example.java";
+    files[0].language = CBM_LANG_JAVA;
+    files[1].path = kpath;
+    files[1].rel_path = (char *)"src/main/kotlin/com/example/KotlinService.kt";
+    files[1].language = CBM_LANG_KOTLIN;
+
+    cbm_gbuf_t *gbuf = run_parallel("com", tmpdir, files, 2, 2);
+    ASSERT_NOT_NULL(gbuf);
+
+    const cbm_gbuf_edge_t *java_to_kotlin =
+        find_calls_edge_by_tails(gbuf, "JavaCaller.call", "KotlinService.ping");
+    const cbm_gbuf_edge_t *kotlin_to_java =
+        find_calls_edge_by_tails(gbuf, "KotlinService.ping", "JavaService.pong");
+
+    ASSERT_NOT_NULL(java_to_kotlin);
+    ASSERT_NOT_NULL(kotlin_to_java);
+    ASSERT_NOT_NULL(java_to_kotlin->properties_json);
+    ASSERT_NOT_NULL(kotlin_to_java->properties_json);
+    ASSERT_NOT_NULL(strstr(java_to_kotlin->properties_json, "\"strategy\":\"lsp"));
+    ASSERT_NOT_NULL(strstr(kotlin_to_java->properties_json, "\"strategy\":\"lsp"));
+    ASSERT_TRUE(strstr(java_to_kotlin->properties_json, "\"strategy\":\"callee_suffix\"") == NULL);
+    ASSERT_TRUE(strstr(kotlin_to_java->properties_json, "\"strategy\":\"callee_suffix\"") == NULL);
+
+    cbm_gbuf_free(gbuf);
+    unlink(kpath);
+    unlink(jpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
+/* Gate guard for the JVM-only unique-tail fallbacks (lsp_resolve.h).
+ *
+ * The tail fallbacks join LSP overrides across QN drift by unique
+ * "Class.method" leaf. That is only sound where class-per-file package
+ * semantics hold (Java/Kotlin); in any other language a single
+ * wrong-module coincidence would fabricate a CALLS edge, so
+ * cbm_pipeline_lsp_allow_tail_match must keep the fallbacks OFF there.
+ *
+ * NOTE: a natural end-to-end non-JVM coincidence fixture is impractical:
+ * reaching the fallbacks requires the LSP and the textual extraction to
+ * disagree on QN prefixes, which path-derived single-root languages do
+ * not produce in a small fixture (that drift is precisely the JVM
+ * mixed-source-root symptom the fallback exists for). So this test
+ * exercises the gated branches directly: the SAME wrong-module
+ * coincidence must resolve with the gate open (JVM) and must NOT with
+ * the gate closed. If the gate were removed — fallbacks made
+ * unconditional again — the gate-closed assertions below would fail. */
+TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm) {
+    /* Policy: exactly the JVM languages. */
+    ASSERT_TRUE(cbm_pipeline_lsp_allow_tail_match(CBM_LANG_JAVA));
+    ASSERT_TRUE(cbm_pipeline_lsp_allow_tail_match(CBM_LANG_KOTLIN));
+    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_PYTHON));
+    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_GO));
+    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_TYPESCRIPT));
+    ASSERT_TRUE(!cbm_pipeline_lsp_allow_tail_match(CBM_LANG_CPP));
+
+    /* Wrong-module coincidence: the resolved entry's caller shares only
+     * the "Service.handle" tail with the textual call's enclosing
+     * function, so the exact caller_qn pass misses and only the tail
+     * fallback could join them. */
+    CBMResolvedCall rc_item = {0};
+    rc_item.caller_qn = "com.example.pkg.Service.handle";
+    rc_item.callee_qn = "com.example.pkg.Helper.run";
+    rc_item.strategy = "lsp";
+    rc_item.confidence = 0.9f;
+    CBMResolvedCallArray arr = {0};
+    arr.items = &rc_item;
+    arr.count = 1;
+    arr.cap = 1;
+
+    CBMCall call = {0};
+    call.enclosing_func_qn = "proj.other_mod.Service.handle";
+    call.callee_name = "helper.run";
+
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&arr, &call, false) == NULL);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&arr, &call, true) == &rc_item);
+
+    /* Target-node fallback: callee_qn misses both as-is and
+     * project-prefixed; exactly one node coincidentally shares the
+     * "Helper.run" tail in an unrelated module. */
+    cbm_gbuf_t *tgbuf = cbm_gbuf_new("proj", "/tmp");
+    ASSERT_NOT_NULL(tgbuf);
+    int64_t nid = cbm_gbuf_upsert_node(tgbuf, "Method", "run", "proj.zeta.Helper.run",
+                                       "zeta/helper.py", 1, 3, NULL);
+    ASSERT_TRUE(nid != 0);
+    ASSERT_TRUE(cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", false) ==
+                NULL);
+    const cbm_gbuf_node_t *jvm_hit =
+        cbm_pipeline_lsp_target_node(tgbuf, "proj", "com.other.Helper.run", true);
+    ASSERT_NOT_NULL(jvm_hit);
+    ASSERT_TRUE(strcmp(jvm_hit->qualified_name, "proj.zeta.Helper.run") == 0);
+    cbm_gbuf_free(tgbuf);
+    PASS();
+}
+
 TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_XXXXXX");
@@ -719,6 +941,8 @@ SUITE(parallel) {
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
     RUN_TEST(parallel_defines_method_parity);

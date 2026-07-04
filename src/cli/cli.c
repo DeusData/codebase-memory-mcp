@@ -80,6 +80,7 @@ enum {
 #endif
 #include <errno.h>  // EEXIST
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
+#include <limits.h> // UINT_MAX
 #include <stdint.h> // uintptr_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -2054,7 +2055,7 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
         return;
     }
     (void)fprintf(f,
-                  "#!/bin/bash\n"
+                  "#!/usr/bin/env bash\n"
                   "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
                   "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
                   "# Despite the name this NEVER blocks a tool call - it only adds\n"
@@ -2098,7 +2099,7 @@ static void cbm_install_session_reminder_script(const char *home) {
         return;
     }
     (void)fprintf(
-        f, "#!/bin/bash\n"
+        f, "#!/usr/bin/env bash\n"
            "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
            "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
            "cat << 'REMINDER'\n"
@@ -2186,7 +2187,7 @@ static void cbm_install_subagent_reminder_script(const char *home) {
      * backslashes, or newlines, so the JSON below is valid as written — no
      * runtime escaping (and no python3/jq dependency) is required. */
     (void)fprintf(f,
-                  "#!/bin/bash\n"
+                  "#!/usr/bin/env bash\n"
                   "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
                   "# Installed by codebase-memory-mcp. Fires when any subagent is spawned.\n"
                   "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
@@ -2485,12 +2486,22 @@ enum {
     ZIP_STORED = 0,
     ZIP_DEFLATE = 8
 };
-static const uint32_t ZIP_MAX_UNCOMP = 500U * 1024U * 1024U;
+static const size_t ZIP_MAX_UNCOMP = 500U * 1024U * 1024U;
+
+static uint16_t zip_read_u16le(const unsigned char *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << BYTE_SHIFT));
+}
+
+static uint32_t zip_read_u32le(const unsigned char *p) {
+    return ((uint32_t)p[0]) | ((uint32_t)p[1] << BYTE_SHIFT) |
+           ((uint32_t)p[2] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
+           ((uint32_t)p[3] << (BYTE_SHIFT * CLI_JSON_INDENT));
+}
 
 /* Decompress a single zip entry (stored or deflated). Returns malloc'd buffer
  * or NULL on failure. *out_len receives the decompressed size. */
 static unsigned char *zip_extract_entry(const unsigned char *file_data, uint16_t method,
-                                        uint32_t comp_size, uint32_t uncomp_size, int *out_len) {
+                                        size_t comp_size, size_t uncomp_size, int *out_len) {
     if (method == ZIP_STORED) {
         if (comp_size > ZIP_MAX_UNCOMP) {
             return NULL;
@@ -2507,15 +2518,18 @@ static unsigned char *zip_extract_entry(const unsigned char *file_data, uint16_t
         if (uncomp_size > ZIP_MAX_UNCOMP) {
             return NULL;
         }
+        if (comp_size > UINT_MAX || uncomp_size > UINT_MAX) {
+            return NULL;
+        }
         unsigned char *out = malloc(uncomp_size);
         if (!out) {
             return NULL;
         }
         z_stream strm = {0};
         strm.next_in = (unsigned char *)file_data;
-        strm.avail_in = comp_size;
+        strm.avail_in = (uInt)comp_size;
         strm.next_out = out;
-        strm.avail_out = uncomp_size;
+        strm.avail_out = (uInt)uncomp_size;
         if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
             free(out);
             return NULL;
@@ -2545,28 +2559,14 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
             break;
         }
 
-        uint16_t method = (uint16_t)(data[pos + ZIP_OFF_METHOD] |
-                                     (data[pos + ZIP_OFF_METHOD + CLI_SKIP_ONE] << BYTE_SHIFT));
-        uint32_t comp_size =
-            (uint32_t)(data[pos + ZIP_OFF_COMP] |
-                       (data[pos + ZIP_OFF_COMP + CLI_SKIP_ONE] << BYTE_SHIFT) |
-                       (data[pos + ZIP_OFF_COMP + CLI_PAIR_LEN] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
-                       (data[pos + ZIP_OFF_COMP + CLI_JSON_INDENT]
-                        << (BYTE_SHIFT * CLI_JSON_INDENT)));
-        uint32_t uncomp_size =
-            (uint32_t)(data[pos + ZIP_OFF_UNCOMP] |
-                       (data[pos + ZIP_OFF_UNCOMP + CLI_SKIP_ONE] << BYTE_SHIFT) |
-                       (data[pos + ZIP_OFF_UNCOMP + CLI_PAIR_LEN] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
-                       (data[pos + ZIP_OFF_UNCOMP + CLI_JSON_INDENT]
-                        << (BYTE_SHIFT * CLI_JSON_INDENT)));
-        uint16_t name_len = (uint16_t)(data[pos + ZIP_OFF_NAMELEN] |
-                                       (data[pos + ZIP_OFF_NAMELEN + CLI_SKIP_ONE] << BYTE_SHIFT));
-        uint16_t extra_len =
-            (uint16_t)(data[pos + ZIP_OFF_EXTRALEN] |
-                       (data[pos + ZIP_OFF_EXTRALEN + CLI_SKIP_ONE] << BYTE_SHIFT));
+        uint16_t method = zip_read_u16le(data + pos + ZIP_OFF_METHOD);
+        uint32_t comp_size = zip_read_u32le(data + pos + ZIP_OFF_COMP);
+        uint32_t uncomp_size = zip_read_u32le(data + pos + ZIP_OFF_UNCOMP);
+        uint16_t name_len = zip_read_u16le(data + pos + ZIP_OFF_NAMELEN);
+        uint16_t extra_len = zip_read_u16le(data + pos + ZIP_OFF_EXTRALEN);
 
         int header_end = pos + ZIP_HDR_SZ + name_len + extra_len;
-        if (header_end + (int)comp_size > data_len) {
+        if (header_end > data_len || comp_size > (uint32_t)(data_len - header_end)) {
             break;
         }
 

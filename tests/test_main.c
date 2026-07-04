@@ -43,6 +43,7 @@ extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
 extern void suite_platform(void);
+extern void suite_subprocess(void);
 extern void suite_extraction(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
@@ -58,10 +59,12 @@ extern void suite_mcp(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
 extern void suite_gitignore(void);
+extern void suite_git_context(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_index_resilience(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
@@ -143,6 +146,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
     RUN_SELECTED_SUITE(platform);
+    RUN_SELECTED_SUITE(subprocess);
     RUN_SELECTED_SUITE(dump_verify);
 
     /* Existing C code regression tests */
@@ -173,6 +177,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(language);
     RUN_SELECTED_SUITE(userconfig);
     RUN_SELECTED_SUITE(gitignore);
+    RUN_SELECTED_SUITE(git_context);
     RUN_SELECTED_SUITE(discover);
 
     /* Graph Buffer (M7) */
@@ -181,6 +186,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(index_resilience);
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);
     RUN_SELECTED_SUITE(path_alias);
