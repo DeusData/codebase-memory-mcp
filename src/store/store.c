@@ -6528,6 +6528,67 @@ int cbm_store_find_nodes_by_name_overlay_view(cbm_store_t *s, const char *projec
     return rc;
 }
 
+int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *project,
+                                               const char *label, cbm_node_t **out, int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+
+    char active_cte[ST_SQL_BUF];
+    if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "find_nodes_by_label_overlay active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    char sql[ST_SQL_BUF];
+    int n = 0;
+    if (label) {
+        n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                     "n.file_path, n.start_line, n.end_line, n.properties "
+                     "FROM active_nodes n "
+                     "WHERE n.project = ?3 AND n.label = ?4 "
+                     "ORDER BY n.qualified_name",
+                     active_cte);
+    } else {
+        n = snprintf(sql, sizeof(sql),
+                     "%s"
+                     "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                     "n.file_path, n.start_line, n.end_line, n.properties "
+                     "FROM active_nodes n "
+                     "WHERE n.project = ?3 "
+                     "ORDER BY n.qualified_name",
+                     active_cte);
+    }
+    if (n < 0 || (size_t)n >= sizeof(sql)) {
+        store_set_error(s, "find_nodes_by_label_overlay SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_nodes_by_label_overlay prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, project);
+    if (label) {
+        bind_text(stmt, ST_COL_4, label);
+    }
+
+    int rc = collect_nodes_from_stmt(s, stmt, "find_nodes_by_label_overlay", out, count);
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 static int search_overlay_collect_connected_names(cbm_store_t *s, const char *active_cte,
                                                   const cbm_search_params_t *params,
                                                   const char *qualified_name,

@@ -316,6 +316,13 @@ typedef struct {
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out);
 
+/* Execute with the active overlay node read view when the query is node-only.
+ * Relationship, EXISTS, and degree-derived queries fall back to canonical rows.
+ * used_active_nodes is set true only when active node scans were used. */
+int cbm_cypher_execute_active_nodes(cbm_store_t *store, const char *query, const char *project,
+                                    int max_rows, cbm_cypher_result_t *out,
+                                    bool *used_active_nodes);
+
 /* Free a query result. */
 void cbm_cypher_result_free(cbm_cypher_result_t *r);
 

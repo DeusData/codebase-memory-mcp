@@ -2555,6 +2555,11 @@ typedef struct {
     int col_count;
 } result_builder_t;
 
+typedef enum {
+    CYP_NODE_SCAN_CANONICAL = 0,
+    CYP_NODE_SCAN_ACTIVE_OVERLAY
+} cypher_node_scan_mode_t;
+
 static void rb_init(result_builder_t *rb) {
     memset(rb, 0, sizeof(*rb));
     rb->row_cap = CBM_SZ_32;
@@ -2768,7 +2773,8 @@ static bool label_alt_matches(const char *actual, const char *pat) {
  * Node-struct fields are moved (shallow) into out_nodes; each per-label array
  * container is freed. */
 static void scan_alternation_labels(cbm_store_t *store, const char *project, const char *labels,
-                                    cbm_node_t **out_nodes, int *out_count) {
+                                    cypher_node_scan_mode_t scan_mode, cbm_node_t **out_nodes,
+                                    int *out_count) {
     *out_nodes = NULL;
     *out_count = 0;
     int cap = 0;
@@ -2780,7 +2786,11 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
     for (char *tok = strtok_r(copy, "|", &save); tok; tok = strtok_r(NULL, "|", &save)) {
         cbm_node_t *part = NULL;
         int pc = 0;
-        cbm_store_find_nodes_by_label(store, project, tok, &part, &pc);
+        if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
+            cbm_store_find_nodes_by_label_overlay_view(store, project, tok, &part, &pc);
+        } else {
+            cbm_store_find_nodes_by_label(store, project, tok, &part, &pc);
+        }
         if (pc > 0 && part) {
             if (*out_count + pc > cap) {
                 cap = (*out_count + pc) * PAIR_LEN;
@@ -2795,11 +2805,19 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
 }
 
 static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
-                               cbm_node_pattern_t *first, cbm_node_t **out_nodes, int *out_count) {
+                               cbm_node_pattern_t *first, cypher_node_scan_mode_t scan_mode,
+                               cbm_node_t **out_nodes, int *out_count) {
     if (first->label && strchr(first->label, '|')) {
-        scan_alternation_labels(store, project, first->label, out_nodes, out_count);
+        scan_alternation_labels(store, project, first->label, scan_mode, out_nodes, out_count);
     } else if (first->label) {
-        cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
+        if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
+            cbm_store_find_nodes_by_label_overlay_view(store, project, first->label, out_nodes,
+                                                       out_count);
+        } else {
+            cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
+        }
+    } else if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
+        cbm_store_find_nodes_by_label_overlay_view(store, project, NULL, out_nodes, out_count);
     } else {
         cbm_search_params_t params = {.project = project,
                                       .min_degree = CYP_FOUND_NONE,
@@ -4305,8 +4323,8 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
 
 /* Expand additional MATCH patterns (pi >= 1) */
 static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
-                                       int max_rows, binding_t **bindings, int *bind_count,
-                                       int *bind_cap) {
+                                       int max_rows, cypher_node_scan_mode_t scan_mode,
+                                       binding_t **bindings, int *bind_count, int *bind_cap) {
     for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
         cbm_pattern_t *patn = &q->patterns[pi];
         bool opt = q->pattern_optional[pi];
@@ -4330,7 +4348,8 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
 
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
-        scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+        scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], scan_mode, &extra_nodes,
+                           &extra_count);
         if (patn->rel_count == 0) {
             cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
         } else {
@@ -4371,13 +4390,14 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
-                          result_builder_t *rb) {
+                          cypher_node_scan_mode_t scan_mode, result_builder_t *rb) {
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
-    scan_pattern_nodes(store, project, max_rows, &pat0->nodes[0], &scanned, &scan_count);
+    scan_pattern_nodes(store, project, max_rows, &pat0->nodes[0], scan_mode, &scanned,
+                       &scan_count);
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
@@ -4402,7 +4422,8 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                         q->pattern_optional[0]);
 
     /* Step 2b: Additional patterns */
-    expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap);
+    expand_additional_patterns(store, q, project, max_rows, scan_mode, &bindings, &bind_count,
+                               &bind_cap);
 
     /* Step 3: Late WHERE */
     if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
@@ -4428,11 +4449,95 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     return 0;
 }
 
+static bool cypher_is_degree_prop(const char *prop) {
+    return prop && (strcmp(prop, "in_degree") == 0 || strcmp(prop, "out_degree") == 0);
+}
+
+static bool cypher_expr_requires_canonical_edges(const cbm_expr_t *expr) {
+    if (!expr) {
+        return false;
+    }
+    if (expr->type == EXPR_CONDITION) {
+        return (expr->cond.op && strcmp(expr->cond.op, "EXISTS") == 0) ||
+               cypher_is_degree_prop(expr->cond.property);
+    }
+    return cypher_expr_requires_canonical_edges(expr->left) ||
+           cypher_expr_requires_canonical_edges(expr->right);
+}
+
+static bool cypher_where_requires_canonical_edges(const cbm_where_clause_t *where) {
+    if (!where) {
+        return false;
+    }
+    if (cypher_expr_requires_canonical_edges(where->root)) {
+        return true;
+    }
+    for (int i = 0; i < where->count; i++) {
+        if ((where->conditions[i].op && strcmp(where->conditions[i].op, "EXISTS") == 0) ||
+            cypher_is_degree_prop(where->conditions[i].property)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cypher_return_requires_canonical_edges(const cbm_return_clause_t *ret) {
+    if (!ret) {
+        return false;
+    }
+    if (ret->order_by &&
+        (strstr(ret->order_by, ".in_degree") || strstr(ret->order_by, ".out_degree"))) {
+        return true;
+    }
+    for (int i = 0; i < ret->count; i++) {
+        if (ret->items[i].func && strcmp(ret->items[i].func, "id") == 0) {
+            return true;
+        }
+        if (ret->items[i].kase) {
+            for (int b = 0; b < ret->items[i].kase->branch_count; b++) {
+                if (cypher_expr_requires_canonical_edges(ret->items[i].kase->branches[b].when_expr)) {
+                    return true;
+                }
+            }
+        }
+        if (cypher_is_degree_prop(ret->items[i].property)) {
+            return true;
+        }
+        for (int a = 0; a < ret->items[i].arg_count; a++) {
+            if (cypher_is_degree_prop(ret->items[i].args[a].property)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
+    for (const cbm_query_t *cur = q; cur; cur = cur->union_next) {
+        for (int pi = 0; pi < cur->pattern_count; pi++) {
+            if (cur->patterns[pi].rel_count > 0) {
+                return false;
+            }
+        }
+        if (cypher_where_requires_canonical_edges(cur->where) ||
+            cypher_where_requires_canonical_edges(cur->post_with_where) ||
+            cypher_return_requires_canonical_edges(cur->with_clause) ||
+            cypher_return_requires_canonical_edges(cur->ret)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* ── Main entry point ─────────────────────────────────────────── */
 
-int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
-                       cbm_cypher_result_t *out) {
+static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const char *project,
+                                   int max_rows, bool request_active_nodes,
+                                   cbm_cypher_result_t *out, bool *used_active_nodes) {
     memset(out, 0, sizeof(*out));
+    if (used_active_nodes) {
+        *used_active_nodes = false;
+    }
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
     }
@@ -4444,9 +4549,17 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
         return CBM_NOT_FOUND;
     }
 
+    cypher_node_scan_mode_t scan_mode = CYP_NODE_SCAN_CANONICAL;
+    if (request_active_nodes && project && cypher_query_supports_active_nodes(q)) {
+        scan_mode = CYP_NODE_SCAN_ACTIVE_OVERLAY;
+        if (used_active_nodes) {
+            *used_active_nodes = true;
+        }
+    }
+
     result_builder_t rb = {0};
     // cppcheck-suppress knownConditionTrueFalse
-    if (execute_single(store, q, project, max_rows, &rb) < 0) {
+    if (execute_single(store, q, project, max_rows, scan_mode, &rb) < 0) {
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }
@@ -4456,7 +4569,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     while (uq) {
         result_builder_t rb2 = {0};
         // cppcheck-suppress knownConditionTrueFalse
-        if (execute_single(store, uq, project, max_rows, &rb2) < 0) {
+        if (execute_single(store, uq, project, max_rows, scan_mode, &rb2) < 0) {
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
@@ -4480,7 +4593,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (rb.row_count >= CYPHER_RESULT_CEILING) {
         rb_free(&rb);
         cbm_query_free(q);
-        out->error = heap_strdup("result exceeded 100k rows — use narrower filters or add LIMIT");
+        out->error = heap_strdup("result exceeded row ceiling; use narrower filters or add LIMIT");
         return CBM_NOT_FOUND;
     }
 
@@ -4491,6 +4604,17 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
 
     cbm_query_free(q);
     return 0;
+}
+
+int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
+                       cbm_cypher_result_t *out) {
+    return cbm_cypher_execute_impl(store, query, project, max_rows, false, out, NULL);
+}
+
+int cbm_cypher_execute_active_nodes(cbm_store_t *store, const char *query, const char *project,
+                                    int max_rows, cbm_cypher_result_t *out,
+                                    bool *used_active_nodes) {
+    return cbm_cypher_execute_impl(store, query, project, max_rows, true, out, used_active_nodes);
 }
 
 void cbm_cypher_result_free(cbm_cypher_result_t *r) {
