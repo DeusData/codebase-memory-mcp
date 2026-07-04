@@ -49,6 +49,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_DERIVED_GENERATION_UNKNOWN 0
 #define CBM_STORE_DERIVED_KIND_DIRECT "direct"
 #define CBM_STORE_DERIVED_VIEW_NODES_FTS "nodes_fts"
+#define CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY "nodes_fts_overlay"
 #define CBM_STORE_DERIVED_VIEW_PAGERANK "pagerank"
 #define CBM_STORE_DERIVED_VIEW_LINKRANK "linkrank"
 #define CBM_STORE_DERIVED_VIEW_NODE_DEGREE "node_degree"

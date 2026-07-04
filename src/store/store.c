@@ -642,7 +642,7 @@ static int init_schema(cbm_store_t *s) {
         return rc;
     }
 
-    /* FTS5 contentless virtual table for BM25 full-text search.
+    /* FTS5 contentless virtual tables for BM25 full-text search.
      * Contentless (content='') means FTS5 stores only the inverted index,
      * not a copy of the source text — required for camelCase tokenization
      * because we feed it `cbm_camel_split(name)` at insert time but want
@@ -651,12 +651,25 @@ static int init_schema(cbm_store_t *s) {
     {
         char *fts_err = NULL;
         int fts_rc = sqlite3_exec(s->db,
-                                  "CREATE VIRTUAL TABLE IF NOT EXISTS nodes_fts USING fts5("
+                                  "CREATE VIRTUAL TABLE IF NOT EXISTS "
+                                  CBM_STORE_DERIVED_VIEW_NODES_FTS " USING fts5("
                                   "  name, qualified_name, label, file_path,"
                                   "  content='',"
                                   "  tokenize='unicode61 remove_diacritics 2'"
                                   ");",
                                   NULL, NULL, &fts_err);
+        if (fts_rc != SQLITE_OK && fts_err) {
+            sqlite3_free(fts_err);
+        }
+        fts_err = NULL;
+        fts_rc = sqlite3_exec(s->db,
+                              "CREATE VIRTUAL TABLE IF NOT EXISTS "
+                              CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY " USING fts5("
+                              "  name, qualified_name, label, file_path,"
+                              "  content='',"
+                              "  tokenize='unicode61 remove_diacritics 2'"
+                              ");",
+                              NULL, NULL, &fts_err);
         if (fts_rc != SQLITE_OK && fts_err) {
             sqlite3_free(fts_err);
         }
@@ -3838,9 +3851,22 @@ static int store_resolve_node_id(cbm_store_t *s, const char *project, const char
     return CBM_STORE_OK;
 }
 
-static bool store_nodes_fts_unavailable(cbm_store_t *s) {
+static bool store_fts_unavailable(cbm_store_t *s, const char *table_name) {
     const char *msg = (s && s->db) ? sqlite3_errmsg(s->db) : NULL;
-    return msg && strstr(msg, "no such table: nodes_fts") != NULL;
+    if (!msg || !table_name || !table_name[0]) {
+        return false;
+    }
+    char needle[CBM_SZ_128];
+    int n = snprintf(needle, sizeof(needle), "no such table: %s", table_name);
+    return n >= 0 && (size_t)n < sizeof(needle) && strstr(msg, needle) != NULL;
+}
+
+static bool store_nodes_fts_unavailable(cbm_store_t *s) {
+    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS);
+}
+
+static bool store_overlay_nodes_fts_unavailable(cbm_store_t *s) {
+    return store_fts_unavailable(s, CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY);
 }
 
 int cbm_store_rebuild_nodes_fts(cbm_store_t *s) {
@@ -3949,6 +3975,66 @@ static int store_nodes_fts_insert_node(cbm_store_t *s, int64_t node_id, const cb
     sqlite3_finalize(stmt);
     if (step != SQLITE_DONE) {
         store_set_error_sqlite(s, "nodes_fts_insert_node");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_nodes_fts_delete_by_file(cbm_store_t *s, const char *project,
+                                                  int64_t overlay_generation,
+                                                  const char *rel_path) {
+    static const char sql[] =
+        "INSERT INTO " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "(" CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        ", rowid, name, qualified_name, label, file_path) "
+        "SELECT 'delete', id, cbm_camel_split(name), qualified_name, label, file_path "
+        "FROM overlay_nodes "
+        "WHERE project = ?1 AND overlay_generation = ?2 AND rel_path = ?3 "
+        "  AND EXISTS (SELECT 1 FROM " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "              WHERE rowid = overlay_nodes.id);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_overlay_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "overlay_nodes_fts_delete_by_file");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
+    bind_text(stmt, ST_COL_3, rel_path);
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_nodes_fts_delete_by_file");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_overlay_nodes_fts_insert_node(cbm_store_t *s, int64_t overlay_node_id,
+                                               const cbm_node_t *node) {
+    static const char sql[] =
+        "INSERT INTO " CBM_STORE_DERIVED_VIEW_NODES_FTS_OVERLAY
+        "(rowid, name, qualified_name, label, file_path) "
+        "VALUES(?1, cbm_camel_split(?2), ?3, ?4, ?5);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        if (store_overlay_nodes_fts_unavailable(s)) {
+            return CBM_STORE_OK;
+        }
+        store_set_error_sqlite(s, "overlay_nodes_fts_insert_node");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_bind_int64(stmt, ST_COL_1, overlay_node_id);
+    bind_text(stmt, ST_COL_2, node->name ? node->name : "");
+    bind_text(stmt, ST_COL_3, node->qualified_name ? node->qualified_name : "");
+    bind_text(stmt, ST_COL_4, node->label ? node->label : "");
+    bind_text(stmt, ST_COL_5, node->file_path ? node->file_path : "");
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "overlay_nodes_fts_insert_node");
         return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
@@ -4731,6 +4817,10 @@ enum {
 static int store_overlay_delete_file_rows_body(cbm_store_t *s, const char *project,
                                                int64_t overlay_generation,
                                                const char *rel_path) {
+    int rc = store_overlay_nodes_fts_delete_by_file(s, project, overlay_generation, rel_path);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
     static const char *const delete_sql[] = {
         "DELETE FROM overlay_edges WHERE project = ?1 AND overlay_generation = ?2 "
         "AND rel_path = ?3;",
@@ -4749,7 +4839,7 @@ static int store_overlay_delete_file_rows_body(cbm_store_t *s, const char *proje
         bind_text(stmt, ST_COL_1, project);
         sqlite3_bind_int64(stmt, ST_COL_2, overlay_generation);
         bind_text(stmt, ST_COL_3, rel_path);
-        int rc = sqlite3_step(stmt);
+        rc = sqlite3_step(stmt);
         sqlite3_finalize(stmt);
         if (rc != SQLITE_DONE) {
             store_set_error_sqlite(s, "overlay_delete_file_rows");
@@ -4817,9 +4907,10 @@ static int store_overlay_insert_file_tombstone_body(cbm_store_t *s, const char *
     return CBM_STORE_OK;
 }
 
-static int store_overlay_insert_node_body(sqlite3_stmt *stmt, const cbm_store_file_delta_t *delta,
+static int store_overlay_insert_node_body(cbm_store_t *s, sqlite3_stmt *stmt,
+                                          const cbm_store_file_delta_t *delta,
                                           int64_t overlay_generation, const cbm_node_t *node,
-                                          bool owned) {
+                                          bool owned, int64_t *out_overlay_node_id) {
     sqlite3_reset(stmt);
     sqlite3_clear_bindings(stmt);
     bind_text(stmt, STORE_OVERLAY_NODE_PROJECT_COL, delta->project);
@@ -4835,7 +4926,13 @@ static int store_overlay_insert_node_body(sqlite3_stmt *stmt, const cbm_store_fi
     sqlite3_bind_int(stmt, STORE_OVERLAY_NODE_END_LINE_COL, node->end_line);
     bind_text(stmt, STORE_OVERLAY_NODE_PROPERTIES_COL,
               node->properties_json ? node->properties_json : "{}");
-    return sqlite3_step(stmt) == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        return CBM_STORE_ERR;
+    }
+    if (out_overlay_node_id) {
+        *out_overlay_node_id = sqlite3_last_insert_rowid(s->db);
+    }
+    return CBM_STORE_OK;
 }
 
 static int store_overlay_insert_nodes_body(cbm_store_t *s,
@@ -4851,19 +4948,32 @@ static int store_overlay_insert_nodes_body(cbm_store_t *s,
         return CBM_STORE_ERR;
     }
     for (int i = 0; i < delta->context_node_count; i++) {
-        if (store_overlay_insert_node_body(stmt, delta, overlay_generation,
-                                           &delta->context_nodes[i], false) != CBM_STORE_OK) {
+        int64_t overlay_node_id = 0;
+        if (store_overlay_insert_node_body(s, stmt, delta, overlay_generation,
+                                           &delta->context_nodes[i], false,
+                                           &overlay_node_id) != CBM_STORE_OK) {
             store_set_error_sqlite(s, "overlay_insert_context_node");
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
         }
+        int rc = store_overlay_nodes_fts_insert_node(s, overlay_node_id, &delta->context_nodes[i]);
+        if (rc != CBM_STORE_OK) {
+            sqlite3_finalize(stmt);
+            return rc;
+        }
     }
     for (int i = 0; i < delta->node_count; i++) {
-        if (store_overlay_insert_node_body(stmt, delta, overlay_generation, &delta->nodes[i],
-                                           true) != CBM_STORE_OK) {
+        int64_t overlay_node_id = 0;
+        if (store_overlay_insert_node_body(s, stmt, delta, overlay_generation, &delta->nodes[i],
+                                           true, &overlay_node_id) != CBM_STORE_OK) {
             store_set_error_sqlite(s, "overlay_insert_node");
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
+        }
+        int rc = store_overlay_nodes_fts_insert_node(s, overlay_node_id, &delta->nodes[i]);
+        if (rc != CBM_STORE_OK) {
+            sqlite3_finalize(stmt);
+            return rc;
         }
     }
     sqlite3_finalize(stmt);
