@@ -974,7 +974,7 @@ ACTIVE_OVERLAY_CTE_SQL = (
     "                    WHERE af.project = s.project AND af.rel_path = s.file_path)"
     "    AND NOT EXISTS (SELECT 1 FROM active_files af"
     "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
-    "  UNION ALL"
+    "  UNION"
     "  SELECT e.project, e.source_qn, e.target_qn, e.type, e.properties"
     "  FROM overlay_edges e"
     "  JOIN active_files af"

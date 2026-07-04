@@ -7946,6 +7946,8 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
         n = snprintf(buf + used, buf_sz - used, " ");
         return (n >= 0 && used + (size_t)n < buf_sz) ? CBM_STORE_OK : CBM_STORE_ERR;
     }
+    /* Active edges are logical graph edges. A cross-file edge can have one
+     * overlay ownership row per changed file in the same generation. */
     n = snprintf(buf + used, buf_sz - used,
                  ", active_edges AS ("
                  "  SELECT s.qualified_name AS source_qn, t.qualified_name AS target_qn, e.type,"
@@ -7957,7 +7959,7 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                  "                    WHERE af.project = s.project AND af.rel_path = s.file_path)"
                  "    AND NOT EXISTS (SELECT 1 FROM active_files af"
                  "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
-                 "  UNION ALL"
+                 "  UNION"
                  "  SELECT e.source_qn, e.target_qn, e.type, e.properties"
                  "  FROM overlay_edges e"
                  "  JOIN active_files af"
