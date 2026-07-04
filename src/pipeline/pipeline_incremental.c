@@ -1824,6 +1824,26 @@ cleanup:
     return CBM_STORE_OK;
 }
 
+static void incr_report_exact_delta_plan_fallback(cbm_pipeline_t *p,
+                                                  const cbm_pipeline_file_delta_plan_t *plan,
+                                                  int input_path_count, int max_affected_paths,
+                                                  const char *phase,
+                                                  const char *default_reason) {
+    const char *reason = plan && plan->reason ? plan->reason : default_reason;
+    int affected_paths = (plan && plan->affected_count >= 0) ? plan->affected_count : -1;
+    cbm_pipeline_set_exact_delta_stats_with_limit(p, input_path_count, affected_paths, -1,
+                                                  max_affected_paths, false);
+    cbm_pipeline_set_publish_reason(p, reason ? reason : "plan_error");
+    if (affected_paths >= 0) {
+        cbm_log_info("incremental.exact.fallback", "reason", reason ? reason : "plan_error",
+                     "phase", phase ? phase : "plan", "affected", itoa_buf_incr(affected_paths),
+                     "max_affected", itoa_buf_incr(max_affected_paths));
+    } else {
+        cbm_log_info("incremental.exact.fallback", "reason", reason ? reason : "plan_error",
+                     "phase", phase ? phase : "plan");
+    }
+}
+
 static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, const char *db_path,
                                        const char *project, cbm_file_info_t *changed_files,
                                        int changed_count, cbm_file_info_t *all_files,
@@ -1879,11 +1899,25 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
                                                         exact_files, &exact_count, exact_file_cap,
                                                         &frontier_reason);
     if (frontier_rc != CBM_STORE_OK) {
-        cbm_pipeline_set_exact_delta_stats(p, input_path_count, exact_count + deleted_count, -1);
+        bool frontier_truncated =
+            frontier_reason && strcmp(frontier_reason,
+                                      CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE) == 0;
+        cbm_pipeline_set_exact_delta_stats_with_limit(
+            p, input_path_count, exact_count + deleted_count, -1, max_affected_paths,
+            frontier_truncated);
         cbm_pipeline_set_publish_reason(
             p, frontier_reason ? frontier_reason : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR);
-        cbm_log_info("incremental.exact.fallback", "reason",
-                     frontier_reason ? frontier_reason : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR);
+        if (frontier_truncated) {
+            cbm_log_info("incremental.exact.fallback", "reason",
+                         frontier_reason ? frontier_reason
+                                         : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR,
+                         "affected", itoa_buf_incr(exact_count + deleted_count),
+                         "max_affected", itoa_buf_incr(max_affected_paths), "truncated", "true");
+        } else {
+            cbm_log_info("incremental.exact.fallback", "reason",
+                         frontier_reason ? frontier_reason
+                                         : CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR);
+        }
         free(exact_files);
         return CBM_STORE_OK;
     }
@@ -2076,9 +2110,8 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
                                                 max_affected_paths, &plan);
         CBM_PROF_END_N("incremental_exact", "10_plan_delta", t_exact_plan, delta_count);
         if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
-            cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "plan_error");
-            cbm_log_info("incremental.exact.fallback", "reason",
-                         plan.reason ? plan.reason : "plan_error");
+            incr_report_exact_delta_plan_fallback(p, &plan, input_path_count, max_affected_paths,
+                                                  "plan", "plan_error");
             goto cleanup;
         }
         cbm_pipeline_file_delta_plan_free(&plan);
@@ -2172,9 +2205,8 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     CBM_PROF_END_N("incremental_exact", "13_apply_delta", t_exact_apply, delta_count);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         incr_mark_generation_failed(store, project, generation);
-        cbm_pipeline_set_publish_reason(p, plan.reason ? plan.reason : "apply_error");
-        cbm_log_info("incremental.exact.fallback", "reason",
-                     plan.reason ? plan.reason : "apply_error");
+        incr_report_exact_delta_plan_fallback(p, &plan, input_path_count, max_affected_paths,
+                                              "apply", "apply_error");
         goto cleanup;
     }
 

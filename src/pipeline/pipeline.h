@@ -53,9 +53,11 @@ typedef enum {
 } cbm_pipeline_publish_kind_t;
 
 typedef struct {
-    int changed_paths;   /* source paths classified as changed/deleted before frontier expansion */
-    int affected_paths;  /* paths in the exact-delta frontier, including changed/deleted paths */
-    int published_paths; /* paths published by exact delta; 0 for exact no-op, -1 if not exact */
+    int changed_paths;              /* changed/deleted paths before frontier expansion */
+    int affected_paths;             /* exact frontier paths known before publish/fallback */
+    int published_paths;            /* paths published by exact delta; 0 for exact no-op, -1 if not exact */
+    int affected_paths_limit;       /* configured exact frontier cap when relevant; -1 if not reported */
+    bool affected_paths_truncated;  /* true when affected_paths reached the cap before full counting */
 } cbm_pipeline_exact_delta_stats_t;
 
 /* Generation used by compatibility full/containment publishes that replace the

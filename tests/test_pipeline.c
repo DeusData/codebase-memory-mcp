@@ -10153,6 +10153,12 @@ TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full
     ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
     ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
     ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_GT(stats.affected_paths, 1);
+    ASSERT_EQ(stats.affected_paths_limit, cbm_pipeline_exact_max_affected_paths(p));
+    ASSERT_TRUE(stats.affected_paths_truncated);
+    ASSERT_EQ(stats.published_paths, -1);
     cbm_pipeline_free(p);
 
     cbm_store_t *owner_store = cbm_store_open_path(g_incr_dbpath);
