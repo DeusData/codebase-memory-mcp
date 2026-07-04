@@ -1684,11 +1684,104 @@ TEST(store_overlay_node_view_summary_counts_latest_ready_overlay) {
               CBM_STORE_OK);
 
     ASSERT_EQ(cbm_store_get_overlay_node_view_summary(s, "test", &summary), CBM_STORE_OK);
-    ASSERT_EQ(summary.overlay_ready_generations, 2);
+    ASSERT_EQ(summary.overlay_ready_generations, 1);
     ASSERT_EQ(summary.active_file_tombstones, 1);
     ASSERT_EQ(summary.canonical_nodes_visible, 1);
     ASSERT_EQ(summary.overlay_owned_nodes_visible, 1);
     ASSERT_EQ(summary.total_nodes_visible, 2);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_NODES, "test", first_overlay,
+                                       "main.go"),
+              0);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
+                                       first_overlay, "main.go"),
+              0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_overlay_publish_prunes_superseded_file_rows_and_fts) {
+    enum { BASE_GENERATION = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t first_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &first_overlay),
+              CBM_STORE_OK);
+    cbm_node_t stale_main = {.project = "test",
+                             .label = "Function",
+                             .name = "stale_symbol",
+                             .qualified_name = "test.stale_symbol",
+                             .file_path = "main.go",
+                             .properties_json = "{}"};
+    cbm_node_t helper = {.project = "test",
+                         .label = "Function",
+                         .name = "helper_symbol",
+                         .qualified_name = "test.helper_symbol",
+                         .file_path = "helper.go",
+                         .properties_json = "{}"};
+    cbm_store_file_delta_t first_main = {.project = "test",
+                                         .rel_path = "main.go",
+                                         .generation = BASE_GENERATION,
+                                         .nodes = &stale_main,
+                                         .node_count = 1};
+    cbm_store_file_delta_t first_helper = {.project = "test",
+                                           .rel_path = "helper.go",
+                                           .generation = BASE_GENERATION,
+                                           .nodes = &helper,
+                                           .node_count = 1};
+    const cbm_store_file_delta_t *first_deltas[] = {&first_main, &first_helper};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta_batch(s, first_deltas, CBM_SZ_2,
+                                                         first_overlay),
+              CBM_STORE_OK);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "stale"), 1);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "helper"), 1);
+
+    int64_t second_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &second_overlay),
+              CBM_STORE_OK);
+    cbm_node_t fresh_main = {.project = "test",
+                             .label = "Function",
+                             .name = "fresh_symbol",
+                             .qualified_name = "test.fresh_symbol",
+                             .file_path = "main.go",
+                             .properties_json = "{}"};
+    cbm_store_file_delta_t second_main = {.project = "test",
+                                          .rel_path = "main.go",
+                                          .generation = BASE_GENERATION,
+                                          .nodes = &fresh_main,
+                                          .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &second_main, second_overlay),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_NODES, "test", first_overlay,
+                                       "main.go"),
+              0);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
+                                       first_overlay, "main.go"),
+              0);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_NODES, "test", first_overlay,
+                                       "helper.go"),
+              1);
+    ASSERT_EQ(store_count_overlay_rows(s, STORE_TEST_OVERLAY_TOMBSTONES, "test",
+                                       first_overlay, "helper.go"),
+              1);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "stale"), 0);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "helper"), 1);
+    ASSERT_EQ(store_count_overlay_fts_raw_matches(s, "fresh"), 1);
+
+    int count = -1;
+    ASSERT_EQ(cbm_store_count_overlay_generations(s, "test", CBM_STORE_OVERLAY_STATUS_READY,
+                                                  &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", first_overlay, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_READY),
+              1);
+    ASSERT_EQ(store_count_overlay_generation_row(s, "test", second_overlay, BASE_GENERATION,
+                                                 CBM_STORE_OVERLAY_STATUS_READY),
+              1);
 
     cbm_store_close(s);
     PASS();
@@ -4950,6 +5043,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_overlay_file_delta_batch_rolls_back_all_files);
     RUN_TEST(store_overlay_file_delta_publish_rejects_failed_generation);
     RUN_TEST(store_overlay_node_view_summary_counts_latest_ready_overlay);
+    RUN_TEST(store_overlay_publish_prunes_superseded_file_rows_and_fts);
     RUN_TEST(store_find_nodes_by_file_overlay_view_returns_latest_ready_rows);
     RUN_TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search);
     RUN_TEST(store_search_overlay_view_matches_full_rebuild_oracle);
