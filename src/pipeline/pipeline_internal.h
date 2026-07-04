@@ -339,6 +339,10 @@ typedef struct {
 
 #define CBM_PIPELINE_EDGE_CONTAINS_FILE "CONTAINS_FILE"
 #define CBM_PIPELINE_EDGE_CONTAINS_FOLDER "CONTAINS_FOLDER"
+#define CBM_PIPELINE_EDGE_DATA_FLOWS "DATA_FLOWS"
+#define CBM_PIPELINE_EDGE_FILE_CHANGES_WITH "FILE_CHANGES_WITH"
+#define CBM_PIPELINE_EDGE_SEMANTICALLY_RELATED "SEMANTICALLY_RELATED"
+#define CBM_PIPELINE_EDGE_SIMILAR_TO "SIMILAR_TO"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR "frontier_error"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
@@ -435,6 +439,10 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
+bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
+int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
+                                                        cbm_pipeline_file_delta_t *delta,
+                                                        int *out_added);
 int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_delta_t *delta,
                                                              const cbm_file_info_t *file,
                                                              const char *pass_fingerprint);

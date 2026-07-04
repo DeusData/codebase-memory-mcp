@@ -616,16 +616,11 @@ typedef struct {
  * IMPLEMENTS) are deduped on re-link, while structural containment edges
  * (CONTAINS_FILE, CONTAINS_FOLDER) — which the full-only structure pass does
  * NOT regenerate incrementally — are preserved precisely by this snapshot. */
-static bool incr_edge_type_is_recomputed(const char *type) {
-    return type && (strcmp(type, "SIMILAR_TO") == 0 || strcmp(type, "SEMANTICALLY_RELATED") == 0 ||
-                    strcmp(type, "FILE_CHANGES_WITH") == 0 || strcmp(type, "DATA_FLOWS") == 0);
-}
-
 /* cbm_gbuf_foreach_edge visitor: snapshot inbound cross-file edges into
  * changed files so they survive the purge and can be re-linked afterward. */
 static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     cbm_edge_capture_t *cap = (cbm_edge_capture_t *)userdata;
-    if (incr_edge_type_is_recomputed(edge->type)) {
+    if (cbm_pipeline_delta_edge_type_is_recomputed(edge->type)) {
         return;
     }
     const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(cap->gbuf, edge->source_id);
