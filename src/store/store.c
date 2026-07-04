@@ -9139,6 +9139,16 @@ void cbm_store_search_free(cbm_search_output_t *out) {
  * satisfy -Werror=unused-function. The active implementation is the inline
  * logic within cbm_store_bfs() below. */
 
+static int store_bfs_direction_from_string(const char *direction) {
+    if (direction && strcmp(direction, "inbound") == 0) {
+        return CBM_STORE_EDGE_DIR_INBOUND;
+    }
+    if (direction && strcmp(direction, "any") == 0) {
+        return CBM_STORE_EDGE_DIR_ANY;
+    }
+    return CBM_STORE_EDGE_DIR_OUTBOUND;
+}
+
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
@@ -9176,9 +9186,11 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     char sql[CBM_SZ_4K];
     const char *join_cond;
     const char *next_id;
-    bool is_inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0);
-
-    if (is_inbound) {
+    int bfs_direction = store_bfs_direction_from_string(direction);
+    if (bfs_direction == CBM_STORE_EDGE_DIR_ANY) {
+        join_cond = "(e.source_id = bfs.node_id OR e.target_id = bfs.node_id)";
+        next_id = "CASE WHEN e.source_id = bfs.node_id THEN e.target_id ELSE e.source_id END";
+    } else if (bfs_direction == CBM_STORE_EDGE_DIR_INBOUND) {
         join_cond = "e.target_id = bfs.node_id";
         next_id = "e.source_id";
     } else {
@@ -9423,9 +9435,19 @@ int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *
         return CBM_STORE_ERR;
     }
 
-    bool is_inbound = direction && strcmp(direction, "inbound") == 0;
-    const char *join_cond = is_inbound ? "e.target_qn = bfs.qn" : "e.source_qn = bfs.qn";
-    const char *next_qn = is_inbound ? "e.source_qn" : "e.target_qn";
+    const char *join_cond = NULL;
+    const char *next_qn = NULL;
+    int bfs_direction = store_bfs_direction_from_string(direction);
+    if (bfs_direction == CBM_STORE_EDGE_DIR_ANY) {
+        join_cond = "(e.source_qn = bfs.qn OR e.target_qn = bfs.qn)";
+        next_qn = "CASE WHEN e.source_qn = bfs.qn THEN e.target_qn ELSE e.source_qn END";
+    } else if (bfs_direction == CBM_STORE_EDGE_DIR_INBOUND) {
+        join_cond = "e.target_qn = bfs.qn";
+        next_qn = "e.source_qn";
+    } else {
+        join_cond = "e.source_qn = bfs.qn";
+        next_qn = "e.target_qn";
+    }
     const char *pagerank_select =
         use_pagerank ? "COALESCE(pr.rank, 0.0) AS pr_rank " : "0.0 AS pr_rank ";
     const char *pagerank_join = use_pagerank ? "LEFT JOIN pagerank pr ON pr.node_id = n.id " : "";

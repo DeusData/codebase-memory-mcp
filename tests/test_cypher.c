@@ -834,6 +834,35 @@ TEST(cypher_exec_variable_length) {
     PASS();
 }
 
+TEST(cypher_exec_variable_length_any_direction) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS*1..2]-(g:Function) "
+                                "WHERE f.name = \"SubmitOrder\" "
+                                "RETURN g.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GTE(r.row_count, 2);
+    int saw_validate = 0;
+    int saw_handle = 0;
+    for (int i = 0; i < r.row_count; i++) {
+        if (strcmp(r.rows[i][0], "ValidateOrder") == 0) {
+            saw_validate = 1;
+        }
+        if (strcmp(r.rows[i][0], "HandleOrder") == 0) {
+            saw_handle = 1;
+        }
+    }
+    ASSERT_EQ(saw_validate, 1);
+    ASSERT_EQ(saw_handle, 1);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_defines_edge) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2613,6 +2642,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_limit);
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);
+    RUN_TEST(cypher_exec_variable_length_any_direction);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);
