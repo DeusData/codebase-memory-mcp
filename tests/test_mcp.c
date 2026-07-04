@@ -46,6 +46,45 @@ static bool has_dirty_freshness_counts(const char *json, int pending, int overla
            strstr(json, pending_buf) && strstr(json, overlay_buf);
 }
 
+static int mcp_store_node_qn_exists(cbm_store_t *store, const char *project,
+                                    const char *qn) {
+    cbm_node_t node = {0};
+    int rc = cbm_store_find_node_by_qn(store, project, qn, &node);
+    cbm_node_free_fields(&node);
+    return rc == CBM_STORE_OK ? 1 : 0;
+}
+
+static int mcp_publish_single_node_delta(cbm_store_t *store, const char *project,
+                                         int64_t generation, const char *rel_path,
+                                         const char *name, const char *qualified_name) {
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = name,
+                       .qualified_name = qualified_name,
+                       .file_path = rel_path,
+                       .properties_json = "{}"};
+    cbm_store_file_delta_t delta = {.project = project,
+                                    .rel_path = rel_path,
+                                    .generation = generation,
+                                    .nodes = &node,
+                                    .node_count = 1,
+                                    .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                    .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    return cbm_store_publish_file_delta(store, &delta);
+}
+
+static int mcp_publish_delete_overlay_delta(cbm_store_t *store, const char *project,
+                                            int64_t base_generation,
+                                            int64_t overlay_generation,
+                                            const char *rel_path) {
+    cbm_store_file_delta_t delta = {.project = project,
+                                    .rel_path = rel_path,
+                                    .generation = base_generation,
+                                    .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                    .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    return cbm_store_publish_overlay_file_delta(store, &delta, overlay_generation);
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
  * ══════════════════════════════════════════════════════════════════ */
@@ -3767,6 +3806,114 @@ TEST(tool_ingest_traces_empty) {
     PASS();
 }
 
+TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins) {
+    enum { BASE_GENERATION = 1, COMPACT_ONE_GENERATION = 1 };
+    const char *project = "overlay-worker-project";
+    char *cache_tmp = th_mktempdir("cbm_mcp_overlay_worker_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    int n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    ASSERT(n >= 0 && (size_t)n < sizeof(db_path));
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, cache), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(mcp_publish_single_node_delta(store, project, generation, "main.go", "Old",
+                                            "overlay-worker-project.main.Old"),
+              CBM_STORE_OK);
+    ASSERT_EQ(mcp_publish_single_node_delta(store, project, generation, "helper.go",
+                                            "Helper",
+                                            "overlay-worker-project.helper.Helper"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(store, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+
+    int64_t first_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(store, project, BASE_GENERATION,
+                                                   &first_overlay),
+              CBM_STORE_OK);
+    ASSERT_EQ(mcp_publish_delete_overlay_delta(store, project, BASE_GENERATION,
+                                               first_overlay, "main.go"),
+              CBM_STORE_OK);
+
+    int64_t second_overlay = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(store, project, BASE_GENERATION,
+                                                   &second_overlay),
+              CBM_STORE_OK);
+    ASSERT_EQ(mcp_publish_delete_overlay_delta(store, project, BASE_GENERATION,
+                                               second_overlay, "helper.go"),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(srv, project,
+                                                        COMPACT_ONE_GENERATION));
+    ASSERT_FALSE(cbm_mcp_server_start_overlay_compaction(srv, project,
+                                                         COMPACT_ONE_GENERATION));
+    int compacted = -1;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted), CBM_STORE_OK);
+    ASSERT_EQ(compacted, 1);
+    ASSERT_FALSE(cbm_mcp_server_overlay_compaction_active(srv));
+
+    store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project,
+                                       "overlay-worker-project.main.Old"),
+              0);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project,
+                                       "overlay-worker-project.helper.Helper"),
+              1);
+    cbm_store_close(store);
+
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(
+        srv, project, CBM_STORE_COMPACT_ALL_GENERATIONS));
+    compacted = -1;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted), CBM_STORE_OK);
+    ASSERT_EQ(compacted, 1);
+
+    store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(mcp_store_node_qn_exists(store, project,
+                                       "overlay-worker-project.helper.Helper"),
+              0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_free(srv);
+    cbm_unlink(db_path);
+    char sidecar[CBM_PATH_MAX];
+    n = snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+    if (n >= 0 && (size_t)n < sizeof(sidecar)) {
+        cbm_unlink(sidecar);
+    }
+    n = snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+    if (n >= 0 && (size_t)n < sizeof(sidecar)) {
+        cbm_unlink(sidecar);
+    }
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_cleanup(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  IDLE STORE EVICTION
  * ══════════════════════════════════════════════════════════════════ */
@@ -5266,6 +5413,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
+    RUN_TEST(mcp_overlay_compaction_worker_uses_own_store_and_joins);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);

@@ -115,6 +115,20 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 
+/* Start one bounded background overlay compaction pass for a project.
+ * Returns false if args are invalid, max_generations is negative, or a prior
+ * compaction thread has not been joined yet. This is not an MCP tool. */
+bool cbm_mcp_server_start_overlay_compaction(cbm_mcp_server_t *srv, const char *project,
+                                             int max_generations);
+
+/* Join the overlay compaction thread if one was started. Returns 0 on success,
+ * a negative store-style error code on worker/join failure, or 0 when no worker
+ * is pending. out_compacted may be NULL. */
+int cbm_mcp_server_join_overlay_compaction(cbm_mcp_server_t *srv, int *out_compacted);
+
+/* True while the one-shot compaction thread is still running. */
+bool cbm_mcp_server_overlay_compaction_active(cbm_mcp_server_t *srv);
+
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
