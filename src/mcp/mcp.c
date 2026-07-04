@@ -1150,7 +1150,9 @@ static const tool_def_t TOOLS[] = {
      "\"Indexed project name to delete.\"}},\"required\":["
      "\"project\"]}"},
 
-    {"index_status", "Get the indexing status of a project",
+    {"index_status",
+     "Report project index freshness, graph counts, overlay read-view counts, and background "
+     "overlay compaction state.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
      "\"Indexed project name to inspect.\"}},\"required\":["
      "\"project\"]}"},
@@ -1974,6 +1976,48 @@ bool cbm_mcp_server_overlay_compaction_active(cbm_mcp_server_t *srv) {
     return active;
 }
 
+static void add_overlay_compaction_worker_status(cbm_mcp_server_t *srv, yyjson_mut_doc *doc,
+                                                 yyjson_mut_val *root) {
+    if (!srv || !doc || !root) {
+        return;
+    }
+
+    bool started = false;
+    bool finished = false;
+    char project[CBM_SZ_256];
+    int max_generations = CBM_STORE_COMPACT_ALL_GENERATIONS;
+    int rc = CBM_STORE_OK;
+    int compacted = 0;
+    project[0] = '\0';
+
+    cbm_mutex_lock(&srv->overlay_compaction_lock);
+    started = srv->overlay_compaction_started;
+    finished = srv->overlay_compaction_finished;
+    int n = snprintf(project, sizeof(project), "%s", srv->overlay_compaction_project);
+    if (n < 0 || (size_t)n >= sizeof(project)) {
+        project[0] = '\0';
+    }
+    max_generations = srv->overlay_compaction_max_generations;
+    rc = srv->overlay_compaction_rc;
+    compacted = srv->overlay_compaction_compacted;
+    cbm_mutex_unlock(&srv->overlay_compaction_lock);
+
+    yyjson_mut_val *status = yyjson_mut_obj(doc);
+    const char *state = !started ? "idle" : (finished ? "finished" : "running");
+    yyjson_mut_obj_add_str(doc, status, "state", state);
+    if (project[0]) {
+        yyjson_mut_obj_add_strcpy(doc, status, "project", project);
+    }
+    if (started) {
+        yyjson_mut_obj_add_int(doc, status, "max_generations", max_generations);
+    }
+    if (finished) {
+        yyjson_mut_obj_add_int(doc, status, "result_rc", rc);
+        yyjson_mut_obj_add_int(doc, status, "compacted_generations", compacted);
+    }
+    yyjson_mut_obj_add_val(doc, root, "overlay_compaction", status);
+}
+
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
@@ -2131,9 +2175,13 @@ static void *overlay_compaction_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
     char project[CBM_SZ_256];
     int max_generations = CBM_STORE_COMPACT_ALL_GENERATIONS;
+    project[0] = '\0';
 
     cbm_mutex_lock(&srv->overlay_compaction_lock);
-    snprintf(project, sizeof(project), "%s", srv->overlay_compaction_project);
+    int n = snprintf(project, sizeof(project), "%s", srv->overlay_compaction_project);
+    if (n < 0 || (size_t)n >= sizeof(project)) {
+        project[0] = '\0';
+    }
     max_generations = srv->overlay_compaction_max_generations;
     cbm_mutex_unlock(&srv->overlay_compaction_lock);
 
@@ -4898,6 +4946,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
+    add_overlay_compaction_worker_status(srv, doc, root);
 
     if (project) {
         int nodes = cbm_store_count_nodes(store, project);

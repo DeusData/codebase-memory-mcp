@@ -4558,6 +4558,24 @@ TEST(mcp_overlay_compaction_worker_reaps_finished_before_next_start) {
     }
     ASSERT_FALSE(cbm_mcp_server_overlay_compaction_active(srv));
 
+    char req[CBM_SZ_4K];
+    n = snprintf(req, sizeof(req),
+                 "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"index_status\","
+                 "\"arguments\":{\"project\":\"%s\"}}}",
+                 project);
+    ASSERT(n >= 0 && (size_t)n < sizeof(req));
+    char *resp = cbm_mcp_server_handle(srv, req);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"overlay_compaction\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"state\":\"finished\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"result_rc\":0"));
+    ASSERT_NOT_NULL(strstr(inner, "\"compacted_generations\":1"));
+    free(inner);
+    free(resp);
+
     ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(
         srv, project, CBM_STORE_COMPACT_ALL_GENERATIONS));
     int compacted = -1;
