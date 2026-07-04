@@ -2197,7 +2197,7 @@ TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay) {
     PASS();
 }
 
-TEST(tool_query_graph_keeps_variable_length_relationship_query_canonical_with_ready_overlay) {
+TEST(tool_query_graph_uses_active_variable_length_relationship_query_with_ready_overlay) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -2255,14 +2255,32 @@ TEST(tool_query_graph_keeps_variable_length_relationship_query_canonical_with_re
              "\"params\":{\"name\":\"query_graph\","
              "\"arguments\":{\"project\":\"query-overlay-rel-var-canonical\","
              "\"query\":\"MATCH (f:Function)-[:CALLS*1..2]->(g:Function) "
-             "RETURN f.name LIMIT 5\"}}}");
+             "RETURN f.name, g.name LIMIT 5\"}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "FreshVarSource"));
+    ASSERT_NOT_NULL(strstr(inner, "OldVarTarget"));
+    ASSERT_NULL(strstr(inner, "OldVarSource"));
+    ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"overlay_active_nodes\""));
+    ASSERT_NOT_NULL(strstr(inner, "active edge-derived predicates"));
+
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":156,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"query_graph\","
+             "\"arguments\":{\"project\":\"query-overlay-rel-var-canonical\","
+             "\"query\":\"MATCH (f:Function)-[:CALLS*1..2]-(g:Function) "
+             "RETURN f.name, g.name LIMIT 5\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "OldVarSource"));
     ASSERT_NULL(strstr(inner, "FreshVarSource"));
     ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
-    ASSERT_NOT_NULL(strstr(inner, "fixed one-hop relationship"));
+    ASSERT_NOT_NULL(strstr(inner, "directed variable-length"));
 
     free(inner);
     free(resp);
@@ -2399,7 +2417,7 @@ TEST(tool_query_graph_keeps_id_query_canonical_with_ready_overlay) {
     ASSERT_NOT_NULL(strstr(inner, "OldIdSource"));
     ASSERT_NULL(strstr(inner, "FreshIdSource"));
     ASSERT_NOT_NULL(strstr(inner, "\"read_model\":\"canonical_only\""));
-    ASSERT_NOT_NULL(strstr(inner, "fixed one-hop relationship"));
+    ASSERT_NOT_NULL(strstr(inner, "directed variable-length"));
 
     free(inner);
     free(resp);
@@ -6049,7 +6067,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_uses_ready_overlay_for_node_only_query);
     RUN_TEST(tool_query_graph_uses_additive_overlay_without_tombstone);
     RUN_TEST(tool_query_graph_uses_active_relationship_query_with_ready_overlay);
-    RUN_TEST(tool_query_graph_keeps_variable_length_relationship_query_canonical_with_ready_overlay);
+    RUN_TEST(tool_query_graph_uses_active_variable_length_relationship_query_with_ready_overlay);
     RUN_TEST(tool_query_graph_uses_active_edges_for_degree_and_exists);
     RUN_TEST(tool_query_graph_keeps_id_query_canonical_with_ready_overlay);
     RUN_TEST(tool_query_graph_warns_when_broad_query_returns_stale_route);
