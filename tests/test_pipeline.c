@@ -8621,7 +8621,9 @@ static int write_incremental_c_header_extra_export(int marker) {
                  "#define SHARED_H\n"
                  "#define SHARED_MARKER %d\n"
                  "int shared_value(void);\n"
-                 "int shared_extra(void);\n"
+                 "static int shared_extra(void) {\n"
+                 "    return SHARED_MARKER + 1;\n"
+                 "}\n"
                  "#endif\n",
                  marker);
     if (n < 0 || (size_t)n >= sizeof(body)) {
@@ -10147,6 +10149,62 @@ TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
         FAIL(diff_err[0] ? diff_err : "C header full fallback differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_publish_single_c_header_uses_active_overlay) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT(strstr(logs, "scope=c_family_header") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "shared_extra"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "shared.h",
+                                                    "shared_extra"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
 
     free(project);
     cbm_config_close(cfg);
@@ -13702,6 +13760,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
+    RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
     RUN_TEST(incremental_c_header_uses_exact_not_overlay_until_active_edges_are_exact);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
