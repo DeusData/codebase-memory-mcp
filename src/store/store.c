@@ -6408,7 +6408,8 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
     }
     n = snprintf(buf + used, buf_sz - used,
                  ", active_edges AS ("
-                 "  SELECT s.qualified_name AS source_qn, t.qualified_name AS target_qn, e.type"
+                 "  SELECT s.qualified_name AS source_qn, t.qualified_name AS target_qn, e.type,"
+                 "         e.properties"
                  "  FROM edges e"
                  "  JOIN nodes s ON s.id = e.source_id"
                  "  JOIN nodes t ON t.id = e.target_id"
@@ -6417,7 +6418,7 @@ int cbm_store_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_ed
                  "    AND NOT EXISTS (SELECT 1 FROM active_files af"
                  "                    WHERE af.project = t.project AND af.rel_path = t.file_path)"
                  "  UNION ALL"
-                 "  SELECT e.source_qn, e.target_qn, e.type"
+                 "  SELECT e.source_qn, e.target_qn, e.type, e.properties"
                  "  FROM overlay_edges e"
                  "  JOIN active_files af"
                  "    ON af.project = e.project AND af.rel_path = e.rel_path"
@@ -7674,32 +7675,92 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
 
 enum { SCHEMA_MAX_JSON_KEYS = 50 };
 
+typedef struct {
+    int index;
+    const char *text;
+} schema_text_bind_t;
+
+static const char *schema_node_base_cols[] = {"name", "qualified_name", "file_path",
+                                              "start_line", "end_line"};
+static const char *schema_edge_base_cols[] = {"source_id", "target_id"};
+
 /* Discover distinct JSON property keys for a table/column via json_each().
  * Prepends base_cols, then appends up to SCHEMA_MAX_JSON_KEYS from the query.
  * Caller must free the returned array and each string in it. */
-static void schema_discover_props(sqlite3 *db, const char *sql, const char *project,
-                                  const char *filter, const char **base_cols, int base_col_count,
-                                  char ***out_props, int *out_count) {
+static int schema_discover_props(cbm_store_t *s, const char *sql, const schema_text_bind_t *binds,
+                                 int bind_count, const char **base_cols, int base_col_count,
+                                 char ***out_props, int *out_count, const char *error_context) {
+    if (!s || !s->db || !sql || !base_cols || base_col_count < 0 || !out_props || !out_count) {
+        return CBM_NOT_FOUND;
+    }
+    *out_props = NULL;
+    *out_count = 0;
     int pcap = base_col_count + SCHEMA_MAX_JSON_KEYS;
     char **props = malloc(pcap * sizeof(char *));
+    if (!props) {
+        store_set_error(s, "schema property keys out of memory");
+        return CBM_NOT_FOUND;
+    }
     int pn = 0;
 
     for (int b = 0; b < base_col_count; b++) {
         props[pn++] = heap_strdup(base_cols[b]);
+        if (!props[pn - 1]) {
+            for (int i = 0; i < pn - 1; i++) {
+                free(props[i]);
+            }
+            free(props);
+            store_set_error(s, "schema property keys out of memory");
+            return CBM_NOT_FOUND;
+        }
     }
 
     sqlite3_stmt *pstmt = NULL;
-    if (sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &pstmt, NULL) == SQLITE_OK) {
-        bind_text(pstmt, SKIP_ONE, project);
-        bind_text(pstmt, PAIR_LEN, filter);
-        while (sqlite3_step(pstmt) == SQLITE_ROW && pn < pcap) {
-            props[pn++] = heap_strdup((const char *)sqlite3_column_text(pstmt, 0));
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &pstmt, NULL) != SQLITE_OK || !pstmt) {
+        if (pstmt) {
+            sqlite3_finalize(pstmt);
         }
-        sqlite3_finalize(pstmt);
+        for (int i = 0; i < pn; i++) {
+            free(props[i]);
+        }
+        free(props);
+        store_set_error_sqlite(s, error_context ? error_context : "schema property keys prepare");
+        return CBM_NOT_FOUND;
     }
+    for (int i = 0; i < bind_count; i++) {
+        bind_text(pstmt, binds[i].index, binds[i].text);
+    }
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(pstmt)) == SQLITE_ROW) {
+        if (pn >= pcap) {
+            continue;
+        }
+        props[pn] = heap_strdup(safe_str((const char *)sqlite3_column_text(pstmt, 0)));
+        if (!props[pn]) {
+            sqlite3_finalize(pstmt);
+            for (int i = 0; i < pn; i++) {
+                free(props[i]);
+            }
+            free(props);
+            store_set_error(s, "schema property keys out of memory");
+            return CBM_NOT_FOUND;
+        }
+        pn++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        sqlite3_finalize(pstmt);
+        for (int i = 0; i < pn; i++) {
+            free(props[i]);
+        }
+        free(props);
+        store_set_error_sqlite(s, error_context ? error_context : "schema property keys");
+        return CBM_NOT_FOUND;
+    }
+    sqlite3_finalize(pstmt);
 
     *out_props = props;
     *out_count = pn;
+    return CBM_STORE_OK;
 }
 
 /* Path scoping for architecture/schema summaries. Paths are relative prefixes:
@@ -7985,20 +8046,27 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
 
     /* Node label property keys: base columns + distinct JSON property keys per label */
     if (with_props) {
-        static const char *node_base_cols[] = {"name", "qualified_name", "file_path", "start_line",
-                                               "end_line"};
         const char *prop_sql = "SELECT DISTINCT je.key "
-                               "FROM nodes, json_each(nodes.properties) AS je "
+                               "FROM nodes, "
+                               "json_each(CASE WHEN json_valid(nodes.properties) "
+                               "THEN nodes.properties ELSE '{}' END) AS je "
                                "WHERE nodes.project = ?1 AND nodes.label = ?2 "
                                "  AND nodes.properties != '{}' "
                                "ORDER BY je.key "
                                "LIMIT 50;";
 
         for (int i = 0; i < out->node_label_count; i++) {
-            schema_discover_props(
-                s->db, prop_sql, project, out->node_labels[i].label, node_base_cols,
-                (int)(sizeof(node_base_cols) / sizeof(node_base_cols[0])),
-                &out->node_labels[i].properties, &out->node_labels[i].property_count);
+            const schema_text_bind_t binds[] = {{ST_COL_1, project},
+                                                {ST_COL_2, out->node_labels[i].label}};
+            if (schema_discover_props(
+                    s, prop_sql, binds, (int)(sizeof(binds) / sizeof(binds[0])),
+                    schema_node_base_cols,
+                    (int)(sizeof(schema_node_base_cols) / sizeof(schema_node_base_cols[0])),
+                    &out->node_labels[i].properties, &out->node_labels[i].property_count,
+                    "schema node properties") != CBM_STORE_OK) {
+                cbm_store_schema_free(out);
+                return CBM_NOT_FOUND;
+            }
         }
     }
 
@@ -8026,19 +8094,27 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
 
     /* Edge type property keys: base columns + distinct JSON property keys per type */
     if (with_props) {
-        static const char *edge_base_cols[] = {"source_id", "target_id"};
         const char *prop_sql = "SELECT DISTINCT je.key "
-                               "FROM edges, json_each(edges.properties) AS je "
+                               "FROM edges, "
+                               "json_each(CASE WHEN json_valid(edges.properties) "
+                               "THEN edges.properties ELSE '{}' END) AS je "
                                "WHERE edges.project = ?1 AND edges.type = ?2 "
                                "  AND edges.properties != '{}' "
                                "ORDER BY je.key "
                                "LIMIT 50;";
 
         for (int i = 0; i < out->edge_type_count; i++) {
-            schema_discover_props(s->db, prop_sql, project, out->edge_types[i].type, edge_base_cols,
-                                  (int)(sizeof(edge_base_cols) / sizeof(edge_base_cols[0])),
-                                  &out->edge_types[i].properties,
-                                  &out->edge_types[i].property_count);
+            const schema_text_bind_t binds[] = {{ST_COL_1, project},
+                                                {ST_COL_2, out->edge_types[i].type}};
+            if (schema_discover_props(
+                    s, prop_sql, binds, (int)(sizeof(binds) / sizeof(binds[0])),
+                    schema_edge_base_cols,
+                    (int)(sizeof(schema_edge_base_cols) / sizeof(schema_edge_base_cols[0])),
+                    &out->edge_types[i].properties, &out->edge_types[i].property_count,
+                    "schema edge properties") != CBM_STORE_OK) {
+                cbm_store_schema_free(out);
+                return CBM_NOT_FOUND;
+            }
         }
     }
 
@@ -8053,8 +8129,8 @@ int cbm_store_get_schema_counts(cbm_store_t *s, const char *project, cbm_schema_
     return get_schema_impl(s, project, out, false);
 }
 
-int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project,
-                                             cbm_schema_info_t *out) {
+static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_schema_info_t *out,
+                                   bool with_props) {
     memset(out, 0, sizeof(*out));
     if (!s || !s->db || !project || !project[0]) {
         return CBM_NOT_FOUND;
@@ -8094,6 +8170,42 @@ int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project
         return rc;
     }
 
+    if (with_props) {
+        nsql = snprintf(sql, sizeof(sql),
+                        "%s"
+                        "SELECT DISTINCT je.key "
+                        "FROM active_nodes n "
+                        "JOIN json_each(CASE WHEN json_valid(n.properties) "
+                        "THEN n.properties ELSE '{}' END) AS je "
+                        "WHERE n.project = ?3 AND n.label = ?4 "
+                        "  AND n.properties != '{}' "
+                        "ORDER BY je.key LIMIT 50;",
+                        active_cte);
+        if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+            cbm_store_schema_free(out);
+            store_set_error(s, "schema_overlay node property SQL truncated");
+            return CBM_NOT_FOUND;
+        }
+        for (int i = 0; i < out->node_label_count; i++) {
+            const schema_text_bind_t binds[] = {
+                {ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY},
+                {ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE},
+                {ST_COL_3, project},
+                {ST_COL_4, out->node_labels[i].label},
+            };
+            rc = schema_discover_props(
+                s, sql, binds, (int)(sizeof(binds) / sizeof(binds[0])),
+                schema_node_base_cols,
+                (int)(sizeof(schema_node_base_cols) / sizeof(schema_node_base_cols[0])),
+                &out->node_labels[i].properties, &out->node_labels[i].property_count,
+                "schema_overlay node properties");
+            if (rc != CBM_STORE_OK) {
+                cbm_store_schema_free(out);
+                return rc;
+            }
+        }
+    }
+
     nsql = snprintf(sql, sizeof(sql),
                     "%s"
                     "SELECT e.type, COUNT(*) FROM active_edges e "
@@ -8123,8 +8235,56 @@ int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project
     sqlite3_finalize(stmt);
     if (rc != CBM_STORE_OK) {
         cbm_store_schema_free(out);
+        return rc;
+    }
+
+    if (with_props) {
+        nsql = snprintf(sql, sizeof(sql),
+                        "%s"
+                        "SELECT DISTINCT je.key "
+                        "FROM active_edges e "
+                        "JOIN active_nodes src ON src.qualified_name = e.source_qn "
+                        "JOIN active_nodes dst ON dst.qualified_name = e.target_qn "
+                        "JOIN json_each(CASE WHEN json_valid(e.properties) "
+                        "THEN e.properties ELSE '{}' END) AS je "
+                        "WHERE src.project = ?3 AND dst.project = ?3 AND e.type = ?4 "
+                        "  AND e.properties != '{}' "
+                        "ORDER BY je.key LIMIT 50;",
+                        active_cte);
+        if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+            cbm_store_schema_free(out);
+            store_set_error(s, "schema_overlay edge property SQL truncated");
+            return CBM_NOT_FOUND;
+        }
+        for (int i = 0; i < out->edge_type_count; i++) {
+            const schema_text_bind_t binds[] = {
+                {ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY},
+                {ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE},
+                {ST_COL_3, project},
+                {ST_COL_4, out->edge_types[i].type},
+            };
+            rc = schema_discover_props(
+                s, sql, binds, (int)(sizeof(binds) / sizeof(binds[0])),
+                schema_edge_base_cols,
+                (int)(sizeof(schema_edge_base_cols) / sizeof(schema_edge_base_cols[0])),
+                &out->edge_types[i].properties, &out->edge_types[i].property_count,
+                "schema_overlay edge properties");
+            if (rc != CBM_STORE_OK) {
+                cbm_store_schema_free(out);
+                return rc;
+            }
+        }
     }
     return rc;
+}
+
+int cbm_store_get_schema_overlay_view(cbm_store_t *s, const char *project, cbm_schema_info_t *out) {
+    return get_schema_overlay_impl(s, project, out, true);
+}
+
+int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project,
+                                             cbm_schema_info_t *out) {
+    return get_schema_overlay_impl(s, project, out, false);
 }
 
 int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,

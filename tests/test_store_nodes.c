@@ -1867,13 +1867,13 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
                            .name = "old_main",
                            .qualified_name = "test.old_main",
                            .file_path = "main.go",
-                           .properties_json = "{}"};
+                           .properties_json = "{\"old_role\":true}"};
     cbm_node_t stable = {.project = "test",
                          .label = "Class",
                          .name = "stable",
                          .qualified_name = "test.stable",
                          .file_path = "stable.go",
-                         .properties_json = "{}"};
+                         .properties_json = "{\"stable_role\":true}"};
     int64_t old_main_id = cbm_store_upsert_node(s, &old_main);
     int64_t stable_id = cbm_store_upsert_node(s, &stable);
     ASSERT_GT(old_main_id, 0);
@@ -1881,7 +1881,8 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
     cbm_edge_t old_edge = {.project = "test",
                            .source_id = old_main_id,
                            .target_id = stable_id,
-                           .type = "CALLS"};
+                           .type = "CALLS",
+                           .properties_json = "{\"old_edge\":true}"};
     ASSERT_GT(cbm_store_insert_edge(s, &old_edge), 0);
 
     int64_t overlay_generation = 0;
@@ -1893,11 +1894,11 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
                            .name = "/fresh",
                            .qualified_name = "test.route.fresh",
                            .file_path = "main.go",
-                           .properties_json = "{}"};
+                           .properties_json = "{\"fresh_role\":true}"};
     cbm_store_delta_edge_t new_edge = {.source_qn = "test.route.fresh",
                                        .target_qn = "test.stable",
                                        .type = "HANDLES",
-                                       .properties_json = "{}",
+                                       .properties_json = "{\"fresh_edge\":true}",
                                        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
     cbm_store_file_delta_t delta = {.project = "test",
                                     .rel_path = "main.go",
@@ -1939,6 +1940,47 @@ TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
     ASSERT_EQ(function_count, CBM_NOT_FOUND);
     ASSERT_EQ(handles_count, 1);
     ASSERT_EQ(calls_count, CBM_NOT_FOUND);
+    cbm_store_schema_free(&schema);
+
+    ASSERT_EQ(cbm_store_get_schema_overlay_view(s, "test", &schema), CBM_STORE_OK);
+    bool saw_fresh_node_prop = false;
+    bool saw_old_node_prop = false;
+    bool saw_stable_node_prop = false;
+    for (int i = 0; i < schema.node_label_count; i++) {
+        for (int j = 0; j < schema.node_labels[i].property_count; j++) {
+            const char *prop = schema.node_labels[i].properties[j];
+            if (strcmp(schema.node_labels[i].label, "Route") == 0 &&
+                strcmp(prop, "fresh_role") == 0) {
+                saw_fresh_node_prop = true;
+            }
+            if (strcmp(prop, "old_role") == 0) {
+                saw_old_node_prop = true;
+            }
+            if (strcmp(schema.node_labels[i].label, "Class") == 0 &&
+                strcmp(prop, "stable_role") == 0) {
+                saw_stable_node_prop = true;
+            }
+        }
+    }
+    bool saw_fresh_edge_prop = false;
+    bool saw_old_edge_prop = false;
+    for (int i = 0; i < schema.edge_type_count; i++) {
+        for (int j = 0; j < schema.edge_types[i].property_count; j++) {
+            const char *prop = schema.edge_types[i].properties[j];
+            if (strcmp(schema.edge_types[i].type, "HANDLES") == 0 &&
+                strcmp(prop, "fresh_edge") == 0) {
+                saw_fresh_edge_prop = true;
+            }
+            if (strcmp(prop, "old_edge") == 0) {
+                saw_old_edge_prop = true;
+            }
+        }
+    }
+    ASSERT(saw_fresh_node_prop);
+    ASSERT(saw_stable_node_prop);
+    ASSERT(!saw_old_node_prop);
+    ASSERT(saw_fresh_edge_prop);
+    ASSERT(!saw_old_edge_prop);
     cbm_store_schema_free(&schema);
 
     cbm_store_close(s);
