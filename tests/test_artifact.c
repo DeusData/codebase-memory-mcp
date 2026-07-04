@@ -601,6 +601,74 @@ TEST(artifact_reconcile_skips_without_git) {
     PASS();
 }
 
+/* P2: persist_hashes now writes all hash rows in one batch transaction from
+ * classify-time stamps (no per-file re-stat). Verify the round-trip via the
+ * real pipeline route: index → modify → incremental reindex (batch persist) →
+ * the row reflects the new content, and a follow-up run classifies it as
+ * unchanged (proving the persisted stamps are usable). Offline synthetic repo. */
+TEST(incremental_persist_batch_roundtrip) {
+    setup_artifact_test();
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn original() {}\n");
+
+    char *proj = cbm_project_name_from_path(g_repo);
+    ASSERT_NOT_NULL(proj);
+
+    /* Run 1: full index → file_hashes populated (size = len(original)). */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    ASSERT_EQ(n, 1);
+    int64_t size_before = rows[0].size;
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+    ASSERT_GT(size_before, 0);
+
+    /* Modify the file (different size → detectable by classify on next run). */
+    write_text_file(src, "pub fn original() { /* expanded with more content now */ }\n");
+
+    /* Run 2: routes to incremental → persist_hashes (batch) writes the new stamp. */
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    ASSERT_EQ(n, 1);
+    int64_t size_after = rows[0].size;
+    /* Persisted mtime now equals the file's current (classify-time) mtime. */
+    char c_path[1024];
+    snprintf(c_path, sizeof(c_path), "%s/a.rs", g_repo);
+    ASSERT_EQ(rows[0].mtime_ns, t_mtime_ns(c_path));
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+    ASSERT_NEQ(size_after, size_before);
+
+    /* Run 3: no-op — the persisted classify-time stamp makes classify see no
+     * change, proving the batch-persisted row is correct and reusable. */
+    capture_logs_start();
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    const char *logs = capture_logs_end();
+    ASSERT(strstr(logs, "incremental.noop") != NULL);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 SUITE(artifact) {
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
@@ -617,4 +685,5 @@ SUITE(artifact) {
     RUN_TEST(artifact_reconcile_skips_untrusted_metadata);
     RUN_TEST(artifact_reconcile_skips_unknown_commit);
     RUN_TEST(artifact_reconcile_skips_without_git);
+    RUN_TEST(incremental_persist_batch_roundtrip);
 }
