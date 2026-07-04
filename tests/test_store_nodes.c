@@ -2730,6 +2730,94 @@ TEST(store_search_overlay_view_uses_active_relationship_edges) {
     PASS();
 }
 
+TEST(store_search_overlay_view_dedupes_multi_owner_active_edges) {
+    enum {
+        BASE_GENERATION = 1,
+        EXPECTED_ACTIVE_NODES = 2,
+        EXPECTED_LOGICAL_EDGES = 1,
+        SEARCH_LIMIT = 10,
+    };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION,
+                                                   &overlay_generation),
+              CBM_STORE_OK);
+
+    cbm_node_t main_node = {.project = "test",
+                            .label = "Function",
+                            .name = "main",
+                            .qualified_name = "test.main",
+                            .file_path = "main.go",
+                            .properties_json = "{}"};
+    cbm_store_delta_edge_t main_edge = {.source_qn = "test.main",
+                                        .target_qn = "test.helper",
+                                        .type = "CALLS",
+                                        .properties_json = "{}",
+                                        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t main_delta = {.project = "test",
+                                         .rel_path = "main.go",
+                                         .generation = BASE_GENERATION,
+                                         .nodes = &main_node,
+                                         .node_count = 1,
+                                         .edges = &main_edge,
+                                         .edge_count = 1};
+    cbm_node_t helper_node = {.project = "test",
+                              .label = "Function",
+                              .name = "helper",
+                              .qualified_name = "test.helper",
+                              .file_path = "helper.go",
+                              .properties_json = "{}"};
+    cbm_store_delta_edge_t helper_edge = {.source_qn = "test.main",
+                                          .target_qn = "test.helper",
+                                          .type = "CALLS",
+                                          .properties_json = "{}",
+                                          .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t helper_delta = {.project = "test",
+                                           .rel_path = "helper.go",
+                                           .generation = BASE_GENERATION,
+                                           .nodes = &helper_node,
+                                           .node_count = 1,
+                                           .edges = &helper_edge,
+                                           .edge_count = 1};
+    const cbm_store_file_delta_t *deltas[] = {&main_delta, &helper_delta};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta_batch(s, deltas, CBM_SZ_2,
+                                                         overlay_generation),
+              CBM_STORE_OK);
+
+    cbm_search_params_t params = {.project = "test",
+                                  .relationship = "CALLS",
+                                  .sort_by = "name",
+                                  .limit = SEARCH_LIMIT,
+                                  .min_degree = 0,
+                                  .max_degree = -1};
+    cbm_search_output_t active = {0};
+    ASSERT_EQ(cbm_store_search_overlay_view(s, &params, &active), CBM_STORE_OK);
+    ASSERT_EQ(active.total, EXPECTED_ACTIVE_NODES);
+    ASSERT_EQ(active.count, EXPECTED_ACTIVE_NODES);
+    ASSERT_STR_EQ(active.results[0].node.name, "helper");
+    ASSERT_EQ(active.results[0].in_degree, EXPECTED_LOGICAL_EDGES);
+    ASSERT_EQ(active.results[0].out_degree, 0);
+    ASSERT_STR_EQ(active.results[1].node.name, "main");
+    ASSERT_EQ(active.results[1].in_degree, 0);
+    ASSERT_EQ(active.results[1].out_degree, EXPECTED_LOGICAL_EDGES);
+    cbm_store_search_free(&active);
+
+    cbm_schema_info_t schema = {0};
+    ASSERT_EQ(cbm_store_get_schema_counts_overlay_view(s, "test", &schema), CBM_STORE_OK);
+    ASSERT_EQ(schema.edge_type_count, EXPECTED_LOGICAL_EDGES);
+    ASSERT_STR_EQ(schema.edge_types[0].type, "CALLS");
+    ASSERT_EQ(schema.edge_types[0].count, EXPECTED_LOGICAL_EDGES);
+    ASSERT_EQ(schema.rel_pattern_count, EXPECTED_LOGICAL_EDGES);
+    ASSERT_STR_EQ(schema.rel_patterns[0], "(Function)-[CALLS]->(Function) [1x]");
+    cbm_store_schema_free(&schema);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges) {
     enum { BASE_GENERATION = 1 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -5623,6 +5711,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_search_overlay_view_without_ready_overlay_matches_canonical_search);
     RUN_TEST(store_search_overlay_view_matches_full_rebuild_oracle);
     RUN_TEST(store_search_overlay_view_uses_active_relationship_edges);
+    RUN_TEST(store_search_overlay_view_dedupes_multi_owner_active_edges);
     RUN_TEST(store_schema_counts_overlay_view_uses_active_nodes_and_edges);
     RUN_TEST(store_owner_metadata_crud);
     RUN_TEST(store_rebuild_file_delta_owners_derives_from_graph);
