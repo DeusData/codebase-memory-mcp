@@ -395,6 +395,9 @@ int cbm_pipeline_create_import_edges_for_file(cbm_pipeline_ctx_t *ctx,
                                               const CBMFileResult *result,
                                               const char *rel_path,
                                               CBMHashTable *namespace_map);
+int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
+                                                const CBMFileResult *result,
+                                                const char *rel_path);
 
 /* Extract IMPORTS edge local_name from the canonical edge JSON. Caller frees. */
 char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);

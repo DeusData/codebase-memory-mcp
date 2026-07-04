@@ -889,6 +889,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         imports_edges += cbm_pipeline_create_import_edges_for_file(ctx, result, rel, namespace_map);
         create_channel_edges(ctx, result, rel);
+        cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);
