@@ -104,6 +104,42 @@ static int bind_text(sqlite3_stmt *s, int col, const char *v) {
     return sqlite3_bind_text(s, col, v, CBM_NOT_FOUND, BIND_TRANSIENT);
 }
 
+static const char ST_DEFAULT_EDGE_TYPE[] = "CALLS";
+
+static int store_build_edge_type_placeholders(char *buf, size_t buf_sz, int first_bind,
+                                              int edge_type_count, int *out_bind_count) {
+    if (!buf || buf_sz == 0 || first_bind <= 0 || !out_bind_count) {
+        return CBM_STORE_ERR;
+    }
+    int bind_count = edge_type_count > 0 ? edge_type_count : 1;
+    if (bind_count > ST_BFS_EDGE_TYPE_LIMIT) {
+        bind_count = ST_BFS_EDGE_TYPE_LIMIT;
+    }
+
+    int len = 0;
+    for (int i = 0; i < bind_count; i++) {
+        int n = snprintf(buf + len, buf_sz - (size_t)len, "%s?%d", i > 0 ? "," : "",
+                         first_bind + i);
+        if (n < 0 || (size_t)n >= buf_sz - (size_t)len) {
+            return CBM_STORE_ERR;
+        }
+        len += n;
+    }
+    *out_bind_count = bind_count;
+    return CBM_STORE_OK;
+}
+
+static void store_bind_edge_types(sqlite3_stmt *stmt, int first_bind, const char **edge_types,
+                                  int edge_type_count, int bind_count) {
+    if (edge_type_count > 0) {
+        for (int i = 0; i < bind_count; i++) {
+            bind_text(stmt, first_bind + i, edge_types[i]);
+        }
+    } else {
+        bind_text(stmt, first_bind, ST_DEFAULT_EDGE_TYPE);
+    }
+}
+
 /* ── Internal store structure ───────────────────────────────────── */
 
 struct cbm_store {
@@ -6334,9 +6370,10 @@ static bool search_overlay_needs_active_edges(const cbm_search_params_t *params)
             strcmp(params->sort_by, "linkrank") == 0);
 }
 
-static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges) {
+static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool include_edges,
+                                           bool recursive) {
     int n = snprintf(buf, buf_sz,
-                     "WITH active_files AS ("
+                     "%s active_files AS ("
                      "  SELECT t.project, t.rel_path, MAX(t.overlay_generation) AS overlay_generation"
                      "  FROM overlay_tombstones t"
                      "  JOIN overlay_generations g"
@@ -6358,7 +6395,8 @@ static int search_build_active_overlay_cte(char *buf, size_t buf_sz, bool includ
                      "   AND af.overlay_generation = n.overlay_generation"
                      "  WHERE n.owned = %d"
                      ")",
-                     STORE_OVERLAY_TOMBSTONE_ACTIVE, CBM_STORE_NO_NODE_ID,
+                     recursive ? "WITH RECURSIVE" : "WITH", STORE_OVERLAY_TOMBSTONE_ACTIVE,
+                     CBM_STORE_NO_NODE_ID,
                      STORE_OVERLAY_ROW_OWNED);
     if (n < 0 || (size_t)n >= buf_sz) {
         return CBM_STORE_ERR;
@@ -6820,7 +6858,8 @@ int cbm_store_search_overlay_view(cbm_store_t *s, const cbm_search_params_t *par
                      : "FROM active_nodes n";
 
     char active_cte[ST_SQL_BUF];
-    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), use_active_edges) !=
+    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), use_active_edges,
+                                        false) !=
         CBM_STORE_OK) {
         store_set_error(s, "search_overlay_view active CTE SQL truncated");
         return CBM_STORE_ERR;
@@ -6968,26 +7007,13 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     /* MERGE: fork delta — build edge type IN clause with ?N parameterized
      * placeholders and cap at ST_BFS_EDGE_TYPE_LIMIT so the bind loop and clause
      * stay consistent. edge_types[] come from MCP tool call args. */
-    char types_clause[CBM_SZ_512] = "?1"; /* default: single placeholder for "CALLS" */
-    const char *default_edge_type = "CALLS";
-    int bfs_et_count = edge_type_count > 0 ? edge_type_count : 1;
-    if (edge_type_count > 0) {
-        int tlen = 0;
-        for (int i = 0; i < edge_type_count && i < ST_BFS_EDGE_TYPE_LIMIT; i++) {
-            if (i > 0) {
-                tlen += snprintf(types_clause + tlen, sizeof(types_clause) - (size_t)tlen, ",");
-                if (tlen >= (int)sizeof(types_clause)) {
-                    tlen = (int)sizeof(types_clause) - 1;
-                }
-            }
-            tlen +=
-                snprintf(types_clause + tlen, sizeof(types_clause) - (size_t)tlen, "?%d", i + 1);
-            if (tlen >= (int)sizeof(types_clause)) {
-                tlen = (int)sizeof(types_clause) - 1;
-            }
-        }
-        bfs_et_count =
-            edge_type_count < ST_BFS_EDGE_TYPE_LIMIT ? edge_type_count : ST_BFS_EDGE_TYPE_LIMIT;
+    char types_clause[CBM_SZ_512];
+    int bfs_et_count = 0;
+    if (store_build_edge_type_placeholders(types_clause, sizeof(types_clause), ST_COL_1,
+                                           edge_type_count, &bfs_et_count) != CBM_STORE_OK) {
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs edge type clause too large");
+        return CBM_STORE_ERR;
     }
 
     /* Build recursive CTE for BFS */
@@ -7038,15 +7064,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     }
 
     /* Bind edge type parameters */
-    if (edge_type_count > 0) {
-        /* MERGE: fork delta — bind loop capped at bfs_et_count. */
-        for (int i = 0; i < bfs_et_count; i++) {
-            bind_text(stmt, i + SKIP_ONE, edge_types[i]);
-        }
-    } else {
-        /* Default: only "CALLS" edges */
-        bind_text(stmt, SKIP_ONE, default_edge_type);
-    }
+    store_bind_edge_types(stmt, ST_COL_1, edge_types, edge_type_count, bfs_et_count);
 
     int cap = ST_INIT_CAP_16;
     int n = 0;
@@ -7150,13 +7168,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         rc = sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &estmt, NULL);
         if (rc == SQLITE_OK) {
             /* Bind edge type parameters for the edge query */
-            if (edge_type_count > 0) {
-                for (int i = 0; i < bfs_et_count; i++) {
-                    bind_text(estmt, i + SKIP_ONE, edge_types[i]);
-                }
-            } else {
-                bind_text(estmt, SKIP_ONE, default_edge_type);
-            }
+            store_bind_edge_types(estmt, ST_COL_1, edge_types, edge_type_count, bfs_et_count);
 
             int ecap = ST_INIT_CAP_8;
             int en = 0;
@@ -7219,6 +7231,184 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         result.edge_count = 0;
     }
 
+    *out = result;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *start_qn,
+                               const char *direction, const char **edge_types,
+                               int edge_type_count, int max_depth, int max_results,
+                               cbm_traverse_result_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project || !project[0] || !start_qn || !start_qn[0]) {
+        return CBM_STORE_ERR;
+    }
+
+    cbm_traverse_result_t result = {0};
+    char root_cte[ST_SQL_BUF];
+    if (search_build_active_overlay_cte(root_cte, sizeof(root_cte), false, false) !=
+        CBM_STORE_OK) {
+        store_set_error(s, "bfs_overlay root CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char root_sql[ST_SQL_BUF];
+    int root_n = snprintf(
+        root_sql, sizeof(root_sql),
+        "%s"
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties "
+        "FROM active_nodes n "
+        "WHERE n.project = ?3 AND n.qualified_name = ?4 "
+        "LIMIT 1",
+        root_cte);
+    if (root_n < 0 || (size_t)root_n >= sizeof(root_sql)) {
+        store_set_error(s, "bfs_overlay root SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *root_stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, root_sql, CBM_NOT_FOUND, &root_stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "bfs_overlay root prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(root_stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(root_stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(root_stmt, ST_COL_3, project);
+    bind_text(root_stmt, ST_COL_4, start_qn);
+    int root_step = sqlite3_step(root_stmt);
+    if (root_step == SQLITE_ROW) {
+        if (scan_node(s, root_stmt, &result.root) != CBM_STORE_OK) {
+            sqlite3_finalize(root_stmt);
+            cbm_store_traverse_free(&result);
+            return CBM_STORE_ERR;
+        }
+    } else if (root_step == SQLITE_DONE) {
+        sqlite3_finalize(root_stmt);
+        return CBM_STORE_NOT_FOUND;
+    } else {
+        store_set_error_sqlite(s, "bfs_overlay root step");
+        sqlite3_finalize(root_stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(root_stmt);
+
+    const char *freshness_project =
+        result.root.project && result.root.project[0] ? result.root.project : project;
+    result.pagerank_stale =
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    result.linkrank_stale =
+        cbm_store_derived_view_is_stale(s, freshness_project, CBM_STORE_DERIVED_VIEW_LINKRANK);
+    bool use_pagerank = !result.pagerank_stale;
+
+    char types_clause[CBM_SZ_512];
+    int bfs_et_count = 0;
+    if (store_build_edge_type_placeholders(types_clause, sizeof(types_clause), ST_COL_4,
+                                           edge_type_count, &bfs_et_count) != CBM_STORE_OK) {
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs_overlay edge type clause too large");
+        return CBM_STORE_ERR;
+    }
+
+    bool is_inbound = direction && strcmp(direction, "inbound") == 0;
+    const char *join_cond = is_inbound ? "e.target_qn = bfs.qn" : "e.source_qn = bfs.qn";
+    const char *next_qn = is_inbound ? "e.source_qn" : "e.target_qn";
+    const char *pagerank_select =
+        use_pagerank ? "COALESCE(pr.rank, 0.0) AS pr_rank " : "0.0 AS pr_rank ";
+    const char *pagerank_join = use_pagerank ? "LEFT JOIN pagerank pr ON pr.node_id = n.id " : "";
+    const char *pagerank_order = use_pagerank ? "bfs.hop, pr_rank DESC" : "bfs.hop, n.name";
+
+    char active_cte[ST_SQL_BUF];
+    if (search_build_active_overlay_cte(active_cte, sizeof(active_cte), true, true) !=
+        CBM_STORE_OK) {
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs_overlay active CTE SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_SQL_BUF];
+    int sql_n = snprintf(
+        sql, sizeof(sql),
+        "%s"
+        ", bfs(qn, hop) AS ("
+        "  SELECT ?3, 0"
+        "  UNION"
+        "  SELECT %s, bfs.hop + 1"
+        "  FROM bfs"
+        "  JOIN active_edges e ON %s"
+        "  WHERE e.type IN (%s) AND bfs.hop < %d"
+        ")"
+        "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, "
+        "%s"
+        "FROM bfs "
+        "JOIN active_nodes n ON n.qualified_name = bfs.qn "
+        "%s"
+        "WHERE bfs.hop > 0 "
+        "ORDER BY %s "
+        "LIMIT %d",
+        active_cte, next_qn, join_cond, types_clause, max_depth, pagerank_select,
+        pagerank_join, pagerank_order, max_results);
+    if (sql_n < 0 || (size_t)sql_n >= sizeof(sql)) {
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs_overlay SQL truncated");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        cbm_store_traverse_free(&result);
+        store_set_error_sqlite(s, "bfs_overlay prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
+    bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
+    bind_text(stmt, ST_COL_3, start_qn);
+    store_bind_edge_types(stmt, ST_COL_4, edge_types, edge_type_count, bfs_et_count);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_hop_t *visited = calloc((size_t)cap, sizeof(cbm_node_hop_t));
+    if (!visited) {
+        sqlite3_finalize(stmt);
+        cbm_store_traverse_free(&result);
+        store_set_error(s, "bfs_overlay out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            if (store_grow_array(s, (void **)&visited, &cap, sizeof(*visited),
+                                 "bfs_overlay out of memory", true) != CBM_STORE_OK) {
+                result.visited = visited;
+                result.visited_count = n;
+                cbm_store_traverse_free(&result);
+                sqlite3_finalize(stmt);
+                return CBM_STORE_ERR;
+            }
+        }
+        if (scan_node(s, stmt, &visited[n].node) != CBM_STORE_OK) {
+            result.visited = visited;
+            result.visited_count = n + 1;
+            cbm_store_traverse_free(&result);
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        visited[n].pagerank_score = sqlite3_column_double(stmt, ST_COL_10);
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        result.visited = visited;
+        result.visited_count = n;
+        cbm_store_traverse_free(&result);
+        sqlite3_finalize(stmt);
+        store_set_error_sqlite(s, "bfs_overlay step");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+
+    result.visited = visited;
+    result.visited_count = n;
     *out = result;
     return CBM_STORE_OK;
 }

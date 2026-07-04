@@ -759,6 +759,10 @@ void cbm_store_search_free(cbm_search_output_t *out);
 
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
+int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *start_qn,
+                               const char *direction, const char **edge_types,
+                               int edge_type_count, int max_depth, int max_results,
+                               cbm_traverse_result_t *out);
 
 /* Free a traverse result's allocated memory. */
 void cbm_store_traverse_free(cbm_traverse_result_t *out);

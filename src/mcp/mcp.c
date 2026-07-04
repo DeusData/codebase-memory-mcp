@@ -303,6 +303,34 @@ static void add_overlay_active_node_search_freshness(
               "trace results remain canonical until separately enabled.");
 }
 
+static void add_overlay_active_trace_freshness(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_store_overlay_node_view_summary_t *summary) {
+    if (!summary || summary->active_file_tombstones <= 0) {
+        return;
+    }
+    yyjson_mut_val *freshness = ensure_response_freshness(doc, root);
+    if (!freshness) {
+        return;
+    }
+    yyjson_mut_obj_add_str(doc, freshness, CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+                           CBM_MCP_FRESHNESS_READ_MODEL_OVERLAY_ACTIVE_GRAPH);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_ready_generations",
+                           summary->overlay_ready_generations);
+    yyjson_mut_obj_add_int(doc, freshness, "active_file_tombstones",
+                           summary->active_file_tombstones);
+    yyjson_mut_obj_add_int(doc, freshness, "canonical_nodes_visible",
+                           summary->canonical_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "overlay_owned_nodes_visible",
+                           summary->overlay_owned_nodes_visible);
+    yyjson_mut_obj_add_int(doc, freshness, "total_nodes_visible",
+                           summary->total_nodes_visible);
+    add_response_warning(doc, root,
+                         "trace_path used overlay active node and relationship rows for a "
+                         "qualified_name trace; function_name resolution and FTS query mode "
+                         "remain canonical until separately enabled.");
+}
+
 static void add_pipeline_exact_delta_stats(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                            cbm_pipeline_exact_delta_stats_t stats) {
     if (!doc || !root || (stats.changed_paths < 0 && stats.affected_paths < 0 &&
@@ -4796,6 +4824,7 @@ static void trace_append_nodes(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjso
     /* yyjson borrows node strings here; callers must serialize before
      * cbm_store_traverse_free(). */
     int64_t *seen = calloc((size_t)tr->visited_count + SKIP_ONE, sizeof(int64_t));
+    const char **seen_qn = calloc((size_t)tr->visited_count + SKIP_ONE, sizeof(char *));
     int seen_count = 0;
     for (int i = 0; i < tr->visited_count; i++) {
         const cbm_node_hop_t *hop = &tr->visited[i];
@@ -4809,7 +4838,13 @@ static void trace_append_nodes(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjso
         if (seen) {
             bool dup = false;
             for (int j = 0; j < seen_count; j++) {
-                if (seen[j] == hop->node.id) {
+                if (hop->node.id > CBM_STORE_NO_NODE_ID && seen[j] == hop->node.id) {
+                    dup = true;
+                    break;
+                }
+                if (hop->node.id <= CBM_STORE_NO_NODE_ID && seen[j] <= CBM_STORE_NO_NODE_ID &&
+                    hop->node.qualified_name && seen_qn && seen_qn[j] &&
+                    strcmp(seen_qn[j], hop->node.qualified_name) == 0) {
                     dup = true;
                     break;
                 }
@@ -4818,6 +4853,9 @@ static void trace_append_nodes(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjso
                 continue;
             }
             seen[seen_count++] = hop->node.id;
+            if (seen_qn) {
+                seen_qn[seen_count - 1] = hop->node.qualified_name;
+            }
         }
 
         yyjson_mut_val *item = yyjson_mut_obj(doc);
@@ -4844,6 +4882,7 @@ static void trace_append_nodes(cbm_mcp_server_t *srv, yyjson_mut_doc *doc, yyjso
         }
         yyjson_mut_arr_add_val(arr, item);
     }
+    free(seen_qn);
     free(seen);
 }
 
@@ -4950,6 +4989,12 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
     const char *effective_direction = direction ? direction : "both";
+    cbm_store_overlay_node_view_summary_t overlay_summary = {0};
+    bool overlay_ready_for_trace =
+        qn_input && project && project[0] &&
+        cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) ==
+            CBM_STORE_OK &&
+        overlay_summary.active_file_tombstones > 0;
 
     /* QN-first lookup: if qualified_name provided, resolve to node directly */
     cbm_node_t *qn_node = NULL;
@@ -4961,6 +5006,21 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
                 *qn_node = qn_tmp;  /* shallow copy; ownership of heap fields transferred */
             } else {
                 free_node_contents(&qn_tmp);  /* OOM: free fields to avoid leak */
+            }
+        }
+    }
+    if (!qn_node && overlay_ready_for_trace) {
+        qn_node = calloc(1, sizeof(cbm_node_t));
+        if (qn_node) {
+            qn_node->id = CBM_STORE_NO_NODE_ID;
+            qn_node->project = heap_strdup(project);
+            qn_node->qualified_name = heap_strdup(qn_input);
+            const char *last_dot = strrchr(qn_input, '.');
+            qn_node->name = heap_strdup(last_dot && last_dot[1] ? last_dot + 1 : qn_input);
+            if (!qn_node->project || !qn_node->qualified_name || !qn_node->name) {
+                free_node_contents(qn_node);
+                free(qn_node);
+                qn_node = NULL;
             }
         }
     }
@@ -5128,10 +5188,21 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_traverse_result_t tr_out = {0};
     cbm_traverse_result_t tr_in = {0};
+    bool overlay_trace_requested =
+        overlay_ready_for_trace && qn_input && nodes[sel].qualified_name &&
+        nodes[sel].qualified_name[0];
+    bool overlay_trace_succeeded = false;
 
     if (do_outbound) {
-        cbm_store_bfs(store, nodes[sel].id, "outbound", edge_types, edge_type_count, depth,
-                      max_results, &tr_out);
+        int bfs_rc = overlay_trace_requested
+                         ? cbm_store_bfs_overlay_view(store, project, nodes[sel].qualified_name,
+                                                      "outbound", edge_types, edge_type_count,
+                                                      depth, max_results, &tr_out)
+                         : cbm_store_bfs(store, nodes[sel].id, "outbound", edge_types,
+                                         edge_type_count, depth, max_results, &tr_out);
+        if (bfs_rc == CBM_STORE_OK && overlay_trace_requested) {
+            overlay_trace_succeeded = true;
+        }
 
         yyjson_mut_val *callees = yyjson_mut_arr(doc);
         trace_append_nodes(srv, doc, callees, &tr_out, compact, include_tests, risk_labels,
@@ -5141,8 +5212,15 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (do_inbound) {
-        cbm_store_bfs(store, nodes[sel].id, "inbound", edge_types, edge_type_count, depth,
-                      max_results, &tr_in);
+        int bfs_rc = overlay_trace_requested
+                         ? cbm_store_bfs_overlay_view(store, project, nodes[sel].qualified_name,
+                                                      "inbound", edge_types, edge_type_count,
+                                                      depth, max_results, &tr_in)
+                         : cbm_store_bfs(store, nodes[sel].id, "inbound", edge_types,
+                                         edge_type_count, depth, max_results, &tr_in);
+        if (bfs_rc == CBM_STORE_OK && overlay_trace_requested) {
+            overlay_trace_succeeded = true;
+        }
 
         yyjson_mut_val *callers = yyjson_mut_arr(doc);
         trace_append_nodes(srv, doc, callers, &tr_in, compact, include_tests, risk_labels,
@@ -5159,11 +5237,16 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
                                    false);
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
+    if (overlay_trace_succeeded) {
+        add_overlay_active_trace_freshness(doc, root, &overlay_summary);
+    }
     if (get_dirty_file_counts(store, project, &dirty_pending, &dirty_overlay_ready)) {
         add_dirty_file_freshness_counts(doc, root, dirty_pending, dirty_overlay_ready);
-        add_response_warning(doc, root,
-                             "trace_path reads canonical graph rows; dirty file changes may "
-                             "be absent until overlay or reindex completes.");
+        if (!overlay_trace_succeeded) {
+            add_response_warning(doc, root,
+                                 "trace_path reads canonical graph rows; dirty file changes may "
+                                 "be absent until overlay or reindex completes.");
+        }
     }
 
     if (srv->session_project[0])
