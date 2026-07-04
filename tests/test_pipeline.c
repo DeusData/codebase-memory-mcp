@@ -352,15 +352,59 @@ TEST(pipeline_structure_edges) {
     /* Check CONTAINS_FILE edges */
     int cf_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE");
     /* Check CONTAINS_FOLDER edges */
-    int cd_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER");
+    int cd_count = cbm_store_count_edges_by_type(s, project, CBM_PIPELINE_EDGE_CONTAINS_FOLDER);
+
+    char *pkg_qn = cbm_pipeline_fqn_folder(project, "pkg");
+    char *util_qn = cbm_pipeline_fqn_folder(project, "pkg/util");
+    bool made_pkg_qn = pkg_qn != NULL;
+    bool made_util_qn = util_qn != NULL;
+    cbm_node_t pkg_node = {0};
+    cbm_node_t util_node = {0};
+    bool found_pkg = false;
+    bool found_util = false;
+    if (pkg_qn) {
+        rc = cbm_store_find_node_by_qn(s, project, pkg_qn, &pkg_node);
+        found_pkg = rc == CBM_STORE_OK;
+    }
+    if (util_qn) {
+        rc = cbm_store_find_node_by_qn(s, project, util_qn, &util_node);
+        found_util = rc == CBM_STORE_OK;
+    }
+    cbm_edge_t *pkg_folders = NULL;
+    int pkg_folder_count = 0;
+    bool found_pkg_folder_edges = false;
+    if (found_pkg) {
+        rc = cbm_store_find_edges_by_source_type(s, pkg_node.id,
+                                                 CBM_PIPELINE_EDGE_CONTAINS_FOLDER, &pkg_folders,
+                                                 &pkg_folder_count);
+        found_pkg_folder_edges = rc == CBM_STORE_OK;
+    }
+    bool has_nested_folder_edge = false;
+    for (int i = 0; i < pkg_folder_count; i++) {
+        if (pkg_folders[i].target_id == util_node.id) {
+            has_nested_folder_edge = true;
+            break;
+        }
+    }
 
     /* Cleanup before assertions (so failures don't leak) */
+    cbm_store_free_edges(pkg_folders, pkg_folder_count);
+    cbm_node_free_fields(&pkg_node);
+    cbm_node_free_fields(&util_node);
+    free(pkg_qn);
+    free(util_qn);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_test_repo();
 
     ASSERT_GTE(cf_count, 3); /* project->main.go, pkg->service.go, util->helper.go */
-    ASSERT_GTE(cd_count, 1); /* project->pkg (pkg->util may merge on some platforms) */
+    ASSERT_GTE(cd_count, 2); /* branch->pkg and pkg->util */
+    ASSERT_TRUE(made_pkg_qn);
+    ASSERT_TRUE(made_util_qn);
+    ASSERT_TRUE(found_pkg);
+    ASSERT_TRUE(found_util);
+    ASSERT_TRUE(found_pkg_folder_edges);
+    ASSERT_TRUE(has_nested_folder_edge);
     PASS();
 }
 

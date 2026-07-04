@@ -471,7 +471,7 @@ static void delta_visit_edge(const cbm_gbuf_edge_t *edge, void *userdata) {
     bool target_is_changed_file = delta_same_path(tgt->file_path, ctx->rel_path) &&
                                   tgt->label && strcmp(tgt->label, "File") == 0;
     bool context_structure_edge =
-        strcmp(edge->type, "CONTAINS_FOLDER") == 0 && target_context &&
+        strcmp(edge->type, CBM_PIPELINE_EDGE_CONTAINS_FOLDER) == 0 && target_context &&
         (source_context || delta_node_is_structure_root(src));
     bool regenerated_file_structure = !source_owned &&
                                       strcmp(edge->type, cbm_delta_edge_contains_file) == 0 &&
