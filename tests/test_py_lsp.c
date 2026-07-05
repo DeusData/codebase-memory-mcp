@@ -594,6 +594,61 @@ TEST(pylsp_crossfile_classmethod_on_class_issue228) {
     PASS();
 }
 
+TEST(pylsp_crossfile_apirouter_self_method_registry_parity) {
+    const char *source =
+        "class APIRouter:\n"
+        "    def add_api_route(self):\n"
+        "        return None\n"
+        "    def include_router(self):\n"
+        "        self.add_api_route()\n";
+
+    enum { APIROUTER_DEF_COUNT = 3 };
+    CBMLSPDef defs[APIROUTER_DEF_COUNT];
+    memset(defs, 0, sizeof(defs));
+
+    defs[0].qualified_name = "fastapi.routing.APIRouter";
+    defs[0].short_name = "APIRouter";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "fastapi.routing";
+    defs[0].lang = CBM_LANG_PYTHON;
+
+    defs[1].qualified_name = "fastapi.routing.APIRouter.add_api_route";
+    defs[1].short_name = "add_api_route";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "fastapi.routing.APIRouter";
+    defs[1].def_module_qn = "fastapi.routing";
+    defs[1].lang = CBM_LANG_PYTHON;
+
+    defs[2].qualified_name = "fastapi.routing.APIRouter.include_router";
+    defs[2].short_name = "include_router";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "fastapi.routing.APIRouter";
+    defs[2].def_module_qn = "fastapi.routing";
+    defs[2].lang = CBM_LANG_PYTHON;
+
+    CBMArena direct_arena;
+    cbm_arena_init(&direct_arena);
+    CBMResolvedCallArray direct_out = {0};
+    cbm_run_py_lsp_cross(&direct_arena, source, (int)strlen(source), "fastapi.routing", defs,
+                         APIROUTER_DEF_COUNT, NULL, NULL, 0, NULL, &direct_out);
+    ASSERT_GTE(find_resolved_arr(&direct_out, "include_router", "add_api_route"), 0);
+
+    CBMArena registry_arena;
+    cbm_arena_init(&registry_arena);
+    CBMTypeRegistry *reg =
+        cbm_py_build_cross_registry(&registry_arena, defs, APIROUTER_DEF_COUNT);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray registry_out = {0};
+    cbm_run_py_lsp_cross_with_registry(&registry_arena, source, (int)strlen(source),
+                                       "fastapi.routing", reg, NULL, NULL, 0, NULL,
+                                       &registry_out);
+    ASSERT_GTE(find_resolved_arr(&registry_out, "include_router", "add_api_route"), 0);
+
+    cbm_arena_destroy(&registry_arena);
+    cbm_arena_destroy(&direct_arena);
+    PASS();
+}
+
 TEST(pylsp_crossfile_inheritance) {
     /* svc.py defines class Base with shared(); main.py defines class Child(Base)
      * and calls self.shared(). Caller passes ALL relevant defs (cross-file
@@ -1280,6 +1335,7 @@ SUITE(py_lsp) {
     /* Phase 9 — cross-file + batch */
     RUN_TEST(pylsp_crossfile_method_dispatch);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
+    RUN_TEST(pylsp_crossfile_apirouter_self_method_registry_parity);
     RUN_TEST(pylsp_crossfile_inheritance);
     RUN_TEST(pylsp_batch_two_files);
     /* Phase 10 — stdlib resolution */
