@@ -13469,6 +13469,9 @@ TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
@@ -14398,7 +14401,8 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
     ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
     ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
-    ASSERT_FALSE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p));
 
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
@@ -14710,7 +14714,7 @@ TEST(config_registry_includes_incremental_exact_frontier_caps) {
 TEST(config_registry_includes_incremental_derived_refresh_policy) {
     const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH);
     ASSERT_NOT_NULL(entry);
-    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
     ASSERT_STR_EQ(entry->category, "Indexing");
     ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
     ASSERT_NOT_NULL(strstr(entry->guidance,
@@ -14723,7 +14727,7 @@ TEST(config_registry_includes_incremental_derived_refresh_policy) {
 TEST(config_registry_includes_rank_refresh_policy) {
     const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_RANK_REFRESH);
     ASSERT_NOT_NULL(entry);
-    ASSERT_STR_EQ(entry->default_val, CBM_RANK_REFRESH_EAGER);
+    ASSERT_STR_EQ(entry->default_val, CBM_RANK_REFRESH_DEFAULT);
     ASSERT_STR_EQ(entry->category, "PageRank");
     ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
     ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_EXACT));

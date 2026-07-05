@@ -206,7 +206,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->lsp_confidence_floor = 0.0;
     p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     p->overlay_publish = CBM_OVERLAY_PUBLISH_OFF;
-    p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_EAGER;
+    p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
     p->exact_delta_max_changed_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
     p->exact_delta_max_affected_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
     p->persistence = false;
@@ -363,7 +363,7 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
             : CBM_OVERLAY_PUBLISH_OFF;
 
     const char *derived_refresh = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                                                 CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER);
+                                                 CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
     if (derived_refresh &&
         strcmp(derived_refresh, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL) ==
             0) {

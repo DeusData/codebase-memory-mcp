@@ -126,6 +126,8 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "eager"
 #define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT "stale_on_exact"
 #define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL "stale_on_incremental"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT \
+    CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL
 
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */

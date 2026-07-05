@@ -2924,17 +2924,18 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Default is conservative. Raise only with canonical-graph benchmarks for your workload; larger "
      "frontiers can approach full-rebuild cost."},
     {CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER,
+     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT,
      NULL,
      "Indexing",
      "When incremental publishes may defer global semantic/similarity edge refresh",
      CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "|"
      CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT "|"
      CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL,
-     "'eager' preserves full/moderate publish freshness. 'stale_on_exact' lets small exact "
+     "'stale_on_incremental' (default): incremental publishes mark semantic_edges stale and defer "
+     "global semantic/similarity refresh; query surfaces warn until a full/eager run rebuilds them. "
+     "'eager' preserves full/moderate publish freshness synchronously. 'stale_on_exact' lets small exact "
      "incremental graph deltas publish after marking semantic_edges stale; semantic/similarity "
-     "queries warn until an eager index run or full reindex rebuilds those global edges. "
-     "'stale_on_incremental' also allows containment incremental publishes to defer."},
+     "queries warn until an eager index run or full reindex rebuilds those global edges."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
      "Default max results for search_graph/search_code",
@@ -3044,11 +3045,13 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "'full' (default): score the project plus its dependency sub-projects. "
      "'project': score only the requested project's own symbols. "
      "'deps': score only dependency sub-project symbols."},
-    {"rank_refresh", CBM_RANK_REFRESH_EAGER, NULL, "PageRank",
+    {"rank_refresh", CBM_RANK_REFRESH_DEFAULT, NULL, "PageRank",
      "When to recompute PageRank/LinkRank after indexing",
      CBM_RANK_REFRESH_EAGER "|" CBM_RANK_REFRESH_STALE_ON_EXACT "|"
      CBM_RANK_REFRESH_STALE_ON_INCREMENTAL,
-     "'eager' (default): recompute after graph changes, dependency reindexes, or missing rank views. "
+     "'stale_on_incremental' (default): incremental publishes may defer rank recompute after marking "
+     "rank views stale; search/trace omit stale rank until a full/eager refresh. "
+     "'eager': recompute after graph changes, dependency reindexes, or missing rank views. "
      "'stale_on_exact': exact incremental graph deltas may skip synchronous rank recompute only after "
      "rank views are marked stale. 'stale_on_incremental': also allows containment incremental publishes "
      "to defer; search/trace then omit stale rank until a refresh runs."},
