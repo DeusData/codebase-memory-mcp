@@ -53,6 +53,11 @@ const char *cbm_service_pattern_http_method(const char *callee_name);
  * Returns NULL if not a known route registration method. */
 const char *cbm_service_pattern_route_method(const char *callee_name);
 
+/* True when a route-registration suffix is specific enough to use without a
+ * handler argument in suffix-only fallback. Generic HTTP verbs like .get/.Get
+ * return false so HTTP client wrappers get normal resolution first. */
+bool cbm_service_pattern_route_suffix_allows_no_handler(const char *callee_name);
+
 /* Classify a string literal as a genuine HTTP route path. Returns true for
  * real routes ("/api/orders", "/users/:id", "https://..."); false for file
  * paths ("/tmp/foo.md"), CLI slash-commands ("/ar:allow"), description strings

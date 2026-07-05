@@ -1303,7 +1303,10 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
         const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
-        if (route_path) {
+        bool has_route_handler = handler_ref && handler_ref[0] != '\0';
+        bool handlerless_route_api =
+            cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name);
+        if (route_path && (!suffix_only_route_reg || has_route_handler || handlerless_route_api)) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);
             return;
