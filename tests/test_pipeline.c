@@ -12025,6 +12025,105 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
     PASS();
 }
 
+TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex) {
+    enum { PIPELINE_EXACT_ONE_PATH = 1 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_ONE_PATH);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('new')\n\n"
+                            "def scoped_gap_marker():\n"
+                            "    return Service().run()\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    cbm_pipeline_free(p);
+
+    char *source_qn = cbm_pipeline_fqn_compute(project, "service.py", "Service.run");
+    char *target_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log");
+    ASSERT_NOT_NULL(source_qn);
+    ASSERT_NOT_NULL(target_qn);
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(g_incr_dbpath, project, source_qn, "CALLS", target_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "Python receiver-type full reindex differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(source_qn);
+    free(target_qn);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -14722,6 +14821,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex);
+    RUN_TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex);
     RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
