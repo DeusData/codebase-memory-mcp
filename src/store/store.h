@@ -565,8 +565,12 @@ int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const c
 /* Insert or update edge. Returns edge ID (>0) or CBM_STORE_ERR. */
 int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 
-/* Insert edges in batch. */
+/* Insert edges in a new transaction. */
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
+
+/* Insert edges while the caller owns the active transaction. */
+int cbm_store_insert_edge_batch_in_transaction(cbm_store_t *s, const cbm_edge_t *edges,
+                                               int count);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);

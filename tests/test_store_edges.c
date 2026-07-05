@@ -345,6 +345,61 @@ TEST(store_edge_batch_insert_50) {
     PASS();
 }
 
+TEST(store_edge_batch_bulk_merges_duplicate_properties) {
+    int64_t ids[40];
+    cbm_store_t *s = setup_store_with_nodes(40, ids);
+
+    cbm_edge_t edges[35];
+    edges[0] = (cbm_edge_t){.project = "test",
+                            .source_id = ids[0],
+                            .target_id = ids[1],
+                            .type = "CALLS",
+                            .properties_json = "{\"first\":1}"};
+    edges[1] = (cbm_edge_t){.project = "test",
+                            .source_id = ids[0],
+                            .target_id = ids[1],
+                            .type = "CALLS",
+                            .properties_json = "{\"second\":2}"};
+    for (int i = 2; i < 35; i++) {
+        edges[i] = (cbm_edge_t){
+            .project = "test", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+    }
+
+    ASSERT_EQ(cbm_store_insert_edge_batch(s, edges, 35), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 34);
+
+    cbm_edge_t *out = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(s, ids[0], "CALLS", &out, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT(strstr(out[0].properties_json, "\"first\":1") != NULL);
+    ASSERT(strstr(out[0].properties_json, "\"second\":2") != NULL);
+    cbm_store_free_edges(out, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_edge_batch_in_transaction_bulk) {
+    int64_t ids[40];
+    cbm_store_t *s = setup_store_with_nodes(40, ids);
+
+    cbm_edge_t edges[35];
+    for (int i = 0; i < 35; i++) {
+        edges[i] = (cbm_edge_t){
+            .project = "test", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+    }
+
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_insert_edge_batch_in_transaction(s, edges, 35), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_commit(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 35);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── find_edges_by_source with non-existent source ─────────────── */
 
 TEST(store_edge_find_source_nonexistent) {
@@ -594,6 +649,8 @@ SUITE(store_edges) {
     /* Edge case tests */
     RUN_TEST(store_edge_batch_insert_zero_count);
     RUN_TEST(store_edge_batch_insert_50);
+    RUN_TEST(store_edge_batch_bulk_merges_duplicate_properties);
+    RUN_TEST(store_edge_batch_in_transaction_bulk);
     RUN_TEST(store_edge_find_source_nonexistent);
     RUN_TEST(store_edge_find_target_nonexistent);
     RUN_TEST(store_edge_find_type_nonexistent);

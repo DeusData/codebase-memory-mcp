@@ -1408,6 +1408,45 @@ TEST(gbuf_flush_skips_orphan_edges) {
     PASS();
 }
 
+TEST(gbuf_flush_bulk_edges_preserves_buffer_properties) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/repo");
+    int64_t ids[40];
+    char name[CBM_SZ_32];
+    char qn[CBM_SZ_64];
+    for (int i = 0; i < 40; i++) {
+        snprintf(name, sizeof(name), "n%d", i);
+        snprintf(qn, sizeof(qn), "proj::n%d", i);
+        ids[i] = cbm_gbuf_upsert_node(gb, "Function", name, qn, "f.c", i + 1, i + 1, "{}");
+    }
+
+    cbm_gbuf_insert_edge(gb, ids[0], ids[1], "CALLS", "{\"first\":1}");
+    cbm_gbuf_insert_edge(gb, ids[0], ids[1], "CALLS", "{\"second\":2}");
+    for (int i = 1; i < 35; i++) {
+        cbm_gbuf_insert_edge(gb, ids[i], ids[i + 1], "CALLS", "{}");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_gbuf_flush_to_store(gb, store), 0);
+    ASSERT_EQ(cbm_store_count_edges(store, "proj"), 35);
+
+    cbm_node_t first = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "proj", "proj::n0", &first), CBM_STORE_OK);
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source_type(store, first.id, "CALLS", &edges, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT(strstr(edges[0].properties_json, "\"first\":1") == NULL);
+    ASSERT(strstr(edges[0].properties_json, "\"second\":2") != NULL);
+    cbm_store_free_edges(edges, count);
+    cbm_node_free_fields(&first);
+
+    cbm_store_close(store);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 /* B1 pipeline-path isolation probe (#23): cbm_write_db is clean 10/10 even with
@@ -1654,6 +1693,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_flush_begin_failure_preserves_existing_project);
     RUN_TEST(gbuf_merge_into_store_preserves);
     RUN_TEST(gbuf_flush_skips_orphan_edges);
+    RUN_TEST(gbuf_flush_bulk_edges_preserves_buffer_properties);
 
     /* Shared ID tests */
     RUN_TEST(gbuf_shared_ids_unique);
