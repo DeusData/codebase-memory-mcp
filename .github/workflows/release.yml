@@ -87,7 +87,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -100,14 +100,15 @@ jobs:
         run: sha256sum *.tar.gz *.zip > checksums.txt
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: '*.tar.gz,*.zip,checksums.txt'
 
       - name: Generate SBOM
         run: |
           python3 -c "
-          import json
+          import json, glob, os
+          n_grammars = len([d for d in glob.glob('internal/cbm/vendored/grammars/*') if os.path.isdir(d)])
           sbom = {
             'spdxVersion': 'SPDX-2.3',
             'dataLicense': 'CC0-1.0',
@@ -131,7 +132,7 @@ jobs:
               {'SPDXID': 'SPDXRef-Package-verstable', 'name': 'verstable', 'versionInfo': '2.2.1', 'licenseDeclared': 'MIT', 'downloadLocation': 'https://github.com/JacksonAllan/Verstable', 'filesAnalyzed': False},
               {'SPDXID': 'SPDXRef-Package-wyhash', 'name': 'wyhash', 'versionInfo': 'final-4.3', 'licenseDeclared': 'Unlicense', 'downloadLocation': 'https://github.com/wangyi-fudan/wyhash', 'filesAnalyzed': False},
               {'SPDXID': 'SPDXRef-Package-nomic-embed-code', 'name': 'nomic-embed-code-token-embeddings', 'versionInfo': '1.0', 'licenseDeclared': 'Apache-2.0', 'downloadLocation': 'https://huggingface.co/nomic-ai/nomic-embed-code', 'filesAnalyzed': False, 'comment': 'Derived int8 token embeddings; see vendored/nomic/NOTICE'},
-              {'SPDXID': 'SPDXRef-Package-tree-sitter-grammars', 'name': 'tree-sitter-grammars-aggregate', 'versionInfo': '158-grammars', 'licenseDeclared': 'MIT', 'downloadLocation': 'NOASSERTION', 'filesAnalyzed': False, 'comment': 'Aggregate of 158 vendored tree-sitter grammars. Predominantly MIT; exceptions: clojure CC0-1.0, jinja2 + just Apache-2.0, first-party grammars (c) DeusData MIT. Per-grammar provenance: internal/cbm/vendored/grammars/MANIFEST.md; full texts ship in THIRD_PARTY_NOTICES.md inside each archive.'}
+              {'SPDXID': 'SPDXRef-Package-tree-sitter-grammars', 'name': 'tree-sitter-grammars-aggregate', 'versionInfo': f'{n_grammars}-grammars', 'licenseDeclared': 'MIT', 'downloadLocation': 'NOASSERTION', 'filesAnalyzed': False, 'comment': f'Aggregate of {n_grammars} vendored tree-sitter grammars, compiled statically. Predominantly MIT; non-MIT families present include CC0-1.0 (clojure, fennel), Apache-2.0 (elixir, erlang, gleam, hcl, ini, jinja2, just, pkl, sway, wit), ISC (pine, templ), Unlicense (fish); first-party grammars (c) DeusData, MIT. This summary is non-exhaustive; the authoritative complete per-grammar license list is internal/cbm/vendored/grammars/MANIFEST.md, and full license texts ship in THIRD_PARTY_NOTICES.md inside each archive.'}
             ]
           }
           json.dump(sbom, open('sbom.json', 'w'), indent=2)
@@ -194,7 +195,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
 
@@ -294,7 +295,7 @@ jobs:
       contents: read
       id-token: write   # for npm provenance
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # The packaged versions MUST match the dispatched release version —
       # the 0.8.0 release failed here because pkg/npm still carried the
@@ -329,7 +330,7 @@ jobs:
 
       # ── PyPI ─────────────────────────────────────────────────
       - name: Setup Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: '3.12'
 
@@ -368,7 +369,7 @@ jobs:
       id-token: write   # GitHub OIDC auth to the MCP Registry
       contents: read
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Sync server.json version to the released package
         env:

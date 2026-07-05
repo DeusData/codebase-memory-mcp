@@ -34,7 +34,7 @@ src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validate
 src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
 src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 
-# ── Pipeline: git history parsing (fallback when libgit2 not available) ────
+# ── Pipeline: git history parsing (git log) ────────────────────────────────
 src/pipeline/pass_githistory.c:cbm_popen:git log for file history (path validated)
 src/pipeline/pass_githistory.c:popen:via cbm_popen wrapper call
 

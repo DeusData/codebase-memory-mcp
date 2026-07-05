@@ -1235,6 +1235,10 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     snprintf(path, sizeof(path), "%s/.kiro", home_dir);
     agents.kiro = dir_exists(path);
 
+    /* Junie (JetBrains): ~/.junie/ */
+    snprintf(path, sizeof(path), "%s/.junie", home_dir);
+    agents.junie = dir_exists(path);
+
     return agents;
 }
 
@@ -1768,6 +1772,17 @@ int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path)
 }
 
 int cbm_remove_antigravity_mcp(const char *config_path) {
+    return cbm_remove_editor_mcp(config_path);
+}
+
+/* ── Junie MCP config (JSON, same mcpServers format) ──────────── */
+
+int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path) {
+    /* Junie (JetBrains) uses same mcpServers format as Cursor/Antigravity */
+    return cbm_install_editor_mcp(binary_path, config_path);
+}
+
+int cbm_remove_junie_mcp(const char *config_path) {
     return cbm_remove_editor_mcp(config_path);
 }
 
@@ -3148,6 +3163,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->cursor, "Cursor"},
         {a->openclaw, "OpenClaw"},
         {a->kiro, "Kiro"},
+        {a->junie, "Junie"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -3516,6 +3532,16 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         install_generic_agent_config("Kiro", binary_path, cp, NULL, dry_run,
                                      cbm_install_editor_mcp);
     }
+    if (agents->junie) {
+        char cp[CLI_BUF_1K];
+        char sd[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
+        snprintf(sd, sizeof(sd), "%s/.junie/mcp", home);
+        if (!dry_run) {
+            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+        }
+        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run, cbm_upsert_junie_mcp);
+    }
 }
 
 static void cbm_install_agent_configs(const char *home, const char *binary_path, bool force,
@@ -3668,6 +3694,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         {det.cursor, "cursor"},
         {det.openclaw, "openclaw"},
         {det.kiro, "kiro"},
+        {det.junie, "junie"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -4040,6 +4067,12 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(cp, sizeof(cp), "%s/.kiro/settings/mcp.json", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kiro", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp);
+    }
+    if (agents->junie) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Junie", cp, NULL}, dry_run,
+                                  cbm_remove_junie_mcp);
     }
 }
 

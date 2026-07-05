@@ -505,11 +505,11 @@ typedef struct {
 
 // --- Public API ---
 
-// Bind third-party allocators (tree-sitter, sqlite3, libgit2) to mimalloc as
+// Bind third-party allocators (tree-sitter, sqlite3) to mimalloc as
 // defense-in-depth, so they never depend on the fragile MI_OVERRIDE symbol
 // override (#424). MUST be called as the very first statement of main(), before
 // any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
-// SQLITE_MISUSE once sqlite has initialized) and before any git_libgit2_init.
+// SQLITE_MISUSE once sqlite has initialized).
 // Idempotent (static guard); intended for single-threaded startup. cbm_init()
 // also calls it so non-main entry points (pipeline passes) still get the binds.
 // In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.

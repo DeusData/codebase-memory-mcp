@@ -13,7 +13,7 @@
  * module has no dependency on the response format.
  *
  * fork+exec only (never fork-and-run-in-child): the server holds persistent
- * threads plus mimalloc/sqlite/libgit2 global state with no pthread_atfork, so a
+ * threads plus mimalloc/sqlite global state with no pthread_atfork, so a
  * fork without exec would be a latent deadlock. Recursion is prevented by an argv
  * flag (`--index-worker`), never an ambient env var.
  */

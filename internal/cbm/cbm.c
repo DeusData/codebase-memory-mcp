@@ -21,23 +21,6 @@
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
-#if defined(HAVE_LIBGIT2)
-#include <git2/version.h>
-#if defined(LIBGIT2_VERSION_CHECK)
-#if !LIBGIT2_VERSION_CHECK(1, 7, 0)
-#error "HAVE_LIBGIT2 requires libgit2 >= 1.7.0 for git_allocator"
-#endif
-#elif defined(LIBGIT2_VER_MAJOR) && defined(LIBGIT2_VER_MINOR) && defined(LIBGIT2_VER_REVISION)
-#if ((LIBGIT2_VER_MAJOR * 1000000) + (LIBGIT2_VER_MINOR * 10000) + (LIBGIT2_VER_REVISION * 100)) < \
-    1070000
-#error "HAVE_LIBGIT2 requires libgit2 >= 1.7.0 for git_allocator"
-#endif
-#else
-#error "HAVE_LIBGIT2 requires known libgit2 version macros for the >= 1.7.0 git_allocator guard"
-#endif
-#include <git2.h>           // git_libgit2_opts, GIT_OPT_SET_ALLOCATOR — bind libgit2 to mimalloc
-#include <git2/sys/alloc.h> // git_allocator — not pulled in by <git2.h> (it's a sys/ header)
-#endif
 #endif
 #include <stdint.h> // uint32_t, uint64_t, int64_t
 #include <stdlib.h>
@@ -256,7 +239,7 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
 
 // --- Allocator binding (defense-in-depth, #424) ---
 
-/* Bind tree-sitter, sqlite3, and libgit2 to mimalloc explicitly so a correct
+/* Bind tree-sitter and sqlite3 to mimalloc explicitly so a correct
  * binary does NOT depend on the fragile MI_OVERRIDE symbol override. Under
  * MI_OVERRIDE=1 — particularly the Windows static-MinGW link with
  * --allow-multiple-definition — `malloc`/`free` can resolve to DIFFERENT
@@ -300,25 +283,6 @@ static int cbm_sqlite_meminit(void *appdata) {
 static void cbm_sqlite_memshutdown(void *appdata) {
     (void)appdata;
 }
-
-#if defined(HAVE_LIBGIT2)
-/* libgit2 >= 1.7 git_allocator backed by mimalloc. The struct has exactly
- * three members: gmalloc(size_t,file,line), grealloc(ptr,size,file,line),
- * gfree(ptr). The file/line args are ignored. */
-static void *cbm_git_malloc(size_t n, const char *file, int line) {
-    (void)file;
-    (void)line;
-    return mi_malloc(n);
-}
-static void *cbm_git_realloc(void *ptr, size_t size, const char *file, int line) {
-    (void)file;
-    (void)line;
-    return mi_realloc(ptr, size);
-}
-static void cbm_git_free(void *ptr) {
-    mi_free(ptr);
-}
-#endif /* HAVE_LIBGIT2 */
 #endif /* CBM_BIND_TS_ALLOCATOR */
 
 void cbm_alloc_init(void) {
@@ -349,24 +313,6 @@ void cbm_alloc_init(void) {
     int sqlite_rc = sqlite3_config(SQLITE_CONFIG_MALLOC, &cbm_sqlite_mem);
     assert(sqlite_rc == SQLITE_OK && "SQLITE_CONFIG_MALLOC must run before sqlite3_initialize");
     (void)sqlite_rc;
-
-#if defined(HAVE_LIBGIT2)
-    /* libgit2. GIT_OPT_SET_ALLOCATOR MUST be set BEFORE git_libgit2_init():
-     * libgit2's git_allocator_global_init (run during init) installs the default
-     * stdalloc only if no custom allocator is set yet
-     * (`if (git__allocator.gmalloc != git_failalloc_malloc) return 0;`), and the
-     * pre-init global is the fail-allocator. There is no allocator-reset on
-     * git_libgit2_shutdown, so binding once here — before pass_githistory's
-     * per-call git_libgit2_init/shutdown pairs ever run — persists for the whole
-     * process. git_libgit2_opts(GIT_OPT_SET_ALLOCATOR,...) itself does not
-     * allocate, so calling it before init is safe. */
-    static git_allocator cbm_git_alloc = {
-        cbm_git_malloc,  /* gmalloc */
-        cbm_git_realloc, /* grealloc */
-        cbm_git_free,    /* gfree */
-    };
-    git_libgit2_opts(GIT_OPT_SET_ALLOCATOR, &cbm_git_alloc);
-#endif /* HAVE_LIBGIT2 */
 #endif /* CBM_BIND_TS_ALLOCATOR */
 }
 

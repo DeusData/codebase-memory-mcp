@@ -225,7 +225,7 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         /* Child: redirect stdout+stderr to the log (or discard), then exec.
          * Use open()+dup2() (async-signal-safe, no malloc) rather than freopen():
          * the parent may be multithreaded (the MCP server holds worker/watcher/http
-         * threads plus mimalloc/sqlite/libgit2 global state), and a fork() copies
+         * threads plus mimalloc/sqlite global state), and a fork() copies
          * only the calling thread — a malloc between fork and exec could deadlock on
          * a lock another thread held at fork time. open/dup2/execv touch no heap. */
         const char *bin = opts->bin;

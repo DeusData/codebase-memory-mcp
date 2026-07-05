@@ -33,7 +33,7 @@ jobs:
           BROAD: ${{ inputs.broad_platforms }}
         run: |
           CORE_UNIX='[
-            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++","libgit2":true},
+            {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
             {"os":"ubuntu-24.04-arm","cc":"gcc","cxx":"g++"},
             {"os":"macos-14","cc":"cc","cxx":"c++"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
@@ -75,19 +75,14 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ${{ matrix.libgit2 == true && 'libgit2-dev pkg-config' || '' }}
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
       - name: Test
-        run: |
-          if [ "${{ matrix.libgit2 == true }}" = "true" ]; then
-            echo "REQUIRE_LIBGIT2=1"
-            pkg-config --modversion libgit2
-          fi
-          scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} ${{ matrix.libgit2 == true && 'REQUIRE_LIBGIT2=1' || '' }}
+        run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
 
@@ -100,7 +95,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
@@ -136,7 +131,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:

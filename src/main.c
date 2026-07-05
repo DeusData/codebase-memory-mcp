@@ -594,7 +594,7 @@ static void setup_signal_handlers(void) {
 }
 
 int main(int argc, char **argv) {
-    /* Defense-in-depth: bind tree-sitter, sqlite3, and libgit2 to mimalloc so a
+    /* Defense-in-depth: bind tree-sitter and sqlite3 to mimalloc so a
      * correct binary does not rely on the fragile MI_OVERRIDE symbol override
      * (#424). MUST be the VERY FIRST statement: SQLITE_CONFIG_MALLOC has to run
      * before the first sqlite3_open* (cbm_mcp_server_new → cbm_store_open_memory

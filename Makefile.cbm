@@ -34,30 +34,6 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 
-# ── Optional libgit2 (faster git history parsing) ────────────────
-# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent
-# or too old for the git_allocator ABI used by the production allocator bind.
-PKG_CONFIG ?= pkg-config
-LIBGIT2_MIN_VERSION := 1.7.0
-LIBGIT2_AVAILABLE := $(shell $(PKG_CONFIG) --atleast-version=$(LIBGIT2_MIN_VERSION) libgit2 >/dev/null 2>&1 && echo yes || echo no)
-
-ifeq ($(REQUIRE_LIBGIT2),1)
-ifneq ($(LIBGIT2_AVAILABLE),yes)
-LIBGIT2_VERSION := $(shell $(PKG_CONFIG) --modversion libgit2 2>/dev/null)
-$(error libgit2 >= $(LIBGIT2_MIN_VERSION) is required when REQUIRE_LIBGIT2=1; pkg-config found $(if $(LIBGIT2_VERSION),$(LIBGIT2_VERSION),none))
-endif
-endif
-
-ifeq ($(LIBGIT2_AVAILABLE),yes)
-LIBGIT2_CFLAGS := $(shell $(PKG_CONFIG) --cflags libgit2 2>/dev/null)
-LIBGIT2_LIBS := $(shell $(PKG_CONFIG) --libs libgit2 2>/dev/null)
-LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
-else
-LIBGIT2_CFLAGS =
-LIBGIT2_FLAGS =
-LIBGIT2_LIBS =
-endif
-
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
 IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
@@ -72,8 +48,7 @@ CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 $(GCC_ONLY_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
-                -I$(CBM_DIR) -I$(TS_INCLUDE) \
-                $(LIBGIT2_FLAGS)
+                -I$(CBM_DIR) -I$(TS_INCLUDE)
 
 CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
@@ -111,9 +86,9 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
