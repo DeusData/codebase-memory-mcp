@@ -2434,6 +2434,7 @@ TEST(pipeline_python_reexport_call_uses_resolved_import_edge) {
 }
 
 TEST(pipeline_incremental_reexport_target_matches_full) {
+    enum { REEXPORT_AFFECTED_PATHS = 2 };
     enum { REEXPORT_FILE_COUNT = 4 };
     const char *files[] = {"fastapi/__init__.py", "fastapi/param_functions.py",
                            "fastapi/openapi/models.py", "docs_src/app/main.py"};
@@ -2453,7 +2454,7 @@ TEST(pipeline_incremental_reexport_target_matches_full) {
     ASSERT_GT(n, 0);
     ASSERT_LT((size_t)n, sizeof(db));
 
-    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     char *project = strdup(cbm_pipeline_project_name(p));
@@ -2466,10 +2467,33 @@ TEST(pipeline_incremental_reexport_target_matches_full) {
 
     cbm_config_t *cfg = incremental_test_config(g_lang_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    char affected_cap[CBM_SZ_32];
+    n = snprintf(affected_cap, sizeof(affected_cap), "%d", CBM_SZ_64);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(affected_cap));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+                             affected_cap),
+              0);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=2") != NULL ||
+           strstr(logs, "msg=incremental.frontier changed=1 expanded=2") != NULL);
+    cbm_pipeline_publish_kind_t kind = cbm_pipeline_publish_kind(p);
+    ASSERT(kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT ||
+           kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    if (kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT) {
+        cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+        ASSERT_EQ(stats.changed_paths, 1);
+        ASSERT_EQ(stats.affected_paths, REEXPORT_AFFECTED_PATHS);
+        ASSERT_EQ(stats.published_paths, REEXPORT_AFFECTED_PATHS);
+    } else {
+        ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "missing_existing_ownership");
+    }
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
 
@@ -2482,7 +2506,7 @@ TEST(pipeline_incremental_reexport_target_matches_full) {
     ASSERT_EQ(pipeline_dump_store_file_to_file(db, incremental_db), CBM_STORE_OK);
 
     cbm_unlink(db);
-    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
@@ -12229,7 +12253,8 @@ TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
 }
 
 TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild) {
-    enum { PIPELINE_EXACT_ONE_PATH = 1 };
+    enum { PIPELINE_EXACT_AFFECTED_PATHS = 2 };
+    enum { PIPELINE_EXACT_PUBLISHED_PATHS = 1 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -12256,7 +12281,7 @@ TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild) {
                              CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
               0);
     char cap_value[CBM_SZ_32];
-    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_ONE_PATH);
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_AFFECTED_PATHS);
     ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
               0);
@@ -12290,8 +12315,8 @@ TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild) {
     ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
     ASSERT_EQ(stats.changed_paths, 1);
-    ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_ONE_PATH);
-    ASSERT_EQ(stats.published_paths, PIPELINE_EXACT_ONE_PATH);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_AFFECTED_PATHS);
+    ASSERT_EQ(stats.published_paths, PIPELINE_EXACT_PUBLISHED_PATHS);
     cbm_pipeline_free(p);
 
     char diff_err[CBM_SZ_8K] = {0};

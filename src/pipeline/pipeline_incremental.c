@@ -1472,46 +1472,46 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
             }
             return rc;
         }
-        if (!recursive) {
-            cbm_store_free_inbound_edges(edges, edge_count);
-            continue;
-        }
-        for (int i = 0; i < edge_count; i++) {
-            const char *source_rel_path = edges[i].source_rel_path;
-            if (!source_rel_path || source_rel_path[0] == '\0') {
-                if (incr_empty_source_inbound_edge_is_structure(&edges[i]) ||
-                    incr_inbound_edge_owner_is_exact_file(&edges[i], exact_files, *exact_count)) {
-                    if (!incr_empty_source_inbound_edge_is_structure(&edges[i])) {
-                        if (*exact_count > original_exact_count) {
-                            if (out_reason) {
-                                *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+        if (recursive) {
+            for (int i = 0; i < edge_count; i++) {
+                const char *source_rel_path = edges[i].source_rel_path;
+                if (!source_rel_path || source_rel_path[0] == '\0') {
+                    if (incr_empty_source_inbound_edge_is_structure(&edges[i]) ||
+                        incr_inbound_edge_owner_is_exact_file(&edges[i], exact_files,
+                                                              *exact_count)) {
+                        if (!incr_empty_source_inbound_edge_is_structure(&edges[i])) {
+                            if (*exact_count > original_exact_count) {
+                                if (out_reason) {
+                                    *out_reason =
+                                        CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                                }
+                                cbm_store_free_inbound_edges(edges, edge_count);
+                                return CBM_STORE_NOT_FOUND;
                             }
-                            cbm_store_free_inbound_edges(edges, edge_count);
-                            return CBM_STORE_NOT_FOUND;
+                            saw_batch_owned_empty_source_edge = true;
                         }
-                        saw_batch_owned_empty_source_edge = true;
+                        continue;
                     }
-                    continue;
+                    if (out_reason) {
+                        *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                    }
+                    cbm_store_free_inbound_edges(edges, edge_count);
+                    return CBM_STORE_NOT_FOUND;
                 }
-                if (out_reason) {
-                    *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                if (saw_batch_owned_empty_source_edge) {
+                    if (out_reason) {
+                        *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                    }
+                    cbm_store_free_inbound_edges(edges, edge_count);
+                    return CBM_STORE_NOT_FOUND;
                 }
-                cbm_store_free_inbound_edges(edges, edge_count);
-                return CBM_STORE_NOT_FOUND;
-            }
-            if (saw_batch_owned_empty_source_edge) {
-                if (out_reason) {
-                    *out_reason = CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL;
+                rc = incr_append_exact_frontier_path(source_rel_path, all_files, all_file_count,
+                                                     exact_files, exact_count, max_exact_files,
+                                                     out_reason);
+                if (rc != CBM_STORE_OK) {
+                    cbm_store_free_inbound_edges(edges, edge_count);
+                    return rc;
                 }
-                cbm_store_free_inbound_edges(edges, edge_count);
-                return CBM_STORE_NOT_FOUND;
-            }
-            rc = incr_append_exact_frontier_path(source_rel_path, all_files, all_file_count,
-                                                 exact_files, exact_count, max_exact_files,
-                                                 out_reason);
-            if (rc != CBM_STORE_OK) {
-                cbm_store_free_inbound_edges(edges, edge_count);
-                return rc;
             }
         }
         cbm_store_free_inbound_edges(edges, edge_count);
