@@ -8,6 +8,7 @@
 #include "test_helpers.h"
 #include <store/store.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -992,6 +993,40 @@ TEST(store_bfs_with_risk_labels) {
     PASS();
 }
 
+TEST(store_bfs_caps_recursive_cte_rows) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t root = {.project = "test",
+                       .label = "Function",
+                       .name = "Root",
+                       .qualified_name = "test.Root"};
+    int64_t root_id = cbm_store_upsert_node(s, &root);
+
+    enum { NODE_COUNT = 4200 };
+    for (int i = 0; i < NODE_COUNT; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "Leaf%d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = name, .qualified_name = name};
+        int64_t leaf_id = cbm_store_upsert_node(s, &leaf);
+        cbm_edge_t edge = {
+            .project = "test", .source_id = root_id, .target_id = leaf_id, .type = "CALLS"};
+        cbm_store_insert_edge(s, &edge);
+    }
+
+    const char *types[] = {"CALLS"};
+    cbm_traverse_result_t result = {0};
+    int rc = cbm_store_bfs(s, root_id, "outbound", types, 1, 1, 5000, &result);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_TRUE(result.visited_count > 0);
+    ASSERT_TRUE(result.visited_count < NODE_COUNT);
+
+    cbm_store_traverse_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── BFS cross-service summary ─────────────────────────────────── */
 
 TEST(store_bfs_cross_service_summary) {
@@ -1509,6 +1544,7 @@ SUITE(store_search) {
     RUN_TEST(store_cross_service_detection);
     RUN_TEST(store_deduplicate_hops);
     RUN_TEST(store_bfs_with_risk_labels);
+    RUN_TEST(store_bfs_caps_recursive_cte_rows);
     RUN_TEST(store_bfs_cross_service_summary);
     RUN_TEST(store_glob_to_like);
     RUN_TEST(store_extract_like_hints);

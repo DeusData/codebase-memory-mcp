@@ -61,6 +61,8 @@ enum {
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
+    ST_BFS_CTE_ROW_MULTIPLIER = 8,
+    ST_BFS_MAX_CTE_ROWS = 4096,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -3793,6 +3795,18 @@ static void bfs_build_types_clause(int edge_type_count, char *buf, int buf_sz) {
     }
 }
 
+static int bfs_cte_row_limit(int max_results) {
+    int result_budget = max_results > 0 ? max_results : ST_INIT_CAP_16;
+    long row_budget = (long)result_budget * ST_BFS_CTE_ROW_MULTIPLIER + SKIP_ONE;
+    if (row_budget > ST_BFS_MAX_CTE_ROWS) {
+        return ST_BFS_MAX_CTE_ROWS;
+    }
+    if (row_budget < ST_INIT_CAP_16) {
+        return ST_INIT_CAP_16;
+    }
+    return (int)row_budget;
+}
+
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
@@ -3821,6 +3835,8 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         next_id = "e.target_id";
     }
 
+    int cte_row_limit = bfs_cte_row_limit(max_results);
+
     snprintf(sql, sizeof(sql),
              "WITH RECURSIVE bfs(node_id, hop, edge_path) AS ("
              "  SELECT %lld, 0, ''"
@@ -3832,6 +3848,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "  JOIN edges e ON %s"
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
              "    AND instr(',' || bfs.edge_path || ',', ',' || e.id || ',') = 0"
+             "  LIMIT %d"
              ")"
              "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
              "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
@@ -3843,7 +3860,8 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
               * watermarks and reproducible trace output depend on it. */
              "ORDER BY hop, n.id "
              "LIMIT %d;",
-             (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+             (long long)start_id, next_id, join_cond, types_clause, max_depth, cte_row_limit,
+             max_results);
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
