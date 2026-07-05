@@ -8,10 +8,10 @@
  * the resulting CBMResolvedCall entries back into per-file results.
  *
  * The pass is a no-op for any file whose CBMFileResult is missing or
- * whose language has no cross-file LSP entry registered (e.g. Rust /
- * Java today). Per-LSP emit functions dedup against entries already in
- * resolved_calls, so this pass is also idempotent — safe to invoke
- * multiple times if the pipeline gains a re-run path later.
+ * whose language has no cross-file LSP entry registered. Per-LSP emit
+ * functions dedup against entries already in resolved_calls, so this pass
+ * is also idempotent — safe to invoke multiple times if the pipeline gains
+ * a re-run path later.
  */
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline_internal.h"
