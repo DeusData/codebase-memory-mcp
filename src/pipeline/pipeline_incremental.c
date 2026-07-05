@@ -27,6 +27,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "foundation/platform.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -82,25 +83,39 @@ typedef struct {
 /* Artifact auto-export debounce (P3). A fast-mode artifact is re-exported on
  * every incremental run by default; that churns the user's working tree and
  * burns O(graph) I/O/CPU. Skip the export for small change sets unless the
- * artifact's indexed_at is older than the max age. CBM_ARTIFACT_EXPORT_MIN_CHANGES=0
- * restores per-run export (today's behavior). */
+ * cumulative drift since the last export crosses the same threshold or the
+ * artifact's indexed_at is older than the max age.
+ * CBM_ARTIFACT_EXPORT_MIN_CHANGES=0 restores per-run export (today's
+ * behavior); CBM_ARTIFACT_EXPORT_MAX_AGE_S overrides the age cap. */
 enum {
     CBM_ARTIFACT_EXPORT_MIN_CHANGES_DEFAULT = 10,
-    CBM_ARTIFACT_EXPORT_MAX_AGE_S = 24 * 60 * 60,
+    CBM_ARTIFACT_EXPORT_MAX_AGE_S_DEFAULT = 24 * 60 * 60,
 };
 
-static int export_min_changes(void) {
-    const char *raw = getenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+/* Non-negative integer env override with a strict parse; any missing, empty,
+ * non-numeric, trailing-garbage, or negative value falls back to def. */
+static int env_override_nonneg(const char *name, int def) {
+    const char *raw = getenv(name);
     if (!raw || !raw[0]) {
-        return CBM_ARTIFACT_EXPORT_MIN_CHANGES_DEFAULT;
+        return def;
     }
     errno = 0;
     char *end = NULL;
     long v = strtol(raw, &end, 10);
-    if (errno != 0 || end == raw || *end != '\0' || v < 0) {
-        return CBM_ARTIFACT_EXPORT_MIN_CHANGES_DEFAULT;
+    if (errno != 0 || end == raw || *end != '\0' || v < 0 || v > INT_MAX) {
+        return def;
     }
     return (int)v;
+}
+
+static int export_min_changes(void) {
+    return env_override_nonneg("CBM_ARTIFACT_EXPORT_MIN_CHANGES",
+                               CBM_ARTIFACT_EXPORT_MIN_CHANGES_DEFAULT);
+}
+
+static int export_max_age_s(void) {
+    return env_override_nonneg("CBM_ARTIFACT_EXPORT_MAX_AGE_S",
+                               CBM_ARTIFACT_EXPORT_MAX_AGE_S_DEFAULT);
 }
 
 /* ── File classification ─────────────────────────────────────────── */
@@ -760,7 +775,8 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     }
 
     /* Auto-update artifact if one already exists (persistence was enabled
-     * previously). Debounced: skip for small change sets unless the artifact's
+     * previously). Debounced: skip for small change sets unless cumulative
+     * drift since the last export crosses the same threshold or the artifact's
      * indexed_at is older than the max age. Staleness is cheap with P1's
      * git reconcile (a slightly larger diff to reconcile on bootstrap); the
      * skip is logged so staleness stays observable ("no silent caps"), and
@@ -768,12 +784,33 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     if (repo_path && cbm_artifact_exists(repo_path)) {
         int min_changes = export_min_changes();
         int64_t age_s = cbm_artifact_age_seconds(repo_path);
-        bool age_expired = (age_s >= 0 && age_s >= CBM_ARTIFACT_EXPORT_MAX_AGE_S);
-        if (changed_total >= min_changes || age_expired) {
+        bool age_expired = (age_s >= 0 && age_s >= export_max_age_s());
+
+        /* Cumulative drift: files whose classify-time mtime lands in a later
+         * second than the artifact's indexed_at. A per-run change count alone
+         * would let many consecutive small runs leave the artifact stale
+         * forever short of the age cap; files touched since the last export
+         * keep mtimes newer than indexed_at, so this accumulates across runs
+         * with no persisted counter. Strictly-later-second comparison keeps
+         * files written within the export's own second (the whole tree during
+         * a fast full index) from counting as drift; over-counting
+         * (touched-but-unchanged files) only exports more often — safe. */
+        int drift = 0;
+        int64_t exported_epoch = cbm_artifact_indexed_at_epoch(repo_path);
+        if (exported_epoch >= 0 && stamps) {
+            const int64_t next_sec_ns = (exported_epoch + 1) * CBM_NS_PER_SEC;
+            for (int i = 0; i < file_count; i++) {
+                if (stamps[i].valid && stamps[i].mtime_ns >= next_sec_ns) {
+                    drift++;
+                }
+            }
+        }
+
+        if (changed_total >= min_changes || drift >= min_changes || age_expired) {
             cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
         } else {
-            cbm_log_info("artifact.export_skipped", "changed", itoa_buf(changed_total), "age_s",
-                         itoa_buf((int)age_s));
+            cbm_log_info("artifact.export_skipped", "changed", itoa_buf(changed_total), "drift",
+                         itoa_buf(drift), "age_s", itoa_buf((int)age_s));
         }
     }
 }

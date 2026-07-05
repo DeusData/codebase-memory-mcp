@@ -745,6 +745,112 @@ TEST(artifact_export_forced_by_env) {
     PASS();
 }
 
+/* P3: cumulative drift forces export. Many consecutive below-threshold runs
+ * must not leave the artifact stale: files touched since the last export keep
+ * mtimes newer than indexed_at, so their count accumulates across runs and
+ * crosses the same threshold a single big run would. */
+TEST(artifact_export_forced_by_cumulative_drift) {
+    setup_artifact_test();
+    unsetenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+    unsetenv("CBM_ARTIFACT_EXPORT_MAX_AGE_S");
+    git_init(g_repo);
+    char gi[1024];
+    snprintf(gi, sizeof(gi), "%s/.gitignore", g_repo);
+    write_text_file(gi, ".codebase-memory/\n");
+    char paths[12][1024];
+    for (int i = 0; i < 12; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/f%d.rs", g_repo, i);
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(paths[i], body);
+    }
+
+    /* Full index + export → artifact exists, indexed_at = now. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char zst[1152];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    int64_t mt0 = t_mtime_ns(zst);
+    ASSERT_GTE(mt0, 0);
+
+    /* Drift compares mtime seconds strictly after indexed_at's second, so the
+     * edits must land in a later second than the export. */
+    cbm_usleep(1100 * 1000);
+
+    /* Run A: 5 changes (< 10), drift 5 (< 10) → skip. */
+    for (int i = 0; i < 5; i++) {
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() { /* edit */ }\n", i);
+        write_text_file(paths[i], body);
+    }
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_EQ(t_mtime_ns(zst), mt0); /* still debounced */
+
+    /* Run B: 6 different changes (< 10), but cumulative drift is 11 (>= 10)
+     * because run A's files still carry post-export mtimes → export fires. */
+    for (int i = 5; i < 11; i++) {
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() { /* edit */ }\n", i);
+        write_text_file(paths[i], body);
+    }
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_NEQ(t_mtime_ns(zst), mt0); /* re-exported by drift */
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* P3: CBM_ARTIFACT_EXPORT_MAX_AGE_S override. With the age cap forced to 0 a
+ * 1-change run must export despite being below the change/drift thresholds. */
+TEST(artifact_export_forced_by_max_age_env) {
+    setup_artifact_test();
+    unsetenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+    git_init(g_repo);
+    char gi[1024];
+    snprintf(gi, sizeof(gi), "%s/.gitignore", g_repo);
+    write_text_file(gi, ".codebase-memory/\n");
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn f0() {}\n");
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char zst[1152];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    int64_t mt0 = t_mtime_ns(zst);
+    ASSERT_GTE(mt0, 0);
+
+    /* age >= 0 always holds once a second has elapsed, so MAX_AGE_S=0 expires
+     * immediately; sleep past indexed_at's 1s resolution to avoid age = -0. */
+    ASSERT_EQ(setenv("CBM_ARTIFACT_EXPORT_MAX_AGE_S", "0", 1), 0);
+    cbm_usleep(1100 * 1000);
+    write_text_file(src, "pub fn f0() { /* modified */ }\n");
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    unsetenv("CBM_ARTIFACT_EXPORT_MAX_AGE_S");
+
+    ASSERT_NEQ(t_mtime_ns(zst), mt0); /* re-exported by age override */
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 /* P2: persist_hashes now writes all hash rows in one batch transaction from
  * classify-time stamps (no per-file re-stat). Verify the round-trip via the
  * real pipeline route: index → modify → incremental reindex (batch persist) →
@@ -833,4 +939,6 @@ SUITE(artifact) {
     RUN_TEST(incremental_persist_batch_roundtrip);
     RUN_TEST(artifact_export_debounced);
     RUN_TEST(artifact_export_forced_by_env);
+    RUN_TEST(artifact_export_forced_by_cumulative_drift);
+    RUN_TEST(artifact_export_forced_by_max_age_env);
 }

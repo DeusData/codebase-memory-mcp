@@ -54,9 +54,13 @@ bool cbm_artifact_exists(const char *repo_path);
  * Returns NULL if artifact doesn't exist or has no commit field. */
 char *cbm_artifact_commit(const char *repo_path);
 
-/* Age of the existing artifact in seconds (now - artifact.json indexed_at).
+/* Unix epoch seconds of the artifact's indexed_at metadata timestamp.
  * Returns -1 when there is no artifact.json or indexed_at is absent/unparseable.
  * Uses the metadata timestamp, NOT the .zst filesystem mtime. */
+int64_t cbm_artifact_indexed_at_epoch(const char *repo_path);
+
+/* Age of the existing artifact in seconds (now - artifact.json indexed_at).
+ * Returns -1 when the indexed_at epoch is unavailable. */
 int64_t cbm_artifact_age_seconds(const char *repo_path);
 
 /* After a successful import of a trusted clean-basis artifact, re-stamp

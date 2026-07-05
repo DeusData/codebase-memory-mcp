@@ -931,11 +931,11 @@ bool cbm_artifact_exists(const char *repo_path) {
 
 /* ── Commit hash extraction ──────────────────────────────────────── */
 
-/* Age of the existing artifact in seconds (now - artifact.json indexed_at).
+/* Unix epoch seconds of the artifact's indexed_at metadata timestamp.
  * Returns -1 when there is no artifact.json or indexed_at is absent/unparseable.
  * Uses the metadata timestamp, NOT the .zst filesystem mtime, because
  * checkout/touch operations can make an old artifact look fresh. */
-int64_t cbm_artifact_age_seconds(const char *repo_path) {
+int64_t cbm_artifact_indexed_at_epoch(const char *repo_path) {
     if (!repo_path) {
         return -1;
     }
@@ -955,15 +955,22 @@ int64_t cbm_artifact_age_seconds(const char *repo_path) {
     }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *val = yyjson_obj_get(root, "indexed_at");
-    int64_t age = -1;
+    int64_t epoch = -1;
     if (val) {
-        int64_t t = parse_iso8601_utc(yyjson_get_str(val));
-        if (t >= 0) {
-            age = (int64_t)time(NULL) - t;
-        }
+        epoch = parse_iso8601_utc(yyjson_get_str(val));
     }
     yyjson_doc_free(doc);
-    return age;
+    return epoch;
+}
+
+/* Age of the existing artifact in seconds (now - artifact.json indexed_at).
+ * Returns -1 when the indexed_at epoch is unavailable. */
+int64_t cbm_artifact_age_seconds(const char *repo_path) {
+    int64_t epoch = cbm_artifact_indexed_at_epoch(repo_path);
+    if (epoch < 0) {
+        return -1;
+    }
+    return (int64_t)time(NULL) - epoch;
 }
 
 char *cbm_artifact_commit(const char *repo_path) {
