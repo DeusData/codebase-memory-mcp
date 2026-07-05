@@ -14,7 +14,6 @@ enum {
     MCP_TIMEOUT_MS = 1000,
     MCP_HALF_SEC_US = 500000,
     MCP_MAX_ROWS = 100,
-    MCP_MAX_DEPTH = 15,
     MCP_COL_2 = 2,
     MCP_COL_3 = 3,
     MCP_COL_4 = 4,
@@ -54,6 +53,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
+#include "foundation/limits.h"
 #include "mcp/index_supervisor.h"
 #include "foundation/str_util.h"
 #include "foundation/dump_verify.h"
@@ -2933,6 +2933,22 @@ static void bfs_union_same_name(cbm_store_t *store, const cbm_node_t *nodes, int
     }
 }
 
+/* Clamp a client-supplied traversal depth to the MCP ceiling (cbm_mcp_max_depth),
+ * WARN-logging when it does so — never a silent truncation (#887). An unclamped
+ * `depth` would drive the shared cbm_store_bfs to an arbitrary hop count. */
+static int clamp_mcp_depth(int depth, const char *tool) {
+    int cap = cbm_mcp_max_depth();
+    if (depth > cap) {
+        char req_buf[16];
+        char cap_buf[16];
+        snprintf(req_buf, sizeof(req_buf), "%d", depth);
+        snprintf(cap_buf, sizeof(cap_buf), "%d", cap);
+        cbm_log_warn("mcp.depth_capped", "tool", tool, "requested", req_buf, "cap", cap_buf);
+        return cap;
+    }
+    return depth;
+}
+
 static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *project = get_project_arg(args);
@@ -2941,6 +2957,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     char *mode = cbm_mcp_get_string_arg(args, "mode");
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_DEPTH);
+    depth = clamp_mcp_depth(depth, "trace_call_path");
     bool risk_labels = cbm_mcp_get_bool_arg(args, "risk_labels");
     bool include_tests = cbm_mcp_get_bool_arg(args, "include_tests");
 
@@ -5201,6 +5218,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     char *since = cbm_mcp_get_string_arg(args, "since");
     char *scope = cbm_mcp_get_string_arg(args, "scope");
     int depth = cbm_mcp_get_int_arg(args, "depth", MCP_DEFAULT_BFS_DEPTH);
+    depth = clamp_mcp_depth(depth, "detect_changes");
 
     /* scope: "files" = just changed files, "symbols" = files + symbols (default) */
     bool want_symbols = !scope || strcmp(scope, "symbols") == 0 || strcmp(scope, "impact") == 0;

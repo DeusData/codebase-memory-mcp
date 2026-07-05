@@ -1001,6 +1001,62 @@ TEST(tool_trace_call_path_prefers_definition) {
     PASS();
 }
 
+/* Reproduce-first (#887): the client-supplied `depth` on trace_call_path must be
+ * clamped to the MCP ceiling (cbm_mcp_max_depth(), default 15). On origin/main
+ * an MCP_MAX_DEPTH=15 constant was defined but never applied — `depth` flowed
+ * straight into bfs_union_same_name, so an unbounded value drives the shared
+ * cbm_store_bfs to arbitrary depth. Over an 18-node call chain, depth=1000
+ * reaches n16/n17 (RED); with the clamp the walk stops at hop 15, so n15 is
+ * reached but n16 is not (GREEN). Quoted tokens ("n15"/"n16") match only the
+ * node-name field, never the qualified_name (preceded by '.'), so the boundary
+ * check is exact. */
+TEST(tool_trace_call_path_depth_clamped) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "depth-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/depth");
+
+    /* Linear call chain n00 -CALLS-> n01 -> ... -> n17 (18 nodes). */
+    int64_t ids[18];
+    for (int i = 0; i < 18; i++) {
+        char name[8];
+        char qn[32];
+        snprintf(name, sizeof(name), "n%02d", i);
+        snprintf(qn, sizeof(qn), "depth-proj.n%02d", i);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "chain.c",
+                        .start_line = 1,
+                        .end_line = 2};
+        ids[i] = cbm_store_upsert_node(st, &n);
+    }
+    for (int i = 0; i < 17; i++) {
+        cbm_edge_t e = {
+            .project = proj, .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+        cbm_store_insert_edge(st, &e);
+    }
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"n00\","
+             "\"project\":\"depth-proj\",\"direction\":\"outbound\",\"depth\":1000}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* Reached within the ceiling (proves the traversal ran) but clamped at 15. */
+    ASSERT_NOT_NULL(strstr(inner, "\"n15\""));
+    ASSERT_NULL(strstr(inner, "\"n16\""));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Reproduce-first (#650, distilled): two GENUINELY-DIFFERENT same-named functions
  * whose bodies differ in length score differently, so the old exact-tie check did
  * not flag them ambiguous — and bfs_union_same_name (#546) then merged the caller
@@ -4711,6 +4767,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
     RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
     RUN_TEST(tool_delete_project_not_found);

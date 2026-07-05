@@ -8,6 +8,8 @@
 #include "cypher/cypher.h"
 #include "store/store.h"
 #include "foundation/platform.h"
+#include "foundation/limits.h"
+#include "foundation/log.h"
 
 enum {
     CYP_BUF_16 = 16,
@@ -22,7 +24,6 @@ enum {
     CYP_MAX_VARS = 16,     /* max Cypher variables in a query */
     CYP_MAX_EDGE_VARS = 8, /* max edge variables */
     CYP_GROWTH_10 = 10,    /* binding growth factor */
-    CYP_MAX_DEPTH = 10,    /* max variable-length path depth */
     CYP_CHAR_IDX1 = 1,     /* second character index (e.g. op[1]) */
     CYP_EBUF_MASK = 7,
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
@@ -2886,7 +2887,20 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
                               const char *to_var, binding_t *new_bindings, int *new_count,
                               int max_new, int *match_count) {
-    int max_depth = rel->max_hops > 0 ? rel->max_hops : CYP_MAX_DEPTH;
+    /* Clamp BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms to the
+     * engine ceiling: an explicit N above the cap was previously honoured
+     * verbatim, driving cbm_store_bfs to an unbounded hop count (#887). WARN on
+     * clamp — never a silent truncation. */
+    int depth_cap = cbm_cypher_max_depth();
+    int max_depth = rel->max_hops > 0 ? rel->max_hops : depth_cap;
+    if (max_depth > depth_cap) {
+        char req_buf[16];
+        char cap_buf[16];
+        snprintf(req_buf, sizeof(req_buf), "%d", max_depth);
+        snprintf(cap_buf, sizeof(cap_buf), "%d", depth_cap);
+        cbm_log_warn("cypher.depth_capped", "requested", req_buf, "cap", cap_buf);
+        max_depth = depth_cap;
+    }
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
     cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
