@@ -26,6 +26,7 @@
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "yyjson/yyjson.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +148,101 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->embedded_types = pxc_join_pipe(arena, src->base_classes);
     dst->lang = lang;
     return 0;
+}
+
+static const char *pxc_json_string_dup(CBMArena *arena, yyjson_val *root, const char *key) {
+    if (!arena || !root || !key) {
+        return NULL;
+    }
+    yyjson_val *val = yyjson_obj_get(root, key);
+    if (!val || !yyjson_is_str(val)) {
+        return NULL;
+    }
+    const char *str = yyjson_get_str(val);
+    return str && str[0] ? cbm_arena_strdup(arena, str) : NULL;
+}
+
+static const char **pxc_json_string_array_dup(CBMArena *arena, yyjson_val *root,
+                                              const char *key) {
+    if (!arena || !root || !key) {
+        return NULL;
+    }
+    yyjson_val *arr = yyjson_obj_get(root, key);
+    if (!arr || !yyjson_is_arr(arr)) {
+        return NULL;
+    }
+    size_t len = yyjson_arr_size(arr);
+    if (len == 0 || len > INT32_MAX) {
+        return NULL;
+    }
+    const char **out = (const char **)cbm_arena_alloc(arena, (len + 1) * sizeof(*out));
+    if (!out) {
+        return NULL;
+    }
+    size_t idx = 0;
+    size_t max = 0;
+    size_t write = 0;
+    yyjson_val *val = NULL;
+    yyjson_arr_foreach(arr, idx, max, val) {
+        if (!yyjson_is_str(val)) {
+            continue;
+        }
+        const char *str = yyjson_get_str(val);
+        if (str && str[0]) {
+            out[write++] = cbm_arena_strdup(arena, str);
+        }
+    }
+    out[write] = NULL;
+    return out;
+}
+
+int cbm_pxc_build_lsp_def_from_node(CBMArena *arena, const cbm_node_t *node, CBMLanguage lang,
+                                    CBMLSPDef *out) {
+    if (!arena || !node || !out || !node->project || !node->qualified_name || !node->name ||
+        !node->label || !node->file_path) {
+        return -1;
+    }
+
+    char *module_heap = cbm_pipeline_fqn_module(node->project, node->file_path);
+    if (!module_heap) {
+        return -1;
+    }
+    const char *module_qn = cbm_arena_strdup(arena, module_heap);
+    free(module_heap);
+    if (!module_qn) {
+        return -1;
+    }
+
+    yyjson_doc *doc = NULL;
+    yyjson_val *root = NULL;
+    const char *props = node->properties_json ? node->properties_json : "{}";
+    doc = yyjson_read(props, strlen(props), 0);
+    if (doc) {
+        root = yyjson_doc_get_root(doc);
+        if (!root || !yyjson_is_obj(root)) {
+            root = NULL;
+        }
+    }
+
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = cbm_arena_strdup(arena, node->name);
+    def.qualified_name = cbm_arena_strdup(arena, node->qualified_name);
+    def.label = cbm_arena_strdup(arena, node->label);
+    def.file_path = cbm_arena_strdup(arena, node->file_path);
+    if (root) {
+        def.return_type = pxc_json_string_dup(arena, root, "return_type");
+        def.parent_class = pxc_json_string_dup(arena, root, "parent_class");
+        def.base_classes = pxc_json_string_array_dup(arena, root, "base_classes");
+    }
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+
+    if (!def.name || !def.qualified_name || !def.label || !def.file_path) {
+        return -1;
+    }
+    return pxc_build_lsp_def(arena, &def, module_qn, lang, out);
 }
 
 /* Collect a project-wide CBMLSPDef[] from all cached results. Returns a

@@ -11,6 +11,7 @@
 #include "test_helpers.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "store/store.h"
 #include "cli/cli.h"
 #include "git/git_context.h"
@@ -2117,6 +2118,22 @@ static bool pipeline_store_has_edge_between_qns(const char *db_path, const char 
                                                 const char *target_qn) {
     return pipeline_store_edge_between_qns_matches(db_path, project, source_qn, type, target_qn,
                                                    NULL);
+}
+
+static bool pipeline_resolved_call_contains(const CBMResolvedCallArray *arr,
+                                            const char *caller_substr,
+                                            const char *callee_substr) {
+    if (!arr || !caller_substr || !callee_substr) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && rc->callee_qn && strstr(rc->caller_qn, caller_substr) &&
+            strstr(rc->callee_qn, callee_substr)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void pipeline_restore_workers_env(bool had_workers, const char *saved_workers) {
@@ -12124,6 +12141,138 @@ TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex) {
     PASS();
 }
 
+TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
+    enum { PIPELINE_PERSISTED_DEF_CAP = 3 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    const char *changed_source =
+        "from provider import Logger\n\n"
+        "class Service:\n"
+        "    def __init__(self):\n"
+        "        self.logger: Logger = Logger()\n\n"
+        "    def run(self):\n"
+        "        return self.logger.log('new')\n";
+    CBMFileResult *changed_result = cbm_extract_file_with_options(
+        changed_source, (int)strlen(changed_source), CBM_LANG_PYTHON, project, "service.py",
+        CBM_EXTRACT_BUDGET, NULL, NULL, false);
+    ASSERT_NOT_NULL(changed_result);
+
+    cbm_file_info_t changed_file = {
+        .path = service_path,
+        .rel_path = "service.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    CBMFileResult *changed_cache[] = {changed_result};
+    char *changed_modules[] = {NULL};
+    int own_def_count = 0;
+    CBMLSPDef *own_defs = cbm_pxc_collect_all_defs(changed_cache, &changed_file, CBM_ALLOC_ONE,
+                                                   project, changed_modules, &own_def_count);
+    ASSERT_NOT_NULL(own_defs);
+    ASSERT_GT(own_def_count, 0);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+
+    char *provider_qns[PIPELINE_PERSISTED_DEF_CAP] = {
+        cbm_pipeline_fqn_compute(project, "provider.py", "Logger"),
+        cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log"),
+        cbm_pipeline_fqn_compute(project, "provider.py", "OtherLogger.log"),
+    };
+    for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
+        ASSERT_NOT_NULL(provider_qns[i]);
+    }
+
+    CBMArena persisted_arena;
+    cbm_arena_init(&persisted_arena);
+    CBMLSPDef persisted_defs[PIPELINE_PERSISTED_DEF_CAP];
+    memset(persisted_defs, 0, sizeof(persisted_defs));
+    int persisted_count = 0;
+    for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
+        cbm_node_t node = {0};
+        ASSERT_EQ(cbm_store_find_node_by_qn(store, project, provider_qns[i], &node), CBM_STORE_OK);
+        ASSERT_EQ(cbm_pxc_build_lsp_def_from_node(&persisted_arena, &node, CBM_LANG_PYTHON,
+                                                  &persisted_defs[persisted_count]),
+                  0);
+        persisted_count++;
+        cbm_node_free_fields(&node);
+    }
+    cbm_store_close(store);
+
+    int total_def_count = own_def_count + persisted_count;
+    CBMLSPDef *all_defs = calloc((size_t)total_def_count, sizeof(*all_defs));
+    ASSERT_NOT_NULL(all_defs);
+    memcpy(all_defs, own_defs, (size_t)own_def_count * sizeof(*all_defs));
+    memcpy(all_defs + own_def_count, persisted_defs,
+           (size_t)persisted_count * sizeof(*all_defs));
+
+    char *module_qn = cbm_pipeline_fqn_module(project, "service.py");
+    char *import_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger");
+    ASSERT_NOT_NULL(module_qn);
+    ASSERT_NOT_NULL(import_qn);
+    const char *imp_names[] = {"Logger"};
+    const char *imp_qns[] = {import_qn};
+    CBMArena out_arena;
+    cbm_arena_init(&out_arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross(&out_arena, changed_source, (int)strlen(changed_source), module_qn,
+                         all_defs, total_def_count, imp_names, imp_qns, CBM_ALLOC_ONE,
+                         changed_result->cached_tree, &out);
+
+    ASSERT_TRUE(pipeline_resolved_call_contains(&out, "Service.run", "provider.Logger.log"));
+
+    cbm_arena_destroy(&out_arena);
+    free(import_qn);
+    free(module_qn);
+    free(all_defs);
+    for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
+        free(provider_qns[i]);
+    }
+    cbm_arena_destroy(&persisted_arena);
+    free(own_defs);
+    free(changed_modules[0]);
+    cbm_free_result(changed_result);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -14822,6 +14971,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex);
     RUN_TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex);
+    RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
