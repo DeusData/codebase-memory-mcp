@@ -115,6 +115,11 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 
+/* Detect session root/project from the current working directory.
+ * Stdio MCP calls this during initialize; one-shot CLI calls this before
+ * dispatch so omitted project params use the same auto-index/session context. */
+void cbm_mcp_server_detect_session(cbm_mcp_server_t *srv);
+
 /* Start one bounded background overlay compaction pass for a project.
  * Returns false if args are invalid, max_generations is negative, or a prior
  * compaction thread has not been joined yet. This is not an MCP tool. */

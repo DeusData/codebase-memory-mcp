@@ -9134,6 +9134,13 @@ static void detect_session(cbm_mcp_server_t *srv) {
     }
 }
 
+void cbm_mcp_server_detect_session(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    detect_session(srv);
+}
+
 /* Background auto-index thread function */
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
