@@ -2033,6 +2033,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
 
     CBM_PROF_START(t_flush_total);
     int64_t *temp_to_real = NULL;
+    cbm_edge_t *store_edges = NULL;
     const char *phase = "begin_bulk";
     CBM_PROF_START(t_begin_bulk);
     int rc = cbm_store_begin_bulk(store);
@@ -2125,6 +2126,18 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     /* Insert all edges with remapped IDs */
     phase = "insert_edges";
     CBM_PROF_START(t_insert_edges);
+    int valid_edge_count = 0;
+    if (gb->edges.count > 0) {
+        if ((size_t)gb->edges.count > SIZE_MAX / sizeof(*store_edges)) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        store_edges = malloc((size_t)gb->edges.count * sizeof(*store_edges));
+        if (!store_edges) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+    }
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         int64_t real_src = (e->source_id < max_temp_id) ? temp_to_real[e->source_id] : 0;
@@ -2140,12 +2153,13 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .type = e->type,
             .properties_json = e->properties_json,
         };
-        if (cbm_store_insert_edge(store, &se) <= 0) {
-            rc = CBM_STORE_ERR;
-            goto fail;
-        }
+        store_edges[valid_edge_count++] = se;
     }
-    CBM_PROF_END_N("gbuf_flush", "6_insert_edges", t_insert_edges, gb->edges.count);
+    rc = cbm_store_insert_edge_batch_in_transaction(store, store_edges, valid_edge_count);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    CBM_PROF_END_N("gbuf_flush", "6_insert_edges", t_insert_edges, valid_edge_count);
 
     phase = "create_indexes";
     CBM_PROF_START(t_create_indexes);
@@ -2172,6 +2186,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     CBM_PROF_END_N("gbuf_flush", "TOTAL", t_flush_total, gb->nodes.count + gb->edges.count);
 
     free(temp_to_real);
+    free(store_edges);
     return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
 
 fail:
@@ -2184,6 +2199,7 @@ fail:
     (void)cbm_store_rollback(store);
     (void)cbm_store_end_bulk(store);
     free(temp_to_real);
+    free(store_edges);
     return rc;
 }
 

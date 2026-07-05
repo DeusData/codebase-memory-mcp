@@ -2673,22 +2673,132 @@ int cbm_store_delete_edges_by_type(cbm_store_t *s, const char *project, const ch
     return CBM_STORE_OK;
 }
 
+static int store_prepare_edge_batch_temp(cbm_store_t *s) {
+    static const char create_sql[] =
+        "CREATE TEMP TABLE IF NOT EXISTS cbm_edge_batch_tmp("
+        "seq INTEGER PRIMARY KEY,"
+        "project TEXT NOT NULL,"
+        "source_id INTEGER NOT NULL,"
+        "target_id INTEGER NOT NULL,"
+        "type TEXT NOT NULL,"
+        "properties TEXT NOT NULL);";
+    int rc = exec_sql(s, create_sql);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return exec_sql(s, "DELETE FROM cbm_edge_batch_tmp;");
+}
+
+static int store_fill_edge_batch_temp(cbm_store_t *s, const cbm_edge_t *edges, int count) {
+    static const char insert_sql[] =
+        "INSERT INTO cbm_edge_batch_tmp"
+        "(seq, project, source_id, target_id, type, properties) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, insert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "fill_edge_batch_temp prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+
+    for (int i = 0; i < count; i++) {
+        sqlite3_bind_int(stmt, ST_COL_1, i);
+        bind_text(stmt, ST_COL_2, safe_str(edges[i].project));
+        sqlite3_bind_int64(stmt, ST_COL_3, edges[i].source_id);
+        sqlite3_bind_int64(stmt, ST_COL_4, edges[i].target_id);
+        bind_text(stmt, ST_COL_5, safe_str(edges[i].type));
+        bind_text(stmt, ST_COL_6, safe_props(edges[i].properties_json));
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "fill_edge_batch_temp");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_insert_edge_batch_bulk(cbm_store_t *s, const cbm_edge_t *edges, int count) {
+    int rc = store_prepare_edge_batch_temp(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_fill_edge_batch_temp(s, edges, count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    static const char upsert_sql[] =
+        "INSERT INTO edges(project, source_id, target_id, type, properties) "
+        "SELECT project, source_id, target_id, type, properties "
+        "FROM cbm_edge_batch_tmp WHERE true ORDER BY seq "
+        "ON CONFLICT(source_id, target_id, type) DO UPDATE SET "
+        "properties = json_patch(properties, excluded.properties);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, upsert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "insert_edge_batch_bulk prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "insert_edge_batch_bulk");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_insert_edge_batch_loop(cbm_store_t *s, const cbm_edge_t *edges, int count) {
+    for (int i = 0; i < count; i++) {
+        int64_t id = cbm_store_insert_edge(s, &edges[i]);
+        if (id == CBM_STORE_ERR) {
+            return CBM_STORE_ERR;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
 /* ── Edge batch ─────────────────────────────────────────────────── */
+
+int cbm_store_insert_edge_batch_in_transaction(cbm_store_t *s, const cbm_edge_t *edges,
+                                               int count) {
+    if (count == 0) {
+        return CBM_STORE_OK;
+    }
+    if (!s || !s->db || !edges || count < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (count >= ST_DELTA_EDGE_BULK_MIN) {
+        return store_insert_edge_batch_bulk(s, edges, count);
+    }
+    return store_insert_edge_batch_loop(s, edges, count);
+}
 
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count) {
     if (count == 0) {
         return CBM_STORE_OK;
     }
-
-    exec_sql(s, "BEGIN IMMEDIATE;");
-    for (int i = 0; i < count; i++) {
-        int64_t id = cbm_store_insert_edge(s, &edges[i]);
-        if (id == CBM_STORE_ERR) {
-            exec_sql(s, "ROLLBACK;");
-            return CBM_STORE_ERR;
-        }
+    if (!s || !s->db || !edges || count < 0) {
+        return CBM_STORE_ERR;
     }
-    exec_sql(s, "COMMIT;");
+
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_insert_edge_batch_in_transaction(s, edges, count);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
     return CBM_STORE_OK;
 }
 
