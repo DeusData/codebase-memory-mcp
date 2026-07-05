@@ -9586,6 +9586,23 @@ static int pipeline_file_delta_count_usage_edge(const cbm_pipeline_file_delta_t 
     return matches;
 }
 
+static int pipeline_file_delta_count_call_edge(const cbm_pipeline_file_delta_t *delta,
+                                               const char *source_qn, const char *target_qn,
+                                               const char *callee, const char *strategy) {
+    int matches = 0;
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &delta->edges[i];
+        if (edge->type && strcmp(edge->type, "CALLS") == 0 &&
+            edge->source_qn && strcmp(edge->source_qn, source_qn) == 0 &&
+            edge->target_qn && strcmp(edge->target_qn, target_qn) == 0 &&
+            (!callee || (edge->properties_json && strstr(edge->properties_json, callee))) &&
+            (!strategy || (edge->properties_json && strstr(edge->properties_json, strategy)))) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
 static const char *pipeline_exact_scratch_structure_root_qn(const cbm_gbuf_t *gbuf,
                                                             const char *project) {
     const cbm_gbuf_node_t **branches = NULL;
@@ -12612,6 +12629,131 @@ TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild) {
     PASS();
 }
 
+TEST(incremental_exact_scratch_field_hint_materializes_store_target) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char docs_dir[CBM_PATH_MAX];
+    char custom_dir[CBM_PATH_MAX];
+    char fastapi_dir[CBM_PATH_MAX];
+    char routing_path[CBM_PATH_MAX];
+    char tutorial_path[CBM_PATH_MAX];
+    char payload_path[CBM_PATH_MAX];
+    int n = snprintf(docs_dir, sizeof(docs_dir), "%s/docs_src", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(docs_dir));
+    n = snprintf(custom_dir, sizeof(custom_dir), "%s/docs_src/custom_request_and_route",
+                 g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(custom_dir));
+    n = snprintf(fastapi_dir, sizeof(fastapi_dir), "%s/fastapi", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fastapi_dir));
+    ASSERT_EQ(th_mkdir_p(docs_dir), 0);
+    ASSERT_EQ(th_mkdir_p(custom_dir), 0);
+    ASSERT_EQ(th_mkdir_p(fastapi_dir), 0);
+
+    n = snprintf(routing_path, sizeof(routing_path), "%s/fastapi/routing.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(routing_path));
+    n = snprintf(tutorial_path, sizeof(tutorial_path),
+                 "%s/docs_src/custom_request_and_route/tutorial001.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(tutorial_path));
+    n = snprintf(payload_path, sizeof(payload_path), "%s/payloads.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(payload_path));
+
+    ASSERT_EQ(th_write_file(tutorial_path,
+                            "class GzipRequest:\n"
+                            "    def body(self):\n"
+                            "        return b'gzip'\n"),
+              0);
+    ASSERT_EQ(th_write_file(payload_path,
+                            "class Payload:\n"
+                            "    def body(self):\n"
+                            "        return b'payload'\n"),
+              0);
+    ASSERT_EQ(th_write_file(routing_path,
+                            "def route(request):\n"
+                            "    return request.body()\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(routing_path,
+                            "def route(request):\n"
+                            "    value = request.body()\n"
+                            "    return value\n"),
+              0);
+
+    cbm_file_info_t changed = {
+        .path = routing_path,
+        .rel_path = "fastapi/routing.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             &changed, CBM_ALLOC_ONE, &scratch,
+                                                             &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+
+    char *source_qn = cbm_pipeline_fqn_compute(project, "fastapi/routing.py", "route");
+    char *target_qn =
+        cbm_pipeline_fqn_compute(project, "docs_src/custom_request_and_route/tutorial001.py",
+                                 "GzipRequest.body");
+    ASSERT_NOT_NULL(source_qn);
+    ASSERT_NOT_NULL(target_qn);
+    ASSERT_EQ(pipeline_file_delta_count_call_edge(&delta, source_qn, target_qn, "request.body",
+                                                  "field_type_hint"),
+              1);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, deltas, CBM_ALLOC_ONE,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "field-hint exact delta differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(source_qn);
+    free(target_qn);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -15315,6 +15457,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
     RUN_TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild);
+    RUN_TEST(incremental_exact_scratch_field_hint_materializes_store_target);
     RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);

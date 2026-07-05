@@ -342,8 +342,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return 0;
     }
-    cbm_pipeline_try_field_type_hint(ctx->registry, ctx->gbuf, &res, call->callee_name,
-                                     source_node->id);
+    cbm_pipeline_try_field_type_hint_ctx(ctx, &res, call->callee_name, source_node->id);
 
     if (lsp_target_unindexed && cbm_registry_strategy_is_weak_short_name(res.strategy) &&
         !cbm_registry_is_import_reachable(res.qualified_name, imp_vals, imp_count)) {

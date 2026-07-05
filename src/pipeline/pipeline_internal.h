@@ -263,13 +263,18 @@ static inline void cbm_pipeline_close_call_edge_props(char *props, size_t props_
     }
 }
 
-static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *registry,
-                                                    const cbm_gbuf_t *gbuf,
-                                                    cbm_resolution_t *res,
-                                                    const char *callee_name,
-                                                    int64_t source_id) {
-    if (!registry || !gbuf || !res || !res->qualified_name ||
-        res->candidate_count <= SKIP_ONE || !callee_name) {
+typedef const cbm_gbuf_node_t *(*cbm_pipeline_field_hint_find_fn)(void *ctx, const char *qn);
+
+static inline const cbm_gbuf_node_t *cbm_pipeline_field_hint_find_in_gbuf(void *ctx,
+                                                                          const char *qn) {
+    return cbm_gbuf_find_by_qn((const cbm_gbuf_t *)ctx, qn);
+}
+
+static inline void cbm_pipeline_try_field_type_hint_with_finder(
+    const cbm_registry_t *registry, cbm_resolution_t *res, const char *callee_name,
+    int64_t source_id, cbm_pipeline_field_hint_find_fn find_node, void *find_ctx) {
+    if (!registry || !res || !res->qualified_name || res->candidate_count <= SKIP_ONE ||
+        !callee_name || !find_node) {
         return;
     }
     const char *dot = strchr(callee_name, '.');
@@ -317,7 +322,7 @@ static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *regist
             (!strstr(candidates[i], type_name) && !strstr(candidates[i], interface_name))) {
             continue;
         }
-        const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(gbuf, candidates[i]);
+        const cbm_gbuf_node_t *better = find_node(find_ctx, candidates[i]);
         if (better && better->id != source_id) {
             res->qualified_name = candidates[i];
             res->confidence = CBM_PIPELINE_FIELD_TYPE_HINT_CONFIDENCE;
@@ -325,6 +330,19 @@ static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *regist
             return;
         }
     }
+}
+
+static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *registry,
+                                                    const cbm_gbuf_t *gbuf,
+                                                    cbm_resolution_t *res,
+                                                    const char *callee_name,
+                                                    int64_t source_id) {
+    if (!gbuf) {
+        return;
+    }
+    cbm_pipeline_try_field_type_hint_with_finder(
+        registry, res, callee_name, source_id, cbm_pipeline_field_hint_find_in_gbuf,
+        (void *)gbuf);
 }
 
 /* Test-only incremental fault injection. Values name internal phases and are
@@ -644,6 +662,22 @@ int cbm_pipeline_seed_file_delta_scratch_from_store(cbm_store_t *store, cbm_gbuf
                                                     const char *const *changed_paths,
                                                     int changed_path_count);
 const cbm_gbuf_node_t *cbm_pipeline_find_node_by_qn(cbm_pipeline_ctx_t *ctx, const char *qn);
+
+static inline const cbm_gbuf_node_t *cbm_pipeline_field_hint_find_in_ctx(void *ctx,
+                                                                         const char *qn) {
+    return cbm_pipeline_find_node_by_qn((cbm_pipeline_ctx_t *)ctx, qn);
+}
+
+static inline void cbm_pipeline_try_field_type_hint_ctx(cbm_pipeline_ctx_t *ctx,
+                                                        cbm_resolution_t *res,
+                                                        const char *callee_name,
+                                                        int64_t source_id) {
+    if (!ctx) {
+        return;
+    }
+    cbm_pipeline_try_field_type_hint_with_finder(
+        ctx->registry, res, callee_name, source_id, cbm_pipeline_field_hint_find_in_ctx, ctx);
+}
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
  * Each result that declared a namespace/package contributes one entry keyed by
