@@ -1840,6 +1840,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_resolve_cache_begin(result->calls.count + result->usages.count + 64);
 
         char *module_qn = cbm_pipeline_fqn_module(rc->project_name, rel);
+        const char *def_module = rc->def_modules ? rc->def_modules[file_idx] : module_qn;
 
         /* ── Cross-file LSP (FUSED) ─────────────────────────────
          * Runs BEFORE resolve_file_calls so its additions to
@@ -1857,9 +1858,25 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * walks across thousands of files in a single worker thread. */
         if (cross_lsp_eligible) {
             if (result->source && result->source_len > 0) {
-                const char *def_module = rc->def_modules ? rc->def_modules[file_idx] : module_qn;
-
                 uint64_t lsp_t0 = extract_now_ns();
+                const char **lsp_imp_vals = imp_vals;
+                CBMLSPDef *import_refine_defs = NULL;
+                int import_refine_def_count = rc->def_count;
+                if (rc->module_def_index && imp_count > 0) {
+                    int fc = 0;
+                    import_refine_defs =
+                        cbm_pxc_filter_defs_for_file(rc->module_def_index, rc->all_defs,
+                                                     def_module, imp_vals, imp_count, &fc);
+                    if (import_refine_defs) {
+                        import_refine_def_count = fc;
+                    }
+                }
+                const char **refined_imp_vals = cbm_pxc_refine_import_values_from_defs(
+                    &result->arena, import_refine_defs ? import_refine_defs : rc->all_defs,
+                    import_refine_def_count, imp_keys, imp_vals, imp_count);
+                if (refined_imp_vals) {
+                    lsp_imp_vals = refined_imp_vals;
+                }
 
                 /* Tier 2 full fast path: pre-built per-language registry.
                  * When available, skip the per-file registry build entirely
@@ -1883,15 +1900,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                          * just re-derive the same metadata via a second
                          * AST walk and arrive at the same answers — it
                          * is now skipped entirely for Go. */
-                        cbm_go_fast_resolve_qualified_calls(result, prebuilt, imp_keys, imp_vals,
-                                                            imp_count);
+                        cbm_go_fast_resolve_qualified_calls(result, prebuilt, imp_keys,
+                                                            lsp_imp_vals, imp_count);
                         used_prebuilt = true;
                         break;
                     }
                     case CBM_LANG_PYTHON:
                         cbm_run_py_lsp_cross_with_registry(
                             &result->arena, result->source, result->source_len, def_module,
-                            prebuilt, imp_keys, imp_vals, imp_count, result->cached_tree,
+                            prebuilt, imp_keys, lsp_imp_vals, imp_count, result->cached_tree,
                             &result->resolved_calls);
                         used_prebuilt = true;
                         break;
@@ -1900,14 +1917,15 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                     case CBM_LANG_CUDA:
                         cbm_run_c_lsp_cross_with_registry(
                             &result->arena, result->source, result->source_len, def_module,
-                            (lang != CBM_LANG_C), prebuilt, imp_keys, imp_vals, imp_count,
+                            (lang != CBM_LANG_C), prebuilt, imp_keys, lsp_imp_vals, imp_count,
                             result->cached_tree, &result->resolved_calls);
                         used_prebuilt = true;
                         break;
                     case CBM_LANG_CSHARP:
                         cbm_run_cs_lsp_cross_with_registry(&result->arena, result->source,
                                                            result->source_len, def_module, prebuilt,
-                                                           imp_vals, imp_count, result->cached_tree,
+                                                           lsp_imp_vals, imp_count,
+                                                           result->cached_tree,
                                                            &result->resolved_calls);
                         used_prebuilt = true;
                         break;
@@ -1937,7 +1955,7 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                         }
                         cbm_run_ts_lsp_cross_with_registry(
                             &result->arena, result->source, result->source_len, def_module, js, jsx,
-                            dts, prebuilt, ts_defs, ts_def_count, imp_keys, imp_vals, imp_count,
+                            dts, prebuilt, ts_defs, ts_def_count, imp_keys, lsp_imp_vals, imp_count,
                             result->cached_tree, &result->resolved_calls);
                         free(ts_filtered);
                         used_prebuilt = true;
@@ -1970,15 +1988,16 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
                         bool js, jsx, dts;
                         cbm_pxc_ts_modes(lang, rel, &js, &jsx, &dts);
                         cbm_pxc_run_one_ts(result, result->source, result->source_len, def_module,
-                                           file_defs, file_def_count, imp_keys, imp_vals, imp_count,
-                                           js, jsx, dts);
+                                           file_defs, file_def_count, imp_keys, lsp_imp_vals,
+                                           imp_count, js, jsx, dts);
                     } else {
                         cbm_pxc_run_one(lang, result, result->source, result->source_len,
-                                        def_module, file_defs, file_def_count, imp_keys, imp_vals,
-                                        imp_count);
+                                        def_module, file_defs, file_def_count, imp_keys,
+                                        lsp_imp_vals, imp_count);
                     }
                 }
                 free(filtered);
+                free(import_refine_defs);
                 /* Contract: cbm_slab_reclaim() requires the thread parser to be
                  * destroyed first; otherwise its lexer holds slab pointers
                  * (lexer.included_ranges) that get freed underneath it, causing

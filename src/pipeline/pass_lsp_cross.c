@@ -479,6 +479,57 @@ static bool pxc_language_for_store_path(const cbm_pipeline_ctx_t *ctx, const cha
     return false;
 }
 
+static const char *pxc_find_import_symbol_qn(CBMLSPDef *defs, int def_count,
+                                             const char *module_qn,
+                                             const char *local_name) {
+    if (!defs || def_count <= 0 || !module_qn || !module_qn[0] || !local_name ||
+        !local_name[0] || strcmp(local_name, "*") == 0) {
+        return NULL;
+    }
+
+    size_t module_len = strlen(module_qn);
+    for (int i = 0; i < def_count; i++) {
+        const char *qn = defs[i].qualified_name;
+        const char *short_name = defs[i].short_name;
+        if (!qn || !short_name || strcmp(short_name, local_name) != 0) {
+            continue;
+        }
+        if (strncmp(qn, module_qn, module_len) == 0 && qn[module_len] == '.' &&
+            strcmp(qn + module_len + 1, local_name) == 0) {
+            return qn;
+        }
+    }
+    return NULL;
+}
+
+const char **cbm_pxc_refine_import_values_from_defs(CBMArena *arena, CBMLSPDef *defs,
+                                                    int def_count, const char **imp_keys,
+                                                    const char **imp_vals, int imp_count) {
+    if (!arena || !defs || def_count <= 0 || !imp_keys || !imp_vals || imp_count <= 0) {
+        return NULL;
+    }
+
+    const char **refined = NULL;
+    for (int i = 0; i < imp_count; i++) {
+        const char *override =
+            pxc_find_import_symbol_qn(defs, def_count, imp_vals[i], imp_keys[i]);
+        if (!override || (imp_vals[i] && strcmp(override, imp_vals[i]) == 0)) {
+            continue;
+        }
+        if (!refined) {
+            refined = (const char **)cbm_arena_alloc(arena, (size_t)imp_count * sizeof(*refined));
+            if (!refined) {
+                return NULL;
+            }
+            for (int j = 0; j < imp_count; j++) {
+                refined[j] = imp_vals[j];
+            }
+        }
+        refined[i] = override;
+    }
+    return refined;
+}
+
 static CBMLSPDef *pxc_collect_store_backed_defs_for_file(
     const cbm_pipeline_ctx_t *ctx, CBMArena *arena, const char *const *imp_qns, int imp_count,
     int *out_count) {
@@ -550,41 +601,6 @@ static CBMLSPDef *pxc_collect_store_backed_defs_for_file(
     return defs;
 }
 
-static const char *pxc_store_backed_import_value_override(const cbm_pipeline_ctx_t *ctx,
-                                                          CBMArena *arena,
-                                                          const char *module_qn,
-                                                          const char *local_name) {
-    if (!ctx || !arena || !ctx->store_backed_node_lookup || !ctx->project_name ||
-        ctx->store_backed_lsp_scope_cap <= 0 || !module_qn || !module_qn[0] || !local_name ||
-        !local_name[0] || strcmp(local_name, "*") == 0) {
-        return NULL;
-    }
-
-    char *candidate_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, local_name);
-    if (!candidate_qn) {
-        return NULL;
-    }
-
-    cbm_node_t node;
-    memset(&node, 0, sizeof(node));
-    int rc = cbm_store_find_node_by_qn(ctx->store_backed_node_lookup, ctx->project_name,
-                                       candidate_qn, &node);
-    if (rc != CBM_STORE_OK) {
-        return NULL;
-    }
-
-    const char *override = NULL;
-    CBMLanguage lang = CBM_LANG_COUNT;
-    if (node.name && strcmp(node.name, local_name) == 0 && pxc_map_label(node.label) &&
-        !pxc_path_in_list(node.file_path, ctx->store_backed_changed_paths,
-                          ctx->store_backed_changed_path_count) &&
-        pxc_language_for_store_path(ctx, node.file_path, &lang) && cbm_pxc_has_cross_lsp(lang)) {
-        override = candidate_qn;
-    }
-    cbm_node_free_fields(&node);
-    return override;
-}
-
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
     if (!ctx || !files || file_count <= 0 || !cache)
@@ -641,23 +657,6 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         int store_def_count = 0;
         CBMLSPDef *store_defs = pxc_collect_store_backed_defs_for_file(
             ctx, &store_defs_arena, imp_vals, imp_count, &store_def_count);
-        const char **run_imp_vals = imp_vals;
-        if (store_def_count > 0 && imp_count > 0) {
-            const char **override_vals =
-                (const char **)cbm_arena_alloc(&store_defs_arena,
-                                               (size_t)imp_count * sizeof(*override_vals));
-            if (override_vals) {
-                for (int j = 0; j < imp_count; j++) {
-                    const char *override = pxc_store_backed_import_value_override(
-                        ctx, &store_defs_arena, imp_vals ? imp_vals[j] : NULL,
-                        imp_keys ? imp_keys[j] : NULL);
-                    override_vals[j] = override ? override : (imp_vals ? imp_vals[j] : NULL);
-                }
-                run_imp_vals = override_vals;
-            } else {
-                cbm_log_info("lsp_cross.store_imports_skipped", "reason", "alloc");
-            }
-        }
         int run_def_count = def_count + store_def_count;
         CBMLSPDef *run_defs = all_defs;
         bool free_run_defs = false;
@@ -675,6 +674,12 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
                 run_def_count = def_count;
                 cbm_log_info("lsp_cross.store_defs_skipped", "reason", "alloc");
             }
+        }
+        const char **run_imp_vals = imp_vals;
+        const char **refined_imp_vals = cbm_pxc_refine_import_values_from_defs(
+            &store_defs_arena, run_defs, run_def_count, imp_keys, imp_vals, imp_count);
+        if (refined_imp_vals) {
+            run_imp_vals = refined_imp_vals;
         }
 
         if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {

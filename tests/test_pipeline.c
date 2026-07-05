@@ -12434,7 +12434,7 @@ TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs) {
     PASS();
 }
 
-TEST(incremental_exact_scratch_store_backed_lsp_oracle_gap_is_visible) {
+TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild) {
     enum { PIPELINE_STORE_BACKED_EXACT_SCOPE_CAP = CBM_SZ_8 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -12537,9 +12537,9 @@ TEST(incremental_exact_scratch_store_backed_lsp_oracle_gap_is_visible) {
     int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
-        ASSERT(strstr(diff_err, "lsp_method") != NULL);
-        ASSERT(strstr(diff_err, "suffix_match") != NULL);
+        FAIL(diff_err[0] ? diff_err : "store-backed Python exact delta differed from fresh rebuild");
     }
+    ASSERT_EQ(diff_rc, 0);
 
     free(source_qn);
     free(target_qn);
@@ -15251,7 +15251,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
-    RUN_TEST(incremental_exact_scratch_store_backed_lsp_oracle_gap_is_visible);
+    RUN_TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild);
     RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
