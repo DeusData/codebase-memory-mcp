@@ -545,6 +545,49 @@ bool cbm_is_loop_node_type(const char *kind) {
     return false;
 }
 
+static bool cbm_c_family_terminal_name_kind(const char *kind) {
+    return strcmp(kind, "identifier") == 0 || strcmp(kind, "field_identifier") == 0 ||
+           strcmp(kind, "operator_name") == 0 || strcmp(kind, "operator_cast") == 0 ||
+           strcmp(kind, "destructor_name") == 0;
+}
+
+static TSNode cbm_c_family_qualified_name_node(TSNode decl) {
+    static const char *name_kinds[] = {"operator_name", "operator_cast",    "destructor_name",
+                                       "identifier",    "field_identifier", NULL};
+    for (const char **kind = name_kinds; *kind; kind++) {
+        TSNode found = cbm_find_child_by_kind(decl, *kind);
+        if (!ts_node_is_null(found)) {
+            return found;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+TSNode cbm_c_family_declarator_name(TSNode node) {
+    enum { CBM_C_DECLARATOR_DEPTH_LIMIT = 8 };
+    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
+    for (int depth = 0; depth < CBM_C_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
+        const char *kind = ts_node_type(decl);
+        if (cbm_c_family_terminal_name_kind(kind)) {
+            return decl;
+        }
+        if (strcmp(kind, "qualified_identifier") == 0 || strcmp(kind, "scoped_identifier") == 0) {
+            return cbm_c_family_qualified_name_node(decl);
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        if (ts_node_is_null(inner)) {
+            break;
+        }
+        decl = inner;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
 // Is `kind` a chained member/subscript access node? Language-agnostic generic
 // set covering the common grammars; used only for the structural "access depth"
 // smell, so unmatched grammars simply report 0 (never wrong, just silent).
@@ -757,6 +800,16 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
 // Get the name of a function node (basic: try "name" field)
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+         lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+         lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC) &&
+        strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        TSNode c_name = cbm_c_family_declarator_name(func_node);
+        if (!ts_node_is_null(c_name)) {
+            return cbm_node_text(a, c_name, source);
+        }
+    }
+
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
     if (lang == CBM_LANG_WOLFRAM) {
         const char *nk = ts_node_type(func_node);

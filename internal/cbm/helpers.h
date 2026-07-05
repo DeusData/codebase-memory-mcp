@@ -42,6 +42,10 @@ const char *cbm_enclosing_func_qn_cached(CBMExtractCtx *ctx, TSNode node);
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// Resolve the terminal name node from a C-family function declarator chain.
+// Used by both definition extraction and call-scope attribution.
+TSNode cbm_c_family_declarator_name(TSNode node);
+
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
 

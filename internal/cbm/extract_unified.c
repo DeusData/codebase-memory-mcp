@@ -105,6 +105,16 @@ static const char *compute_ocaml_func_qn(CBMExtractCtx *ctx, TSNode node) {
 
 // Resolve the name node for function-scope attribution.
 static TSNode resolve_func_name_node(TSNode node, CBMLanguage lang) {
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+         lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+         lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC) &&
+        strcmp(ts_node_type(node), "function_definition") == 0) {
+        TSNode c_name = cbm_c_family_declarator_name(node);
+        if (!ts_node_is_null(c_name)) {
+            return c_name;
+        }
+    }
+
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "arrow_function") == 0) {
         TSNode parent = ts_node_parent(node);
