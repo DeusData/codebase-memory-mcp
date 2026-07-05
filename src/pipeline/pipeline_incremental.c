@@ -1631,6 +1631,7 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
     cbm_gbuf_t *scratch = NULL;
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
+    CBMHashTable *pkgmap = NULL;
     cbm_pipeline_file_delta_t *deltas = NULL;
     cbm_pipeline_file_delta_t *additive_deltas = NULL;
     const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
@@ -1677,6 +1678,9 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
     }
 
     path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    pkgmap = cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), changed_files, changed_count,
+                                        project);
+    cbm_pipeline_set_pkgmap(pkgmap);
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
@@ -1851,6 +1855,10 @@ cleanup:
     incr_free_file_deltas(deltas, changed_count);
     incr_free_result_cache(result_cache, changed_count);
     cbm_path_alias_collection_free(path_aliases);
+    if (cbm_pipeline_get_pkgmap() == pkgmap) {
+        cbm_pipeline_set_pkgmap(NULL);
+    }
+    cbm_pkgmap_free(pkgmap);
     cbm_registry_free(registry);
     cbm_gbuf_free(scratch);
     free(changed_paths);
@@ -1897,6 +1905,14 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     bool exact_deferred_global_derived =
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST &&
         cbm_pipeline_incremental_derived_refresh_stale_on_exact(p);
+    if (scoped_overlay_gap) {
+        cbm_pipeline_set_exact_delta_stats_with_limit(
+            p, input_path_count, input_path_count, -1, max_affected_paths, true);
+        cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
+        cbm_log_info("incremental.exact.skip", "reason", "scoped_lsp_gap", "action",
+                     "full_reindex");
+        return CBM_STORE_OK;
+    }
     if (deleted_count < 0 || changed_count > max_changed_paths ||
         (cbm_pipeline_get_mode(p) < CBM_MODE_FAST && !exact_deferred_global_derived) ||
         input_path_count > max_affected_paths) {
@@ -1967,6 +1983,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_gbuf_t *scratch = NULL;
     cbm_registry_t *registry = NULL;
     cbm_path_alias_collection_t *path_aliases = NULL;
+    CBMHashTable *pkgmap = NULL;
     cbm_pipeline_file_delta_t *deltas = NULL;
     const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
     const cbm_store_file_delta_t **store_delta_ptrs = NULL;
@@ -2021,6 +2038,9 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
 
     path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    pkgmap = cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), exact_files, exact_count,
+                                        project);
+    cbm_pipeline_set_pkgmap(pkgmap);
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
         .repo_path = cbm_pipeline_repo_path(p),
@@ -2302,6 +2322,10 @@ cleanup:
     incr_free_file_deltas(deltas, delta_count);
     incr_free_result_cache(result_cache, exact_count);
     cbm_path_alias_collection_free(path_aliases);
+    if (cbm_pipeline_get_pkgmap() == pkgmap) {
+        cbm_pipeline_set_pkgmap(NULL);
+    }
+    cbm_pkgmap_free(pkgmap);
     cbm_registry_free(registry);
     cbm_gbuf_free(scratch);
     free(changed_paths);

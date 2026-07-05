@@ -2,6 +2,7 @@
 
 #include "foundation/compat.h"
 #include "foundation/constants.h"
+#include "foundation/log.h"
 #include "foundation/str_util.h"
 
 #include <inttypes.h>
@@ -44,6 +45,7 @@ static const char cbm_delta_reason_rename_requires_full[] = "rename_requires_ful
 static const char cbm_delta_reason_unresolved_edge_endpoint[] = "unresolved_edge_endpoint";
 static const char cbm_delta_reason_unsupported_derived_view[] = "unsupported_derived_view";
 static const char cbm_delta_reason_unsupported_edges[] = "unsupported_edges";
+static const char cbm_delta_debug_inbound_env[] = "CBM_DEBUG_DELTA_INBOUND";
 
 static const char *const cbm_delta_scratch_graph_seed_labels[] = {
     "Project", "Branch", "Folder", "File", "Module", NULL,
@@ -1035,6 +1037,26 @@ static bool delta_inbound_edge_is_regenerated_by_batch(
                                      edge->type);
 }
 
+static void delta_inbound_debug_unsupported(const cbm_store_file_delta_t *delta,
+                                            const cbm_store_inbound_edge_t *edge,
+                                            int delta_count) {
+    char env[CBM_SZ_16];
+    if (!delta || !edge ||
+        cbm_safe_getenv(cbm_delta_debug_inbound_env, env, sizeof(env), NULL) == NULL ||
+        env[0] == '\0' || env[0] == '0') {
+        return;
+    }
+    char delta_count_buf[CBM_SZ_16];
+    if (snprintf(delta_count_buf, sizeof(delta_count_buf), "%d", delta_count) < 0) {
+        return;
+    }
+    cbm_log_debug("delta.inbound.unsupported", "project", delta->project, "rel_path",
+                  delta->rel_path, "source_path", edge->source_rel_path, "edge_path",
+                  edge->edge_rel_path, "target_path", edge->target_rel_path, "type",
+                  edge->type, "source_qn", edge->source_qn, "target_qn", edge->target_qn,
+                  "delta_count", delta_count_buf);
+}
+
 static bool delta_owned_inbound_edge_is_deleted(const cbm_store_inbound_edge_t *edge,
                                                 const cbm_pipeline_file_delta_t *delta) {
     return edge && delta && delta->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE &&
@@ -1061,6 +1083,7 @@ static bool delta_inbound_edges_supported(cbm_store_t *store,
                                        edges[i].target_qn, edges[i].type) &&
             !delta_inbound_edge_is_regenerated_by_batch(&edges[i], deltas, delta_count) &&
             !delta_owned_inbound_edge_is_deleted(&edges[i], delta)) {
+            delta_inbound_debug_unsupported(&delta->delta, &edges[i], delta_count);
             ok = false;
             break;
         }
