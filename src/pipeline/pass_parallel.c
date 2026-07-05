@@ -1308,7 +1308,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);
             return;
         }
-        if (suffix_only_route_reg) {
+        if (suffix_only_route_reg && (!target || source->id == target->id)) {
             return;
         }
         /* A resolved route-registration API with no route literal is still a

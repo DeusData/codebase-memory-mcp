@@ -1118,6 +1118,47 @@ static bool resolved_call_contains(const CBMResolvedCallArray *arr, const char *
     return false;
 }
 
+typedef struct {
+    const cbm_gbuf_t *gbuf;
+    const char *source_sub;
+    const char *target_sub;
+    const char *props_sub;
+    bool found;
+} call_edge_contains_ctx_t;
+
+static void call_edge_contains_visit(const cbm_gbuf_edge_t *edge, void *ud) {
+    call_edge_contains_ctx_t *ctx = ud;
+    if (!ctx || ctx->found || !edge || !edge->type || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(ctx->gbuf, edge->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gbuf, edge->target_id);
+    if (!source || !target || !source->qualified_name || !target->qualified_name) {
+        return;
+    }
+    if (strstr(source->qualified_name, ctx->source_sub) &&
+        strstr(target->qualified_name, ctx->target_sub) &&
+        (!ctx->props_sub ||
+         (edge->properties_json && strstr(edge->properties_json, ctx->props_sub)))) {
+        ctx->found = true;
+    }
+}
+
+static bool call_edge_contains(const cbm_gbuf_t *gbuf, const char *source_sub,
+                               const char *target_sub, const char *props_sub) {
+    if (!gbuf || !source_sub || !target_sub) {
+        return false;
+    }
+    call_edge_contains_ctx_t ctx = {
+        .gbuf = gbuf,
+        .source_sub = source_sub,
+        .target_sub = target_sub,
+        .props_sub = props_sub,
+    };
+    cbm_gbuf_foreach_edge(gbuf, call_edge_contains_visit, &ctx);
+    return ctx.found;
+}
+
 TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_XXXXXX");
@@ -1326,6 +1367,12 @@ TEST(parallel_cross_lsp_pruning_requires_matching_call_resolution) {
 
     ASSERT_TRUE(resolved_call_contains(&result_cache[0]->resolved_calls, "include_router",
                                        "add_api_route"));
+    lsp_edge_count_ctx_t lsp_edges = {0};
+    cbm_gbuf_foreach_edge(gbuf, count_lsp_call_edges, &lsp_edges);
+    ASSERT_GT(lsp_edges.total_calls, 0);
+    ASSERT_GT(lsp_edges.lsp_strategy_count, 0);
+    ASSERT_TRUE(call_edge_contains(gbuf, "APIRouter.include_router", "APIRouter.add_api_route",
+                                   "\"strategy\":\"lsp_method\""));
 
     cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
