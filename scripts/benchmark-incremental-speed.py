@@ -1215,16 +1215,18 @@ def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> li
         path = repo_dir / rel
         source = path.read_text(encoding="utf-8")
         insert = (
-            "\n\n"
-            "def cbm_frontier_noop_mask_probe() -> int:\n"
-            f"    return {FASTAPI_PROBE_RETURN_VALUE}\n"
+            "\n"
+            "    def cbm_frontier_noop_mask_probe(self) -> int:\n"
+            f"        return {FASTAPI_PROBE_RETURN_VALUE}\n"
         )
         if FASTAPI_PROBE_INSERT_BEFORE not in source:
             raise RuntimeError(f"FastAPI probe insertion point not found: {rel.as_posix()}")
-        path.write_text(
-            source.replace(FASTAPI_PROBE_INSERT_BEFORE, insert + FASTAPI_PROBE_INSERT_BEFORE, 1),
-            encoding="utf-8",
-        )
+        mutated = source.replace(FASTAPI_PROBE_INSERT_BEFORE, insert + FASTAPI_PROBE_INSERT_BEFORE, 1)
+        try:
+            compile(mutated, rel.as_posix(), "exec")
+        except SyntaxError as exc:
+            raise RuntimeError(f"FastAPI probe mutation produced invalid Python: {exc}") from exc
+        path.write_text(mutated, encoding="utf-8")
         return [rel.as_posix()]
     raise ValueError(f"unknown matrix scenario: {name}")
 
