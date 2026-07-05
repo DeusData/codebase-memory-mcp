@@ -11455,9 +11455,8 @@ TEST(incremental_fast_route_decorator_change_matches_full_rebuild) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
-    cbm_pipeline_publish_kind_t kind = cbm_pipeline_publish_kind(p);
-    ASSERT(kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT ||
-           kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
     cbm_pipeline_free(p);
 
     ASSERT(!pipeline_store_has_route_name(g_incr_dbpath, project, "/api/orders"));
@@ -11847,8 +11846,8 @@ TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
     PASS();
 }
 
-TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_direct_exact) {
-    enum { PIPELINE_EXACT_TWO_PATHS = 2 };
+TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
+    enum { PIPELINE_EXACT_ONE_PATH = 1 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -11875,7 +11874,7 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_direct_exact) {
                              CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
               0);
     char cap_value[CBM_SZ_32];
-    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_TWO_PATHS);
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_ONE_PATH);
     ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
               0);
@@ -11903,21 +11902,24 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_direct_exact) {
     int run_rc = cbm_pipeline_run(p);
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
-    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
-    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") != NULL);
     ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
     cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
     ASSERT_EQ(stats.changed_paths, 1);
-    ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_TWO_PATHS);
-    ASSERT_EQ(stats.published_paths, 1);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_ONE_PATH);
+    ASSERT_EQ(stats.published_paths, -1);
     cbm_pipeline_free(p);
 
     char diff_err[CBM_SZ_8K] = {0};
     int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
-        FAIL(diff_err[0] ? diff_err : "Python scoped-LSP fallback differed from fresh rebuild");
+        FAIL(diff_err[0] ? diff_err
+                         : "Python scoped-LSP full reindex differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -14491,7 +14493,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
-    RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_direct_exact);
+    RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
