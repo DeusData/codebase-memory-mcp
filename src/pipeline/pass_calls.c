@@ -11,7 +11,16 @@
  */
 #include "foundation/constants.h"
 
-enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
+enum {
+    PC_RING = 4,
+    PC_RING_MASK = 3,
+    PC_SIG_SCAN = 15,
+    PC_REGEX_GRP = 2,
+    /* Keep sequential CALLS/HTTP/CONFIG edge property capacity aligned with
+     * pass_parallel.c so incremental overlays serialize the same call args as
+     * a fresh full index. */
+    PC_CALL_PROPS_CAP = CBM_SZ_2K,
+};
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
@@ -160,7 +169,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (!is_url && !is_topic) {
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
-        char props[CBM_SZ_512];
+        char props[PC_CALL_PROPS_CAP];
         snprintf(props, sizeof(props),
                  "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
                  esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
@@ -182,7 +191,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
-    char props[CBM_SZ_512];
+    char props[PC_CALL_PROPS_CAP];
     snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
              esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
              broker ? ",\"broker\":\"" : "", broker ? broker : "");
@@ -219,7 +228,7 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         char esc_k[CBM_SZ_256];
         cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
         cbm_json_escape(esc_k, sizeof(esc_k), call->first_string_arg ? call->first_string_arg : "");
-        char props[CBM_SZ_512];
+        char props[PC_CALL_PROPS_CAP];
         snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"key\":\"%s\",\"confidence\":%.2f}",
                  esc_c, esc_k, res->confidence);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
@@ -228,7 +237,7 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
-    char props[CBM_SZ_512];
+    char props[PC_CALL_PROPS_CAP];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\",\"candidates\":%d}",
              esc_c2, res->confidence, res->strategy ? res->strategy : "unknown",
