@@ -104,6 +104,10 @@ static const char *simple_name(const char *qn) {
     return seg;
 }
 
+static bool callee_has_qualified_separator(const char *callee_name) {
+    return callee_name && (strchr(callee_name, '.') != NULL || strstr(callee_name, "::") != NULL);
+}
+
 /* Extract everything before the last dot. Returns heap-allocated string. */
 
 /* Check if a qualified name looks like a test/mock path. */
@@ -613,7 +617,8 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
 
 /* Strategy 4: multiple candidates with import filtering. */
 static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const char *module_qn,
-                                                   const char **import_vals, int import_count) {
+                                                   const char **import_vals, int import_count,
+                                                   bool callee_qualified) {
     const char *filtered[CBM_SZ_256];
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
@@ -632,7 +637,10 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
-    /* No import-reachable — use all candidates with penalty */
+    if (callee_qualified) {
+        return empty_result();
+    }
+    /* No import-reachable for a bare callee — use all candidates with penalty. */
     const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
@@ -672,7 +680,7 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     dotted[w] = '\0';
     /* Must be qualified (contain a '.') — a bare name matches every candidate
      * and carries no disambiguating signal. */
-    if (!strchr(dotted, '.')) {
+    if (!callee_has_qualified_separator(dotted)) {
         return NULL;
     }
     const char *match = NULL;
@@ -733,7 +741,8 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 4: multiple candidates */
     if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
+        return resolve_multi_with_imports(arr, module_qn, import_vals, import_count,
+                                          callee_has_qualified_separator(callee_name));
     }
     const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (best) {

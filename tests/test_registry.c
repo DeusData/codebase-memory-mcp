@@ -326,6 +326,40 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
     PASS();
 }
 
+TEST(resolve_qualified_imported_external_rejects_unreachable_suffix) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "Message", "proj.docs.additional.Message", "Class");
+    cbm_registry_add(r, "Message", "proj.models.Message", "Class");
+    cbm_registry_add(r, "Message", "proj.other.Message", "Class");
+
+    const char *keys[] = {"email.message"};
+    const char *vals[] = {"email.message"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "email.message.Message", "proj.fastapi.routing", keys, vals, 1);
+    ASSERT_TRUE(!res.qualified_name || res.qualified_name[0] == '\0');
+    ASSERT_TRUE(!res.strategy || res.strategy[0] == '\0');
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+TEST(resolve_dotted_receiver_rejects_unreachable_suffix_when_imports_exist) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "get", "proj.fastapi.routing.APIRouter.get", "Method");
+    cbm_registry_add(r, "get", "proj.datastructures.Headers.get", "Method");
+    cbm_registry_add(r, "get", "proj.other.Mapping.get", "Method");
+
+    const char *keys[] = {"Request"};
+    const char *vals[] = {"starlette.requests.Request"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "response.get", "proj.fastapi.routing", keys, vals, 1);
+    ASSERT_TRUE(!res.qualified_name || res.qualified_name[0] == '\0');
+    ASSERT_TRUE(!res.strategy || res.strategy[0] == '\0');
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
@@ -797,6 +831,8 @@ SUITE(registry) {
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(resolve_qualified_imported_external_rejects_unreachable_suffix);
+    RUN_TEST(resolve_dotted_receiver_rejects_unreachable_suffix_when_imports_exist);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_unique_name);
