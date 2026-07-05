@@ -94,6 +94,13 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
                                         const char *own_module, const char *const *imp_qns,
                                         int imp_count, int *out_count);
 
+/* Return arena-owned import values refined from module QNs to imported symbol
+ * QNs when defs prove `module_qn.local_name` exists. Returns NULL when no
+ * values need refinement; callers should then keep using imp_vals. */
+const char **cbm_pxc_refine_import_values_from_defs(CBMArena *arena, CBMLSPDef *defs,
+                                                    int def_count, const char **imp_keys,
+                                                    const char **imp_vals, int imp_count);
+
 /* ── Tier 2 full: pre-built per-language cross-LSP registries ─────
  *
  * Each non-NULL registry is built ONCE in pipeline.c (in a dedicated
