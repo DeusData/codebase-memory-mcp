@@ -541,6 +541,71 @@ TEST(pipeline_call_edge_props_include_args_and_line) {
     PASS();
 }
 
+TEST(pipeline_sequential_call_edges_preserve_eighth_arg) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    const char *py_path = TH_PATH(g_tmpdir, "wide_args.py");
+    ASSERT_EQ(th_write_file(py_path,
+                            "def wide_target(**kwargs):\n"
+                            "    return kwargs\n"
+                            "\n"
+                            "def wide_caller():\n"
+                            "    first_expression_value = 1\n"
+                            "    second_expression_value = 2\n"
+                            "    third_expression_value = 3\n"
+                            "    fourth_expression_value = 4\n"
+                            "    fifth_expression_value = 5\n"
+                            "    sixth_expression_value = 6\n"
+                            "    seventh_expression_value = 7\n"
+                            "    eighth_expression_value = 8\n"
+                            "    return wide_target(\n"
+                            "        first_keyword_argument=first_expression_value,\n"
+                            "        second_keyword_argument=second_expression_value,\n"
+                            "        third_keyword_argument=third_expression_value,\n"
+                            "        fourth_keyword_argument=fourth_expression_value,\n"
+                            "        fifth_keyword_argument=fifth_expression_value,\n"
+                            "        sixth_keyword_argument=sixth_expression_value,\n"
+                            "        seventh_keyword_argument=seventh_expression_value,\n"
+                            "        eighth_keyword_argument=eighth_expression_value,\n"
+                            "    )\n"),
+              0);
+
+    char db_path[CBM_SZ_512];
+    int n = snprintf(db_path, sizeof(db_path), "%s/wide_args.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_NOT_NULL(project);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    const char sql[] =
+        "SELECT e.properties FROM edges e "
+        "JOIN nodes t ON t.id = e.target_id "
+        "WHERE e.project = ?1 AND e.type = 'CALLS' AND t.name = 'wide_target' "
+        "LIMIT 1";
+    ASSERT_EQ(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    const char *edge_props = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_NOT_NULL(edge_props);
+    ASSERT(strstr(edge_props, "\"k\":\"eighth_keyword_argument\"") != NULL);
+    ASSERT(strstr(edge_props, "\"e\":\"eighth_expression_value\"") != NULL);
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 TEST(pipeline_fast_mode) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -14436,6 +14501,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_project_name_derived);
     RUN_TEST(pipeline_mode_global_semantic_edges_policy);
     RUN_TEST(pipeline_call_edge_props_include_args_and_line);
+    RUN_TEST(pipeline_sequential_call_edges_preserve_eighth_arg);
     RUN_TEST(pipeline_fast_mode);
     /* Definitions pass */
     RUN_TEST(pipeline_definitions_function_nodes);

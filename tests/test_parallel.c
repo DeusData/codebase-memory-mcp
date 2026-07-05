@@ -500,6 +500,59 @@ static int count_route_registration_for_path(cbm_gbuf_t *gbuf, const char *url_p
     return c.route_registration_calls;
 }
 
+static void count_exception_edges(const cbm_gbuf_edge_t *edge, void *ud) {
+    int *count = (int *)ud;
+    if (!edge || !edge->type || !count) {
+        return;
+    }
+    if (strcmp(edge->type, "THROWS") == 0 || strcmp(edge->type, "RAISES") == 0) {
+        (*count)++;
+    }
+}
+
+static int exception_edge_count(cbm_gbuf_t *gbuf) {
+    int count = 0;
+    cbm_gbuf_foreach_edge(gbuf, count_exception_edges, &count);
+    return count;
+}
+
+TEST(parallel_top_level_raise_matches_sequential_no_file_fallback) {
+    char dir[CBM_PATH_MAX];
+    int n = snprintf(dir, sizeof(dir), "%s/cbm_top_raise_XXXXXX", cbm_tmpdir());
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(dir));
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    const char *source =
+        "class HTTPException(Exception):\n"
+        "    pass\n\n"
+        "raise HTTPException()\n";
+
+    char path[CBM_PATH_MAX];
+    n = snprintf(path, sizeof(path), "%s/app.py", dir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(path));
+    ASSERT_EQ(th_write_file(path, source), 0);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *seq = run_sequential("cbm_top_raise", dir, files, 1);
+    cbm_gbuf_t *par = run_parallel("cbm_top_raise", dir, files, 1, 1);
+    ASSERT_NOT_NULL(seq);
+    ASSERT_NOT_NULL(par);
+
+    ASSERT_EQ(exception_edge_count(seq), 0);
+    ASSERT_EQ(exception_edge_count(par), 0);
+
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(dir);
+    PASS();
+}
+
 TEST(parallel_fastapi_websocket_route_registration_matches_sequential) {
     char dir[256];
     snprintf(dir, sizeof(dir), "/tmp/cbm_ws_routes_XXXXXX");
@@ -1256,6 +1309,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
     RUN_TEST(parallel_unresolved_route_suffix_does_not_emit_self_call);
+    RUN_TEST(parallel_top_level_raise_matches_sequential_no_file_fallback);
     RUN_TEST(parallel_fastapi_websocket_route_registration_matches_sequential);
 
     /* Cleanup shared state */

@@ -136,6 +136,7 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
                                const char *rel, const char *module_qn, const char **imp_keys,
                                const char **imp_vals, int imp_count) {
+    (void)rel; /* Throws intentionally match the parallel pass: no file-node fallback. */
     int resolved = 0;
     for (int t = 0; t < result->throws.count; t++) {
         CBMThrow *thr = &result->throws.items[t];
@@ -143,8 +144,9 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             continue;
         }
 
-        const cbm_gbuf_node_t *src = find_enclosing_node(ctx, thr->enclosing_func_qn, rel);
-        if (!src) {
+        const cbm_gbuf_node_t *src =
+            thr->enclosing_func_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, thr->enclosing_func_qn) : NULL;
+        if (!cbm_pipeline_node_is_callable_scope(src)) {
             continue;
         }
 

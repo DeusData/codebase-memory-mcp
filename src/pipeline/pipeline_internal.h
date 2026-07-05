@@ -139,6 +139,11 @@ static inline bool cbm_pipeline_label_is_import_target(const char *label) {
                      strcmp(label, "File") == 0);
 }
 
+static inline bool cbm_pipeline_node_is_callable_scope(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0);
+}
+
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
 #define CBM_US_PER_SEC 1000000LL
