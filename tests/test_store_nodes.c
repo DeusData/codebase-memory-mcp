@@ -3714,6 +3714,77 @@ TEST(store_file_delta_publish_repeated_edge_endpoints) {
     PASS();
 }
 
+TEST(store_file_delta_publish_duplicate_edge_merges_properties) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t nodes[CBM_SZ_2] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "A",
+         .qualified_name = "test.main.A",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "B",
+         .qualified_name = "test.main.B",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+    };
+    cbm_store_delta_edge_t edges[CBM_SZ_32];
+    for (int i = 0; i < CBM_SZ_32; i++) {
+        edges[i] = (cbm_store_delta_edge_t){.source_qn = "test.main.A",
+                                            .target_qn = "test.main.B",
+                                            .type = "CALLS",
+                                            .properties_json = "{}"};
+    }
+    edges[0].properties_json = "{\"first\":1}";
+    edges[1].properties_json = "{\"second\":2}";
+    cbm_file_hash_t hash = {.project = "test",
+                            .rel_path = "main.go",
+                            .sha256 = "dup-hash",
+                            .mtime_ns = 1,
+                            .size = 10};
+    cbm_file_state_t state = {.project = "test",
+                              .rel_path = "main.go",
+                              .content_hash = "dup-content",
+                              .git_oid = "",
+                              .mtime_ns = 1,
+                              .size = 10,
+                              .language = "c",
+                              .pass_fingerprint = "pass-a",
+                              .generation = 1,
+                              .indexed_at = "2026-06-30T00:00:00Z"};
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "main.go",
+                                    .generation = 1,
+                                    .file_hash = &hash,
+                                    .file_state = &state,
+                                    .nodes = nodes,
+                                    .node_count = CBM_SZ_2,
+                                    .edges = edges,
+                                    .edge_count = CBM_SZ_32,
+                                    .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                    .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), 1);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "main.go"), 1);
+
+    cbm_edge_t *stored = NULL;
+    int stored_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, "test", "CALLS", &stored, &stored_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(stored_count, 1);
+    ASSERT(strstr(stored[0].properties_json, "\"first\":1") != NULL);
+    ASSERT(strstr(stored[0].properties_json, "\"second\":2") != NULL);
+    cbm_store_free_edges(stored, stored_count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 static int store_publish_helper_file_delta_named(cbm_store_t *s, int64_t generation,
                                                 const char *name, const char *qualified_name,
                                                 const char *sha256, const char *content_hash) {
@@ -6100,6 +6171,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_affected_paths_high_fanout_dedupes);
     RUN_TEST(store_file_delta_publish_rolls_back_on_failure);
     RUN_TEST(store_file_delta_publish_repeated_edge_endpoints);
+    RUN_TEST(store_file_delta_publish_duplicate_edge_merges_properties);
     RUN_TEST(store_file_delta_publish_matches_fresh_final_graph);
     RUN_TEST(store_file_delta_graph_noop_refreshes_metadata_only);
     RUN_TEST(store_file_delta_preserves_owned_graph_detects_additive_subset);
