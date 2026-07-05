@@ -9461,6 +9461,8 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
     CBMFileResult **result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
     cbm_gbuf_t *scratch = cbm_gbuf_new(project, repo_path);
     cbm_registry_t *registry = cbm_registry_new();
+    cbm_path_alias_collection_t *path_aliases = NULL;
+    CBMHashTable *pkgmap = NULL;
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
     int rc = CBM_STORE_ERR;
@@ -9476,6 +9478,10 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
         goto cleanup;
     }
 
+    path_aliases = cbm_load_path_aliases(repo_path);
+    pkgmap = cbm_pkgmap_build_from_repo(repo_path, changed_files, changed_count, project);
+    cbm_pipeline_set_pkgmap(pkgmap);
+
     const double pipeline_default_threshold = 0.0; /* Pipeline constructor sentinel: use pass defaults. */
     cbm_pipeline_ctx_t ctx = {.project_name = project,
                               .repo_path = repo_path,
@@ -9488,6 +9494,7 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
                               .semantic_threshold = pipeline_default_threshold,
                               .githistory_min_coupling = pipeline_default_threshold,
                               .lsp_confidence_floor = pipeline_default_threshold,
+                              .path_aliases = path_aliases,
                               .result_cache = result_cache,
                               .store_backed_node_lookup = store,
                               .store_backed_changed_paths = changed_paths,
@@ -9536,6 +9543,11 @@ cleanup:
         }
     }
     free(result_cache);
+    cbm_path_alias_collection_free(path_aliases);
+    if (cbm_pipeline_get_pkgmap() == pkgmap) {
+        cbm_pipeline_set_pkgmap(NULL);
+    }
+    cbm_pkgmap_free(pkgmap);
     cbm_registry_free(registry);
     cbm_gbuf_free(scratch);
     free(changed_paths);
@@ -11923,6 +11935,137 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
     }
     ASSERT_EQ(diff_rc, 0);
 
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char fastapi_dir[CBM_PATH_MAX];
+    int n = snprintf(fastapi_dir, sizeof(fastapi_dir), "%s/fastapi", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fastapi_dir));
+    ASSERT_EQ(cbm_mkdir(fastapi_dir), 0);
+
+    char init_path[CBM_PATH_MAX];
+    char exceptions_path[CBM_PATH_MAX];
+    char datastructures_path[CBM_PATH_MAX];
+    char routing_path[CBM_PATH_MAX];
+    n = snprintf(init_path, sizeof(init_path), "%s/fastapi/__init__.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(init_path));
+    n = snprintf(exceptions_path, sizeof(exceptions_path), "%s/fastapi/exceptions.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(exceptions_path));
+    n = snprintf(datastructures_path, sizeof(datastructures_path),
+                 "%s/fastapi/datastructures.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(datastructures_path));
+    n = snprintf(routing_path, sizeof(routing_path), "%s/fastapi/routing.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(routing_path));
+
+    ASSERT_EQ(th_write_file(init_path,
+                            "from .datastructures import DefaultPlaceholder\n"
+                            "from .exceptions import HTTPException\n"),
+              0);
+    ASSERT_EQ(th_write_file(exceptions_path,
+                            "class HTTPException(Exception):\n"
+                            "    pass\n"),
+              0);
+    ASSERT_EQ(th_write_file(datastructures_path,
+                            "class DefaultPlaceholder:\n"
+                            "    pass\n"),
+              0);
+    ASSERT_EQ(th_write_file(routing_path,
+                            "from fastapi.datastructures import DefaultPlaceholder\n"
+                            "from fastapi.exceptions import HTTPException\n\n"
+                            "def serialize_response(field=None, response_content=None):\n"
+                            "    return response_content\n\n"
+                            "def route_handler(response_field, raw_response):\n"
+                            "    marker = DefaultPlaceholder()\n"
+                            "    if marker:\n"
+                            "        raise HTTPException()\n"
+                            "    return raw_response\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(routing_path,
+                            "from fastapi.datastructures import DefaultPlaceholder\n"
+                            "from fastapi.exceptions import HTTPException\n\n"
+                            "def serialize_response(field=None, response_content=None, include=None, "
+                            "exclude=None, by_alias=True, exclude_unset=False, "
+                            "exclude_defaults=False, exclude_none=False):\n"
+                            "    return response_content\n\n"
+                            "def route_handler(response_field, raw_response, response_model_include, "
+                            "response_model_exclude, response_model_by_alias, "
+                            "response_model_exclude_unset, response_model_exclude_defaults, "
+                            "response_model_exclude_none):\n"
+                            "    marker = DefaultPlaceholder()\n"
+                            "    if not marker:\n"
+                            "        return raw_response\n"
+                            "    return serialize_response(field=response_field, "
+                            "response_content=raw_response, include=response_model_include, "
+                            "exclude=response_model_exclude, by_alias=response_model_by_alias, "
+                            "exclude_unset=response_model_exclude_unset, "
+                            "exclude_defaults=response_model_exclude_defaults, "
+                            "exclude_none=response_model_exclude_none)\n"),
+              0);
+
+    cbm_file_info_t changed = {
+        .path = routing_path,
+        .rel_path = "fastapi/routing.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             &changed, CBM_ALLOC_ONE, &scratch,
+                                                             &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, deltas, CBM_ALLOC_ONE,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "Python exact scratch delta differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
     free(project);
     cbm_config_close(cfg);
     cleanup_incremental_repo();
@@ -14494,6 +14637,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex);
+    RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
