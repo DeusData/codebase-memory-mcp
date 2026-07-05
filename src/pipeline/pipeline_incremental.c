@@ -1423,7 +1423,8 @@ static char *incr_frontier_import_target_qn(const char *project, const char *rel
 static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *project,
                                               const cbm_file_info_t *all_files, int all_file_count,
                                               cbm_file_info_t *exact_files, int *exact_count,
-                                              int max_exact_files, const char **out_reason) {
+                                              int max_exact_files, bool recursive,
+                                              const char **out_reason) {
     if (out_reason) {
         *out_reason = NULL;
     }
@@ -1437,7 +1438,8 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
 
     const int original_exact_count = *exact_count;
     bool saw_batch_owned_empty_source_edge = false;
-    for (int cursor = 0; cursor < *exact_count; cursor++) {
+    for (int cursor = 0; cursor < *exact_count && (recursive || cursor < original_exact_count);
+         cursor++) {
         const char *rel_path = exact_files[cursor].rel_path;
         cbm_store_inbound_edge_t *edges = NULL;
         int edge_count = 0;
@@ -1891,6 +1893,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     int max_affected_paths = cbm_pipeline_exact_max_affected_paths(p);
     int input_path_count = changed_count + deleted_count;
     cbm_pipeline_set_exact_delta_stats(p, input_path_count, -1, -1);
+    bool scoped_overlay_gap = incr_changed_has_scoped_overlay_gap(changed_files, changed_count);
     bool exact_deferred_global_derived =
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST &&
         cbm_pipeline_incremental_derived_refresh_stale_on_exact(p);
@@ -1928,7 +1931,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     const char *frontier_reason = NULL;
     int frontier_rc = incr_expand_exact_inbound_frontier(store, project, all_files, all_file_count,
                                                         exact_files, &exact_count, exact_file_cap,
-                                                        &frontier_reason);
+                                                        !scoped_overlay_gap, &frontier_reason);
     if (frontier_rc != CBM_STORE_OK) {
         bool frontier_truncated =
             frontier_reason && strcmp(frontier_reason,
@@ -1968,19 +1971,24 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     const cbm_pipeline_file_delta_t **delta_ptrs = NULL;
     const cbm_store_file_delta_t **store_delta_ptrs = NULL;
     CBMFileResult **result_cache = NULL;
+    bool *frontier_noop_mask = NULL;
     cbm_pipeline_file_delta_plan_t plan = {0};
     int64_t generation = 0;
     bool graph_noop_candidate = false;
+    int exact_publish_count = delta_count;
 
     changed_paths = malloc((size_t)exact_count * sizeof(*changed_paths));
     deltas = calloc((size_t)delta_count, sizeof(*deltas));
     delta_ptrs = malloc((size_t)delta_count * sizeof(*delta_ptrs));
     store_delta_ptrs = malloc((size_t)delta_count * sizeof(*store_delta_ptrs));
     result_cache = calloc((size_t)exact_count, sizeof(*result_cache));
+    if (scoped_overlay_gap) {
+        frontier_noop_mask = calloc((size_t)delta_count, sizeof(*frontier_noop_mask));
+    }
     scratch = cbm_gbuf_new(project, cbm_pipeline_repo_path(p));
     registry = cbm_registry_new();
     if (!changed_paths || !deltas || !delta_ptrs || !store_delta_ptrs || !result_cache ||
-        !scratch || !registry) {
+        (scoped_overlay_gap && !frontier_noop_mask) || !scratch || !registry) {
         cbm_pipeline_set_publish_reason(p, "alloc");
         cbm_log_info("incremental.exact.fallback", "reason", "alloc");
         goto cleanup;
@@ -2107,8 +2115,39 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
                          itoa_buf_incr(rc));
             goto cleanup;
         }
+        if (scoped_overlay_gap && i < changed_count) {
+            int preserved = 0;
+            rc = cbm_pipeline_file_delta_add_preserved_inbound_edges(store, &deltas[i],
+                                                                     &preserved);
+            if (rc != CBM_STORE_OK) {
+                cbm_pipeline_set_publish_reason(p, "preserve_inbound");
+                cbm_log_info("incremental.exact.fallback", "reason", "preserve_inbound", "rc",
+                             itoa_buf_incr(rc));
+                goto cleanup;
+            }
+        }
         delta_ptrs[i] = &deltas[i];
         store_delta_ptrs[i] = &deltas[i].delta;
+        if (scoped_overlay_gap && i >= changed_count) {
+            bool equal = false;
+            const cbm_store_file_delta_t *single_delta = &deltas[i].delta;
+            rc = cbm_store_file_delta_batch_graph_equal(store, &single_delta, 1, &equal);
+            if (rc != CBM_STORE_OK) {
+                cbm_pipeline_set_publish_reason(p, "graph_equal");
+                cbm_log_info("incremental.exact.fallback", "reason", "graph_equal", "rc",
+                             itoa_buf_incr(rc));
+                goto cleanup;
+            }
+            frontier_noop_mask[i] = equal;
+        }
+    }
+    if (scoped_overlay_gap) {
+        exact_publish_count = 0;
+        for (int i = 0; i < delta_count; i++) {
+            if (!frontier_noop_mask[i]) {
+                exact_publish_count++;
+            }
+        }
     }
     for (int i = 0; i < deleted_count; i++) {
         int delta_index = exact_count + i;
@@ -2137,8 +2176,9 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
 
     if (!graph_noop_candidate) {
         CBM_PROF_START(t_exact_plan);
-        rc = cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, delta_count,
-                                                max_affected_paths, &plan);
+        rc = cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+            store, delta_ptrs, scoped_overlay_gap ? frontier_noop_mask : NULL, delta_count,
+            max_affected_paths, &plan);
         CBM_PROF_END_N("incremental_exact", "10_plan_delta", t_exact_plan, delta_count);
         if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
             incr_report_exact_delta_plan_fallback(p, &plan, input_path_count, max_affected_paths,
@@ -2152,7 +2192,6 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     bool overlay_publish_already_failed =
         prior_reason && strcmp(prior_reason, "overlay_publish_error") == 0;
     bool header_overlay_unsafe = incr_changed_contains_c_family_header(changed_files, changed_count);
-    bool scoped_overlay_gap = incr_changed_has_scoped_overlay_gap(changed_files, changed_count);
     if (!graph_noop_candidate && !header_overlay_unsafe && !scoped_overlay_gap &&
         cbm_pipeline_overlay_publish_small_deltas(p) &&
         !overlay_publish_already_failed) {
@@ -2232,8 +2271,9 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
 
     CBM_PROF_START(t_exact_apply);
-    rc = cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, delta_count,
-                                             max_affected_paths, &plan);
+    rc = cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+        store, delta_ptrs, scoped_overlay_gap ? frontier_noop_mask : NULL, delta_count,
+        max_affected_paths, &plan);
     CBM_PROF_END_N("incremental_exact", "13_apply_delta", t_exact_apply, delta_count);
     if (rc != CBM_STORE_OK || plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         incr_mark_generation_failed(store, project, generation);
@@ -2247,17 +2287,18 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     cbm_pipeline_set_graph_changed(p, true);
     cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_set_publish_reason(p, NULL);
-    cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, delta_count);
+    cbm_pipeline_set_exact_delta_stats(p, input_path_count, delta_count, exact_publish_count);
     if (cbm_pipeline_repo_path(p) && cbm_artifact_exists(cbm_pipeline_repo_path(p))) {
         (void)cbm_artifact_export(db_path, cbm_pipeline_repo_path(p), project, CBM_ARTIFACT_FAST);
     }
-    cbm_log_info("incremental.exact.done", "files", itoa_buf_incr(delta_count));
+    cbm_log_info("incremental.exact.done", "files", itoa_buf_incr(exact_publish_count));
     *applied = 1;
 
 cleanup:
     cbm_pipeline_file_delta_plan_free(&plan);
     free(store_delta_ptrs);
     free(delta_ptrs);
+    free(frontier_noop_mask);
     incr_free_file_deltas(deltas, delta_count);
     incr_free_result_cache(result_cache, exact_count);
     cbm_path_alias_collection_free(path_aliases);

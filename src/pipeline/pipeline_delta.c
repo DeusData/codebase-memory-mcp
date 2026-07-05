@@ -1024,6 +1024,8 @@ static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *de
     return false;
 }
 
+static bool delta_node_qn_present(const cbm_store_file_delta_t *delta, const char *qn);
+
 static bool delta_inbound_edge_is_regenerated_by_batch(
     const cbm_store_inbound_edge_t *edge, const cbm_pipeline_file_delta_t *const *deltas,
     int delta_count) {
@@ -1055,6 +1057,8 @@ static bool delta_inbound_edges_supported(cbm_store_t *store,
     bool ok = true;
     for (int i = 0; i < edge_count; i++) {
         if (!delta_path_in_batch(edges[i].source_rel_path, deltas, delta_count) &&
+            !delta_batch_contains_edge(deltas, delta_count, edges[i].source_qn,
+                                       edges[i].target_qn, edges[i].type) &&
             !delta_inbound_edge_is_regenerated_by_batch(&edges[i], deltas, delta_count) &&
             !delta_owned_inbound_edge_is_deleted(&edges[i], delta)) {
             ok = false;
@@ -1376,12 +1380,15 @@ static int delta_plan_append_frontier(cbm_pipeline_file_delta_plan_t *plan, char
 
 static int delta_collect_batch_affected_paths(cbm_store_t *store,
                                               const cbm_pipeline_file_delta_t *const *deltas,
-                                              int delta_count,
+                                              const bool *frontier_noop_mask, int delta_count,
                                               cbm_pipeline_file_delta_plan_t *out) {
     if (!store || !deltas || delta_count <= 0 || !out) {
         return CBM_STORE_ERR;
     }
     for (int i = 0; i < delta_count; i++) {
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
         const cbm_store_file_delta_t *delta = deltas[i] ? &deltas[i]->delta : NULL;
         if (!delta || !delta->project || !delta->rel_path) {
             return CBM_STORE_ERR;
@@ -1488,6 +1495,14 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
                                        const cbm_pipeline_file_delta_t *const *deltas,
                                        int delta_count, int max_affected_paths,
                                        cbm_pipeline_file_delta_plan_t *out) {
+    return cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+        store, deltas, NULL, delta_count, max_affected_paths, out);
+}
+
+int cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out) {
     if (!out) {
         return CBM_STORE_ERR;
     }
@@ -1522,6 +1537,9 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
     }
     for (int i = 0; i < delta_count; i++) {
         const cbm_pipeline_file_delta_t *delta = deltas[i];
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
         if (!delta_plan_precheck_common(delta, out)) {
             return CBM_STORE_OK;
         }
@@ -1546,7 +1564,8 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
         }
     }
 
-    if (delta_collect_batch_affected_paths(store, deltas, delta_count, out) != CBM_STORE_OK) {
+    if (delta_collect_batch_affected_paths(store, deltas, frontier_noop_mask, delta_count,
+                                           out) != CBM_STORE_OK) {
         delta_plan_set_fallback(out, cbm_delta_reason_frontier_error);
         return CBM_STORE_OK;
     }
@@ -1591,8 +1610,16 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
                                         const cbm_pipeline_file_delta_t *const *deltas,
                                         int delta_count, int max_affected_paths,
                                         cbm_pipeline_file_delta_plan_t *out) {
-    int rc =
-        cbm_pipeline_plan_file_delta_batch(store, deltas, delta_count, max_affected_paths, out);
+    return cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+        store, deltas, NULL, delta_count, max_affected_paths, out);
+}
+
+int cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out) {
+    int rc = cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+        store, deltas, frontier_noop_mask, delta_count, max_affected_paths, out);
     if (rc != CBM_STORE_OK || !out || out->route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
         return rc;
     }
@@ -1619,6 +1646,9 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
     int delete_count = 0;
     int upsert_count = 0;
     for (int i = 0; i < delta_count; i++) {
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
         if (deltas[i] && deltas[i]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
             delete_count++;
         } else {
@@ -1639,6 +1669,9 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
         int di = 0;
         int ui = 0;
         for (int i = 0; i < delta_count; i++) {
+            if (frontier_noop_mask && frontier_noop_mask[i]) {
+                continue;
+            }
             if (deltas[i]->change_kind == CBM_PIPELINE_DELTA_CHANGE_DELETE) {
                 delete_deltas[di++] = &deltas[i]->delta;
             } else {
@@ -1655,16 +1688,24 @@ int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
         return CBM_STORE_OK;
     }
 
+    if (upsert_count <= 0) {
+        delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
+        return CBM_STORE_OK;
+    }
     const cbm_store_file_delta_t **publish_deltas =
-        malloc((size_t)delta_count * sizeof(*publish_deltas));
+        malloc((size_t)upsert_count * sizeof(*publish_deltas));
     if (!publish_deltas) {
         delta_plan_set_fallback(out, cbm_delta_reason_preflight_error);
         return CBM_STORE_OK;
     }
+    int publish_count = 0;
     for (int i = 0; i < delta_count; i++) {
-        publish_deltas[i] = &deltas[i]->delta;
+        if (frontier_noop_mask && frontier_noop_mask[i]) {
+            continue;
+        }
+        publish_deltas[publish_count++] = &deltas[i]->delta;
     }
-    rc = cbm_store_publish_file_delta_batch_complete(store, publish_deltas, delta_count);
+    rc = cbm_store_publish_file_delta_batch_complete(store, publish_deltas, publish_count);
     free(publish_deltas);
     if (rc != CBM_STORE_OK) {
         delta_plan_set_fallback(out, cbm_delta_reason_publish_error);

@@ -469,10 +469,18 @@ int cbm_pipeline_plan_file_delta_batch(cbm_store_t *store,
                                        const cbm_pipeline_file_delta_t *const *deltas,
                                        int delta_count, int max_affected_paths,
                                        cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out);
 int cbm_pipeline_apply_file_delta_batch(cbm_store_t *store,
                                         const cbm_pipeline_file_delta_t *const *deltas,
                                         int delta_count, int max_affected_paths,
                                         cbm_pipeline_file_delta_plan_t *out);
+int cbm_pipeline_apply_file_delta_batch_with_frontier_noop_mask(
+    cbm_store_t *store, const cbm_pipeline_file_delta_t *const *deltas,
+    const bool *frontier_noop_mask, int delta_count, int max_affected_paths,
+    cbm_pipeline_file_delta_plan_t *out);
 int cbm_pipeline_publish_overlay_file_delta_batch(cbm_store_t *store,
                                                   const cbm_pipeline_file_delta_t *const *deltas,
                                                   int delta_count, int64_t base_generation,

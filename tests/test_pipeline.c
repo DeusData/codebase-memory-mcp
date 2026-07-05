@@ -5824,6 +5824,174 @@ TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
     PASS();
 }
 
+TEST(pipeline_file_delta_plan_frontier_noop_mask_bounds_recursive_frontier) {
+    enum {
+        PIPELINE_NOOP_FRONTIER_DELTA_COUNT = 2,
+        PIPELINE_NOOP_FRONTIER_MAX_AFFECTED = 2,
+    };
+    const char *project = "test";
+    const char *lib_rel = "lib.py";
+    const char *importer_rel = "a.py";
+    const char *downstream_rel = "b.py";
+    const char *lib_qn = "test.lib.Hot";
+    const char *importer_qn = "test.a.Stable";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, lib_rel, lib_qn), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, importer_rel, importer_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, lib_qn, lib_rel,
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, importer_qn, importer_rel,
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, importer_rel, "test.lib", "Hot", lib_qn,
+                                          1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, downstream_rel, "test.a", "Stable",
+                                          importer_qn, 1),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t lib_exports[1] = {
+        {.qualified_name = lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_symbol_export_t importer_exports[1] = {
+        {.qualified_name = importer_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t lib_delta = {
+        .delta = {.project = project,
+                  .rel_path = lib_rel,
+                  .exports = lib_exports,
+                  .export_count = 1}};
+    cbm_pipeline_file_delta_t importer_delta = {
+        .delta = {.project = project,
+                  .rel_path = importer_rel,
+                  .exports = importer_exports,
+                  .export_count = 1}};
+    cbm_file_hash_t lib_hash = {0};
+    cbm_file_hash_t importer_hash = {0};
+    cbm_file_state_t lib_state = {0};
+    cbm_file_state_t importer_state = {0};
+    pipeline_delta_attach_test_metadata(&lib_delta, &lib_hash, &lib_state);
+    pipeline_delta_attach_test_metadata(&importer_delta, &importer_hash, &importer_state);
+    const cbm_pipeline_file_delta_t *deltas[PIPELINE_NOOP_FRONTIER_DELTA_COUNT] = {
+        &lib_delta, &importer_delta};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(
+                  s, deltas, PIPELINE_NOOP_FRONTIER_DELTA_COUNT,
+                  PIPELINE_NOOP_FRONTIER_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_too_large");
+    ASSERT_EQ(plan.affected_count, 3);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 1);
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    bool frontier_noop_mask[PIPELINE_NOOP_FRONTIER_DELTA_COUNT] = {false, true};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+                  s, deltas, frontier_noop_mask, PIPELINE_NOOP_FRONTIER_DELTA_COUNT,
+                  PIPELINE_NOOP_FRONTIER_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, PIPELINE_NOOP_FRONTIER_MAX_AFFECTED);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_frontier_noop_mask_skips_masked_inbound_precheck) {
+    enum {
+        PIPELINE_NOOP_INBOUND_DELTA_COUNT = 2,
+        PIPELINE_NOOP_INBOUND_MAX_AFFECTED = 2,
+        PIPELINE_NOOP_INBOUND_GENERATION = 1,
+    };
+    const char *project = "test";
+    const char *lib_rel = "lib.py";
+    const char *importer_rel = "a.py";
+    const char *downstream_rel = "b.py";
+    const char *lib_qn = "test.lib.Hot";
+    const char *importer_qn = "test.a.Stable";
+    const char *downstream_qn = "test.b.UsesStable";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, lib_rel, lib_qn), CBM_STORE_OK);
+    int64_t importer_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, importer_rel, importer_qn);
+    int64_t downstream_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, downstream_rel, downstream_qn);
+    ASSERT_GT(importer_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(downstream_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, lib_qn, lib_rel,
+                                             CBM_STORE_NO_NODE_ID,
+                                             PIPELINE_NOOP_INBOUND_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, importer_rel, "test.lib", "Hot", lib_qn,
+                                          PIPELINE_NOOP_INBOUND_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_edge_t downstream_call = {.project = (char *)project,
+                                  .source_id = downstream_id,
+                                  .target_id = importer_id,
+                                  .type = "CALLS",
+                                  .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &downstream_call);
+    ASSERT_GT(edge_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, project, edge_id, downstream_rel, NULL,
+                                          PIPELINE_NOOP_INBOUND_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t lib_exports[1] = {
+        {.qualified_name = lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_symbol_export_t importer_exports[1] = {
+        {.qualified_name = importer_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t lib_delta = {
+        .delta = {.project = project,
+                  .rel_path = lib_rel,
+                  .exports = lib_exports,
+                  .export_count = 1}};
+    cbm_pipeline_file_delta_t importer_delta = {
+        .delta = {.project = project,
+                  .rel_path = importer_rel,
+                  .exports = importer_exports,
+                  .export_count = 1}};
+    cbm_file_hash_t lib_hash = {0};
+    cbm_file_hash_t importer_hash = {0};
+    cbm_file_state_t lib_state = {0};
+    cbm_file_state_t importer_state = {0};
+    pipeline_delta_attach_test_metadata(&lib_delta, &lib_hash, &lib_state);
+    pipeline_delta_attach_test_metadata(&importer_delta, &importer_hash, &importer_state);
+    const cbm_pipeline_file_delta_t *deltas[PIPELINE_NOOP_INBOUND_DELTA_COUNT] = {
+        &lib_delta, &importer_delta};
+    bool frontier_noop_mask[PIPELINE_NOOP_INBOUND_DELTA_COUNT] = {false, true};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+                  s, deltas, frontier_noop_mask, PIPELINE_NOOP_INBOUND_DELTA_COUNT,
+                  PIPELINE_NOOP_INBOUND_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, PIPELINE_NOOP_INBOUND_MAX_AFFECTED);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_plan_batch_accepts_mutual_frontier) {
     enum {
         PIPELINE_MUTUAL_GENERATION = 1,
@@ -11679,8 +11847,8 @@ TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
     PASS();
 }
 
-TEST(incremental_overlay_publish_python_scoped_lsp_gap_falls_back) {
-    enum { PIPELINE_EXACT_ONE_PATH = 1 };
+TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_direct_exact) {
+    enum { PIPELINE_EXACT_TWO_PATHS = 2 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -11707,7 +11875,7 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_falls_back) {
                              CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
               0);
     char cap_value[CBM_SZ_32];
-    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_ONE_PATH);
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_TWO_PATHS);
     ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
               0);
@@ -11735,11 +11903,14 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_falls_back) {
     int run_rc = cbm_pipeline_run(p);
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
-    ASSERT(strstr(logs,
-                  "msg=incremental.fallback reason=scoped_lsp_gap "
-                  "exact_reason=frontier_too_large") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") == NULL);
     ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_TWO_PATHS);
+    ASSERT_EQ(stats.published_paths, 1);
     cbm_pipeline_free(p);
 
     char diff_err[CBM_SZ_8K] = {0};
@@ -14085,6 +14256,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint);
     RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
+    RUN_TEST(pipeline_file_delta_plan_frontier_noop_mask_bounds_recursive_frontier);
+    RUN_TEST(pipeline_file_delta_plan_frontier_noop_mask_skips_masked_inbound_precheck);
     RUN_TEST(pipeline_file_delta_plan_batch_accepts_mutual_frontier);
     RUN_TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish);
     /* File persistence */
@@ -14318,7 +14491,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
-    RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_falls_back);
+    RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_direct_exact);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
     RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
