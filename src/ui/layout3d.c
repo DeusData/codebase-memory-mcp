@@ -25,8 +25,10 @@
 /* ── Constants ────────────────────────────────────────────────── */
 
 #define DEFAULT_MAX_NODES 2000
-#define HARD_MAX_NODES 10000
+#define HARD_MAX_NODES 200000
 #define BH_THETA 1.2f
+#define OCTREE_MAX_DEPTH 26   /* stop subdividing coincident points (OOM guard) */
+#define OCTREE_MIN_HALF 1e-4f /* minimum octree cell half-size */
 
 /* Local optimization: gentle, preserves structure */
 #define LOCAL_REPULSION 8.0f
@@ -34,6 +36,63 @@
 #define LOCAL_ANCHOR_K 0.25f /* how strongly nodes stick to their anchor */
 #define LOCAL_ITERATIONS 40
 #define Z_DEPTH_SPACING 50.0f /* gentle z-layering per call depth */
+
+/* cbm_store_batch_count_degrees builds a bound "?,?,..." IN clause into a fixed
+ * 4KB buffer (~2045 placeholders max) but binds every id passed — so calling it
+ * with more ids than fit silently drops the tail (their degree stays 0, which
+ * here would masquerade as dead code). Feed it in safe-sized chunks. */
+#define DEAD_DEGREE_CHUNK 500
+
+/* ── Dead-code node-flag parsing ──────────────────────────────── */
+
+typedef struct {
+    bool is_entry;
+    bool is_test;
+    bool is_exported;
+    bool is_route;
+} node_flags_t;
+
+/* Truthy across the representations properties_json may use (JSON bool, the
+ * integer 1 sqlite/json_extract emits, or a "true"/"1" string). */
+static bool json_truthy(yyjson_val *v) {
+    if (!v)
+        return false;
+    if (yyjson_is_bool(v))
+        return yyjson_get_bool(v);
+    if (yyjson_is_int(v))
+        return yyjson_get_int(v) != 0;
+    if (yyjson_is_uint(v))
+        return yyjson_get_uint(v) != 0;
+    if (yyjson_is_real(v))
+        return yyjson_get_real(v) != 0.0;
+    if (yyjson_is_str(v)) {
+        const char *s = yyjson_get_str(v);
+        return s && s[0] && strcmp(s, "0") != 0 && strcmp(s, "false") != 0;
+    }
+    return false;
+}
+
+static node_flags_t parse_node_flags(const char *props_json) {
+    node_flags_t f = {false, false, false, false};
+    if (!props_json || !props_json[0])
+        return f;
+    yyjson_doc *d = yyjson_read(props_json, strlen(props_json), 0);
+    if (!d)
+        return f;
+    yyjson_val *root = yyjson_doc_get_root(d);
+    if (root && yyjson_is_obj(root)) {
+        f.is_entry = json_truthy(yyjson_obj_get(root, "is_entry_point"));
+        f.is_test = json_truthy(yyjson_obj_get(root, "is_test"));
+        f.is_exported = json_truthy(yyjson_obj_get(root, "is_exported"));
+        yyjson_val *rp = yyjson_obj_get(root, "route_path");
+        if (rp && yyjson_is_str(rp)) {
+            const char *s = yyjson_get_str(rp);
+            f.is_route = s && s[0];
+        }
+    }
+    yyjson_doc_free(d);
+    return f;
+}
 
 /* ── Node colors/sizes ────────────────────────────────────────── */
 
@@ -175,7 +234,8 @@ static void child_center(octree_node_t *n, int o, float *cx, float *cy, float *c
     *cy = n->oy + ((o & 2) ? q : -q);
     *cz = n->oz + ((o & 4) ? q : -q);
 }
-static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, float mass) {
+static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, float mass,
+                          int depth) {
     if (n->total_mass == 0.0f && n->body_index == -1) {
         n->body_index = idx;
         n->body_mass = mass;
@@ -183,6 +243,20 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         n->cy = y;
         n->cz = z;
         n->total_mass = mass;
+        return;
+    }
+    /* OOM guard: when bodies share (or nearly share) a position, subdivision
+     * never separates them, so half_size shrinks toward zero and we allocate
+     * octree cells without bound — the runaway that exhausted memory on large
+     * graphs. Once we hit the depth/size floor, stop splitting and fold the body
+     * into this cell as an aggregate (mass-weighted centroid). */
+    if (depth >= OCTREE_MAX_DEPTH || n->half_size < OCTREE_MIN_HALF) {
+        float nm = n->total_mass + mass;
+        n->cx = (n->cx * n->total_mass + x * mass) / nm;
+        n->cy = (n->cy * n->total_mass + y * mass) / nm;
+        n->cz = (n->cz * n->total_mass + z * mass) / nm;
+        n->total_mass = nm;
+        n->body_index = -1;
         return;
     }
     if (n->body_index >= 0) {
@@ -196,7 +270,7 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
             n->children[o] = octree_new(a, b, c, n->half_size * 0.5f);
         }
         if (n->children[o])
-            octree_insert(n->children[o], oi, ox, oy, oz, om);
+            octree_insert(n->children[o], oi, ox, oy, oz, om, depth + 1);
     }
     float nm = n->total_mass + mass;
     n->cx = (n->cx * n->total_mass + x * mass) / nm;
@@ -210,7 +284,7 @@ static void octree_insert(octree_node_t *n, int idx, float x, float y, float z, 
         n->children[o] = octree_new(a, b, c, n->half_size * 0.5f);
     }
     if (n->children[o])
-        octree_insert(n->children[o], idx, x, y, z, mass);
+        octree_insert(n->children[o], idx, x, y, z, mass, depth + 1);
 }
 static void octree_repulse(octree_node_t *n, float px, float py, float pz, float mm, int si,
                            float kr, float *fx, float *fy, float *fz) {
@@ -274,7 +348,7 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
         if (!root)
             break;
         for (int i = 0; i < n; i++)
-            octree_insert(root, i, b[i].x, b[i].y, b[i].z, b[i].mass);
+            octree_insert(root, i, b[i].x, b[i].y, b[i].z, b[i].mass, 0);
         for (int i = 0; i < n; i++)
             octree_repulse(root, b[i].x, b[i].y, b[i].z, b[i].mass, i, LOCAL_REPULSION, &b[i].fx,
                            &b[i].fy, &b[i].fz);
@@ -549,6 +623,27 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     result->node_count = n;
     result->total_nodes = total_count;
 
+    /* True full-graph incoming degree for dead-code classification. This MUST
+     * come from the store, not the sampled `mapped` edges built above: that set
+     * drops any edge whose other endpoint falls outside the rendered
+     * <=max_nodes window, which would falsely mark a sampled-in function as
+     * having zero callers. */
+    int64_t *node_ids = malloc((size_t)n * sizeof(int64_t));
+    int *in_calls = calloc((size_t)n, sizeof(int));
+    int *in_usage = calloc((size_t)n, sizeof(int));
+    int *deg_dummy = calloc((size_t)n, sizeof(int));
+    if (node_ids && in_calls && in_usage && deg_dummy) {
+        for (int i = 0; i < n; i++)
+            node_ids[i] = search_out.results[i].node.id;
+        for (int off = 0; off < n; off += DEAD_DEGREE_CHUNK) {
+            int cnt = (n - off < DEAD_DEGREE_CHUNK) ? (n - off) : DEAD_DEGREE_CHUNK;
+            cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALLS", in_calls + off,
+                                          deg_dummy + off);
+            cbm_store_batch_count_degrees(store, node_ids + off, cnt, "USAGE", in_usage + off,
+                                          deg_dummy + off);
+        }
+    }
+
     for (int i = 0; i < n; i++) {
         const cbm_node_t *sn = &search_out.results[i].node;
         const char *fp = sn->file_path ? sn->file_path : "";
@@ -591,11 +686,40 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         result->nodes[i].name = sn->name ? strdup(sn->name) : NULL;
         result->nodes[i].qualified_name = sn->qualified_name ? strdup(sn->qualified_name) : NULL;
         result->nodes[i].file_path = sn->file_path ? strdup(sn->file_path) : NULL;
+        result->nodes[i].start_line = sn->start_line;
+        result->nodes[i].end_line = sn->end_line;
         result->nodes[i].color = stellar_color(deg[i]);
         /* Size: base from label + boost from degree (hubs are bigger stars) */
         float base_size = size_for_label(sn->label);
         float deg_boost = (deg[i] > 5) ? fminf((float)deg[i] * 0.3f, 10.0f) : 0;
         result->nodes[i].size = base_size + deg_boost;
+
+        /* Dead-code classification. Only Function/Method are candidates; other
+         * labels are structural. Default to non-dead (1) if the batch degree
+         * query failed, so a query error never masquerades as dead code. */
+        node_flags_t nf = parse_node_flags(sn->properties_json);
+        bool is_fn =
+            sn->label && (strcmp(sn->label, "Function") == 0 || strcmp(sn->label, "Method") == 0);
+        bool testish = nf.is_test || (sn->file_path && cbm_is_test_file_path(sn->file_path));
+        int ic = in_calls ? in_calls[i] : 1;
+        int iu = in_usage ? in_usage[i] : 1;
+        const char *status;
+        if (!is_fn)
+            status = "structural";
+        else if (testish)
+            status = "test";
+        else if (nf.is_entry || nf.is_route)
+            status = "entry";
+        else if (nf.is_exported)
+            status = "exported";
+        else if (ic == 0 && iu == 0)
+            status = "dead";
+        else if (ic == 1)
+            status = "single";
+        else
+            status = "normal";
+        result->nodes[i].in_calls = ic;
+        result->nodes[i].status = status;
     }
 
     /* 6. Gentle local optimization (anchor-preserving) */
@@ -624,6 +748,10 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     free(es);
     free(ed);
     free(cdepth);
+    free(node_ids);
+    free(in_calls);
+    free(in_usage);
+    free(deg_dummy);
     free_edge_array(all_edges, mapped);
     cbm_store_search_free(&search_out);
     return result;
@@ -668,11 +796,20 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
             yyjson_mut_obj_add_str(doc, nd, "name", r->nodes[i].name);
         if (r->nodes[i].file_path)
             yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
+        if (r->nodes[i].qualified_name)
+            yyjson_mut_obj_add_str(doc, nd, "qualified_name", r->nodes[i].qualified_name);
+        if (r->nodes[i].start_line > 0)
+            yyjson_mut_obj_add_int(doc, nd, "start_line", r->nodes[i].start_line);
+        if (r->nodes[i].end_line > 0)
+            yyjson_mut_obj_add_int(doc, nd, "end_line", r->nodes[i].end_line);
         double nsz = isfinite(r->nodes[i].size) ? (double)r->nodes[i].size : 1.0;
         yyjson_mut_obj_add_real(doc, nd, "size", nsz);
         char hex[CBM_SZ_8];
         snprintf(hex, sizeof(hex), "#%06x", r->nodes[i].color);
         yyjson_mut_obj_add_strcpy(doc, nd, "color", hex);
+        yyjson_mut_obj_add_int(doc, nd, "in_calls", r->nodes[i].in_calls);
+        if (r->nodes[i].status)
+            yyjson_mut_obj_add_str(doc, nd, "status", r->nodes[i].status);
         yyjson_mut_arr_append(na, nd);
     }
     yyjson_mut_obj_add_val(doc, root, "nodes", na);

@@ -1158,6 +1158,50 @@ TEST(contract_edge_workspaces_imports_issue408) {
     PASS();
 }
 
+/* #767: a wildcard tsconfig alias for the "@lib" prefix (mapped to ./src/lib)
+ * shares that prefix with an unrelated scoped npm package ("@lib/external-pkg",
+ * meant to resolve normally from node_modules). The engine has no such file
+ * and must NOT invent an edge to the "src/lib" Folder node via a later
+ * fallback strategy that re-tries the truncated "@lib" prefix against the
+ * tsconfig's other, bare alias entry. Zero IMPORTS edges in the whole project
+ * is the correct outcome: the same as any other unresolved external import. */
+TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"tsconfig.json", "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                          "      \"@lib\": [\"./src/lib\"],\n"
+                          "      \"@lib/*\": [\"./src/lib/*\"]\n    }\n  }\n}\n"},
+        {"src/lib/thing.ts", "export const Thing = {};\n"},
+        {"src/consumer.ts",
+         "import { ClientC } from '@lib/external-pkg';\n\n"
+         "export function useClient() {\n  return new ClientC();\n}\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 3);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : -1;
+    if (got != 0) {
+        fprintf(stderr, "  [EDGE] FAIL IMPORTS count=%d expected=0 (phantom Folder edge)\n", got);
+    }
+    ASSERT_EQ(got, 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* #767 regression guard: a wildcard tsconfig alias resolving to a REAL,
+ * indexed file must still produce its IMPORTS edge — the import-targetable
+ * label filter must reject Folder/Project/etc. matches without rejecting
+ * legitimate File/Module matches. */
+TEST(contract_edge_imports_alias_resolves_real_file_issue767) {
+    static const LangFile f[] = {
+        {"tsconfig.json", "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                          "      \"@lib\": [\"./src/lib\"],\n"
+                          "      \"@lib/*\": [\"./src/lib/*\"]\n    }\n  }\n}\n"},
+        {"src/lib/thing.ts", "export const Thing = {};\n"},
+        {"src/consumer.ts",
+         "import { Thing } from '@lib/thing';\n\n"
+         "export function useThing() {\n  return Thing;\n}\n"}};
+    ASSERT_TRUE(edge_present(f, 3, "IMPORTS", 1));
+    PASS();
+}
+
 /* DEPENDS_ON — Helm Chart.yaml `dependencies:` -> per-dependency Chart node.
  * Basename must be exactly "Chart.yaml"; pass_k8s runs in both pipeline paths. */
 TEST(contract_edge_depends_on) {
@@ -1365,6 +1409,8 @@ SUITE(lang_contract) {
      * FILE_CHANGES_WITH (git co-change). Completes 25-edge-type coverage. */
     RUN_TEST(contract_edge_tests);
     RUN_TEST(contract_edge_workspaces_imports_issue408);
+    RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
+    RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);

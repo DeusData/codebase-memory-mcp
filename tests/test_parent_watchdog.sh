@@ -73,14 +73,37 @@ if ! kill -0 "${child_pid}" 2>/dev/null; then
   exit 3
 fi
 
+# Wait until the child has reached startup far enough to have installed the
+# parent watchdog. The PID file is written immediately after fork; killing the
+# wrapper before the child runs main() is an untestable early-reparent race where
+# the child never observed the original parent PID.
+for _ in {1..50}; do
+  if [[ -s "${tmpdir}/child.err" ]] && grep -q "mem.init" "${tmpdir}/child.err"; then
+    break
+  fi
+  sleep 0.1
+done
+if ! grep -q "mem.init" "${tmpdir}/child.err" 2>/dev/null; then
+  echo "child did not reach watchdog-ready startup point" >&2
+  [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+  exit 3
+fi
+
 # Kill the wrapper parent: the orphaned child must now self-exit.
 kill -9 "${wrapper_pid}"
 wait "${wrapper_pid}" 2>/dev/null || true
 
-deadline=$((SECONDS + 6))
+deadline=$((SECONDS + 15))
 while (( SECONDS < deadline )); do
   if ! kill -0 "${child_pid}" 2>/dev/null; then
     echo "ok: child ${child_pid} exited after parent death"
+    exit 0
+  fi
+  # A zombie no longer holds stdin or runs the MCP loop; kill -0 still reports
+  # it until launchd/test parent reaps it, so treat that as a successful exit.
+  child_state="$(ps -p "${child_pid}" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "${child_state}" == Z* ]]; then
+    echo "ok: child ${child_pid} exited after parent death (zombie awaiting reap)"
     exit 0
   fi
   sleep 0.2

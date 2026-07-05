@@ -11,7 +11,8 @@ import { FilterPanel } from "./FilterPanel";
 import { NodeDetailPanel } from "./NodeDetailPanel";
 import { ResizeHandle } from "./ResizeHandle";
 import { ErrorBoundary } from "./ErrorBoundary";
-import type { GraphNode, GraphData } from "../lib/types";
+import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
+import { colorForStatus } from "../lib/colors";
 
 /* Persist panel widths */
 function loadWidth(key: string, fallback: number): number {
@@ -31,7 +32,7 @@ interface GraphTabProps {
 
 export function formatGraphLimitNotice(data: GraphData | null): string | null {
   if (!data || data.total_nodes <= data.nodes.length) return null;
-  return `Showing ${data.nodes.length.toLocaleString()} of ${data.total_nodes.toLocaleString()} nodes. Use filters to narrow.`;
+  return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes. Use filters to narrow.`;
 }
 
 export function GraphTab({ project }: GraphTabProps) {
@@ -40,6 +41,7 @@ export function GraphTab({ project }: GraphTabProps) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
+  const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
   const [showLabels, setShowLabels] = useState(true);
   const [leftWidth, setLeftWidth] = useState(() => loadWidth("cbm-left-w", 260));
   const [rightWidth, setRightWidth] = useState(() => loadWidth("cbm-right-w", 280));
@@ -48,6 +50,12 @@ export function GraphTab({ project }: GraphTabProps) {
   /* Filter state — all enabled by default */
   const [enabledLabels, setEnabledLabels] = useState<Set<string>>(new Set());
   const [enabledEdgeTypes, setEnabledEdgeTypes] = useState<Set<string>>(new Set());
+
+  /* Dead-code view: recolor by status + status-based filters */
+  const [deadCodeView, setDeadCodeView] = useState(false);
+  const [showOnlyDead, setShowOnlyDead] = useState(false);
+  const [hideEntryPoints, setHideEntryPoints] = useState(false);
+  const [hideTests, setHideTests] = useState(false);
 
   /* Initialize filters when data loads */
   useEffect(() => {
@@ -67,7 +75,19 @@ export function GraphTab({ project }: GraphTabProps) {
   const filteredData: GraphData | null = useMemo(() => {
     if (!data) return null;
 
-    const nodes = data.nodes.filter((n) => enabledLabels.has(n.label));
+    /* Status-based filters (dead-code view) */
+    const statusOk = (n: GraphNode) => {
+      if (showOnlyDead && n.status !== "dead") return false;
+      if (hideEntryPoints && n.status === "entry") return false;
+      if (hideTests && n.status === "test") return false;
+      return true;
+    };
+    /* Recolor by status when the dead-code view is on */
+    const paint = (n: GraphNode): GraphNode =>
+      deadCodeView ? { ...n, color: colorForStatus(n.status) } : n;
+    const keep = (n: GraphNode) => enabledLabels.has(n.label) && statusOk(n);
+
+    const nodes = data.nodes.filter(keep).map(paint);
     const nodeIds = new Set(nodes.map((n) => n.id));
     const edges = data.edges.filter(
       (e) =>
@@ -77,7 +97,7 @@ export function GraphTab({ project }: GraphTabProps) {
     );
 
     const linked_projects = data.linked_projects?.map((lp) => {
-      const lpNodes = lp.nodes.filter((n) => enabledLabels.has(n.label));
+      const lpNodes = lp.nodes.filter(keep).map(paint);
       const lpIds = new Set(lpNodes.map((n) => n.id));
       const lpEdges = lp.edges.filter(
         (e) =>
@@ -91,7 +111,15 @@ export function GraphTab({ project }: GraphTabProps) {
     });
 
     return { nodes, edges, total_nodes: data.total_nodes, linked_projects };
-  }, [data, enabledLabels, enabledEdgeTypes]);
+  }, [
+    data,
+    enabledLabels,
+    enabledEdgeTypes,
+    deadCodeView,
+    showOnlyDead,
+    hideEntryPoints,
+    hideTests,
+  ]);
 
   useEffect(() => {
     if (project) {
@@ -100,6 +128,24 @@ export function GraphTab({ project }: GraphTabProps) {
       setSelectedPath(null);
     }
   }, [project, fetchOverview]);
+
+  /* Fetch git remote metadata for GitHub deep-links */
+  useEffect(() => {
+    if (!project) {
+      setRepoInfo(null);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/repo-info?project=${encodeURIComponent(project)}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (!cancelled && d && !d.error) setRepoInfo(d as RepoInfo);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
 
   const handleSelectPath = useCallback(
     (path: string, nodeIds: Set<number>) => {
@@ -181,7 +227,7 @@ export function GraphTab({ project }: GraphTabProps) {
     return (
       <div className="flex items-center justify-center h-full">
         <p className="text-white/30 text-sm">
-          Select a project from the Stats tab
+          Select a project from the Projects tab
         </p>
       </div>
     );
@@ -211,21 +257,13 @@ export function GraphTab({ project }: GraphTabProps) {
     );
   }
 
-  if (!data || !filteredData || filteredData.nodes.length === 0) {
+  /* No data, or the project genuinely has no nodes — there are no filters to
+     interact with, so show a plain full-screen message. The "all filtered out"
+     case is handled inside the layout below so the filter sidebar stays put. */
+  if (!data || !filteredData || data.nodes.length === 0) {
     return (
       <div className="flex items-center justify-center h-full">
-        <div className="text-center">
-          <p className="text-white/30 text-sm mb-3">
-            {data && filteredData?.nodes.length === 0
-              ? "All nodes filtered out"
-              : "No nodes in this project"}
-          </p>
-          {data && filteredData?.nodes.length === 0 && (
-            <Button size="sm" onClick={enableAll}>
-              Reset Filters
-            </Button>
-          )}
-        </div>
+        <p className="text-white/30 text-sm">No nodes in this project</p>
       </div>
     );
   }
@@ -247,6 +285,14 @@ export function GraphTab({ project }: GraphTabProps) {
           onToggleShowLabels={() => setShowLabels((v) => !v)}
           onEnableAll={enableAll}
           onDisableAll={disableAll}
+          deadCodeView={deadCodeView}
+          showOnlyDead={showOnlyDead}
+          hideEntryPoints={hideEntryPoints}
+          hideTests={hideTests}
+          onToggleDeadCodeView={() => setDeadCodeView((v) => !v)}
+          onToggleShowOnlyDead={() => setShowOnlyDead((v) => !v)}
+          onToggleHideEntryPoints={() => setHideEntryPoints((v) => !v)}
+          onToggleHideTests={() => setHideTests((v) => !v)}
         />
         <Sidebar
           nodes={filteredData.nodes}
@@ -267,65 +313,78 @@ export function GraphTab({ project }: GraphTabProps) {
 
       {/* Graph area */}
       <div className="flex-1 relative overflow-hidden">
-        <ErrorBoundary>
-          <GraphScene
-            data={filteredData}
-            highlightedIds={highlightedIds}
-            cameraTarget={cameraTarget}
-            showLabels={showLabels}
-            onNodeClick={handleNodeClick}
-          />
-        </ErrorBoundary>
+        {filteredData.nodes.length === 0 ? (
+          <div className="flex items-center justify-center h-full">
+            <div className="text-center">
+              <p className="text-white/30 text-sm mb-3">All nodes filtered out</p>
+              <Button size="sm" onClick={enableAll}>
+                Reset Filters
+              </Button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <ErrorBoundary>
+              <GraphScene
+                data={filteredData}
+                highlightedIds={highlightedIds}
+                cameraTarget={cameraTarget}
+                showLabels={showLabels}
+                onNodeClick={handleNodeClick}
+              />
+            </ErrorBoundary>
 
-        {/* HUD */}
-        <div className="absolute top-4 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
-          <p>
-            {filteredData.nodes.length.toLocaleString()} nodes /{" "}
-            {filteredData.edges.length.toLocaleString()} edges
-          </p>
-          {data.nodes.length > filteredData.nodes.length && (
-            <p className="text-white/25 mt-0.5">
-              filtered from {data.nodes.length.toLocaleString()}
-            </p>
-          )}
-          {limitNotice && (
-            <p className="text-amber-300/80 mt-0.5">{limitNotice}</p>
-          )}
-          {highlightedIds && highlightedIds.size > 0 && (
-            <p className="text-cyan-400/50 mt-0.5">
-              {highlightedIds.size} selected
-            </p>
-          )}
-        </div>
+            {/* HUD */}
+            <div className="absolute top-4 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
+              <p>
+                {filteredData.nodes.length.toLocaleString()} nodes /{" "}
+                {filteredData.edges.length.toLocaleString()} edges
+              </p>
+              {data.nodes.length > filteredData.nodes.length && (
+                <p className="text-white/25 mt-0.5">
+                  filtered from {data.nodes.length.toLocaleString()}
+                </p>
+              )}
+              {limitNotice && (
+                <p className="text-amber-300/80 mt-0.5">{limitNotice}</p>
+              )}
+              {highlightedIds && highlightedIds.size > 0 && (
+                <p className="text-cyan-400/50 mt-0.5">
+                  {highlightedIds.size} selected
+                </p>
+              )}
+            </div>
 
-        <div className="absolute top-4 right-4 flex gap-2">
-          {highlightedIds && (
-            <Button
-              size="sm"
-              onClick={() => {
-                setHighlightedIds(null);
-                setSelectedPath(null);
-                setSelectedNode(null);
-                setCameraTarget(null);
-              }}
-            >
-              Clear
-            </Button>
-          )}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              setHighlightedIds(null);
-              setSelectedPath(null);
-              setSelectedNode(null);
-              setCameraTarget(null);
-              fetchOverview(project);
-            }}
-          >
-            Refresh
-          </Button>
-        </div>
+            <div className="absolute top-4 right-4 flex gap-2">
+              {highlightedIds && (
+                <Button
+                  size="sm"
+                  onClick={() => {
+                    setHighlightedIds(null);
+                    setSelectedPath(null);
+                    setSelectedNode(null);
+                    setCameraTarget(null);
+                  }}
+                >
+                  Clear selection
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setHighlightedIds(null);
+                  setSelectedPath(null);
+                  setSelectedNode(null);
+                  setCameraTarget(null);
+                  fetchOverview(project);
+                }}
+              >
+                Refresh
+              </Button>
+            </div>
+          </>
+        )}
       </div>
 
       {/* Right detail panel — resizable */}
@@ -349,6 +408,8 @@ export function GraphTab({ project }: GraphTabProps) {
               node={selectedNode}
               allNodes={filteredData.nodes}
               allEdges={filteredData.edges}
+              project={project}
+              repoInfo={repoInfo}
               onClose={() => {
                 setSelectedNode(null);
                 setHighlightedIds(null);

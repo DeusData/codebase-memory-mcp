@@ -245,7 +245,7 @@ static bool expand_git_path(const char *path, char *out, size_t out_sz) {
 }
 
 static bool read_core_excludes_file(const char *config_path, char *out, size_t out_sz) {
-    FILE *f = fopen(config_path, "r");
+    FILE *f = cbm_fopen(config_path, "r");
     if (!f) {
         return false;
     }
@@ -473,6 +473,19 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
     return rel_path;
 }
 
+/* Non-negatable safety core: built-in skip dirs that a .cbmignore negation
+ * can NEVER un-skip. A repo-committed .cbmignore must not be able to defeat
+ * OOM/safety skips: .git holds VCS internals (and the info/exclude sources,
+ * #489), node_modules explodes discovery, and the worktree-internal dirs
+ * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
+ * contain parallel checkouts of the same repo whose indexing would duplicate
+ * the whole codebase (#802). */
+static bool is_safety_core_dir(const char *name) {
+    static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
+                                                   ".claude-worktrees", NULL};
+    return str_in_list(name, SAFETY_CORE_DIRS);
+}
+
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
@@ -480,7 +493,15 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
-        return true;
+        /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
+         * match for this dir un-skips a built-in skip-list dir — except the
+         * non-negatable safety core. Fall through so .gitignore/global/local
+         * rules still apply to the un-skipped dir. */
+        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
+                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (!unskipped) {
+            return true;
+        }
     }
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
         return true;
@@ -737,6 +758,108 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 
 /* ── Public API ───────────────────────────────── */
 
+static bool discover_path_is_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+#ifdef _WIN32
+    return isalpha((unsigned char)path[0]) && path[1] == ':';
+#else
+    return false;
+#endif
+}
+
+/* Resolve the shared "common" git directory for repo_path.
+ * Handles three layouts:
+ *   1. <repo>/.git is a directory    - ordinary repo; common_dir == <repo>/.git
+ *   2. <repo>/.git is a regular file - linked worktree gitlink "gitdir: <path>";
+ *      the common dir is read from <git_dir>/commondir (git stores info/exclude +
+ *      config there, shared across worktrees). Falls back to git_dir when no
+ *      commondir file exists.
+ *   3. neither - not a git repo.
+ * Returns true when a git dir was resolved. Fixes the worktree case where
+ * .git/info/exclude and core.excludesfile were silently dropped because the old
+ * check required .git to be a directory (issue #489 only covered ordinary repos). */
+static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size_t cd_sz) {
+    char dot_git[CBM_SZ_4K];
+    snprintf(dot_git, sizeof(dot_git), "%s/.git", repo_path);
+    struct stat st;
+    if (wide_stat(dot_git, &st) != 0) {
+        return false;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        snprintf(common_dir, cd_sz, "%s", dot_git);
+        cbm_normalize_path_sep(common_dir);
+        return true;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return false;
+    }
+
+    /* Linked worktree: parse "gitdir: <path>" from the gitlink file.
+     * cbm_fopen (not raw fopen) so non-ASCII repo paths open on Windows. */
+    FILE *f = cbm_fopen(dot_git, "r");
+    if (!f) {
+        return false;
+    }
+    char git_dir[CBM_SZ_4K];
+    bool got_git_dir = false;
+    char line[CBM_SZ_4K];
+    while (fgets(line, sizeof(line), f)) {
+        char *gs = trim_ws(line);
+        if (strncmp(gs, "gitdir:", 7) == 0) {
+            char *val = trim_ws(gs + 7);
+            if (val[0] != '\0') {
+                if (discover_path_is_absolute(val)) {
+                    snprintf(git_dir, sizeof(git_dir), "%s", val);
+                    cbm_normalize_path_sep(git_dir);
+                } else {
+                    path_join(git_dir, sizeof(git_dir), repo_path, val);
+                }
+                got_git_dir = true;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    if (!got_git_dir) {
+        return false;
+    }
+
+    /* The shared dir holding info/exclude + config is named in <git_dir>/commondir
+     * (typically a relative path like "../.."). Absent in single-worktree gitdirs. */
+    char commondir_path[CBM_SZ_4K];
+    path_join(commondir_path, sizeof(commondir_path), git_dir, "commondir");
+    FILE *cf = cbm_fopen(commondir_path, "r");
+    if (cf) {
+        char cbuf[CBM_SZ_4K];
+        bool resolved = false;
+        if (fgets(cbuf, sizeof(cbuf), cf)) {
+            char *cs = trim_ws(cbuf);
+            if (cs[0] != '\0') {
+                if (discover_path_is_absolute(cs)) {
+                    snprintf(common_dir, cd_sz, "%s", cs);
+                    cbm_normalize_path_sep(common_dir);
+                } else {
+                    path_join(common_dir, cd_sz, git_dir, cs);
+                }
+                resolved = true;
+            }
+        }
+        fclose(cf);
+        if (resolved) {
+            return true;
+        }
+    }
+
+    snprintf(common_dir, cd_sz, "%s", git_dir);
+    cbm_normalize_path_sep(common_dir);
+    return true;
+}
+
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
     return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL);
@@ -763,31 +886,35 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
         return CBM_NOT_FOUND;
     }
 
-    /* Load gitignore sources when a .git directory is present.
+    /* Load gitignore sources for ordinary repos AND linked worktrees.
      * Sources merged in order (later patterns win on conflict):
-     *   1. <repo>/.gitignore        — committed exclusions
-     *   2. <repo>/.git/info/exclude — per-clone exclusions, not committed
-     * Both are folded into a single matcher so all downstream call paths
-     * remain unchanged.  Fixes issue #489: OOM on repos whose worktrees
-     * are excluded only via .git/info/exclude (e.g. Sandcastle). */
+     *   1. <repo>/.gitignore     — committed exclusions
+     *   2. <common>/info/exclude — per-clone exclusions, not committed
+     * <common> is the git common dir, resolved via resolve_git_common_dir() so a
+     * worktree (where .git is a gitlink file) reads the shared info/exclude/config
+     * just like a normal checkout. Both are folded into a single matcher so all
+     * downstream call paths remain unchanged. Fixes issue #489: OOM on repos whose
+     * worktrees are excluded only via .git/info/exclude (e.g. Sandcastle). */
     cbm_gitignore_t *gitignore = NULL;
     char gi_path[CBM_SZ_4K];
-    snprintf(gi_path, sizeof(gi_path), "%s/.git", repo_path);
     struct stat gi_stat;
-    bool is_git_repo = wide_stat(gi_path, &gi_stat) == 0 && S_ISDIR(gi_stat.st_mode);
+    /* Resolve the git common dir, transparently following a worktree gitlink so the
+     * .git/info/exclude and core.excludesfile sources are honoured inside linked
+     * worktrees too (where .git is a file pointing at the shared dir, not a directory). */
+    char git_common_dir[CBM_SZ_4K];
+    bool is_git_repo = resolve_git_common_dir(repo_path, git_common_dir, sizeof(git_common_dir));
     bool has_git_config = false;
     /* Always honour the .gitignore at the indexed-directory root, even when the
      * directory is not a git repo root (e.g. indexing a sub-package directly).
-     * The .git/info/exclude and global-excludes sources still require .git/.
      * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
     snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
     gitignore = cbm_gitignore_load(gi_path);
     if (is_git_repo) {
-        snprintf(gi_path, sizeof(gi_path), "%s/.git/config", repo_path);
+        path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
         has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
 
         char exc_path[CBM_SZ_4K];
-        snprintf(exc_path, sizeof(exc_path), "%s/.git/info/exclude", repo_path);
+        path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");
         cbm_gitignore_t *git_exclude = cbm_gitignore_load(exc_path);
         if (git_exclude) {
             if (!gitignore) {

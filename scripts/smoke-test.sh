@@ -12,11 +12,12 @@ set -euo pipefail
 BINARY="${1:?usage: smoke-test.sh <binary-path>}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 TMPDIR=$(mktemp -d)
+DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'rm -rf "$TMPDIR"' EXIT
+trap 'rm -rf "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
 
 CLI_STDERR=$(mktemp)
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
@@ -119,8 +120,12 @@ with open(sys.argv[1], "w") as f:
     f.write("}\n")
 GENEOF
 
-# Index
-RESULT=$(cli index_repository "{\"repo_path\":\"$TMPDIR\"}")
+# Index (flag form: --repo-path -> repo_path)
+if ! RESULT=$(cli index_repository --repo-path "$TMPDIR"); then
+  echo "FAIL: index_repository (flag form) exited non-zero"
+  cat "$CLI_STDERR"
+  exit 1
+fi
 echo "$RESULT"
 
 # Allocator-integrity guard: the prod binary overrides the global allocator with
@@ -166,7 +171,9 @@ echo "=== Phase 3: verify queries ==="
 # 3a: search_graph — find the compute function
 PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('project',''))" 2>/dev/null || echo "")
 
-SEARCH=$(cli search_graph "{\"project\":\"$PROJECT\",\"name_pattern\":\"compute\"}")
+if ! SEARCH=$(cli search_graph --project "$PROJECT" --name-pattern compute); then
+  echo "FAIL: search_graph (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
 TOTAL=$(echo "$SEARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
 if [ "$TOTAL" -lt 1 ]; then
   echo "FAIL: search_graph for 'compute' returned 0 results"
@@ -175,7 +182,9 @@ fi
 echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 
 # 3b: trace_path — verify compute has callers
-TRACE=$(cli trace_path "{\"project\":\"$PROJECT\",\"function_name\":\"compute\",\"direction\":\"inbound\",\"depth\":1}")
+if ! TRACE=$(cli trace_path --project "$PROJECT" --function-name compute --direction inbound --depth 1); then
+  echo "FAIL: trace_path (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
 CALLERS=$(echo "$TRACE" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('callers',[])))" 2>/dev/null || echo "0")
 if [ "$CALLERS" -lt 1 ]; then
   echo "FAIL: trace_path found 0 callers for 'compute'"
@@ -184,7 +193,9 @@ fi
 echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
 # 3c: get_graph_schema — verify labels exist
-SCHEMA=$(cli get_graph_schema "{\"project\":\"$PROJECT\"}")
+if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT"); then
+  echo "FAIL: get_graph_schema (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
 LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
 if [ "$LABELS" -lt 3 ]; then
   echo "FAIL: schema has fewer than 3 node labels"
@@ -193,7 +204,9 @@ fi
 echo "OK: schema has $LABELS node labels"
 
 # 3d: Verify __init__.py didn't clobber Folder node
-FOLDERS=$(cli search_graph "{\"project\":\"$PROJECT\",\"label\":\"Folder\"}")
+if ! FOLDERS=$(cli search_graph --project "$PROJECT" --label Folder); then
+  echo "FAIL: search_graph --label Folder exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
 FOLDER_COUNT=$(echo "$FOLDERS" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
 if [ "$FOLDER_COUNT" -lt 2 ]; then
   echo "FAIL: expected at least 2 Folder nodes (src, src/pkg), got $FOLDER_COUNT"
@@ -203,7 +216,7 @@ echo "OK: $FOLDER_COUNT Folder nodes (init.py didn't clobber them)"
 
 # 3d-cypher: query_graph Cypher capabilities
 # #238 WITH DISTINCT — all functions share label "Function" → collapses to 1 row.
-CYPHER_WD=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WITH DISTINCT f.label AS lbl RETURN lbl\"}")
+CYPHER_WD=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WITH DISTINCT f.label AS lbl RETURN lbl")
 WD_ROWS=$(echo "$CYPHER_WD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
 if [ "$WD_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WITH DISTINCT returned 0 rows"
@@ -213,7 +226,7 @@ fi
 echo "OK: query_graph WITH DISTINCT returned $WD_ROWS row(s)"
 
 # #241 WHERE label test — f:Function is true for every Function node.
-CYPHER_LBL=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f:Function RETURN f.name\"}")
+CYPHER_LBL=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE f:Function RETURN f.name")
 LBL_ROWS=$(echo "$CYPHER_LBL" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
 if [ "$LBL_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WHERE label-test returned 0 rows"
@@ -223,7 +236,7 @@ fi
 echo "OK: query_graph WHERE f:Function returned $LBL_ROWS row(s)"
 
 # #242 label alternation — (n:Function|Module) seeds either label.
-CYPHER_ALT=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (n:Function|Module) RETURN n.name\"}")
+CYPHER_ALT=$(cli query_graph --project "$PROJECT" --query "MATCH (n:Function|Module) RETURN n.name")
 ALT_ROWS=$(echo "$CYPHER_ALT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
 if [ "$ALT_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph label alternation returned 0 rows"
@@ -233,7 +246,7 @@ fi
 echo "OK: query_graph (n:Function|Module) returned $ALT_ROWS row(s)"
 
 # #239 count(DISTINCT) — must parse and return a single aggregate row.
-CYPHER_CD=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) RETURN count(DISTINCT f.label)\"}")
+CYPHER_CD=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) RETURN count(DISTINCT f.label)")
 CD_ROWS=$(echo "$CYPHER_CD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
 if [ "$CD_ROWS" -ne 1 ]; then
   echo "FAIL: query_graph count(DISTINCT) expected 1 row, got $CD_ROWS"
@@ -244,11 +257,10 @@ echo "OK: query_graph count(DISTINCT f.label) returned 1 aggregate row"
 
 # 3d-funcs: scalar / introspection functions (full Cypher suite, Tier 1)
 cyp_first_cell() {
-  # $1 = query; echoes rows[0][0] (or empty)
-  # Escape embedded double-quotes so string-literal args (e.g. replace(x,"a","A"))
-  # don't break the JSON we build by interpolation.
-  local q="${1//\"/\\\"}"
-  cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"$q\"}" |
+  # $1 = query; echoes rows[0][0] (or empty). Flag form passes the query as ONE
+  # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
+  # metacharacters {}|=~<>" need no JSON escaping.
+  cli query_graph --project "$PROJECT" --query "$1" |
     python3 -c "import json,sys; d=json.loads(sys.stdin.read()); rows=d.get('rows',[]); print(rows[0][0] if rows and rows[0] else '')" 2>/dev/null || echo ""
 }
 
@@ -303,7 +315,7 @@ if [ -z "$COALV" ]; then echo "FAIL: query_graph coalesce(...) returned empty"; 
 echo "OK: query_graph coalesce(f.nonesuch, f.name) = $COALV"
 
 # EXISTS { } pattern predicate (edge-type-specific existence)
-CYPHER_EX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } RETURN f.name\"}")
+CYPHER_EX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } RETURN f.name")
 EX_ROWS=$(echo "$CYPHER_EX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
 if [ "$EX_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph EXISTS{} predicate returned 0 rows"; echo "$CYPHER_EX"; exit 1
@@ -311,7 +323,7 @@ fi
 echo "OK: query_graph EXISTS { (f)-[:CALLS]->() } returned $EX_ROWS row(s)"
 
 # =~ regex match in WHERE
-CYPHER_RX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE f.name =~ \\\".+\\\" RETURN f.name\"}")
+CYPHER_RX=$(cli query_graph --project "$PROJECT" --query 'MATCH (f:Function) WHERE f.name =~ ".+" RETURN f.name')
 RX_ROWS=$(echo "$CYPHER_RX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
 if [ "$RX_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WHERE =~ regex returned 0 rows"; echo "$CYPHER_RX"; exit 1
@@ -334,7 +346,7 @@ LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
 [ -n "$LEFTV" ] && echo "OK: query_graph left(f.name,3) = $LEFTV" || { echo "FAIL: left empty"; exit 1; }
 
 # NOT EXISTS dead-code query (functions with no caller)
-CYPHER_NX=$(cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name\"}")
+CYPHER_NX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name")
 NX_OK=$(echo "$CYPHER_NX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('rows' in d)" 2>/dev/null || echo "False")
 [ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
 
@@ -345,7 +357,7 @@ CASEV=$(cyp_first_cell 'MATCH (f:Function) RETURN CASE WHEN f.name =~ ".+" THEN 
 # unsupported function must FAIL LOUDLY (not silently return empty). The CLI
 # prints the parse error to stderr (captured by cli() into $CLI_STDERR) and exits
 # non-zero, leaving stdout empty — so verify the loud failure on that channel.
-if cli query_graph "{\"project\":\"$PROJECT\",\"query\":\"MATCH (f:Function) RETURN nosuchfn(f.name)\"}" >/dev/null; then
+if cli query_graph --project "$PROJECT" --query "MATCH (f:Function) RETURN nosuchfn(f.name)" >/dev/null; then
   echo "FAIL: unsupported function did not error (exit 0)"; exit 1
 fi
 ERROUT=$(cat "$CLI_STDERR" 2>/dev/null)
@@ -355,7 +367,9 @@ case "$ERROUT" in
 esac
 
 # 3f: get_architecture surfaces Leiden community clusters
-ARCH=$(cli get_architecture "{\"project\":\"$PROJECT\",\"aspects\":[\"clusters\"]}")
+if ! ARCH=$(cli get_architecture --project "$PROJECT" --aspects clusters); then
+  echo "FAIL: get_architecture (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
 NCLUST=$(echo "$ARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('clusters',[])))" 2>/dev/null || echo "0")
 if [ "$NCLUST" -lt 1 ]; then
   echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
@@ -363,22 +377,127 @@ fi
 echo "OK: get_architecture returned $NCLUST community cluster(s)"
 
 # 3g: search_code — basic search reports elapsed_ms + matches
-SC=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_\",\"mode\":\"compact\",\"limit\":5}")
+SC=$(cli search_code --project "$PROJECT" --pattern cbm_ --mode compact --limit 5)
 echo "$SC" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); assert 'elapsed_ms' in d; print('OK: search_code elapsed_ms='+str(d['elapsed_ms'])+' total_grep_matches='+str(d.get('total_grep_matches')))" 2>/dev/null || { echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1; }
 
 # 3g: search_code — literal '|' under regex=false must surface a warning (#282)
-SCW=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_init|cbm_nope\",\"regex\":false,\"limit\":5}")
+SCW=$(cli search_code --project "$PROJECT" --pattern "cbm_init|cbm_nope" --regex false --limit 5)
 echo "$SCW" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); w=' '.join(d.get('warnings',[])); assert 'regex=true' in w; print('OK: search_code literal-| warning surfaced')" 2>/dev/null || { echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1; }
 
 # 3g: search_code — '&' in file_pattern accepted, not rejected as invalid (#272)
-SCA=$(cli search_code "{\"project\":\"$PROJECT\",\"pattern\":\"cbm_\",\"file_pattern\":\"*R&D*.c\",\"limit\":5}")
+SCA=$(cli search_code --project "$PROJECT" --pattern cbm_ --file-pattern "*R&D*.c" --limit 5)
 case "$SCA" in
   *"invalid characters"*) echo "FAIL: search_code rejected '&' in file_pattern"; echo "$SCA" | head -c 300; exit 1 ;;
   *) echo "OK: search_code accepts '&' in file_pattern" ;;
 esac
 
+echo ""
+echo "=== Phase 3h: CLI input-mode guards (flags / stdin / --args-file / --help / deprecation) ==="
+
+# Small helper: assert its stdin is a JSON object (exit non-zero otherwise).
+assert_json_obj() { python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d,dict) else 1)" 2>/dev/null; }
+
+# B1: INTEGER flag — --limit is schema-typed integer; must parse to valid JSON.
+if ! IM_INT=$(cli search_graph --project "$PROJECT" --name-pattern compute --limit 5); then
+  echo "FAIL B1: search_graph --limit 5 exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
+if echo "$IM_INT" | assert_json_obj; then
+  echo "OK B1: INTEGER flag (--limit 5) parsed → valid JSON"
+else
+  echo "FAIL B1: --limit 5 did not produce valid JSON"; echo "$IM_INT" | head -c 300; exit 1
+fi
+
+# B2: BOOLEAN bare flag — --exclude-entry-points with no value → true; must succeed.
+if ! IM_BOOL=$(cli search_graph --project "$PROJECT" --exclude-entry-points); then
+  echo "FAIL B2: search_graph --exclude-entry-points exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
+if echo "$IM_BOOL" | assert_json_obj; then
+  echo "OK B2: BOOLEAN bare flag (--exclude-entry-points) → success"
+else
+  echo "FAIL B2: --exclude-entry-points did not produce valid JSON"; echo "$IM_BOOL" | head -c 300; exit 1
+fi
+
+# B3: ARRAY flag — repeated --semantic-query accumulates into a JSON array.
+# semantic_results may be empty (index-mode dependent); only assert valid JSON.
+if ! IM_ARR=$(cli search_graph --project "$PROJECT" --semantic-query send --semantic-query publish); then
+  echo "FAIL B3: search_graph repeated --semantic-query exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
+if echo "$IM_ARR" | assert_json_obj; then
+  echo "OK B3: ARRAY flag (repeated --semantic-query) → valid JSON"
+else
+  echo "FAIL B3: repeated --semantic-query did not produce valid JSON"; echo "$IM_ARR" | head -c 300; exit 1
+fi
+
+# B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
+IM_STDIN=$(echo "{\"project\":\"$PROJECT\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
+if ! echo "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
+  echo "FAIL B4: stdin get_graph_schema did not resolve"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
+fi
+if grep -qi 'deprecated' "$CLI_STDERR"; then
+  echo "FAIL B4: stdin path wrongly emitted a deprecation warning"; cat "$CLI_STDERR"; exit 1
+fi
+echo "OK B4: STDIN input resolves, no deprecation warning"
+
+# B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
+IM_ARGS_FILE=$(mktemp)
+echo "{\"project\":\"$PROJECT\"}" > "$IM_ARGS_FILE"
+if ! IM_AF=$(cli get_graph_schema --args-file "$IM_ARGS_FILE"); then
+  echo "FAIL B5: get_graph_schema --args-file exited non-zero"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
+fi
+if ! echo "$IM_AF" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
+  echo "FAIL B5: --args-file get_graph_schema did not resolve"; echo "$IM_AF" | head -c 300; rm -f "$IM_ARGS_FILE"; exit 1
+fi
+if grep -qi 'deprecated' "$CLI_STDERR"; then
+  echo "FAIL B5: --args-file path wrongly emitted a deprecation warning"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
+fi
+rm -f "$IM_ARGS_FILE"
+echo "OK B5: --args-file input resolves, no deprecation warning"
+
+# B6: per-tool --help — RC0 with expected flags in stdout; unknown tool errors non-zero.
+if ! H_SG=$(cli search_graph --help); then
+  echo "FAIL B6a: 'search_graph --help' exited non-zero"; exit 1
+fi
+if echo "$H_SG" | grep -q -- "--name-pattern"; then
+  echo "OK B6a: search_graph --help (RC0) lists --name-pattern"
+else
+  echo "FAIL B6a: search_graph --help missing --name-pattern"; echo "$H_SG" | head -c 400; exit 1
+fi
+if ! H_IR=$(cli index_repository --help); then
+  echo "FAIL B6b: 'index_repository --help' exited non-zero"; exit 1
+fi
+if echo "$H_IR" | grep -q -- "--repo-path"; then
+  echo "OK B6b: index_repository --help (RC0) lists --repo-path"
+else
+  echo "FAIL B6b: index_repository --help missing --repo-path"; echo "$H_IR" | head -c 400; exit 1
+fi
+# Unknown tool: must exit non-zero and report "unknown tool" (on stderr).
+if cli notatool --help >/dev/null; then
+  echo "FAIL B6c: 'notatool --help' exited 0 (expected non-zero for unknown tool)"; exit 1
+fi
+if grep -qi 'unknown tool' "$CLI_STDERR"; then
+  echo "OK B6c: 'notatool --help' errors non-zero with 'unknown tool'"
+else
+  echo "FAIL B6c: 'notatool --help' did not report 'unknown tool'"; cat "$CLI_STDERR"; exit 1
+fi
+
+# B7: DEPRECATION guard — one raw-JSON call MUST warn on stderr; flag form must NOT.
+cli search_graph "{\"project\":\"$PROJECT\",\"name_pattern\":\"compute\"}" >/dev/null || true
+if grep -qi 'deprecated' "$CLI_STDERR"; then
+  echo "OK B7a: raw-JSON cli emits deprecation warning on stderr"
+else
+  echo "FAIL B7a: raw-JSON cli did NOT emit deprecation warning"; cat "$CLI_STDERR"; exit 1
+fi
+cli search_graph --project "$PROJECT" --name-pattern compute >/dev/null || true
+if grep -qi 'deprecated' "$CLI_STDERR"; then
+  echo "FAIL B7b: flag-form cli wrongly emitted a deprecation warning"; cat "$CLI_STDERR"; exit 1
+else
+  echo "OK B7b: flag-form cli emits no deprecation warning"
+fi
+
 # 3e: delete_project cleanup
-cli delete_project "{\"project\":\"$PROJECT\"}" > /dev/null
+if ! cli delete_project --project "$PROJECT" > /dev/null; then
+  echo "FAIL: delete_project (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
+fi
 
 echo ""
 echo "=== Phase 4: security checks ==="
@@ -561,9 +680,27 @@ rm -f "$MCP_CL_INPUT" "$MCP_CL_OUTPUT" "$MCP_TOOL_INPUT" "$MCP_TOOL_OUTPUT"
 echo ""
 echo "=== Phase 6: CLI subcommands ==="
 
+DRYRUN_HOME=$(mktemp -d)
+DRYRUN_CACHE="$DRYRUN_HOME/.cache/codebase-memory-mcp"
+mkdir -p "$DRYRUN_CACHE" \
+  "$DRYRUN_HOME/.local/bin" \
+  "$DRYRUN_HOME/.config" \
+  "$DRYRUN_HOME/AppData/Roaming" \
+  "$DRYRUN_HOME/AppData/Local"
+
+run_dryrun_env() {
+  HOME="$DRYRUN_HOME" \
+    XDG_CONFIG_HOME="$DRYRUN_HOME/.config" \
+    APPDATA="$DRYRUN_HOME/AppData/Roaming" \
+    LOCALAPPDATA="$DRYRUN_HOME/AppData/Local" \
+    CBM_CACHE_DIR="$DRYRUN_CACHE" \
+    PATH="$DRYRUN_HOME/.local/bin:$PATH" \
+    "$@"
+}
+
 # 6a: install --dry-run -y
 echo "--- Phase 6a: install --dry-run ---"
-INSTALL_OUT=$("$BINARY" install --dry-run -y 2>&1)
+INSTALL_OUT=$(run_dryrun_env "$BINARY" install --dry-run -y 2>&1)
 if ! echo "$INSTALL_OUT" | grep -qi 'install\|skill\|mcp\|agent'; then
   echo "FAIL: install --dry-run produced unexpected output"
   echo "$INSTALL_OUT"
@@ -577,7 +714,7 @@ echo "OK: install --dry-run completed"
 
 # 6b: uninstall --dry-run -y
 echo "--- Phase 6b: uninstall --dry-run ---"
-UNINSTALL_OUT=$("$BINARY" uninstall --dry-run -y 2>&1)
+UNINSTALL_OUT=$(run_dryrun_env "$BINARY" uninstall --dry-run -y 2>&1)
 if ! echo "$UNINSTALL_OUT" | grep -qi 'uninstall\|remov'; then
   echo "FAIL: uninstall --dry-run produced unexpected output"
   echo "$UNINSTALL_OUT"
@@ -587,7 +724,7 @@ echo "OK: uninstall --dry-run completed"
 
 # 6c: update --dry-run --standard -y
 echo "--- Phase 6c: update --dry-run ---"
-UPDATE_OUT=$("$BINARY" update --dry-run --standard -y 2>&1)
+UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1)
 if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
   echo "FAIL: update --dry-run did not indicate dry-run mode"
   echo "$UPDATE_OUT"
@@ -612,13 +749,13 @@ echo "OK: update --dry-run --standard completed"
 
 # 6d: config set/get/reset round-trip
 echo "--- Phase 6d: config set/get/reset ---"
-"$BINARY" config set auto_index true 2>/dev/null
-CONFIG_VAL=$("$BINARY" config get auto_index 2>/dev/null)
+run_dryrun_env "$BINARY" config set auto_index true 2>/dev/null
+CONFIG_VAL=$(run_dryrun_env "$BINARY" config get auto_index 2>/dev/null)
 if ! echo "$CONFIG_VAL" | grep -q 'true'; then
   echo "FAIL: config get auto_index returned '$CONFIG_VAL', expected 'true'"
   exit 1
 fi
-"$BINARY" config reset auto_index 2>/dev/null
+run_dryrun_env "$BINARY" config reset auto_index 2>/dev/null
 echo "OK: config set/get/reset round-trip"
 
 # 6e: Simulated binary replacement (update flow without network)

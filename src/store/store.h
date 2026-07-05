@@ -201,9 +201,15 @@ cbm_store_t *cbm_store_open_memory(void);
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
 
-/* Open an existing file-backed database for querying only (no SQLITE_OPEN_CREATE).
- * Returns NULL if the file does not exist — never creates a new .db file. */
+/* Open an existing file-backed database for querying only. Opened READ-ONLY
+ * (no SQLITE_OPEN_CREATE, no write pragmas) so queries never mutate the DB and
+ * work on a read-only file / filesystem. Returns NULL if the file does not
+ * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
+
+/* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
+ * store. The returned pointer is owned by the store. */
+const char *cbm_store_db_path(const cbm_store_t *s);
 
 /* Check database integrity. Returns true if the DB passes basic sanity checks
  * (projects table has correct types, no corruption indicators).
@@ -334,6 +340,12 @@ bool cbm_store_arch_path_scoped(const char *path);
 
 /* When scoped, writes normalized directory prefix into norm_out. Returns false if unscoped. */
 bool cbm_store_normalize_arch_path(const char *path, char *norm_out, size_t norm_sz);
+
+/* True when architecture aspect `name` belongs to the "overview" subset:
+ * every aspect EXCEPT the large per-file listing (file_tree). Shared by both
+ * aspect gates — want_aspect (store.c) and aspect_wanted (mcp.c) — so the
+ * two sites cannot drift. */
+bool cbm_store_arch_aspect_in_overview(const char *name);
 
 /* Delete all nodes for a project (cascade deletes edges). */
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project);

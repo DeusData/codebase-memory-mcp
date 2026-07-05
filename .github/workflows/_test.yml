@@ -38,10 +38,12 @@ jobs:
             {"os":"macos-14","cc":"cc","cxx":"c++"},
             {"os":"macos-15-intel","cc":"cc","cxx":"c++"}
           ]'
+          # Broad matrix legs are REQUIRED gates (no optional/continue-on-error
+          # escape hatches): the release dry run must be all-green, every platform.
           BROAD_UNIX='[
-            {"os":"ubuntu-22.04","cc":"gcc","cxx":"g++","optional":true},
-            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++","optional":true},
-            {"os":"macos-15","cc":"cc","cxx":"c++","optional":true}
+            {"os":"ubuntu-22.04","cc":"gcc","cxx":"g++"},
+            {"os":"ubuntu-22.04-arm","cc":"gcc","cxx":"g++"},
+            {"os":"macos-15","cc":"cc","cxx":"c++"}
           ]'
           # Each Windows leg pins the msys2 environment + package arch to the
           # RUNNER architecture so the build is native, never emulated:
@@ -53,7 +55,7 @@ jobs:
           # the native ARM64 toolchain ASan instruments native ARM64 code, so it
           # is a real (non-optional) gate, not a tolerated emulated-flake.
           CORE_WIN='[{"os":"windows-latest","msystem":"CLANG64","pkg":"x86_64"}]'
-          BROAD_WIN='[{"os":"windows-2025","optional":true,"msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
+          BROAD_WIN='[{"os":"windows-2025","msystem":"CLANG64","pkg":"x86_64"},{"os":"windows-11-arm","msystem":"CLANGARM64","pkg":"aarch64"}]'
           if [ "$BROAD" = "true" ]; then
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
             WIN=$(jq -cn --argjson a "$CORE_WIN" --argjson b "$BROAD_WIN" '$a + $b')
@@ -75,7 +77,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -95,7 +97,7 @@ jobs:
     continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
@@ -119,3 +121,43 @@ jobs:
         run: scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=' || '' }}
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+
+  # Windows product-surface regression guards. Distinct from test-windows above
+  # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
+  # over stdio / CLI / HTTP and fail if a Windows bug already fixed on main comes
+  # back -- non-ASCII repo paths dropping definitions (#636/#357, fixed by #700),
+  # the PreToolUse hook augmenter no-op on drive-letter cwd (#618, fixed by #619),
+  # and the UI directory picker not enumerating drives (#548, roots field). The
+  # still-open narrow-argv repro (#423/#20) is opt-in and excluded via -GuardsOnly.
+  test-windows-guards:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            make
+            git
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build product binary with embedded UI
+        shell: msys2 {0}
+        # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
+        # guard's HTTP UI is available. Functional gate only (no sanitizers).
+        run: scripts/build.sh --with-ui CC=clang CXX=clang++
+
+      - name: Windows regression guards (#636/#357, #618, #548)
+        shell: pwsh
+        # -GuardsOnly runs the three green guards and gates on them; the runner
+        # runs indexing in-process (CBM_INDEX_SUPERVISOR=0) so a guard reflects the
+        # path/hook/drive fix under test, not the orthogonal index-worker spawn.
+        run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

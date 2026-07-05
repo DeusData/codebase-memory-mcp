@@ -318,7 +318,53 @@ TEST(artifact_null_safety) {
     PASS();
 }
 
+/* ── git shell-out path safety ────────────────────────────────────────────────
+ *
+ * artifact.c shells out to git via cbm_popen with the repo path interpolated into
+ * the command. It previously used single quotes (`git -C '%s'`) with NO validation
+ * — but cmd.exe does not honor single quotes, so on Windows a repo path with a space
+ * broke argument grouping, and an embedded quote/metacharacter could break out of the
+ * intended argument entirely. The hardening validates the path and switches to double
+ * quotes; cbm_artifact_repo_path_is_shell_safe() is the guard. Rejecting quotes and
+ * shell/cmd.exe metacharacters is the contract; spaces must stay allowed (double
+ * quotes handle them) — that is the concrete regression the single-quote form caused. */
+TEST(artifact_repo_path_shell_safe_accepts_plain_and_spaced) {
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/home/user/repo"));
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("C:/Users/me/repo"));
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/home/user/my repo")); /* space OK */
+    PASS();
+}
+
+TEST(artifact_repo_path_shell_safe_rejects_injection) {
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe(NULL));
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("it's"));        /* single quote */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("a\"b"));        /* double quote */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("x; rm -rf /")); /* command sep */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("$(whoami)"));   /* substitution */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("a`id`b"));      /* backtick */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("a|b"));         /* pipe */
+    PASS();
+}
+
+TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows) {
+#ifdef _WIN32
+    /* cmd.exe expands %VAR%, delayed !VAR!, and escapes with ^ even inside double
+     * quotes — git_context.c rejects these on Windows and this must match. */
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("C:/a%USERPROFILE%b"));
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("C:/a!b"));
+    ASSERT_FALSE(cbm_artifact_repo_path_is_shell_safe("C:/a^b"));
+#else
+    /* POSIX shells treat % ! ^ literally inside double quotes — allowed. */
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/a%b"));
+    ASSERT_TRUE(cbm_artifact_repo_path_is_shell_safe("/a^b"));
+#endif
+    PASS();
+}
+
 SUITE(artifact) {
+    RUN_TEST(artifact_repo_path_shell_safe_accepts_plain_and_spaced);
+    RUN_TEST(artifact_repo_path_shell_safe_rejects_injection);
+    RUN_TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows);
     RUN_TEST(artifact_export_fast_roundtrip);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);

@@ -14,14 +14,13 @@
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
+#include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
-#if defined(HAVE_LIBGIT2)
-#include <git2.h> // git_allocator, git_libgit2_opts, GIT_OPT_SET_ALLOCATOR — bind libgit2 to mimalloc
-#endif
 #endif
 #include <stdint.h> // uint32_t, uint64_t, int64_t
 #include <stdlib.h>
@@ -240,7 +239,7 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
 
 // --- Allocator binding (defense-in-depth, #424) ---
 
-/* Bind tree-sitter, sqlite3, and libgit2 to mimalloc explicitly so a correct
+/* Bind tree-sitter and sqlite3 to mimalloc explicitly so a correct
  * binary does NOT depend on the fragile MI_OVERRIDE symbol override. Under
  * MI_OVERRIDE=1 — particularly the Windows static-MinGW link with
  * --allow-multiple-definition — `malloc`/`free` can resolve to DIFFERENT
@@ -284,25 +283,6 @@ static int cbm_sqlite_meminit(void *appdata) {
 static void cbm_sqlite_memshutdown(void *appdata) {
     (void)appdata;
 }
-
-#if defined(HAVE_LIBGIT2)
-/* libgit2 git_allocator backed by mimalloc. The struct (current libgit2) has
- * exactly three members: gmalloc(size_t,file,line), grealloc(ptr,size,file,line),
- * gfree(ptr). The file/line args are ignored. */
-static void *cbm_git_malloc(size_t n, const char *file, int line) {
-    (void)file;
-    (void)line;
-    return mi_malloc(n);
-}
-static void *cbm_git_realloc(void *ptr, size_t size, const char *file, int line) {
-    (void)file;
-    (void)line;
-    return mi_realloc(ptr, size);
-}
-static void cbm_git_free(void *ptr) {
-    mi_free(ptr);
-}
-#endif /* HAVE_LIBGIT2 */
 #endif /* CBM_BIND_TS_ALLOCATOR */
 
 void cbm_alloc_init(void) {
@@ -333,24 +313,6 @@ void cbm_alloc_init(void) {
     int sqlite_rc = sqlite3_config(SQLITE_CONFIG_MALLOC, &cbm_sqlite_mem);
     assert(sqlite_rc == SQLITE_OK && "SQLITE_CONFIG_MALLOC must run before sqlite3_initialize");
     (void)sqlite_rc;
-
-#if defined(HAVE_LIBGIT2)
-    /* libgit2. GIT_OPT_SET_ALLOCATOR MUST be set BEFORE git_libgit2_init():
-     * libgit2's git_allocator_global_init (run during init) installs the default
-     * stdalloc only if no custom allocator is set yet
-     * (`if (git__allocator.gmalloc != git_failalloc_malloc) return 0;`), and the
-     * pre-init global is the fail-allocator. There is no allocator-reset on
-     * git_libgit2_shutdown, so binding once here — before pass_githistory's
-     * per-call git_libgit2_init/shutdown pairs ever run — persists for the whole
-     * process. git_libgit2_opts(GIT_OPT_SET_ALLOCATOR,...) itself does not
-     * allocate, so calling it before init is safe. */
-    static git_allocator cbm_git_alloc = {
-        cbm_git_malloc,  /* gmalloc */
-        cbm_git_realloc, /* grealloc */
-        cbm_git_free,    /* gfree */
-    };
-    git_libgit2_opts(GIT_OPT_SET_ALLOCATOR, &cbm_git_alloc);
-#endif /* HAVE_LIBGIT2 */
 #endif /* CBM_BIND_TS_ALLOCATOR */
 }
 
@@ -438,6 +400,77 @@ static bool is_alloc_name(const char *n) {
     return name_in_set(n, set);
 }
 
+// Extract the receiver identifier from a def's receiver text — Go's
+// "(s *Store)" / "(s Store)" → "s". Stores the identifier start in *out and
+// returns its length; returns 0 for unnamed receivers ("(*Store)", "(Store)"),
+// where no second token follows the identifier (a lone token is the TYPE, not
+// a name — such methods have no receiver variable to call through anyway).
+static size_t receiver_ident(const char *recv_text, const char **out) {
+    const char *p = recv_text;
+    if (*p == '(') {
+        p++;
+    }
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    const char *start = p;
+    while ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
+           *p == '_') {
+        p++;
+    }
+    size_t len = (size_t)(p - start);
+    if (len == 0) {
+        return 0; // "(*Store)": leading '*', no identifier
+    }
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == ')' || *p == '\0') {
+        return 0; // "(Store)": single token is the type, receiver unnamed
+    }
+    *out = start;
+    return len;
+}
+
+// Whether a callee expression targets the same instance/class as the enclosing
+// def, i.e. counts as genuine self-recursion rather than a same-named call on a
+// different receiver. callee_name may be bare ("recur") or qualified
+// ("self.recur", "this.recur", "super().save", "axios.get", "self.obj.recur").
+//
+// Bare names have no receiver → assume self-call (free function calling itself
+// by bare name; preserves prior behavior). Qualified names: the receiver chain
+// is everything before the LAST '.', and the WHOLE chain must name the same
+// object — self/this/cls/@self, or the enclosing def's own receiver identifier
+// (Go: `s` in `func (s *Store) save()`, from CBMDefinition.receiver). Matching
+// the whole chain (not its first segment) keeps self.obj.recur() out: it
+// targets self's FIELD obj, a different object. super() is the parent class and
+// any other receiver (axios, console, ...) a different target. See #599.
+static bool is_self_receiver(const char *callee_name, const char *def_receiver) {
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    const char *dot = strrchr(callee_name, '.');
+    if (!dot) {
+        return true; // bare name → self-recursion candidate
+    }
+    size_t rlen = (size_t)(dot - callee_name);
+    static const char *const self_receivers[] = {"self", "this", "cls", "@self", NULL};
+    for (int i = 0; self_receivers[i]; i++) {
+        size_t sl = strlen(self_receivers[i]);
+        if (rlen == sl && strncmp(callee_name, self_receivers[i], sl) == 0) {
+            return true;
+        }
+    }
+    if (def_receiver) {
+        const char *rid = NULL;
+        size_t ril = receiver_ident(def_receiver, &rid);
+        if (ril > 0 && ril == rlen && strncmp(callee_name, rid, ril) == 0) {
+            return true; // call through the enclosing method's own receiver
+        }
+    }
+    return false; // super() / axios / console / self.obj / any other receiver
+}
+
 // Count parameters from a signature string like "(int a, Foo* b, cb (*)(int,int))".
 // Fallback for languages where param_names isn't populated (e.g. C keeps only the
 // signature text). Counts commas at the top paren level; treats "()"/"(void)" as 0.
@@ -494,6 +527,146 @@ static int count_params_from_signature(const char *sig) {
 
 // --- Main extraction function ---
 
+/* Test-only deterministic fault injection for the crash/hang supervisor tests.
+ * Gated entirely behind env vars that are never set in production; a matching
+ * rel_path either aborts (a fault signal the supervisor classifies as a crash)
+ * or spins forever (an external-scanner infinite loop the quiet-timeout kills).
+ * This gives an honest guard — green iff the supervisor actually contains a real
+ * fault — instead of a fixture that may stop faulting once a root cause is fixed. */
+/* Crash-supervisor per-file marker (Stage 3c skip-and-continue). In the
+ * supervisor's single-threaded recovery re-run, cbm_extract_file records the
+ * file it is ABOUT to process here (CBM_INDEX_MARKER_FILE) before touching it,
+ * so that if this file hard-crashes the worker the parent can read the marker
+ * back and learn the EXACT crasher to quarantine. Only meaningful single-
+ * threaded (parallel would race the marker); the env var is set solely by the
+ * supervisor during recovery, so it is a no-op on every normal run. */
+static void cbm_index_write_marker(const char *rel_path) {
+    const char *mf = getenv("CBM_INDEX_MARKER_FILE");
+    if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
+        return;
+    }
+    FILE *f = cbm_fopen(mf, "wb");
+    if (f) {
+        (void)fputs(rel_path, f);
+        (void)fclose(f);
+    }
+}
+
+/* ── Crash-quarantine set (Stage 3c skip-and-continue) ──────────────────────
+ * After a crash the supervisor re-runs the worker single-threaded, passing
+ * CBM_INDEX_QUARANTINE_FILE — a newline-delimited list of repo-relative paths
+ * that already crashed the indexer and MUST NOT be extracted again. Owned here,
+ * next to the other env-driven extract hooks (marker + fault injector), so the
+ * single hard guard lives at the one choke point every pass funnels through
+ * (cbm_extract_file): whether a pass re-extracts from disk on a cache miss
+ * (sequential pass_calls/usages/semantic) or extracts fresh, a quarantined file
+ * short-circuits to an empty result and never reaches the parser/crash. The
+ * pipeline extract loops separately REPORT the skip as phase="crash" via
+ * cbm_index_is_quarantined() so the crasher surfaces in the response skipped[].
+ * Loaded once, lazily; read-only after load (safe for the parallel workers,
+ * though recovery runs single-threaded). Unset env ⇒ empty set ⇒ cheap no-op. */
+static CBMHashTable *g_quarantine_set = NULL;
+enum { CBM_QSET_UNINIT = 0, CBM_QSET_INITING = 1, CBM_QSET_INITED = 2 };
+static atomic_int g_quarantine_state = CBM_QSET_UNINIT;
+
+static void cbm_quarantine_load(void) {
+    const char *qf = getenv("CBM_INDEX_QUARANTINE_FILE");
+    if (!qf || !qf[0]) {
+        return; /* normal path: empty set */
+    }
+    FILE *f = cbm_fopen(qf, "rb");
+    if (!f) {
+        return;
+    }
+    CBMHashTable *set = cbm_ht_create(16);
+    if (!set) {
+        (void)fclose(f);
+        return;
+    }
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        /* Line format: "path\tphase" where phase is "crash" or "hang". A bare
+         * "path" line (no tab) is tolerated and defaults to phase "crash" for
+         * backward compatibility with older quarantine files. */
+        char *tab = strchr(line, '\t');
+        const char *phase = "crash";
+        if (tab) {
+            *tab = '\0';
+            if (tab[1]) {
+                phase = tab + 1;
+            }
+        }
+        if (line[0] == '\0') {
+            continue; /* empty path (line began with a tab) — skip */
+        }
+        /* The table borrows the key + value pointers, so dup both. Intentionally
+         * never freed: the set lives for the whole (short-lived worker) process.
+         * The value stores the phase so cbm_index_quarantine_phase() can report
+         * "crash" vs "hang"; membership (cbm_index_is_quarantined) is value != NULL. */
+        char *key = cbm_strdup(line);
+        char *pval = cbm_strdup(phase);
+        if (key && pval) {
+            cbm_ht_set(set, key, (void *)pval);
+        }
+    }
+    (void)fclose(f);
+    g_quarantine_set = set;
+}
+
+bool cbm_index_is_quarantined(const char *rel_path) {
+    if (!rel_path || !rel_path[0]) {
+        return false;
+    }
+    int state = atomic_load(&g_quarantine_state);
+    if (state != CBM_QSET_INITED) {
+        /* First caller wins the CAS and loads; racers spin until INITED.
+         * Same once-init pattern as cbm_ui_log_init (http_server.c). */
+        state = CBM_QSET_UNINIT;
+        if (atomic_compare_exchange_strong(&g_quarantine_state, &state, CBM_QSET_INITING)) {
+            cbm_quarantine_load();
+            atomic_store(&g_quarantine_state, CBM_QSET_INITED);
+        } else {
+            while (atomic_load(&g_quarantine_state) != CBM_QSET_INITED) {
+                cbm_usleep(1000); /* 1ms */
+            }
+        }
+    }
+    return g_quarantine_set && cbm_ht_has(g_quarantine_set, rel_path);
+}
+
+const char *cbm_index_quarantine_phase(const char *rel_path) {
+    /* cbm_index_is_quarantined drives the lazy once-load and returns true only
+     * when the set is loaded and holds rel_path — so on true, g_quarantine_set is
+     * non-NULL and the stored value is the phase string ("crash"/"hang"). */
+    if (!cbm_index_is_quarantined(rel_path)) {
+        return NULL;
+    }
+    return (const char *)cbm_ht_get(g_quarantine_set, rel_path);
+}
+
+static void cbm_test_fault_inject(const char *rel_path) {
+    if (!rel_path || !rel_path[0]) {
+        return;
+    }
+    const char *crash_on = getenv("CBM_TEST_CRASH_ON");
+    if (crash_on && crash_on[0] && strstr(rel_path, crash_on)) {
+        abort(); /* SIGABRT → WIFSIGNALED → classified as a crash */
+    }
+    const char *hang_on = getenv("CBM_TEST_HANG_ON");
+    if (hang_on && hang_on[0] && strstr(rel_path, hang_on)) {
+        for (;;) {
+            /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
+        }
+    }
+}
+
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
@@ -506,6 +679,20 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
 
     cbm_arena_init(&result->arena);
     CBMArena *a = &result->arena;
+
+    /* Crash-quarantine hard guard (Stage 3c): a file the supervisor pinned as a
+     * crasher must NEVER be parsed again. Return a clean empty result BEFORE the
+     * marker write and fault injector so no pass (including sequential re-extract
+     * passes that miss the result cache) can crash on it. The pipeline extract
+     * loops separately record it as a phase="crash" skip. Checked before the
+     * marker so quarantined files never overwrite it — the marker keeps pointing
+     * at the real (non-quarantined) file being processed when a crash hits. */
+    if (cbm_index_is_quarantined(rel_path)) {
+        return result;
+    }
+
+    cbm_index_write_marker(rel_path);
+    cbm_test_fault_inject(rel_path);
 
     // Get language spec
     const CBMLangSpec *spec = cbm_lang_spec(language);
@@ -771,12 +958,16 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
             continue;
         }
         CBMDefinition *d = &result->defs.items[best];
-        // callee_name may be bare ("recur") or qualified ("pkg.recur", "self.recur")
+        // callee_name may be bare ("recur") or qualified ("self.recur",
+        // "super().save", "axios.get"). A short-name match alone is not
+        // self-recursion: the callee must also target the same object
+        // (is_self_receiver), or super().save() inside save and axios.get
+        // inside get are false positives (#599).
         const char *dot = strrchr(c->callee_name, '.');
         const char *callee_short = dot ? dot + 1 : c->callee_name;
         bool in_loop = c->loop_depth > 0;
 
-        if (strcmp(callee_short, d->name) == 0) {
+        if (strcmp(callee_short, d->name) == 0 && is_self_receiver(c->callee_name, d->receiver)) {
             // Direct self-recursion. The call graph omits self-edges (pass_calls
             // skips source==target), so detect it here; seeds "recursive".
             d->is_recursive = true;

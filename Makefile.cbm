@@ -12,6 +12,15 @@
 # Linux: gcc/g++ — system default with full sanitizer support
 # CI scripts pass CC/CXX explicitly; don't rely on defaults here
 
+# Target architecture (macOS): build.sh/test.sh export ARCHFLAGS="-arch <arch>"
+# (see scripts/env.sh). Fold it into the compiler drivers with `override` so it
+# reaches EVERY compile and link recipe — including the vendored objects below
+# that use their own *_CFLAGS — and so it survives a command-line `CC=` override.
+# ARCHFLAGS is empty on Linux/Windows and for native direct `make` invocations,
+# leaving CC/CXX unchanged there.
+override CC := $(CC) $(ARCHFLAGS)
+override CXX := $(CXX) $(ARCHFLAGS)
+
 # ── Common flags ─────────────────────────────────────────────────
 
 # Include paths for:
@@ -24,17 +33,6 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # Vendored tree-sitter src/ contains unicode/ headers (umachine.h, utf.h, utf8.h).
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
-
-# ── Optional libgit2 (faster git history parsing) ────────────────
-# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent.
-LIBGIT2_CFLAGS := $(shell pkg-config --cflags libgit2 2>/dev/null)
-LIBGIT2_LIBS := $(shell pkg-config --libs libgit2 2>/dev/null)
-ifneq ($(LIBGIT2_LIBS),)
-LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
-else
-LIBGIT2_FLAGS =
-LIBGIT2_LIBS =
-endif
 
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
@@ -50,8 +48,7 @@ CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 $(GCC_ONLY_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
-                -I$(CBM_DIR) -I$(TS_INCLUDE) \
-                $(LIBGIT2_FLAGS)
+                -I$(CBM_DIR) -I$(TS_INCLUDE)
 
 CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
@@ -89,9 +86,9 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
-LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
-LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(LIBGIT2_LIBS) $(WIN32_LIBS)
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
+LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS)
+LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz -fsanitize=thread $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -112,7 +109,9 @@ FOUNDATION_SRCS = \
     src/foundation/mem.c \
     src/foundation/diagnostics.c \
     src/foundation/profile.c \
-    src/foundation/dump_verify.c
+    src/foundation/dump_verify.c \
+    src/foundation/limits.c \
+    src/foundation/subprocess.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -134,6 +133,18 @@ EXTRACTION_SRCS = \
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
+
+# Header/source dependencies of the lsp_all unity object. lsp_all.c #includes
+# every lsp/*.c resolver, which in turn include cbm.h — and CBMCall is copied
+# BY VALUE across the lsp -> pipeline boundary (cbm_calls_push). This object is
+# compiled standalone and linked in, NOT recompiled with the rest on every link,
+# so it must list the headers/sources it pulls in. Without this, a changed struct
+# layout (e.g. a new CBMCall field) leaves a stale lsp_all.o with the old layout —
+# an ODR mismatch that under-reads the by-value struct copy. Explicit because this
+# Makefile does not use compiler auto-dependency (-MMD) generation.
+LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
+                 $(wildcard $(CBM_DIR)/lsp/*.c $(CBM_DIR)/lsp/*.h \
+                            $(CBM_DIR)/lsp/generated/*.c $(CBM_DIR)/*.h)
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
@@ -160,7 +171,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
@@ -297,7 +308,8 @@ TEST_FOUNDATION_SRCS = \
     tests/test_log.c \
     tests/test_str_util.c \
     tests/test_platform.c \
-    tests/test_dump_verify.c
+    tests/test_dump_verify.c \
+    tests/test_subprocess.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -328,11 +340,12 @@ TEST_DISCOVER_SRCS = \
     tests/test_language.c \
     tests/test_userconfig.c \
     tests/test_gitignore.c \
+    tests/test_git_context.c \
     tests/test_discover.c
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -385,6 +398,10 @@ TEST_SECURITY_SRCS = tests/test_security.c
 
 TEST_YAML_SRCS = tests/test_yaml.c
 
+TEST_SEMANTIC_SRCS = tests/test_semantic.c
+TEST_AST_PROFILE_SRCS = tests/test_ast_profile.c
+TEST_SLAB_ALLOC_SRCS = tests/test_slab_alloc.c
+
 TEST_SIMHASH_SRCS = tests/test_simhash.c
 
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
@@ -424,6 +441,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_new_cypher_limit_zero.c \
     tests/repro/repro_issue363.c \
     tests/repro/repro_issue581.c \
+    tests/repro/repro_issue787.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
@@ -444,10 +462,11 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_c_cpp.c \
     tests/repro/repro_lsp_go_py.c \
     tests/repro/repro_lsp_ts.c \
+    tests/repro/repro_ts_inherited_method.c \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -492,7 +511,7 @@ $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+$(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
@@ -554,7 +573,7 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 
 $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ \
+	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
@@ -596,7 +615,7 @@ $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)

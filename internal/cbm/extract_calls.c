@@ -1892,6 +1892,29 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                 strcmp(ts_node_type(node), "method_call_expression") == 0) {
                 call.is_method = true;
             }
+            // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent
+            // as the Perl flag above). Flag a member call x.foo() whose receiver
+            // is NOT `this`/`super`. When the TS-LSP cannot resolve the receiver
+            // type, the call-resolution pass suppresses weak short-name matches
+            // for these (so `re.test()` cannot fabricate an edge to a project
+            // `test`). this/super receivers stay unflagged — their target is the
+            // enclosing class, where a namespace-proximity weak match is usually
+            // right. Bare calls (helper()) and new_expression have no member
+            // receiver, so they keep is_method=false (struct is zero-init).
+            if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
+                 ctx->language == CBM_LANG_TSX) &&
+                strcmp(ts_node_type(node), "call_expression") == 0) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
+                    TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+                    if (!ts_node_is_null(obj)) {
+                        const char *ok = ts_node_type(obj);
+                        if (strcmp(ok, "this") != 0 && strcmp(ok, "super") != 0) {
+                            call.is_method = true;
+                        }
+                    }
+                }
+            }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             if (!ts_node_is_null(args)) {

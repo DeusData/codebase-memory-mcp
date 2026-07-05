@@ -236,7 +236,9 @@ typedef struct {
     int loop_depth;                     // enclosing loop nesting at the call site
     int branch_depth;                   // enclosing branch nesting at the call site
     int start_line;                     // 1-based source line of the call (for def range-match)
-    bool is_method;                     // Perl-only: arrow/method call ($obj->m). Default false.
+    bool is_method;                     // method/member call with a non-self receiver. Perl:
+                                        // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                        // x.foo() whose receiver is not this/super. Default false.
 } CBMCall;
 
 typedef struct {
@@ -503,11 +505,11 @@ typedef struct {
 
 // --- Public API ---
 
-// Bind third-party allocators (tree-sitter, sqlite3, libgit2) to mimalloc as
+// Bind third-party allocators (tree-sitter, sqlite3) to mimalloc as
 // defense-in-depth, so they never depend on the fragile MI_OVERRIDE symbol
 // override (#424). MUST be called as the very first statement of main(), before
 // any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
-// SQLITE_MISUSE once sqlite has initialized) and before any git_libgit2_init.
+// SQLITE_MISUSE once sqlite has initialized).
 // Idempotent (static guard); intended for single-threaded startup. cbm_init()
 // also calls it so non-main entry points (pipeline passes) still get the binds.
 // In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
@@ -515,6 +517,20 @@ void cbm_alloc_init(void);
 
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
+
+// True when rel_path is in the crash-quarantine set — the newline-delimited list
+// of files (CBM_INDEX_QUARANTINE_FILE) the crash supervisor pinned as crashers
+// during its single-threaded recovery re-run. Loaded once, lazily; read-only
+// after load. cbm_extract_file short-circuits such files to an empty result so no
+// pass can crash on them; the pipeline extract loops call this to also REPORT the
+// skip as phase="crash". Always false (cheap no-op) when the env var is unset.
+bool cbm_index_is_quarantined(const char *rel_path);
+
+// Phase a quarantined file was pinned under: "crash" (a fault signal) or "hang"
+// (killed for making no progress). Returns NULL when rel_path is not quarantined.
+// Drives the same lazy once-load as cbm_index_is_quarantined. Used by the pipeline
+// extract loops to report the skip's phase in skipped[] (falls back to "crash").
+const char *cbm_index_quarantine_phase(const char *rel_path);
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.

@@ -7,6 +7,7 @@
 #include "test_framework.h"
 #include <cypher/cypher.h>
 #include <store/store.h>
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -828,6 +829,73 @@ TEST(cypher_exec_variable_length) {
     ASSERT_EQ(rc, 0);
     /* Should find: ValidateOrder (1 hop), SubmitOrder (2 hops), LogError (1 hop) */
     ASSERT_GTE(r.row_count, 3);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Reproduce-first (#887): an EXPLICIT variable-length upper bound must still be
+ * capped at the engine ceiling (cbm_cypher_max_depth(), default 10). On
+ * origin/main, expand_var_length honoured an explicit `*1..N` verbatim (only the
+ * unbounded `*` / `*..m` forms were capped), so `[:CALLS*1..N]` passed N straight
+ * to cbm_store_bfs — an unbounded traversal (a DoS on cyclic graphs). RED before
+ * the clamp: a *1..12 walk over a 13-node chain
+ * returns all 12 hops (N01..N12). GREEN after: it stops at the depth-10 ceiling
+ * (N01..N10); N11/N12 are never emitted. max_rows=64 keeps the binding-expansion
+ * cap (bind_cap*10) well above the hop count, so DEPTH — not the binding cap — is
+ * the bound under test. */
+TEST(cypher_exec_var_length_explicit_bound_capped) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* Linear chain N00 -CALLS-> N01 -> ... -> N12 (13 nodes, one node per hop). */
+    int64_t ids[13];
+    for (int i = 0; i < 13; i++) {
+        char name[8];
+        char qn[24];
+        snprintf(name, sizeof(name), "N%02d", i);
+        snprintf(qn, sizeof(qn), "test.N%02d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "chain.go"};
+        ids[i] = cbm_store_upsert_node(s, &n);
+    }
+    for (int i = 0; i < 12; i++) {
+        cbm_edge_t e = {
+            .project = "test", .source_id = ids[i], .target_id = ids[i + 1], .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function {name: \"N00\"})-[:CALLS*1..12]->"
+                                "(x:Function) RETURN x.name",
+                                "test", 64, &r);
+    ASSERT_EQ(rc, 0);
+
+    /* Capped at 10 hops → exactly N01..N10; N11/N12 are beyond the ceiling. */
+    ASSERT_EQ(r.row_count, 10);
+    bool saw_n10 = false;
+    bool saw_n11 = false;
+    bool saw_n12 = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *v = r.rows[i][0];
+        if (v && strcmp(v, "N10") == 0) {
+            saw_n10 = true;
+        }
+        if (v && strcmp(v, "N11") == 0) {
+            saw_n11 = true;
+        }
+        if (v && strcmp(v, "N12") == 0) {
+            saw_n12 = true;
+        }
+    }
+    ASSERT_TRUE(saw_n10);  /* within the ceiling — proves the traversal really ran */
+    ASSERT_FALSE(saw_n11); /* clamped away */
+    ASSERT_FALSE(saw_n12);
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -2581,6 +2649,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_limit);
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);
+    RUN_TEST(cypher_exec_var_length_explicit_bound_capped);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);

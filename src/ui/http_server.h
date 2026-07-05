@@ -14,6 +14,7 @@
 #include <stddef.h>
 
 typedef struct cbm_http_server cbm_http_server_t;
+struct cbm_watcher;
 
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
@@ -39,6 +40,9 @@ int cbm_http_server_port(const cbm_http_server_t *srv);
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
 
+/* Set external watcher reference for UI project lifecycle actions. Not owned. */
+void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
+
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);
 
@@ -50,5 +54,17 @@ void cbm_http_server_set_binary_path(const char *path);
 
 /* Resolve argv[0] into an executable path suitable for subprocess spawning. */
 bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t outsz);
+
+/* Pure git-remote URL helpers used by GET /api/repo-info. Exposed for tests. */
+
+/* Normalize a git remote (scp-style / ssh:// / https://) to a canonical
+ * "https://host/org/repo" web base, with trailing ".git" and any embedded
+ * credentials removed. malloc'd or NULL. Caller frees. */
+char *cbm_ui_git_web_base(const char *url);
+
+/* Copy `url` with any "user[:password]@" userinfo stripped from a
+ * scheme://authority URL (scp-style is left unchanged). malloc'd, or NULL when
+ * `url` is NULL. Caller frees. */
+char *cbm_ui_git_strip_credentials(const char *url);
 
 #endif /* CBM_UI_HTTP_SERVER_H */

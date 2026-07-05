@@ -106,6 +106,21 @@ static void check_pressure(size_t rss) {
 
 /* ── Public API ────────────────────────────────────────────────── */
 
+#define RAM_FRACTION_DEFAULT 0.5
+#define RAM_FRACTION_16GB 0.25
+#define RAM_FRACTION_32GB 0.35
+#define RAM_BYTES_PER_GB (1024ULL * 1024 * 1024)
+
+double cbm_mem_ram_fraction_for_total(size_t total_ram_bytes) {
+    if (total_ram_bytes <= 16ULL * RAM_BYTES_PER_GB) {
+        return RAM_FRACTION_16GB;
+    }
+    if (total_ram_bytes <= 32ULL * RAM_BYTES_PER_GB) {
+        return RAM_FRACTION_32GB;
+    }
+    return RAM_FRACTION_DEFAULT;
+}
+
 void cbm_mem_init(double ram_fraction) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {
@@ -122,6 +137,15 @@ void cbm_mem_init(double ram_fraction) {
     mi_option_set(mi_option_arena_eager_commit, 0);
     mi_option_set(mi_option_purge_decommits, SKIP_ONE);
     mi_option_set(mi_option_purge_delay, 0); /* immediate purge, no 1s delay */
+    /* v3 (#832): reclaim abandoned pages on ANY thread's free (=1), restoring the
+     * v2 behaviour. mimalloc v3 defaults page_reclaim_on_free=0, so pages a worker
+     * thread abandons at exit are NOT reclaimed when the main thread later frees
+     * their blocks (and mi_collect cannot touch abandoned pages) — RSS then
+     * ratchets across repeated in-process index cycles. The supervised subprocess
+     * is the primary cure (the child returns 100% RSS on exit); this is the
+     * in-process fallback for any path that stays in-process (kill switch,
+     * spawn-fail degrade, embedders). */
+    mi_option_set(mi_option_page_reclaim_on_free, 1);
 
     /* CBM_MEM_BUDGET_MB env override (memory analogue of CBM_WORKERS).
      * Lets users cap the budget directly without an enclosing cgroup —
@@ -151,19 +175,54 @@ void cbm_mem_init(double ram_fraction) {
 }
 
 size_t cbm_mem_rss(void) {
+#if defined(__linux__)
+    /* Linux: mimalloc's _mi_prim_process_info() (vendored/mimalloc/src/prim/
+     * unix/prim.c) never sets pinfo->current_rss on Linux — it only sets
+     * peak_rss (from getrusage's ru_maxrss). current_rss therefore keeps
+     * mi_process_info()'s default of pinfo.current_commit: mimalloc's OWN
+     * committed-page counter, which this project deliberately tunes low via
+     * mi_option_arena_eager_commit=0 + purge_decommits=1 + purge_delay=0
+     * (cbm_mem_init) to reduce upfront memory. So on Linux "current_rss" is a
+     * low-biased mimalloc-internal metric, not true RSS: under concurrent
+     * large-file parsing it can read a few MB while real RSS is multiple GB,
+     * silently blinding cbm_mem_over_budget()'s backpressure to real memory
+     * pressure (small-but-nonzero, so the `current_rss > 0` guard below never
+     * catches it). os_rss() reads /proc/self/statm — authoritative OS RSS,
+     * unaffected by mimalloc's accounting — so it is the PRIMARY source on
+     * Linux, not a last-resort fallback. macOS/Windows are unaffected:
+     * mimalloc sets current_rss correctly there via task_info /
+     * GetProcessMemoryInfo. */
+    size_t proc_rss = os_rss();
+    if (proc_rss > 0) {
+        return proc_rss;
+    }
+    /* Extremely unlikely (/proc unavailable) — fall through to mimalloc. */
+#endif
     size_t current_rss = 0;
     size_t peak_rss = 0;
     mi_process_info(NULL, NULL, NULL, &current_rss, &peak_rss, NULL, NULL, NULL);
     if (current_rss > 0) {
         return current_rss;
     }
-    /* Fallback for ASan builds (MI_OVERRIDE=0) */
+    /* Fallback for ASan builds (MI_OVERRIDE=0) and any platform where
+     * mimalloc's current_rss is unavailable/zero. */
     return os_rss();
 }
 
 size_t cbm_mem_peak_rss(void) {
     size_t peak_rss = 0;
     mi_process_info(NULL, NULL, NULL, NULL, &peak_rss, NULL, NULL, NULL);
+    /* Peak RSS is by definition >= current RSS. On Linux cbm_mem_rss() reads the
+     * live /proc/self/statm value (page-granular), while mimalloc's peak_rss
+     * comes from getrusage's ru_maxrss (KB-granular, and it can lag the live
+     * statm read by a few pages). Reading the two sources independently lets a
+     * fresh current read momentarily exceed the reported peak, breaking the
+     * peak >= current invariant. Reconcile them: the true peak is at least the
+     * current RSS. (Not observable on macOS, where both come from mimalloc.) */
+    size_t current = cbm_mem_rss();
+    if (current > peak_rss) {
+        peak_rss = current;
+    }
     if (peak_rss > 0) {
         return peak_rss;
     }

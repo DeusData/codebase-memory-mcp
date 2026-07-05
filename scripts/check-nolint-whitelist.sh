@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Verify NOLINT(misc-no-recursion) only appears on whitelisted functions.
 WHITELIST="src/foundation/recursion_whitelist.h"
 if [ ! -f "$WHITELIST" ]; then

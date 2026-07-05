@@ -3111,6 +3111,132 @@ TEST(complexity_guarded_recursion) {
     PASS();
 }
 
+/* #599: super().save() inside a method named save is a parent-class call —
+ * the receiver is super(), never self — so it must NOT flag self-recursion.
+ * super()-ONLY fixture: no self.save() alongside, so the assertion cannot pass
+ * vacuously off a genuine self-call. */
+TEST(complexity_super_only_not_recursive) {
+    CBMFileResult *r = extract("class B(A):\n"
+                               "    def save(self):\n"
+                               "        super().save()\n",
+                               CBM_LANG_PYTHON, "t", "super_only.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* parent-class call, not self-recursion */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #599: a same-named call on an unrelated receiver (axios.get inside a
+ * function also named get) is delegation, not self-recursion. */
+TEST(complexity_same_name_other_receiver_not_recursive) {
+    CBMFileResult *r = extract("function get(url) {\n"
+                               "    return axios.get(url);\n"
+                               "}\n",
+                               CBM_LANG_JAVASCRIPT, "t", "axios_get.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "get");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* axios.get targets axios, not this fn */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Guard: genuine self-recursion through self/this receivers still trips the
+ * detector after the receiver-aware narrowing (#599). */
+TEST(complexity_self_receiver_still_recursive) {
+    /* Python: self.recur() — same object. */
+    CBMFileResult *r = extract("class C:\n"
+                               "    def recur(self, n):\n"
+                               "        if n > 0:\n"
+                               "            self.recur(n - 1)\n",
+                               CBM_LANG_PYTHON, "t", "self_recur.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "recur");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive);
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
+    cbm_free_result(r);
+
+    /* JS: this.step() — same object. */
+    r = extract("class C {\n"
+                "    step(n) {\n"
+                "        if (n > 0) { this.step(n - 1); }\n"
+                "    }\n"
+                "}\n",
+                CBM_LANG_JAVASCRIPT, "t", "this_step.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "step");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive);
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if (n > 0)` */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #599: chained receiver — self.obj.recur() inside recur targets self's FIELD
+ * obj, a different object. The whole receiver chain ("self.obj") must be
+ * compared, not just its first segment ("self"). */
+TEST(complexity_chained_receiver_not_self) {
+    CBMFileResult *r = extract("class C:\n"
+                               "    def recur(self, n):\n"
+                               "        self.obj.recur(n)\n",
+                               CBM_LANG_PYTHON, "t", "chained_recur.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "recur");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* self.obj is not self */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #599: Go method receiver — the enclosing def's own receiver identifier
+ * (`s` in `func (s *Store) save()`) is whitelisted dynamically from
+ * CBMDefinition.receiver, so s.save() still counts as self-recursion while
+ * s.backup.save() (a field's same-named method) does not. */
+TEST(complexity_go_method_receiver_self_recursion) {
+    CBMFileResult *r = extract("package p\n"
+                               "type Store struct{}\n"
+                               "func (s *Store) save(n int) {\n"
+                               "    if n > 0 {\n"
+                               "        s.save(n - 1)\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "store.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(d->is_recursive); /* s.save() == receiver s → self */
+    ASSERT_FALSE(d->unguarded_recursion); /* guarded by `if n > 0` */
+    cbm_free_result(r);
+
+    /* Same-named method on a field of the receiver: NOT self-recursion. */
+    r = extract("package p\n"
+                "type Store struct{ backup *Store }\n"
+                "func (s *Store) save(n int) {\n"
+                "    s.backup.save(n)\n"
+                "}\n",
+                CBM_LANG_GO, "t", "store_backup.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    d = find_def(r, "save");
+    ASSERT_NOT_NULL(d);
+    ASSERT_FALSE(d->is_recursive); /* s.backup is not s */
+    ASSERT_FALSE(d->unguarded_recursion);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Deep chained member access + parameter count structure smells. */
 TEST(complexity_access_depth_and_params) {
     CBMFileResult *r = extract("package p\n"
@@ -3222,11 +3348,12 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
-/* Other languages must be unaffected: a JS method call never sets is_method
- * (the flag is Perl-only). */
-TEST(extract_non_perl_method_call_not_flagged_is_method) {
-    CBMFileResult *r =
-        extract("function run(o){ o.commit(); helper(); }\n", CBM_LANG_JAVASCRIPT, "t", "x.js");
+/* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
+ * be unaffected: a Go method call never sets is_method. */
+TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
+    CBMFileResult *r = extract("package m\n"
+                               "func run(o Obj) { o.Commit(); helper() }\n",
+                               CBM_LANG_GO, "t", "x.go");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     for (int i = 0; i < r->calls.count; i++) {
@@ -3236,9 +3363,156 @@ TEST(extract_non_perl_method_call_not_flagged_is_method) {
     PASS();
 }
 
+/* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
+ * A member call x.foo() with a non-this/super receiver is flagged is_method so
+ * the resolver can suppress a weak short-name match (`re.test()` must not bind a
+ * project `test`); a bare call is not flagged. */
+TEST(extract_ts_member_call_flags_is_method) {
+    CBMFileResult *r = extract("const re = /^a+$/;\n"
+                               "export function checkFormat(s: string) { return re.test(s); }\n"
+                               "function helper() { return 1; }\n"
+                               "export function run() { return helper(); }\n",
+                               CBM_LANG_TYPESCRIPT, "t", "a.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int member = 0;
+    int bare = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (strcmp(cn, "re.test") == 0) {
+            member++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        }
+        if (strcmp(cn, "helper") == 0) {
+            bare++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
+    }
+    ASSERT_TRUE(member >= 1); /* re.test() flagged */
+    ASSERT_TRUE(bare >= 1);   /* helper() not flagged */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* this/super receivers keep the enclosing-class target, where a weak
+ * namespace-proximity match is usually correct — so they are NOT flagged. A
+ * new_expression has no member receiver and is never flagged either. */
+TEST(extract_ts_this_super_receiver_not_flagged) {
+    CBMFileResult *r = extract("class A extends B {\n"
+                               "  m() { this.helper(); super.render(); return new A(); }\n"
+                               "  helper() {}\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "b.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* Every call here has a self receiver (this/super) or is a new-expression,
+     * so NONE may be flagged. */
+    for (int i = 0; i < r->calls.count; i++) {
+        ASSERT_FALSE(r->calls.items[i].is_method);
+    }
+    /* Sanity: the this/super member calls were actually extracted. */
+    ASSERT_TRUE(has_call(r, "helper")); /* this.helper */
+    ASSERT_TRUE(has_call(r, "render")); /* super.render */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* JS dialect behaves like TS (the flag is gated on the language set, not the
+ * dialect). Replaces the pre-#592 test that asserted JS never flags is_method. */
+TEST(extract_js_member_call_flags_is_method) {
+    CBMFileResult *r =
+        extract("function run(o){ o.commit(); helper(); }\n", CBM_LANG_JAVASCRIPT, "t", "x.js");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int member = 0;
+    int bare = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (strcmp(cn, "o.commit") == 0) {
+            member++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        }
+        if (strcmp(cn, "helper") == 0) {
+            bare++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
+    }
+    ASSERT_TRUE(member >= 1); /* o.commit() flagged */
+    ASSERT_TRUE(bare >= 1);   /* helper() not flagged */
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
+ * C-stack frame that overflowed small thread stacks (the reporter's crash was in
+ * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
+ * SILENTLY DROPPED every top-level definition past 4096. The growable heap stack
+ * fixes both: a file with > 4096 top-level defs must extract ALL of them. RED
+ * before the fix (extracted count capped near 4096), GREEN after. */
+TEST(walk_defs_no_truncation_over_4096_issue668) {
+    enum { N = 5000 };
+    /* N top-level Python defs → N Function defs, all direct module children, so
+     * walk_defs pushes all N children at once — the >4096 truncation site. */
+    size_t cap = (size_t)N * 24 + 1;
+    char *src = (char *)malloc(cap);
+    ASSERT_NOT_NULL(src);
+    size_t off = 0;
+    for (int i = 0; i < N; i++) {
+        off += (size_t)snprintf(src + off, cap - off, "def f%d(): pass\n", i);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "t", "big.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int nfuncs = count_defs_with_label(r, "Function");
+    ASSERT(nfuncs >= N); /* all N present — not truncated at the old 4096 cap */
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * Suite
  * ═══════════════════════════════════════════════════════════════════ */
+
+/* Rust: inline #[test]/#[tokio::test] functions must be marked is_test so the
+ * store.c `is_test != 1` filter excludes them from graph context. Detection is
+ * otherwise file-path-based (cbm_is_test_file), so test fns in a regular .rs
+ * file leak. (#855) */
+TEST(extract_rust_test_attr_marks_is_test_issue855) {
+    CBMFileResult *r = extract(
+        "pub fn real_fn() {}\n"
+        "\n"
+        "#[test]\n"
+        "fn sync_test() {}\n"
+        "\n"
+        "#[tokio::test]\n"
+        "async fn async_test() {}\n",
+        CBM_LANG_RUST, "t", "src/lib.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    int real = -1, sync = -1, asyn = -1;
+    for (int i = 0; i < r->defs.count; i++) {
+        const char *n = r->defs.items[i].name;
+        if (!n) {
+            continue;
+        }
+        if (strcmp(n, "real_fn") == 0) {
+            real = r->defs.items[i].is_test ? 1 : 0;
+        } else if (strcmp(n, "sync_test") == 0) {
+            sync = r->defs.items[i].is_test ? 1 : 0;
+        } else if (strcmp(n, "async_test") == 0) {
+            asyn = r->defs.items[i].is_test ? 1 : 0;
+        }
+    }
+    ASSERT(real >= 0 && sync >= 0 && asyn >= 0 && "all three fns extracted");
+    ASSERT(real == 0 && "real_fn is NOT a test");
+    ASSERT(sync == 1 && "#[test] fn is_test");
+    ASSERT(asyn == 1 && "#[tokio::test] fn is_test");
+
+    cbm_free_result(r);
+    PASS();
+}
 
 SUITE(extraction) {
     /* Initialize extraction library */
@@ -3248,7 +3522,10 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
-    RUN_TEST(extract_non_perl_method_call_not_flagged_is_method);
+    RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
+    RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_ts_this_super_receiver_not_flagged);
+    RUN_TEST(extract_js_member_call_flags_is_method);
 
     /* R box-module imports + member calls */
     RUN_TEST(extract_r_box_use_imports_issue218);
@@ -3484,7 +3761,14 @@ SUITE(extraction) {
     RUN_TEST(complexity_linear_scan_in_loop);
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);
+    RUN_TEST(complexity_super_only_not_recursive);
+    RUN_TEST(complexity_same_name_other_receiver_not_recursive);
+    RUN_TEST(complexity_self_receiver_still_recursive);
+    RUN_TEST(complexity_chained_receiver_not_self);
+    RUN_TEST(complexity_go_method_receiver_self_recursion);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
+    RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
 
     cbm_shutdown();
 }

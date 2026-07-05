@@ -9,9 +9,73 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "foundation/compat.h"    /* cbm_setenv — #845 supervisor kill switch */
+#include "foundation/compat_fs.h" /* cbm_fopen — worker response file */
+#include "foundation/mem.h"       /* cbm_mem_init — worker budget */
+#include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
+#include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
 #include <sqlite3.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* #832 guard support: when the index supervisor spawns THIS binary as
+ * `<self> cli --index-worker index_repository <args_json> --response-out <file>`
+ * (exactly the argv cbm_index_spawn_worker builds), act as a faithful in-process
+ * index worker instead of re-running the test suites. This lets the deterministic
+ * gating guard (test_mcp.c) spawn a REAL worker child that indexes the fixture and
+ * writes its response back, using only public APIs — no production test seam.
+ * Returns an exit code (>=0) when it handled a worker invocation, else -1. */
+static int tf_maybe_run_index_worker(int argc, char **argv) {
+    if (argc < 2 || strcmp(argv[1], "cli") != 0) {
+        return -1;
+    }
+    bool is_worker = false;
+    const char *tool = NULL;
+    const char *args_json = "{}";
+    const char *response_out = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--index-worker") == 0) {
+            is_worker = true;
+        } else if (strcmp(argv[i], "--response-out") == 0) {
+            if (i + 1 < argc) {
+                response_out = argv[++i];
+            }
+        } else if (argv[i][0] == '{') {
+            args_json = argv[i];
+        } else if (argv[i][0] != '-' && !tool) {
+            tool = argv[i];
+        }
+    }
+    if (!is_worker) {
+        return -1;
+    }
+    if (!tool) {
+        tool = "index_repository";
+    }
+
+    cbm_mem_init(0.5);
+    cbm_index_set_worker_role(true, response_out); /* worker role → index in-process */
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return 1;
+    }
+    char *result = cbm_mcp_handle_tool(srv, tool, args_json);
+    if (result) {
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            FILE *rf = cbm_fopen(ro, "wb");
+            if (rf) {
+                (void)fputs(result, rf);
+                (void)fclose(rf);
+            }
+        }
+        free(result);
+    }
+    cbm_mcp_server_free(srv);
+    return 0;
+}
 
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
@@ -43,6 +107,7 @@ extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
 extern void suite_platform(void);
+extern void suite_subprocess(void);
 extern void suite_extraction(void);
 extern void suite_extraction_inheritance(void);
 extern void suite_extraction_imports(void);
@@ -58,10 +123,12 @@ extern void suite_mcp(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
 extern void suite_gitignore(void);
+extern void suite_git_context(void);
 extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_index_resilience(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
@@ -120,6 +187,9 @@ extern void suite_grammar_probe_e(void);
 extern void suite_grammar_probe_f(void);
 extern void suite_grammar_probe_g(void);
 extern void suite_incremental(void);
+extern void suite_semantic(void);
+extern void suite_ast_profile(void);
+extern void suite_slab_alloc(void);
 extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
 extern void suite_dump_verify(void);
@@ -131,6 +201,20 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    /* #832: if spawned as a supervised index worker, do the real work and exit
+     * before any suite runs (see tf_maybe_run_index_worker). */
+    int worker_rc = tf_maybe_run_index_worker(argc, argv);
+    if (worker_rc >= 0) {
+        return worker_rc;
+    }
+
+    /* #845 belt-and-suspenders: this binary EMBEDS cbm_mcp_handle_tool. The
+     * supervisor gate already ignores unmarked hosts, but pin the kill switch
+     * too so even a future supervisor-marked test host can never resolve THIS
+     * binary as `<self> cli --index-worker …` and recursively re-run suites.
+     * A test that exercises the supervisor must explicitly re-enable it. */
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
     g_suite_argc = argc;
     g_suite_argv = argv;
     printf("\n  codebase-memory-mcp  C test suite\n");
@@ -143,6 +227,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
     RUN_SELECTED_SUITE(platform);
+    RUN_SELECTED_SUITE(subprocess);
     RUN_SELECTED_SUITE(dump_verify);
 
     /* Existing C code regression tests */
@@ -173,6 +258,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(language);
     RUN_SELECTED_SUITE(userconfig);
     RUN_SELECTED_SUITE(gitignore);
+    RUN_SELECTED_SUITE(git_context);
     RUN_SELECTED_SUITE(discover);
 
     /* Graph Buffer (M7) */
@@ -181,6 +267,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(index_resilience);
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);
     RUN_SELECTED_SUITE(path_alias);
@@ -239,6 +326,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(parallel);
 
     /* mem + arena + slab integration */
+    RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
 
     /* UI (config, embedded assets, layout) */
@@ -254,6 +342,8 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(yaml);
 
     /* SimHash / SIMILAR_TO */
+    RUN_SELECTED_SUITE(semantic);
+    RUN_SELECTED_SUITE(ast_profile);
     RUN_SELECTED_SUITE(simhash);
 
     /* Stack overflow regression (GitHub #199) */

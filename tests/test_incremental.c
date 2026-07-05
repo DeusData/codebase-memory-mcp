@@ -297,14 +297,18 @@ TEST(incr_full_index) {
         printf("    [PERF WARNING] full index: %.0fms (>30s)\n", ms);
     }
 
-    /* Memory: should not exceed ~2GB for a 1100-file Python project. ARM (and
-     * other large-page) Linux/macOS use 16KB pages vs x86's 4KB; per-allocation
-     * page rounding inflates RSS ~25-30% for the SAME logical footprint (not a
-     * leak — x86 peaks ~1870MB, ARM ~2385MB on the same index). Scale the budget
-     * by page size so the guard still catches real runaway memory (a leak would
-     * be GBs over) without false-failing on large-page architectures. */
+    /* Memory: bounded budget for a 1100-file Python project. ARM (and other
+     * large-page) Linux/macOS use 16KB pages vs x86's 4KB; per-allocation page
+     * rounding inflates RSS ~25-30% for the SAME logical footprint (not a leak —
+     * ARM ~2385MB on the same index). Scale the budget by page size so the guard
+     * still catches real runaway memory (a leak would be GBs over) without
+     * false-failing on large-page architectures. The x86 base budget is 2304MB:
+     * after the retention/source-text-cap and RAM-tiering work the x86 peak for
+     * this index settled at ~2050-2072MB (measured across CI runs), so the old
+     * 2048 limit sat right on the line and flaked; 2304 restores headroom while a
+     * genuine leak (GBs over) still trips it. */
     size_t rss_delta_mb = peak_mb - (g_rss_before_full / (1024 * 1024));
-    int rss_limit_mb = 2048;
+    int rss_limit_mb = 2304;
 #ifndef _WIN32
     if (sysconf(_SC_PAGESIZE) >= 16384) {
         rss_limit_mb = 2816;

@@ -8,6 +8,31 @@ codebase-memory-mcp interacts deeply with your filesystem. It reads source files
 
 We are humans and can make mistakes. We take security seriously — it is Priority #1 for this project — but we cannot guarantee perfection. By using this software you accept responsibility for evaluating whether it meets your own security requirements.
 
+## Runtime Network Behavior
+
+Indexing, graph queries, semantic search, and MCP tool handling run locally. The
+MCP server does not upload source code, repository paths, graph indexes, query
+contents, environment variables, usage metrics, or telemetry.
+
+The MCP server has one best-effort external runtime check: after MCP
+`initialize`, it starts a background update-check thread that requests release
+metadata from
+`https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest`.
+That request is used only to show an update notice when a newer release exists.
+It sends no project data; only standard HTTPS metadata, such as the destination
+host and the normal `curl` request headers, are visible to GitHub and the
+network path.
+
+The update check is non-blocking for MCP startup and tool calls. If the machine
+is offline, DNS fails, GitHub is unreachable, or `curl` exits with an error, the
+check is ignored. The request is also bounded with `curl --max-time 5`; a
+process shutting down immediately while the check is still running may wait for
+that bounded background thread to finish.
+
+Explicit install, package-manager, and `codebase-memory-mcp update` flows are
+separate user-initiated network operations that download release assets and
+checksums from GitHub.
+
 ## Help Us Stay Secure
 
 **We actively invite security researchers to try to break this project.**

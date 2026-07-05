@@ -21,6 +21,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h" /* cbm_validate_shell_arg — git shell-out hardening */
 
 #include "zstd_store.h"
 
@@ -122,7 +123,7 @@ static bool artifact_path(char *buf, size_t bufsz, const char *repo_path, const 
 
 /* Read entire file into malloc'd buffer. Sets *out_len. Returns NULL on error. */
 static char *read_file_alloc(const char *path, size_t *out_len) {
-    FILE *fp = fopen(path, "rb");
+    FILE *fp = cbm_fopen(path, "rb");
     if (!fp) {
         return NULL;
     }
@@ -201,10 +202,45 @@ static int write_file_atomic(const char *path, const char *data, size_t len,
     return 0;
 }
 
+#ifdef _WIN32
+#define ARTIFACT_NULL_DEV "NUL"
+#else
+#define ARTIFACT_NULL_DEV "/dev/null"
+#endif
+
+/* See artifact.h. Mirrors git_context.c's git_validate_repo_path (the best-hardened
+ * git shell-out): cbm_validate_shell_arg rejects quote / backslash / substitution
+ * metacharacters, and on Windows we also reject the cmd.exe expansion metacharacters
+ * % ! ^. Callers then use DOUBLE quotes (honored by both POSIX sh and cmd.exe, unlike
+ * single quotes on cmd.exe), so a repo path may legitimately contain spaces. */
+bool cbm_artifact_repo_path_is_shell_safe(const char *repo_path) {
+    if (!cbm_validate_shell_arg(repo_path)) {
+        return false;
+    }
+#ifdef _WIN32
+    for (const char *p = repo_path; *p; p++) {
+        if (*p == '%' || *p == '!' || *p == '^') {
+            return false;
+        }
+    }
+#endif
+    return true;
+}
+
 /* Get current git HEAD hash. buf must be >= CBM_SZ_64. Returns false on error. */
 static bool git_head_hash(const char *repo_path, char *buf, size_t bufsz) {
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' rev-parse HEAD 2>/dev/null", repo_path);
+    if (!cbm_artifact_repo_path_is_shell_safe(repo_path)) {
+        buf[0] = '\0';
+        return false;
+    }
+    int n =
+        snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse HEAD 2>" ARTIFACT_NULL_DEV, repo_path);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        buf[0] = '\0'; /* truncated command → don't run a malformed shell string (parity with
+                          git_context.c) */
+        return false;
+    }
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         buf[0] = '\0';
@@ -357,8 +393,15 @@ static void ensure_gitattributes(const char *repo_path) {
     }
 
     /* Best-effort: configure merge driver */
+    if (!cbm_artifact_repo_path_is_shell_safe(repo_path)) {
+        return;
+    }
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' config merge.ours.driver true 2>/dev/null", repo_path);
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git -C \"%s\" config merge.ours.driver true 2>" ARTIFACT_NULL_DEV, repo_path);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return; /* truncated command → skip (parity with git_context.c) */
+    }
     FILE *p = cbm_popen(cmd, "r");
     if (p) {
         (void)cbm_pclose(p);

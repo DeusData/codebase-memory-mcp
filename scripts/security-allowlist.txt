@@ -8,6 +8,7 @@
 src/foundation/compat_fs.c:popen:cbm_popen wrapper definition (POSIX)
 src/foundation/compat_fs.c:cbm_popen:cbm_popen function definition
 src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free subprocess execution
+src/foundation/subprocess.c:fork:cbm_run_posix — fork+execv for the crash/hang-isolating index worker (supervisor primitive; child execs immediately, no code runs in the forked image)
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
@@ -33,7 +34,7 @@ src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validate
 src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
 src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 
-# ── Pipeline: git history parsing (fallback when libgit2 not available) ────
+# ── Pipeline: git history parsing (git log) ────────────────────────────────
 src/pipeline/pass_githistory.c:cbm_popen:git log for file history (path validated)
 src/pipeline/pass_githistory.c:popen:via cbm_popen wrapper call
 
@@ -55,3 +56,4 @@ URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest:version chec
 URL:http://127.0.0.1:UI server binding (localhost only)
 URL:https://www.sqlite.org/c3ref/c_checkpoint_full.html:sqlite WAL checkpoint API doc reference (comment only, not a network call)
 URL:https://github.com/DeusData/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/mcp.c)
+URL:https://%s:GitHub blob-URL construction in src/ui/http_server.c cbm_ui_git_web_base — https-forces the repo web base for frontend deep-links (not a network call)

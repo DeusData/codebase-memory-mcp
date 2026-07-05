@@ -13,7 +13,8 @@
  * file LSP picks them up.
  *
  * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
- * TSX, PHP, C#. Anything else short-circuits via cbm_pxc_has_cross_lsp.
+ * TSX, PHP, C#, and JVM (Java/Kotlin via the shared filter helper).
+ * Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
  * (cbm_pipeline_pass_lsp_cross) that re-read every source file from
@@ -65,15 +66,13 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * modules. gopls observed the same: it builds per-package summaries
  * and per-file only loads the summaries the file imports.
  *
- * cbm_pxc_build_module_def_index() builds an inverted index once
- * (O(D)) mapping def_module_qn → list of indices into all_defs[].
- * cbm_pxc_filter_defs_for_file() then returns a small CBMLSPDef[]
- * containing ONLY the defs from own_module + imp_qns — typically
- * 50-100× smaller than the global all_defs[].
- *
- * Net: per-file registry build drops from O(all_defs) to O(relevant_
- * defs). On a Go file importing 10 packages, relevant ≈ 1-2k vs
- * 110k → ~50× per-file speedup on the dominant cost. */
+ * cbm_pxc_build_module_def_index() builds inverted indexes once (O(D)):
+ * def_module_qn → defs and declared namespace/package → defs.
+ * cbm_pxc_filter_defs_for_file() then returns own_module + imp_qns for
+ * most languages. For Java/Kotlin callers it additionally returns
+ * same-namespace JVM defs so Gradle/Maven mixed source roots
+ * (`src/main/java/...` + `src/main/kotlin/...`) resolve same-package
+ * references without falling back to a full project registry per file. */
 typedef struct CBMModuleDefIndex CBMModuleDefIndex;
 
 CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_count);
@@ -81,12 +80,15 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
 void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx);
 
 /* Return a malloc'd CBMLSPDef[] containing all defs whose
- * def_module_qn matches own_module OR any of imp_qns. String fields
- * inside each entry are borrowed from the original all_defs[] arena
- * (caller keeps it alive). Caller frees the returned array with
- * free(). Writes the entry count to *out_count. Returns NULL if no
- * matches (with *out_count = 0). */
+ * def_module_qn matches own_module OR any of imp_qns. For Java/Kotlin
+ * callers, also include defs from the same declared package/namespace:
+ * JVM same-package references often cross `src/main/java` and
+ * `src/main/kotlin` roots without import statements. String fields inside
+ * each entry are borrowed from the original all_defs[] arena (caller keeps
+ * it alive). Caller frees the returned array with free(). Writes the entry
+ * count to *out_count. Returns NULL if no matches (with *out_count = 0). */
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
+                                        CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
                                         int imp_count, int *out_count);
 

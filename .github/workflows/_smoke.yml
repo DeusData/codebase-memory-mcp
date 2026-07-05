@@ -40,22 +40,24 @@ jobs:
           # Broad legs reuse existing goos/goarch artifacts on newer/older OS
           # versions (e.g. ubuntu-22.04 = older glibc) to widen the run-anywhere
           # signal without building new targets.
+          # Broad legs are REQUIRED gates (no optional / continue-on-error):
+          # every smoke leg must pass. No `optional` flags anywhere.
           BROAD_UNIX='[
-            {"os":"ubuntu-22.04","goos":"linux","goarch":"amd64","optional":true},
-            {"os":"ubuntu-22.04-arm","goos":"linux","goarch":"arm64","optional":true},
-            {"os":"macos-15","goos":"darwin","goarch":"arm64","optional":true}
+            {"os":"ubuntu-22.04","goos":"linux","goarch":"amd64"},
+            {"os":"ubuntu-22.04-arm","goos":"linux","goarch":"arm64"},
+            {"os":"macos-15","goos":"darwin","goarch":"arm64"}
           ]'
           CORE_WIN='[{"os":"windows-latest"}]'
           # windows-11-arm runs the shipped x86_64 binary under emulation —
           # verifies the Windows artifact still launches on ARM hardware.
-          BROAD_WIN='[{"os":"windows-2025","optional":true},{"os":"windows-11-arm","optional":true}]'
+          BROAD_WIN='[{"os":"windows-2025"},{"os":"windows-11-arm"}]'
           CORE_PORTABLE='[
             {"arch":"amd64","runner":"ubuntu-latest"},
             {"arch":"arm64","runner":"ubuntu-24.04-arm"}
           ]'
           BROAD_PORTABLE='[
-            {"arch":"amd64","runner":"ubuntu-22.04","optional":true},
-            {"arch":"arm64","runner":"ubuntu-22.04-arm","optional":true}
+            {"arch":"amd64","runner":"ubuntu-22.04"},
+            {"arch":"arm64","runner":"ubuntu-22.04-arm"}
           ]'
           if [ "$BROAD" = "true" ]; then
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
@@ -66,9 +68,19 @@ jobs:
             WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
             PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" '$a')
           fi
-          echo "unix={\"variant\":[\"standard\",\"ui\"],\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
-          echo "windows={\"variant\":[\"standard\",\"ui\"],\"include\":$WIN}" >> "$GITHUB_OUTPUT"
-          echo "portable={\"variant\":[\"standard\",\"ui\"],\"include\":$PORTABLE}" >> "$GITHUB_OUTPUT"
+          # Expand each OS entry over both variants into a FLAT include list so
+          # every {os,variant} runs as its own job. A {variant:[...],include:$LIST}
+          # matrix collapses under GitHub's include-merge (later os entries
+          # overwrite the variant combos last-wins), which silently dropped every
+          # OS except the last — e.g. only windows-11-arm ran, never windows-latest.
+          # Building the cartesian explicitly avoids that.
+          VARIANTS='["standard","ui"]'
+          UNIX_M=$(jq -cn --argjson a "$UNIX" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          WIN_M=$(jq -cn --argjson a "$WIN" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          PORTABLE_M=$(jq -cn --argjson a "$PORTABLE" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          echo "unix=$UNIX_M" >> "$GITHUB_OUTPUT"
+          echo "windows=$WIN_M" >> "$GITHUB_OUTPUT"
+          echo "portable=$PORTABLE_M" >> "$GITHUB_OUTPUT"
 
   smoke-unix:
     needs: setup-matrix
@@ -76,10 +88,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -153,10 +164,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
@@ -220,10 +230,9 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.portable) }}
     runs-on: ${{ matrix.runner }}
-    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -266,7 +275,7 @@ jobs:
     timeout-minutes: 10
     continue-on-error: true
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build Glama image and verify MCP introspection
         run: bash pkg/glama/verify.sh
       - name: Test homebrew installation

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # soak-test.sh — Endurance test for codebase-memory-mcp.
 #
 # Runs compressed workload cycles: queries, file mutations, reindexes, idle periods.

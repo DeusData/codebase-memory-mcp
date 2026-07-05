@@ -120,7 +120,12 @@ export function Sidebar({ nodes, onSelectPath, selectedPath }: SidebarProps) {
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
-      <div className="px-3 py-2.5 border-b border-border/30">
+      <div className="px-4 pt-3 pb-2 shrink-0">
+        <span className="text-[11px] font-medium text-foreground/50 uppercase tracking-widest">
+          {t.graph.folders}
+        </span>
+      </div>
+      <div className="px-3 pb-2.5 border-b border-border/30 shrink-0">
         <div className="relative">
           <input
             type="text"

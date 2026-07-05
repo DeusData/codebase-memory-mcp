@@ -8,6 +8,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 
 /* CLI buffer size constants. */
 enum {
@@ -79,6 +80,7 @@ enum {
 #endif
 #include <errno.h>  // EEXIST
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
+#include <limits.h> // UINT_MAX
 #include <stdint.h> // uintptr_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -1233,6 +1235,10 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     snprintf(path, sizeof(path), "%s/.kiro", home_dir);
     agents.kiro = dir_exists(path);
 
+    /* Junie (JetBrains): ~/.junie/ */
+    snprintf(path, sizeof(path), "%s/.junie", home_dir);
+    agents.junie = dir_exists(path);
+
     return agents;
 }
 
@@ -1769,6 +1775,17 @@ int cbm_remove_antigravity_mcp(const char *config_path) {
     return cbm_remove_editor_mcp(config_path);
 }
 
+/* ── Junie MCP config (JSON, same mcpServers format) ──────────── */
+
+int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path) {
+    /* Junie (JetBrains) uses same mcpServers format as Cursor/Antigravity */
+    return cbm_install_editor_mcp(binary_path, config_path);
+}
+
+int cbm_remove_junie_mcp(const char *config_path) {
+    return cbm_remove_editor_mcp(config_path);
+}
+
 /* ── Claude Code pre-tool hooks ───────────────────────────────── */
 
 /* Matcher intentionally excludes Read: gating Read breaks Claude Code's
@@ -1795,9 +1812,15 @@ static const char *const cmm_gemini_old_matchers[] = {
     NULL,
 };
 
-/* Check if a hook array entry is ours (current matcher or a known old one). */
+/* Check if a hook array entry is ours (current matcher or a known old one).
+ * When require_command_substr is non-NULL, the matcher match is not sufficient:
+ * the entry must ALSO carry a hooks[].command containing that substring. This
+ * disambiguates our entry from a user's own hook that happens to share the same
+ * matcher (notably "*", which a user is likely to pick for a catch-all hook), so
+ * upsert/remove never clobber a foreign entry. NULL preserves matcher-only
+ * matching for callers whose matcher is already CMM-specific (e.g. "startup"). */
 static bool is_cmm_hook_entry(yyjson_mut_val *entry, const char *matcher_str,
-                              const char *const *old_matchers) {
+                              const char *const *old_matchers, const char *require_command_substr) {
     yyjson_mut_val *matcher = yyjson_mut_obj_get(entry, "matcher");
     if (!matcher || !yyjson_mut_is_str(matcher)) {
         return false;
@@ -1806,16 +1829,36 @@ static bool is_cmm_hook_entry(yyjson_mut_val *entry, const char *matcher_str,
     if (!val) {
         return false;
     }
-    if (strcmp(val, matcher_str) == 0) {
-        return true;
-    }
+    bool matcher_ok = strcmp(val, matcher_str) == 0;
     /* Also match old versions for backwards-compatible upgrade */
-    for (int i = 0; old_matchers && old_matchers[i]; i++) {
+    for (int i = 0; !matcher_ok && old_matchers && old_matchers[i]; i++) {
         if (strcmp(val, old_matchers[i]) == 0) {
-            return true;
+            matcher_ok = true;
         }
     }
-    return false;
+    if (!matcher_ok) {
+        return false;
+    }
+    if (require_command_substr) {
+        yyjson_mut_val *hooks = yyjson_mut_obj_get(entry, "hooks");
+        if (!hooks || !yyjson_mut_is_arr(hooks)) {
+            return false;
+        }
+        size_t idx;
+        size_t max;
+        yyjson_mut_val *h;
+        yyjson_mut_arr_foreach(hooks, idx, max, h) {
+            yyjson_mut_val *cmd = yyjson_mut_obj_get(h, "command");
+            if (cmd && yyjson_mut_is_str(cmd)) {
+                const char *cs = yyjson_mut_get_str(cmd);
+                if (cs && strstr(cs, require_command_substr)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    return true;
 }
 
 /* Generic hook upsert for both Claude Code and Gemini CLI */
@@ -1825,8 +1868,10 @@ typedef struct {
     const char *hook_event;
     const char *matcher_str;
     const char *command_str;
-    const char *const *old_matchers; /* NULL-terminated; may be NULL */
-    int timeout_sec;                 /* >0 adds "timeout" to the hook entry */
+    const char *const *old_matchers;  /* NULL-terminated; may be NULL */
+    int timeout_sec;                  /* >0 adds "timeout" to the hook entry */
+    const char *match_command_substr; /* non-NULL: also require this in the
+                                       * entry command to claim ownership */
 } hooks_upsert_args_t;
 static int upsert_hooks_json(hooks_upsert_args_t args) {
     const char *settings_path = args.settings_path;
@@ -1876,7 +1921,7 @@ static int upsert_hooks_json(hooks_upsert_args_t args) {
     size_t max;
     yyjson_mut_val *item;
     yyjson_mut_arr_foreach(event_arr, idx, max, item) {
-        if (is_cmm_hook_entry(item, matcher_str, old_matchers)) {
+        if (is_cmm_hook_entry(item, matcher_str, old_matchers, args.match_command_substr)) {
             yyjson_mut_arr_remove(event_arr, idx);
             break;
         }
@@ -1909,7 +1954,9 @@ typedef struct {
     const char *settings_path;
     const char *hook_event;
     const char *matcher_str;
-    const char *const *old_matchers; /* NULL-terminated; may be NULL */
+    const char *const *old_matchers;  /* NULL-terminated; may be NULL */
+    const char *match_command_substr; /* non-NULL: also require this in the
+                                       * entry command to claim ownership */
 } hooks_remove_args_t;
 static int remove_hooks_json(hooks_remove_args_t args) {
     const char *settings_path = args.settings_path;
@@ -1950,7 +1997,7 @@ static int remove_hooks_json(hooks_remove_args_t args) {
     size_t max;
     yyjson_mut_val *item;
     yyjson_mut_arr_foreach(event_arr, idx, max, item) {
-        if (is_cmm_hook_entry(item, matcher_str, old_matchers)) {
+        if (is_cmm_hook_entry(item, matcher_str, old_matchers, args.match_command_substr)) {
             yyjson_mut_arr_remove(event_arr, idx);
             break;
         }
@@ -2023,7 +2070,7 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
         return;
     }
     (void)fprintf(f,
-                  "#!/bin/bash\n"
+                  "#!/usr/bin/env bash\n"
                   "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
                   "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
                   "# Despite the name this NEVER blocks a tool call - it only adds\n"
@@ -2067,7 +2114,7 @@ static void cbm_install_session_reminder_script(const char *home) {
         return;
     }
     (void)fprintf(
-        f, "#!/bin/bash\n"
+        f, "#!/usr/bin/env bash\n"
            "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
            "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
            "cat << 'REMINDER'\n"
@@ -2119,6 +2166,82 @@ static int cbm_remove_session_hooks(const char *settings_path) {
         }
     }
     return rc;
+}
+
+/* SubagentStart hook: subagents spawned via the Agent tool do NOT fire
+ * SessionStart, so the SessionStart reminder above never reaches them. This
+ * hook is their equivalent. Unlike SessionStart (where plain stdout is injected
+ * as context), SubagentStart injects context only via a JSON object on stdout:
+ *   {"hookSpecificOutput":{"hookEventName":"SubagentStart","additionalContext":"…"}}
+ * The text is a leaner variant of the SessionStart protocol: it omits the
+ * "run index_repository first" step, since the parent session has already
+ * indexed the project. Matcher "*" fires for every agent type. */
+#define CMM_SUBAGENT_REMINDER_SCRIPT "cbm-subagent-reminder"
+
+static void cbm_install_subagent_reminder_script(const char *home) {
+    if (!home) {
+        return;
+    }
+    char config_dir[CLI_BUF_1K];
+    cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
+    if (!config_dir[0]) {
+        return;
+    }
+    char hooks_dir[CLI_BUF_1K];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM);
+
+    char script_path[CLI_BUF_1K];
+    snprintf(script_path, sizeof(script_path), "%s/" CMM_SUBAGENT_REMINDER_SCRIPT, hooks_dir);
+
+    FILE *f = fopen(script_path, "w");
+    if (!f) {
+        return;
+    }
+    /* The additionalContext value is a single line with no embedded quotes,
+     * backslashes, or newlines, so the JSON below is valid as written — no
+     * runtime escaping (and no python3/jq dependency) is required. */
+    (void)fprintf(f,
+                  "#!/usr/bin/env bash\n"
+                  "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
+                  "# Installed by codebase-memory-mcp. Fires when any subagent is spawned.\n"
+                  "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
+                  "cat << 'REMINDER'\n"
+                  "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
+                  "\"additionalContext\":\"Code discovery: prefer codebase-memory-mcp tools "
+                  "(search_graph, trace_path, get_code_snippet, query_graph, get_architecture, "
+                  "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
+                  "text, configs, and non-code files.\"}}\n"
+                  "REMINDER\n");
+#ifndef _WIN32
+    fchmod(fileno(f), CLI_OCTAL_PERM);
+#endif
+    (void)fclose(f);
+#ifdef _WIN32
+    chmod(script_path, CLI_OCTAL_PERM);
+#endif
+}
+
+int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
+    char command[CLI_BUF_1K];
+    cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command));
+    /* matcher "*" is the natural choice a user would also pick for their own
+     * catch-all SubagentStart hook, so claim ownership by command too — never
+     * clobber or remove a foreign "*" entry. */
+    return upsert_hooks_json(
+        (hooks_upsert_args_t){.settings_path = settings_path,
+                              .hook_event = "SubagentStart",
+                              .matcher_str = "*",
+                              .command_str = command,
+                              .match_command_substr = CMM_SUBAGENT_REMINDER_SCRIPT});
+}
+
+int cbm_remove_claude_subagent_hooks(const char *settings_path) {
+    return remove_hooks_json(
+        (hooks_remove_args_t){.settings_path = settings_path,
+                              .hook_event = "SubagentStart",
+                              .matcher_str = "*",
+                              .match_command_substr = CMM_SUBAGENT_REMINDER_SCRIPT});
 }
 
 /* Matcher excludes read_file for consistency with the Claude fix: the hook
@@ -2378,12 +2501,22 @@ enum {
     ZIP_STORED = 0,
     ZIP_DEFLATE = 8
 };
-static const uint32_t ZIP_MAX_UNCOMP = 500U * 1024U * 1024U;
+static const size_t ZIP_MAX_UNCOMP = 500U * 1024U * 1024U;
+
+static uint16_t zip_read_u16le(const unsigned char *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << BYTE_SHIFT));
+}
+
+static uint32_t zip_read_u32le(const unsigned char *p) {
+    return ((uint32_t)p[0]) | ((uint32_t)p[1] << BYTE_SHIFT) |
+           ((uint32_t)p[2] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
+           ((uint32_t)p[3] << (BYTE_SHIFT * CLI_JSON_INDENT));
+}
 
 /* Decompress a single zip entry (stored or deflated). Returns malloc'd buffer
  * or NULL on failure. *out_len receives the decompressed size. */
 static unsigned char *zip_extract_entry(const unsigned char *file_data, uint16_t method,
-                                        uint32_t comp_size, uint32_t uncomp_size, int *out_len) {
+                                        size_t comp_size, size_t uncomp_size, int *out_len) {
     if (method == ZIP_STORED) {
         if (comp_size > ZIP_MAX_UNCOMP) {
             return NULL;
@@ -2400,15 +2533,18 @@ static unsigned char *zip_extract_entry(const unsigned char *file_data, uint16_t
         if (uncomp_size > ZIP_MAX_UNCOMP) {
             return NULL;
         }
+        if (comp_size > UINT_MAX || uncomp_size > UINT_MAX) {
+            return NULL;
+        }
         unsigned char *out = malloc(uncomp_size);
         if (!out) {
             return NULL;
         }
         z_stream strm = {0};
         strm.next_in = (unsigned char *)file_data;
-        strm.avail_in = comp_size;
+        strm.avail_in = (uInt)comp_size;
         strm.next_out = out;
-        strm.avail_out = uncomp_size;
+        strm.avail_out = (uInt)uncomp_size;
         if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
             free(out);
             return NULL;
@@ -2438,28 +2574,14 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
             break;
         }
 
-        uint16_t method = (uint16_t)(data[pos + ZIP_OFF_METHOD] |
-                                     (data[pos + ZIP_OFF_METHOD + CLI_SKIP_ONE] << BYTE_SHIFT));
-        uint32_t comp_size =
-            (uint32_t)(data[pos + ZIP_OFF_COMP] |
-                       (data[pos + ZIP_OFF_COMP + CLI_SKIP_ONE] << BYTE_SHIFT) |
-                       (data[pos + ZIP_OFF_COMP + CLI_PAIR_LEN] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
-                       (data[pos + ZIP_OFF_COMP + CLI_JSON_INDENT]
-                        << (BYTE_SHIFT * CLI_JSON_INDENT)));
-        uint32_t uncomp_size =
-            (uint32_t)(data[pos + ZIP_OFF_UNCOMP] |
-                       (data[pos + ZIP_OFF_UNCOMP + CLI_SKIP_ONE] << BYTE_SHIFT) |
-                       (data[pos + ZIP_OFF_UNCOMP + CLI_PAIR_LEN] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
-                       (data[pos + ZIP_OFF_UNCOMP + CLI_JSON_INDENT]
-                        << (BYTE_SHIFT * CLI_JSON_INDENT)));
-        uint16_t name_len = (uint16_t)(data[pos + ZIP_OFF_NAMELEN] |
-                                       (data[pos + ZIP_OFF_NAMELEN + CLI_SKIP_ONE] << BYTE_SHIFT));
-        uint16_t extra_len =
-            (uint16_t)(data[pos + ZIP_OFF_EXTRALEN] |
-                       (data[pos + ZIP_OFF_EXTRALEN + CLI_SKIP_ONE] << BYTE_SHIFT));
+        uint16_t method = zip_read_u16le(data + pos + ZIP_OFF_METHOD);
+        uint32_t comp_size = zip_read_u32le(data + pos + ZIP_OFF_COMP);
+        uint32_t uncomp_size = zip_read_u32le(data + pos + ZIP_OFF_UNCOMP);
+        uint16_t name_len = zip_read_u16le(data + pos + ZIP_OFF_NAMELEN);
+        uint16_t extra_len = zip_read_u16le(data + pos + ZIP_OFF_EXTRALEN);
 
         int header_end = pos + ZIP_HDR_SZ + name_len + extra_len;
-        if (header_end + (int)comp_size > data_len) {
+        if (header_end > data_len || comp_size > (uint32_t)(data_len - header_end)) {
             break;
         }
 
@@ -2715,6 +2837,8 @@ int cbm_cmd_config(int argc, char **argv) {
                "Enable auto-indexing on MCP session start");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
                "Max files for auto-indexing new projects");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
+               "Register background git watcher on session connect");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
         return 0;
@@ -2742,6 +2866,8 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
                cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
+               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
     } else if (strcmp(argv[0], "get") == 0) {
@@ -3037,6 +3163,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->cursor, "Cursor"},
         {a->openclaw, "OpenClaw"},
         {a->kiro, "Kiro"},
+        {a->junie, "Junie"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -3116,6 +3243,8 @@ static void install_claude_code_config(const char *home, const char *binary_path
         plan_record("Claude Code", "hook", p);
         snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
         plan_record("Claude Code", "hook", p);
+        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SUBAGENT_REMINDER_SCRIPT);
+        plan_record("Claude Code", "hook", p);
         return;
     }
 
@@ -3149,9 +3278,12 @@ static void install_claude_code_config(const char *home, const char *binary_path
         cbm_install_hook_gate_script(home, binary_path);
         cbm_install_session_reminder_script(home);
         cbm_upsert_session_hooks(settings_path);
+        cbm_install_subagent_reminder_script(home);
+        cbm_upsert_claude_subagent_hooks(settings_path);
     }
     printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
     printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
+    printf("  hooks: SubagentStart (MCP usage reminder for subagents)\n");
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
      * still exists, mention it so users can clean up stale artifacts. */
@@ -3400,6 +3532,16 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         install_generic_agent_config("Kiro", binary_path, cp, NULL, dry_run,
                                      cbm_install_editor_mcp);
     }
+    if (agents->junie) {
+        char cp[CLI_BUF_1K];
+        char sd[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
+        snprintf(sd, sizeof(sd), "%s/.junie/mcp", home);
+        if (!dry_run) {
+            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+        }
+        install_generic_agent_config("Junie", binary_path, cp, NULL, dry_run, cbm_upsert_junie_mcp);
+    }
 }
 
 static void cbm_install_agent_configs(const char *home, const char *binary_path, bool force,
@@ -3552,6 +3694,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         {det.cursor, "cursor"},
         {det.openclaw, "openclaw"},
         {det.kiro, "kiro"},
+        {det.junie, "junie"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -3774,8 +3917,9 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
     if (!dry_run) {
         cbm_remove_claude_hooks(settings_path);
         cbm_remove_session_hooks(settings_path);
+        cbm_remove_claude_subagent_hooks(settings_path);
     }
-    printf("  removed PreToolUse + SessionStart hooks\n");
+    printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
 }
 
 /* Remove MCP + instructions for a generic agent. */
@@ -3923,6 +4067,12 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(cp, sizeof(cp), "%s/.kiro/settings/mcp.json", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kiro", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp);
+    }
+    if (agents->junie) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.junie/mcp/mcp.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Junie", cp, NULL}, dry_run,
+                                  cbm_remove_junie_mcp);
     }
 }
 
@@ -4328,4 +4478,255 @@ int cbm_cmd_update(int argc, char **argv) {
     printf("\nPlease restart your MCP client to use the new binary.\n");
     (void)variant;
     return 0;
+}
+
+/* ── CLI tool arguments (flags / --args-file / --help) ────────────── */
+
+/* Flag-name normalization: kebab-case CLI flags map to snake_case JSON keys
+ * (--name-pattern -> name_pattern). In-place; buffer is NUL-terminated. */
+static void cli_kebab_to_snake(char *s) {
+    for (; *s; s++) {
+        if (*s == '-') {
+            *s = '_';
+        }
+    }
+}
+
+/* snake_case JSON key -> kebab-case flag name (for --help display). In-place. */
+static void cli_snake_to_kebab(char *s) {
+    for (; *s; s++) {
+        if (*s == '_') {
+            *s = '-';
+        }
+    }
+}
+
+/* Heap-format a one-argument error message for *err_out. Caller frees. */
+static char *cli_heap_msgf(const char *fmt, const char *arg) {
+    char buf[CLI_BUF_512];
+    snprintf(buf, sizeof(buf), fmt, arg);
+    return cbm_strdup(buf);
+}
+
+/* True if the schema's required[] array contains `key`. */
+static bool cli_schema_required_has(yyjson_val *required, const char *key) {
+    if (!required || !yyjson_is_arr(required)) {
+        return false;
+    }
+    size_t idx;
+    size_t max;
+    yyjson_val *v;
+    yyjson_arr_foreach(required, idx, max, v) {
+        if (yyjson_is_str(v) && strcmp(yyjson_get_str(v), key) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Look up a property's JSON-schema "type" string (string/integer/number/
+ * boolean/array). Returns NULL when the schema or property is unknown — the
+ * caller then treats the value as a plain string. */
+static const char *cli_schema_type(yyjson_val *props, const char *key) {
+    if (!props || !yyjson_is_obj(props)) {
+        return NULL;
+    }
+    yyjson_val *p = yyjson_obj_get(props, key);
+    if (!p || !yyjson_is_obj(p)) {
+        return NULL;
+    }
+    yyjson_val *t = yyjson_obj_get(p, "type");
+    return (t && yyjson_is_str(t)) ? yyjson_get_str(t) : NULL;
+}
+
+/* Append a typed value to the output object under `key`. For array-typed
+ * properties, repeated flags accumulate into a single JSON array. */
+static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *key,
+                          const char *type, const char *value, bool have_value) {
+    if (type && strcmp(type, "array") == 0) {
+        yyjson_mut_val *arr = yyjson_mut_obj_get(obj, key);
+        if (!arr || !yyjson_mut_is_arr(arr)) {
+            arr = yyjson_mut_arr(out);
+            yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
+        }
+        yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
+        return;
+    }
+
+    yyjson_mut_val *vv;
+    if (type && strcmp(type, "boolean") == 0) {
+        bool b = !have_value || strcmp(value, "true") == 0 || strcmp(value, "1") == 0 ||
+                 strcmp(value, "yes") == 0;
+        vv = yyjson_mut_bool(out, b);
+    } else if (type && strcmp(type, "integer") == 0) {
+        char *endp = NULL;
+        const char *v = have_value ? value : "";
+        long n = strtol(v, &endp, CLI_STRTOL_BASE);
+        vv = (endp && endp != v && *endp == '\0') ? yyjson_mut_int(out, (int64_t)n)
+                                                  : yyjson_mut_strcpy(out, v);
+    } else if (type && strcmp(type, "number") == 0) {
+        char *endp = NULL;
+        const char *v = have_value ? value : "";
+        double d = strtod(v, &endp);
+        vv = (endp && endp != v && *endp == '\0') ? yyjson_mut_real(out, d)
+                                                  : yyjson_mut_strcpy(out, v);
+    } else {
+        /* string or unknown type */
+        vv = yyjson_mut_strcpy(out, have_value ? value : "");
+    }
+    yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), vv);
+}
+
+char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char **err_out) {
+    if (err_out) {
+        *err_out = NULL;
+    }
+
+    /* The tool's input_schema (may be NULL for an unknown tool — then every
+     * value is treated as a string). Static lifetime; do not free. */
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    yyjson_doc *schema_doc = NULL;
+    yyjson_val *props = NULL;
+    if (schema_str) {
+        schema_doc = yyjson_read(schema_str, strlen(schema_str), 0);
+        if (schema_doc) {
+            props = yyjson_obj_get(yyjson_doc_get_root(schema_doc), "properties");
+        }
+    }
+
+    yyjson_mut_doc *out = yyjson_mut_doc_new(NULL);
+    if (!out) {
+        if (schema_doc) {
+            yyjson_doc_free(schema_doc);
+        }
+        return NULL;
+    }
+    yyjson_mut_val *obj = yyjson_mut_obj(out);
+    yyjson_mut_doc_set_root(out, obj);
+
+    bool ok = true;
+    for (int i = 0; i < argc && ok; i++) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--") == 0) {
+            break; /* end of flag parsing */
+        }
+        if (strncmp(arg, "--", CLI_PAIR_LEN) != 0) {
+            if (err_out) {
+                *err_out = cli_heap_msgf("unexpected argument '%s' (expected --flag value)", arg);
+            }
+            ok = false;
+            break;
+        }
+
+        const char *body = arg + CLI_PAIR_LEN; /* skip leading "--" */
+        const char *eq = strchr(body, '=');
+        char key[CLI_BUF_256];
+        const char *value = NULL;
+        bool have_value = false;
+
+        if (eq) {
+            /* --key=value : split on the FIRST '='; value may contain '='/spaces. */
+            size_t klen = (size_t)(eq - body);
+            if (klen >= sizeof(key)) {
+                klen = sizeof(key) - CLI_SKIP_ONE;
+            }
+            memcpy(key, body, klen);
+            key[klen] = '\0';
+            value = eq + CLI_SKIP_ONE;
+            have_value = true;
+        } else {
+            snprintf(key, sizeof(key), "%s", body);
+            /* Consume the next token as the value unless it is itself a flag
+             * (then this is a bare boolean/string flag). */
+            if (i + CLI_SKIP_ONE < argc &&
+                strncmp(argv[i + CLI_SKIP_ONE], "--", CLI_PAIR_LEN) != 0) {
+                value = argv[i + CLI_SKIP_ONE];
+                have_value = true;
+                i++;
+            }
+        }
+
+        cli_kebab_to_snake(key);
+        const char *type = cli_schema_type(props, key);
+
+        if (type && strcmp(type, "array") == 0 && !have_value) {
+            if (err_out) {
+                *err_out = cli_heap_msgf("flag --%s requires a value", key);
+            }
+            ok = false;
+            break;
+        }
+
+        cli_add_typed(out, obj, key, type, value, have_value);
+    }
+
+    char *result = NULL;
+    if (ok) {
+        size_t len = 0;
+        result = yyjson_mut_write(out, 0, &len); /* malloc'd; caller frees */
+    }
+
+    yyjson_mut_doc_free(out);
+    if (schema_doc) {
+        yyjson_doc_free(schema_doc);
+    }
+    return result;
+}
+
+int cbm_cli_print_tool_help(const char *tool_name) {
+    const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
+    if (!schema_str) {
+        return CLI_ERR;
+    }
+
+    yyjson_doc *doc = yyjson_read(schema_str, strlen(schema_str), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *props = root ? yyjson_obj_get(root, "properties") : NULL;
+    yyjson_val *required = root ? yyjson_obj_get(root, "required") : NULL;
+
+    printf("Usage:\n");
+    printf("  codebase-memory-mcp cli %s --flag value [--flag2 value2 ...]\n", tool_name);
+    printf("  codebase-memory-mcp cli %s --args-file <path-to-json>\n", tool_name);
+    printf("  echo '<json>' | codebase-memory-mcp cli %s\n", tool_name);
+    printf("  codebase-memory-mcp cli %s '<raw-json-args>'\n", tool_name);
+
+    printf("\nFlags:\n");
+    if (props && yyjson_is_obj(props)) {
+        yyjson_obj_iter iter;
+        yyjson_obj_iter_init(props, &iter);
+        yyjson_val *pkey;
+        while ((pkey = yyjson_obj_iter_next(&iter)) != NULL) {
+            yyjson_val *pval = yyjson_obj_iter_get_val(pkey);
+            const char *name = yyjson_get_str(pkey);
+            if (!name) {
+                continue;
+            }
+            const char *type = "string";
+            const char *desc = "";
+            if (yyjson_is_obj(pval)) {
+                yyjson_val *t = yyjson_obj_get(pval, "type");
+                if (t && yyjson_is_str(t)) {
+                    type = yyjson_get_str(t);
+                }
+                yyjson_val *d = yyjson_obj_get(pval, "description");
+                if (d && yyjson_is_str(d)) {
+                    desc = yyjson_get_str(d);
+                }
+            }
+            char flag[CLI_BUF_256];
+            snprintf(flag, sizeof(flag), "%s", name);
+            cli_snake_to_kebab(flag);
+            bool req = cli_schema_required_has(required, name);
+            printf("  --%s <%s>%s", flag, type, req ? " [required]" : "");
+            if (desc[0]) {
+                printf("  %s", desc);
+            }
+            printf("\n");
+        }
+    }
+
+    if (doc) {
+        yyjson_doc_free(doc);
+    }
+    return CLI_OK;
 }

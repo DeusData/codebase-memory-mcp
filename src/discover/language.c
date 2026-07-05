@@ -11,6 +11,7 @@
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
 #include "foundation/constants.h"
+#include "foundation/compat_fs.h"
 
 enum { LANG_SCAN_PASSES = 2 };
 #define SLEN(s) (sizeof(s) - 1)
@@ -998,7 +999,7 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
         return CBM_LANG_MATLAB;
     }
 
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         return CBM_LANG_MATLAB;
     }
