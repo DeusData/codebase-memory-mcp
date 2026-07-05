@@ -284,15 +284,16 @@ static bool calls_is_python_super_init(const CBMCall *call, CBMLanguage lang) {
            strcmp(call->callee_name, "super().__init__") == 0;
 }
 
-static bool calls_suppress_python_file_self_weak_match(const cbm_gbuf_node_t *source,
-                                                       const CBMCall *call,
-                                                       const cbm_resolution_t *res,
-                                                       CBMLanguage lang) {
-    static const char SELF_PREFIX[] = "self.";
+static bool calls_suppress_python_file_weak_dotted_match(const cbm_gbuf_node_t *source,
+                                                         const CBMCall *call,
+                                                         const cbm_resolution_t *res,
+                                                         const char **imp_vals, int imp_count,
+                                                         CBMLanguage lang) {
     return lang == CBM_LANG_PYTHON && source && source->label &&
            strcmp(source->label, "File") == 0 && call && call->callee_name &&
-           strncmp(call->callee_name, SELF_PREFIX, sizeof(SELF_PREFIX) - 1) == 0 && res &&
-           cbm_registry_strategy_is_weak_short_name(res->strategy);
+           strchr(call->callee_name, '.') != NULL && res && res->qualified_name &&
+           cbm_registry_strategy_is_weak_short_name(res->strategy) &&
+           !cbm_registry_is_import_reachable(res->qualified_name, imp_vals, imp_count);
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
@@ -359,7 +360,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         !cbm_registry_is_import_reachable(res.qualified_name, imp_vals, imp_count)) {
         return 0;
     }
-    if (calls_suppress_python_file_self_weak_match(source_node, call, &res, lang)) {
+    if (calls_suppress_python_file_weak_dotted_match(source_node, call, &res, imp_vals,
+                                                     imp_count, lang)) {
         return 0;
     }
 
