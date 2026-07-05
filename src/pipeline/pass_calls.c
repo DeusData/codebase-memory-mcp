@@ -331,6 +331,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         return 0;
     }
+    cbm_pipeline_try_field_type_hint(ctx->registry, ctx->gbuf, &res, call->callee_name,
+                                     source_node->id);
 
     /* Perl call-graph noise guard (#476). Perl has no LSP resolver, so the
      * generic registry chain is the only resolver; for builtins (push/shift/

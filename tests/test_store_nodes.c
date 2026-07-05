@@ -3449,9 +3449,9 @@ TEST(store_file_delta_affected_paths_from_exports_and_imports) {
     ASSERT_EQ(cbm_store_list_file_delta_affected_paths(s, "test", "lib.go", new_exports, 2,
                                                        &paths, &count),
               CBM_STORE_OK);
-    ASSERT_EQ(count, 4);
+    ASSERT_EQ(count, 3);
     ASSERT_EQ(store_string_array_contains(paths, count, "lib.go"), 1);
-    ASSERT_EQ(store_string_array_contains(paths, count, "caller.go"), 1);
+    ASSERT_EQ(store_string_array_contains(paths, count, "caller.go"), 0);
     ASSERT_EQ(store_string_array_contains(paths, count, "removed_user.go"), 1);
     ASSERT_EQ(store_string_array_contains(paths, count, "new_user.go"), 1);
     ASSERT_EQ(store_string_array_contains(paths, count, "unrelated.go"), 0);

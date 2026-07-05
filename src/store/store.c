@@ -405,7 +405,7 @@ static int store_append_text(char ***items, int *count, int *cap, const char *te
     return CBM_STORE_OK;
 }
 
-static bool store_text_array_contains(char *const *items, int count, const char *text) {
+static bool store_text_array_contains(const char *const *items, int count, const char *text) {
     if (!items || !text) {
         return false;
     }
@@ -2184,7 +2184,8 @@ int cbm_store_list_symbol_scope_qns_by_qns(cbm_store_t *s, const char *project,
         int step_rc = SQLITE_OK;
         while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             const char *candidate = (const char *)sqlite3_column_text(stmt, 0);
-            if (!candidate || store_text_array_contains(items, n, candidate)) {
+            if (!candidate ||
+                store_text_array_contains((const char *const *)items, n, candidate)) {
                 continue;
             }
             if (n >= max_qns) {
@@ -3644,6 +3645,9 @@ int cbm_store_list_file_delta_affected_paths(cbm_store_t *s, const char *project
         return rc;
     }
     for (int i = 0; i < old_export_count; i++) {
+        if (store_text_array_contains(new_export_qns, new_export_count, old_exports[i])) {
+            continue;
+        }
         rc = store_append_importers_for_target(s, project, old_exports[i], &items, &n, &cap);
         if (rc != CBM_STORE_OK) {
             store_free_text_array(old_exports, old_export_count);
@@ -3651,19 +3655,24 @@ int cbm_store_list_file_delta_affected_paths(cbm_store_t *s, const char *project
             return rc;
         }
     }
-    store_free_text_array(old_exports, old_export_count);
-
     for (int i = 0; i < new_export_count; i++) {
         if (!new_export_qns[i]) {
+            store_free_text_array(old_exports, old_export_count);
             store_free_text_array(items, n);
             return CBM_STORE_ERR;
         }
+        if (store_text_array_contains((const char *const *)old_exports, old_export_count,
+                                      new_export_qns[i])) {
+            continue;
+        }
         rc = store_append_importers_for_target(s, project, new_export_qns[i], &items, &n, &cap);
         if (rc != CBM_STORE_OK) {
+            store_free_text_array(old_exports, old_export_count);
             store_free_text_array(items, n);
             return rc;
         }
     }
+    store_free_text_array(old_exports, old_export_count);
 
     store_sort_unique_text_array(items, &n);
     *out = items;

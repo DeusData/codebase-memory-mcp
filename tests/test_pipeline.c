@@ -5707,6 +5707,7 @@ TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch)
     const char *lib_rel = "lib.go";
     const char *main_rel = "main.go";
     const char *lib_qn = "test.lib.Hot";
+    const char *new_lib_qn = "test.lib.HotRenamed";
 
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -5720,12 +5721,12 @@ TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch)
 
     cbm_node_t nodes[1] = {{.project = (char *)project,
                             .label = "Function",
-                            .name = "Hot",
-                            .qualified_name = (char *)lib_qn,
+                            .name = "HotRenamed",
+                            .qualified_name = (char *)new_lib_qn,
                             .file_path = (char *)lib_rel,
                             .properties_json = "{}"}};
     cbm_store_symbol_export_t exports[1] = {
-        {.qualified_name = lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+        {.qualified_name = new_lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
     cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
                                                  .rel_path = lib_rel,
                                                  .nodes = nodes,
@@ -5897,7 +5898,7 @@ TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
               CBM_STORE_OK);
 
     cbm_store_symbol_export_t exports[1] = {
-        {.qualified_name = "test.lib.Hot", .node_id = CBM_STORE_NO_NODE_ID}};
+        {.qualified_name = "test.lib.HotRenamed", .node_id = CBM_STORE_NO_NODE_ID}};
     cbm_pipeline_file_delta_t delta = {
         .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
     cbm_file_hash_t hash = {0};
@@ -5950,9 +5951,9 @@ TEST(pipeline_file_delta_plan_frontier_noop_mask_bounds_recursive_frontier) {
               CBM_STORE_OK);
 
     cbm_store_symbol_export_t lib_exports[1] = {
-        {.qualified_name = lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+        {.qualified_name = "test.lib.HotRenamed", .node_id = CBM_STORE_NO_NODE_ID}};
     cbm_store_symbol_export_t importer_exports[1] = {
-        {.qualified_name = importer_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+        {.qualified_name = "test.a.StableRenamed", .node_id = CBM_STORE_NO_NODE_ID}};
     cbm_pipeline_file_delta_t lib_delta = {
         .delta = {.project = project,
                   .rel_path = lib_rel,
@@ -6076,9 +6077,9 @@ TEST(pipeline_file_delta_plan_frontier_noop_mask_skips_masked_inbound_precheck) 
               CBM_STORE_OK);
     ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
     ASSERT_STR_EQ(plan.reason, "candidate");
-    ASSERT_EQ(plan.affected_count, PIPELINE_NOOP_INBOUND_MAX_AFFECTED);
+    ASSERT_EQ(plan.affected_count, 1);
     ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
-    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 0);
     ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 0);
 
     cbm_pipeline_file_delta_plan_free(&plan);
@@ -14236,6 +14237,7 @@ TEST(config_registry_includes_incremental_exact_frontier_caps) {
     ASSERT_STR_EQ(affected->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS);
     ASSERT_STR_EQ(affected->category, "Indexing");
     ASSERT_STR_EQ(affected->range, "1-100000");
+
     PASS();
 }
 
