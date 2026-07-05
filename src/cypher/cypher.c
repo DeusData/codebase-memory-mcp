@@ -3129,9 +3129,14 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
     cbm_store_bfs(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT, &tr);
+    cbm_node_t *bound_to = binding_get(b, to_var);
+    int64_t bound_to_id = bound_to ? bound_to->id : 0;
     for (int v = 0; v < tr.visited_count && *new_count < max_new; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
         if (hop->hop < rel->min_hops) {
+            continue;
+        }
+        if (bound_to && hop->node.id != bound_to_id) {
             continue;
         }
         if (target_node->label && !label_alt_matches(hop->node.label, target_node->label)) {

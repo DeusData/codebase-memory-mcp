@@ -1170,6 +1170,48 @@ TEST(cypher_exec_var_length_explicit_bound_capped) {
     PASS();
 }
 
+TEST(cypher_exec_variable_length_repeated_node_var_unifies) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS*1..2]->(f:Function) "
+                                "RETURN f.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_var_length_no_reuse_self_loop) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "Recursive",
+                    .qualified_name = "test.Recursive",
+                    .file_path = "recursive.go"};
+    int64_t id = cbm_store_upsert_node(s, &n);
+    cbm_edge_t e = {.project = "test", .source_id = id, .target_id = id, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function {name: \"Recursive\"})-[:CALLS*2..2]"
+                                "->(g:Function) RETURN g.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 0);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_defines_edge) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3118,6 +3160,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);
     RUN_TEST(cypher_exec_var_length_explicit_bound_capped);
+    RUN_TEST(cypher_exec_variable_length_repeated_node_var_unifies);
+    RUN_TEST(cypher_exec_var_length_no_reuse_self_loop);
     RUN_TEST(cypher_exec_defines_edge);
     RUN_TEST(cypher_exec_no_results);
     RUN_TEST(cypher_exec_where_numeric);
