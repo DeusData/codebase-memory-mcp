@@ -465,27 +465,6 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
     return null_node;
 }
 
-// Check if a node type is a terminal C declarator name.
-static bool is_c_terminal_name(const char *dk) {
-    return strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
-           strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0 ||
-           strcmp(dk, "destructor_name") == 0;
-}
-
-// Resolve name from a C++ qualified_identifier/scoped_identifier.
-static TSNode resolve_qualified_name(TSNode decl) {
-    static const char *name_kinds[] = {"operator_name", "operator_cast",    "destructor_name",
-                                       "identifier",    "field_identifier", NULL};
-    for (const char **k = name_kinds; *k; k++) {
-        TSNode found = cbm_find_child_by_kind(decl, *k);
-        if (!ts_node_is_null(found)) {
-            return found;
-        }
-    }
-    TSNode null_node = {0};
-    return null_node;
-}
-
 // C++/CUDA: out-of-line method definitions name the function with a qualified
 // declarator (`Foo::bar`, or `ns::Foo::bar`). Return the immediate enclosing
 // class name (the scope segment directly left of the function name, e.g. "Foo"),
@@ -534,30 +513,6 @@ static char *cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *
     }
     char *text = cbm_node_text(a, scope, source);
     return (text && text[0]) ? text : NULL;
-}
-
-// Resolve function name from C/C++/CUDA/GLSL declarator chain.
-static TSNode resolve_c_declarator_name(TSNode node) {
-    TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
-    for (int depth = 0; depth < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
-        const char *dk = ts_node_type(decl);
-        if (is_c_terminal_name(dk)) {
-            return decl;
-        }
-        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
-            return resolve_qualified_name(decl);
-        }
-        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
-        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
-            inner = ts_node_named_child(decl, 0);
-        }
-        if (ts_node_is_null(inner)) {
-            break;
-        }
-        decl = inner;
-    }
-    TSNode null_node = {0};
-    return null_node;
 }
 
 // R: resolve function_definition name from parent binary_operator lhs.
@@ -683,7 +638,7 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
          lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
          lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC) &&
         strcmp(kind, "function_definition") == 0) {
-        return resolve_c_declarator_name(*node_ptr);
+        return cbm_c_family_declarator_name(*node_ptr);
     }
     TSNode null_node = {0};
     return null_node;

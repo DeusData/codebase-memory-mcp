@@ -304,6 +304,41 @@ TEST(contract_c_calls_attributed_to_function) {
     PASS();
 }
 
+TEST(contract_c_nested_calls_keep_enclosing_function_qn) {
+    const char *src = "static int is_streamlined_default_tool(const char *name) {\n"
+                      "    return name && name[0];\n"
+                      "}\n"
+                      "static void emit_tool(int i) { (void)i; }\n"
+                      "char *cbm_mcp_tools_list(void *srv) {\n"
+                      "    (void)srv;\n"
+                      "    for (int i = 0; i < 3; i++) {\n"
+                      "        if (is_streamlined_default_tool(\"search_graph\")) {\n"
+                      "            emit_tool(i);\n"
+                      "        }\n"
+                      "    }\n"
+                      "    return 0;\n"
+                      "}\n";
+    CBMFileResult *r =
+        cbm_extract_file(src, (int)strlen(src), CBM_LANG_C, "lc", "mcp.c", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+
+    int scoped_calls = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->callee_name || !call->enclosing_func_qn) {
+            continue;
+        }
+        if ((strcmp(call->callee_name, "is_streamlined_default_tool") == 0 ||
+             strcmp(call->callee_name, "emit_tool") == 0) &&
+            strstr(call->enclosing_func_qn, "cbm_mcp_tools_list")) {
+            scoped_calls++;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_GTE(scoped_calls, 2);
+    PASS();
+}
+
 /* Java: extraction must not crash on a real-world construct mix (enhanced-for +
  * method reference + method chain + pattern instanceof) — reproduces the SIGBUS. */
 static const char *JAVA_SRC = "package zip;\n"
@@ -1343,6 +1378,7 @@ SUITE(lang_contract) {
      * tier; these fast contracts still guard against regressions. */
     RUN_TEST(contract_kotlin_imports_extracted);
     RUN_TEST(contract_c_calls_attributed_to_function);
+    RUN_TEST(contract_c_nested_calls_keep_enclosing_function_qn);
     RUN_TEST(contract_java_extract_no_crash);
 
     /* Rich per-language invariants (P3). */
