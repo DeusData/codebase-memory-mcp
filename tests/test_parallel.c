@@ -1103,6 +1103,21 @@ static void count_lsp_call_edges(const cbm_gbuf_edge_t *edge, void *ud) {
     }
 }
 
+static bool resolved_call_contains(const CBMResolvedCallArray *arr, const char *caller_sub,
+                                   const char *callee_sub) {
+    if (!arr || !caller_sub || !callee_sub) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, caller_sub) && rc->callee_qn &&
+            strstr(rc->callee_qn, callee_sub)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 TEST(parallel_python_lsp_override_emits_lsp_strategy_edges) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_XXXXXX");
@@ -1236,6 +1251,97 @@ TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+TEST(parallel_cross_lsp_pruning_requires_matching_call_resolution) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_pylsp_prune_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+
+    char rpath[512];
+    snprintf(rpath, sizeof(rpath), "%s/routing.py", tmpdir);
+    FILE *rf = fopen(rpath, "w");
+    if (!rf) {
+        rmdir(tmpdir);
+        FAIL("fopen routing.py failed");
+    }
+    fprintf(rf, "class APIRouter:\n"
+                "    def add_api_route(self):\n"
+                "        return None\n"
+                "    def include_router(self):\n"
+                "        self.add_api_route()\n");
+    fclose(rf);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = rpath;
+    files[0].rel_path = (char *)"routing.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("cbm_par_pylsp_prune", tmpdir);
+    cbm_registry_t *reg = cbm_registry_new();
+    CBMFileResult **result_cache = calloc(1, sizeof(*result_cache));
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_NOT_NULL(result_cache);
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "cbm_par_pylsp_prune",
+                              .repo_path = tmpdir,
+                              .gbuf = gbuf,
+                              .registry = reg,
+                              .cancelled = &cancelled};
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(gbuf));
+
+    cbm_init();
+    ASSERT_EQ(cbm_parallel_extract(&ctx, files, 1, result_cache, &shared_ids, 1), 0);
+    cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+    ASSERT_NOT_NULL(result_cache[0]);
+    ASSERT_GT(result_cache[0]->calls.count, 0);
+
+    result_cache[0]->resolved_calls.count = 0;
+    CBMResolvedCall unrelated = {.caller_qn = "cbm_par_pylsp_prune.routing.unrelated",
+                                 .callee_qn = "cbm_par_pylsp_prune.routing.APIRouter.unrelated",
+                                 .strategy = "lsp_method",
+                                 .confidence = 0.95f};
+    cbm_resolvedcall_push(&result_cache[0]->resolved_calls, &result_cache[0]->arena, unrelated);
+    ASSERT_EQ(result_cache[0]->resolved_calls.count, result_cache[0]->calls.count);
+
+    ASSERT_EQ(cbm_build_registry_from_cache(&ctx, files, 1, result_cache), 0);
+
+    char **def_modules = calloc(1, sizeof(*def_modules));
+    int def_count = 0;
+    CBMLSPDef *all_defs =
+        cbm_pxc_collect_all_defs(result_cache, files, 1, ctx.project_name, def_modules, &def_count);
+    CBMModuleDefIndex *module_def_index =
+        all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    ASSERT_NOT_NULL(all_defs);
+
+    ASSERT_EQ(cbm_parallel_resolve(&ctx, files, 1, result_cache, &shared_ids, 1, all_defs,
+                                   def_count, def_modules, module_def_index,
+                                   NULL /* cross_registries */),
+              0);
+    cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
+
+    ASSERT_TRUE(resolved_call_contains(&result_cache[0]->resolved_calls, "include_router",
+                                       "add_api_route"));
+
+    cbm_pxc_free_module_def_index(module_def_index);
+    free(all_defs);
+    if (def_modules) {
+        free(def_modules[0]);
+        free(def_modules);
+    }
+    cbm_free_result(result_cache[0]);
+    free(result_cache);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gbuf);
+    unlink(rpath);
+    rmdir(tmpdir);
+    PASS();
+}
+
 /* issue #294: gRPC service-name extraction must (a) preserve the canonical
  * proto service name (FooServiceClient → FooService, not Foo) and (b) only
  * match real stub/client types — ordinary receiver vars must NOT produce
@@ -1297,6 +1403,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_node_count);
     RUN_TEST(parallel_python_lsp_override_emits_lsp_strategy_edges);
     RUN_TEST(parallel_python_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_cross_lsp_pruning_requires_matching_call_resolution);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);
     RUN_TEST(parallel_defines_method_parity);
