@@ -32,6 +32,7 @@ DEFAULT_TIMEOUT_SECONDS = 240
 DEFAULT_RANK_REFRESH = "stale_on_exact"
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
+DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
@@ -41,10 +42,14 @@ FAILURE_FALLBACK_DIRNAME = "cbm-benchmark-failures"
 FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
+MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
 SELF_DOGFOOD_SCENARIOS_DEFAULT = "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
 SELF_DOGFOOD_MARKER_PREFIX = "cbm_pan4_oracle"
 SELF_DOGFOOD_REPO_SUBDIR = "repo"
 SELF_DOGFOOD_CACHE_SUBDIR = "cache"
+FASTAPI_PROBE_REL_PATH = "fastapi/routing.py"
+FASTAPI_PROBE_INSERT_BEFORE = "\n    def add_api_route(\n"
+FASTAPI_PROBE_RETURN_VALUE = 64
 PUBLISH_FULL = "full"
 PUBLISH_INCREMENTAL_NOOP = "incremental_noop"
 PUBLISH_INCREMENTAL_EXACT = "incremental_exact"
@@ -227,6 +232,21 @@ def command_stdout(cmd: list[str], timeout: int, cwd: Path | None = None) -> str
         rendered = " ".join(cmd)
         raise RuntimeError(f"{rendered} failed: {proc.stderr.strip()}")
     return proc.stdout.strip()
+
+
+def command_stdout_bytes(cmd: list[str], timeout: int, cwd: Path | None = None) -> bytes:
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=dict(os.environ),
+        capture_output=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        rendered = " ".join(cmd)
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"{rendered} failed: {stderr}")
+    return proc.stdout
 
 
 def append_text(path: Path, text: str) -> None:
@@ -1131,7 +1151,14 @@ def build_env(cache_dir: Path) -> dict[str, str]:
     return env
 
 
-def prepare_matrix_scenario(name: str, repo_dir: Path, files: int, funcs_per_file: int) -> None:
+def prepare_matrix_scenario(
+    name: str,
+    repo_dir: Path,
+    files: int,
+    funcs_per_file: int,
+    args: argparse.Namespace,
+    case_root: Path,
+) -> dict[str, Any]:
     if name in {
         "go_modify_1",
         "go_modify_2",
@@ -1141,13 +1168,15 @@ def prepare_matrix_scenario(name: str, repo_dir: Path, files: int, funcs_per_fil
         "go_new_folder",
     }:
         create_repo(repo_dir, files, funcs_per_file)
-        return
+        return {"source": "synthetic_go"}
     if name == "route_decorator":
         create_route_repo(repo_dir, "/api/orders")
-        return
+        return {"source": "synthetic_route"}
     if name == "python_reexport":
         create_python_reexport_repo(repo_dir)
-        return
+        return {"source": "synthetic_python_reexport"}
+    if name == "fastapi_insert_probe":
+        return copy_fastapi_head_to_case(args, repo_dir, case_root)
     raise ValueError(f"unknown matrix scenario: {name}")
 
 
@@ -1181,6 +1210,22 @@ def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> li
         rel = Path("fastapi") / "__init__.py"
         write_text(repo_dir / rel, "from .openapi.models import Header\n")
         return [rel.as_posix()]
+    if name == "fastapi_insert_probe":
+        rel = Path(FASTAPI_PROBE_REL_PATH)
+        path = repo_dir / rel
+        source = path.read_text(encoding="utf-8")
+        insert = (
+            "\n\n"
+            "def cbm_frontier_noop_mask_probe() -> int:\n"
+            f"    return {FASTAPI_PROBE_RETURN_VALUE}\n"
+        )
+        if FASTAPI_PROBE_INSERT_BEFORE not in source:
+            raise RuntimeError(f"FastAPI probe insertion point not found: {rel.as_posix()}")
+        path.write_text(
+            source.replace(FASTAPI_PROBE_INSERT_BEFORE, insert + FASTAPI_PROBE_INSERT_BEFORE, 1),
+            encoding="utf-8",
+        )
+        return [rel.as_posix()]
     raise ValueError(f"unknown matrix scenario: {name}")
 
 
@@ -1202,6 +1247,74 @@ def git_metadata(repo_root: Path, timeout: int) -> dict[str, Any]:
         "short_head": maybe(["rev-parse", "--short", "HEAD"]),
         "branch": maybe(["branch", "--show-current"]),
         "dirty_status_short": maybe(["status", "--short"]),
+    }
+
+
+def clone_real_repo(url: str, target: Path, timeout: int) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    proc, _ = command_result(
+        ["git", "clone", "--depth=1", url, str(target)],
+        dict(os.environ),
+        timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"git clone failed for {url}: {proc.stderr.strip()}")
+    return target
+
+
+def resolve_fastapi_source(args: argparse.Namespace, case_root: Path) -> Path:
+    candidates: list[Path] = []
+    if args.fastapi_repo:
+        candidates.append(Path(args.fastapi_repo).expanduser())
+    env_repo = os.environ.get("CBM_FASTAPI_REPO")
+    if env_repo:
+        candidates.append(Path(env_repo).expanduser())
+    candidates.extend(
+        [
+            Path.home() / "source" / "fastapi",
+            Path.home() / ".cache" / "codebase-memory-mcp" / "bench-repos" / "fastapi",
+        ]
+    )
+    for candidate in candidates:
+        if (candidate / FASTAPI_PROBE_REL_PATH).is_file():
+            return resolve_git_repo_root(candidate, args.timeout)
+    if not args.clone_missing_real_repos:
+        searched = ", ".join(str(path) for path in candidates)
+        raise RuntimeError(
+            "fastapi_insert_probe requires --fastapi-repo, CBM_FASTAPI_REPO, "
+            f"or --clone-missing-real-repos; searched: {searched}"
+        )
+    return clone_real_repo(args.fastapi_url, case_root / "source-fastapi", args.timeout)
+
+
+def copy_git_head_to_dir(source_repo: Path, dest: Path, timeout: int) -> None:
+    if dest.exists() and any(dest.iterdir()):
+        raise RuntimeError(f"destination is not empty: {dest}")
+    dest.mkdir(parents=True, exist_ok=True)
+    raw = command_stdout_bytes(
+        ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD"], timeout, source_repo
+    )
+    rel_paths = [
+        item.decode("utf-8", "surrogateescape")
+        for item in raw.split(b"\0")
+        if item
+    ]
+    for rel_path in rel_paths:
+        blob = command_stdout_bytes(["git", "show", f"HEAD:{rel_path}"], timeout, source_repo)
+        target = dest / rel_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(blob)
+
+
+def copy_fastapi_head_to_case(
+    args: argparse.Namespace, repo_dir: Path, case_root: Path
+) -> dict[str, Any]:
+    source_repo = resolve_fastapi_source(args, case_root)
+    copy_git_head_to_dir(source_repo, repo_dir, args.timeout)
+    return {
+        "source_repo": str(source_repo),
+        "source_git": git_metadata(source_repo, args.timeout),
+        "copy_policy": "git_tracked_files_from_HEAD",
     }
 
 
@@ -1413,7 +1526,9 @@ def run_matrix_case(
 ) -> dict[str, Any]:
     repo_dir = case_root / "repo"
     cache_dir = case_root / "cache"
-    repo_dir.mkdir(parents=True, exist_ok=True)
+    case_root.mkdir(parents=True, exist_ok=True)
+    if scenario not in MATRIX_REAL_REPO_SCENARIOS:
+        repo_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
     case_env = dict(env)
     case_env["CBM_CACHE_DIR"] = str(cache_dir)
@@ -1421,7 +1536,9 @@ def run_matrix_case(
     run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
     apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
 
-    prepare_matrix_scenario(scenario, repo_dir, args.files, args.functions_per_file)
+    scenario_metadata = prepare_matrix_scenario(
+        scenario, repo_dir, args.files, args.functions_per_file, args, case_root
+    )
     if args.transport == "mcp":
         with McpClient(binary, case_env, args.timeout) as client:
             initial = run_index_for_transport(
@@ -1473,6 +1590,7 @@ def run_matrix_case(
         "scenario": scenario,
         "project": project,
         "changed_paths": changed_paths,
+        "scenario_metadata": scenario_metadata,
         "removed_project_dbs": removed_dbs,
         "initial_fast_full": initial,
         "incremental": incremental,
@@ -1734,6 +1852,24 @@ def parse_args() -> argparse.Namespace:
         "--matrix-scenarios",
         default=MATRIX_SCENARIOS_DEFAULT,
         help="Comma-separated matrix scenarios to run.",
+    )
+    parser.add_argument(
+        "--fastapi-repo",
+        default="",
+        help=(
+            "Existing FastAPI checkout for matrix scenario fastapi_insert_probe. "
+            "Defaults also check CBM_FASTAPI_REPO and common local cache/source paths."
+        ),
+    )
+    parser.add_argument(
+        "--fastapi-url",
+        default=DEFAULT_FASTAPI_URL,
+        help="Clone URL used only with --clone-missing-real-repos.",
+    )
+    parser.add_argument(
+        "--clone-missing-real-repos",
+        action="store_true",
+        help="Clone missing real benchmark repos into the isolated work root.",
     )
     parser.add_argument(
         "--self-dogfood-scenarios",
