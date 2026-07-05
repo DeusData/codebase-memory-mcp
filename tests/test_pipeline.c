@@ -9536,13 +9536,11 @@ static const char *pipeline_exact_scratch_structure_root_qn(const cbm_gbuf_t *gb
     return project;
 }
 
-static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
-                                                          const char *repo_path,
-                                                          const char *project,
-                                                          cbm_file_info_t *changed_files,
-                                                          int changed_count,
-                                                          cbm_gbuf_t **out_scratch,
-                                                          cbm_pipeline_file_delta_t *deltas) {
+static int pipeline_build_exact_scratch_for_changed_files_ex(
+    cbm_store_t *store, const char *repo_path, const char *project,
+    cbm_file_info_t *changed_files, int changed_count, const cbm_file_info_t *all_files,
+    int all_file_count, int store_backed_lsp_scope_cap, cbm_gbuf_t **out_scratch,
+    cbm_pipeline_file_delta_t *deltas) {
     if (out_scratch) {
         *out_scratch = NULL;
     }
@@ -9592,7 +9590,10 @@ static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
                               .result_cache = result_cache,
                               .store_backed_node_lookup = store,
                               .store_backed_changed_paths = changed_paths,
-                              .store_backed_changed_path_count = changed_count};
+                              .store_backed_changed_path_count = changed_count,
+                              .store_backed_all_files = all_files,
+                              .store_backed_all_file_count = all_file_count,
+                              .store_backed_lsp_scope_cap = store_backed_lsp_scope_cap};
     const char *structure_root_qn = pipeline_exact_scratch_structure_root_qn(scratch, project);
     for (int i = 0; i < changed_count; i++) {
         if (cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
@@ -9646,6 +9647,18 @@ cleanup:
     cbm_gbuf_free(scratch);
     free(changed_paths);
     return rc;
+}
+
+static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
+                                                          const char *repo_path,
+                                                          const char *project,
+                                                          cbm_file_info_t *changed_files,
+                                                          int changed_count,
+                                                          cbm_gbuf_t **out_scratch,
+                                                          cbm_pipeline_file_delta_t *deltas) {
+    return pipeline_build_exact_scratch_for_changed_files_ex(
+        store, repo_path, project, changed_files, changed_count, NULL, 0, 0, out_scratch,
+        deltas);
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -12421,6 +12434,123 @@ TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs) {
     PASS();
 }
 
+TEST(incremental_exact_scratch_store_backed_lsp_oracle_gap_is_visible) {
+    enum { PIPELINE_STORE_BACKED_EXACT_SCOPE_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('new')\n"),
+              0);
+
+    cbm_file_info_t all_files[] = {
+        {.path = provider_path, .rel_path = "provider.py", .language = CBM_LANG_PYTHON},
+        {.path = service_path, .rel_path = "service.py", .language = CBM_LANG_PYTHON},
+    };
+    cbm_file_info_t changed = {
+        .path = service_path,
+        .rel_path = "service.py",
+        .language = CBM_LANG_PYTHON,
+    };
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files_ex(
+                  store, g_incr_tmpdir, project, &changed, CBM_ALLOC_ONE, all_files,
+                  (int)(sizeof(all_files) / sizeof(all_files[0])),
+                  PIPELINE_STORE_BACKED_EXACT_SCOPE_CAP, &scratch, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, deltas, CBM_ALLOC_ONE,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char *source_qn = cbm_pipeline_fqn_compute(project, "service.py", "Service.run");
+    char *target_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log");
+    ASSERT_NOT_NULL(source_qn);
+    ASSERT_NOT_NULL(target_qn);
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(g_incr_dbpath, project, source_qn, "CALLS", target_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        ASSERT(strstr(diff_err, "lsp_method") != NULL);
+        ASSERT(strstr(diff_err, "suffix_match") != NULL);
+    }
+
+    free(source_qn);
+    free(target_qn);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -15121,6 +15251,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
+    RUN_TEST(incremental_exact_scratch_store_backed_lsp_oracle_gap_is_visible);
     RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
