@@ -202,9 +202,12 @@ typedef enum {
 
 static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *cfg) {
     const char *policy = cfg ? cbm_config_get(cfg, CBM_CONFIG_RANK_REFRESH,
-                                             CBM_RANK_REFRESH_EAGER)
-                             : CBM_RANK_REFRESH_EAGER;
-    if (!policy || !policy[0] || strcmp(policy, CBM_RANK_REFRESH_EAGER) == 0) {
+                                             CBM_RANK_REFRESH_DEFAULT)
+                             : CBM_RANK_REFRESH_DEFAULT;
+    if (!policy || !policy[0]) {
+        policy = CBM_RANK_REFRESH_DEFAULT;
+    }
+    if (strcmp(policy, CBM_RANK_REFRESH_EAGER) == 0) {
         return CBM_RANK_REFRESH_POLICY_EAGER;
     }
     if (strcmp(policy, CBM_RANK_REFRESH_STALE_ON_EXACT) == 0) {

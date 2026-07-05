@@ -33,6 +33,7 @@ struct cbm_config;
 #define CBM_RANK_REFRESH_EAGER          "eager"
 #define CBM_RANK_REFRESH_STALE_ON_EXACT "stale_on_exact"
 #define CBM_RANK_REFRESH_STALE_ON_INCREMENTAL "stale_on_incremental"
+#define CBM_RANK_REFRESH_DEFAULT        CBM_RANK_REFRESH_STALE_ON_INCREMENTAL
 
 typedef enum {
     CBM_RANK_REFRESH_PUBLISH_FULL = 0,

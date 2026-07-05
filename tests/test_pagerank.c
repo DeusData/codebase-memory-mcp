@@ -450,7 +450,39 @@ TEST(pagerank_refresh_stale_on_incremental_defers_containment) {
     PASS();
 }
 
-TEST(pagerank_refresh_invalid_policy_uses_eager_default) {
+TEST(pagerank_refresh_default_defers_incremental_when_rank_views_stale) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "refresh_default", "/tmp/refresh_default");
+    int64_t a = add_node(s, "refresh_default", "a");
+    int64_t b = add_node(s, "refresh_default", "b");
+    add_edge(s, "refresh_default", a, b, "CALLS");
+
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_default"), 2);
+    int64_t c = add_node(s, "refresh_default", "c");
+    add_edge(s, "refresh_default", b, c, "CALLS");
+    ASSERT_EQ(cbm_store_mark_rank_derived_views_stale(
+                  s, "refresh_default", CBM_STORE_DERIVED_GENERATION_UNKNOWN),
+              CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_pagerank_refresh_after_publish(
+                  s, "refresh_default", NULL, true, 0,
+                  CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT),
+              0);
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "refresh_default"));
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 2);
+
+    ASSERT_EQ(cbm_pagerank_refresh_after_publish(
+                  s, "refresh_default", NULL, true, 1,
+                  CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT),
+              3);
+    ASSERT_TRUE(cbm_pagerank_views_complete(s, "refresh_default"));
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 3);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pagerank_refresh_invalid_policy_falls_back_to_eager) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_invalid_policy", "/tmp/refresh_invalid_policy");
     int64_t a = add_node(s, "refresh_invalid_policy", "a");
@@ -1292,7 +1324,8 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views);
     RUN_TEST(pagerank_refresh_stale_on_exact_does_not_defer_containment);
     RUN_TEST(pagerank_refresh_stale_on_incremental_defers_containment);
-    RUN_TEST(pagerank_refresh_invalid_policy_uses_eager_default);
+    RUN_TEST(pagerank_refresh_default_defers_incremental_when_rank_views_stale);
+    RUN_TEST(pagerank_refresh_invalid_policy_falls_back_to_eager);
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);
