@@ -7956,6 +7956,66 @@ TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback) {
     PASS();
 }
 
+TEST(pipeline_external_lsp_target_suppresses_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Function", "caller", "proj.app.caller", "app.py", 1, 10,
+                             "{}");
+    int64_t suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "get", "proj.fastapi.routing.APIRouter.get", "routing.py", 1, 10, "{}");
+    int64_t second_suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "get", "proj.other.Mapping.get", "other.py", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(suffix_target_id, 0);
+    ASSERT_GT(second_suffix_target_id, 0);
+    cbm_registry_add(reg, "get", "proj.fastapi.routing.APIRouter.get", "Method");
+    cbm_registry_add(reg, "get", "proj.other.Mapping.get", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "scope.get",
+                    .enclosing_func_qn = "proj.app.caller",
+                    .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMResolvedCall resolved = {.caller_qn = "proj.app.caller",
+                                .callee_qn = "external.collections.Mapping.get",
+                                .strategy = "lsp_external_method",
+                                .confidence = 0.95f};
+    cbm_resolvedcall_push(&result.resolved_calls, &result.arena, resolved);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/app.py",
+                                 .rel_path = "app.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
@@ -15198,6 +15258,7 @@ SUITE(pipeline) {
     RUN_TEST(registry_confidence_unique_name);
     RUN_TEST(registry_confidence_suffix_match);
     RUN_TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback);
+    RUN_TEST(pipeline_external_lsp_target_suppresses_suffix_fallback);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
     RUN_TEST(registry_negative_import_rejects);
