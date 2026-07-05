@@ -83,6 +83,7 @@ typedef enum {
 typedef enum {
     CBM_INCREMENTAL_DERIVED_REFRESH_EAGER = 0,
     CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT,
+    CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL,
 } cbm_incremental_derived_refresh_policy_t;
 
 void cbm_pipeline_lock(void) {
@@ -363,12 +364,17 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
 
     const char *derived_refresh = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
                                                  CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER);
-    p->incremental_derived_refresh =
-        derived_refresh &&
-                strcmp(derived_refresh,
-                       CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT) == 0
-            ? CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT
-            : CBM_INCREMENTAL_DERIVED_REFRESH_EAGER;
+    if (derived_refresh &&
+        strcmp(derived_refresh, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL) ==
+            0) {
+        p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
+    } else if (derived_refresh &&
+               strcmp(derived_refresh, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT) ==
+                   0) {
+        p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT;
+    } else {
+        p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_EAGER;
+    }
 
     int max_changed = cbm_config_get_int(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
                                          p->exact_delta_max_changed_paths);
@@ -637,7 +643,16 @@ bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p) {
 }
 
 bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_t *p) {
-    return p && p->incremental_derived_refresh == CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT;
+    return p &&
+           (p->incremental_derived_refresh == CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT ||
+            p->incremental_derived_refresh ==
+                CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL);
+}
+
+bool cbm_pipeline_incremental_derived_refresh_stale_on_incremental(const cbm_pipeline_t *p) {
+    return p &&
+           p->incremental_derived_refresh ==
+               CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
 }
 
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p) {
@@ -1532,7 +1547,8 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
             return fts_rc;
         }
     }
-    int derived_rc = cbm_pipeline_mark_replacement_derived_views(store, p->project_name, p->mode);
+    int derived_rc =
+        cbm_pipeline_mark_replacement_derived_views(store, p->project_name, p->mode, true);
     if (derived_rc != CBM_STORE_OK) {
         cbm_log_error("pipeline.err", "phase", "mark_derived_views", "rc", itoa_buf(derived_rc));
         return derived_rc;

@@ -2371,7 +2371,8 @@ cleanup:
 static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                                cbm_file_info_t *files, int file_count,
                                const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                               const char *repo_path, const char *pass_fingerprint, int mode) {
+                               const char *repo_path, const char *pass_fingerprint, int mode,
+                               bool semantic_edges_refreshed) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -2423,7 +2424,9 @@ static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char
             cbm_store_close(hash_store);
             return fts_rc;
         }
-        int derived_rc = cbm_pipeline_mark_replacement_derived_views(hash_store, project, mode);
+        int derived_rc =
+            cbm_pipeline_mark_replacement_derived_views(hash_store, project, mode,
+                                                        semantic_edges_refreshed);
         if (derived_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "mark_derived_views", "rc",
                           itoa_buf_incr(derived_rc));
@@ -2752,7 +2755,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                           itoa_buf_incr(CBM_NOT_FOUND));
             pipeline_rc = CBM_NOT_FOUND;
         } else {
-            pipeline_rc = run_postpasses(&ctx, changed_files, ci, project, true);
+            bool refresh_global_semantic_edges =
+                !cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p);
+            pipeline_rc = run_postpasses(&ctx, changed_files, ci, project,
+                                         refresh_global_semantic_edges);
         }
     }
 
@@ -2807,10 +2813,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full publishes. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
+    bool semantic_edges_refreshed =
+        !cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p);
     int persist_rc = publish_and_persist(existing, db_path, project, files, file_count,
                                          cls.mode_skipped, cls.mode_skipped_count,
                                          cbm_pipeline_repo_path(p), pass_fingerprint,
-                                         cbm_pipeline_get_mode(p));
+                                         cbm_pipeline_get_mode(p), semantic_edges_refreshed);
     if (persist_rc == 0) {
         cbm_pipeline_set_graph_changed(p, true);
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);

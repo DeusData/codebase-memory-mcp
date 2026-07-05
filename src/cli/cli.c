@@ -2927,12 +2927,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER,
      NULL,
      "Indexing",
-     "When exact incremental publishes may defer global semantic/similarity edge refresh",
+     "When incremental publishes may defer global semantic/similarity edge refresh",
      CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "|"
-     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT,
+     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT "|"
+     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL,
      "'eager' preserves full/moderate publish freshness. 'stale_on_exact' lets small exact "
      "incremental graph deltas publish after marking semantic_edges stale; semantic/similarity "
-     "queries warn until an eager index run or full reindex rebuilds those global edges."},
+     "queries warn until an eager index run or full reindex rebuilds those global edges. "
+     "'stale_on_incremental' also allows containment incremental publishes to defer."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
      "Default max results for search_graph/search_code",

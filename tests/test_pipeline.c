@@ -11343,6 +11343,81 @@ TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale) {
     PASS();
 }
 
+TEST(incremental_full_stale_on_incremental_defers_containment_semantic_refresh) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n\tLeaf()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func NewLeaf() int {\n\treturn 17\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=changed_batch_too_large") != NULL);
+    ASSERT(strstr(logs, "pass=incr_semantic_edges") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "changed_batch_too_large");
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project,
+                                                CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
+    cbm_store_close(s);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild) {
     enum { PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8 };
     if (setup_incremental_repo() != 0) {
@@ -14637,9 +14712,11 @@ TEST(config_registry_includes_incremental_derived_refresh_policy) {
     ASSERT_NOT_NULL(entry);
     ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER);
     ASSERT_STR_EQ(entry->category, "Indexing");
-    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact");
+    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
     ASSERT_NOT_NULL(strstr(entry->guidance,
                            CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT));
+    ASSERT_NOT_NULL(strstr(entry->guidance,
+                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL));
     PASS();
 }
 
@@ -15631,6 +15708,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_full_stale_on_exact_defers_global_derived_refresh);
     RUN_TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale);
+    RUN_TEST(incremental_full_stale_on_incremental_defers_containment_semantic_refresh);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
