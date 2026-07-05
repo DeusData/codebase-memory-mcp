@@ -2136,6 +2136,18 @@ static bool pipeline_resolved_call_contains(const CBMResolvedCallArray *arr,
     return false;
 }
 
+static bool pipeline_text_array_contains(char *const *items, int count, const char *needle) {
+    if (!items || !needle) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (items[i] && strcmp(items[i], needle) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void pipeline_restore_workers_env(bool had_workers, const char *saved_workers) {
     if (had_workers) {
         cbm_setenv("CBM_WORKERS", saved_workers, 1);
@@ -12142,7 +12154,7 @@ TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex) {
 }
 
 TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
-    enum { PIPELINE_PERSISTED_DEF_CAP = 3 };
+    enum { PIPELINE_PERSISTED_SCOPE_CAP = CBM_SZ_8 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -12209,30 +12221,38 @@ TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
     cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
     ASSERT_NOT_NULL(store);
 
-    char *provider_qns[PIPELINE_PERSISTED_DEF_CAP] = {
-        cbm_pipeline_fqn_compute(project, "provider.py", "Logger"),
-        cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log"),
-        cbm_pipeline_fqn_compute(project, "provider.py", "OtherLogger.log"),
-    };
-    for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
-        ASSERT_NOT_NULL(provider_qns[i]);
-    }
-    const char *provider_qn_view[PIPELINE_PERSISTED_DEF_CAP] = {
-        provider_qns[0],
-        provider_qns[1],
-        provider_qns[2],
-    };
+    char *import_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger");
+    char *provider_log_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log");
+    char *other_log_qn = cbm_pipeline_fqn_compute(project, "provider.py", "OtherLogger.log");
+    ASSERT_NOT_NULL(import_qn);
+    ASSERT_NOT_NULL(provider_log_qn);
+    ASSERT_NOT_NULL(other_log_qn);
+
+    const char *scope_inputs[] = {import_qn};
+    char **candidate_qns = NULL;
+    int candidate_qn_count = 0;
+    bool candidate_truncated = true;
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(
+                  store, project, scope_inputs, CBM_ALLOC_ONE, PIPELINE_PERSISTED_SCOPE_CAP,
+                  &candidate_qns, &candidate_qn_count, &candidate_truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(candidate_truncated);
+    ASSERT_EQ(candidate_qn_count, PAIR_LEN);
+    ASSERT_TRUE(pipeline_text_array_contains(candidate_qns, candidate_qn_count, import_qn));
+    ASSERT_TRUE(pipeline_text_array_contains(candidate_qns, candidate_qn_count, provider_log_qn));
+    ASSERT_FALSE(pipeline_text_array_contains(candidate_qns, candidate_qn_count, other_log_qn));
+
     cbm_node_t *provider_nodes = NULL;
     int provider_node_count = 0;
-    ASSERT_EQ(cbm_store_find_nodes_by_qns(store, project, provider_qn_view,
-                                          PIPELINE_PERSISTED_DEF_CAP, &provider_nodes,
+    ASSERT_EQ(cbm_store_find_nodes_by_qns(store, project, (const char **)candidate_qns,
+                                          candidate_qn_count, &provider_nodes,
                                           &provider_node_count),
               CBM_STORE_OK);
-    ASSERT_EQ(provider_node_count, PIPELINE_PERSISTED_DEF_CAP);
+    ASSERT_EQ(provider_node_count, PAIR_LEN);
 
     CBMArena persisted_arena;
     cbm_arena_init(&persisted_arena);
-    CBMLSPDef persisted_defs[PIPELINE_PERSISTED_DEF_CAP];
+    CBMLSPDef persisted_defs[PIPELINE_PERSISTED_SCOPE_CAP];
     memset(persisted_defs, 0, sizeof(persisted_defs));
     int persisted_count = 0;
     for (int i = 0; i < provider_node_count; i++) {
@@ -12253,9 +12273,7 @@ TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
            (size_t)persisted_count * sizeof(*all_defs));
 
     char *module_qn = cbm_pipeline_fqn_module(project, "service.py");
-    char *import_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger");
     ASSERT_NOT_NULL(module_qn);
-    ASSERT_NOT_NULL(import_qn);
     const char *imp_names[] = {"Logger"};
     const char *imp_qns[] = {import_qn};
     CBMArena out_arena;
@@ -12269,11 +12287,14 @@ TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
 
     cbm_arena_destroy(&out_arena);
     free(import_qn);
+    free(provider_log_qn);
+    free(other_log_qn);
     free(module_qn);
     free(all_defs);
-    for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
-        free(provider_qns[i]);
+    for (int i = 0; i < candidate_qn_count; i++) {
+        free(candidate_qns[i]);
     }
+    free(candidate_qns);
     cbm_arena_destroy(&persisted_arena);
     free(own_defs);
     free(changed_modules[0]);

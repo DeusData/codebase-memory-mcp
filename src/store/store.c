@@ -405,6 +405,18 @@ static int store_append_text(char ***items, int *count, int *cap, const char *te
     return CBM_STORE_OK;
 }
 
+static bool store_text_array_contains(char *const *items, int count, const char *text) {
+    if (!items || !text) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (items[i] && strcmp(items[i], text) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int store_grow_array(cbm_store_t *s, void **items, int *cap, size_t item_size,
                             const char *op, bool zero_new) {
     if (!items || !cap || item_size == 0 || *cap <= 0 || *cap > INT_MAX / ST_GROWTH) {
@@ -2067,6 +2079,140 @@ int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char 
 
     *out = arr;
     *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_list_symbol_scope_qns_by_qns(cbm_store_t *s, const char *project,
+                                           const char **qns, int qn_count, int max_qns,
+                                           char ***out, int *count, bool *out_truncated) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (out_truncated) {
+        *out_truncated = false;
+    }
+    if (!s || !s->db || !project || max_qns <= 0) {
+        return CBM_STORE_ERR;
+    }
+    if (qn_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (!qns) {
+        return CBM_STORE_ERR;
+    }
+
+    int cap = max_qns < ST_INIT_CAP_8 ? max_qns : ST_INIT_CAP_8;
+    char **items = malloc((size_t)cap * sizeof(*items));
+    if (!items) {
+        store_set_error(s, "list_symbol_scope_qns out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int n = 0;
+    int offset = 0;
+    bool truncated = false;
+    const int sqlite_bind_limit = sqlite3_limit(s->db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    const int qn_bind_limit =
+        sqlite_bind_limit > SKIP_ONE ? (sqlite_bind_limit - SKIP_ONE) / PAIR_LEN : SKIP_ONE;
+    static const char prefix[] = "WITH q(ord, qn) AS (VALUES ";
+    static const char suffix[] =
+        "), candidates AS ("
+        " SELECT q.ord,"
+        "        CASE WHEN n.qualified_name = q.qn THEN 0 ELSE 1 END AS member_rank,"
+        "        n.qualified_name"
+        " FROM q JOIN nodes n ON n.project = ?"
+        "  AND (n.qualified_name = q.qn"
+        /* '/' is the byte after '.', so this is a bounded prefix scan for qn + '.'. */
+        "       OR (n.qualified_name >= q.qn || '.' AND n.qualified_name < q.qn || '/'))"
+        ") SELECT qualified_name FROM candidates ORDER BY ord, member_rank, qualified_name;";
+
+    while (offset < qn_count && !truncated) {
+        char sql[ST_SQL_BUF];
+        int pos = snprintf(sql, sizeof(sql), "%s", prefix);
+        if (pos < 0 || pos >= (int)sizeof(sql)) {
+            store_free_text_array(items, n);
+            return CBM_STORE_ERR;
+        }
+
+        int chunk_end = offset;
+        int bind_count = 0;
+        for (; chunk_end < qn_count && bind_count < qn_bind_limit; chunk_end++) {
+            if (!qns[chunk_end]) {
+                continue;
+            }
+            static const char row_sql[] = "(?,?)";
+            int extra = (bind_count > 0 ? 1 : 0) + (int)SLEN(row_sql) + (int)SLEN(suffix);
+            if (pos + extra + ST_IN_CLAUSE_MARGIN >= (int)sizeof(sql)) {
+                break;
+            }
+            if (bind_count > 0) {
+                sql[pos++] = ',';
+            }
+            memcpy(sql + pos, row_sql, SLEN(row_sql));
+            pos += (int)SLEN(row_sql);
+            bind_count++;
+        }
+        if (bind_count == 0) {
+            offset++;
+            continue;
+        }
+        if (pos + (int)SLEN(suffix) >= (int)sizeof(sql)) {
+            store_free_text_array(items, n);
+            return CBM_STORE_ERR;
+        }
+        memcpy(sql + pos, suffix, SLEN(suffix) + 1);
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "list_symbol_scope_qns prepare");
+            store_free_text_array(items, n);
+            return CBM_STORE_ERR;
+        }
+
+        int bind_col = SKIP_ONE;
+        for (int i = offset; i < chunk_end; i++) {
+            if (!qns[i]) {
+                continue;
+            }
+            sqlite3_bind_int(stmt, bind_col++, i);
+            bind_text(stmt, bind_col++, qns[i]);
+        }
+        bind_text(stmt, bind_col, project);
+
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            const char *candidate = (const char *)sqlite3_column_text(stmt, 0);
+            if (!candidate || store_text_array_contains(items, n, candidate)) {
+                continue;
+            }
+            if (n >= max_qns) {
+                truncated = true;
+                break;
+            }
+            int rc = store_append_text(&items, &n, &cap, candidate);
+            if (rc != CBM_STORE_OK) {
+                sqlite3_finalize(stmt);
+                store_free_text_array(items, n);
+                return rc;
+            }
+        }
+        if (step_rc != SQLITE_DONE && !truncated) {
+            store_set_error_sqlite(s, "list_symbol_scope_qns step");
+            sqlite3_finalize(stmt);
+            store_free_text_array(items, n);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_finalize(stmt);
+        offset = chunk_end;
+    }
+
+    *out = items;
+    *count = n;
+    if (out_truncated) {
+        *out_truncated = truncated;
+    }
     return CBM_STORE_OK;
 }
 
