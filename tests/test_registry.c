@@ -264,6 +264,36 @@ TEST(resolve_same_module) {
     PASS();
 }
 
+TEST(resolve_same_module_only_on_self_receiver) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "get", "proj.pkg.service.get", "Function");
+
+    /* Dotted call with unrelated receiver (e.g. "axios.get") -> should NOT resolve */
+    cbm_resolution_t res1 = cbm_registry_resolve(r, "axios.get", "proj.pkg.service", NULL, NULL, 0);
+    ASSERT_TRUE(res1.qualified_name == NULL || res1.qualified_name[0] == '\0');
+
+    /* Dotted call with delegation pattern (e.g. "_get_store().get") -> should NOT resolve */
+    cbm_resolution_t res2 = cbm_registry_resolve(r, "_get_store().get", "proj.pkg.service", NULL, NULL, 0);
+    ASSERT_TRUE(res2.qualified_name == NULL || res2.qualified_name[0] == '\0');
+
+    /* Dotted call with self-receiver (e.g. "self.get") -> should resolve */
+    cbm_resolution_t res3 = cbm_registry_resolve(r, "self.get", "proj.pkg.service", NULL, NULL, 0);
+    ASSERT_STR_EQ(res3.qualified_name, "proj.pkg.service.get");
+    ASSERT_STR_EQ(res3.strategy, "same_module");
+
+    /* Dotted call with exact module name prefix (e.g. "proj.pkg.service.get") -> should resolve */
+    cbm_resolution_t res4 = cbm_registry_resolve(r, "proj.pkg.service.get", "proj.pkg.service", NULL, NULL, 0);
+    ASSERT_STR_EQ(res4.qualified_name, "proj.pkg.service.get");
+
+    /* Dotted call with namespace/module last segment (e.g. "service.get") -> should resolve */
+    cbm_resolution_t res5 = cbm_registry_resolve(r, "service.get", "proj.pkg.service", NULL, NULL, 0);
+    ASSERT_STR_EQ(res5.qualified_name, "proj.pkg.service.get");
+    ASSERT_STR_EQ(res5.strategy, "same_module");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 /* A package/namespace-qualified callee whose bare name is defined in several
  * places must resolve to the package named in the call — not collapse onto a
  * single winner. Regression for qualified cross-file calls (e.g. Perl
@@ -833,6 +863,7 @@ SUITE(registry) {
     RUN_TEST(registry_no_duplicates);
     /* Resolution */
     RUN_TEST(resolve_same_module);
+    RUN_TEST(resolve_same_module_only_on_self_receiver);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
     RUN_TEST(resolve_import_map);
