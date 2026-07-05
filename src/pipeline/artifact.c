@@ -10,8 +10,8 @@ enum {
     ART_DIR_PERMS = 0755,
     ART_ZSTD_FAST = 3,
     ART_ZSTD_BEST = 9,
-    ART_RATIO_SCALE = 10, /* multiply ratio by 10 for integer logging */
-    ART_NUL = 1,          /* NUL terminator byte */
+    ART_RATIO_SCALE = 10,        /* multiply ratio by 10 for integer logging */
+    ART_NUL = 1,                 /* NUL terminator byte */
     ART_NS_PER_SEC = 1000000000, /* nanoseconds per second (mtime_ns helper) */
 };
 #define ART_BYTES_PER_MB ((size_t)1024 * 1024)
@@ -22,7 +22,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
-#include "foundation/str_util.h" /* cbm_validate_shell_arg */
+#include "foundation/str_util.h"   /* cbm_validate_shell_arg */
 #include "foundation/hash_table.h" /* CBMHashTable (reconcile changed-set) */
 
 #include "zstd_store.h"
@@ -268,8 +268,7 @@ static bool is_hex_oid(const char *s) {
  * a third cross-file dependency for one helper. */
 static int64_t art_stat_mtime_ns(const struct stat *st) {
 #ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * ART_NS_PER_SEC) +
-           (int64_t)st->st_mtimespec.tv_nsec;
+    return ((int64_t)st->st_mtimespec.tv_sec * ART_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
 #elif defined(_WIN32)
     return (int64_t)st->st_mtime * ART_NS_PER_SEC;
 #else
@@ -311,8 +310,7 @@ static bool git_run_ok(const char *repo_path, const char *args) {
         return false;
     }
     char drain[CBM_SZ_4K];
-    while (fread(drain, 1, sizeof(drain), fp) > 0) {
-    }
+    while (fread(drain, 1, sizeof(drain), fp) > 0) {}
     return cbm_pclose(fp) == 0;
 }
 
