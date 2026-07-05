@@ -330,7 +330,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
             const char *handler_ref = NULL;
             const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
-            if (route_path) {
+            if (route_path &&
+                ((handler_ref && handler_ref[0] != '\0') ||
+                 cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
                 handle_route_registration(ctx, call, source_node, route_path, handler_ref,
                                           module_qn, imp_keys, imp_vals, imp_count);
                 return SKIP_ONE;
@@ -342,7 +344,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
         const char *handler_ref = NULL;
         const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
-        if (route_path) {
+        if (route_path &&
+            ((handler_ref && handler_ref[0] != '\0') ||
+             cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
             handle_route_registration(ctx, call, source_node, route_path, handler_ref, module_qn,
                                       imp_keys, imp_vals, imp_count);
             return SKIP_ONE;

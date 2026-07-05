@@ -463,61 +463,66 @@ static const lib_pattern_t trpc_libraries[] = {
     {NULL, CBM_SVC_NONE, NULL},
 };
 
-/* Method suffix type (used by both route registration and HTTP client tables) */
 typedef struct {
     const char *suffix;
     const char *method;
 } method_suffix_t;
 
+typedef struct {
+    const char *suffix;
+    const char *method;
+    bool allows_no_handler;
+} route_reg_suffix_t;
+
 /* Route registration method suffixes — matched on callee name.
  * These are methods on router objects that register handlers. */
-static const method_suffix_t route_reg_suffixes[] = {
+static const route_reg_suffix_t route_reg_suffixes[] = {
     /* HTTP method registrations */
-    {".GET", "GET"},
-    {".Get", "GET"},
-    {".get", "GET"},
-    {".POST", "POST"},
-    {".Post", "POST"},
-    {".post", "POST"},
-    {".PUT", "PUT"},
-    {".Put", "PUT"},
-    {".put", "PUT"},
-    {".DELETE", "DELETE"},
-    {".Delete", "DELETE"},
-    {".delete", "DELETE"},
-    {".PATCH", "PATCH"},
-    {".Patch", "PATCH"},
-    {".patch", "PATCH"},
+    {".GET", "GET", false},
+    {".Get", "GET", false},
+    {".get", "GET", false},
+    {".POST", "POST", false},
+    {".Post", "POST", false},
+    {".post", "POST", false},
+    {".PUT", "PUT", false},
+    {".Put", "PUT", false},
+    {".put", "PUT", false},
+    {".DELETE", "DELETE", false},
+    {".Delete", "DELETE", false},
+    {".delete", "DELETE", false},
+    {".PATCH", "PATCH", false},
+    {".Patch", "PATCH", false},
+    {".patch", "PATCH", false},
     /* Handle/HandleFunc (Go stdlib, gorilla) */
-    {".Handle", "ANY"},
-    {".HandleFunc", "ANY"},
-    {".handle", "ANY"},
+    {".Handle", "ANY", false},
+    {".HandleFunc", "ANY", false},
+    {".handle", "ANY", false},
     /* Framework-specific route registration */
-    {".Route", "ANY"},
-    {".route", "ANY"},
-    {".websocket_route", "ANY"},
-    {".websocket", "ANY"},
-    {"::get", "GET"},
-    {"::post", "POST"},
-    {"::put", "PUT"},
-    {"::delete", "DELETE"},
-    {"::patch", "PATCH"},
+    {".Route", "ANY", false},
+    {".route", "ANY", false},
+    {".websocket_route", "ANY", true},
+    {".websocket", "ANY", true},
+    {"::get", "GET", false},
+    {"::post", "POST", false},
+    {"::put", "PUT", false},
+    {"::delete", "DELETE", false},
+    {"::patch", "PATCH", false},
     /* Minimal API (C# ASP.NET) */
-    {".MapGet", "GET"},
-    {".MapPost", "POST"},
-    {".MapPut", "PUT"},
-    {".MapDelete", "DELETE"},
+    {".MapGet", "GET", false},
+    {".MapPost", "POST", false},
+    {".MapPut", "PUT", false},
+    {".MapDelete", "DELETE", false},
     /* Router mounting / prefix registration (any method) */
-    {".include_router", "ANY"},
-    {".mount", "ANY"},
-    {".add_url_rule", "ANY"},
-    {".register_blueprint", "ANY"},
-    {".use", "ANY"},
-    {".register", "ANY"},
-    {".add_route", "ANY"},
-    {".add_api_route", "ANY"},
-    {".add_api_websocket_route", "ANY"},
-    {NULL, NULL},
+    {".include_router", "ANY", true},
+    {".mount", "ANY", false},
+    {".add_url_rule", "ANY", true},
+    {".register_blueprint", "ANY", true},
+    {".use", "ANY", false},
+    {".register", "ANY", false},
+    {".add_route", "ANY", true},
+    {".add_api_route", "ANY", true},
+    {".add_api_websocket_route", "ANY", true},
+    {NULL, NULL, false},
 };
 
 /* ── HTTP method inference from function/method name suffix ───── */
@@ -891,6 +896,20 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
         }
     }
     return NULL;
+}
+
+bool cbm_service_pattern_route_suffix_allows_no_handler(const char *callee_name) {
+    if (!callee_name) {
+        return false;
+    }
+    size_t clen = strlen(callee_name);
+    for (int i = 0; route_reg_suffixes[i].suffix != NULL; i++) {
+        size_t slen = strlen(route_reg_suffixes[i].suffix);
+        if (clen >= slen && strcmp(callee_name + clen - slen, route_reg_suffixes[i].suffix) == 0) {
+            return route_reg_suffixes[i].allows_no_handler;
+        }
+    }
+    return false;
 }
 
 const char *cbm_service_pattern_broker(const char *resolved_qn) {
