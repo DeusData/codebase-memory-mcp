@@ -14,6 +14,7 @@
 #include "test_framework.h"
 #include <cli/cli.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <depindex/depindex.h>
 #include <yyjson/yyjson.h>
@@ -723,6 +724,48 @@ TEST(search_graph_has_session_project) {
     ASSERT_NOT_NULL(strstr(result, "test_proj"));
     free(result);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(cli_session_detection_uses_cwd_project_slug) {
+    char old_cwd[CBM_PATH_MAX];
+    ASSERT_NOT_NULL(getcwd(old_cwd, sizeof(old_cwd)));
+
+    char *repo = th_mktempdir("cbm_cli_session");
+    ASSERT_NOT_NULL(repo);
+    char repo_path[CBM_PATH_MAX];
+    int repo_n = snprintf(repo_path, sizeof(repo_path), "%s", repo);
+    ASSERT_GT(repo_n, 0);
+    ASSERT((size_t)repo_n < sizeof(repo_path));
+    char *expected_project = cbm_project_name_from_path(repo_path);
+    ASSERT_NOT_NULL(expected_project);
+
+    char *cfg_dir = th_mktempdir("cbm_cli_session_cfg");
+    ASSERT_NOT_NULL(cfg_dir);
+    cbm_config_t *cfg = cbm_config_open(cfg_dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    ASSERT_EQ(chdir(repo_path), 0);
+    cbm_mcp_server_detect_session(srv);
+    ASSERT_EQ(chdir(old_cwd), 0);
+
+    char *result = cbm_mcp_handle_tool(srv, "search_graph",
+        "{\"name_pattern\":\"cbm_cli_session_unindexed\"}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, "session_project"));
+    ASSERT_NOT_NULL(strstr(result, expected_project));
+    free(result);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    free(expected_project);
+    th_cleanup(cfg_dir);
+    th_cleanup(repo_path);
     PASS();
 }
 
@@ -2762,6 +2805,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(hidden_tools_still_dispatch);
     /* Session context */
     RUN_TEST(search_graph_has_session_project);
+    RUN_TEST(cli_session_detection_uses_cwd_project_slug);
     RUN_TEST(search_graph_slug_project_sets_session_context);
     RUN_TEST(index_status_has_session_project);
     /* Context injection */

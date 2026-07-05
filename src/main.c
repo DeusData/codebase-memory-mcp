@@ -318,6 +318,7 @@ static int run_cli(int argc, char **argv) {
         runtime_config = cbm_config_open(cbm_resolve_cache_dir());
         cbm_mcp_server_set_config(srv, runtime_config);
     }
+    cbm_mcp_server_detect_session(srv);
 
     char *result = cbm_mcp_handle_tool(srv, tool_name, args_json);
     int exit_code = 0;
