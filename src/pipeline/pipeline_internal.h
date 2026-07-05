@@ -330,11 +330,16 @@ typedef struct {
      * upsert route, resolvers may materialize referenced unchanged nodes from
      * the store on demand instead of preloading every stored symbol node. The
      * changed-path list prevents stale stored nodes for files being reparsed
-     * from re-entering the scratch graph. Leave NULL/0 on full, containment,
-     * dependency, and parallel worker paths. */
+     * from re-entering the scratch graph. The all-file list plus positive LSP
+     * scope cap opt into bounded persisted cross-LSP defs; leave cap 0 unless a
+     * caller has a fresh-equivalence proof for the route using it. Leave NULL/0
+     * on full, containment, dependency, and parallel worker paths. */
     cbm_store_t *store_backed_node_lookup;
     const char *const *store_backed_changed_paths;
     int store_backed_changed_path_count;
+    const cbm_file_info_t *store_backed_all_files;
+    int store_backed_all_file_count;
+    int store_backed_lsp_scope_cap;
 } cbm_pipeline_ctx_t;
 
 static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {

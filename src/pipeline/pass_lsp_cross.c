@@ -451,6 +451,140 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
     cbm_arena_destroy(&scratch);
 }
 
+static bool pxc_path_in_list(const char *path, const char *const *paths, int count) {
+    if (!path || !paths || count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (paths[i] && strcmp(path, paths[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool pxc_language_for_store_path(const cbm_pipeline_ctx_t *ctx, const char *rel_path,
+                                        CBMLanguage *out) {
+    if (!ctx || !rel_path || !out || !ctx->store_backed_all_files ||
+        ctx->store_backed_all_file_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < ctx->store_backed_all_file_count; i++) {
+        const cbm_file_info_t *file = &ctx->store_backed_all_files[i];
+        if (file->rel_path && strcmp(file->rel_path, rel_path) == 0) {
+            *out = file->language;
+            return true;
+        }
+    }
+    return false;
+}
+
+static CBMLSPDef *pxc_collect_store_backed_defs_for_file(
+    const cbm_pipeline_ctx_t *ctx, CBMArena *arena, const char *const *imp_qns, int imp_count,
+    int *out_count) {
+    if (out_count) {
+        *out_count = 0;
+    }
+    if (!ctx || !arena || !out_count || !ctx->store_backed_node_lookup || !ctx->project_name ||
+        !imp_qns || imp_count <= 0 || ctx->store_backed_lsp_scope_cap <= 0) {
+        return NULL;
+    }
+
+    char **candidate_qns = NULL;
+    int candidate_count = 0;
+    bool truncated = false;
+    int rc = cbm_store_list_symbol_scope_qns_by_qns(
+        ctx->store_backed_node_lookup, ctx->project_name, imp_qns, imp_count,
+        ctx->store_backed_lsp_scope_cap, &candidate_qns, &candidate_count, &truncated);
+    if (rc != CBM_STORE_OK || truncated || candidate_count <= 0) {
+        if (truncated) {
+            cbm_log_info("lsp_cross.store_defs_skipped", "reason", "scope_truncated",
+                         "cap", itoa_buf(ctx->store_backed_lsp_scope_cap));
+        }
+        for (int i = 0; i < candidate_count; i++) {
+            free(candidate_qns[i]);
+        }
+        free(candidate_qns);
+        return NULL;
+    }
+
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    rc = cbm_store_find_nodes_by_qns(ctx->store_backed_node_lookup, ctx->project_name,
+                                     (const char **)candidate_qns, candidate_count, &nodes,
+                                     &node_count);
+    for (int i = 0; i < candidate_count; i++) {
+        free(candidate_qns[i]);
+    }
+    free(candidate_qns);
+    if (rc != CBM_STORE_OK || node_count <= 0) {
+        return NULL;
+    }
+
+    CBMLSPDef *defs = (CBMLSPDef *)calloc((size_t)node_count, sizeof(*defs));
+    if (!defs) {
+        cbm_store_free_nodes(nodes, node_count);
+        return NULL;
+    }
+    int def_count = 0;
+    for (int i = 0; i < node_count; i++) {
+        if (pxc_path_in_list(nodes[i].file_path, ctx->store_backed_changed_paths,
+                             ctx->store_backed_changed_path_count)) {
+            continue;
+        }
+        CBMLanguage lang = CBM_LANG_COUNT;
+        if (!pxc_language_for_store_path(ctx, nodes[i].file_path, &lang) ||
+            !cbm_pxc_has_cross_lsp(lang)) {
+            continue;
+        }
+        if (cbm_pxc_build_lsp_def_from_node(arena, &nodes[i], lang, &defs[def_count]) == 0) {
+            def_count++;
+        }
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    if (def_count == 0) {
+        free(defs);
+        return NULL;
+    }
+    *out_count = def_count;
+    return defs;
+}
+
+static const char *pxc_store_backed_import_value_override(const cbm_pipeline_ctx_t *ctx,
+                                                          CBMArena *arena,
+                                                          const char *module_qn,
+                                                          const char *local_name) {
+    if (!ctx || !arena || !ctx->store_backed_node_lookup || !ctx->project_name ||
+        ctx->store_backed_lsp_scope_cap <= 0 || !module_qn || !module_qn[0] || !local_name ||
+        !local_name[0] || strcmp(local_name, "*") == 0) {
+        return NULL;
+    }
+
+    char *candidate_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, local_name);
+    if (!candidate_qn) {
+        return NULL;
+    }
+
+    cbm_node_t node;
+    memset(&node, 0, sizeof(node));
+    int rc = cbm_store_find_node_by_qn(ctx->store_backed_node_lookup, ctx->project_name,
+                                       candidate_qn, &node);
+    if (rc != CBM_STORE_OK) {
+        return NULL;
+    }
+
+    const char *override = NULL;
+    CBMLanguage lang = CBM_LANG_COUNT;
+    if (node.name && strcmp(node.name, local_name) == 0 && pxc_map_label(node.label) &&
+        !pxc_path_in_list(node.file_path, ctx->store_backed_changed_paths,
+                          ctx->store_backed_changed_path_count) &&
+        pxc_language_for_store_path(ctx, node.file_path, &lang) && cbm_pxc_has_cross_lsp(lang)) {
+        override = candidate_qn;
+    }
+    cbm_node_free_fields(&node);
+    return override;
+}
+
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
     if (!ctx || !files || file_count <= 0 || !cache)
@@ -502,15 +636,62 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, files[i].rel_path,
                                                  &imp_keys, &imp_vals, &imp_count);
 
+        CBMArena store_defs_arena;
+        cbm_arena_init(&store_defs_arena);
+        int store_def_count = 0;
+        CBMLSPDef *store_defs = pxc_collect_store_backed_defs_for_file(
+            ctx, &store_defs_arena, imp_vals, imp_count, &store_def_count);
+        const char **run_imp_vals = imp_vals;
+        if (store_def_count > 0 && imp_count > 0) {
+            const char **override_vals =
+                (const char **)cbm_arena_alloc(&store_defs_arena,
+                                               (size_t)imp_count * sizeof(*override_vals));
+            if (override_vals) {
+                for (int j = 0; j < imp_count; j++) {
+                    const char *override = pxc_store_backed_import_value_override(
+                        ctx, &store_defs_arena, imp_vals ? imp_vals[j] : NULL,
+                        imp_keys ? imp_keys[j] : NULL);
+                    override_vals[j] = override ? override : (imp_vals ? imp_vals[j] : NULL);
+                }
+                run_imp_vals = override_vals;
+            } else {
+                cbm_log_info("lsp_cross.store_imports_skipped", "reason", "alloc");
+            }
+        }
+        int run_def_count = def_count + store_def_count;
+        CBMLSPDef *run_defs = all_defs;
+        bool free_run_defs = false;
+        if (store_def_count > 0) {
+            run_defs = (CBMLSPDef *)calloc((size_t)run_def_count, sizeof(*run_defs));
+            if (run_defs) {
+                if (def_count > 0 && all_defs) {
+                    memcpy(run_defs, all_defs, (size_t)def_count * sizeof(*run_defs));
+                }
+                memcpy(run_defs + def_count, store_defs,
+                       (size_t)store_def_count * sizeof(*run_defs));
+                free_run_defs = true;
+            } else {
+                run_defs = all_defs;
+                run_def_count = def_count;
+                cbm_log_info("lsp_cross.store_defs_skipped", "reason", "alloc");
+            }
+        }
+
         if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
             bool js, jsx, dts;
             cbm_pxc_ts_modes(lang, files[i].rel_path, &js, &jsx, &dts);
-            cbm_pxc_run_one_ts(cache[i], source, source_len, def_modules[i], all_defs, def_count,
-                               imp_keys, imp_vals, imp_count, js, jsx, dts);
+            cbm_pxc_run_one_ts(cache[i], source, source_len, def_modules[i], run_defs, run_def_count,
+                               imp_keys, run_imp_vals, imp_count, js, jsx, dts);
         } else {
-            cbm_pxc_run_one(lang, cache[i], source, source_len, def_modules[i], all_defs, def_count,
-                            imp_keys, imp_vals, imp_count);
+            cbm_pxc_run_one(lang, cache[i], source, source_len, def_modules[i], run_defs,
+                            run_def_count,
+                            imp_keys, run_imp_vals, imp_count);
         }
+        if (free_run_defs) {
+            free(run_defs);
+        }
+        free(store_defs);
+        cbm_arena_destroy(&store_defs_arena);
         per_lang_calls++;
         processed++;
 
