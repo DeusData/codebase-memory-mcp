@@ -59,6 +59,7 @@ enum {
     INCR_ACCURACY_NODE_TOLERANCE = 2,
     INCR_ACCURACY_EDGE_TOLERANCE = 50,
     INCR_ACCURACY_CALL_TOLERANCE = 2,
+    INCR_FULL_INDEX_MAX_RSS_DELTA_MB = 2048,
 };
 
 static const char *INCR_TEST_ARTIFACT_ENV = "CBM_TEST_ARTIFACT_DIR";
@@ -68,6 +69,15 @@ static const char *INCR_TEST_FASTAPI_URL = "https://github.com/fastapi/fastapi.g
 static const char *INCR_TEST_FASTAPI_TAG = "0.99.1";
 static const char *INCR_TEST_FASTAPI_COMMIT = "dd4e78ca7b09abdf0d4646fe4697316c021a8b2e";
 static const char *INCR_TEST_FASTAPI_DEFAULT_CACHE_NAME = "cbm-test-fastapi-0.99.1-cache";
+
+static bool incr_memory_debug_allocator_active(void) {
+    const char *scribble = getenv("MallocScribble");
+    const char *pre_scribble = getenv("MallocPreScribble");
+    const char *guard_malloc = getenv("DYLD_INSERT_LIBRARIES");
+    return (scribble && strcmp(scribble, "1") == 0) ||
+           (pre_scribble && strcmp(pre_scribble, "1") == 0) ||
+           (guard_malloc && strstr(guard_malloc, "libgmalloc") != NULL);
+}
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
 
@@ -632,9 +642,17 @@ TEST(incr_full_index) {
         printf("    [PERF WARNING] full index: %.0fms (>30s)\n", ms);
     }
 
-    /* Memory: should not exceed 2GB for a 1100-file Python project */
+    /* Memory: should not exceed 2GB for a normal 1100-file Python project.
+     * Diagnostic allocators intentionally inflate RSS, so they report instead
+     * of failing this production memory guard. */
     size_t rss_delta_mb = peak_mb - (g_rss_before_full / (1024 * 1024));
-    ASSERT_LT((int)rss_delta_mb, 2048);
+    if (incr_memory_debug_allocator_active()) {
+        printf("    [perf note] full index rss_delta=%zuMB under debug allocator "
+               "(normal limit=%dMB)\n",
+               rss_delta_mb, INCR_FULL_INDEX_MAX_RSS_DELTA_MB);
+    } else {
+        ASSERT_LT((int)rss_delta_mb, INCR_FULL_INDEX_MAX_RSS_DELTA_MB);
+    }
 
     printf("    [perf] full: %d nodes, %d edges (%d CALLS, %d IMPORTS) "
            "in %.0fms, peak=%zuMB\n",
