@@ -5190,6 +5190,93 @@ TEST(store_find_nodes_by_qns_returns_full_rows_in_input_order) {
     PASS();
 }
 
+TEST(store_list_symbol_scope_qns_by_qns_expands_exact_and_members) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cbm_store_upsert_project(s, "test", "/tmp/test") == CBM_STORE_OK);
+    ASSERT_TRUE(cbm_store_upsert_project(s, "other", "/tmp/other") == CBM_STORE_OK);
+
+    cbm_node_t cls = {.project = "test",
+                      .label = "Class",
+                      .name = "Logger",
+                      .qualified_name = "test.provider.Logger"};
+    cbm_node_t debug = {.project = "test",
+                        .label = "Method",
+                        .name = "debug",
+                        .qualified_name = "test.provider.Logger.debug"};
+    cbm_node_t log = {.project = "test",
+                      .label = "Method",
+                      .name = "log",
+                      .qualified_name = "test.provider.Logger.log"};
+    cbm_node_t sibling = {.project = "test",
+                          .label = "Method",
+                          .name = "log",
+                          .qualified_name = "test.provider.LoggerExtra.log"};
+    cbm_node_t unrelated = {.project = "test",
+                            .label = "Method",
+                            .name = "log",
+                            .qualified_name = "test.provider.OtherLogger.log"};
+    cbm_node_t other_project = {.project = "other",
+                                .label = "Method",
+                                .name = "trace",
+                                .qualified_name = "test.provider.Logger.trace"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &cls) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &debug) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &log) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &sibling) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &unrelated) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &other_project) > 0);
+
+    const char *scopes[] = {"test.provider.Logger", "missing.Q", NULL, "test.provider.Logger"};
+    char **qns = NULL;
+    int count = 0;
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(
+                  s, "test", scopes, (int)(sizeof(scopes) / sizeof(scopes[0])), CBM_SZ_16, &qns,
+                  &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(truncated);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(qns[0], "test.provider.Logger");
+    ASSERT_STR_EQ(qns[1], "test.provider.Logger.debug");
+    ASSERT_STR_EQ(qns[2], "test.provider.Logger.log");
+    for (int i = 0; i < count; i++) {
+        free(qns[i]);
+    }
+    free(qns);
+
+    qns = NULL;
+    count = 0;
+    truncated = false;
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(
+                  s, "test", scopes, (int)(sizeof(scopes) / sizeof(scopes[0])), PAIR_LEN, &qns,
+                  &count, &truncated),
+              CBM_STORE_OK);
+    ASSERT_TRUE(truncated);
+    ASSERT_EQ(count, PAIR_LEN);
+    ASSERT_STR_EQ(qns[0], "test.provider.Logger");
+    ASSERT_STR_EQ(qns[1], "test.provider.Logger.debug");
+    for (int i = 0; i < count; i++) {
+        free(qns[i]);
+    }
+    free(qns);
+
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(
+                  s, "test", scopes, (int)(sizeof(scopes) / sizeof(scopes[0])), 0, &qns, &count,
+                  NULL),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(s, "test", NULL, 1, CBM_SZ_16, &qns,
+                                                     &count, NULL),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(s, "test", NULL, 0, CBM_SZ_16, &qns,
+                                                     &count, NULL),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Integrity check tests ──────────────────────────────────────── */
 
 TEST(store_integrity_clean) {
@@ -5927,6 +6014,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_pragma_settings);
     RUN_TEST(store_find_node_ids_by_qns);
     RUN_TEST(store_find_nodes_by_qns_returns_full_rows_in_input_order);
+    RUN_TEST(store_list_symbol_scope_qns_by_qns_expands_exact_and_members);
     RUN_TEST(store_node_null_project);
     RUN_TEST(store_node_null_qn);
     RUN_TEST(store_node_empty_strings);

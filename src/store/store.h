@@ -532,6 +532,15 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
 int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char **qns,
                                 int qn_count, cbm_node_t **out, int *count);
 
+/* Candidate scope expansion for bounded resolver context.
+ * Returns exact QNs plus member QNs below each input QN ("Type.member"),
+ * preserving first input order and skipping duplicates/missing/null inputs.
+ * max_qns must be positive; out_truncated is optional. Caller frees each
+ * returned string and the array. */
+int cbm_store_list_symbol_scope_qns_by_qns(cbm_store_t *s, const char *project,
+                                           const char **qns, int qn_count, int max_qns,
+                                           char ***out, int *count, bool *out_truncated);
+
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
 int cbm_store_count_nodes(cbm_store_t *s, const char *project);
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
