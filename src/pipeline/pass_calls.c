@@ -77,33 +77,35 @@ static const char *itoa_log(int val) {
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
-                                      const cbm_gbuf_node_t *source_node, const char *module_qn,
+                                      const cbm_gbuf_node_t *source_node, const char *route_path,
+                                      const char *handler_ref, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
     /* Reject CLI slash-command args (e.g. "/ar:allow") that start with '/' and
      * so pass the caller's first_string_arg[0]=='/' check, but aren't valid
      * route paths. Same gate as pass_route_nodes.c — keeps command-syntax
      * strings from becoming spurious Route nodes. */
-    if (!cbm_service_pattern_is_http_route_literal(call->first_string_arg, call->callee_name)) {
+    if (!cbm_service_pattern_is_http_route_literal(route_path, call->callee_name)) {
         return;
     }
     int64_t route_id = cbm_pipeline_upsert_service_route(
-        ctx->gbuf, call->first_string_arg, CBM_SVC_HTTP, method, NULL, NULL, NULL);
+        ctx->gbuf, route_path, CBM_SVC_HTTP, method, NULL, NULL, NULL);
     if (route_id == 0) {
         return;
     }
     char esc_cn[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
     char esc_fa[CBM_SZ_256];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
-    cbm_json_escape(esc_fa, sizeof(esc_fa), call->first_string_arg);
+    cbm_json_escape(esc_fa, sizeof(esc_fa), route_path);
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
              esc_fa);
     cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, route_id, "CALLS", props);
-    if (call->second_arg_name != NULL && call->second_arg_name[0] != '\0') {
-        cbm_resolution_t hres = cbm_registry_resolve(ctx->registry, call->second_arg_name,
-                                                     module_qn, imp_keys, imp_vals, imp_count);
+    if (handler_ref != NULL && handler_ref[0] != '\0') {
+        cbm_resolution_t hres =
+            cbm_registry_resolve(ctx->registry, handler_ref, module_qn, imp_keys, imp_vals,
+                                 imp_count);
         if (hres.qualified_name != NULL && hres.qualified_name[0] != '\0') {
             const cbm_gbuf_node_t *handler = cbm_gbuf_find_by_qn(ctx->gbuf, hres.qualified_name);
             if (handler == NULL) {
@@ -199,9 +201,14 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_resolution_t *res, const char *module_qn,
                                  const char **imp_keys, const char **imp_vals, int imp_count) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
-    if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
-        return false;
+    if (svc == CBM_SVC_ROUTE_REG) {
+        const char *handler_ref = NULL;
+        const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
+        if (route_path) {
+            handle_route_registration(ctx, call, source, route_path, handler_ref, module_qn,
+                                      imp_keys, imp_vals, imp_count);
+            return false;
+        }
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
         emit_http_async_edge(ctx, call, source, target, res, svc);
@@ -296,6 +303,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                      imp_keys, imp_vals, imp_count)) {
                 cbm_pipeline_detect_url_arg_routes(ctx->gbuf, source_node, call, rel, lang);
             }
+            return SKIP_ONE;
+        }
+    }
+
+    if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        const char *handler_ref = NULL;
+        const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
+        if (route_path) {
+            handle_route_registration(ctx, call, source_node, route_path, handler_ref, module_qn,
+                                      imp_keys, imp_vals, imp_count);
             return SKIP_ONE;
         }
     }

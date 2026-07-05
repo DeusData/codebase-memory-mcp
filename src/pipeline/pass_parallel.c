@@ -983,57 +983,6 @@ typedef struct {
     _Atomic uint64_t time_ns_rc_source;     /* find_source_node */
 } resolve_ctx_t;
 
-/* Scan call args for a URL-like route path and handler reference. */
-static bool is_path_keyword(const char *keyword) {
-    static const char *path_keywords[] = {"prefix",     "path",     "route", "pattern",
-                                          "url",        "endpoint", "rule",  "mount_path",
-                                          "route_path", "url_path", NULL};
-    for (const char **kw = path_keywords; *kw; kw++) {
-        if (strcmp(keyword, *kw) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
-    *out_handler = NULL;
-    /* 1. First string arg starting with / */
-    if (call->first_string_arg && call->first_string_arg[0] == '/') {
-        *out_handler = call->second_arg_name;
-        return call->first_string_arg;
-    }
-    /* 2. Keyword args (prefix=, path=, route=, etc.) */
-    const char *found = NULL;
-    for (int ai = 0; ai < call->arg_count && !found; ai++) {
-        const CBMCallArg *ca = &call->args[ai];
-        const char *val = ca->value ? ca->value : ca->expr;
-        if (!val || val[0] != '/') {
-            continue;
-        }
-        if ((ca->keyword && is_path_keyword(ca->keyword)) || (!ca->keyword && ca->index == 0)) {
-            found = val;
-        }
-    }
-    if (!found) {
-        return NULL;
-    }
-    /* 3. Handler: first identifier arg that's not a path/keyword */
-    for (int ai = 0; ai < call->arg_count; ai++) {
-        const CBMCallArg *ca = &call->args[ai];
-        if (!ca->expr || ca->expr[0] == '/' || ca->expr[0] == '"' || ca->expr[0] == '\'') {
-            continue;
-        }
-        if (ca->keyword && (strcmp(ca->keyword, "prefix") == 0 ||
-                            strcmp(ca->keyword, "name") == 0 || strcmp(ca->keyword, "tags") == 0)) {
-            continue;
-        }
-        *out_handler = ca->expr;
-        break;
-    }
-    return found;
-}
-
 /* Build props JSON, append args, close brace, emit edge. */
 static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
                               const char *edge_type, char *props, int n, const CBMCall *call) {
@@ -1355,7 +1304,7 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
-        const char *route_path = find_route_path_in_args(call, &handler_ref);
+        const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
         if (route_path) {
             emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
                                     registry, main_gbuf, imp_keys, imp_vals, imp_count);

@@ -495,6 +495,8 @@ static const method_suffix_t route_reg_suffixes[] = {
     /* Framework-specific route registration */
     {".Route", "ANY"},
     {".route", "ANY"},
+    {".websocket_route", "ANY"},
+    {".websocket", "ANY"},
     {"::get", "GET"},
     {"::post", "POST"},
     {"::put", "PUT"},

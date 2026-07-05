@@ -59,6 +59,74 @@ void cbm_pipeline_detect_url_arg_routes(cbm_gbuf_t *gb, const cbm_gbuf_node_t *s
                                         const CBMCall *call, const char *rel_path,
                                         CBMLanguage lang);
 
+static inline bool cbm_pipeline_call_arg_is_route_path_keyword(const char *keyword) {
+    static const char *const path_keywords[] = {"prefix",     "path",      "route",
+                                                "pattern",    "url",       "endpoint",
+                                                "rule",       "mount_path", "route_path",
+                                                "url_path",   "uri",       NULL};
+    if (!keyword) {
+        return false;
+    }
+    for (const char *const *kw = path_keywords; *kw; kw++) {
+        if (strcmp(keyword, *kw) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Locate the path literal and optional handler reference for route registration
+ * APIs. Shared by sequential and parallel call passes to keep FastAPI/Starlette,
+ * Express-style, and keyword-argument registrations on the same semantics. */
+static inline const char *cbm_pipeline_call_route_path_and_handler(const CBMCall *call,
+                                                                  const char **out_handler) {
+    if (out_handler) {
+        *out_handler = NULL;
+    }
+    if (!call) {
+        return NULL;
+    }
+    if (call->first_string_arg && call->first_string_arg[0] == '/') {
+        if (out_handler) {
+            *out_handler = call->second_arg_name;
+        }
+        return call->first_string_arg;
+    }
+
+    const char *found = NULL;
+    for (int ai = 0; ai < call->arg_count && !found; ai++) {
+        const CBMCallArg *ca = &call->args[ai];
+        const char *val = ca->value ? ca->value : ca->expr;
+        if (!val || val[0] != '/') {
+            continue;
+        }
+        if ((ca->keyword && cbm_pipeline_call_arg_is_route_path_keyword(ca->keyword)) ||
+            (!ca->keyword && ca->index == 0)) {
+            found = val;
+        }
+    }
+    if (!found) {
+        return NULL;
+    }
+
+    if (out_handler) {
+        for (int ai = 0; ai < call->arg_count; ai++) {
+            const CBMCallArg *ca = &call->args[ai];
+            if (!ca->expr || ca->expr[0] == '/' || ca->expr[0] == '"' || ca->expr[0] == '\'') {
+                continue;
+            }
+            if (ca->keyword &&
+                (strcmp(ca->keyword, "prefix") == 0 || strcmp(ca->keyword, "name") == 0 ||
+                 strcmp(ca->keyword, "tags") == 0)) {
+                continue;
+            }
+            *out_handler = ca->expr;
+            break;
+        }
+    }
+    return found;
+}
+
 static inline bool cbm_pipeline_label_is_registry_symbol(const char *label) {
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
                      cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
