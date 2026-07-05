@@ -50,6 +50,12 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
                                     int file_count, const char *project_name, char **def_modules,
                                     int *out_count);
 
+/* Build one cross-LSP def row from a persisted graph node. String fields in
+ * out borrow from arena. Returns 0 when the node maps to an LSP def label,
+ * -1 when the node is invalid or not a supported symbol label. */
+int cbm_pxc_build_lsp_def_from_node(CBMArena *arena, const cbm_node_t *node, CBMLanguage lang,
+                                    CBMLSPDef *out);
+
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
                       bool *out_dts);
