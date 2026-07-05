@@ -15,12 +15,10 @@
  * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
  * TSX, PHP, C#. Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
- * Previously this work ran as a separate sequential pipeline pass
- * (cbm_pipeline_pass_lsp_cross) that re-read every source file from
- * disk and re-parsed each tree-sitter tree on a single thread — a 50×
- * regression vs the parallel extract pass on large repos. The pass was
- * deleted; the resolve worker now invokes these helpers directly using
- * the source bytes retained in result->arena during extract.
+ * Full-repo FAST mode runs this work inside the parallel resolve worker
+ * using source bytes retained in result->arena during extract. The
+ * sequential pass remains available for small or scoped pipelines, but
+ * its precision depends on the caller-provided cache/def universe.
  */
 #ifndef CBM_PIPELINE_PASS_LSP_CROSS_H
 #define CBM_PIPELINE_PASS_LSP_CROSS_H

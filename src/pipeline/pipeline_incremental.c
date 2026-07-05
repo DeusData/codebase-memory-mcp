@@ -974,9 +974,11 @@ static void incr_free_result_cache(CBMFileResult **cache, int count) {
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
     struct timespec t;
 
-    /* Per-file LSP always runs (every mode). Cross-file LSP stays disabled in
-     * incremental regardless (cbm_parallel_resolve is called with NULL
-     * cross_registries below). */
+    /* Per-file LSP always runs. Sequential scoped increments run the reusable
+     * cross-LSP pass over the changed-file cache only; this is not equivalent
+     * to full-repo FAST for languages whose receiver/type resolution needs
+     * project-wide defs. Parallel scoped increments pass NULL cross registries
+     * below, so their fused cross-LSP step is a no-op. */
 
 #define MIN_FILES_FOR_PARALLEL_INCR 50
     int worker_count = cbm_default_worker_count(true);
