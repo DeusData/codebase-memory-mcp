@@ -1112,6 +1112,13 @@ TEST(incr_db_deleted_recovery) {
 }
 
 TEST(incr_accuracy_vs_full) {
+    /* This test is the strict canonical full-vs-incremental oracle. The
+     * production default may intentionally defer global semantic-derived edges,
+     * so opt into eager refresh here instead of weakening the graph comparison. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
+
     /* Modify a file to create a known incremental state */
     write_file_at("fastapi/incr_accuracy.py", "def accuracy_a():\n    return 1\n"
                                               "def accuracy_b():\n    return accuracy_a() + 1\n");
@@ -1181,6 +1188,9 @@ TEST(incr_accuracy_vs_full) {
 
     delete_file_at("fastapi/incr_accuracy.py");
     cbm_unlink(incr_snapshot_path);
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT),
+              0);
     ASSERT_EQ(graph_diff_rc, 0);
     PASS();
 }
