@@ -72,6 +72,7 @@ enum {
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/profile.h"
 #include "foundation/compat_regex.h"
@@ -4977,6 +4978,23 @@ static int store_publish_file_delta_context_nodes_body(cbm_store_t *s,
     return CBM_STORE_OK;
 }
 
+static void *store_endpoint_index_to_ptr(int index) {
+    return (void *)(uintptr_t)(index + 1);
+}
+
+static int store_endpoint_index_from_ptr(void *ptr) {
+    return (int)((uintptr_t)ptr - 1u);
+}
+
+static void store_endpoint_lookup_free(const char **unique_qns, int64_t *unique_ids,
+                                       int *endpoint_unique_indexes,
+                                       CBMHashTable *endpoint_map) {
+    free(unique_qns);
+    free(unique_ids);
+    free(endpoint_unique_indexes);
+    cbm_ht_free(endpoint_map);
+}
+
 static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_t *delta,
                                      const cbm_store_delta_edge_t *edges, int edge_count,
                                      bool own_edges) {
@@ -4991,32 +5009,62 @@ static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_
         endpoint_count > SIZE_MAX / sizeof(int64_t)) {
         return CBM_STORE_ERR;
     }
-    const char **endpoint_qns = malloc(endpoint_count * sizeof(*endpoint_qns));
-    int64_t *endpoint_ids = malloc(endpoint_count * sizeof(*endpoint_ids));
-    if (!endpoint_qns || !endpoint_ids) {
-        free(endpoint_qns);
-        free(endpoint_ids);
+    const char **unique_qns = malloc(endpoint_count * sizeof(*unique_qns));
+    int64_t *unique_ids = malloc(endpoint_count * sizeof(*unique_ids));
+    int *endpoint_unique_indexes = malloc(endpoint_count * sizeof(*endpoint_unique_indexes));
+    CBMHashTable *endpoint_map = cbm_ht_create((uint32_t)endpoint_count);
+    if (!unique_qns || !unique_ids || !endpoint_unique_indexes || !endpoint_map) {
+        store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes, endpoint_map);
         return CBM_STORE_ERR;
     }
 
+    CBM_PROF_START(t_dedupe);
+    int unique_count = 0;
     for (int i = 0; i < edge_count; i++) {
-        endpoint_qns[(size_t)i * PAIR_LEN] = edges[i].source_qn;
-        endpoint_qns[(size_t)i * PAIR_LEN + SKIP_ONE] = edges[i].target_qn;
+        const char *edge_qns[PAIR_LEN] = {edges[i].source_qn, edges[i].target_qn};
+        for (int j = 0; j < PAIR_LEN; j++) {
+            const char *qn = edge_qns[j];
+            if (!qn) {
+                store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
+                                           endpoint_map);
+                return CBM_STORE_NOT_FOUND;
+            }
+            void *existing = cbm_ht_get(endpoint_map, qn);
+            size_t endpoint_pos = (size_t)i * PAIR_LEN + (size_t)j;
+            if (existing) {
+                endpoint_unique_indexes[endpoint_pos] = store_endpoint_index_from_ptr(existing);
+                continue;
+            }
+            unique_qns[unique_count] = qn;
+            endpoint_unique_indexes[endpoint_pos] = unique_count;
+            cbm_ht_set(endpoint_map, qn, store_endpoint_index_to_ptr(unique_count));
+            if (!cbm_ht_has(endpoint_map, qn)) {
+                store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
+                                           endpoint_map);
+                return CBM_STORE_ERR;
+            }
+            unique_count++;
+        }
     }
-    int found = cbm_store_find_node_ids_by_qns(s, delta->project, endpoint_qns, (int)endpoint_count,
-                                               endpoint_ids);
-    if (found < (int)endpoint_count) {
-        free(endpoint_qns);
-        free(endpoint_ids);
+    CBM_PROF_END_N("store_delta_edges", "1_dedupe_endpoints", t_dedupe, edge_count);
+    CBM_PROF_START(t_lookup);
+    int found = cbm_store_find_node_ids_by_qns(s, delta->project, unique_qns, unique_count,
+                                               unique_ids);
+    CBM_PROF_END_N("store_delta_edges", "2_lookup_endpoints", t_lookup, unique_count);
+    if (found < unique_count) {
+        store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes, endpoint_map);
         return found < 0 ? CBM_STORE_ERR : CBM_STORE_NOT_FOUND;
     }
 
+    CBM_PROF_START(t_insert);
     for (int i = 0; i < edge_count; i++) {
-        int64_t source_id = endpoint_ids[(size_t)i * PAIR_LEN];
-        int64_t target_id = endpoint_ids[(size_t)i * PAIR_LEN + SKIP_ONE];
+        int source_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN];
+        int target_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN + SKIP_ONE];
+        int64_t source_id = unique_ids[source_index];
+        int64_t target_id = unique_ids[target_index];
         if (source_id <= CBM_STORE_NO_NODE_ID || target_id <= CBM_STORE_NO_NODE_ID) {
-            free(endpoint_qns);
-            free(endpoint_ids);
+            store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
+                                       endpoint_map);
             return CBM_STORE_NOT_FOUND;
         }
         cbm_edge_t edge = {.project = delta->project,
@@ -5026,22 +5074,22 @@ static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_
                            .properties_json = edges[i].properties_json};
         int64_t edge_id = cbm_store_insert_edge(s, &edge);
         if (edge_id <= CBM_STORE_NO_NODE_ID) {
-            free(endpoint_qns);
-            free(endpoint_ids);
+            store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
+                                       endpoint_map);
             return CBM_STORE_ERR;
         }
         if (own_edges) {
             rc = cbm_store_upsert_edge_owner(s, delta->project, edge_id, delta->rel_path,
                                              edges[i].derived_kind, delta->generation);
             if (rc != CBM_STORE_OK) {
-                free(endpoint_qns);
-                free(endpoint_ids);
+                store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
+                                           endpoint_map);
                 return rc;
             }
         }
     }
-    free(endpoint_qns);
-    free(endpoint_ids);
+    CBM_PROF_END_N("store_delta_edges", "3_insert_edges", t_insert, edge_count);
+    store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes, endpoint_map);
     return CBM_STORE_OK;
 }
 

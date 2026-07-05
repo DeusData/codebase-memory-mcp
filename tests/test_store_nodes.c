@@ -3603,6 +3603,117 @@ TEST(store_file_delta_publish_rolls_back_on_failure) {
     PASS();
 }
 
+TEST(store_file_delta_publish_repeated_edge_endpoints) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    enum {
+        REPEATED_ENDPOINT_NODE_COUNT = 3,
+        REPEATED_ENDPOINT_EDGE_COUNT = 5,
+    };
+    cbm_node_t nodes[REPEATED_ENDPOINT_NODE_COUNT] = {
+        {.project = "test",
+         .label = "Function",
+         .name = "A",
+         .qualified_name = "test.main.A",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "B",
+         .qualified_name = "test.main.B",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+        {.project = "test",
+         .label = "Function",
+         .name = "C",
+         .qualified_name = "test.main.C",
+         .file_path = "main.go",
+         .properties_json = "{}"},
+    };
+    cbm_store_delta_edge_t edges[REPEATED_ENDPOINT_EDGE_COUNT] = {
+        {.source_qn = "test.main.A", .target_qn = "test.main.B", .type = "CALLS", .properties_json = "{}"},
+        {.source_qn = "test.main.A", .target_qn = "test.main.C", .type = "CALLS", .properties_json = "{}"},
+        {.source_qn = "test.main.B", .target_qn = "test.main.A", .type = "CALLS", .properties_json = "{}"},
+        {.source_qn = "test.main.C", .target_qn = "test.main.A", .type = "CALLS", .properties_json = "{}"},
+        {.source_qn = "test.main.A", .target_qn = "test.main.A", .type = "SELF", .properties_json = "{}"},
+    };
+    cbm_file_hash_t hash = {
+        .project = "test", .rel_path = "main.go", .sha256 = "old-hash", .mtime_ns = 1, .size = 10};
+    cbm_file_state_t state = {.project = "test",
+                              .rel_path = "main.go",
+                              .content_hash = "old-content",
+                              .git_oid = "old-oid",
+                              .mtime_ns = 1,
+                              .size = 10,
+                              .language = "c",
+                              .pass_fingerprint = "pass-a",
+                              .generation = 1,
+                              .indexed_at = "2026-06-30T00:00:00Z"};
+    cbm_store_file_delta_t delta = {.project = "test",
+                                    .rel_path = "main.go",
+                                    .generation = 1,
+                                    .file_hash = &hash,
+                                    .file_state = &state,
+                                    .nodes = nodes,
+                                    .node_count = REPEATED_ENDPOINT_NODE_COUNT,
+                                    .edges = edges,
+                                    .edge_count = REPEATED_ENDPOINT_EDGE_COUNT,
+                                    .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                    .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), REPEATED_ENDPOINT_NODE_COUNT);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), REPEATED_ENDPOINT_EDGE_COUNT);
+    ASSERT_EQ(store_count_metadata_owners(s, 0, "test", "main.go"),
+              REPEATED_ENDPOINT_NODE_COUNT);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "main.go"),
+              REPEATED_ENDPOINT_EDGE_COUNT);
+
+    cbm_node_t bad_nodes[1] = {{.project = "test",
+                                .label = "Function",
+                                .name = "New",
+                                .qualified_name = "test.main.New",
+                                .file_path = "main.go",
+                                .properties_json = "{}"}};
+    cbm_store_delta_edge_t bad_edges[1] = {{.source_qn = "test.main.New",
+                                            .target_qn = "test.main.Missing",
+                                            .type = "CALLS",
+                                            .properties_json = "{}"}};
+    cbm_file_hash_t bad_hash = {
+        .project = "test", .rel_path = "main.go", .sha256 = "bad-hash", .mtime_ns = 2, .size = 20};
+    cbm_file_state_t bad_state = {.project = "test",
+                                  .rel_path = "main.go",
+                                  .content_hash = "bad-content",
+                                  .git_oid = "bad-oid",
+                                  .mtime_ns = 2,
+                                  .size = 20,
+                                  .language = "c",
+                                  .pass_fingerprint = "pass-b",
+                                  .generation = 2,
+                                  .indexed_at = "2026-06-30T00:01:00Z"};
+    cbm_store_file_delta_t bad_delta = {.project = "test",
+                                        .rel_path = "main.go",
+                                        .generation = 2,
+                                        .file_hash = &bad_hash,
+                                        .file_state = &bad_state,
+                                        .nodes = bad_nodes,
+                                        .node_count = 1,
+                                        .edges = bad_edges,
+                                        .edge_count = 1,
+                                        .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                        .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &bad_delta), CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.A"), 1);
+    ASSERT_EQ(store_node_qn_exists(s, "test", "test.main.New"), 0);
+    ASSERT_EQ(cbm_store_count_edges(s, "test"), REPEATED_ENDPOINT_EDGE_COUNT);
+    ASSERT_EQ(store_count_metadata_owners(s, 1, "test", "main.go"),
+              REPEATED_ENDPOINT_EDGE_COUNT);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 static int store_publish_helper_file_delta_named(cbm_store_t *s, int64_t generation,
                                                 const char *name, const char *qualified_name,
                                                 const char *sha256, const char *content_hash) {
@@ -5988,6 +6099,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_file_delta_affected_paths_from_exports_and_imports);
     RUN_TEST(store_file_delta_affected_paths_high_fanout_dedupes);
     RUN_TEST(store_file_delta_publish_rolls_back_on_failure);
+    RUN_TEST(store_file_delta_publish_repeated_edge_endpoints);
     RUN_TEST(store_file_delta_publish_matches_fresh_final_graph);
     RUN_TEST(store_file_delta_graph_noop_refreshes_metadata_only);
     RUN_TEST(store_file_delta_preserves_owned_graph_detects_additive_subset);
