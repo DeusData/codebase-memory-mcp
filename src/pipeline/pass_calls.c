@@ -298,6 +298,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     /* LSP-resolved calls take precedence over registry-textual matching. */
     const CBMResolvedCall *lsp =
         cbm_lsp_resolution_index_find(lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor);
+    bool lsp_target_unindexed = false;
     if (lsp) {
         const cbm_gbuf_node_t *target_node = calls_lsp_target_node(ctx, lsp->callee_qn);
         if (target_node && source_node->id != target_node->id) {
@@ -314,6 +315,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             }
             return SKIP_ONE;
         }
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
+            const char *handler_ref = NULL;
+            const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
+            if (route_path) {
+                handle_route_registration(ctx, call, source_node, route_path, handler_ref,
+                                          module_qn, imp_keys, imp_vals, imp_count);
+                return SKIP_ONE;
+            }
+        }
+        lsp_target_unindexed = true;
     }
 
     if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
@@ -333,6 +344,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     }
     cbm_pipeline_try_field_type_hint(ctx->registry, ctx->gbuf, &res, call->callee_name,
                                      source_node->id);
+
+    if (lsp_target_unindexed && cbm_registry_strategy_is_weak_short_name(res.strategy) &&
+        !cbm_registry_is_import_reachable(res.qualified_name, imp_vals, imp_count)) {
+        return 0;
+    }
 
     /* Perl call-graph noise guard (#476). Perl has no LSP resolver, so the
      * generic registry chain is the only resolver; for builtins (push/shift/

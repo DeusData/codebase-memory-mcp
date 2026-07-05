@@ -393,11 +393,21 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     if (!strategy || !strategy[0]) {
         return false;
     }
-    if (strcmp(strategy, "same_module") == 0 || strcmp(strategy, "import_map") == 0 ||
-        strcmp(strategy, "import_map_suffix") == 0) {
+    if (!cbm_registry_strategy_is_weak_short_name(strategy)) {
         return false; /* high-confidence import/same-module match — keep the genuine edge */
     }
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
+}
+
+bool cbm_registry_strategy_is_weak_short_name(const char *strategy) {
+    if (!strategy || !strategy[0]) {
+        return false;
+    }
+    if (strcmp(strategy, "same_module") == 0 || strcmp(strategy, "import_map") == 0 ||
+        strcmp(strategy, "import_map_suffix") == 0) {
+        return false;
+    }
+    return true;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
