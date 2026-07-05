@@ -2540,6 +2540,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
     const char *exact_reason = cbm_pipeline_publish_reason(p);
     if (strcmp(exact_reason ? exact_reason : "",
+               CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL) == 0) {
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.fallback", "reason",
+                     CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
+        return CBM_NOT_FOUND;
+    }
+    if (strcmp(exact_reason ? exact_reason : "",
                CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE) == 0 &&
         incr_changed_contains_c_family_header(changed_files, ci)) {
         incr_classification_free(&cls);
