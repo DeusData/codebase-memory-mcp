@@ -478,6 +478,68 @@ TEST(parallel_unresolved_route_suffix_does_not_emit_self_call) {
     PASS();
 }
 
+typedef struct {
+    const char *url_path;
+    int route_registration_calls;
+} route_registration_count_ctx_t;
+
+static void count_route_registration_edges(const cbm_gbuf_edge_t *edge, void *ud) {
+    route_registration_count_ctx_t *c = ud;
+    if (!edge || !edge->type || strcmp(edge->type, "CALLS") != 0 || !edge->properties_json) {
+        return;
+    }
+    if (strstr(edge->properties_json, "\"via\":\"route_registration\"") &&
+        strstr(edge->properties_json, c->url_path)) {
+        c->route_registration_calls++;
+    }
+}
+
+static int count_route_registration_for_path(cbm_gbuf_t *gbuf, const char *url_path) {
+    route_registration_count_ctx_t c = {.url_path = url_path, .route_registration_calls = 0};
+    cbm_gbuf_foreach_edge(gbuf, count_route_registration_edges, &c);
+    return c.route_registration_calls;
+}
+
+TEST(parallel_fastapi_websocket_route_registration_matches_sequential) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_ws_routes_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    const char *source =
+        "from fastapi import APIRouter, WebSocket\n\n"
+        "router = APIRouter()\n\n"
+        "@router.websocket('/custom_error/')\n"
+        "async def router_ws_custom_error(websocket: WebSocket):\n"
+        "    raise RuntimeError('boom')\n\n"
+        "@router.websocket_route('/router')\n"
+        "async def routerindex(websocket: WebSocket):\n"
+        "    await websocket.accept()\n";
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/app.py", dir);
+    ASSERT_EQ(th_write_file(path, source), 0);
+
+    cbm_file_info_t files[1] = {0};
+    files[0].path = path;
+    files[0].rel_path = (char *)"app.py";
+    files[0].language = CBM_LANG_PYTHON;
+
+    cbm_gbuf_t *seq = run_sequential("cbm_ws_routes", dir, files, 1);
+    cbm_gbuf_t *par = run_parallel("cbm_ws_routes", dir, files, 1, 1);
+    ASSERT_NOT_NULL(seq);
+    ASSERT_NOT_NULL(par);
+
+    ASSERT_EQ(count_route_registration_for_path(seq, "/custom_error/"), 1);
+    ASSERT_EQ(count_route_registration_for_path(seq, "/router"), 1);
+    ASSERT_EQ(count_route_registration_for_path(par, "/custom_error/"), 1);
+    ASSERT_EQ(count_route_registration_for_path(par, "/router"), 1);
+
+    cbm_gbuf_free(seq);
+    cbm_gbuf_free(par);
+    th_rmtree(dir);
+    PASS();
+}
+
 /* ── Production pipeline worker-count parity ─────────────────────── */
 
 enum {
@@ -1194,6 +1256,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_empty_files);
     RUN_TEST(parallel_args_json_no_overflow);
     RUN_TEST(parallel_unresolved_route_suffix_does_not_emit_self_call);
+    RUN_TEST(parallel_fastapi_websocket_route_registration_matches_sequential);
 
     /* Cleanup shared state */
     parity_teardown();
