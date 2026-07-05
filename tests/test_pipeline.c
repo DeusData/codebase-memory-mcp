@@ -12305,6 +12305,122 @@ TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
     PASS();
 }
 
+TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs) {
+    enum { PIPELINE_STORE_BACKED_LSP_SCOPE_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('new')\n"),
+              0);
+
+    const char *changed_paths[] = {"service.py"};
+    cbm_file_info_t all_files[] = {
+        {.path = provider_path, .rel_path = "provider.py", .language = CBM_LANG_PYTHON},
+        {.path = service_path, .rel_path = "service.py", .language = CBM_LANG_PYTHON},
+    };
+    cbm_file_info_t changed_file = {
+        .path = service_path,
+        .rel_path = "service.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    CBMFileResult *result_cache[CBM_ALLOC_ONE] = {NULL};
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, g_incr_tmpdir);
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  store, scratch, registry, project, changed_paths, CBM_ALLOC_ONE),
+              CBM_STORE_OK);
+    const char *structure_root_qn = pipeline_exact_scratch_structure_root_qn(scratch, project);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
+                                                 changed_file.rel_path, NULL),
+              0);
+
+    const double pipeline_default_threshold = 0.0;
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = g_incr_tmpdir,
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .similarity_threshold = pipeline_default_threshold,
+                              .httplink_min_confidence = pipeline_default_threshold,
+                              .semantic_threshold = pipeline_default_threshold,
+                              .githistory_min_coupling = pipeline_default_threshold,
+                              .lsp_confidence_floor = pipeline_default_threshold,
+                              .result_cache = result_cache,
+                              .store_backed_node_lookup = store,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = CBM_ALLOC_ONE,
+                              .store_backed_all_files = all_files,
+                              .store_backed_all_file_count =
+                                  (int)(sizeof(all_files) / sizeof(all_files[0])),
+                              .store_backed_lsp_scope_cap =
+                                  PIPELINE_STORE_BACKED_LSP_SCOPE_CAP};
+
+    ASSERT_EQ(cbm_pipeline_pass_definitions(&ctx, &changed_file, CBM_ALLOC_ONE), 0);
+    ASSERT_NOT_NULL(result_cache[0]);
+    ASSERT_EQ(cbm_pipeline_pass_lsp_cross(&ctx, &changed_file, CBM_ALLOC_ONE, result_cache), 0);
+    ASSERT_TRUE(pipeline_resolved_call_contains(&result_cache[0]->resolved_calls, "Service.run",
+                                                "provider.Logger.log"));
+    ASSERT_FALSE(pipeline_resolved_call_contains(&result_cache[0]->resolved_calls, "Service.run",
+                                                 "provider.OtherLogger.log"));
+
+    cbm_free_result(result_cache[0]);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(store);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -15004,6 +15120,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex);
     RUN_TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
+    RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
     RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
     RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
     RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);

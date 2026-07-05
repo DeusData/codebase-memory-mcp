@@ -538,7 +538,7 @@ int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char 
  * max_qns must be positive; out_truncated is optional. Caller frees each
  * returned string and the array. */
 int cbm_store_list_symbol_scope_qns_by_qns(cbm_store_t *s, const char *project,
-                                           const char **qns, int qn_count, int max_qns,
+                                           const char *const *qns, int qn_count, int max_qns,
                                            char ***out, int *count, bool *out_truncated);
 
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */

@@ -2083,7 +2083,7 @@ int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char 
 }
 
 int cbm_store_list_symbol_scope_qns_by_qns(cbm_store_t *s, const char *project,
-                                           const char **qns, int qn_count, int max_qns,
+                                           const char *const *qns, int qn_count, int max_qns,
                                            char ***out, int *count, bool *out_truncated) {
     if (!out || !count) {
         return CBM_STORE_ERR;
