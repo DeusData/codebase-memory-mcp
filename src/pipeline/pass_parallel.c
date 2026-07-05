@@ -1465,6 +1465,33 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
     cbm_lsp_resolution_index_free(&lsp_idx);
 }
 
+static bool result_lsp_covers_all_calls(const CBMFileResult *result, double confidence_floor) {
+    if (!result || result->calls.count <= 0) {
+        return true;
+    }
+    if (result->resolved_calls.count <= 0) {
+        return false;
+    }
+
+    cbm_lsp_resolution_index_t lsp_idx;
+    cbm_lsp_resolution_index_build(&lsp_idx, &result->resolved_calls, result->calls.count,
+                                   confidence_floor);
+    bool all_covered = true;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->callee_name) {
+            continue;
+        }
+        if (!cbm_lsp_resolution_index_find(&lsp_idx, &result->resolved_calls, call,
+                                           confidence_floor)) {
+            all_covered = false;
+            break;
+        }
+    }
+    cbm_lsp_resolution_index_free(&lsp_idx);
+    return all_covered;
+}
+
 /* Resolve usages for one file. */
 static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                 CBMFileResult *result, const char *rel, const char *module_qn,
@@ -1730,18 +1757,16 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         }
 
         /* Cross-file LSP is a per-file tree-sitter re-parse + AST walk +
-         * registry lookups — ~50-150ms per file. It can ONLY find calls
-         * that exist in the AST. If the per-file extract found zero calls,
-         * cross-LSP will too: the AST is the same. And if every call is
-         * already resolved (resolved_calls.count >= calls.count), there's
-         * nothing left for cross-LSP to improve. Skip in both cases —
-         * pure perf win, zero semantic loss. This is the smart-pruning
-         * pre-condition that brings down kubernetes resolve time
-         * dramatically (most files have no cross-file calls left to
-         * resolve once per-file LSP has run). */
+         * registry lookups — ~50-150ms per file. It can only find calls that
+         * exist in the AST, so files with zero calls are skipped. For non-empty
+         * files, prune only when every textual call has a matching resolved
+         * LSP row. A raw count check is insufficient: one unrelated resolved row
+         * can make resolved_calls.count >= calls.count while a receiver call
+         * such as self.add_api_route still needs cross-LSP refinement. */
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
-             result->calls.count > 0 && result->resolved_calls.count < result->calls.count &&
+             result->calls.count > 0 &&
+             !result_lsp_covers_all_calls(result, rc->lsp_confidence_floor) &&
              !is_generated);
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
