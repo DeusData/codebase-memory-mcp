@@ -438,7 +438,8 @@ static inline bool cbm_pipeline_mode_extracts_macro_nodes(int mode) {
 }
 
 static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store,
-                                                              const char *project, int mode) {
+                                                              const char *project, int mode,
+                                                              bool semantic_edges_refreshed) {
     static const char *const complete_graph_views[] = {
         CBM_STORE_DERIVED_VIEW_ROUTES,
         CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
@@ -459,7 +460,7 @@ static inline int cbm_pipeline_mark_replacement_derived_views(cbm_store_t *store
     if (rc != CBM_STORE_OK) {
         return rc;
     }
-    if (cbm_pipeline_mode_builds_global_semantic_edges(mode)) {
+    if (cbm_pipeline_mode_builds_global_semantic_edges(mode) && semantic_edges_refreshed) {
         return cbm_store_mark_derived_views_complete(
             store, project, CBM_PIPELINE_COMPAT_GENERATION, semantic_views,
             (int)(sizeof(semantic_views) / sizeof(semantic_views[0])));
@@ -1151,6 +1152,7 @@ void cbm_pipeline_set_publish_kind(cbm_pipeline_t *p, cbm_pipeline_publish_kind_
 void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason);
 bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p);
 bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_t *p);
+bool cbm_pipeline_incremental_derived_refresh_stale_on_incremental(const cbm_pipeline_t *p);
 void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
                                         int affected_paths, int published_paths);
 void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
