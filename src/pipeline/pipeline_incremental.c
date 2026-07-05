@@ -1453,6 +1453,10 @@ static int incr_expand_exact_inbound_frontier(cbm_store_t *store, const char *pr
             }
             return rc;
         }
+        if (!recursive) {
+            cbm_store_free_inbound_edges(edges, edge_count);
+            continue;
+        }
         for (int i = 0; i < edge_count; i++) {
             const char *source_rel_path = edges[i].source_rel_path;
             if (!source_rel_path || source_rel_path[0] == '\0') {

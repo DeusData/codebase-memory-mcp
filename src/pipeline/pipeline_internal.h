@@ -152,6 +152,9 @@ static inline bool cbm_pipeline_node_is_callable_scope(const cbm_gbuf_node_t *no
 
 /* Internal alias retained for the existing exact-delta code vocabulary. */
 enum { CBM_PIPELINE_COMPAT_GENERATION = CBM_PIPELINE_FILE_DELTA_GENERATION };
+enum { CBM_PIPELINE_FIELD_TYPE_HINT_CSHARP_M_PREFIX_LEN = 2 };
+/* Matches the historical parallel resolver confidence for type-name field hints. */
+#define CBM_PIPELINE_FIELD_TYPE_HINT_CONFIDENCE 0.85
 
 enum {
     CBM_CALL_ARG_EXPR_MAX = 120,
@@ -257,6 +260,70 @@ static inline void cbm_pipeline_close_call_edge_props(char *props, size_t props_
     if (pos < props_sz - SKIP_ONE) {
         props[pos] = '}';
         props[pos + SKIP_ONE] = '\0';
+    }
+}
+
+static inline void cbm_pipeline_try_field_type_hint(const cbm_registry_t *registry,
+                                                    const cbm_gbuf_t *gbuf,
+                                                    cbm_resolution_t *res,
+                                                    const char *callee_name,
+                                                    int64_t source_id) {
+    if (!registry || !gbuf || !res || !res->qualified_name ||
+        res->candidate_count <= SKIP_ONE || !callee_name) {
+        return;
+    }
+    const char *dot = strchr(callee_name, '.');
+    if (!dot) {
+        return;
+    }
+
+    size_t prefix_len = (size_t)(dot - callee_name);
+    char object_name[CBM_SZ_256];
+    if (prefix_len >= sizeof(object_name)) {
+        return;
+    }
+    memcpy(object_name, callee_name, prefix_len);
+    object_name[prefix_len] = '\0';
+
+    const char *type_hint = object_name;
+    if (type_hint[0] == '_') {
+        type_hint++;
+    }
+    if (type_hint[0] == 'm' && type_hint[SKIP_ONE] == '_') {
+        type_hint += CBM_PIPELINE_FIELD_TYPE_HINT_CSHARP_M_PREFIX_LEN;
+    }
+
+    char type_name[CBM_SZ_256];
+    int n = snprintf(type_name, sizeof(type_name), "%s", type_hint);
+    if (n < 0 || (size_t)n >= sizeof(type_name)) {
+        return;
+    }
+    if (type_name[0] >= 'a' && type_name[0] <= 'z') {
+        type_name[0] -= ('a' - 'A');
+    }
+
+    char interface_name[CBM_SZ_256];
+    n = snprintf(interface_name, sizeof(interface_name), "I%s", type_name);
+    if (n < 0 || (size_t)n >= sizeof(interface_name)) {
+        return;
+    }
+
+    const char *method = dot + SKIP_ONE;
+    const char **candidates = NULL;
+    int candidate_count = 0;
+    cbm_registry_find_by_name(registry, method, &candidates, &candidate_count);
+    for (int i = 0; i < candidate_count; i++) {
+        if (!candidates[i] ||
+            (!strstr(candidates[i], type_name) && !strstr(candidates[i], interface_name))) {
+            continue;
+        }
+        const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(gbuf, candidates[i]);
+        if (better && better->id != source_id) {
+            res->qualified_name = candidates[i];
+            res->confidence = CBM_PIPELINE_FIELD_TYPE_HINT_CONFIDENCE;
+            res->strategy = "field_type_hint";
+            return;
+        }
     }
 }
 
@@ -436,7 +503,6 @@ enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_4 };
 /* Default changed-file batch cap. Larger batches need explicit config and
  * same-batch parity coverage for deletes, renames, folders, and derived views. */
 enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS = CBM_SZ_2 };
-
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
