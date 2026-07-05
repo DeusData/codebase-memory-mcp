@@ -12409,6 +12409,57 @@ static bool pkg_in_list(const char *pkg, char **list, int count) {
     return false;
 }
 
+static const char *arch_file_path_to_package(const char *file_path) {
+    if (!file_path || !file_path[0]) {
+        return "";
+    }
+    static CBM_TLS char buf[CBM_SZ_256];
+    const char *end = file_path + strlen(file_path);
+    while (end > file_path && (end[-1] == '/' || end[-1] == '\\')) {
+        end--;
+    }
+    if (end <= file_path) {
+        return "";
+    }
+    const char *file_start = end;
+    while (file_start > file_path && file_start[-1] != '/' && file_start[-1] != '\\') {
+        file_start--;
+    }
+    const char *seg_end = file_start;
+    while (seg_end > file_path && (seg_end[-1] == '/' || seg_end[-1] == '\\')) {
+        seg_end--;
+    }
+    const char *seg_start = seg_end;
+    while (seg_start > file_path && seg_start[-1] != '/' && seg_start[-1] != '\\') {
+        seg_start--;
+    }
+    if (seg_start == seg_end) {
+        const char *dot = NULL;
+        for (const char *p = file_start; p < end; p++) {
+            if (*p == '.') {
+                dot = p;
+            }
+        }
+        seg_start = file_start;
+        seg_end = dot && dot > file_start ? dot : end;
+    }
+    size_t len = (size_t)(seg_end - seg_start);
+    if (len == 0 || len >= sizeof(buf)) {
+        return "";
+    }
+    memcpy(buf, seg_start, len);
+    buf[len] = '\0';
+    return buf;
+}
+
+static const char *arch_route_node_package(const char *qn, const char *file_path) {
+    const char *pkg = cbm_qn_to_package(qn);
+    if (pkg && pkg[0]) {
+        return pkg;
+    }
+    return arch_file_path_to_package(file_path);
+}
+
 /* Collect package names from nodes matching a SQL query (must use ?1 = project). */
 static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project, const char *path,
                              char **pkgs, int max_pkgs) {
@@ -12457,6 +12508,71 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
     return count;
 }
 
+static int collect_route_pkg_names(cbm_store_t *s, const char *project, const char *path,
+                                   char **pkgs, int max_pkgs) {
+    char norm[CBM_SZ_512];
+    char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
+    bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    char sql[ST_SQL_BUF];
+    bool use_active_nodes = arch_has_active_overlay_nodes(s, project);
+    const char *active_base =
+        "SELECT name, qualified_name, COALESCE(file_path, '') FROM active_nodes "
+        "WHERE project=?3 AND label='Route' "
+        "AND (json_extract(properties, '$.is_test') IS NULL OR "
+        "json_extract(properties, '$.is_test') != 1) ";
+    const char *canonical_base =
+        "SELECT name, qualified_name, COALESCE(file_path, '') FROM nodes "
+        "WHERE project=?1 AND label='Route' "
+        "AND (json_extract(properties, '$.is_test') IS NULL OR "
+        "json_extract(properties, '$.is_test') != 1) ";
+    if (arch_build_node_view_sql(s, sql, sizeof(sql), use_active_nodes, active_base,
+                                 canonical_base, scoped, 0,
+                                 "arch_layers route package SQL truncated") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) {
+            sqlite3_finalize(stmt);
+        }
+        return CBM_STORE_ERR;
+    }
+    arch_bind_node_view_sql(stmt, use_active_nodes, project, scoped, norm, like, 0);
+
+    int count = 0;
+    int step_rc = SQLITE_OK;
+    while (count < max_pkgs && (step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 0);
+        const char *qn = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        const char *fp = (const char *)sqlite3_column_text(stmt, CBM_SZ_2);
+        if (cbm_is_test_file_path(fp) || !arch_route_should_include(name, qn)) {
+            continue;
+        }
+        const char *pkg = arch_route_node_package(qn, fp);
+        if (!pkg || !pkg[0]) {
+            continue;
+        }
+        pkgs[count] = heap_strdup(pkg);
+        if (!pkgs[count]) {
+            for (int i = 0; i < count; i++) {
+                free(pkgs[i]);
+            }
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        count++;
+    }
+    if (step_rc != SQLITE_DONE && count < max_pkgs) {
+        for (int i = 0; i < count; i++) {
+            free(pkgs[i]);
+        }
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return count;
+}
+
 static int arch_layers(cbm_store_t *s, const char *project, const char *path,
                        cbm_architecture_info_t *out) {
     out->layers = NULL;
@@ -12472,9 +12588,7 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
 
     /* Collect route and entry point packages */
     char *route_pkgs[CBM_SZ_32];
-    int nrpkgs =
-        collect_pkg_names(s, "SELECT qualified_name FROM nodes WHERE project=?1 AND label='Route'",
-                          project, path, route_pkgs, CBM_SZ_32);
+    int nrpkgs = collect_route_pkg_names(s, project, path, route_pkgs, CBM_SZ_32);
     if (nrpkgs < 0) {
         arch_free_boundaries(boundaries, bcount);
         store_set_error(s, "arch_layers route package collection failed");
