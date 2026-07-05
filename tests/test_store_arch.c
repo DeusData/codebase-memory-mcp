@@ -613,6 +613,48 @@ TEST(arch_layers) {
     PASS();
 }
 
+TEST(arch_layers_filter_infra_routes_and_use_route_file_package) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_node_t modern_route = {
+        .project = "test",
+        .label = "Route",
+        .name = "/api/status",
+        .qualified_name = "__route__ANY__/api/status",
+        .file_path = "graph-ui/src/components/StatsTab.tsx",
+        .properties_json = "{\"method\":\"ANY\",\"path\":\"/api/status\"}"};
+    cbm_store_upsert_node(s, &modern_route);
+    cbm_node_t infra_url = {
+        .project = "test",
+        .label = "Route",
+        .name = "https://github.com/DeusData/codebase-memory-mcp/issues",
+        .qualified_name = "__route__infra__https://github.com/DeusData/codebase-memory-mcp/issues",
+        .file_path = "pkg/winget/manifest.yaml",
+        .properties_json = "{\"source\":\"infra\",\"key_path\":\"PackageUrl\"}"};
+    cbm_store_upsert_node(s, &infra_url);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    bool saw_components_api = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        ASSERT_STR_NEQ(info.layers[i].name, "");
+        ASSERT_STR_NEQ(info.layers[i].name, "com/DeusData");
+        ASSERT_STR_NEQ(info.layers[i].name, "com/DeusData/codebase-memory-mcp/issues");
+        if (strcmp(info.layers[i].name, "components") == 0) {
+            saw_components_api = true;
+            ASSERT_STR_EQ(info.layers[i].layer, "api");
+            ASSERT_STR_EQ(info.layers[i].reason, "has HTTP route definitions");
+        }
+    }
+    ASSERT_TRUE(saw_components_api);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_file_tree) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1779,6 +1821,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_boundaries);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
+    RUN_TEST(arch_layers_filter_infra_routes_and_use_route_file_package);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
     RUN_TEST(arch_clusters_resolution_knob);
