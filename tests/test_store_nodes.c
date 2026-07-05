@@ -5136,6 +5136,60 @@ TEST(store_find_node_ids_by_qns) {
     PASS();
 }
 
+TEST(store_find_nodes_by_qns_returns_full_rows_in_input_order) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cbm_store_upsert_project(s, "test", "/tmp/test") == CBM_STORE_OK);
+    ASSERT_TRUE(cbm_store_upsert_project(s, "other", "/tmp/other") == CBM_STORE_OK);
+
+    cbm_node_t na = {.project = "test",
+                     .label = "Function",
+                     .name = "A",
+                     .qualified_name = "test.A",
+                     .file_path = "a.c",
+                     .start_line = 7,
+                     .end_line = 9,
+                     .properties_json = "{\"return_type\":\"int\"}"};
+    cbm_node_t nb = {.project = "test",
+                     .label = "Class",
+                     .name = "B",
+                     .qualified_name = "test.B",
+                     .file_path = "b.c",
+                     .properties_json = "{\"base_classes\":[\"Base\"]}"};
+    cbm_node_t other = {.project = "other",
+                        .label = "Function",
+                        .name = "A",
+                        .qualified_name = "test.A",
+                        .file_path = "other.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(s, &na) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &nb) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(s, &other) > 0);
+
+    const char *qns[] = {"test.B", "missing.Q", NULL, "test.A", "test.B"};
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qns(s, "test", qns, (int)(sizeof(qns) / sizeof(qns[0])),
+                                          &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "test.B");
+    ASSERT_STR_EQ(nodes[0].project, "test");
+    ASSERT_STR_EQ(nodes[0].properties_json, "{\"base_classes\":[\"Base\"]}");
+    ASSERT_STR_EQ(nodes[1].qualified_name, "test.A");
+    ASSERT_STR_EQ(nodes[1].file_path, "a.c");
+    ASSERT_EQ(nodes[1].start_line, 7);
+    ASSERT_STR_EQ(nodes[1].properties_json, "{\"return_type\":\"int\"}");
+    ASSERT_STR_EQ(nodes[2].qualified_name, "test.B");
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qns(s, "test", NULL, 1, &nodes, &count), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_find_nodes_by_qns(s, "test", NULL, 0, &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Integrity check tests ──────────────────────────────────────── */
 
 TEST(store_integrity_clean) {
@@ -5872,6 +5926,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_restore_from);
     RUN_TEST(store_pragma_settings);
     RUN_TEST(store_find_node_ids_by_qns);
+    RUN_TEST(store_find_nodes_by_qns_returns_full_rows_in_input_order);
     RUN_TEST(store_node_null_project);
     RUN_TEST(store_node_null_qn);
     RUN_TEST(store_node_empty_strings);
