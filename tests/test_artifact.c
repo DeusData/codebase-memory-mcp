@@ -11,6 +11,8 @@
 
 #include <sys/stat.h>
 #include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -315,6 +317,605 @@ TEST(artifact_null_safety) {
     ASSERT_NEQ(cbm_artifact_import("/tmp", NULL), 0);
     ASSERT_FALSE(cbm_artifact_exists(NULL));
     ASSERT_NULL(cbm_artifact_commit(NULL));
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(NULL, "/tmp/x.db", "p"), -1);
+    ASSERT_EQ(cbm_artifact_reconcile_hashes("/tmp", NULL, "p"), -1);
+    ASSERT_EQ(cbm_artifact_reconcile_hashes("/tmp", "/tmp/x.db", NULL), -1);
+    PASS();
+}
+
+/* ── Bootstrap reconciliation tests ───────────────────────────────── */
+
+/* printf-formatted system() wrapper; returns the exit status. */
+static int runf(const char *fmt, ...) {
+    char cmd[4096];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(cmd, sizeof(cmd), fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= sizeof(cmd)) {
+        return -1;
+    }
+    return system(cmd);
+}
+
+static void git_init(const char *repo) {
+    runf("git -C '%s' init -q", repo);
+    runf("git -C '%s' config user.email t@t.com", repo);
+    runf("git -C '%s' config user.name t", repo);
+    runf("git -C '%s' config commit.gpgsign false", repo);
+}
+
+/* Portable local mtime_ns for assertions (mirrors art_stat_mtime_ns). */
+static int64_t t_mtime_ns(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+#ifdef __APPLE__
+    return (int64_t)st.st_mtimespec.tv_sec * 1000000000LL + (int64_t)st.st_mtimespec.tv_nsec;
+#elif defined(__linux__)
+    return (int64_t)st.st_mtim.tv_sec * 1000000000LL + (int64_t)st.st_mtim.tv_nsec;
+#else
+    return (int64_t)st.st_mtime * 1000000000LL;
+#endif
+}
+
+/* True iff <repo>/.codebase-memory/artifact.json contains substr. */
+static bool meta_contains(const char *repo, const char *substr) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.codebase-memory/artifact.json", repo);
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char buf[4096];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
+    fclose(fp);
+    buf[n] = '\0';
+    return strstr(buf, substr) != NULL;
+}
+
+static int64_t row_mtime(cbm_file_hash_t *rows, int n, const char *rel) {
+    for (int i = 0; i < n; i++) {
+        if (strcmp(rows[i].rel_path, rel) == 0) {
+            return rows[i].mtime_ns;
+        }
+    }
+    return -1;
+}
+
+/* Build a git repo at g_repo with 5 .rs files, full-index + export (clean tree
+ * → reconcile_basis marker set), and commit .codebase-memory so a clone receives
+ * the artifact. Returns the derived project name (caller frees) or NULL. */
+static char *build_trusted_artifact_repo(void) {
+    git_init(g_repo);
+    const char *names[] = {"a.rs", "b.rs", "c.rs", "d.rs", "e.rs"};
+    for (int i = 0; i < 5; i++) {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", g_repo, names[i]);
+        char body[128];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(p, body);
+    }
+    if (runf("git -C '%s' add -A && git -C '%s' commit -qm init", g_repo, g_repo) != 0) {
+        return NULL;
+    }
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    if (!p) {
+        return NULL;
+    }
+    cbm_pipeline_set_persistence(p, true);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (rc != 0) {
+        return NULL;
+    }
+    /* Clean source tree at export → marker must be present. */
+    if (!meta_contains(g_repo, "\"reconcile_basis\"")) {
+        return NULL;
+    }
+    if (runf("git -C '%s' add -A && git -C '%s' commit -qm artifact", g_repo, g_repo) != 0) {
+        return NULL;
+    }
+    return cbm_project_name_from_path(g_repo);
+}
+
+/* Clones g_repo (A) into <tmp>/work/repo (B) so both share the basename "repo"
+ * and thus the derived project name — required for artifact bootstrap. */
+static bool clone_to_b(char *repoB_out, size_t repoB_sz) {
+    char work[1024];
+    snprintf(work, sizeof(work), "%s/work", g_tmpdir);
+    cbm_mkdir_p(work, 0755);
+    snprintf(repoB_out, repoB_sz, "%s/repo", work);
+    return runf("git clone -q '%s' '%s'", g_repo, repoB_out) == 0;
+}
+
+TEST(artifact_export_marks_clean_basis) {
+    setup_artifact_test();
+    git_init(g_repo);
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn f0() {}\n");
+    ASSERT_EQ(runf("git -C '%s' add -A && git -C '%s' commit -qm init", g_repo, g_repo), 0);
+
+    char *proj = cbm_project_name_from_path(g_repo);
+    ASSERT_NOT_NULL(proj);
+
+    /* Full index + export on a clean source tree → clean-basis marker set. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT(meta_contains(g_repo, "\"reconcile_basis\""));
+
+    /* Dirty the source tree (uncommitted edit). Re-export must omit the marker:
+     * the tree is non-clean outside .codebase-memory (and the a.rs hash row no
+     * longer matches disk). */
+    write_text_file(src, "pub fn dirty() {}\n");
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, proj, CBM_ARTIFACT_FAST), 0);
+    ASSERT_FALSE(meta_contains(g_repo, "\"reconcile_basis\""));
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_restamps_unchanged) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    /* B: modify 2 files + add 1, commit. (Clone gave B fresh mtimes.) */
+    char m1[1152], m2[1152], add[1152];
+    snprintf(m1, sizeof(m1), "%s/a.rs", repoB);
+    snprintf(m2, sizeof(m2), "%s/b.rs", repoB);
+    snprintf(add, sizeof(add), "%s/added.rs", repoB);
+    write_text_file(m1, "pub fn f0() { /* changed */ }\n");
+    write_text_file(m2, "pub fn f1() { /* changed */ }\n");
+    write_text_file(add, "pub fn new_fn() {}\n");
+    ASSERT_EQ(runf("git -C '%s' add -A && git -C '%s' commit -qm edits", repoB, repoB), 0);
+
+    /* Import A's artifact into a fresh cache DB for B. */
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Reconcile: 5 rows; a.rs+b.rs changed (left foreign), 3 unchanged restamped. */
+    int restamped = cbm_artifact_reconcile_hashes(repoB, dbB, proj);
+    ASSERT_EQ(restamped, 3);
+
+    /* Unchanged row (c.rs) now carries B's local mtime; modified row (a.rs)
+     * still carries A's foreign mtime. */
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    char c_path[1152], a_path[1152];
+    snprintf(c_path, sizeof(c_path), "%s/c.rs", repoB);
+    snprintf(a_path, sizeof(a_path), "%s/a.rs", repoB);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), t_mtime_ns(c_path));
+    ASSERT_NEQ(row_mtime(rows, n, "a.rs"), t_mtime_ns(a_path));
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_untracked_rows) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    /* B: a gitignored-yet-indexed file (the .cbmignore-negation shape, #500).
+     * git diff/ls-files are both blind to it, so without the tracked-at-commit
+     * gate it would be restamped as "unchanged" even though git cannot vouch
+     * for its content. */
+    char gen[1152], gi[1152];
+    snprintf(gen, sizeof(gen), "%s/gen.rs", repoB);
+    snprintf(gi, sizeof(gi), "%s/.gitignore", repoB);
+    write_text_file(gen, "pub fn generated_local() {}\n");
+    write_text_file(gi, "gen.rs\n");
+    ASSERT_EQ(runf("git -C '%s' add .gitignore && git -C '%s' commit -qm ignore", repoB, repoB), 0);
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Simulate the exporter having indexed gen.rs: insert a foreign-mtime row. */
+    const int64_t foreign_mtime = 12345;
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, proj, "gen.rs", "", foreign_mtime, 7), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    /* Reconcile: the 5 tracked unchanged rows restamp; gen.rs must not. */
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), 5);
+
+    s = cbm_store_open_path(dbB);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), CBM_STORE_OK);
+    ASSERT_EQ(row_mtime(rows, n, "gen.rs"), foreign_mtime);
+    char c_path[1152];
+    snprintf(c_path, sizeof(c_path), "%s/c.rs", repoB);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), t_mtime_ns(c_path));
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_untrusted_metadata) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Snapshot one foreign mtime, then strip the trust marker. */
+    cbm_store_t *s = cbm_store_open_path(dbB);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    cbm_store_get_file_hashes(s, proj, &rows, &n);
+    int64_t before = row_mtime(rows, n, "c.rs");
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    /* Rewrite artifact.json without reconcile_basis (schema_version preserved). */
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "{\"schema_version\":2,\"commit\":\"deadbeef\","
+                "\"original_size\":1000,\"indexed_at\":\"2026-01-01T00:00:00Z\"}");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    /* Rows untouched: still the foreign value captured before. */
+    s = cbm_store_open_path(dbB);
+    cbm_store_get_file_hashes(s, proj, &rows, &n);
+    ASSERT_EQ(row_mtime(rows, n, "c.rs"), before);
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_unknown_commit) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Rewrite artifact.json: keep the marker but point commit at a hex-valid
+     * SHA that does not exist locally → cat-file -e fails. */
+    char meta[1152];
+    snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
+    FILE *fp = fopen(meta, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp,
+            "{\"schema_version\":2,\"commit\":\"%s\","
+            "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}",
+            "1111111111111111111111111111111111111111");
+    fclose(fp);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_reconcile_skips_without_git) {
+    setup_artifact_test();
+    char *proj = build_trusted_artifact_repo();
+    ASSERT_NOT_NULL(proj);
+    char repoB[1024];
+    ASSERT(clone_to_b(repoB, sizeof(repoB)));
+
+    char dbB[1152];
+    snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(repoB, dbB), 0);
+
+    /* Remove .git → not a repo. Marker + commit still present, but git fails. */
+    ASSERT_EQ(runf("rm -rf '%s/.git'", repoB), 0);
+
+    ASSERT_EQ(cbm_artifact_reconcile_hashes(repoB, dbB, proj), -1);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* P3: artifact auto-export is debounced. With a small change set (< default
+ * threshold 10) and a fresh artifact (age < 24h) the incremental run must NOT
+ * re-export — the .zst inode mtime is unchanged and artifact.export_skipped is
+ * logged. CBM_ARTIFACT_EXPORT_MIN_CHANGES=0 forces per-run export (today's
+ * behavior). Nanosecond mtime compare needs no sleep: an untouched inode's
+ * mtime is bit-identical. */
+TEST(artifact_export_debounced) {
+    setup_artifact_test();
+    unsetenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+    git_init(g_repo);
+    char gi[1024];
+    snprintf(gi, sizeof(gi), "%s/.gitignore", g_repo);
+    write_text_file(gi, ".codebase-memory/\n");
+    const char *fnames[] = {"a.rs", "b.rs", "c.rs", "d.rs"};
+    for (int i = 0; i < 4; i++) {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", g_repo, fnames[i]);
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(p, body);
+    }
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+
+    /* Run 1: full index + export → artifact exists, indexed_at = now. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char zst[1152];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    int64_t mt0 = t_mtime_ns(zst);
+    ASSERT_GTE(mt0, 0);
+
+    /* Modify 1 file → incremental run, changed_total = 1 (< 10), age ~0 → skip. */
+    write_text_file(src, "pub fn f0() { /* modified */ }\n");
+    capture_logs_start();
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    const char *logs = capture_logs_end();
+
+    ASSERT_EQ(t_mtime_ns(zst), mt0); /* untouched */
+    ASSERT(strstr(logs, "artifact.export_skipped") != NULL);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(artifact_export_forced_by_env) {
+    setup_artifact_test();
+    git_init(g_repo);
+    char gi[1024];
+    snprintf(gi, sizeof(gi), "%s/.gitignore", g_repo);
+    write_text_file(gi, ".codebase-memory/\n");
+    const char *fnames[] = {"a.rs", "b.rs", "c.rs", "d.rs"};
+    for (int i = 0; i < 4; i++) {
+        char p[1024];
+        snprintf(p, sizeof(p), "%s/%s", g_repo, fnames[i]);
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(p, body);
+    }
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char zst[1152];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    int64_t mt0 = t_mtime_ns(zst);
+
+    /* CBM_ARTIFACT_EXPORT_MIN_CHANGES=0 forces export even for 1 change. */
+    ASSERT_EQ(setenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES", "0", 1), 0);
+    write_text_file(src, "pub fn f0() { /* modified */ }\n");
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    unsetenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+
+    ASSERT_NEQ(t_mtime_ns(zst), mt0); /* re-exported */
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* P3: cumulative drift forces export. Many consecutive below-threshold runs
+ * must not leave the artifact stale: files touched since the last export keep
+ * mtimes newer than indexed_at, so their count accumulates across runs and
+ * crosses the same threshold a single big run would. */
+TEST(artifact_export_forced_by_cumulative_drift) {
+    setup_artifact_test();
+    unsetenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+    unsetenv("CBM_ARTIFACT_EXPORT_MAX_AGE_S");
+    git_init(g_repo);
+    char gi[1024];
+    snprintf(gi, sizeof(gi), "%s/.gitignore", g_repo);
+    write_text_file(gi, ".codebase-memory/\n");
+    char paths[12][1024];
+    for (int i = 0; i < 12; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/f%d.rs", g_repo, i);
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() {}\n", i);
+        write_text_file(paths[i], body);
+    }
+
+    /* Full index + export → artifact exists, indexed_at = now. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char zst[1152];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    int64_t mt0 = t_mtime_ns(zst);
+    ASSERT_GTE(mt0, 0);
+
+    /* Drift compares mtime seconds strictly after indexed_at's second, so the
+     * edits must land in a later second than the export. */
+    cbm_usleep(1100 * 1000);
+
+    /* Run A: 5 changes (< 10), drift 5 (< 10) → skip. */
+    for (int i = 0; i < 5; i++) {
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() { /* edit */ }\n", i);
+        write_text_file(paths[i], body);
+    }
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_EQ(t_mtime_ns(zst), mt0); /* still debounced */
+
+    /* Run B: 6 different changes (< 10), but cumulative drift is 11 (>= 10)
+     * because run A's files still carry post-export mtimes → export fires. */
+    for (int i = 5; i < 11; i++) {
+        char body[64];
+        snprintf(body, sizeof(body), "pub fn f%d() { /* edit */ }\n", i);
+        write_text_file(paths[i], body);
+    }
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    ASSERT_NEQ(t_mtime_ns(zst), mt0); /* re-exported by drift */
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* P3: CBM_ARTIFACT_EXPORT_MAX_AGE_S override. With the age cap forced to 0 a
+ * 1-change run must export despite being below the change/drift thresholds. */
+TEST(artifact_export_forced_by_max_age_env) {
+    setup_artifact_test();
+    unsetenv("CBM_ARTIFACT_EXPORT_MIN_CHANGES");
+    git_init(g_repo);
+    char gi[1024];
+    snprintf(gi, sizeof(gi), "%s/.gitignore", g_repo);
+    write_text_file(gi, ".codebase-memory/\n");
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn f0() {}\n");
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char zst[1152];
+    snprintf(zst, sizeof(zst), "%s/.codebase-memory/graph.db.zst", g_repo);
+    int64_t mt0 = t_mtime_ns(zst);
+    ASSERT_GTE(mt0, 0);
+
+    /* age >= 0 always holds once a second has elapsed, so MAX_AGE_S=0 expires
+     * immediately; sleep past indexed_at's 1s resolution to avoid age = -0. */
+    ASSERT_EQ(setenv("CBM_ARTIFACT_EXPORT_MAX_AGE_S", "0", 1), 0);
+    cbm_usleep(1100 * 1000);
+    write_text_file(src, "pub fn f0() { /* modified */ }\n");
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    unsetenv("CBM_ARTIFACT_EXPORT_MAX_AGE_S");
+
+    ASSERT_NEQ(t_mtime_ns(zst), mt0); /* re-exported by age override */
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+/* P2: persist_hashes now writes all hash rows in one batch transaction from
+ * classify-time stamps (no per-file re-stat). Verify the round-trip via the
+ * real pipeline route: index → modify → incremental reindex (batch persist) →
+ * the row reflects the new content, and a follow-up run classifies it as
+ * unchanged (proving the persisted stamps are usable). Offline synthetic repo. */
+TEST(incremental_persist_batch_roundtrip) {
+    setup_artifact_test();
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/a.rs", g_repo);
+    write_text_file(src, "pub fn original() {}\n");
+
+    char *proj = cbm_project_name_from_path(g_repo);
+    ASSERT_NOT_NULL(proj);
+
+    /* Run 1: full index → file_hashes populated (size = len(original)). */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    cbm_file_hash_t *rows = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    ASSERT_EQ(n, 1);
+    int64_t size_before = rows[0].size;
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+    ASSERT_GT(size_before, 0);
+
+    /* Modify the file (different size → detectable by classify on next run). */
+    write_text_file(src, "pub fn original() { /* expanded with more content now */ }\n");
+
+    /* Run 2: routes to incremental → persist_hashes (batch) writes the new stamp. */
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_get_file_hashes(s, proj, &rows, &n), 0);
+    ASSERT_EQ(n, 1);
+    int64_t size_after = rows[0].size;
+    /* Persisted mtime now equals the file's current (classify-time) mtime. */
+    char c_path[1024];
+    snprintf(c_path, sizeof(c_path), "%s/a.rs", g_repo);
+    ASSERT_EQ(rows[0].mtime_ns, t_mtime_ns(c_path));
+    cbm_store_free_file_hashes(rows, n);
+    cbm_store_close(s);
+    ASSERT_NEQ(size_after, size_before);
+
+    /* Run 3: no-op — the persisted classify-time stamp makes classify see no
+     * change, proving the batch-persisted row is correct and reusable. */
+    capture_logs_start();
+    p = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    const char *logs = capture_logs_end();
+    ASSERT(strstr(logs, "incremental.noop") != NULL);
+
+    free(proj);
+    cleanup_dir(g_tmpdir);
     PASS();
 }
 
@@ -329,4 +930,15 @@ SUITE(artifact) {
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_null_safety);
+    RUN_TEST(artifact_export_marks_clean_basis);
+    RUN_TEST(artifact_reconcile_restamps_unchanged);
+    RUN_TEST(artifact_reconcile_skips_untracked_rows);
+    RUN_TEST(artifact_reconcile_skips_untrusted_metadata);
+    RUN_TEST(artifact_reconcile_skips_unknown_commit);
+    RUN_TEST(artifact_reconcile_skips_without_git);
+    RUN_TEST(incremental_persist_batch_roundtrip);
+    RUN_TEST(artifact_export_debounced);
+    RUN_TEST(artifact_export_forced_by_env);
+    RUN_TEST(artifact_export_forced_by_cumulative_drift);
+    RUN_TEST(artifact_export_forced_by_max_age_env);
 }

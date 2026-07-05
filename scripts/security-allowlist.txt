@@ -41,6 +41,7 @@ src/pipeline/pass_githistory.c:popen:via cbm_popen wrapper call
 # ── Pipeline: artifact persistence (git HEAD hash, merge driver config) ────
 src/pipeline/artifact.c:cbm_popen:git rev-parse HEAD for artifact metadata (hardcoded cmd)
 src/pipeline/artifact.c:cbm_popen:git config merge.ours.driver for gitattributes (hardcoded cmd)
+src/pipeline/artifact.c:cbm_popen:git diff/ls-files/ls-tree/cat-file for bootstrap hash reconciliation (commit hex-validated via is_hex_oid, repo path shell-validated via cbm_validate_shell_arg)
 src/pipeline/artifact.c:popen:via cbm_popen wrapper calls
 
 # ── UI: HTTP server process management ─────────────────────────────────────

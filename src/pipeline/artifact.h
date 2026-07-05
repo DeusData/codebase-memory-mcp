@@ -10,6 +10,7 @@
 #define CBM_ARTIFACT_H
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /* Schema version — increment when DB schema changes (new tables/indexes).
  * Import refuses artifacts with schema_version > current.
@@ -52,5 +53,23 @@ bool cbm_artifact_exists(const char *repo_path);
 /* Get the git commit hash from artifact metadata. Caller must free().
  * Returns NULL if artifact doesn't exist or has no commit field. */
 char *cbm_artifact_commit(const char *repo_path);
+
+/* Unix epoch seconds of the artifact's indexed_at metadata timestamp.
+ * Returns -1 when there is no artifact.json or indexed_at is absent/unparseable.
+ * Uses the metadata timestamp, NOT the .zst filesystem mtime. */
+int64_t cbm_artifact_indexed_at_epoch(const char *repo_path);
+
+/* Age of the existing artifact in seconds (now - artifact.json indexed_at).
+ * Returns -1 when the indexed_at epoch is unavailable. */
+int64_t cbm_artifact_age_seconds(const char *repo_path);
+
+/* After a successful import of a trusted clean-basis artifact, re-stamp
+ * file_hashes rows for files whose content is unchanged between the artifact's
+ * commit and the local working tree, using local stat() values.
+ * Returns the number of rows re-stamped, or -1 when reconciliation was skipped
+ * (no git / untrusted metadata / unknown commit / any uncertainty).
+ * Best-effort: never fails the import. */
+int cbm_artifact_reconcile_hashes(const char *repo_path, const char *cache_db_path,
+                                  const char *project_name);
 
 #endif /* CBM_ARTIFACT_H */

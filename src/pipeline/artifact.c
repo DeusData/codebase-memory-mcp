@@ -10,8 +10,9 @@ enum {
     ART_DIR_PERMS = 0755,
     ART_ZSTD_FAST = 3,
     ART_ZSTD_BEST = 9,
-    ART_RATIO_SCALE = 10, /* multiply ratio by 10 for integer logging */
-    ART_NUL = 1,          /* NUL terminator byte */
+    ART_RATIO_SCALE = 10,        /* multiply ratio by 10 for integer logging */
+    ART_NUL = 1,                 /* NUL terminator byte */
+    ART_NS_PER_SEC = 1000000000, /* nanoseconds per second (mtime_ns helper) */
 };
 #define ART_BYTES_PER_MB ((size_t)1024 * 1024)
 
@@ -21,6 +22,8 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat.h"
 #include "foundation/log.h"
+#include "foundation/str_util.h"   /* cbm_validate_shell_arg */
+#include "foundation/hash_table.h" /* CBMHashTable (reconcile changed-set) */
 
 #include "zstd_store.h"
 
@@ -234,6 +237,243 @@ static void iso_timestamp(char *buf, size_t bufsz) {
     (void)strftime(buf, bufsz, "%Y-%m-%dT%H:%M:%SZ", &tm);
 }
 
+/* Parse a "YYYY-MM-DDTHH:MM:SSZ" (UTC) timestamp into unix epoch seconds.
+ * Returns -1 on any format/range mismatch. Computes epoch directly via
+ * days-from-civil so it is independent of libc timegm/timezone (portable
+ * across POSIX and Windows), matching the fixed format iso_timestamp emits. */
+static int64_t parse_iso8601_utc(const char *s) {
+    if (!s) {
+        return -1;
+    }
+    int Y, Mo, D, H, Mi, S;
+    char z = 0;
+    if (sscanf(s, "%d-%d-%dT%d:%d:%d%c", &Y, &Mo, &D, &H, &Mi, &S, &z) != 7 || z != 'Z') {
+        return -1;
+    }
+    if (Mo < 1 || Mo > 12 || D < 1 || D > 31 || H < 0 || H > 23 || Mi < 0 || Mi > 59 || S < 0 ||
+        S > 60) {
+        return -1;
+    }
+    int64_t y = (int64_t)Y - (Mo <= 2);
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    int64_t yoe = y - era * 400;
+    int64_t doy = (153 * (Mo + (Mo > 2 ? -3 : 9)) + 2) / 5 + D - 1;
+    int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    int64_t days = era * 146097 + doe - 719468; /* days since 1970-01-01 */
+    return days * 86400 + (int64_t)H * 3600 + (int64_t)Mi * 60 + (int64_t)S;
+}
+
+/* ── Git + trust helpers for bootstrap reconciliation ────────────── */
+
+/* Non-NULL sentinel value stored in a membership hash set (key presence is all
+ * that matters; the value is never dereferenced). */
+static int g_reconcile_sentinel;
+
+/* Validate s is a hex git object id: 40 chars (SHA-1) or 64 chars (SHA-256).
+ * Repo-controlled strings reach this check, so it is a hard gate before any
+ * commit value is interpolated into a git command string. */
+static bool is_hex_oid(const char *s) {
+    if (!s) {
+        return false;
+    }
+    size_t len = strlen(s);
+    if (len != 40 && len != 64) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Portable mtime in nanoseconds. Duplicated locally to match the existing
+ * per-file idiom in pipeline.c / pipeline_incremental.c rather than introducing
+ * a third cross-file dependency for one helper. */
+static int64_t art_stat_mtime_ns(const struct stat *st) {
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * ART_NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * ART_NS_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * ART_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+/* Build "git -C \"<repo>\" <args> 2><null>" with a shell-validated repo path.
+ * repo_path is the only untrusted component; args is a trusted literal or a
+ * hex-validated commit string (never arbitrary data). Returns false on shell-arg
+ * validation failure or truncation. Mirrors the git_context.c / watcher.c pattern. */
+static bool build_git_cmd(char *buf, size_t bufsz, const char *repo_path, const char *args) {
+    if (!cbm_validate_shell_arg(repo_path)) {
+        return false;
+    }
+#ifdef _WIN32
+    for (const char *p = repo_path; *p; p++) {
+        if (*p == '%' || *p == '!' || *p == '^') {
+            return false;
+        }
+    }
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    int n = snprintf(buf, bufsz, "git -C \"%s\" %s 2>%s", repo_path, args, null_dev);
+    return n >= 0 && (size_t)n < bufsz;
+}
+
+/* Run a git command; return true iff it exits 0. Output is drained (not kept)
+ * so `diff --quiet` semantics work and large outputs don't SIGPIPE. */
+static bool git_run_ok(const char *repo_path, const char *args) {
+    char cmd[CBM_SZ_2K];
+    if (!build_git_cmd(cmd, sizeof(cmd), repo_path, args)) {
+        return false;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return false;
+    }
+    char drain[CBM_SZ_4K];
+    while (fread(drain, 1, sizeof(drain), fp) > 0) {}
+    return cbm_pclose(fp) == 0;
+}
+
+/* Run a git command and capture the FULL stdout (NUL bytes preserved) into a
+ * growing malloc'd buffer. Empty output is success with *out_len = 0. Returns
+ * 0 on success, CBM_NOT_FOUND on popen / non-zero-exit / OOM. Caller frees *out. */
+static int git_capture_full(const char *repo_path, const char *args, char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    char cmd[CBM_SZ_2K];
+    if (!build_git_cmd(cmd, sizeof(cmd), repo_path, args)) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+    size_t cap = CBM_SZ_4K;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (!buf) {
+        (void)cbm_pclose(fp);
+        return CBM_NOT_FOUND;
+    }
+    size_t n;
+    while ((n = fread(buf + len, 1, cap - len, fp)) > 0) {
+        len += n;
+        if (len == cap) {
+            size_t ncap = cap * PAIR_LEN;
+            char *tmp = realloc(buf, ncap);
+            if (!tmp) {
+                free(buf);
+                (void)cbm_pclose(fp);
+                return CBM_NOT_FOUND;
+            }
+            buf = tmp;
+            cap = ncap;
+        }
+    }
+    int rc = cbm_pclose(fp);
+    if (rc != 0) {
+        free(buf);
+        return CBM_NOT_FOUND;
+    }
+    *out = buf;
+    *out_len = len;
+    return 0;
+}
+
+/* True iff the working tree has no tracked/staged/untracked changes outside
+ * .codebase-memory/. The export itself writes .codebase-memory/, so a blanket
+ * dirty check would always fail; excluding that subtree is what makes the
+ * "clean export" invariant checkable. */
+static bool tree_clean_for_reconcile(const char *repo_path) {
+    /* Tracked (staged + unstaged) changes vs HEAD, excluding .codebase-memory.
+     * The pathspec is single-quoted so the shell passes the `:(exclude)` magic
+     * (which contains paren subshell metacharacters) literally to git. */
+    if (!git_run_ok(repo_path, "diff --quiet HEAD -- . ':(exclude).codebase-memory'")) {
+        return false;
+    }
+    /* Untracked (non-ignored) files outside .codebase-memory. */
+    static const char *const ls_args =
+        "ls-files -z --others --exclude-standard -- . ':(exclude).codebase-memory'";
+    char *untracked = NULL;
+    size_t un_len = 0;
+    if (git_capture_full(repo_path, ls_args, &untracked, &un_len) != 0) {
+        return false;
+    }
+    bool clean = (un_len == 0);
+    free(untracked);
+    return clean;
+}
+
+/* True iff every file_hashes row for project has an on-disk file whose
+ * mtime_ns + size matches the stored stamp. Any stat failure, path overflow,
+ * or mismatch makes the artifact untrusted for reconciliation — this is the
+ * belt-and-suspenders that catches a stale/swapped DB even when the tree looks
+ * clean. */
+static bool db_hashes_match_disk(const char *repo_path, const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return false;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    bool match = true;
+    if (cbm_store_get_file_hashes(s, project, &hashes, &count) != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        char abs[CBM_SZ_4K];
+        int n = snprintf(abs, sizeof(abs), "%s/%s", repo_path, hashes[i].rel_path);
+        if (n < 0 || n >= (int)sizeof(abs)) {
+            match = false;
+            break;
+        }
+        struct stat st;
+        if (stat(abs, &st) != 0 || art_stat_mtime_ns(&st) != hashes[i].mtime_ns ||
+            (int64_t)st.st_size != hashes[i].size) {
+            match = false;
+            break;
+        }
+    }
+    cbm_store_free_file_hashes(hashes, count);
+    cbm_store_close(s);
+    return match;
+}
+
+/* Read the optional reconcile_basis marker from artifact.json. True only when it
+ * is exactly "git-clean-head" (the sole trusted basis this code emits). */
+static bool read_metadata_reconcile_trusted(const char *repo_path) {
+    char meta_path[CBM_SZ_4K];
+    if (!artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META)) {
+        return false;
+    }
+    size_t len = 0;
+    char *json = read_file_alloc(meta_path, &len);
+    if (!json) {
+        return false;
+    }
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    free(json);
+    if (!doc) {
+        return false;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *val = yyjson_obj_get(root, "reconcile_basis");
+    bool trusted = false;
+    if (val) {
+        const char *s = yyjson_get_str(val);
+        trusted = (s && strcmp(s, "git-clean-head") == 0);
+    }
+    yyjson_doc_free(doc);
+    return trusted;
+}
+
 /* ── Metadata read/write ─────────────────────────────────────────── */
 
 /* Read schema_version from artifact.json. Returns -1 if missing/invalid. */
@@ -285,11 +525,9 @@ static size_t read_metadata_original_size(const char *repo_path) {
 }
 
 /* Write artifact.json metadata. */
-static int write_metadata(const char *repo_path, const char *project_name, int nodes, int edges,
-                          size_t original_size, size_t compressed_size, int compression_level) {
-    char commit[CBM_SZ_64] = "";
-    git_head_hash(repo_path, commit, sizeof(commit));
-
+static int write_metadata(const char *repo_path, const char *project_name, const char *commit,
+                          int nodes, int edges, size_t original_size, size_t compressed_size,
+                          int compression_level, bool reconcile_trusted) {
     char ts[CBM_SZ_64];
     iso_timestamp(ts, sizeof(ts));
 
@@ -306,6 +544,12 @@ static int write_metadata(const char *repo_path, const char *project_name, int n
     yyjson_mut_obj_add_uint(doc, root, "original_size", (uint64_t)original_size);
     yyjson_mut_obj_add_uint(doc, root, "compressed_size", (uint64_t)compressed_size);
     yyjson_mut_obj_add_int(doc, root, "compression_level", compression_level);
+    /* Optional clean-basis marker: present only when export verified the DB
+     * matches a clean checked-out tree at `commit` (see cbm_artifact_export).
+     * Older binaries ignore this unknown field, so no schema_version bump. */
+    if (reconcile_trusted) {
+        yyjson_mut_obj_add_str(doc, root, "reconcile_basis", "git-clean-head");
+    }
 
     size_t json_len = 0;
     char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, &json_len);
@@ -518,9 +762,19 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
         cbm_store_close(count_store);
     }
 
+    /* Compute the optional clean-basis trust marker. An imported DB can be
+     * fast-reconciled against git only if export can prove it was built from a
+     * clean checked-out tree at a known commit. Any doubt omits the marker and
+     * reconciliation falls back to today's slow-safe full incremental. */
+    char commit[CBM_SZ_64] = "";
+    bool has_commit = git_head_hash(repo_path, commit, sizeof(commit));
+    bool reconcile_trusted = has_commit && is_hex_oid(commit) &&
+                             tree_clean_for_reconcile(repo_path) &&
+                             db_hashes_match_disk(repo_path, db_path, project_name);
+
     /* Write metadata */
-    if (write_metadata(repo_path, project_name, nodes, edges, db_size, (size_t)clen,
-                       compression_level) != 0) {
+    if (write_metadata(repo_path, project_name, commit, nodes, edges, db_size, (size_t)clen,
+                       compression_level, reconcile_trusted) != 0) {
         cbm_unlink(zst_path);
         return CBM_NOT_FOUND;
     }
@@ -675,6 +929,48 @@ bool cbm_artifact_exists(const char *repo_path) {
 
 /* ── Commit hash extraction ──────────────────────────────────────── */
 
+/* Unix epoch seconds of the artifact's indexed_at metadata timestamp.
+ * Returns -1 when there is no artifact.json or indexed_at is absent/unparseable.
+ * Uses the metadata timestamp, NOT the .zst filesystem mtime, because
+ * checkout/touch operations can make an old artifact look fresh. */
+int64_t cbm_artifact_indexed_at_epoch(const char *repo_path) {
+    if (!repo_path) {
+        return -1;
+    }
+    char meta_path[CBM_SZ_4K];
+    if (!artifact_path(meta_path, sizeof(meta_path), repo_path, CBM_ARTIFACT_META)) {
+        return -1;
+    }
+    size_t len = 0;
+    char *json = read_file_alloc(meta_path, &len);
+    if (!json) {
+        return -1;
+    }
+    yyjson_doc *doc = yyjson_read(json, len, 0);
+    free(json);
+    if (!doc) {
+        return -1;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *val = yyjson_obj_get(root, "indexed_at");
+    int64_t epoch = -1;
+    if (val) {
+        epoch = parse_iso8601_utc(yyjson_get_str(val));
+    }
+    yyjson_doc_free(doc);
+    return epoch;
+}
+
+/* Age of the existing artifact in seconds (now - artifact.json indexed_at).
+ * Returns -1 when the indexed_at epoch is unavailable. */
+int64_t cbm_artifact_age_seconds(const char *repo_path) {
+    int64_t epoch = cbm_artifact_indexed_at_epoch(repo_path);
+    if (epoch < 0) {
+        return -1;
+    }
+    return (int64_t)time(NULL) - epoch;
+}
+
 char *cbm_artifact_commit(const char *repo_path) {
     if (!repo_path) {
         return NULL;
@@ -710,4 +1006,196 @@ char *cbm_artifact_commit(const char *repo_path) {
     }
     yyjson_doc_free(doc);
     return result;
+}
+
+/* ── Bootstrap reconciliation ─────────────────────────────────────── */
+
+/* Add every NUL-delimited entry in buf (length len) to the membership set ht.
+ * git -z output NUL-terminates every entry including the last, so each non-empty
+ * entry buf+i is already a C string terminated by its trailing NUL. Keys are
+ * borrowed from buf (the table does not copy keys), so buf must outlive ht.
+ * Empty entries (consecutive NULs) are skipped. */
+static void reconcile_add_nul_entries(CBMHashTable *ht, const char *buf, size_t len) {
+    if (!ht || !buf || len == 0) {
+        return;
+    }
+    size_t i = 0;
+    while (i < len) {
+        const char *entry = buf + i;
+        size_t j = i;
+        while (j < len && buf[j] != '\0') {
+            j++;
+        }
+        if (j > i) {
+            cbm_ht_set(ht, entry, &g_reconcile_sentinel);
+        }
+        i = (j < len) ? j + 1 : len;
+    }
+}
+
+/* After a successful import of a trusted clean-basis artifact, re-stamp
+ * file_hashes rows for files whose content is unchanged between the artifact's
+ * commit and the local working tree, using local stat() values. The subsequent
+ * incremental run then classifies by actual git diff instead of re-parsing
+ * ~every file (whose stored mtime_ns is the exporter's, not local).
+ *
+ * Only rows tracked at the artifact commit are eligible: files git ignores can
+ * still be indexed (.cbmignore negations, #500), and git cannot vouch for their
+ * content — they stay foreign and are re-parsed.
+ *
+ * Returns the number of rows re-stamped, or -1 when reconciliation was skipped
+ * (no git / untrusted metadata / unknown or non-hex commit / shallow clone /
+ * any popen or parse uncertainty). Best-effort: never fails the import — a -1
+ * return leaves rows foreign and the first run falls back to today's slow-safe
+ * full incremental behavior.
+ *
+ * Windows/autocrlf note: on-disk bytes may differ from the exporter's while git
+ * reports "unchanged"; line numbers and parse results are equivalent, so
+ * re-stamping by git's diff is correct. */
+int cbm_artifact_reconcile_hashes(const char *repo_path, const char *cache_db_path,
+                                  const char *project_name) {
+    if (!repo_path || !cache_db_path || !project_name) {
+        return CBM_NOT_FOUND;
+    }
+
+    /* 1. Trusted clean-basis marker must be present and commit must be a valid
+     *    hex object id. Hard gates: repo-controlled metadata never reaches a
+     *    git command otherwise. */
+    if (!read_metadata_reconcile_trusted(repo_path)) {
+        return CBM_NOT_FOUND;
+    }
+    char *commit = cbm_artifact_commit(repo_path);
+    if (!commit || !is_hex_oid(commit)) {
+        free(commit);
+        return CBM_NOT_FOUND;
+    }
+
+    /* 2. Commit must exist locally (shallow-clone guard). commit is hex → safe
+     *    to interpolate into the command. */
+    char catfile_args[CBM_SZ_128];
+    snprintf(catfile_args, sizeof(catfile_args), "cat-file -e '%s^{commit}'", commit);
+    if (!git_run_ok(repo_path, catfile_args)) {
+        free(commit);
+        return CBM_NOT_FOUND;
+    }
+
+    /* 3. Build the changed set relative to the artifact commit, plus the set of
+     *    paths tracked AT that commit. NUL-delimited (-z) output is parsed
+     *    directly; line-oriented parsing cannot handle paths containing
+     *    newlines or quotes. The tracked set exists because git diff/ls-files
+     *    are blind to files git ignores: a gitignored-yet-indexed file (e.g. a
+     *    .cbmignore negation un-skipping a generated dir, #500) would otherwise
+     *    be restamped as "unchanged" while its content is not under git's
+     *    control at all. Only rows tracked at the artifact commit are eligible
+     *    for restamping; everything git can't vouch for stays foreign. */
+    char diff_args[CBM_SZ_256];
+    snprintf(diff_args, sizeof(diff_args), "diff -z --name-only --no-renames %s --", commit);
+    char lstree_args[CBM_SZ_256];
+    snprintf(lstree_args, sizeof(lstree_args), "ls-tree -r -z --name-only %s --", commit);
+    char *diff_out = NULL;
+    size_t diff_len = 0;
+    char *ls_out = NULL;
+    size_t ls_len = 0;
+    char *tracked_out = NULL;
+    size_t tracked_len = 0;
+    if (git_capture_full(repo_path, diff_args, &diff_out, &diff_len) != 0) {
+        free(commit);
+        return CBM_NOT_FOUND;
+    }
+    if (git_capture_full(repo_path, "ls-files -z --others --exclude-standard --", &ls_out,
+                         &ls_len) != 0) {
+        free(diff_out);
+        free(commit);
+        return CBM_NOT_FOUND;
+    }
+    if (git_capture_full(repo_path, lstree_args, &tracked_out, &tracked_len) != 0) {
+        free(diff_out);
+        free(ls_out);
+        free(commit);
+        return CBM_NOT_FOUND;
+    }
+    /* Parse-invariant guard: git -z NUL-terminates every entry including the
+     * last; a non-empty buffer not ending in NUL means truncated/corrupt output
+     * → untrusted → skip rather than risk misclassifying a changed file as
+     * unchanged (graph corruption). */
+    if ((diff_len > 0 && diff_out[diff_len - 1] != '\0') ||
+        (ls_len > 0 && ls_out[ls_len - 1] != '\0') ||
+        (tracked_len > 0 && tracked_out[tracked_len - 1] != '\0')) {
+        free(diff_out);
+        free(ls_out);
+        free(tracked_out);
+        free(commit);
+        return CBM_NOT_FOUND;
+    }
+
+    CBMHashTable *changed = cbm_ht_create(CBM_SZ_64);
+    reconcile_add_nul_entries(changed, diff_out, diff_len);
+    reconcile_add_nul_entries(changed, ls_out, ls_len);
+    int changed_count = (int)cbm_ht_count(changed);
+    CBMHashTable *tracked = cbm_ht_create(CBM_SZ_64);
+    reconcile_add_nul_entries(tracked, tracked_out, tracked_len);
+
+    /* 4. Restamp every row whose rel_path IS tracked at the artifact commit and
+     *    is NOT in the changed set, with local stat() values. Changed or
+     *    untracked rows stay foreign → re-parsed; rows whose file is missing
+     *    locally stay foreign → find_deleted_files purges them. */
+    cbm_store_t *store = cbm_store_open_path(cache_db_path);
+    int restamped = 0;
+    int skipped = 0;
+    if (store) {
+        cbm_file_hash_t *stored = NULL;
+        int stored_count = 0;
+        if (cbm_store_get_file_hashes(store, project_name, &stored, &stored_count) ==
+                CBM_STORE_OK &&
+            stored_count > 0) {
+            cbm_file_hash_t *batch = malloc((size_t)stored_count * sizeof(cbm_file_hash_t));
+            if (batch) {
+                int batch_n = 0;
+                for (int i = 0; i < stored_count; i++) {
+                    if (!cbm_ht_get(tracked, stored[i].rel_path) ||
+                        cbm_ht_get(changed, stored[i].rel_path)) {
+                        continue;
+                    }
+                    char abs[CBM_SZ_4K];
+                    int n = snprintf(abs, sizeof(abs), "%s/%s", repo_path, stored[i].rel_path);
+                    if (n < 0 || n >= (int)sizeof(abs)) {
+                        skipped++;
+                        continue;
+                    }
+                    struct stat st;
+                    if (stat(abs, &st) != 0) {
+                        skipped++;
+                        continue;
+                    }
+                    /* Borrow project from the caller and rel_path/sha256 from
+                     * the row; all outlive the batch upsert call (which
+                     * consumes them) and are freed afterward. */
+                    batch[batch_n].project = project_name;
+                    batch[batch_n].rel_path = stored[i].rel_path;
+                    batch[batch_n].sha256 = stored[i].sha256;
+                    batch[batch_n].mtime_ns = art_stat_mtime_ns(&st);
+                    batch[batch_n].size = (int64_t)st.st_size;
+                    batch_n++;
+                }
+                if (batch_n > 0 &&
+                    cbm_store_upsert_file_hash_batch(store, batch, batch_n) == CBM_STORE_OK) {
+                    restamped = batch_n;
+                }
+                free(batch);
+            }
+        }
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+    }
+
+    cbm_ht_free(changed);
+    cbm_ht_free(tracked);
+    free(diff_out);
+    free(ls_out);
+    free(tracked_out);
+    free(commit);
+
+    cbm_log_info("artifact.reconcile", "restamped", itoa_buf(restamped), "changed",
+                 itoa_buf(changed_count), "skipped", itoa_buf(skipped));
+    return restamped;
 }

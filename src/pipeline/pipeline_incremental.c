@@ -27,6 +27,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include "foundation/platform.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -70,13 +71,61 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 #endif
 }
 
+/* Classify-time file stamp captured exactly once per file. persist_hashes
+ * consumes these instead of re-stat()ing every file post-run (which both
+ * wasted work and masked edits made while indexing was running). */
+typedef struct {
+    int64_t mtime_ns;
+    int64_t size;
+    bool valid;
+} cbm_file_stamp_t;
+
+/* Artifact auto-export debounce (P3). A fast-mode artifact is re-exported on
+ * every incremental run by default; that churns the user's working tree and
+ * burns O(graph) I/O/CPU. Skip the export for small change sets unless the
+ * cumulative drift since the last export crosses the same threshold or the
+ * artifact's indexed_at is older than the max age.
+ * CBM_ARTIFACT_EXPORT_MIN_CHANGES=0 restores per-run export (today's
+ * behavior); CBM_ARTIFACT_EXPORT_MAX_AGE_S overrides the age cap. */
+enum {
+    CBM_ARTIFACT_EXPORT_MIN_CHANGES_DEFAULT = 10,
+    CBM_ARTIFACT_EXPORT_MAX_AGE_S_DEFAULT = 24 * 60 * 60,
+};
+
+/* Non-negative integer env override with a strict parse; any missing, empty,
+ * non-numeric, trailing-garbage, or negative value falls back to def. */
+static int env_override_nonneg(const char *name, int def) {
+    const char *raw = getenv(name);
+    if (!raw || !raw[0]) {
+        return def;
+    }
+    errno = 0;
+    char *end = NULL;
+    long v = strtol(raw, &end, 10);
+    if (errno != 0 || end == raw || *end != '\0' || v < 0 || v > INT_MAX) {
+        return def;
+    }
+    return (int)v;
+}
+
+static int export_min_changes(void) {
+    return env_override_nonneg("CBM_ARTIFACT_EXPORT_MIN_CHANGES",
+                               CBM_ARTIFACT_EXPORT_MIN_CHANGES_DEFAULT);
+}
+
+static int export_max_age_s(void) {
+    return env_override_nonneg("CBM_ARTIFACT_EXPORT_MAX_AGE_S",
+                               CBM_ARTIFACT_EXPORT_MAX_AGE_S_DEFAULT);
+}
+
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored hashes using mtime+size.
  * Returns a boolean array: changed[i] = true if files[i] needs re-parsing.
  * Caller must free the returned array. */
 static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_hash_t *stored,
-                            int stored_count, int *out_changed, int *out_unchanged) {
+                            int stored_count, cbm_file_stamp_t *stamps, int *out_changed,
+                            int *out_unchanged) {
     bool *changed = calloc((size_t)file_count, sizeof(bool));
     if (!changed) {
         return NULL;
@@ -92,7 +141,19 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
         cbm_ht_set(ht, stored[i].rel_path, &stored[i]);
     }
 
+    /* Stat every file exactly once (at classify time) and record the stamp so
+     * persist_hashes can persist it without a second stat. The previous design
+     * re-stat()ed in persist_hashes, which both wasted work and masked mid-run
+     * edits (a post-run mtime hid a file edited while indexing was running). */
     for (int i = 0; i < file_count; i++) {
+        struct stat st;
+        bool st_ok = (stat(files[i].path, &st) == 0);
+        if (stamps) {
+            stamps[i].valid = st_ok;
+            stamps[i].mtime_ns = st_ok ? stat_mtime_ns(&st) : 0;
+            stamps[i].size = st_ok ? (int64_t)st.st_size : 0;
+        }
+
         cbm_file_hash_t *h = cbm_ht_get(ht, files[i].rel_path);
         if (!h) {
             /* New file */
@@ -101,14 +162,7 @@ static bool *classify_files(cbm_file_info_t *files, int file_count, cbm_file_has
             continue;
         }
 
-        struct stat st;
-        if (stat(files[i].path, &st) != 0) {
-            changed[i] = true;
-            n_changed++;
-            continue;
-        }
-
-        if (stat_mtime_ns(&st) != h->mtime_ns || st.st_size != h->size) {
+        if (!st_ok || stat_mtime_ns(&st) != h->mtime_ns || (int64_t)st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
         } else {
@@ -433,33 +487,23 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
 
 /* ── Persist file hashes ─────────────────────────────────────────── */
 
-/* Persist file hash rows for the current discovery and any mode-skipped
- * files preserved from the previous DB.
- *
- * Partial-failure policy: an `upsert` failure on any single row is logged
- * as a warning and the loop continues. We deliberately do NOT abort the
- * whole reindex on a single bad row — partial preservation is better than
- * total loss, and a transient failure on one file should not invalidate
- * the entire incremental update. The trade-off is that a silently-failed
- * row produces the same downstream effect as if the file were never
- * indexed at all (forced re-parse on the next run for current-files,
- * potential orphaned-node revival for mode_skipped). The warning surface
- * is the only signal that something went wrong. */
-static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
-                           int file_count, const cbm_file_hash_t *mode_skipped,
-                           int mode_skipped_count) {
+/* Row-at-a-time fallback used when the single-transaction batch upsert fails
+ * (the batch API rolls back on the first row error). Mirrors the historical
+ * path so one bad row still can't nuke all persistence. Uses classify-time
+ * stamps — no per-file re-stat (see persist_hashes for why that matters). */
+static void persist_hashes_row_by_row(cbm_store_t *store, const char *project,
+                                      cbm_file_info_t *files, int file_count,
+                                      const cbm_file_stamp_t *stamps,
+                                      const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
     int current_failed = 0;
     int ms_failed = 0;
 
-    /* Current discovery: re-stat to capture any mtime/size that changed
-     * during the run, and write fresh hash rows for visited files. */
     for (int i = 0; i < file_count; i++) {
-        struct stat st;
-        if (stat(files[i].path, &st) != 0) {
+        if (!stamps || !stamps[i].valid) {
             continue;
         }
         int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
-                                            stat_mtime_ns(&st), st.st_size);
+                                            stamps[i].mtime_ns, stamps[i].size);
         if (rc != CBM_STORE_OK) {
             cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
                          files[i].rel_path, "rc", itoa_buf(rc));
@@ -467,30 +511,16 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         }
     }
 
-    /* Mode-skipped (preserved): re-upsert hash rows from the previous DB
-     * so the next reindex can still classify these files correctly. Without
-     * this, an orphaned-node bug emerges where:
-     *   - full mode indexes everything
-     *   - fast mode runs and drops mode-skipped hash rows
-     *   - file is then deleted on disk
-     *   - next reindex's stored hashes don't include the file → noop or
-     *     can't detect the deletion → graph nodes for the deleted file
-     *     remain forever (or until a destructive rebuild).
-     *
-     * A failure here is more serious than a current-files failure because
-     * it can revive the orphaned-node bug for that specific file. Logged
-     * with scope=mode_skipped so the warning is searchable. */
-    if (mode_skipped) {
-        for (int i = 0; i < mode_skipped_count; i++) {
-            int rc =
-                cbm_store_upsert_file_hash(store, project, mode_skipped[i].rel_path,
-                                           mode_skipped[i].sha256 ? mode_skipped[i].sha256 : "",
-                                           mode_skipped[i].mtime_ns, mode_skipped[i].size);
-            if (rc != CBM_STORE_OK) {
-                cbm_log_warn("incremental.persist_hash_failed", "scope", "mode_skipped", "rel_path",
-                             mode_skipped[i].rel_path, "rc", itoa_buf(rc));
-                ms_failed++;
-            }
+    /* Mode-skipped rows are preserved verbatim so the next reindex can still
+     * classify them (see find_deleted_files for the orphaned-node guard). */
+    for (int i = 0; i < mode_skipped_count; i++) {
+        int rc = cbm_store_upsert_file_hash(store, project, mode_skipped[i].rel_path,
+                                            mode_skipped[i].sha256 ? mode_skipped[i].sha256 : "",
+                                            mode_skipped[i].mtime_ns, mode_skipped[i].size);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_warn("incremental.persist_hash_failed", "scope", "mode_skipped", "rel_path",
+                         mode_skipped[i].rel_path, "rc", itoa_buf(rc));
+            ms_failed++;
         }
     }
 
@@ -498,6 +528,80 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         cbm_log_warn("incremental.persist_summary", "current_failed", itoa_buf(current_failed),
                      "mode_skipped_failed", itoa_buf(ms_failed));
     }
+}
+
+/* Persist file hash rows for the current discovery and any mode-skipped
+ * files preserved from the previous DB.
+ *
+ * Single transaction + one stat per file: classify_files already stat()ed
+ * every file (captured in `stamps`), so we build one cbm_file_hash_t array
+ * from files[]+stamps[] plus mode_skipped[] and upsert it via the batch API
+ * (one BEGIN…COMMIT). This replaces the prior row-at-a-time loop that
+ * re-stat()ed every file post-run — the re-stat was both wasted work AND a
+ * correctness bug: it stamped a file with its post-run mtime, masking any
+ * edit made while indexing was running so the next run missed it.
+ * Classify-time stamps fix that.
+ *
+ * Partial-failure policy: an `upsert` failure on any single row is logged
+ * as a warning and the loop continues. We deliberately do NOT abort the
+ * whole reindex on a single bad row — partial preservation is better than
+ * total loss, and a transient failure on one file should not invalidate
+ * the entire incremental update. The batch API rolls back on first failure,
+ * so on batch failure we fall back to persist_hashes_row_by_row to preserve
+ * that contract. The trade-off is that a silently-failed row produces the
+ * same downstream effect as if the file were never indexed at all (forced
+ * re-parse on the next run for current-files, potential orphaned-node
+ * revival for mode_skipped). The warning surface is the only signal that
+ * something went wrong. */
+static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+                           int file_count, const cbm_file_stamp_t *stamps,
+                           const cbm_file_hash_t *mode_skipped, int mode_skipped_count) {
+    int total = file_count + mode_skipped_count;
+    if (total <= 0) {
+        return;
+    }
+
+    cbm_file_hash_t *batch = malloc((size_t)total * sizeof(cbm_file_hash_t));
+    if (!batch) {
+        /* OOM: fall back to row-at-a-time rather than dropping all persistence. */
+        persist_hashes_row_by_row(store, project, files, file_count, stamps, mode_skipped,
+                                  mode_skipped_count);
+        return;
+    }
+
+    int n = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (!stamps || !stamps[i].valid) {
+            continue; /* couldn't stat at classify time → skip, re-parse next run */
+        }
+        batch[n].project = project;
+        batch[n].rel_path = files[i].rel_path;
+        batch[n].sha256 = ""; /* column not yet populated at write sites */
+        batch[n].mtime_ns = stamps[i].mtime_ns;
+        batch[n].size = stamps[i].size;
+        n++;
+    }
+    for (int i = 0; i < mode_skipped_count; i++) {
+        batch[n].project = project;
+        batch[n].rel_path = mode_skipped[i].rel_path;
+        batch[n].sha256 = mode_skipped[i].sha256 ? mode_skipped[i].sha256 : "";
+        batch[n].mtime_ns = mode_skipped[i].mtime_ns;
+        batch[n].size = mode_skipped[i].size;
+        n++;
+    }
+
+    if (n > 0) {
+        int rc = cbm_store_upsert_file_hash_batch(store, batch, n);
+        if (rc != CBM_STORE_OK) {
+            /* Batch rolls back on first row failure; fall back so one bad row
+             * can't lose all hash rows. */
+            cbm_log_warn("incremental.persist_batch_failed", "rc", itoa_buf(rc), "rows",
+                         itoa_buf(n));
+            persist_hashes_row_by_row(store, project, files, file_count, stamps, mode_skipped,
+                                      mode_skipped_count);
+        }
+    }
+    free(batch);
 }
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
@@ -629,9 +733,9 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
+                             cbm_file_info_t *files, int file_count, const cbm_file_stamp_t *stamps,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path) {
+                             const char *repo_path, int changed_total) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -649,7 +753,8 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
-        persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+        persist_hashes(hash_store, project, files, file_count, stamps, mode_skipped,
+                       mode_skipped_count);
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
          * any triggers that could have kept nodes_fts synchronized, so we
@@ -668,9 +773,44 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
         cbm_store_close(hash_store);
     }
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
+    /* Auto-update artifact if one already exists (persistence was enabled
+     * previously). Debounced: skip for small change sets unless cumulative
+     * drift since the last export crosses the same threshold or the artifact's
+     * indexed_at is older than the max age. Staleness is cheap with P1's
+     * git reconcile (a slightly larger diff to reconcile on bootstrap); the
+     * skip is logged so staleness stays observable ("no silent caps"), and
+     * CBM_ARTIFACT_EXPORT_MIN_CHANGES=0 forces per-run export. */
     if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
+        int min_changes = export_min_changes();
+        int64_t age_s = cbm_artifact_age_seconds(repo_path);
+        bool age_expired = (age_s >= 0 && age_s >= export_max_age_s());
+
+        /* Cumulative drift: files whose classify-time mtime lands in a later
+         * second than the artifact's indexed_at. A per-run change count alone
+         * would let many consecutive small runs leave the artifact stale
+         * forever short of the age cap; files touched since the last export
+         * keep mtimes newer than indexed_at, so this accumulates across runs
+         * with no persisted counter. Strictly-later-second comparison keeps
+         * files written within the export's own second (the whole tree during
+         * a fast full index) from counting as drift; over-counting
+         * (touched-but-unchanged files) only exports more often — safe. */
+        int drift = 0;
+        int64_t exported_epoch = cbm_artifact_indexed_at_epoch(repo_path);
+        if (exported_epoch >= 0 && stamps) {
+            const int64_t next_sec_ns = (exported_epoch + 1) * CBM_NS_PER_SEC;
+            for (int i = 0; i < file_count; i++) {
+                if (stamps[i].valid && stamps[i].mtime_ns >= next_sec_ns) {
+                    drift++;
+                }
+            }
+        }
+
+        if (changed_total >= min_changes || drift >= min_changes || age_expired) {
+            cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
+        } else {
+            cbm_log_info("artifact.export_skipped", "changed", itoa_buf(changed_total), "drift",
+                         itoa_buf(drift), "age_s", itoa_buf((int)age_s));
+        }
     }
 }
 
@@ -698,8 +838,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     /* Classify files */
     int n_changed = 0;
     int n_unchanged = 0;
+    cbm_file_stamp_t *stamps = calloc((size_t)file_count, sizeof(cbm_file_stamp_t));
     bool *is_changed =
-        classify_files(files, file_count, stored, stored_count, &n_changed, &n_unchanged);
+        classify_files(files, file_count, stored, stored_count, stamps, &n_changed, &n_unchanged);
 
     /* Classify stored files absent from current discovery: truly-deleted
      * (purge) vs mode-skipped (preserve nodes AND hash rows). */
@@ -720,6 +861,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     if (n_changed == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
         free(is_changed);
+        free(stamps);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
@@ -757,6 +899,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_log_error("incremental.err", "msg", "load_db_failed");
         cbm_gbuf_free(existing);
         free(changed_files);
+        free(stamps);
         for (int i = 0; i < deleted_count; i++) {
             free(deleted[i]);
         }
@@ -866,8 +1009,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p));
+    dump_and_persist(existing, db_path, project, files, file_count, stamps, mode_skipped,
+                     mode_skipped_count, cbm_pipeline_repo_path(p), n_changed + deleted_count);
+    free(stamps);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 
