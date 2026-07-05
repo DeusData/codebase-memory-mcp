@@ -63,6 +63,7 @@ enum {
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
     ST_ARCH_PATH_LIKE_EXTRA = 3, /* "/%" plus NUL */
+    ST_DELTA_EDGE_BULK_MIN = CBM_SZ_32,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -4995,6 +4996,163 @@ static void store_endpoint_lookup_free(const char **unique_qns, int64_t *unique_
     cbm_ht_free(endpoint_map);
 }
 
+static int store_publish_delta_edges_loop(cbm_store_t *s, const cbm_store_file_delta_t *delta,
+                                          const cbm_store_delta_edge_t *edges, int edge_count,
+                                          const int64_t *unique_ids,
+                                          const int *endpoint_unique_indexes, bool own_edges) {
+    int rc = CBM_STORE_OK;
+    for (int i = 0; i < edge_count; i++) {
+        int source_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN];
+        int target_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN + SKIP_ONE];
+        int64_t source_id = unique_ids[source_index];
+        int64_t target_id = unique_ids[target_index];
+        if (source_id <= CBM_STORE_NO_NODE_ID || target_id <= CBM_STORE_NO_NODE_ID) {
+            return CBM_STORE_NOT_FOUND;
+        }
+        cbm_edge_t edge = {.project = delta->project,
+                           .source_id = source_id,
+                           .target_id = target_id,
+                           .type = edges[i].type,
+                           .properties_json = edges[i].properties_json};
+        int64_t edge_id = cbm_store_insert_edge(s, &edge);
+        if (edge_id <= CBM_STORE_NO_NODE_ID) {
+            return CBM_STORE_ERR;
+        }
+        if (own_edges) {
+            rc = cbm_store_upsert_edge_owner(s, delta->project, edge_id, delta->rel_path,
+                                             edges[i].derived_kind, delta->generation);
+            if (rc != CBM_STORE_OK) {
+                return rc;
+            }
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static int store_prepare_delta_edges_temp(cbm_store_t *s) {
+    static const char create_sql[] =
+        "CREATE TEMP TABLE IF NOT EXISTS cbm_delta_edges_tmp("
+        "seq INTEGER PRIMARY KEY,"
+        "source_id INTEGER NOT NULL,"
+        "target_id INTEGER NOT NULL,"
+        "type TEXT NOT NULL,"
+        "properties TEXT NOT NULL,"
+        "derived_kind TEXT NOT NULL);";
+    int rc = exec_sql(s, create_sql);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return exec_sql(s, "DELETE FROM cbm_delta_edges_tmp;");
+}
+
+static int store_fill_delta_edges_temp(cbm_store_t *s, const cbm_store_delta_edge_t *edges,
+                                       int edge_count, const int64_t *unique_ids,
+                                       const int *endpoint_unique_indexes, bool own_edges) {
+    static const char insert_sql[] =
+        "INSERT INTO cbm_delta_edges_tmp"
+        "(seq, source_id, target_id, type, properties, derived_kind) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, insert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "fill_delta_edges_temp prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        int source_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN];
+        int target_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN + SKIP_ONE];
+        int64_t source_id = unique_ids[source_index];
+        int64_t target_id = unique_ids[target_index];
+        if (source_id <= CBM_STORE_NO_NODE_ID || target_id <= CBM_STORE_NO_NODE_ID) {
+            sqlite3_finalize(stmt);
+            return CBM_STORE_NOT_FOUND;
+        }
+        sqlite3_bind_int(stmt, ST_COL_1, i);
+        sqlite3_bind_int64(stmt, ST_COL_2, source_id);
+        sqlite3_bind_int64(stmt, ST_COL_3, target_id);
+        bind_text(stmt, ST_COL_4, safe_str(edges[i].type));
+        bind_text(stmt, ST_COL_5, safe_props(edges[i].properties_json));
+        bind_text(stmt, ST_COL_6,
+                  own_edges && edges[i].derived_kind ? edges[i].derived_kind
+                                                     : CBM_STORE_DERIVED_KIND_DIRECT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "fill_delta_edges_temp");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_publish_delta_edges_bulk(cbm_store_t *s, const cbm_store_file_delta_t *delta,
+                                          const cbm_store_delta_edge_t *edges, int edge_count,
+                                          const int64_t *unique_ids,
+                                          const int *endpoint_unique_indexes, bool own_edges) {
+    int rc = store_prepare_delta_edges_temp(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_fill_delta_edges_temp(s, edges, edge_count, unique_ids, endpoint_unique_indexes,
+                                     own_edges);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    static const char upsert_edges_sql[] =
+        "INSERT INTO edges(project, source_id, target_id, type, properties) "
+        "SELECT ?1, source_id, target_id, type, properties "
+        "FROM cbm_delta_edges_tmp WHERE true ORDER BY seq "
+        "ON CONFLICT(source_id, target_id, type) DO UPDATE SET "
+        "properties = json_patch(properties, excluded.properties);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, upsert_edges_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "publish_delta_edges_bulk edges prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "publish_delta_edges_bulk edges");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+
+    if (!own_edges) {
+        return CBM_STORE_OK;
+    }
+
+    static const char upsert_owners_sql[] =
+        "INSERT INTO edge_owners(project, edge_id, rel_path, derived_kind, generation) "
+        "SELECT ?1, e.id, ?2, t.derived_kind, ?3 "
+        "FROM cbm_delta_edges_tmp t "
+        "JOIN edges e ON e.source_id = t.source_id "
+        " AND e.target_id = t.target_id AND e.type = t.type "
+        "WHERE true ORDER BY t.seq "
+        "ON CONFLICT(project, edge_id) DO UPDATE SET "
+        "rel_path = excluded.rel_path, "
+        "derived_kind = excluded.derived_kind, "
+        "generation = excluded.generation;";
+    if (sqlite3_prepare_v2(s->db, upsert_owners_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "publish_delta_edges_bulk owners prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, delta->project);
+    bind_text(stmt, ST_COL_2, delta->rel_path);
+    sqlite3_bind_int64(stmt, ST_COL_3, delta->generation);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "publish_delta_edges_bulk owners");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
 static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_t *delta,
                                      const cbm_store_delta_edge_t *edges, int edge_count,
                                      bool own_edges) {
@@ -5057,40 +5215,16 @@ static int store_publish_delta_edges(cbm_store_t *s, const cbm_store_file_delta_
     }
 
     CBM_PROF_START(t_insert);
-    for (int i = 0; i < edge_count; i++) {
-        int source_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN];
-        int target_index = endpoint_unique_indexes[(size_t)i * PAIR_LEN + SKIP_ONE];
-        int64_t source_id = unique_ids[source_index];
-        int64_t target_id = unique_ids[target_index];
-        if (source_id <= CBM_STORE_NO_NODE_ID || target_id <= CBM_STORE_NO_NODE_ID) {
-            store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
-                                       endpoint_map);
-            return CBM_STORE_NOT_FOUND;
-        }
-        cbm_edge_t edge = {.project = delta->project,
-                           .source_id = source_id,
-                           .target_id = target_id,
-                           .type = edges[i].type,
-                           .properties_json = edges[i].properties_json};
-        int64_t edge_id = cbm_store_insert_edge(s, &edge);
-        if (edge_id <= CBM_STORE_NO_NODE_ID) {
-            store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
-                                       endpoint_map);
-            return CBM_STORE_ERR;
-        }
-        if (own_edges) {
-            rc = cbm_store_upsert_edge_owner(s, delta->project, edge_id, delta->rel_path,
-                                             edges[i].derived_kind, delta->generation);
-            if (rc != CBM_STORE_OK) {
-                store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes,
-                                           endpoint_map);
-                return rc;
-            }
-        }
+    if (edge_count >= ST_DELTA_EDGE_BULK_MIN) {
+        rc = store_publish_delta_edges_bulk(s, delta, edges, edge_count, unique_ids,
+                                            endpoint_unique_indexes, own_edges);
+    } else {
+        rc = store_publish_delta_edges_loop(s, delta, edges, edge_count, unique_ids,
+                                            endpoint_unique_indexes, own_edges);
     }
     CBM_PROF_END_N("store_delta_edges", "3_insert_edges", t_insert, edge_count);
     store_endpoint_lookup_free(unique_qns, unique_ids, endpoint_unique_indexes, endpoint_map);
-    return CBM_STORE_OK;
+    return rc;
 }
 
 static int store_publish_file_delta_edges_body(cbm_store_t *s,
