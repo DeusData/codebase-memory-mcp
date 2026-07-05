@@ -384,6 +384,8 @@ typedef struct {
 void cbm_pkg_entries_init(cbm_pkg_entries_t *e);
 void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
+enum { CBM_PIPELINE_STORE_BACKED_LSP_SCOPE_DEFAULT_CAP = CBM_SZ_64 };
+
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
 typedef struct {

@@ -11799,7 +11799,7 @@ TEST(incremental_fast_new_folder_exact_delta_parity) {
     PASS();
 }
 
-TEST(incremental_fast_route_decorator_change_matches_full_rebuild) {
+TEST(incremental_fast_route_decorator_change_matches_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -11838,8 +11838,7 @@ TEST(incremental_fast_route_decorator_change_matches_full_rebuild) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
-    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_free(p);
 
     ASSERT(!pipeline_store_has_route_name(g_incr_dbpath, project, "/api/orders"));
@@ -12229,7 +12228,7 @@ TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
     PASS();
 }
 
-TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
+TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild) {
     enum { PIPELINE_EXACT_ONE_PATH = 1 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -12285,16 +12284,14 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
     int run_rc = cbm_pipeline_run(p);
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
-    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") == NULL);
-    ASSERT(strstr(logs, "msg=incremental.exact.frontier") == NULL);
-    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") != NULL);
-    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") == NULL);
     ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
     ASSERT_EQ(stats.changed_paths, 1);
     ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_ONE_PATH);
-    ASSERT_EQ(stats.published_paths, -1);
+    ASSERT_EQ(stats.published_paths, PIPELINE_EXACT_ONE_PATH);
     cbm_pipeline_free(p);
 
     char diff_err[CBM_SZ_8K] = {0};
@@ -12302,7 +12299,7 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err
-                         : "Python scoped-LSP full reindex differed from fresh rebuild");
+                         : "Python scoped-LSP exact reindex differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -12312,7 +12309,7 @@ TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex) {
     PASS();
 }
 
-TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex) {
+TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild) {
     enum { PIPELINE_EXACT_ONE_PATH = 1 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -12381,10 +12378,10 @@ TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex) {
     int run_rc = cbm_pipeline_run(p);
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
-    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") != NULL);
-    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") == NULL);
     ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_free(p);
 
     char *source_qn = cbm_pipeline_fqn_compute(project, "service.py", "Service.run");
@@ -12399,7 +12396,7 @@ TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err
-                         : "Python receiver-type full reindex differed from fresh rebuild");
+                         : "Python receiver-type exact reindex differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -15616,14 +15613,14 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_new_folder_exact_delta_parity);
-    RUN_TEST(incremental_fast_route_decorator_change_matches_full_rebuild);
+    RUN_TEST(incremental_fast_route_decorator_change_matches_fresh_rebuild);
     RUN_TEST(incremental_fast_arg_url_route_change_matches_parallel_full_rebuild);
     RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
     RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
-    RUN_TEST(incremental_overlay_publish_python_scoped_lsp_gap_uses_full_reindex);
-    RUN_TEST(incremental_overlay_python_receiver_type_gap_uses_full_reindex);
+    RUN_TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild);
+    RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
     RUN_TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild);
