@@ -10967,7 +10967,7 @@ TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale) {
     PASS();
 }
 
-TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build) {
+TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild) {
     enum { PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -11003,14 +11003,33 @@ TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build)
     const char *logs = pipeline_capture_logs_end();
     ASSERT_EQ(run_rc, 0);
     ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
-    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=inbound_edges_require_full") !=
-           NULL);
+    char exact_fallback_log[CBM_SZ_128];
+    n = snprintf(exact_fallback_log, sizeof(exact_fallback_log),
+                 "msg=incremental.exact.fallback reason=%s",
+                 CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
+    ASSERT(n >= 0 && (size_t)n < sizeof(exact_fallback_log));
+    ASSERT(strstr(logs, exact_fallback_log) != NULL);
+    char full_fallback_log[CBM_SZ_128];
+    n = snprintf(full_fallback_log, sizeof(full_fallback_log),
+                 "msg=incremental.fallback reason=%s",
+                 CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
+    ASSERT(n >= 0 && (size_t)n < sizeof(full_fallback_log));
+    ASSERT(strstr(logs, full_fallback_log) != NULL);
     ASSERT(strstr(logs, "msg=incremental.exact.frontier") == NULL);
     ASSERT(strstr(logs, "msg=incremental.exact.done") == NULL);
-    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
-    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "inbound_edges_require_full");
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p),
+                  CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
     cbm_pipeline_free(p);
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "inbound full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
 
     free(project);
     cbm_config_close(cfg);
@@ -14623,7 +14642,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_full_stale_on_exact_defers_global_derived_refresh);
     RUN_TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale);
-    RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_before_exact_build);
+    RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
     RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);
