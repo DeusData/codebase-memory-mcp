@@ -12217,21 +12217,32 @@ TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
     for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
         ASSERT_NOT_NULL(provider_qns[i]);
     }
+    const char *provider_qn_view[PIPELINE_PERSISTED_DEF_CAP] = {
+        provider_qns[0],
+        provider_qns[1],
+        provider_qns[2],
+    };
+    cbm_node_t *provider_nodes = NULL;
+    int provider_node_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qns(store, project, provider_qn_view,
+                                          PIPELINE_PERSISTED_DEF_CAP, &provider_nodes,
+                                          &provider_node_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(provider_node_count, PIPELINE_PERSISTED_DEF_CAP);
 
     CBMArena persisted_arena;
     cbm_arena_init(&persisted_arena);
     CBMLSPDef persisted_defs[PIPELINE_PERSISTED_DEF_CAP];
     memset(persisted_defs, 0, sizeof(persisted_defs));
     int persisted_count = 0;
-    for (int i = 0; i < PIPELINE_PERSISTED_DEF_CAP; i++) {
-        cbm_node_t node = {0};
-        ASSERT_EQ(cbm_store_find_node_by_qn(store, project, provider_qns[i], &node), CBM_STORE_OK);
-        ASSERT_EQ(cbm_pxc_build_lsp_def_from_node(&persisted_arena, &node, CBM_LANG_PYTHON,
+    for (int i = 0; i < provider_node_count; i++) {
+        ASSERT_EQ(cbm_pxc_build_lsp_def_from_node(&persisted_arena, &provider_nodes[i],
+                                                  CBM_LANG_PYTHON,
                                                   &persisted_defs[persisted_count]),
                   0);
         persisted_count++;
-        cbm_node_free_fields(&node);
     }
+    cbm_store_free_nodes(provider_nodes, provider_node_count);
     cbm_store_close(store);
 
     int total_def_count = own_def_count + persisted_count;

@@ -1950,6 +1950,126 @@ int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char **qns,
+                                int qn_count, cbm_node_t **out, int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    if (qn_count <= 0) {
+        return CBM_STORE_OK;
+    }
+    if (!qns) {
+        return CBM_STORE_ERR;
+    }
+
+    int cap = qn_count < ST_INIT_CAP_16 ? ST_INIT_CAP_16 : qn_count;
+    cbm_node_t *arr = calloc((size_t)cap, sizeof(*arr));
+    if (!arr) {
+        store_set_error(s, "find_nodes_by_qns out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int n = 0;
+    int offset = 0;
+    const int sqlite_bind_limit = sqlite3_limit(s->db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    const int qn_bind_limit =
+        sqlite_bind_limit > SKIP_ONE ? (sqlite_bind_limit - SKIP_ONE) / PAIR_LEN : SKIP_ONE;
+    static const char prefix[] = "WITH q(ord, qn) AS (VALUES ";
+    static const char suffix[] =
+        ") SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, "
+        "n.start_line, n.end_line, n.properties "
+        "FROM q JOIN nodes n ON n.project=? AND n.qualified_name=q.qn "
+        "ORDER BY q.ord;";
+
+    while (offset < qn_count) {
+        char sql[ST_SQL_BUF];
+        int pos = snprintf(sql, sizeof(sql), "%s", prefix);
+        if (pos < 0 || pos >= (int)sizeof(sql)) {
+            cbm_store_free_nodes(arr, n);
+            return CBM_STORE_ERR;
+        }
+
+        int chunk_end = offset;
+        int bind_count = 0;
+        for (; chunk_end < qn_count && bind_count < qn_bind_limit; chunk_end++) {
+            if (!qns[chunk_end]) {
+                continue;
+            }
+            static const char row_sql[] = "(?,?)";
+            int extra = (bind_count > 0 ? 1 : 0) + (int)SLEN(row_sql) + (int)SLEN(suffix);
+            if (pos + extra + ST_IN_CLAUSE_MARGIN >= (int)sizeof(sql)) {
+                break;
+            }
+            if (bind_count > 0) {
+                sql[pos++] = ',';
+            }
+            memcpy(sql + pos, row_sql, SLEN(row_sql));
+            pos += (int)SLEN(row_sql);
+            bind_count++;
+        }
+        if (bind_count == 0) {
+            offset++;
+            continue;
+        }
+        if (pos + (int)SLEN(suffix) >= (int)sizeof(sql)) {
+            cbm_store_free_nodes(arr, n);
+            return CBM_STORE_ERR;
+        }
+        memcpy(sql + pos, suffix, SLEN(suffix) + 1);
+
+        sqlite3_stmt *stmt = NULL;
+        if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "find_nodes_by_qns prepare");
+            cbm_store_free_nodes(arr, n);
+            return CBM_STORE_ERR;
+        }
+
+        int bind_col = SKIP_ONE;
+        for (int i = offset; i < chunk_end; i++) {
+            if (!qns[i]) {
+                continue;
+            }
+            sqlite3_bind_int(stmt, bind_col++, i);
+            bind_text(stmt, bind_col++, qns[i]);
+        }
+        bind_text(stmt, bind_col, project);
+
+        int step_rc = SQLITE_OK;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            if (n >= cap &&
+                store_grow_array(s, (void **)&arr, &cap, sizeof(*arr),
+                                 "find_nodes_by_qns out of memory", true) != CBM_STORE_OK) {
+                sqlite3_finalize(stmt);
+                cbm_store_free_nodes(arr, n);
+                return CBM_STORE_ERR;
+            }
+            if (scan_node(s, stmt, &arr[n]) != CBM_STORE_OK) {
+                sqlite3_finalize(stmt);
+                cbm_store_free_nodes(arr, n + 1);
+                return CBM_STORE_ERR;
+            }
+            n++;
+        }
+        if (step_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "find_nodes_by_qns step");
+            sqlite3_finalize(stmt);
+            cbm_store_free_nodes(arr, n);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_finalize(stmt);
+        offset = chunk_end;
+    }
+
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 static int collect_nodes_from_stmt(cbm_store_t *s, sqlite3_stmt *stmt, const char *op,
                                    cbm_node_t **out, int *count) {
     if (!out || !count) {

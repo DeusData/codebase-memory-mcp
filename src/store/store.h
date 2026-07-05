@@ -527,6 +527,11 @@ int cbm_store_find_nodes_by_file_overlay_view(cbm_store_t *s, const char *projec
 int cbm_store_find_node_ids_by_qns(cbm_store_t *s, const char *project, const char **qns,
                                    int qn_count, int64_t *out_ids);
 
+/* Batch lookup: return full node rows for qualified names that exist in project.
+ * Results are ordered by the input QN order; missing/null QNs are skipped. */
+int cbm_store_find_nodes_by_qns(cbm_store_t *s, const char *project, const char **qns,
+                                int qn_count, cbm_node_t **out, int *count);
+
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
 int cbm_store_count_nodes(cbm_store_t *s, const char *project);
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
