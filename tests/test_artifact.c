@@ -524,8 +524,7 @@ TEST(artifact_reconcile_skips_untracked_rows) {
     snprintf(gi, sizeof(gi), "%s/.gitignore", repoB);
     write_text_file(gen, "pub fn generated_local() {}\n");
     write_text_file(gi, "gen.rs\n");
-    ASSERT_EQ(runf("git -C '%s' add .gitignore && git -C '%s' commit -qm ignore", repoB, repoB),
-              0);
+    ASSERT_EQ(runf("git -C '%s' add .gitignore && git -C '%s' commit -qm ignore", repoB, repoB), 0);
 
     char dbB[1152];
     snprintf(dbB, sizeof(dbB), "%s/b.db", g_tmpdir);
@@ -618,8 +617,9 @@ TEST(artifact_reconcile_skips_unknown_commit) {
     snprintf(meta, sizeof(meta), "%s/.codebase-memory/artifact.json", repoB);
     FILE *fp = fopen(meta, "w");
     ASSERT_NOT_NULL(fp);
-    fprintf(fp, "{\"schema_version\":2,\"commit\":\"%s\","
-                "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}",
+    fprintf(fp,
+            "{\"schema_version\":2,\"commit\":\"%s\","
+            "\"original_size\":1000,\"reconcile_basis\":\"git-clean-head\"}",
             "1111111111111111111111111111111111111111");
     fclose(fp);
 
