@@ -702,8 +702,8 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
             snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
             stored_key = cbm_ht_get_key(r->exact, candidate);
             if (stored_key) {
-                return (cbm_resolution_t){
-                    stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+                return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE,
+                                          REG_RESOLVED};
             }
         }
     }
@@ -899,7 +899,8 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         if (import_vals && import_count > 0) {
             res = resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
         } else {
-            const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+            const char *best =
+                best_by_import_distance((const char **)arr->items, arr->count, module_qn);
             if (best) {
                 double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
                 res = (cbm_resolution_t){best, "suffix_match", conf, arr->count};
