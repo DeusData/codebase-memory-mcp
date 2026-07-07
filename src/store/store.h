@@ -758,13 +758,26 @@ typedef struct {
     double score;
 } cbm_vector_result_t;
 
+/* Maximum first-keyword candidate window scored and re-ranked for paged
+ * semantic-primary results. */
+enum { CBM_VECTOR_SEARCH_CANDIDATE_CAP = 250 };
+
+typedef enum {
+    CBM_VECTOR_SEARCH_SIDECAR = 0,
+    CBM_VECTOR_SEARCH_PRIMARY = 1,
+} cbm_vector_search_policy_t;
+
 /* Search for nodes similar to the given query keywords using stored RI vectors.
- * Builds a merged query vector from the keywords, then does cosine scan via
- * the cbm_cosine_i8 SQL function joined with the nodes table.
- * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+ * Each keyword is scored independently and candidates are ranked by their
+ * minimum cosine. The first keyword drives a bounded SQL prefilter; the full
+ * keyword set is applied in memory. Primary-result searches use a hard cap and
+ * minimum-match threshold; sidecar searches retain the legacy limit*5 window
+ * without thresholding. total_count reports threshold-qualified primary
+ * matches in the bounded window. Returns results sorted by score DESC. Caller
+ * must free with cbm_store_free_vector_results. */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
-                            int keyword_count, int limit, cbm_vector_result_t **out,
-                            int *out_count);
+                            int keyword_count, int limit, cbm_vector_search_policy_t policy,
+                            cbm_vector_result_t **out, int *out_count, int *total_count);
 
 /* Free vector search results. */
 void cbm_store_free_vector_results(cbm_vector_result_t *results, int count);

@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include "foundation/constants.h"
 
+#include <limits.h>
 #include <math.h>
 
 enum {
@@ -7114,7 +7115,12 @@ enum {
     VS_RI_SEED = 0x52494E44,
     VS_MAX_KW = 32,
     VS_STR_BUF = 16,
+    VS_PREFILTER_MULTIPLIER = 5,
 };
+
+/* Query retrieval needs a much lower bar than SEMANTICALLY_RELATED edge
+ * creation, but zero/near-zero cosine candidates are not meaningful matches. */
+#define VS_MIN_MATCH_SCORE 0.10
 
 /* Try to look up an enriched int8 vector for `token` in the token_vectors
  * table.  On success, writes the de-quantized float representation to
@@ -7265,11 +7271,29 @@ static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *
     return results;
 }
 
+static int vs_result_score_desc(const void *lhs, const void *rhs) {
+    const cbm_vector_result_t *a = lhs;
+    const cbm_vector_result_t *b = rhs;
+    if (a->score < b->score) {
+        return 1;
+    }
+    if (a->score > b->score) {
+        return -1;
+    }
+    if (a->node_id < b->node_id) {
+        return -1;
+    }
+    return a->node_id > b->node_id;
+}
+
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
-                            int keyword_count, int limit, cbm_vector_result_t **out,
-                            int *out_count) {
+                            int keyword_count, int limit, cbm_vector_search_policy_t policy,
+                            cbm_vector_result_t **out, int *out_count, int *total_count) {
     *out = NULL;
     *out_count = 0;
+    if (total_count) {
+        *total_count = 0;
+    }
     if (!s || !project || !keywords || keyword_count <= 0) {
         return CBM_STORE_ERR;
     }
@@ -7279,17 +7303,15 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     if (actual_kw == 0) {
         return CBM_STORE_OK;
     }
-
-    /* Scan all node vectors, compute per-keyword cosine, take min.
-     * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
-     * then re-score with min across all keywords in the append helper. */
+    /* Fetch a first-keyword candidate window, then re-score each candidate
+     * with the minimum cosine across all query keywords. */
     const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label,"
                       "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"
                       " WHERE v.project = ?2"
                       " AND n.label IN ('Function','Method','Class')"
-                      " ORDER BY score DESC"
+                      " ORDER BY score DESC, n.id ASC"
                       " LIMIT ?3";
 
     sqlite3_stmt *stmt = NULL;
@@ -7299,8 +7321,19 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
-    /* Use first keyword for SQL pre-filter, fetch more candidates for re-ranking */
-    int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
+    /* Use the first keyword for a bounded SQL prefilter, then re-rank that
+     * window with the minimum score across every keyword. */
+    int requested_limit = limit > 0 ? limit : CBM_SZ_16;
+    bool primary_results = policy == CBM_VECTOR_SEARCH_PRIMARY;
+    if (primary_results && requested_limit > CBM_VECTOR_SEARCH_CANDIDATE_CAP) {
+        requested_limit = CBM_VECTOR_SEARCH_CANDIDATE_CAP;
+    }
+    int fetch_limit = CBM_VECTOR_SEARCH_CANDIDATE_CAP;
+    if (!primary_results) {
+        fetch_limit = requested_limit > INT_MAX / VS_PREFILTER_MULTIPLIER
+                          ? INT_MAX
+                          : requested_limit * VS_PREFILTER_MULTIPLIER;
+    }
     sqlite3_bind_blob(stmt, SKIP_ONE, kw_vecs[0], VS_VEC_DIM, SQLITE_STATIC);
     sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
     sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
@@ -7325,6 +7358,13 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
             break;
         }
         results = grown;
+        if (primary_results && results[count - 1].score < VS_MIN_MATCH_SCORE) {
+            free(results[count - 1].name);
+            free(results[count - 1].qualified_name);
+            free(results[count - 1].file_path);
+            free(results[count - 1].label);
+            count--;
+        }
     }
 
     if (step_rc != SQLITE_DONE) {
@@ -7339,19 +7379,18 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     }
     sqlite3_finalize(stmt);
 
-    /* Re-sort by min-score (SQL sorted by first keyword only) */
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        for (int j = i + SKIP_ONE; j < count; j++) {
-            if (results[j].score > results[i].score) {
-                cbm_vector_result_t tmp = results[i];
-                results[i] = results[j];
-                results[j] = tmp;
-            }
-        }
+    /* Re-sort by min-score (SQL sorted by first keyword only). Node ID is a
+     * deterministic tie-breaker so repeated pages keep the same ordering. */
+    if (count > 1) {
+        qsort(results, (size_t)count, sizeof(*results), vs_result_score_desc);
+    }
+
+    if (total_count) {
+        *total_count = count;
     }
 
     /* Trim to requested limit */
-    int final_limit = limit > 0 ? limit : CBM_SZ_16;
+    int final_limit = requested_limit;
     if (count > final_limit) {
         for (int i = final_limit; i < count; i++) {
             free(results[i].name);
@@ -7360,6 +7399,11 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
             free(results[i].label);
         }
         count = final_limit;
+    }
+
+    if (count == 0) {
+        free(results);
+        results = NULL;
     }
 
     *out = results;

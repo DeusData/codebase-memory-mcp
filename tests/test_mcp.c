@@ -14,6 +14,7 @@
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
+#include <semantic/semantic.h>
 #include <store/store.h>
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
@@ -71,6 +72,18 @@ static void mcp_capture_log(const char *line) {
     snprintf(mcp_log_buf, sizeof(mcp_log_buf), "%s", line ? line : "");
     if (line && strstr(line, "msg=autoindex.")) {
         mcp_saw_autoindex_log = true;
+    }
+}
+
+static int semantic915_fetch_limit = -1;
+
+static void semantic915_capture_vector_log(const char *line) {
+    if (!line || !strstr(line, "msg=vector_search.exec")) {
+        return;
+    }
+    const char *value = strstr(line, "fetch_limit=");
+    if (value) {
+        semantic915_fetch_limit = atoi(value + strlen("fetch_limit="));
     }
 }
 
@@ -1295,6 +1308,298 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static int semantic915_insert_node_vector(sqlite3 *db, int64_t node_id, const char *project,
+                                          const int8_t vector[CBM_SEM_DIM]) {
+    const char *sql = "INSERT INTO node_vectors(node_id, project, vector) VALUES (?1, ?2, ?3)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    sqlite3_bind_int64(stmt, 1, node_id);
+    sqlite3_bind_text(stmt, 2, project, -1, SQLITE_STATIC);
+    sqlite3_bind_blob(stmt, 3, vector, CBM_SEM_DIM, SQLITE_STATIC);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+static int semantic915_insert_token_vector(sqlite3 *db, const char *project, const char *token,
+                                           const int8_t vector[CBM_SEM_DIM]) {
+    const char *sql =
+        "INSERT INTO token_vectors(project, token, vector, idf) VALUES (?1, ?2, ?3, ?4)";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return SQLITE_ERROR;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 2, token, -1, SQLITE_STATIC);
+    sqlite3_bind_blob(stmt, 3, vector, CBM_SEM_DIM, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 4, 1);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? SQLITE_OK : rc;
+}
+
+TEST(tool_search_graph_semantic_only_uses_vector_results_issue915) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-sem915-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp cache failed");
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "issue-915-semantic";
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    bool setup_ok = st != NULL;
+    if (setup_ok &&
+        cbm_store_upsert_project(st, project, "/tmp/issue-915-semantic") != CBM_STORE_OK) {
+        setup_ok = false;
+    }
+
+    cbm_node_t registry = {.project = project,
+                           .label = "Function",
+                           .name = "AAARegistryKey",
+                           .qualified_name = "issue915.registry.AAARegistryKey",
+                           .file_path = "registry.c",
+                           .start_line = 1,
+                           .end_line = 3};
+    if (setup_ok && cbm_store_upsert_node(st, &registry) <= 0) {
+        setup_ok = false;
+    }
+
+    cbm_node_t debt = {.project = project,
+                       .label = "Function",
+                       .name = "DebtCalculator",
+                       .qualified_name = "issue915.finance.DebtCalculator",
+                       .file_path = "debt.c",
+                       .start_line = 10,
+                       .end_line = 20};
+    cbm_node_t resolver = {.project = project,
+                           .label = "Function",
+                           .name = "DebtResolver",
+                           .qualified_name = "issue915.finance.DebtResolver",
+                           .file_path = "resolver.c",
+                           .start_line = 30,
+                           .end_line = 40};
+    int64_t debt_id = setup_ok ? cbm_store_upsert_node(st, &debt) : 0;
+    int64_t resolver_id = setup_ok ? cbm_store_upsert_node(st, &resolver) : 0;
+    setup_ok = setup_ok && debt_id > 0 && resolver_id > debt_id;
+
+    if (setup_ok) {
+        setup_ok =
+            cbm_store_exec(st, "CREATE TABLE node_vectors (node_id INTEGER PRIMARY KEY, "
+                               "project TEXT NOT NULL, vector BLOB NOT NULL)") == CBM_STORE_OK;
+    }
+    if (setup_ok) {
+        setup_ok =
+            cbm_store_exec(st, "CREATE TABLE token_vectors (id INTEGER PRIMARY KEY, "
+                               "project TEXT NOT NULL, token TEXT NOT NULL, "
+                               "vector BLOB NOT NULL, idf INTEGER NOT NULL)") == CBM_STORE_OK;
+    }
+
+    int8_t debt_vec[CBM_SEM_DIM] = {0};
+    debt_vec[0] = 127;
+    if (setup_ok) {
+        setup_ok = semantic915_insert_token_vector(cbm_store_get_db(st), project, "debt",
+                                                   debt_vec) == SQLITE_OK;
+    }
+    if (setup_ok) {
+        setup_ok = semantic915_insert_node_vector(cbm_store_get_db(st), debt_id, project,
+                                                  debt_vec) == SQLITE_OK;
+    }
+    if (setup_ok) {
+        setup_ok = semantic915_insert_node_vector(cbm_store_get_db(st), resolver_id, project,
+                                                  debt_vec) == SQLITE_OK;
+    }
+
+    /* More candidates than the hard window, all below the query threshold. */
+    int8_t tail_vec[CBM_SEM_DIM] = {0};
+    tail_vec[0] = 1;
+    tail_vec[1] = 127;
+    for (int i = 0; setup_ok && i < 260; i++) {
+        char name[32];
+        char qn[64];
+        char file[32];
+        snprintf(name, sizeof(name), "NearZeroTail%03d", i);
+        snprintf(qn, sizeof(qn), "issue915.tail.%s", name);
+        snprintf(file, sizeof(file), "tail_%03d.c", i);
+        cbm_node_t tail = {.project = project,
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = file,
+                           .start_line = i + 1,
+                           .end_line = i + 1};
+        int64_t tail_id = cbm_store_upsert_node(st, &tail);
+        setup_ok = tail_id > 0 && semantic915_insert_node_vector(cbm_store_get_db(st), tail_id,
+                                                                 project, tail_vec) == SQLITE_OK;
+    }
+    if (st) {
+        (void)cbm_store_checkpoint(st);
+        cbm_store_close(st);
+    }
+    if (!setup_ok) {
+        cleanup_project_db(cache, project);
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        cbm_rmdir(cache);
+        FAIL("semantic fixture setup failed");
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    CBMLogLevel previous_log_level = cbm_log_get_level();
+    semantic915_fetch_limit = -1;
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(semantic915_capture_vector_log, CBM_LOG_SINK_REPLACE);
+    char *resp =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"issue-915-semantic\",\"semantic_query\":[\"debt\"],"
+                            "\"format\":\"json\",\"limit\":1,\"offset\":0}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_log_level);
+    int primary_fetch_limit = semantic915_fetch_limit;
+
+    char *inner = extract_text_content(resp);
+    bool first_page_ok =
+        inner && response_contains_json_fragment(inner, "\"search_mode\":\"semantic\"") &&
+        response_contains_json_fragment(inner, "\"total\":2") &&
+        response_contains_json_fragment(inner, "\"has_more\":true") &&
+        response_contains_json_fragment(inner, "\"name\":\"DebtCalculator\"") &&
+        strstr(inner, "DebtResolver") == NULL && strstr(inner, "NearZeroTail") == NULL &&
+        strstr(inner, "AAARegistryKey") == NULL && strstr(inner, "semantic_results") == NULL;
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"semantic_query\":[\"debt\"],"
+                               "\"format\":\"json\",\"limit\":1,\"offset\":1}");
+    inner = extract_text_content(resp);
+    bool second_page_ok = inner && response_contains_json_fragment(inner, "\"total\":2") &&
+                          response_contains_json_fragment(inner, "\"has_more\":false") &&
+                          response_contains_json_fragment(inner, "\"name\":\"DebtResolver\"") &&
+                          strstr(inner, "DebtCalculator") == NULL;
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"semantic_query\":[\"debt\"],"
+                               "\"format\":\"json\",\"limit\":1,\"offset\":2}");
+    inner = extract_text_content(resp);
+    bool exhausted_page_ok = inner && response_contains_json_fragment(inner, "\"total\":2") &&
+                             response_contains_json_fragment(inner, "\"results\":[]") &&
+                             response_contains_json_fragment(inner, "\"has_more\":false");
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"semantic_query\":[\"debt\"],"
+                               "\"limit\":1,\"offset\":1}");
+    inner = extract_text_content(resp);
+    bool toon_page_ok = inner && strstr(inner, "search_mode: semantic") &&
+                        strstr(inner, "total: 2") && strstr(inner, "semantic[1]") &&
+                        strstr(inner, "DebtResolver") && strstr(inner, "has_more: false") &&
+                        strstr(inner, "results[") == NULL && strstr(inner, "NearZeroTail") == NULL;
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"label\":\"\","
+                               "\"semantic_query\":[\"debt\"],\"format\":\"json\",\"limit\":1}");
+    inner = extract_text_content(resp);
+    bool empty_label_omitted_ok =
+        inner && response_contains_json_fragment(inner, "\"search_mode\":\"semantic\"") &&
+        response_contains_json_fragment(inner, "\"total\":2") &&
+        response_contains_json_fragment(inner, "\"name\":\"DebtCalculator\"") &&
+        strstr(inner, "semantic_results") == NULL && strstr(inner, "AAARegistryKey") == NULL;
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"label\":\"\","
+                               "\"semantic_query\":[\"debt\"],\"limit\":1}");
+    inner = extract_text_content(resp);
+    bool empty_label_toon_ok = inner && strstr(inner, "search_mode: semantic") &&
+                               strstr(inner, "total: 2") && strstr(inner, "semantic[1]") &&
+                               strstr(inner, "DebtCalculator") && strstr(inner, "results[") == NULL;
+    free(inner);
+    free(resp);
+
+    semantic915_fetch_limit = -1;
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(semantic915_capture_vector_log, CBM_LOG_SINK_REPLACE);
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"label\":\"Function\","
+                               "\"semantic_query\":[\"debt\"],\"format\":\"json\",\"limit\":60}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_log_level);
+    int combined_fetch_limit = semantic915_fetch_limit;
+    inner = extract_text_content(resp);
+    yyjson_doc *combined_doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *combined_root = combined_doc ? yyjson_doc_get_root(combined_doc) : NULL;
+    yyjson_val *semantic_results =
+        combined_root ? yyjson_obj_get(combined_root, "semantic_results") : NULL;
+    bool combined_has_tail = false;
+    size_t combined_idx = 0;
+    size_t combined_max = 0;
+    yyjson_val *combined_item;
+    yyjson_arr_foreach(semantic_results, combined_idx, combined_max, combined_item) {
+        const char *name = yyjson_get_str(yyjson_obj_get(combined_item, "name"));
+        if (name && strncmp(name, "NearZeroTail", strlen("NearZeroTail")) == 0) {
+            combined_has_tail = true;
+        }
+    }
+    bool combined_ok = semantic_results && yyjson_is_arr(semantic_results) &&
+                       yyjson_arr_size(semantic_results) == 60 && combined_has_tail;
+    if (combined_doc) {
+        yyjson_doc_free(combined_doc);
+    }
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"issue-915-semantic\",\"semantic_query\":[\"debt\"],"
+                               "\"format\":\"json\",\"limit\":1,\"offset\":2147483647}");
+    inner = extract_text_content(resp);
+    bool large_offset_ok = inner && response_contains_json_fragment(inner, "\"results\":[]") &&
+                           response_contains_json_fragment(inner, "\"has_more\":false");
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"issue-915-semantic\",\"semantic_query\":\"debt\",\"limit\":6}");
+    bool type_error_unchanged =
+        resp && strstr(resp, "semantic_query must be an array of keyword strings") != NULL;
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_EQ(primary_fetch_limit, CBM_VECTOR_SEARCH_CANDIDATE_CAP);
+    ASSERT_EQ(combined_fetch_limit, 300);
+    ASSERT_TRUE(first_page_ok);
+    ASSERT_TRUE(second_page_ok);
+    ASSERT_TRUE(exhausted_page_ok);
+    ASSERT_TRUE(toon_page_ok);
+    ASSERT_TRUE(empty_label_omitted_ok);
+    ASSERT_TRUE(empty_label_toon_ok);
+    ASSERT_TRUE(combined_ok);
+    ASSERT_TRUE(large_offset_ok);
+    ASSERT_TRUE(type_error_unchanged);
     PASS();
 }
 
@@ -6406,6 +6711,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(tool_search_graph_semantic_only_uses_vector_results_issue915);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
