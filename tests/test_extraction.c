@@ -7,7 +7,8 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
-#include <time.h> /* wide-flat linearity bound (extract_wide_flat_file_is_linear) */
+#include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
+#include <time.h>
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -3406,37 +3407,76 @@ TEST(extract_rust_test_attr_marks_is_test_issue855) {
  * RED on index-based child pushes, GREEN on the cursor walk. The def-count
  * guard keeps the test honest: extraction must actually process the whole
  * breadth, not skip it. */
-TEST(extract_wide_flat_file_is_linear) {
-    /* Mirror the monster's exact shape: its 580k wide siblings are COMMENT
-     * nodes, not defs, so this fixture isolates the WALK cost. A def-heavy
-     * fixture (400k var statements) additionally hits a separate per-def
-     * sibling-scan cost in extraction (O(defs x siblings), tracked as its own
-     * finding) and took 647s even with the walk fixed — it guarded the wrong
-     * thing. Sparse real defs keep the anti-vacuous breadth check. */
-    const int n = 400 * 1000;                         /* comment siblings */
-    const size_t cap = (size_t)n * 24 + (size_t)8192; /* "// wide filler 399999\n" = 22 chars */
+/* Extract a wide-flat comment-sibling fixture of n lines (the exact shape of
+ * ms-typescript's reallyLargeFile.ts: hundreds of thousands of flat comment
+ * children under the root, plus sparse real defs so the breadth check cannot
+ * pass vacuously). Returns elapsed milliseconds; stores the def count. */
+static long extract_wide_flat_ms(int n, int *out_defs) {
+    const size_t cap = (size_t)n * 24 + (size_t)8192; /* "// wide filler N\n" <= 24 chars */
     char *src = malloc(cap);
-    ASSERT_NOT_NULL(src);
+    if (!src) {
+        return -1;
+    }
     size_t off = 0;
     for (int i = 0; i < n; i++) {
         off += (size_t)snprintf(src + off, cap - off, "// wide filler %d\n", i);
-        if (i % 4000 == 0) {
+        if (i % 2000 == 0) {
             off += (size_t)snprintf(src + off, cap - off, "var wide_a%d = %d;\n", i, i);
         }
     }
-    time_t start = time(NULL);
+    struct timespec a;
+    struct timespec b;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &a);
     CBMFileResult *r =
         cbm_extract_file(src, (int)off, CBM_LANG_JAVASCRIPT, "proj", "wide.js", 0, NULL, NULL);
-    long elapsed_s = (long)(time(NULL) - start);
+    cbm_clock_gettime(CLOCK_MONOTONIC, &b);
     free(src);
-    ASSERT_NOT_NULL(r);
-    /* Anti-vacuous guard: the breadth was actually walked. */
-    ASSERT_GTE(r->defs.count, 100);
+    if (!r) {
+        return -1;
+    }
+    *out_defs = r->defs.count;
     cbm_free_result(r);
-    if (elapsed_s >= 30) {
-        char msg[128];
+    return (b.tv_sec - a.tv_sec) * 1000L + (b.tv_nsec - a.tv_nsec) / 1000000L;
+}
+
+TEST(extract_wide_flat_file_is_linear) {
+    /* SCALING-RATIO guard: assert the COMPLEXITY CLASS, not a wall-clock
+     * bound. Index-based ts_node_child(i) child loops are O(i) per call —
+     * quadratic per wide node — and hung a 580k-sibling file for hours
+     * (ms-typescript reallyLargeFile.ts). An absolute time bound conflates
+     * machine speed with complexity: the gcc-13-ARM ASan CI leg runs this
+     * extraction ~200x slower than clang at the SAME (measured perfectly
+     * linear: 27.1s/54.2s/108.3s for 50k/100k/200k) complexity, and flunked
+     * a 30s bound on linear code. Growing the input 4x must grow the time
+     * ~4x when linear and ~16x when quadratic; the 10x bound splits those
+     * decisively on every toolchain. The 120ms floor keeps clock noise from
+     * mattering on fast machines. */
+    /* Growth and bound CALIBRATED FROM MEASUREMENT, not models. The ASan
+     * test build carries a large LINEAR per-line baseline (~31us/line on
+     * clang-macOS, ~540us/line on gcc-13-ARM) that dilutes small-growth
+     * ratios: at 8x growth the measured quadratic ratio was 22.4 — a 24x
+     * bound false-passed the known-quadratic pre-merge walk. At 20x growth
+     * the measured ratios are ~20x for linear code (both toolchains) and
+     * ~128x for the quadratic walk (clang-macOS) — bound 40 sits >=2x from
+     * both. The 120ms floor keeps clock noise irrelevant on fast hosts. */
+    enum { WF_SMALL = 20 * 1000, WF_BIG = 400 * 1000, WF_RATIO_MAX = 40, WF_FLOOR_MS = 120 };
+    int defs_small = 0;
+    int defs_big = 0;
+    long t_small = extract_wide_flat_ms(WF_SMALL, &defs_small);
+    long t_big = extract_wide_flat_ms(WF_BIG, &defs_big);
+    ASSERT_GTE(t_small, 0);
+    ASSERT_GTE(t_big, 0);
+    /* Anti-vacuous guard: the breadth was actually walked at both sizes. */
+    ASSERT_GTE(defs_small, 10);
+    ASSERT_GTE(defs_big, 40);
+    fprintf(stderr, "  [wide-flat] t(%d)=%ldms t(%d)=%ldms\n", WF_SMALL, t_small, WF_BIG, t_big);
+    long base = t_small > WF_FLOOR_MS ? t_small : WF_FLOOR_MS;
+    if (t_big > WF_RATIO_MAX * base) {
+        char msg[160];
         snprintf(msg, sizeof(msg),
-                 "wide-flat extract took %lds (>=30s bound) — quadratic child access", elapsed_s);
+                 "wide-flat scaling 20x input: %ldms -> %ldms (> %dx base %ldms) — "
+                 "quadratic child access",
+                 t_small, t_big, WF_RATIO_MAX, base);
         FAIL(msg);
     }
     PASS();
