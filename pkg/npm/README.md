@@ -27,7 +27,7 @@ Restart your agent. Say **"Index this project"** — done.
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys.
-- **159 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
+- **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
 - **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro.
 - **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
