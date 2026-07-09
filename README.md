@@ -374,8 +374,8 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 
 | Agent | MCP Config | Instructions | Hooks |
 |-------|-----------|-------------|-------|
-| Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob graph augment, non-blocking) |
-| Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | SessionStart reminder |
+| Claude Code | `.claude/.mcp.json` | 1 Skill (`codebase-memory`) | PreToolUse (Grep/Glob graph augment, non-blocking) + SessionStart + SubagentStart |
+| Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` + 1 Skill (`codebase-memory`) | SessionStart reminder |
 | Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) + SessionStart reminder |
 | Zed | `settings.json` (JSONC) | — | — |
 | OpenCode | `opencode.json` | `AGENTS.md` | — |
