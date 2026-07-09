@@ -519,6 +519,73 @@ TEST(cli_uninstall_removes_skills) {
     PASS();
 }
 
+TEST(cli_codex_skill_install_uses_agents_dir) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    int written = cbm_install_codex_skills(tmpdir, false, false);
+    ASSERT_EQ(written, CBM_SKILL_COUNT);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.agents/skills/codebase-memory/SKILL.md", tmpdir);
+    const char *data = read_test_file(path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "name: codebase-memory") != NULL);
+    ASSERT(strstr(data, "Quick Decision Matrix") != NULL);
+
+    int second = cbm_install_codex_skills(tmpdir, false, false);
+    ASSERT_EQ(second, 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_codex_skill_force_overwrite) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    ASSERT_EQ(cbm_install_codex_skills(tmpdir, false, false), CBM_SKILL_COUNT);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.agents/skills/codebase-memory/SKILL.md", tmpdir);
+    write_test_file(path, "stale skill content\n");
+
+    ASSERT_EQ(cbm_install_codex_skills(tmpdir, false, false), 0);
+    const char *data = read_test_file(path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "stale skill content") != NULL);
+
+    ASSERT_EQ(cbm_install_codex_skills(tmpdir, true, false), CBM_SKILL_COUNT);
+    data = read_test_file(path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "Quick Decision Matrix") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_codex_skill_uninstall_removes_agents_dir_skill) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-skill-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    ASSERT_EQ(cbm_install_codex_skills(tmpdir, false, false), CBM_SKILL_COUNT);
+    ASSERT_EQ(cbm_remove_codex_skills(tmpdir, false), CBM_SKILL_COUNT);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/.agents/skills/codebase-memory", tmpdir);
+    struct stat st;
+    ASSERT(stat(path, &st) != 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_remove_old_monolithic_skill) {
     /* Port of TestRemoveOldMonolithicSkill */
     char tmpdir[256];
@@ -1761,6 +1828,7 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     ASSERT(strstr(json, "cursor") != NULL);
     ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
     ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    ASSERT(strstr(json, ".agents/skills") != NULL);
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
@@ -1769,6 +1837,8 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(cfg, sizeof(cfg), "%s/.cursor/mcp.json", tmpdir);
     ASSERT(stat(cfg, &st) != 0); /* must not exist */
     snprintf(cfg, sizeof(cfg), "%s/.codex/config.toml", tmpdir);
+    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    snprintf(cfg, sizeof(cfg), "%s/.agents/skills/codebase-memory/SKILL.md", tmpdir);
     ASSERT(stat(cfg, &st) != 0); /* must not exist */
 
     test_rmdir_r(tmpdir);
@@ -3085,6 +3155,9 @@ SUITE(cli) {
     RUN_TEST(cli_skill_idempotent);
     RUN_TEST(cli_skill_force_overwrite);
     RUN_TEST(cli_uninstall_removes_skills);
+    RUN_TEST(cli_codex_skill_install_uses_agents_dir);
+    RUN_TEST(cli_codex_skill_force_overwrite);
+    RUN_TEST(cli_codex_skill_uninstall_removes_agents_dir_skill);
     RUN_TEST(cli_remove_old_monolithic_skill);
     RUN_TEST(cli_skill_files_content);
     RUN_TEST(cli_codex_instructions);

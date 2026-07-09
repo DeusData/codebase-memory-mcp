@@ -698,6 +698,35 @@ int cbm_remove_skills(const char *skills_dir, bool dry_run) {
     return count;
 }
 
+static void cbm_codex_skills_dir(const char *home_dir, char *out, size_t out_sz) {
+    if (out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (!home_dir || !home_dir[0]) {
+        return;
+    }
+    snprintf(out, out_sz, "%s/.agents/skills", home_dir);
+}
+
+int cbm_install_codex_skills(const char *home_dir, bool force, bool dry_run) {
+    char skills_dir[CLI_BUF_1K];
+    cbm_codex_skills_dir(home_dir, skills_dir, sizeof(skills_dir));
+    if (!skills_dir[0]) {
+        return 0;
+    }
+    return cbm_install_skills(skills_dir, force, dry_run);
+}
+
+int cbm_remove_codex_skills(const char *home_dir, bool dry_run) {
+    char skills_dir[CLI_BUF_1K];
+    cbm_codex_skills_dir(home_dir, skills_dir, sizeof(skills_dir));
+    if (!skills_dir[0]) {
+        return 0;
+    }
+    return cbm_remove_skills(skills_dir, dry_run);
+}
+
 bool cbm_remove_old_monolithic_skill(const char *skills_dir, bool dry_run) {
     if (!skills_dir) {
         return false;
@@ -3352,14 +3381,22 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
 }
 
 static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const char *home,
-                                      const char *binary_path, bool dry_run) {
+                                      const char *binary_path, bool force, bool dry_run) {
     if (agents->codex) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
+        char sp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.codex/config.toml", home);
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
+        cbm_codex_skills_dir(home, sp, sizeof(sp));
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
+        if (g_install_plan) {
+            plan_record("Codex CLI", "skills", sp);
+        } else {
+            int skill_count = cbm_install_codex_skills(home, force, dry_run);
+            printf("  skills: %d installed\n", skill_count);
+        }
         /* Choose the hook target: if ~/.codex/hooks.json already exists, the
          * user manages Codex hooks via the JSON representation — write the
          * SessionStart reminder there instead of config.toml. Writing both
@@ -3559,7 +3596,7 @@ static void cbm_install_agent_configs(const char *home, const char *binary_path,
     if (agents.claude_code) {
         install_claude_code_config(home, binary_path, force, dry_run);
     }
-    install_cli_agent_configs(&agents, home, binary_path, dry_run);
+    install_cli_agent_configs(&agents, home, binary_path, force, dry_run);
     install_editor_agent_configs(&agents, home, binary_path, dry_run);
 }
 
@@ -3978,6 +4015,8 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         if (!dry_run) {
             cbm_remove_codex_hooks(cp);
         }
+        int removed = cbm_remove_codex_skills(home, dry_run);
+        printf("  removed skills: %d\n", removed);
     }
     if (agents->gemini) {
         uninstall_gemini_config(home, dry_run);
