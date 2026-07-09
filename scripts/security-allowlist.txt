@@ -11,10 +11,9 @@ src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free
 src/foundation/subprocess.c:fork:cbm_run_posix — fork+execv for the crash/hang-isolating index worker (supervisor primitive; child execs immediately, no code runs in the forked image)
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
-# ── CLI: update command (user-initiated, interactive) ──────────────────────
-src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
+# ── CLI: process management (user-initiated, interactive) ──────────────────
 src/cli/cli.c:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
-src/cli/cli.c:popen:sha256 checksum computation via shasum
+src/cli/cli.c:popen:via cbm_popen wrapper call
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
 src/watcher/watcher.c:system:git repo detection (is_git_repo)
@@ -31,7 +30,6 @@ src/git/git_context.c:popen:via cbm_popen wrapper call
 src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)
 src/mcp/mcp.c:cbm_popen:detect_changes via git diff (args validated)
 src/mcp/mcp.c:cbm_popen:git ls-files count for auto-index (session_root validated)
-src/mcp/mcp.c:cbm_popen:update check to api.github.com (hardcoded URL)
 src/mcp/mcp.c:popen:via cbm_popen wrapper calls
 
 # ── Pipeline: git history parsing (git log) ────────────────────────────────
@@ -50,10 +48,6 @@ src/ui/http_server.c:execl:exec indexing binary in child process
 
 # ── Allowed URLs ───────────────────────────────────────────────────────────
 # Format: URL:justification
-URL:https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest:update check
-URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest/download:binary download + checksums
-URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest:version check via redirect header
 URL:http://127.0.0.1:UI server binding (localhost only)
 URL:https://www.sqlite.org/c3ref/c_checkpoint_full.html:sqlite WAL checkpoint API doc reference (comment only, not a network call)
-URL:https://github.com/DeusData/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/mcp.c)
-URL:https://%s:GitHub blob-URL construction in src/ui/http_server.c cbm_ui_git_web_base — https-forces the repo web base for frontend deep-links (not a network call)
+URL:https://%s:repo blob-URL construction in src/ui/http_server.c cbm_ui_git_web_base — https-forces the repo web base for frontend deep-links (not a network call)

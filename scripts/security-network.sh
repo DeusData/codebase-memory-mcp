@@ -74,7 +74,8 @@ if grep 'sa_family=AF_INET' "$STRACE_LOG" > "$TMPDIR/connections.log" 2>/dev/nul
         # Allowed connections:
         # - 127.0.0.1 (localhost, any port)
         # - DNS (port 53, any IP)
-        # - api.github.com (140.82.x.x range, port 443) — update check
+        # The update check was removed from this source-built distribution:
+        # the binary must make ZERO outbound connections, HTTPS included.
         case "$ip" in
             127.0.0.1|0.0.0.0)
                 echo "  OK: localhost:$port"
@@ -82,9 +83,6 @@ if grep 'sa_family=AF_INET' "$STRACE_LOG" > "$TMPDIR/connections.log" 2>/dev/nul
             *)
                 if [[ "$port" == "53" ]]; then
                     echo "  OK: DNS lookup to $ip"
-                elif [[ "$port" == "443" ]]; then
-                    echo "  REVIEW: HTTPS to $ip:$port (expected: api.github.com for update check)"
-                    # This is expected — the binary checks for updates on startup
                 else
                     echo "  BLOCKED: Unexpected connection to $ip:$port"
                     FAIL=1

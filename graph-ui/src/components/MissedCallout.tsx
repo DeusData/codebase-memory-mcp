@@ -45,8 +45,8 @@ function buildIssueUrl(base: string, path: string, project: string | null): stri
 
 function buildAgentPrompt(issuesUrl: string | null, path: string, project: string | null): string {
   const where = issuesUrl
-    ? `file a GitHub issue at ${issuesUrl}`
-    : "file a GitHub issue on the codebase-memory-mcp project";
+    ? `file an issue at ${issuesUrl}`
+    : "report it to the codebase-memory-mcp maintainers";
   return (
     `codebase-memory-mcp could not fully index \`${path}\`` +
     (project ? ` (project \`${project}\`)` : "") +
@@ -118,7 +118,7 @@ export function MissedCallout({ node, project, onClose }: MissedCalloutProps) {
       </p>
       <p className="text-[12px] leading-relaxed text-foreground/70">
         Help us handle this edge case too: let your agent summarize what fails to parse
-        here and file a GitHub issue for the codebase-memory-mcp project.
+        here and report it to the codebase-memory-mcp maintainers.
       </p>
 
       <div className="flex flex-col gap-2 mt-1">
@@ -139,7 +139,7 @@ export function MissedCallout({ node, project, onClose }: MissedCalloutProps) {
             rel="noreferrer"
             className="text-[12px] font-medium rounded-md border border-white/10 bg-white/[0.03] text-foreground/80 hover:bg-white/[0.07] px-3 py-1.5 transition-all"
           >
-            File a GitHub issue (prefilled) ↗
+            File an issue (prefilled) ↗
           </a>
         )}
       </div>

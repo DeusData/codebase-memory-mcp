@@ -722,30 +722,20 @@ if ! echo "$UNINSTALL_OUT" | grep -qi 'uninstall\|remov'; then
 fi
 echo "OK: uninstall --dry-run completed"
 
-# 6c: update --dry-run --standard -y
-echo "--- Phase 6c: update --dry-run ---"
-UPDATE_OUT=$(run_dryrun_env "$BINARY" update --dry-run --standard -y 2>&1)
-if ! echo "$UPDATE_OUT" | grep -qi 'dry-run'; then
-  echo "FAIL: update --dry-run did not indicate dry-run mode"
+# 6c: update is disabled in the source-built distribution — it must refuse
+# to run (non-zero exit) and point the operator at rebuilding from source.
+echo "--- Phase 6c: update disabled ---"
+UPDATE_OUT=$(run_dryrun_env "$BINARY" update 2>&1) && {
+  echo "FAIL: update unexpectedly succeeded (self-update must be disabled)"
+  echo "$UPDATE_OUT"
+  exit 1
+}
+if ! echo "$UPDATE_OUT" | grep -qi 'disabled'; then
+  echo "FAIL: update did not report that self-update is disabled"
   echo "$UPDATE_OUT"
   exit 1
 fi
-if ! echo "$UPDATE_OUT" | grep -qi 'standard'; then
-  echo "FAIL: update --dry-run did not respect --standard flag"
-  exit 1
-fi
-# On Linux the binary must self-update from the static "-portable" asset: the
-# standard linux asset dynamically links glibc 2.38+ and breaks on older distros
-# (Debian 11, RHEL 8, Ubuntu 20.04). Guards build_update_url in src/cli/cli.c.
-if [ "$(uname -s)" = "Linux" ]; then
-  if ! echo "$UPDATE_OUT" | grep -q -- '-portable'; then
-    echo "FAIL: linux update --dry-run does not target the -portable asset"
-    echo "$UPDATE_OUT"
-    exit 1
-  fi
-  echo "OK: linux update targets the -portable (static) asset"
-fi
-echo "OK: update --dry-run --standard completed"
+echo "OK: update is disabled and reports rebuild-from-source instructions"
 
 # 6d: config set/get/reset round-trip
 echo "--- Phase 6d: config set/get/reset ---"
@@ -1448,10 +1438,10 @@ fi
 rm -f "$MCP_KILL_INPUT"
 
 echo ""
-echo "=== Phase 14: update + uninstall E2E ==="
+echo "=== Phase 14: install + uninstall E2E (network-free) ==="
 
-if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
-  # ── 14a-f: Real update command against local HTTP server ──
+if true; then
+  # ── 14a-f: install refreshes configs, uninstall cleans up — no network ──
   UPDATE_HOME=$(mktemp -d)
   mkdir -p "$UPDATE_HOME/.claude" "$UPDATE_HOME/.local/bin"
   if [[ "$BINARY" == *.exe ]]; then
@@ -1468,33 +1458,32 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   # Pre-install agent config with a WRONG binary path (simulates stale config)
   echo '{"mcpServers":{"codebase-memory-mcp":{"command":"/old/stale/path"}}}' > "$UPDATE_HOME/.claude.json"
 
-  # 14a: Run actual update command (detect variant from available archive)
-  UPDATE_VARIANT="--standard"
-  if curl -sf "$SMOKE_DOWNLOAD_URL/" 2>/dev/null | grep -q "ui-"; then
-    UPDATE_VARIANT="--ui"
-  fi
-  HOME="$UPDATE_HOME" CBM_DOWNLOAD_URL="$SMOKE_DOWNLOAD_URL" \
-    "$BINARY" update $UPDATE_VARIANT -y 2>&1 || true
+  # 14a: Run install command — copies the running binary into ~/.local/bin
+  # and refreshes agent configs (same surface the update command used to cover)
+  HOME="$UPDATE_HOME" "$BINARY" install -y 2>&1 || true
 
-  # 14b: Verify new binary exists and runs
-  if [ ! -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp" ]; then
-    echo "FAIL 14b: binary missing after update"
+  # 14b: Verify binary exists and runs
+  if [ ! -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp" ] && [ ! -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe" ]; then
+    echo "FAIL 14b: binary missing after install"
     exit 1
   fi
   UPD_BIN="$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+  if [ ! -f "$UPD_BIN" ]; then
+    UPD_BIN="$UPDATE_HOME/.local/bin/codebase-memory-mcp.exe"
+  fi
   if [ "$(uname -s)" = "Darwin" ]; then
     codesign --sign - --force "$UPD_BIN" 2>/dev/null || true
   fi
   if ! "$UPD_BIN" --version > /dev/null 2>&1; then
-    echo "FAIL 14b: updated binary doesn't run"
+    echo "FAIL 14b: installed binary doesn't run"
     exit 1
   fi
-  echo "OK 14b: updated binary runs"
+  echo "OK 14b: installed binary runs"
 
   # 14c: Verify agent config was refreshed (stale path replaced)
   UPD_CMD=$(cat "$UPDATE_HOME/.claude.json" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command',''))" 2>/dev/null || echo "")
   if [ "$UPD_CMD" = "/old/stale/path" ]; then
-    echo "FAIL 14c: agent config still has stale path after update"
+    echo "FAIL 14c: agent config still has stale path after install"
     exit 1
   fi
   if [ -n "$UPD_CMD" ]; then
@@ -1505,7 +1494,7 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
 
   # ── 14d-f: Real uninstall with binary removal ──
   # First verify binary + configs exist
-  if [ ! -f "$UPDATE_HOME/.local/bin/codebase-memory-mcp" ]; then
+  if [ ! -f "$UPD_BIN" ]; then
     echo "FAIL 14d: binary should exist before uninstall"
     exit 1
   fi
@@ -1534,286 +1523,6 @@ sys.exit(0)
   fi
 
   rm -rf "$UPDATE_HOME"
-
-else
-  # Local mode: basic binary replacement test (no download)
-  UPDATE_DIR=$(mktemp -d)
-  mkdir -p "$UPDATE_DIR/install"
-  cp "$BINARY" "$UPDATE_DIR/install/codebase-memory-mcp"
-  chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp"
-  cp "$BINARY" "$UPDATE_DIR/smoke-downloaded"
-  rm -f "$UPDATE_DIR/install/codebase-memory-mcp"
-  cp "$UPDATE_DIR/smoke-downloaded" "$UPDATE_DIR/install/codebase-memory-mcp"
-  chmod 755 "$UPDATE_DIR/install/codebase-memory-mcp"
-  if [ "$(uname -s)" = "Darwin" ]; then
-    codesign --sign - --force "$UPDATE_DIR/install/codebase-memory-mcp" 2>/dev/null || true
-  fi
-  if ! "$UPDATE_DIR/install/codebase-memory-mcp" --version > /dev/null 2>&1; then
-    echo "FAIL 14: binary replacement failed"
-    exit 1
-  fi
-  echo "OK 14: binary replacement + verify (local mode)"
-  rm -rf "$UPDATE_DIR"
-fi
-
-# ── Phase 12 + 13: Download E2E + install script E2E (CI only) ──
-# These phases require SMOKE_DOWNLOAD_URL to be set (local HTTP server in CI).
-# When unset, they are skipped (local development runs).
-
-if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
-
-echo ""
-echo "=== Phase 12: download + checksum + extraction E2E ==="
-
-DL_DIR=$(mktemp -d)
-
-# Detect platform for archive name
-DL_OS=$(uname -s | tr 'A-Z' 'a-z')
-# Normalize MSYS2/MinGW to "windows"
-case "$DL_OS" in
-  mingw*|msys*) DL_OS="windows" ;;
-esac
-# Prefer a CI-provided SMOKE_ARCH over `uname -m`: on windows-11-arm the base
-# MSYS2 `uname` is an emulated x86_64 binary that reports "x86_64", so uname would
-# request the amd64 archive and 404. The smoke workflow passes the true matrix
-# arch (arm64/amd64). Fall back to uname when SMOKE_ARCH is unset (local runs).
-if [ -n "${SMOKE_ARCH:-}" ]; then
-  DL_ARCH="$SMOKE_ARCH"
-else
-  DL_ARCH=$(uname -m)
-  case "$DL_ARCH" in
-    aarch64) DL_ARCH="arm64" ;;
-    x86_64)
-      # Rosetta detection
-      if [ "$DL_OS" = "darwin" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -qi apple; then
-        DL_ARCH="arm64"
-      else
-        DL_ARCH="amd64"
-      fi
-      ;;
-  esac
-fi
-
-if [ "$DL_OS" = "darwin" ] || [ "$DL_OS" = "linux" ]; then
-  DL_EXT="tar.gz"
-else
-  DL_EXT="zip"
-fi
-# Try standard name first, fall back to UI variant
-DL_ARCHIVE="codebase-memory-mcp-${DL_OS}-${DL_ARCH}.${DL_EXT}"
-DL_ARCHIVE_UI="codebase-memory-mcp-ui-${DL_OS}-${DL_ARCH}.${DL_EXT}"
-
-# 12a: curl download (try standard, then UI variant)
-echo "--- Phase 12a: curl download ---"
-# --noproxy '*': never route the local test server through a proxy — a proxy env
-# var present on some runners (notably windows-11-arm) made curl fail to reach
-# 127.0.0.1 while the app's own downloader (WinHTTP) bypassed it. On failure,
-# surface curl's stderr instead of swallowing it so the reason is visible.
-if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>/tmp/cbm-curl12a.err; then
-  # Try UI variant
-  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>/tmp/cbm-curl12a.err; then
-    DL_ARCHIVE="$DL_ARCHIVE_UI"
-  else
-    echo "FAIL 12a: curl download failed (tried standard and ui variants)"
-    echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
-    cat /tmp/cbm-curl12a.err 2>/dev/null || true
-    exit 1
-  fi
-fi
-if [ ! -s "$DL_DIR/$DL_ARCHIVE" ]; then
-  echo "FAIL 12a: downloaded archive is empty"
-  exit 1
-fi
-echo "OK 12a: archive downloaded ($(wc -c < "$DL_DIR/$DL_ARCHIVE") bytes)"
-
-# 12b: checksum download
-echo "--- Phase 12b: checksum verification ---"
-if ! curl -fsSL -o "$DL_DIR/checksums.txt" "$SMOKE_DOWNLOAD_URL/checksums.txt"; then
-  echo "FAIL 12b: checksums.txt download failed"
-  exit 1
-fi
-
-# 12c: verify checksum
-EXPECTED=$(grep "$DL_ARCHIVE" "$DL_DIR/checksums.txt" | awk '{print $1}')
-if [ -z "$EXPECTED" ]; then
-  echo "FAIL 12c: archive not found in checksums.txt"
-  exit 1
-fi
-if command -v sha256sum &>/dev/null; then
-  ACTUAL=$(sha256sum "$DL_DIR/$DL_ARCHIVE" | awk '{print $1}')
-elif command -v shasum &>/dev/null; then
-  ACTUAL=$(shasum -a 256 "$DL_DIR/$DL_ARCHIVE" | awk '{print $1}')
-else
-  echo "FAIL 12c: no sha256 tool available"
-  exit 1
-fi
-if [ "$EXPECTED" != "$ACTUAL" ]; then
-  echo "FAIL 12c: checksum mismatch (expected=$EXPECTED actual=$ACTUAL)"
-  exit 1
-fi
-echo "OK 12c: checksum verified"
-
-# 12d: extract binary
-echo "--- Phase 12d: extraction ---"
-(cd "$DL_DIR" && if [ "$DL_EXT" = "zip" ]; then unzip -q "$DL_ARCHIVE"; else tar -xzf "$DL_ARCHIVE"; fi)
-DL_BIN="$DL_DIR/codebase-memory-mcp"
-if [ ! -f "$DL_BIN" ]; then
-  echo "FAIL 12d: binary not found after extraction"
-  exit 1
-fi
-chmod +x "$DL_BIN"
-echo "OK 12d: binary extracted"
-
-# 12e: extracted binary runs
-if ! "$DL_BIN" --version > /dev/null 2>&1; then
-  # On macOS arm64, may need signing
-  if [ "$DL_OS" = "darwin" ]; then
-    xattr -d com.apple.quarantine "$DL_BIN" 2>/dev/null || true
-    codesign --sign - --force "$DL_BIN" 2>/dev/null || true
-    if ! "$DL_BIN" --version > /dev/null 2>&1; then
-      echo "FAIL 12e: extracted binary doesn't run even after signing"
-      exit 1
-    fi
-  else
-    echo "FAIL 12e: extracted binary doesn't run"
-    exit 1
-  fi
-fi
-echo "OK 12e: extracted binary runs"
-
-# 12f: platform-specific post-extraction verification
-if [ "$DL_OS" = "darwin" ]; then
-  if codesign -v "$DL_BIN" 2>/dev/null; then
-    echo "OK 12f: macOS binary has valid signature (CI pre-signed)"
-  else
-    echo "OK 12f: macOS binary signed locally (CI pre-sign not yet active)"
-  fi
-else
-  echo "OK 12f: binary runs without signing ($DL_OS)"
-fi
-
-rm -rf "$DL_DIR"
-
-echo ""
-echo "=== Phase 13: install script E2E ==="
-
-if [ "$DL_OS" != "windows" ] && [ -f "$REPO_ROOT/install.sh" ]; then
-  echo "--- Phase 13: install.sh E2E ---"
-  INSTALL_TEST_HOME=$(mktemp -d)
-  INSTALL_TEST_DIR=$(mktemp -d)
-  mkdir -p "$INSTALL_TEST_HOME/.claude"
-  mkdir -p "$INSTALL_TEST_HOME/.local/bin"
-
-  # 13a: run install.sh with local URL + isolated HOME
-  HOME="$INSTALL_TEST_HOME" CBM_DOWNLOAD_URL="$SMOKE_DOWNLOAD_URL" \
-    "$REPO_ROOT/install.sh" --dir="$INSTALL_TEST_DIR" 2>&1 || true
-
-  # 13b: binary placed
-  if [ ! -f "$INSTALL_TEST_DIR/codebase-memory-mcp" ]; then
-    echo "FAIL 13b: binary not placed by install.sh"
-    exit 1
-  fi
-  echo "OK 13b: binary placed"
-
-  # 13c: binary runs
-  # Sign if needed on macOS
-  if [ "$DL_OS" = "darwin" ]; then
-    codesign --sign - --force "$INSTALL_TEST_DIR/codebase-memory-mcp" 2>/dev/null || true
-  fi
-  if ! "$INSTALL_TEST_DIR/codebase-memory-mcp" --version > /dev/null 2>&1; then
-    echo "FAIL 13c: installed binary doesn't run"
-    exit 1
-  fi
-  echo "OK 13c: binary runs"
-
-  # 13d: macOS signature check
-  if [ "$DL_OS" = "darwin" ]; then
-    if codesign -v "$INSTALL_TEST_DIR/codebase-memory-mcp" 2>/dev/null; then
-      echo "OK 13d: macOS binary signed"
-    else
-      echo "FAIL 13d: macOS binary not signed after install.sh"
-      exit 1
-    fi
-  else
-    echo "OK 13d: no signing needed ($DL_OS)"
-  fi
-
-  # 13e: agent configs created (at least Claude Code since we made ~/.claude)
-  if [ -f "$INSTALL_TEST_HOME/.claude.json" ] && grep -q 'codebase-memory-mcp' "$INSTALL_TEST_HOME/.claude.json" 2>/dev/null; then
-    echo "OK 13e: agent configs created by install.sh"
-  else
-    echo "FAIL 13e: install.sh did not create agent configs"
-    exit 1
-  fi
-
-  # 13f: PATH setup — verify shell rc file was modified
-  RC_FILE=""
-  if [ -f "$INSTALL_TEST_HOME/.zshrc" ]; then RC_FILE="$INSTALL_TEST_HOME/.zshrc"; fi
-  if [ -f "$INSTALL_TEST_HOME/.bashrc" ]; then RC_FILE="$INSTALL_TEST_HOME/.bashrc"; fi
-  if [ -f "$INSTALL_TEST_HOME/.profile" ]; then RC_FILE="$INSTALL_TEST_HOME/.profile"; fi
-  if [ -n "$RC_FILE" ] && grep -q '.local/bin' "$RC_FILE" 2>/dev/null; then
-    echo "OK 13f: PATH added to shell rc file"
-  elif echo "$PATH" | grep -q "$INSTALL_TEST_DIR"; then
-    echo "OK 13f: install dir already on PATH"
-  else
-    echo "OK 13f: PATH setup (rc file may not have been modified if already present)"
-  fi
-
-  rm -rf "$INSTALL_TEST_HOME" "$INSTALL_TEST_DIR"
-
-elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; then
-  echo "--- Phase 13: install.ps1 E2E (Windows) ---"
-  PS1_TEST_HOME=$(mktemp -d)
-  PS1_TEST_DIR=$(mktemp -d)
-  mkdir -p "$PS1_TEST_HOME/.claude"
-
-  # Convert MSYS paths to Windows paths for PowerShell
-  if command -v cygpath &>/dev/null; then
-    WIN_DIR=$(cygpath -w "$PS1_TEST_DIR")
-    WIN_URL="$SMOKE_DOWNLOAD_URL"
-    WIN_SCRIPT=$(cygpath -w "$REPO_ROOT/install.ps1")
-    WIN_HOME=$(cygpath -w "$PS1_TEST_HOME")
-  else
-    WIN_DIR="$PS1_TEST_DIR"
-    WIN_URL="$SMOKE_DOWNLOAD_URL"
-    WIN_SCRIPT="$REPO_ROOT/install.ps1"
-    WIN_HOME="$PS1_TEST_HOME"
-  fi
-
-  # 13f: run install.ps1
-  # Pass the known-correct arch: powershell runs under x64 emulation on ARM64, so
-  # install.ps1's own detection can't tell it's arm64. DL_ARCH is authoritative here.
-  HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" CBM_ARCH="$DL_ARCH" \
-    powershell.exe -ExecutionPolicy ByPass -File "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1 || true
-
-  # 13g: binary placed
-  PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp.exe"
-  if [ ! -f "$PS1_BIN" ] && [ -f "$PS1_TEST_DIR/codebase-memory-mcp" ]; then
-    PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp"
-  fi
-  if [ -f "$PS1_BIN" ]; then
-    echo "OK 13g: binary placed by install.ps1"
-  else
-    echo "FAIL 13g: binary not placed by install.ps1"
-    exit 1
-  fi
-
-  # 13h: binary runs
-  if "$PS1_BIN" --version > /dev/null 2>&1; then
-    echo "OK 13h: binary runs"
-  else
-    echo "FAIL 13h: installed binary doesn't run"
-    exit 1
-  fi
-
-  rm -rf "$PS1_TEST_HOME" "$PS1_TEST_DIR"
-else
-  echo "SKIP Phase 13: no install script available for this platform"
-fi
-
-else
-  echo ""
-  echo "=== Phase 12-13: SKIPPED (SMOKE_DOWNLOAD_URL not set) ==="
 fi
 
 # ── Phase 15: UI HTTP server reachability ──

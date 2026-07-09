@@ -4,7 +4,7 @@ set -euo pipefail
 # Layer 2: Binary string audit — post-build check on the production binary.
 #
 # Scans extracted strings for:
-#   1. Unauthorized URLs (only github.com + localhost allowed)
+#   1. Unauthorized URLs (only localhost + vendored/toolchain attribution allowed)
 #   2. Suspiciously long base64-encoded payloads
 #   3. Dangerous command names (wget, nc, netcat, telnet, ssh, /dev/tcp)
 #   4. Credential patterns (password=, secret=, api_key=)
@@ -70,8 +70,6 @@ echo "--- URL audit ---"
 
 # Allowed URL prefixes
 ALLOWED_URLS=(
-    "https://api.github.com/repos/DeusData/codebase-memory-mcp"
-    "https://github.com/DeusData/codebase-memory-mcp"
     "http://127.0.0.1"
     "http://localhost"
     # SQLite internal URLs (part of vendored sqlite3 strings)

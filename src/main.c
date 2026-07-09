@@ -509,7 +509,6 @@ static void print_help(void) {
     printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
-    printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");

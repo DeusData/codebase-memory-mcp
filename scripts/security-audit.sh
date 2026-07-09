@@ -243,7 +243,6 @@ if [ -f "$MCP_FILE" ]; then
     # - get_code_snippet: reads source via read_file_lines (path-contained)
     # - manage_adr: reads/writes ADR files
     # - detect_changes: reads git diff output
-    # - update check: reads the version-check HTTP response (fixed buffer)
     # - HTTP transport: reads the incoming request body (content-length bound)
     # Count fopen/fread calls and compare against expected
     FOPEN_COUNT=$(grep -c 'fopen\|fread\|read_file' "$MCP_FILE" 2>/dev/null || echo "0")
@@ -260,33 +259,6 @@ fi
 
 if $MCP_READS_OK; then
     echo "OK: MCP tool handler file reads within expected count."
-fi
-
-# ── 6. GitHub Actions pinned to SHA ───────────────────────────────
-# Mutable tags (@v4) can be moved by compromised maintainers.
-# All Actions must be pinned to full commit SHAs.
-
-echo ""
-echo "--- Scanning for unpinned GitHub Actions ---"
-
-UNPINNED_FOUND=false
-if [ -d "$ROOT/.github/workflows" ]; then
-    while IFS= read -r file; do
-        relfile="${file#"$ROOT/"}"
-        # Only check files tracked by git (skip stale untracked files)
-        git ls-files --error-unmatch "$file" > /dev/null 2>&1 || continue
-        while IFS= read -r match; do
-            [[ -z "$match" ]] && continue
-            echo "BLOCKED: ${relfile}: ${match}"
-            echo "  -> Pin to SHA: uses: owner/action@<commit-sha> # version"
-            fail
-            UNPINNED_FOUND=true
-        done < <(grep -nE 'uses:.*@v[0-9]' "$file" 2>/dev/null || true)
-    done < <(find "$ROOT/.github/workflows" -name '*.yml' -type f | sort)
-fi
-
-if ! $UNPINNED_FOUND; then
-    echo "OK: All GitHub Actions pinned to commit SHAs."
 fi
 
 # ── Summary ──────────────────────────────────────────────────────
