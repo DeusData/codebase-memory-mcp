@@ -651,6 +651,20 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
+    /* Preserve ADR content stored in project_summaries before replacing the DB. */
+    char *saved_adr = NULL;
+    cbm_store_t *adr_store = cbm_store_open_path(db_path);
+    if (adr_store) {
+        cbm_adr_t existing = {0};
+        if (cbm_store_adr_get(adr_store, project, &existing) == CBM_STORE_OK) {
+            if (existing.content) {
+                saved_adr = strdup(existing.content);
+            }
+            cbm_store_adr_free(&existing);
+        }
+        cbm_store_close(adr_store);
+    }
+
     cbm_unlink(db_path);
     char wal[INCR_WAL_BUF];
     char shm[INCR_WAL_BUF];
@@ -665,6 +679,12 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
+        /* #992: restore the captured ADR before persisting hashes, mirroring the
+         * full-reindex path (#516) -- the DB replacement above dropped it. */
+        if (saved_adr && cbm_store_adr_store(hash_store, project, saved_adr) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "adr_restore", "project", project);
+        }
+
         bool hash_records_complete = persist_hashes(hash_store, project, files, file_count,
                                                     mode_skipped, mode_skipped_count);
 
@@ -705,6 +725,8 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     if (repo_path && cbm_artifact_exists(repo_path)) {
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
+
+    free(saved_adr);
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
