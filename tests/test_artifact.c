@@ -310,6 +310,20 @@ TEST(artifact_gitattributes_created) {
     struct stat st;
     ASSERT_EQ(stat(ga, &st), 0);
 
+    /* Attribute ORDER is load-bearing: gitattributes apply left to right and
+     * the `binary` macro expands to `-diff -merge -text`, so a trailing
+     * `binary` unsets a preceding `merge=ours` (git check-attr merge reports
+     * "unset" and concurrent artifact refreshes produce binary conflicts
+     * instead of auto-resolving). The driver must come after the macro. */
+    FILE *gaf = fopen(ga, "r");
+    ASSERT_NOT_NULL(gaf);
+    char content[512] = {0};
+    size_t rd = fread(content, 1, sizeof(content) - 1, gaf);
+    (void)fclose(gaf);
+    ASSERT_TRUE(rd > 0);
+    ASSERT_NOT_NULL(strstr(content, CBM_ARTIFACT_FILENAME " binary merge=ours"));
+    ASSERT_TRUE(strstr(content, "merge=ours binary") == NULL);
+
     cleanup_dir(g_tmpdir);
     PASS();
 }

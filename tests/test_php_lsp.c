@@ -543,6 +543,31 @@ TEST(phplsp_trait_method_flattened) {
     PASS();
 }
 
+/* ── 23b. Regression: a trait that uses itself must terminate ─────
+ *
+ * `trait T { use T; ... }` — directly, or via an alias that resolves back
+ * to T by short name (`use Other\T as A; use A;`) — previously sent
+ * flatten_trait_into_class() into an unbounded loop: each copied method
+ * re-matched the loop filter while cbm_registry_add_func() grew the
+ * registry, exhausting all memory (40 GB+, freezing the host). The fix
+ * short-circuits self-flattening and snapshots the loop bound. The
+ * assertion is simply that extraction returns: pre-fix this never
+ * completed, and under the ASan test build a regression would surface as
+ * an OOM/abort here rather than a silent hang. */
+TEST(phplsp_trait_self_use_terminates) {
+    const char *src =
+        "<?php\n"
+        "namespace App;\n"
+        "trait EnumTrait {\n"
+        "    use EnumTrait;\n"
+        "    public function getRandom(): int { return 1; }\n"
+        "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 24. Match expression result type ──────────────────────────── */
 
 TEST(phplsp_match_result_type) {
@@ -5160,6 +5185,7 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_phpdoc_property_class_tag);
     RUN_TEST(phplsp_phpdoc_method_class_tag);
     RUN_TEST(phplsp_trait_method_flattened);
+    RUN_TEST(phplsp_trait_self_use_terminates);
     RUN_TEST(phplsp_match_result_type);
     RUN_TEST(phplsp_ternary_result_type);
     RUN_TEST(phplsp_method_chain_depth_three);

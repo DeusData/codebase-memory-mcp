@@ -2528,6 +2528,52 @@ TEST(cypher_issue237_distinct_order_limit) {
     PASS();
 }
 
+/* #873: duplicate projected rows must be deduped before ORDER BY + LIMIT */
+TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n) RETURN DISTINCT n.label AS label ORDER BY label LIMIT 2", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "Function");
+    ASSERT_STR_EQ(r.rows[1][0], "Module");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #873: early LIMIT must not truncate rows before DISTINCT for simple RETURN */
+TEST(cypher_issue873_distinct_limit_dedupes_before_limit) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n) RETURN DISTINCT n.label AS label LIMIT 2", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 2);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #873: SKIP is applied after DISTINCT and ORDER BY, not before dedupe */
+TEST(cypher_issue873_distinct_order_skip_limit_dedupes_before_skip) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n) RETURN DISTINCT n.label AS label ORDER BY label SKIP 1 LIMIT 1", "test",
+        0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "Module");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #252: toInteger() */
 TEST(cypher_issue252_tointeger) {
     cbm_store_t *s = setup_cypher_store();
@@ -2669,6 +2715,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
+    RUN_TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit);
+    RUN_TEST(cypher_issue873_distinct_limit_dedupes_before_limit);
+    RUN_TEST(cypher_issue873_distinct_order_skip_limit_dedupes_before_skip);
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);

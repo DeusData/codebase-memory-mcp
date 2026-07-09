@@ -3459,13 +3459,31 @@ static void flatten_trait_into_class(PHPLSPContext *ctx, CBMTypeRegistry *reg, c
         t = lookup_type_with_project(ctx, trait_qn);
     const char *canonical_trait_qn = t ? t->qualified_name : trait_qn;
 
+    /* A trait cannot meaningfully flatten into itself. PHP itself rejects
+     * `trait T { use T; }` ("Trait T cannot use itself"), and an aliased
+     * `use X as Y; use Y;` can resolve back onto the enclosing trait by short
+     * name. Without this guard the loop below copies the trait's own methods
+     * back onto it with receiver_type == canonical_trait_qn; because each copy
+     * then re-matches the loop's filter while cbm_registry_add_func() keeps
+     * growing reg->func_count, the iteration never terminates — it arena-
+     * allocates a fresh method every pass until the process exhausts all
+     * memory (observed: 40 GB+, freezing the host). See regression test
+     * phplsp_trait_self_use_terminates. */
+    if (strcmp(class_qn, canonical_trait_qn) == 0)
+        return;
+
     /* Iterate registry funcs whose receiver_type is the trait.
      *
      * Self-substitution: when the trait's method has a return type that
      * names the trait itself (e.g. `tap(): self` registered as
      * NAMED(trait_qn)), rewrite it to NAMED(using_class_qn) so chains
-     * like `$c->tap()->classMethod()` resolve correctly. */
-    for (int i = 0; i < reg->func_count; i++) {
+     * like `$c->tap()->classMethod()` resolve correctly.
+     *
+     * Snapshot the count before iterating: cbm_registry_add_func() below
+     * appends to reg->funcs, so the loop must never visit entries it adds
+     * during iteration (a mutate-while-iterating hazard). */
+    const int func_count_before = reg->func_count;
+    for (int i = 0; i < func_count_before; i++) {
         const CBMRegisteredFunc *src = &reg->funcs[i];
         if (!src->receiver_type || strcmp(src->receiver_type, canonical_trait_qn) != 0) {
             continue;

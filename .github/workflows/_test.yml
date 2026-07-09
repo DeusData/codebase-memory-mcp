@@ -88,6 +88,18 @@ jobs:
         env:
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
 
+  test-tsan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+
+      - name: ThreadSanitizer tests
+        run: make -f Makefile.cbm test-tsan CC=clang CXX=clang++
+
   test-windows:
     needs: setup-matrix
     strategy:
