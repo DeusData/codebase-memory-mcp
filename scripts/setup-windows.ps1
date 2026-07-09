@@ -1,6 +1,10 @@
 # codebase-memory-mcp setup script (Windows)
-# Default: download pre-built native Windows binary
-# -FromSource: build from source inside WSL (requires Go + gcc in WSL)
+# Default: build natively from this repository's sources (delegates to
+#          install.ps1 — requires the MSYS2 MinGW toolchain: gcc + make)
+# -FromSource: build inside WSL from this repository's sources (requires gcc
+#              and make in WSL; the MCP entry then runs through wsl.exe)
+#
+# No downloads — both modes build from the local checkout.
 
 param(
     [switch]$FromSource,
@@ -9,9 +13,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$Repo = "DeusData/codebase-memory-mcp"
 $BinaryName = "codebase-memory-mcp"
-$InstallDir = Join-Path $env:LOCALAPPDATA "codebase-memory-mcp"
+$RepoRoot = Split-Path -Parent $PSScriptRoot
 
 # --- Helpers ---
 
@@ -123,8 +126,8 @@ if ($Help) {
     Write-Host ""
     Write-Host "Usage: .\setup-windows.ps1 [-FromSource] [-Help]"
     Write-Host ""
-    Write-Host "  Default:      Download pre-built Windows binary"
-    Write-Host "  -FromSource:  Build from source inside WSL (requires Go 1.23+ and gcc in WSL)"
+    Write-Host "  Default:      Build natively from this repo (MSYS2 gcc + make; runs install.ps1)"
+    Write-Host "  -FromSource:  Build inside WSL from this repo (requires gcc and make in WSL)"
     Write-Host ""
     exit 0
 }
@@ -138,13 +141,13 @@ if ($FromSource) {
     Write-Host "Checking WSL2 (required for building from source)..." -ForegroundColor White
 
     if (-not (Test-WSL)) {
-        Write-Fail "WSL2 is not available. Required for building from source (CGO needs gcc)."
+        Write-Fail "WSL2 is not available. Required for the -FromSource (WSL) build."
         Write-Host ""
         Write-Host "  Install WSL2:" -ForegroundColor Yellow
         Write-Host "    wsl --install -d Ubuntu"
         Write-Host "  Then restart your computer and run this script again."
         Write-Host ""
-        Write-Host "  Alternatively, download a pre-built binary (no WSL needed):" -ForegroundColor Yellow
+        Write-Host "  Alternatively, build natively with MSYS2 (no WSL needed):" -ForegroundColor Yellow
         Write-Host "    .\setup-windows.ps1"
         exit 1
     }
@@ -166,47 +169,23 @@ if ($FromSource) {
     Write-Host ""
     Write-Host "Checking prerequisites inside WSL..." -ForegroundColor White
 
-    # Check for gcc
+    # Check for gcc + make
     try {
-        Invoke-WSL "command -v gcc" | Out-Null
-        Write-Ok "gcc found"
+        Invoke-WSL "command -v gcc && command -v make" | Out-Null
+        Write-Ok "gcc + make found"
     } catch {
-        Write-Warn "gcc not found. Installing build-essential..."
+        Write-Warn "gcc/make not found. Installing build-essential..."
         Invoke-WSL "sudo apt-get update && sudo apt-get install -y build-essential"
     }
 
-    # Check for Go
-    try {
-        $goVersion = Invoke-WSL "go version"
-        Write-Ok "Go: $goVersion"
-    } catch {
-        Write-Fail "Go not found in WSL."
-        Write-Host ""
-        Write-Host "  Install Go 1.23+ inside WSL:" -ForegroundColor Yellow
-        Write-Host "    See https://go.dev/dl/ for Linux amd64 tarball"
-        exit 1
-    }
-
-    # Check for git
-    try {
-        Invoke-WSL "command -v git" | Out-Null
-        Write-Ok "git found"
-    } catch {
-        Write-Fail "git not found in WSL. Install with: sudo apt install git"
-        exit 1
-    }
-
-    # Clone or update
+    # Copy THIS repository's sources into the WSL filesystem (building on
+    # /mnt/c is an order of magnitude slower than on ext4). tar over the
+    # pipe avoids permission-bit loss; .git/build/node_modules are skipped.
     Write-Host ""
     $sourceDir = "/home/$wslUser/.local/share/codebase-memory-mcp"
-    try {
-        Invoke-WSL "test -d $sourceDir/.git" | Out-Null
-        Write-Host "Updating source..." -ForegroundColor White
-        Invoke-WSL "git -C $sourceDir pull --ff-only"
-    } catch {
-        Write-Host "Cloning repository..." -ForegroundColor White
-        Invoke-WSL "mkdir -p /home/$wslUser/.local/share && git clone https://github.com/$Repo.git $sourceDir"
-    }
+    $mntRepo = (Invoke-WSL "wslpath -a '$($RepoRoot -replace '\\', '/')'").Trim()
+    Write-Host "Copying sources into WSL ($sourceDir)..." -ForegroundColor White
+    Invoke-WSL "rm -rf $sourceDir && mkdir -p $sourceDir && tar -C '$mntRepo' --exclude=.git --exclude=build --exclude=graph-ui/node_modules -cf - . | tar -C $sourceDir -xf -"
     Write-Ok "Source at $sourceDir"
 
     # Build
@@ -243,84 +222,13 @@ if ($FromSource) {
     Write-Host "    wsl.exe -- rm -rf ~/.cache/codebase-memory-mcp/"
 
 } else {
-    # --- Download pre-built native Windows binary ---
-    Write-Host "Fetching latest release..." -ForegroundColor White
-
-    $releaseUrl = "https://api.github.com/repos/$Repo/releases/latest"
-    $release = Invoke-RestMethod -Uri $releaseUrl -Headers @{ "User-Agent" = "codebase-memory-mcp-setup" }
-    $tag = $release.tag_name
-
-    if (-not $tag) {
-        Write-Fail "Could not determine latest release."
-        Write-Host "  Check: https://github.com/$Repo/releases"
+    # --- Native build from this repository (delegates to install.ps1) ---
+    $installer = Join-Path $RepoRoot "install.ps1"
+    if (-not (Test-Path $installer)) {
+        Write-Fail "install.ps1 not found at $installer"
         exit 1
     }
-    Write-Ok "Latest release: $tag"
-
-    $asset = "codebase-memory-mcp-windows-amd64.zip"
-    $downloadUrl = "https://github.com/$Repo/releases/download/$tag/$asset"
-
-    Write-Host "Downloading $asset..." -ForegroundColor White
-
-    # Create install directory
-    if (-not (Test-Path $InstallDir)) {
-        New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    }
-
-    $tmpZip = Join-Path $env:TEMP $asset
-    Invoke-WebRequest -Uri $downloadUrl -OutFile $tmpZip -UseBasicParsing
-
-    # Extract
-    Expand-Archive -Path $tmpZip -DestinationPath $InstallDir -Force
-    Remove-Item $tmpZip -Force
-
-    $binaryPath = Join-Path $InstallDir "$BinaryName.exe"
-
-    if (-not (Test-Path $binaryPath)) {
-        Write-Fail "Binary not found at $binaryPath after extraction"
-        exit 1
-    }
-    Write-Ok "Installed to $binaryPath"
-
-    # Verify binary runs
-    try {
-        $verOut = & $binaryPath --version 2>&1
-        Write-Ok "Version: $verOut"
-    } catch {
-        Write-Warn "Could not verify binary version (may still work)"
-    }
-
-    # SmartScreen note
-    Write-Host ""
-    Write-Warn "Windows SmartScreen may show a warning when the binary runs for the first time."
-    Write-Host "    This is normal for unsigned open-source binaries." -ForegroundColor Yellow
-    Write-Host "    Click 'More info' then 'Run anyway' to proceed." -ForegroundColor Yellow
-    Write-Host "    Verify checksums at: https://github.com/$Repo/releases" -ForegroundColor Yellow
-
-    # Check if install dir is on PATH
-    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    if ($userPath -notlike "*$InstallDir*") {
-        Write-Host ""
-        Write-Warn "$InstallDir is not on your PATH."
-        $addPath = Read-Host "  Add it to your user PATH? [y/N]"
-        if ($addPath -match '^[Yy]$') {
-            [Environment]::SetEnvironmentVariable("Path", "$userPath;$InstallDir", "User")
-            Write-Ok "Added to user PATH (restart your terminal to take effect)"
-        }
-    }
-
-    # Configure Claude Code
-    $mcpConfig = [ordered]@{
-        type    = "stdio"
-        command = $binaryPath
-    }
-
-    Configure-ClaudeCode $mcpConfig
-
-    Write-Host ""
-    Write-Ok "Done! Restart Claude Code and verify with /mcp"
-    Write-Host ""
-    Write-Host "  To uninstall:" -ForegroundColor White
-    Write-Host "    Remove-Item -Recurse -Force '$InstallDir'"
-    Write-Host "    Remove-Item -Recurse -Force `"$env:LOCALAPPDATA\codebase-memory-mcp`"  # graph database"
+    Write-Host "Building natively from $RepoRoot (via install.ps1)..." -ForegroundColor White
+    & powershell.exe -ExecutionPolicy ByPass -File $installer @args
+    exit $LASTEXITCODE
 }

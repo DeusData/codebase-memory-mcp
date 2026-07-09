@@ -1,33 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# install.sh — One-line installer for codebase-memory-mcp.
+# install.sh — Build codebase-memory-mcp from THIS repository's sources and
+# install the resulting binary. No downloads: everything needed for the
+# standard build is vendored in the repo, so the build runs fully offline.
 #
-# Usage:
-#   curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash
-#   curl -fsSL ... | bash -s -- --ui          # Install the UI variant
-#   curl -fsSL ... | bash -s -- --dir /path   # Custom install directory
+# Usage (from the repository root):
+#   ./install.sh                    # Build + install the standard variant
+#   ./install.sh --ui               # Build + install the UI variant (needs node/npm)
+#   ./install.sh --dir /path        # Custom install directory
+#   ./install.sh --skip-config      # Skip automatic agent configuration
 #
-# Environment:
-#   CBM_DOWNLOAD_URL  Override base URL for downloads (for testing)
+# Requirements: bash, gcc/g++ (or clang), GNU make.
+# The --ui variant additionally requires node + npm (graph-ui bundle).
 
-# Wrap in main() to prevent partial execution from piped downloads.
-# If curl|bash is interrupted mid-transfer, bash would execute the partial
-# script. With this wrapper, the function is defined but main() is never
-# called because the final line hasn't arrived yet.
 main() {
 
-REPO="DeusData/codebase-memory-mcp"
+# Resolve the repository root from this script's location — the sources we
+# build are the ones sitting next to this script.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
 INSTALL_DIR="$HOME/.local/bin"
 VARIANT="standard"
 SKIP_CONFIG=false
-CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
-
-# Security: reject non-HTTPS download URLs (defense-in-depth)
-case "$CBM_DOWNLOAD_URL" in
-    https://*|http://localhost*|http://127.0.0.1*) ;;
-    *) echo "error: refusing non-HTTPS download URL: $CBM_DOWNLOAD_URL" >&2; exit 1 ;;
-esac
 
 for arg in "$@"; do
     case "$arg" in
@@ -37,8 +32,8 @@ for arg in "$@"; do
         --skip-config)  SKIP_CONFIG=true ;;
         --help|-h)
             echo "Usage: install.sh [--ui] [--dir=<path>] [--skip-config]"
-            echo "  --ui           Install the UI variant (with graph visualization)"
-            echo "  --standard     Install the standard variant (default)"
+            echo "  --ui           Build the UI variant (with graph visualization; needs node/npm)"
+            echo "  --standard     Build the standard variant (default; fully offline build)"
             echo "  --dir PATH     Install directory (default: ~/.local/bin)"
             echo "  --skip-config  Skip automatic agent configuration"
             exit 0
@@ -54,142 +49,76 @@ for arg in "$@"; do
     prev="$arg"
 done
 
-detect_os() {
-    case "$(uname -s)" in
-        Darwin)               echo "darwin" ;;
-        Linux)                echo "linux" ;;
-        MINGW*|MSYS*|CYGWIN*) echo "windows" ;;
-        *) echo "error: unsupported OS: $(uname -s)" >&2; exit 1 ;;
-    esac
-}
+# ── Toolchain check ─────────────────────────────────────────────
+missing=""
+if ! command -v make &>/dev/null; then
+    missing="$missing make"
+fi
+if [ -z "${CC:-}" ] && ! command -v gcc &>/dev/null && ! command -v cc &>/dev/null; then
+    missing="$missing gcc"
+fi
+if [ "$VARIANT" = "ui" ]; then
+    command -v node &>/dev/null || missing="$missing node"
+    command -v npm  &>/dev/null || missing="$missing npm"
+fi
+if [ -n "$missing" ]; then
+    echo "error: missing build tools:$missing" >&2
+    echo "  Install them with your system package manager, e.g.:" >&2
+    echo "    Debian/Ubuntu: sudo apt install build-essential" >&2
+    echo "    RHEL/Fedora:   sudo dnf install gcc gcc-c++ make" >&2
+    echo "    Windows:       MSYS2 (pacman -S mingw-w64-x86_64-gcc make)" >&2
+    exit 1
+fi
 
-detect_arch() {
-    local arch
-    arch="$(uname -m)"
-    case "$arch" in
-        arm64|aarch64) echo "arm64" ;;
-        x86_64|amd64)
-            # Rosetta detection: shell reports x86_64 but hardware is Apple Silicon
-            if [ "$(uname -s)" = "Darwin" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -qi apple; then
-                echo "arm64"
-            else
-                echo "amd64"
-            fi
-            ;;
-        *) echo "error: unsupported architecture: $arch" >&2; exit 1 ;;
-    esac
-}
-
-OS=$(detect_os)
-ARCH=$(detect_arch)
-
-echo "codebase-memory-mcp installer"
-echo "  os:      $OS"
-echo "  arch:    $ARCH"
+echo "codebase-memory-mcp installer (build from source)"
+echo "  repo:    $REPO_ROOT"
 echo "  variant: $VARIANT"
 echo "  target:  $INSTALL_DIR/codebase-memory-mcp"
 echo ""
 
-# Build download URL
-if [ "$OS" = "windows" ]; then
-    EXT="zip"
-else
-    EXT="tar.gz"
-fi
-
-# Linux ships a fully-static "-portable" build; the standard linux binary
-# dynamically links glibc 2.38+ and fails on older distros (Debian 11, RHEL 8,
-# Ubuntu 20.04). macOS/Windows have no such variant.
-PORTABLE=""
-[ "$OS" = "linux" ] && PORTABLE="-portable"
-
+# ── Build ───────────────────────────────────────────────────────
+echo "Building..."
 if [ "$VARIANT" = "ui" ]; then
-    ARCHIVE="codebase-memory-mcp-ui-${OS}-${ARCH}${PORTABLE}.${EXT}"
+    "$REPO_ROOT/scripts/build.sh" --with-ui
 else
-    ARCHIVE="codebase-memory-mcp-${OS}-${ARCH}${PORTABLE}.${EXT}"
+    "$REPO_ROOT/scripts/build.sh"
 fi
 
-URL="${CBM_DOWNLOAD_URL}/${ARCHIVE}"
-
-# Download
-DLDIR=$(mktemp -d)
-trap 'rm -rf "$DLDIR"' EXIT
-
-echo "Downloading ${ARCHIVE}..."
-if command -v curl &>/dev/null; then
-    curl -fSL --progress-bar -o "$DLDIR/$ARCHIVE" "$URL"
-elif command -v wget &>/dev/null; then
-    wget -q --show-progress -O "$DLDIR/$ARCHIVE" "$URL"
-else
-    echo "error: curl or wget required" >&2
+BUILT_BIN="$REPO_ROOT/build/c/codebase-memory-mcp"
+if [ ! -f "$BUILT_BIN" ] && [ -f "$BUILT_BIN.exe" ]; then
+    BUILT_BIN="$BUILT_BIN.exe"
+fi
+if [ ! -f "$BUILT_BIN" ]; then
+    echo "error: build finished but binary not found at $BUILT_BIN" >&2
     exit 1
 fi
 
-# Checksum verification
-CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
-if curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
-    EXPECTED=$(grep "$ARCHIVE" "$DLDIR/checksums.txt" | awk '{print $1}')
-    if [ -n "$EXPECTED" ]; then
-        if command -v sha256sum &>/dev/null; then
-            ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        elif command -v shasum &>/dev/null; then
-            ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        else
-            ACTUAL=""
-        fi
-        if [ -n "$ACTUAL" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
-            echo "  expected: $EXPECTED" >&2
-            echo "  actual:   $ACTUAL" >&2
-            exit 1
-        elif [ -n "$ACTUAL" ]; then
-            echo "Checksum verified."
-        fi
-    fi
-fi
-
-# Extract
-echo "Extracting..."
-cd "$DLDIR"
-if [ "$EXT" = "zip" ]; then
-    unzip -q "$ARCHIVE"
-else
-    tar -xzf "$ARCHIVE"
-fi
-
-DLBIN="$DLDIR/codebase-memory-mcp"
-if [ ! -f "$DLBIN" ]; then
-    echo "error: binary not found after extraction" >&2
-    exit 1
-fi
-
-# macOS: fix signing
-if [ "$OS" = "darwin" ]; then
-    echo "Fixing macOS code signing..."
-    xattr -d com.apple.quarantine "$DLBIN" 2>/dev/null || true
-    codesign --sign - --force "$DLBIN" 2>/dev/null || true
-fi
-
-# Install
+# ── Install ─────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
 DEST="$INSTALL_DIR/codebase-memory-mcp"
+case "$BUILT_BIN" in
+    *.exe) DEST="$DEST.exe" ;;
+esac
 if [ -f "$DEST" ]; then
     rm -f "$DEST"
 fi
-cp "$DLBIN" "$DEST"
+cp "$BUILT_BIN" "$DEST"
 chmod 755 "$DEST"
 
-# Verify
+# macOS: ad-hoc signing (required on arm64, harmless on x86_64)
+if [ "$(uname -s)" = "Darwin" ]; then
+    xattr -d com.apple.quarantine "$DEST" 2>/dev/null || true
+    codesign --sign - --force "$DEST" 2>/dev/null || true
+fi
+
+# ── Verify ──────────────────────────────────────────────────────
 VERSION=$("$DEST" --version 2>&1) || {
     echo "error: installed binary failed to run" >&2
-    if [ "$OS" = "darwin" ]; then
-        echo "  try: xattr -cr $DEST && codesign --force --sign - $DEST" >&2
-    fi
     exit 1
 }
 echo "Installed: $VERSION"
 
-# Configure agents
+# ── Configure agents ────────────────────────────────────────────
 if [ "$SKIP_CONFIG" = true ]; then
     echo ""
     echo "Skipping agent configuration (--skip-config)"
@@ -203,7 +132,7 @@ else
     }
 fi
 
-# PATH check
+# ── PATH check ──────────────────────────────────────────────────
 if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
     echo ""
     echo "NOTE: $INSTALL_DIR is not in your PATH."

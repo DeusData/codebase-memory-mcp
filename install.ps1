@@ -1,27 +1,24 @@
-# install.ps1 — One-line installer for codebase-memory-mcp (Windows).
+# install.ps1 — Build codebase-memory-mcp from THIS repository's sources and
+# install the resulting binary (Windows). No downloads: everything needed for
+# the standard build is vendored in the repo, so the build runs fully offline.
 #
-# Usage: see README.md for install instructions.
+# Usage (from the repository root):
+#   powershell -ExecutionPolicy ByPass -File install.ps1
+#   powershell -ExecutionPolicy ByPass -File install.ps1 --ui
+#   powershell -ExecutionPolicy ByPass -File install.ps1 --dir=C:\tools\cbm
+#   powershell -ExecutionPolicy ByPass -File install.ps1 --skip-config
 #
-# Environment:
-#   CBM_DOWNLOAD_URL  Override base URL for downloads (for testing)
+# Requirements: MinGW-w64 gcc/g++ and GNU make — the MSYS2 toolchain
+# (install MSYS2, then: pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ make).
+# The --ui variant additionally requires node + npm on PATH.
 
 $ErrorActionPreference = "Stop"
 
-# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-
-$Repo = "DeusData/codebase-memory-mcp"
+$RepoRoot = $PSScriptRoot
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
-$BaseUrl = if ($env:CBM_DOWNLOAD_URL) { $env:CBM_DOWNLOAD_URL } else { "https://github.com/$Repo/releases/latest/download" }
 
-# Security: reject non-HTTPS download URLs (defense-in-depth)
-if (-not $BaseUrl.StartsWith("https://") -and -not $BaseUrl.StartsWith("http://localhost") -and -not $BaseUrl.StartsWith("http://127.0.0.1")) {
-    Write-Host "error: refusing non-HTTPS download URL: $BaseUrl" -ForegroundColor Red
-    exit 1
-}
-
-# Detect variant from args (--ui or --standard)
+# Parse args (--ui / --standard / --dir=<path> / --skip-config)
 $Variant = "standard"
 $SkipConfig = $false
 foreach ($arg in $args) {
@@ -31,96 +28,87 @@ foreach ($arg in $args) {
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
 
-# Detect the OS architecture. RuntimeInformation.OSArchitecture reports the real
-# OS arch (Arm64) even from an x64 process running under emulation on ARM64 --
-# unlike $env:PROCESSOR_ARCHITECTURE, which reports the emulated "AMD64", and
-# PROCESSOR_ARCHITEW6432, which is unset for 64-bit emulated processes. Fall back
-# to the env vars only if the .NET API is somehow unavailable.
-if ($env:CBM_ARCH) {
-    # Explicit override wins — used by CI/tests, and an escape hatch under x64
-    # emulation on ARM64 where no in-process detection is reliable.
-    $Arch = $env:CBM_ARCH
-} else {
-    try {
-        $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
-        $Arch = if ($osArch -eq 'Arm64') { "arm64" } else { "amd64" }
-    } catch {
-        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
-            $Arch = "arm64"
-        } else {
-            $Arch = "amd64"
-        }
-    }
+# ── Toolchain check ─────────────────────────────────────────────
+# GNU make: PATH first, then the standard MSYS2 location.
+$Make = $null
+$makeCmd = Get-Command "make" -ErrorAction SilentlyContinue
+if ($makeCmd) {
+    $Make = $makeCmd.Source
+} elseif (Test-Path "C:\msys64\usr\bin\make.exe") {
+    $Make = "C:\msys64\usr\bin\make.exe"
 }
-
-Write-Host "codebase-memory-mcp installer (Windows)"
-Write-Host "  variant: $Variant"
-Write-Host "  arch:    $Arch"
-Write-Host "  target:  $InstallDir\$BinName"
-Write-Host ""
-
-# Build download URL
-if ($Variant -eq "ui") {
-    $Archive = "codebase-memory-mcp-ui-windows-$Arch.zip"
-} else {
-    $Archive = "codebase-memory-mcp-windows-$Arch.zip"
-}
-$Url = "$BaseUrl/$Archive"
-
-# Download
-$TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
-New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
-
-Write-Host "Downloading $Archive..."
-try {
-    Invoke-WebRequest -Uri $Url -OutFile "$TmpDir\$Archive" -UseBasicParsing
-} catch {
-    Write-Host "error: download failed: $_" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+if (-not $Make) {
+    Write-Host "error: GNU make not found (PATH or C:\msys64\usr\bin\make.exe)" -ForegroundColor Red
+    Write-Host "  Install the MSYS2 toolchain: pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ make"
     exit 1
 }
 
-
-# Checksum verification
-$ChecksumUrl = "$BaseUrl/checksums.txt"
-try {
-    Invoke-WebRequest -Uri $ChecksumUrl -OutFile "$TmpDir\checksums.txt" -UseBasicParsing
-    $checksumLine = Get-Content "$TmpDir\checksums.txt" | Where-Object { $_ -like "*$Archive*" }
-    if ($checksumLine) {
-        $expected = ($checksumLine -split '\s+')[0]
-        $actual = (Get-FileHash -Path "$TmpDir\$Archive" -Algorithm SHA256).Hash.ToLower()
-        if ($expected -ne $actual) {
-            Write-Host "error: CHECKSUM MISMATCH!" -ForegroundColor Red
-            Write-Host "  expected: $expected"
-            Write-Host "  actual:   $actual"
-            Remove-Item -Recurse -Force $TmpDir
-            exit 1
-        }
-        Write-Host "Checksum verified."
-    }
-} catch {
-    Write-Host "warning: could not verify checksum (non-fatal)"
-}
-
-# Extract
-Write-Host "Extracting..."
-Expand-Archive -Path "$TmpDir\$Archive" -DestinationPath $TmpDir -Force
-
-$DlBin = Join-Path $TmpDir $BinName
-if (-not (Test-Path $DlBin)) {
-    # UI variant may have different name in zip
-    $UiBin = Join-Path $TmpDir "codebase-memory-mcp-ui.exe"
-    if (Test-Path $UiBin) {
-        Rename-Item $UiBin $BinName
-        $DlBin = Join-Path $TmpDir $BinName
+# gcc: PATH first, then the standard MSYS2 MinGW64 location (prepend to PATH
+# so make's compiler invocations resolve).
+$gccCmd = Get-Command "gcc" -ErrorAction SilentlyContinue
+if (-not $gccCmd) {
+    if (Test-Path "C:\msys64\mingw64\bin\gcc.exe") {
+        $env:PATH = "C:\msys64\mingw64\bin;C:\msys64\usr\bin;$env:PATH"
     } else {
-        Write-Host "error: binary not found after extraction" -ForegroundColor Red
-        Remove-Item -Recurse -Force $TmpDir
+        Write-Host "error: gcc not found (PATH or C:\msys64\mingw64\bin\gcc.exe)" -ForegroundColor Red
+        Write-Host "  Install the MSYS2 toolchain: pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-g++ make"
         exit 1
     }
 }
 
-# Install
+if ($Variant -eq "ui") {
+    $nodeCmd = Get-Command "node" -ErrorAction SilentlyContinue
+    $npmCmd = Get-Command "npm" -ErrorAction SilentlyContinue
+    if (-not $nodeCmd -or -not $npmCmd) {
+        Write-Host "error: the --ui variant requires node and npm on PATH" -ForegroundColor Red
+        exit 1
+    }
+}
+
+Write-Host "codebase-memory-mcp installer (build from source, Windows)"
+Write-Host "  repo:    $RepoRoot"
+Write-Host "  variant: $Variant"
+Write-Host "  make:    $Make"
+Write-Host "  target:  $InstallDir\$BinName"
+Write-Host ""
+
+# ── Build ───────────────────────────────────────────────────────
+# Same targets scripts/test-windows.ps1 uses for native Windows builds.
+# MinGW/LLVM on Windows ships no libasan/libubsan — disable sanitizers.
+$Target = "cbm"
+if ($Variant -eq "ui") { $Target = "cbm-with-ui" }
+
+# A writable Windows temp dir that GNU make forwards to the native gcc. MSYS2
+# strips TMP/TEMP from the environment it hands native children, so pass them
+# as make command-line variables (same invocation as scripts/test-windows.ps1).
+$tmp = $env:TEMP
+if (-not $tmp) { $tmp = "$env:USERPROFILE\AppData\Local\Temp" }
+
+Write-Host "Building ($Target)..."
+Push-Location $RepoRoot
+try {
+    & $Make "-j" "-f" "Makefile.cbm" $Target "SANITIZE=" "TMP=$tmp" "TEMP=$tmp" "TMPDIR=$tmp"
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "error: build failed (exit code $LASTEXITCODE)" -ForegroundColor Red
+        exit 1
+    }
+} finally {
+    Pop-Location
+}
+
+$BuiltBin = Join-Path $RepoRoot "build\c\codebase-memory-mcp.exe"
+if (-not (Test-Path $BuiltBin)) {
+    # Some make setups produce the binary without .exe
+    $alt = Join-Path $RepoRoot "build\c\codebase-memory-mcp"
+    if (Test-Path $alt) {
+        $BuiltBin = $alt
+    } else {
+        Write-Host "error: build finished but binary not found at $BuiltBin" -ForegroundColor Red
+        exit 1
+    }
+}
+
+# ── Install ─────────────────────────────────────────────────────
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $Dest = Join-Path $InstallDir $BinName
 
@@ -135,19 +123,18 @@ if (Test-Path $Dest) {
     }
 }
 
-Copy-Item $DlBin $Dest -Force
+Copy-Item $BuiltBin $Dest -Force
 
-# Verify
+# ── Verify ──────────────────────────────────────────────────────
 try {
     $ver = & $Dest --version 2>&1
     Write-Host "Installed: $ver"
 } catch {
     Write-Host "error: installed binary failed to run" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir
     exit 1
 }
 
-# Configure agents
+# ── Configure agents ────────────────────────────────────────────
 if ($SkipConfig) {
     Write-Host ""
     Write-Host "Skipping agent configuration (--skip-config)"
@@ -164,16 +151,13 @@ if ($SkipConfig) {
     }
 }
 
-# Add to PATH (user scope, no admin needed)
+# ── Add to PATH (user scope, no admin needed) ───────────────────
 $UserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 if ($UserPath -notlike "*$InstallDir*") {
     [Environment]::SetEnvironmentVariable("PATH", "$UserPath;$InstallDir", "User")
     $env:PATH = "$env:PATH;$InstallDir"
     Write-Host "Added $InstallDir to user PATH"
 }
-
-# Cleanup
-Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp."
