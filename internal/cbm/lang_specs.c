@@ -164,6 +164,7 @@ extern const TSLanguage *tree_sitter_apex(void);
 extern const TSLanguage *tree_sitter_soql(void);
 extern const TSLanguage *tree_sitter_sosl(void);
 extern const TSLanguage *tree_sitter_pine(void);
+extern const TSLanguage *tree_sitter_arkts(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -1596,6 +1597,43 @@ static const char *pine_var_types[] = {"variable_definition_statement",
 static const char *pine_branch_types[] = {"if_statement",     "switch_statement", "for_statement",
                                           "for_in_statement", "while_statement",  NULL};
 static const char *pine_assign_types[] = {"reassignment_statement", NULL};
+// ==================== ARKTS (HarmonyOS/OpenHarmony) ====================
+// ArkTS is a TypeScript superset with declarative UI extensions.
+// Grammar: tree-sitter-arkts (https://github.com/Million-mo/tree-sitter-arkts)
+// Reuses TS/JS node types where applicable, adds ArkTS-specific UI nodes.
+static const char *arkts_func_types[] = {"function_declaration",
+                                         "function_expression",
+                                         "arrow_function",
+                                         "method_declaration",
+                                         "constructor_declaration",
+                                         "build_method",
+                                         "decorated_function_declaration",
+                                         "ui_builder_arrow_function",
+                                         NULL};
+static const char *arkts_class_types[] = {"class_declaration",
+                                          "enum_declaration",
+                                          "interface_declaration",
+                                          "type_declaration",
+                                          "component_declaration",
+                                          "decorated_export_declaration",
+                                          NULL};
+static const char *arkts_field_types[] = {"property_declaration", "public_field_definition", NULL};
+static const char *arkts_module_types[] = {"source_file", NULL};
+static const char *arkts_call_types[] = {"call_expression", "new_expression", NULL};
+static const char *arkts_import_types[] = {"import_declaration", "import", NULL};
+static const char *arkts_branch_types[] = {"if_statement",       "for_statement",
+                                           "for_in_statement",   "while_statement",
+                                           "do_statement",       "switch_statement",
+                                           "switch_case",        "switch_default",
+                                           "try_statement",      "catch_clause",
+                                           "for_each_statement", "lazy_for_each_statement",
+                                           "ui_if_statement",    NULL};
+static const char *arkts_var_types[] = {"lexical_declaration", "variable_declaration", NULL};
+static const char *arkts_assign_types[] = {"assignment_expression",
+                                           "augmented_assignment_expression", NULL};
+static const char *arkts_throw_types[] = {"throw_statement", NULL};
+static const char *arkts_decorator_types[] = {"decorator", NULL};
+
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -2570,6 +2608,14 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        pine_module_types, pine_call_types, empty_types, empty_types,
                        pine_branch_types, pine_var_types, pine_assign_types, empty_types, NULL,
                        empty_types, NULL, NULL, tree_sitter_pine, NULL},
+
+    // CBM_LANG_ARKTS — ArkTS (HarmonyOS/OpenHarmony declarative UI language).
+    // TypeScript superset with UI extensions. Uses tree-sitter-arkts grammar.
+    [CBM_LANG_ARKTS] = {CBM_LANG_ARKTS, arkts_func_types, arkts_class_types, arkts_field_types,
+                        arkts_module_types, arkts_call_types, arkts_import_types,
+                        arkts_import_types, arkts_branch_types, arkts_var_types, arkts_assign_types,
+                        arkts_throw_types, NULL, arkts_decorator_types, NULL, NULL,
+                        tree_sitter_arkts, NULL},
 
 };
 

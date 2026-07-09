@@ -697,6 +697,30 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
 
+        /* ArkTS: function_declaration / decorated_function_declaration
+         * have no `name` field; the function name is a plain `identifier` child.
+         * build_method has no name at all — synthesize one from the keyword. */
+        if (lang == CBM_LANG_ARKTS && (strcmp(kind, "function_declaration") == 0 ||
+                                       strcmp(kind, "decorated_function_declaration") == 0)) {
+            TSNode id = cbm_find_child_by_kind(node, "identifier");
+            if (!ts_node_is_null(id)) {
+                return id;
+            }
+        }
+        if (lang == CBM_LANG_ARKTS && strcmp(kind, "build_method") == 0) {
+            /* build() is always named "build" in ArkTS components. Return a
+             * synthetic name by finding the "build" keyword child. If no named
+             * child matches, fall through — extract_func_def will skip it. */
+            TSNode kw = cbm_find_child_by_kind(node, "build");
+            if (!ts_node_is_null(kw)) {
+                return kw;
+            }
+            /* tree-sitter-arkts may use "build" as an anonymous token.
+             * Try the first named child which could be the body. If no
+             * identifier exists, we still want to emit a def — handled in
+             * extract_func_def via a special case. */
+        }
+
         // PowerShell function_statement has no `name` field; the name is a
         // `function_name` child node (#35).
         if (lang == CBM_LANG_POWERSHELL && strcmp(kind, "function_statement") == 0) {
@@ -2636,7 +2660,8 @@ static const char *class_label_for_kind(const char *kind) {
         return "Enum";
     }
     if (strcmp(kind, "type_alias_declaration") == 0 || strcmp(kind, "type_item") == 0 ||
-        strcmp(kind, "type_alias") == 0 || strcmp(kind, "type_definition") == 0) {
+        strcmp(kind, "type_alias") == 0 || strcmp(kind, "type_definition") == 0 ||
+        strcmp(kind, "type_declaration") == 0) {
         return "Type";
     }
     return "Class";
@@ -3078,13 +3103,21 @@ static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source)
 
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
+    const char *kind = ts_node_type(node);
 
     TSNode name_node = cbm_resolve_func_name(node, ctx->language);
-    if (ts_node_is_null(name_node)) {
+
+    /* ArkTS: build_method has no name child — synthesize "build". */
+    char *synth_name = NULL;
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_ARKTS &&
+        strcmp(kind, "build_method") == 0) {
+        synth_name = cbm_arena_strdup(a, "build");
+    }
+    if (ts_node_is_null(name_node) && !synth_name) {
         return;
     }
 
-    char *name = cbm_func_name_node_text(a, name_node, ctx->source);
+    char *name = synth_name ? synth_name : cbm_func_name_node_text(a, name_node, ctx->source);
     if (!name || !name[0] || strcmp(name, "function") == 0) {
         return;
     }
@@ -3512,6 +3545,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         (ctx->language == CBM_LANG_SWIFT || ctx->language == CBM_LANG_KOTLIN)) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
     }
+    // ArkTS: class_declaration / component_declaration / interface_declaration /
+    // enum_declaration / type_declaration have no `name` field; the name is a
+    // plain `identifier` child.
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_ARKTS) {
+        name_node = cbm_find_child_by_kind(node, "identifier");
+    }
     // Protobuf: service_name / message_name / enum_name children
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_PROTOBUF) {
         name_node = cbm_find_child_by_kind(node, "service_name");
@@ -3774,6 +3813,16 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             label = "Interface";
         }
     }
+    // ArkTS: `@Component struct Foo` parses to `component_declaration` (and
+    // `@Component export struct Foo` to `decorated_export_declaration`). These
+    // are UI components, not OOP classes — emit the precise "Component" label.
+    // Scoped to ArkTS only so templ's `component_declaration` (a Go templating
+    // function) keeps its established "Class" labeling and the golden snapshot
+    // for templ is unaffected.
+    if (ctx->language == CBM_LANG_ARKTS && (strcmp(kind, "component_declaration") == 0 ||
+                                            strcmp(kind, "decorated_export_declaration") == 0)) {
+        label = "Component";
+    }
     // Rust/Swift/D: a struct is a distinct kind from a class — emit the precise
     // "Struct" label rather than collapsing it to "Class". Scoped to these three
     // grammar/LSP languages. Rust's struct node is `struct_item`; D's is
@@ -3971,6 +4020,7 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
                                        "block",
                                        "closure",
                                        "implementation_definition",
+                                       "component_body",
                                        NULL};
     uint32_t count = ts_node_child_count(class_node);
     for (uint32_t i = 0; i < count; i++) {
@@ -4074,6 +4124,24 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     // Squirrel: function_declaration's name is a plain `identifier` child.
     if (lang == CBM_LANG_SQUIRREL && strcmp(ck, "function_declaration") == 0) {
         return cbm_find_child_by_kind(child, "identifier");
+    }
+
+    // ArkTS: method / build_method / decorated_function_declaration have no `name`
+    // field; the method name is a plain `identifier` child. For build_method,
+    // the name is always "build" (synthesized by the caller).
+    if (lang == CBM_LANG_ARKTS &&
+        (strcmp(ck, "method_declaration") == 0 || strcmp(ck, "function_declaration") == 0 ||
+         strcmp(ck, "decorated_function_declaration") == 0)) {
+        TSNode id = cbm_find_child_by_kind(child, "identifier");
+        if (!ts_node_is_null(id)) {
+            return id;
+        }
+    }
+    if (lang == CBM_LANG_ARKTS && strcmp(ck, "build_method") == 0) {
+        TSNode kw = cbm_find_child_by_kind(child, "build");
+        if (!ts_node_is_null(kw)) {
+            return kw;
+        }
     }
 
     if (strcmp(ck, "arrow_function") == 0) {
@@ -4234,6 +4302,26 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
         }
 
         TSNode name_node = resolve_method_name(method_node, ctx->language);
+        /* ArkTS: build_method has no name child — synthesize "build" as method name. */
+        if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_ARKTS &&
+            strcmp(ts_node_type(method_node), "build_method") == 0) {
+            /* Use the method_node itself as name_node; push_method_def will
+             * get the text "build_method" — override below. */
+            char *build_name = cbm_arena_strdup(ctx->arena, "build");
+            const char *build_qn = cbm_arena_sprintf(ctx->arena, "%s.build", class_qn);
+            CBMDefinition mdef;
+            memset(&mdef, 0, sizeof(mdef));
+            mdef.name = build_name;
+            mdef.qualified_name = build_qn;
+            mdef.label = "Method";
+            mdef.file_path = ctx->rel_path;
+            mdef.start_line = ts_node_start_point(method_node).row + TS_LINE_OFFSET;
+            mdef.end_line = ts_node_end_point(method_node).row + TS_LINE_OFFSET;
+            mdef.lines = (int)(mdef.end_line - mdef.start_line + TS_LINE_OFFSET);
+            mdef.parent_class = class_qn;
+            cbm_defs_push(&ctx->result->defs, ctx->arena, mdef);
+            continue;
+        }
         if (ts_node_is_null(name_node)) {
             continue;
         }
@@ -5812,6 +5900,9 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_SWIFT) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
     }
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_ARKTS) {
+        name_node = cbm_find_child_by_kind(node, "identifier");
+    }
     if (!ts_node_is_null(name_node)) {
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
         if (cname && cname[0]) {
@@ -5837,6 +5928,7 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
         if (strcmp(ck, "field_declaration_list") == 0 || strcmp(ck, "class_body") == 0 ||
             strcmp(ck, "declaration_list") == 0 || strcmp(ck, "body") == 0 ||
             strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0 ||
+            strcmp(ck, "component_body") == 0 ||
             // Groovy class bodies are a `closure` node; routing through the
             // nested-class path keeps methods from being re-walked (and thus
             // double-extracted) as top-level functions. Gated to Groovy so other
@@ -6329,7 +6421,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 bool descend_into_func =
                     (ctx->language == CBM_LANG_WOLFRAM || ctx->language == CBM_LANG_TYPESCRIPT ||
                      ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TSX ||
-                     ctx->language == CBM_LANG_ADA);
+                     ctx->language == CBM_LANG_ADA || ctx->language == CBM_LANG_ARKTS);
                 if (!descend_into_func) {
                     continue;
                 }

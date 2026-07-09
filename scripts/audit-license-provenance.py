@@ -27,6 +27,7 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "qml": "yuja/tree-sitter-qmljs",
 }
 SPECIAL_NOTICE = {
+    "arkts": "PROVENANCE-NOTICE (upstream Million-mo/tree-sitter-arkts declares MIT in grammar.js header and package.json, ships no LICENSE file; our vendored copy is the MIT text reconstructed from the header declaration, (c) 2024 million per grammar.js @author million)",
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",
     "pine": "PROVENANCE-NOTICE (upstream kvarenzn/tree-sitter-pine declares ISC, ships no license file)",
 }
