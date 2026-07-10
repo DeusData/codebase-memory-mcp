@@ -165,32 +165,42 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return CBM_NOT_FOUND;
 }
 
-/* Resolve the repo toplevel for root_path (git prints '/'-separated absolute
- * paths on every platform). Returns a heap copy or NULL. */
+/* Resolve the repo toplevel for root_path. Uses --show-cdup — the RELATIVE
+ * walk-up from root_path to the toplevel (empty when root_path IS the
+ * toplevel) — joined onto root_path, so the result keeps the caller's path
+ * form. --show-toplevel is unusable here: MSYS/Cygwin git prints POSIX-mapped
+ * absolute paths (/tmp/...) that a native stat() cannot resolve, so
+ * git_status_signature silently lost its mtime/size mix-in on Windows.
+ * Returns a heap copy or NULL. */
 static char *git_show_toplevel(const char *root_path) {
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --show-toplevel 2>%s", root_path,
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --show-cdup 2>%s", root_path,
              WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
         return NULL;
     }
     char line[CBM_SZ_1K];
-    char *out = NULL;
+    line[0] = '\0';
     if (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r' ||
+                           line[len - SKIP_ONE] == '/')) {
             line[--len] = '\0';
-        }
-        if (len > 0) {
-            out = strdup(line);
         }
     }
     if (cbm_pclose(fp) != 0) {
-        free(out);
         return NULL;
     }
-    return out;
+    if (line[0] == '\0') {
+        return strdup(root_path); /* root_path is the toplevel itself */
+    }
+    char joined[CBM_SZ_2K];
+    int n = snprintf(joined, sizeof(joined), "%s/%s", root_path, line);
+    if (n <= 0 || n >= (int)sizeof(joined)) {
+        return NULL;
+    }
+    return strdup(joined);
 }
 
 /* True when root_path has its OWN .git entry (directory, or the gitlink file
