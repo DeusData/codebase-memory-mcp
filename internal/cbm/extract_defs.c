@@ -2002,6 +2002,311 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     return result;
 }
 
+typedef struct {
+    const char *kind;
+    const char *selector;
+    const char *template_url;
+    const char **style_urls;
+    const char **imports;
+    bool standalone;
+    bool standalone_set;
+} angular_metadata_t;
+
+static bool angular_core_import_matches(const CBMExtractCtx *ctx, const char *decorator_name) {
+    const char *dot = strrchr(decorator_name, '.');
+    size_t local_len = dot ? (size_t)(dot - decorator_name) : strlen(decorator_name);
+    for (int i = 0; i < ctx->result->imports.count; i++) {
+        const CBMImport *imp = &ctx->result->imports.items[i];
+        if (!imp->local_name || !imp->module_path ||
+            strcmp(imp->module_path, "@angular/core") != 0) {
+            continue;
+        }
+        if (strlen(imp->local_name) == local_len &&
+            strncmp(imp->local_name, decorator_name, local_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *angular_kind_from_decorator(CBMExtractCtx *ctx, TSNode fn) {
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    char *text = cbm_node_text(ctx->arena, fn, ctx->source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+    if (!angular_core_import_matches(ctx, text)) {
+        return NULL;
+    }
+    const char *short_name = strrchr(text, '.');
+    short_name = short_name ? short_name + SKIP_ONE : text;
+    if (strcmp(short_name, "Component") == 0) {
+        return "component";
+    }
+    if (strcmp(short_name, "Directive") == 0) {
+        return "directive";
+    }
+    if (strcmp(short_name, "Pipe") == 0) {
+        return "pipe";
+    }
+    if (strcmp(short_name, "Injectable") == 0) {
+        return "injectable";
+    }
+    if (strcmp(short_name, "NgModule") == 0) {
+        return "ng_module";
+    }
+    return NULL;
+}
+
+static const char *angular_string_literal(CBMArena *a, TSNode node, const char *source) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "string") != 0 && strcmp(kind, "string_literal") != 0) {
+        return NULL;
+    }
+    char *text = cbm_node_text(a, node, source);
+    size_t len = text ? strlen(text) : 0;
+    if (len < CBM_QUOTE_PAIR || (text[0] != '\'' && text[0] != '"') ||
+        text[len - SKIP_ONE] != text[0]) {
+        return NULL;
+    }
+    return cbm_arena_strndup(a, text + SKIP_ONE, len - CBM_QUOTE_PAIR);
+}
+
+static bool angular_array_contains(const char *const *items, int count, const char *value) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(items[i], value) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool angular_string_array(CBMArena *a, TSNode node, const char *source, const char ***out) {
+    *out = NULL;
+    if (strcmp(ts_node_type(node), "array") != 0) {
+        return false;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    const char **items =
+        (const char **)cbm_arena_alloc(a, sizeof(const char *) * (count + NULL_TERM));
+    if (!items) {
+        return false;
+    }
+    int used = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        const char *value = angular_string_literal(a, ts_node_named_child(node, i), source);
+        if (!value) {
+            return false;
+        }
+        if (!angular_array_contains(items, used, value)) {
+            items[used++] = value;
+        }
+    }
+    items[used] = NULL;
+    *out = used > 0 ? items : NULL;
+    return true;
+}
+
+static bool angular_identifier_array(CBMArena *a, TSNode node, const char *source,
+                                     const char ***out) {
+    *out = NULL;
+    if (strcmp(ts_node_type(node), "array") != 0) {
+        return false;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    const char **items =
+        (const char **)cbm_arena_alloc(a, sizeof(const char *) * (count + NULL_TERM));
+    if (!items) {
+        return false;
+    }
+    int used = 0;
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(item), "identifier") != 0) {
+            return false;
+        }
+        char *value = cbm_node_text(a, item, source);
+        if (!value || !value[0]) {
+            return false;
+        }
+        if (!angular_array_contains(items, used, value)) {
+            items[used++] = value;
+        }
+    }
+    items[used] = NULL;
+    *out = used > 0 ? items : NULL;
+    return true;
+}
+
+static bool angular_parse_object(CBMArena *a, TSNode object, const char *source,
+                                 angular_metadata_t *meta) {
+    enum {
+        ANGULAR_SEEN_SELECTOR = 1 << 0,
+        ANGULAR_SEEN_STANDALONE = 1 << 1,
+        ANGULAR_SEEN_TEMPLATE_URL = 1 << 2,
+        ANGULAR_SEEN_STYLE_URLS = 1 << 3,
+        ANGULAR_SEEN_IMPORTS = 1 << 4,
+    };
+    int seen = 0;
+    uint32_t count = ts_node_named_child_count(object);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode pair = ts_node_named_child(object, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            return false; /* spread/computed entries can override literal fields */
+        }
+        TSNode key_node = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        TSNode value_node = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+        if (ts_node_is_null(key_node) || ts_node_is_null(value_node)) {
+            return false;
+        }
+        char *key = cbm_node_text(a, key_node, source);
+        if (!key || !key[0]) {
+            return false;
+        }
+        size_t key_len = strlen(key);
+        if (key_len >= CBM_QUOTE_PAIR && (key[0] == '\'' || key[0] == '"') &&
+            key[key_len - SKIP_ONE] == key[0]) {
+            key = cbm_arena_strndup(a, key + SKIP_ONE, key_len - CBM_QUOTE_PAIR);
+        }
+
+        int flag = 0;
+        if (strcmp(key, "selector") == 0) {
+            flag = ANGULAR_SEEN_SELECTOR;
+        } else if (strcmp(key, "standalone") == 0) {
+            flag = ANGULAR_SEEN_STANDALONE;
+        } else if (strcmp(key, "templateUrl") == 0) {
+            flag = ANGULAR_SEEN_TEMPLATE_URL;
+        } else if (strcmp(key, "styleUrls") == 0) {
+            flag = ANGULAR_SEEN_STYLE_URLS;
+        } else if (strcmp(key, "imports") == 0) {
+            flag = ANGULAR_SEEN_IMPORTS;
+        } else {
+            continue;
+        }
+        if ((seen & flag) != 0) {
+            return false;
+        }
+        seen |= flag;
+
+        if (flag == ANGULAR_SEEN_SELECTOR) {
+            meta->selector = angular_string_literal(a, value_node, source);
+            if (!meta->selector) {
+                return false;
+            }
+        } else if (flag == ANGULAR_SEEN_STANDALONE) {
+            const char *value_kind = ts_node_type(value_node);
+            if (strcmp(value_kind, "true") != 0 && strcmp(value_kind, "false") != 0) {
+                return false;
+            }
+            meta->standalone = strcmp(value_kind, "true") == 0;
+            meta->standalone_set = true;
+        } else if (flag == ANGULAR_SEEN_TEMPLATE_URL) {
+            meta->template_url = angular_string_literal(a, value_node, source);
+            if (!meta->template_url) {
+                return false;
+            }
+        } else if (flag == ANGULAR_SEEN_STYLE_URLS) {
+            if (!angular_string_array(a, value_node, source, &meta->style_urls)) {
+                return false;
+            }
+        } else if (flag == ANGULAR_SEEN_IMPORTS &&
+                   !angular_identifier_array(a, value_node, source, &meta->imports)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool angular_parse_decorator(CBMExtractCtx *ctx, TSNode decorator,
+                                    angular_metadata_t *meta) {
+    CBMArena *a = ctx->arena;
+    const char *source = ctx->source;
+    TSNode expr =
+        ts_node_named_child_count(decorator) > 0 ? ts_node_named_child(decorator, 0) : (TSNode){0};
+    if (ts_node_is_null(expr)) {
+        return false;
+    }
+    TSNode fn = expr;
+    TSNode args = {0};
+    if (strcmp(ts_node_type(expr), "call_expression") == 0) {
+        fn = ts_node_child_by_field_name(expr, TS_FIELD("function"));
+        args = ts_node_child_by_field_name(expr, TS_FIELD("arguments"));
+    }
+    const char *kind = angular_kind_from_decorator(ctx, fn);
+    if (!kind) {
+        return false;
+    }
+    memset(meta, 0, sizeof(*meta));
+    meta->kind = kind;
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return true;
+    }
+    if (ts_node_named_child_count(args) != 1) {
+        return true;
+    }
+    TSNode object = ts_node_named_child(args, 0);
+    if (strcmp(ts_node_type(object), "object") != 0) {
+        return true;
+    }
+    angular_metadata_t parsed = {.kind = kind};
+    if (angular_parse_object(a, object, source, &parsed)) {
+        *meta = parsed;
+    }
+    return true;
+}
+
+static void extract_angular_metadata(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                     CBMDefinition *def) {
+    if (ctx->language != CBM_LANG_TYPESCRIPT && ctx->language != CBM_LANG_TSX) {
+        return;
+    }
+    angular_metadata_t found = {0};
+    int matches = 0;
+    TSNode prev = ts_node_prev_sibling(node);
+    while (!ts_node_is_null(prev)) {
+        if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
+            angular_metadata_t candidate = {0};
+            if (angular_parse_decorator(ctx, prev, &candidate)) {
+                found = candidate;
+                matches++;
+            }
+        } else if (ts_node_is_named(prev)) {
+            break;
+        }
+        prev = ts_node_prev_sibling(prev);
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode child = ts_node_child(node, i);
+        if (!cbm_kind_in_set(child, spec->decorator_node_types)) {
+            continue;
+        }
+        angular_metadata_t candidate = {0};
+        if (angular_parse_decorator(ctx, child, &candidate)) {
+            found = candidate;
+            matches++;
+        }
+    }
+    if (matches != 1) {
+        return; /* no Angular decorator, or multiple ambiguous Angular roles */
+    }
+    def->angular_kind = found.kind;
+    if ((strcmp(found.kind, "component") == 0 || strcmp(found.kind, "directive") == 0)) {
+        def->angular_selector = found.selector;
+    }
+    def->angular_standalone = found.standalone;
+    def->angular_standalone_set = found.standalone_set;
+    if (strcmp(found.kind, "component") == 0) {
+        def->angular_template_url = found.template_url;
+        def->angular_style_urls = found.style_urls;
+        if (!found.standalone_set || found.standalone) {
+            def->angular_imports = found.imports;
+        }
+    }
+}
+
 /* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
  * attributes both parse as distinct function_item nodes and otherwise receive
  * the SAME qualified_name, so the second graph upsert silently overwrites the
@@ -3983,6 +4288,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
+    extract_angular_metadata(ctx, node, spec, &def);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
     cbm_defs_push(&ctx->result->defs, a, def);

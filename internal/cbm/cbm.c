@@ -979,10 +979,10 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
         .root = root,
     };
 
-    // Run extractors: defs + imports use separate walks (unique recursion patterns),
+    // Run extractors: imports + defs use separate walks (unique recursion patterns),
     // then a single unified cursor walk handles the remaining 7 extractors.
-    cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
+    cbm_extract_definitions(&ctx);
     cbm_extract_unified(&ctx);
     cbm_propagate_angular_http_wrappers(&ctx);
 

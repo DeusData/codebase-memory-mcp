@@ -760,6 +760,8 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(inner, "signature"));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
     ASSERT_NOT_NULL(strstr(inner, "is_exported"));
+    ASSERT_NOT_NULL(strstr(inner, "\"styleUrls\":[\"./a.scss\",\"./theme.css\"]"));
+    ASSERT_NOT_NULL(strstr(inner, "\"angular_imports\":[\"CommonModule\",\"SharedCard\"]"));
     free(inner);
     free(resp);
 
@@ -2799,7 +2801,9 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_hr.end_line = 5;
     n_hr.properties_json = "{\"signature\":\"func HandleRequest() error\","
                            "\"return_type\":\"error\","
-                           "\"is_exported\":true}";
+                           "\"is_exported\":true,"
+                           "\"styleUrls\":[\"./a.scss\",\"./theme.css\"],"
+                           "\"angular_imports\":[\"CommonModule\",\"SharedCard\"]}";
     int64_t id_hr = cbm_store_upsert_node(st, &n_hr);
 
     cbm_node_t n_po = {0};

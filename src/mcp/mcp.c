@@ -394,6 +394,10 @@ static const tool_def_t TOOLS[] = {
      "loop — the hidden O(n^2) that loop_depth misses), alloc_in_loop (allocations/appends inside "
      "a loop), recursion_in_loop (a self-call inside a loop), unguarded_recursion (recursion with "
      "no conditionally-guarded base case), param_count and max_access_depth (structure smells). "
+     "Angular Class nodes expose angular_kind, selector, standalone, templateUrl, styleUrls, and "
+     "angular_imports; resolved standalone dependencies use IMPORTS edges with via="
+     "\"angular_metadata\". Array/object properties are returned as compact JSON text because "
+     "query_graph row cells are strings. "
      "Find all hot-path candidates in one query, e.g. MATCH (f:Function) WHERE "
      "f.transitive_loop_depth >= 3 OR f.linear_scan_in_loop >= 1 RETURN f.qualified_name, "
      "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC. "
@@ -4358,6 +4362,11 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
             yyjson_mut_obj_add_int(doc, obj, k, yyjson_get_int(val));
         } else if (yyjson_is_real(val)) {
             yyjson_mut_obj_add_real(doc, obj, k, yyjson_get_real(val));
+        } else if (yyjson_is_arr(val) || yyjson_is_obj(val)) {
+            yyjson_mut_val *copy = yyjson_val_mut_copy(doc, val);
+            if (copy) {
+                yyjson_mut_obj_add_val(doc, obj, k, copy);
+            }
         }
     }
     return props_doc; /* caller frees after serialization */

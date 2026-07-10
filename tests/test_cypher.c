@@ -2548,8 +2548,8 @@ TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit) {
 TEST(cypher_issue873_distinct_limit_dedupes_before_limit) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(
-        s, "MATCH (n) RETURN DISTINCT n.label AS label LIMIT 2", "test", 0, &r);
+    int rc =
+        cbm_cypher_execute(s, "MATCH (n) RETURN DISTINCT n.label AS label LIMIT 2", "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_NULL(r.error);
     ASSERT_EQ(r.row_count, 2);
@@ -2563,8 +2563,8 @@ TEST(cypher_issue873_distinct_order_skip_limit_dedupes_before_skip) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(
-        s, "MATCH (n) RETURN DISTINCT n.label AS label ORDER BY label SKIP 1 LIMIT 1", "test",
-        0, &r);
+        s, "MATCH (n) RETURN DISTINCT n.label AS label ORDER BY label SKIP 1 LIMIT 1", "test", 0,
+        &r);
     ASSERT_EQ(rc, 0);
     ASSERT_NULL(r.error);
     ASSERT_EQ(r.row_count, 1);
@@ -2617,23 +2617,28 @@ TEST(cypher_multi_prop_projection_no_alias) {
                     .end_line = 42,
                     .properties_json = "{\"complexity\":3,\"cognitive\":7,\"loop_count\":2,"
                                        "\"loop_depth\":1,\"self_recursive\":false,"
-                                       "\"transitive_loop_depth\":5,\"recursive\":true}"};
+                                       "\"transitive_loop_depth\":5,\"recursive\":true,"
+                                       "\"styleUrls\":[\"./a.scss\",\"./theme.css\"],"
+                                       "\"angular_imports\":[\"CommonModule\",\"SharedCard\"]}"};
     cbm_store_upsert_node(s, &n);
 
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(s,
                                 "MATCH (f:Function) RETURN f.loop_depth, f.transitive_loop_depth, "
-                                "f.cognitive, f.complexity, f.start_line, f.end_line",
+                                "f.cognitive, f.complexity, f.start_line, f.end_line, "
+                                "f.styleUrls, f.angular_imports",
                                 "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
-    ASSERT_EQ(r.col_count, 6);
+    ASSERT_EQ(r.col_count, 8);
     ASSERT_STR_EQ(r.rows[0][0], "1");  /* loop_depth — NOT the suffix transitive_loop_depth */
     ASSERT_STR_EQ(r.rows[0][1], "5");  /* transitive_loop_depth */
     ASSERT_STR_EQ(r.rows[0][2], "7");  /* cognitive */
     ASSERT_STR_EQ(r.rows[0][3], "3");  /* complexity */
     ASSERT_STR_EQ(r.rows[0][4], "10"); /* start_line (computed) */
     ASSERT_STR_EQ(r.rows[0][5], "42"); /* end_line (computed) — distinct from start_line */
+    ASSERT_STR_EQ(r.rows[0][6], "[\"./a.scss\",\"./theme.css\"]");
+    ASSERT_STR_EQ(r.rows[0][7], "[\"CommonModule\",\"SharedCard\"]");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();

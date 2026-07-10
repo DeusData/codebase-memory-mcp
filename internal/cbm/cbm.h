@@ -196,7 +196,14 @@ typedef struct {
     const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
     const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
 
-    const char *route_framework; // Producer framework with routing semantics (e.g., "aspnet")
+    const char *route_framework;      // Producer framework with routing semantics (e.g., "aspnet")
+    const char *angular_kind;         // component/directive/pipe/injectable/ng_module or NULL
+    const char *angular_selector;     // literal Component/Directive selector or NULL
+    const char *angular_template_url; // literal external template path or NULL
+    const char **angular_style_urls;  // NULL-terminated literal stylesheet paths
+    const char **angular_imports;     // NULL-terminated standalone dependency identifiers
+    bool angular_standalone;          // literal standalone value when explicitly configured
+    bool angular_standalone_set;      // distinguishes explicit false from an absent property
 
     int complexity;           // cyclomatic complexity
     int cognitive;            // cognitive complexity (nesting-weighted)

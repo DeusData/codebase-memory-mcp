@@ -155,6 +155,9 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **Louvain community detection**: Discovers functional modules by clustering call edges
 - **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected symbols with risk classification
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
+- **Angular metadata**: Preserves literal `Component`, `Directive`, `Pipe`, `Injectable`, and
+  `NgModule` roles on existing class nodes, including selectors, standalone status, external
+  templates/styles, and resolvable standalone imports
 - **Dead code detection**: Finds functions with zero callers, excluding entry points
 - **Cypher-like queries**: `MATCH (f:Function)-[:CALLS]->(g) WHERE f.name = 'main' RETURN g.name`
 
@@ -444,6 +447,10 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 ### Node Labels
 
 `Project`, `Package`, `Folder`, `File`, `Module`, `Class`, `Function`, `Method`, `Interface`, `Enum`, `Type`, `Route`, `Resource`
+
+Angular declarations remain `Class` nodes. Their queryable properties include `angular_kind`,
+`selector`, `standalone`, `templateUrl`, `styleUrls`, and `angular_imports`; resolved standalone
+dependencies use `IMPORTS` edges with `via: "angular_metadata"`.
 
 ### Edge Types
 

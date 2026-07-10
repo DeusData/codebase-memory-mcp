@@ -396,6 +396,82 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
     return et_index_files(lp, files, n);
 }
 
+static int et_angular_metadata_ok(bool parallel) {
+    static const EtFile f[] = {{"src/common.ts", "export class CommonModule {}\n"},
+                               {"src/shared-card.ts", "export class SharedCard {}\n"},
+                               {"src/orders.component.ts",
+                                "import { Component } from '@angular/core';\n"
+                                "import { CommonModule } from './common';\n"
+                                "import { SharedCard } from './shared-card';\n"
+                                "@Component({ selector: 'app-orders', standalone: true,\n"
+                                "  templateUrl: './orders.component.html',\n"
+                                "  styleUrls: ['./orders.component.scss'],\n"
+                                "  imports: [CommonModule, SharedCard] })\n"
+                                "export class OrdersComponent {}\n"}};
+    EtProj lp;
+    cbm_store_t *store = parallel ? et_index_parallel(&lp, f, 3) : et_index_files(&lp, f, 3);
+    int ok = store != NULL;
+    cbm_node_t *components = NULL;
+    int component_count = 0;
+    if (!store ||
+        cbm_store_find_nodes_by_name(store, lp.project, "OrdersComponent", &components,
+                                     &component_count) != CBM_STORE_OK ||
+        component_count != 1) {
+        ok = 0;
+    } else {
+        const char *props = components[0].properties_json;
+        if (!props || !strstr(props, "\"angular_kind\":\"component\"") ||
+            !strstr(props, "\"selector\":\"app-orders\"") ||
+            !strstr(props, "\"standalone\":true") ||
+            !strstr(props, "\"templateUrl\":\"./orders.component.html\"") ||
+            !strstr(props, "\"styleUrls\":[\"./orders.component.scss\"]") ||
+            !strstr(props, "\"angular_imports\":[\"CommonModule\",\"SharedCard\"]")) {
+            ok = 0;
+        }
+
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(store, components[0].id, "IMPORTS", &edges,
+                                                &edge_count) != CBM_STORE_OK ||
+            edge_count != 2) {
+            ok = 0;
+        } else {
+            bool common_found = false;
+            bool card_found = false;
+            for (int i = 0; i < edge_count; i++) {
+                cbm_node_t target = {0};
+                if (!edges[i].properties_json ||
+                    !strstr(edges[i].properties_json, "\"via\":\"angular_metadata\"") ||
+                    cbm_store_find_node_by_id(store, edges[i].target_id, &target) != CBM_STORE_OK) {
+                    ok = 0;
+                    continue;
+                }
+                common_found =
+                    common_found || (target.name && strcmp(target.name, "CommonModule") == 0);
+                card_found = card_found || (target.name && strcmp(target.name, "SharedCard") == 0);
+                cbm_node_free_fields(&target);
+            }
+            if (!common_found || !card_found) {
+                ok = 0;
+            }
+        }
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(components, component_count);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(angular_metadata_sequential) {
+    ASSERT_TRUE(et_angular_metadata_ok(false));
+    PASS();
+}
+
+TEST(angular_metadata_parallel) {
+    ASSERT_TRUE(et_angular_metadata_ok(true));
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  HANDLES — route→handler across web frameworks
  *
@@ -1811,6 +1887,9 @@ TEST(override_go_interface) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(edge_types_probe) {
+    RUN_TEST(angular_metadata_sequential);
+    RUN_TEST(angular_metadata_parallel);
+
     /* HANDLES — route→handler across web frameworks (8 frameworks) */
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);

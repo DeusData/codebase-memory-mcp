@@ -2881,6 +2881,157 @@ static int decorators_contain(const CBMDefinition *d, const char *needle) {
     return 0;
 }
 
+static int assert_string_array(const char *const *actual, const char *const *expected) {
+    ASSERT_NOT_NULL(actual);
+    int i = 0;
+    for (; expected[i]; i++) {
+        ASSERT_NOT_NULL(actual[i]);
+        ASSERT_STR_EQ(actual[i], expected[i]);
+    }
+    ASSERT_EQ(actual[i], NULL);
+    return 0;
+}
+
+TEST(extract_angular_component_literal_metadata) {
+    CBMFileResult *r = extract("import { Component } from '@angular/core';\n"
+                               "import { CommonModule } from '@angular/common';\n"
+                               "import { SharedCard } from './shared-card';\n"
+                               "@Component({\n"
+                               "  selector: 'app-orders',\n"
+                               "  standalone: true,\n"
+                               "  templateUrl: './orders.component.html',\n"
+                               "  styleUrls: ['./orders.component.scss', './theme.css', "
+                               "'./orders.component.scss'],\n"
+                               "  imports: [CommonModule, SharedCard, CommonModule]\n"
+                               "})\n"
+                               "export class OrdersComponent {}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "orders.component.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *component = find_def_by_name(r, "OrdersComponent");
+    ASSERT_NOT_NULL(component);
+    ASSERT_STR_EQ(component->angular_kind, "component");
+    ASSERT_STR_EQ(component->angular_selector, "app-orders");
+    ASSERT(component->angular_standalone_set);
+    ASSERT(component->angular_standalone);
+    ASSERT_STR_EQ(component->angular_template_url, "./orders.component.html");
+    const char *style_urls[] = {"./orders.component.scss", "./theme.css", NULL};
+    const char *imports[] = {"CommonModule", "SharedCard", NULL};
+    ASSERT_EQ(assert_string_array(component->angular_style_urls, style_urls), 0);
+    ASSERT_EQ(assert_string_array(component->angular_imports, imports), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_angular_definition_kinds) {
+    CBMFileResult *r =
+        extract("import { Directive, Injectable, NgModule, Pipe } from '@angular/core';\n"
+                "@Directive({ selector: '[trackClick]', standalone: false })\n"
+                "export class TrackClickDirective {}\n"
+                "@Pipe({ name: 'shortDate', standalone: true })\n"
+                "export class ShortDatePipe {}\n"
+                "@Injectable({ providedIn: 'root' })\n"
+                "export class OrdersService {}\n"
+                "@NgModule({ declarations: [TrackClickDirective] })\n"
+                "export class OrdersModule {}\n",
+                CBM_LANG_TYPESCRIPT, "t", "angular-kinds.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *directive = find_def_by_name(r, "TrackClickDirective");
+    const CBMDefinition *pipe = find_def_by_name(r, "ShortDatePipe");
+    const CBMDefinition *injectable = find_def_by_name(r, "OrdersService");
+    const CBMDefinition *module = find_def_by_name(r, "OrdersModule");
+    ASSERT_NOT_NULL(directive);
+    ASSERT_NOT_NULL(pipe);
+    ASSERT_NOT_NULL(injectable);
+    ASSERT_NOT_NULL(module);
+    ASSERT_STR_EQ(directive->angular_kind, "directive");
+    ASSERT_STR_EQ(directive->angular_selector, "[trackClick]");
+    ASSERT(directive->angular_standalone_set);
+    ASSERT_FALSE(directive->angular_standalone);
+    ASSERT_STR_EQ(pipe->angular_kind, "pipe");
+    ASSERT(pipe->angular_standalone_set);
+    ASSERT(pipe->angular_standalone);
+    ASSERT_STR_EQ(injectable->angular_kind, "injectable");
+    ASSERT_STR_EQ(module->angular_kind, "ng_module");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_angular_rejects_dynamic_or_ambiguous_metadata) {
+    CBMFileResult *r =
+        extract("import { Component } from '@angular/core';\n"
+                "const config = { selector: 'dynamic-selector' };\n"
+                "const EXTRA_IMPORTS = [];\n"
+                "@Component(config)\n"
+                "export class DynamicConfigComponent {}\n"
+                "@Component({ selector: 'first', selector: 'second', standalone: true })\n"
+                "export class DuplicateMetadataComponent {}\n"
+                "@Component({ selector: 'safe', imports: [DynamicConfigComponent, "
+                "...EXTRA_IMPORTS] })\n"
+                "export class DynamicImportsComponent {}\n"
+                "@Component({ selector: 'legacy', standalone: false, "
+                "imports: [DynamicConfigComponent] })\n"
+                "export class NonStandaloneComponent {}\n",
+                CBM_LANG_TYPESCRIPT, "t", "dynamic.component.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *dynamic = find_def_by_name(r, "DynamicConfigComponent");
+    const CBMDefinition *duplicate = find_def_by_name(r, "DuplicateMetadataComponent");
+    const CBMDefinition *dynamic_imports = find_def_by_name(r, "DynamicImportsComponent");
+    const CBMDefinition *non_standalone = find_def_by_name(r, "NonStandaloneComponent");
+    ASSERT_NOT_NULL(dynamic);
+    ASSERT_NOT_NULL(duplicate);
+    ASSERT_NOT_NULL(dynamic_imports);
+    ASSERT_NOT_NULL(non_standalone);
+    ASSERT_STR_EQ(dynamic->angular_kind, "component");
+    ASSERT_EQ(dynamic->angular_selector, NULL);
+    ASSERT_STR_EQ(duplicate->angular_kind, "component");
+    ASSERT_EQ(duplicate->angular_selector, NULL);
+    ASSERT_FALSE(duplicate->angular_standalone_set);
+    ASSERT_STR_EQ(dynamic_imports->angular_kind, "component");
+    ASSERT_EQ(dynamic_imports->angular_selector, NULL);
+    ASSERT_EQ(dynamic_imports->angular_imports, NULL);
+    ASSERT_STR_EQ(non_standalone->angular_selector, "legacy");
+    ASSERT(non_standalone->angular_standalone_set);
+    ASSERT_FALSE(non_standalone->angular_standalone);
+    ASSERT_EQ(non_standalone->angular_imports, NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_angular_namespace_decorator) {
+    CBMFileResult *r = extract("import * as ng from '@angular/core';\n"
+                               "@ng.Component({ selector: 'app-namespace', standalone: true })\n"
+                               "export class NamespaceComponent {}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "namespace.component.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *component = find_def_by_name(r, "NamespaceComponent");
+    ASSERT_NOT_NULL(component);
+    ASSERT_STR_EQ(component->angular_kind, "component");
+    ASSERT_STR_EQ(component->angular_selector, "app-namespace");
+    ASSERT(component->angular_standalone_set);
+    ASSERT(component->angular_standalone);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_non_angular_component_decorator_ignored) {
+    CBMFileResult *r = extract("function Component(config: object) { return config; }\n"
+                               "@Component({ selector: 'not-angular' })\n"
+                               "export class LocalComponent {}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "local-component.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *component = find_def_by_name(r, "LocalComponent");
+    ASSERT_NOT_NULL(component);
+    ASSERT_EQ(component->angular_kind, NULL);
+    ASSERT_EQ(component->angular_selector, NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #382: Java Method nodes had empty decorators / signature. */
 TEST(extract_java_method_annotations_issue382) {
     CBMFileResult *r = extract("public class C {\n"
@@ -3893,6 +4044,11 @@ SUITE(extraction) {
     RUN_TEST(python_init_nested_module_qn);
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
+    RUN_TEST(extract_angular_component_literal_metadata);
+    RUN_TEST(extract_angular_definition_kinds);
+    RUN_TEST(extract_angular_rejects_dynamic_or_ambiguous_metadata);
+    RUN_TEST(extract_angular_namespace_decorator);
+    RUN_TEST(extract_non_angular_component_decorator_ignored);
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);

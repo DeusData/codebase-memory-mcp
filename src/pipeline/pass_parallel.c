@@ -454,6 +454,17 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
+static void append_json_bool(char *buf, size_t bufsize, size_t *pos, const char *key, bool val) {
+    size_t required = strlen(key) + sizeof(",\"\":false") - SKIP_ONE;
+    if (*pos + required + PP_ESC_SPACE > bufsize) {
+        return;
+    }
+    int n = snprintf(buf + *pos, bufsize - *pos, ",\"%s\":%s", key, val ? "true" : "false");
+    if (n > 0 && (size_t)n < bufsize - *pos) {
+        *pos += (size_t)n;
+    }
+}
+
 static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
@@ -500,6 +511,14 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
     append_json_string(buf, bufsize, &pos, "route_framework", def->route_framework);
+    append_json_string(buf, bufsize, &pos, "angular_kind", def->angular_kind);
+    append_json_string(buf, bufsize, &pos, "selector", def->angular_selector);
+    if (def->angular_standalone_set) {
+        append_json_bool(buf, bufsize, &pos, "standalone", def->angular_standalone);
+    }
+    append_json_string(buf, bufsize, &pos, "templateUrl", def->angular_template_url);
+    append_json_str_array(buf, bufsize, &pos, "styleUrls", def->angular_style_urls);
+    append_json_str_array(buf, bufsize, &pos, "angular_imports", def->angular_imports);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -2568,7 +2587,33 @@ static void resolve_def_decorators(resolve_ctx_t *rc, resolve_worker_state_t *ws
     }
 }
 
-/* Resolve INHERITS + DECORATES + IMPLEMENTS for one file. */
+static void resolve_def_angular_imports(resolve_ctx_t *rc, resolve_worker_state_t *ws,
+                                        const CBMDefinition *def, const cbm_gbuf_node_t *node,
+                                        const char *mq, const char **ik, const char **iv, int ic) {
+    if (!def->angular_imports) {
+        return;
+    }
+    for (int i = 0; def->angular_imports[i]; i++) {
+        const char *target_qn =
+            resolve_as_class(rc->registry, def->angular_imports[i], mq, ik, iv, ic);
+        if (!target_qn) {
+            continue;
+        }
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(rc->main_gbuf, target_qn);
+        if (!target || target->id == node->id) {
+            continue;
+        }
+        char escaped[CBM_SZ_256];
+        char props[CBM_SZ_512];
+        cbm_json_escape(escaped, sizeof(escaped), def->angular_imports[i]);
+        snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"angular_metadata\"}",
+                 escaped);
+        cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, target->id, "IMPORTS", props);
+        ws->semantic_resolved++;
+    }
+}
+
+/* Resolve INHERITS + DECORATES + Angular imports + IMPLEMENTS for one file. */
 static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
                                   CBMFileResult *result, const char *module_qn,
                                   const char **imp_keys, const char **imp_vals, int imp_count) {
@@ -2583,6 +2628,7 @@ static void resolve_file_semantic(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         }
         resolve_def_inherits(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
         resolve_def_decorators(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_def_angular_imports(rc, ws, def, node, module_qn, imp_keys, imp_vals, imp_count);
     }
     for (int t = 0; t < result->impl_traits.count; t++) {
         CBMImplTrait *it = &result->impl_traits.items[t];

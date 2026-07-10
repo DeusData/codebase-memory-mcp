@@ -7,9 +7,11 @@
  */
 #include "cypher/cypher.h"
 #include "store/store.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
+#include <yyjson/yyjson.h>
 
 enum {
     CYP_BUF_16 = 16,
@@ -29,6 +31,7 @@ enum {
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
     CYP_EDGE_COLS = 3, /* columns per edge var: name, qn, label */
     CYP_COL_BUF = 48,  /* max column buffer (16 vars * 3 cols) */
+    CYP_NODE_PROP_BUF = CBM_SZ_2K,
     CYP_FOUND_NONE = -1,
     /* search miss sentinel */ /* mask for ebuf ring buffer (8 entries) */
 };
@@ -2092,17 +2095,17 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
      * a single row (or an ORDER-BY comparison) reads several of these before any
      * of them is copied out, so returning one shared static buffer would alias
      * every column to the last value read. Mirrors edge_prop's rotation. */
-    static _Thread_local char bufs[CYP_BUF_8][CBM_SZ_512];
+    static _Thread_local char bufs[CYP_BUF_8][CYP_NODE_PROP_BUF];
     static _Thread_local int buf_idx = 0;
     char *out = bufs[buf_idx];
     buf_idx = (buf_idx + SKIP_ONE) % CYP_BUF_8;
 
     if (strcmp(prop, "start_line") == 0) {
-        snprintf(out, CBM_SZ_512, "%d", n->start_line);
+        snprintf(out, CYP_NODE_PROP_BUF, "%d", n->start_line);
         return out;
     }
     if (strcmp(prop, "end_line") == 0) {
-        snprintf(out, CBM_SZ_512, "%d", n->end_line);
+        snprintf(out, CYP_NODE_PROP_BUF, "%d", n->end_line);
         return out;
     }
     /* Virtual computed properties: in_degree/out_degree via CALLS edges.
@@ -2112,7 +2115,7 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         int out_deg = 0;
         cbm_store_node_degree(store, n->id, &in_deg, &out_deg);
         int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
-        snprintf(out, CBM_SZ_512, "%d", val);
+        snprintf(out, CYP_NODE_PROP_BUF, "%d", val);
         return out;
     }
     /* Fall back to any value stored in the node's properties JSON — exposes the
@@ -2120,7 +2123,7 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
      * transitive_loop_depth, recursive) and any other persisted property to
      * WHERE/RETURN, e.g. WHERE n.loop_depth >= 2. */
     if (n->properties_json && n->properties_json[0] == '{') {
-        const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
+        const char *v = json_extract_prop(n->properties_json, prop, out, CYP_NODE_PROP_BUF);
         if (v && v[0]) {
             return v;
         }
@@ -2139,16 +2142,17 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
             const char *res = NULL;
             const char *rv = node_string_field(&full, prop);
             if (rv && rv[0]) {
-                snprintf(out, CBM_SZ_512, "%s", rv);
+                snprintf(out, CYP_NODE_PROP_BUF, "%s", rv);
                 res = out;
             } else if (strcmp(prop, "start_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
+                snprintf(out, CYP_NODE_PROP_BUF, "%d", full.start_line);
                 res = out;
             } else if (strcmp(prop, "end_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
+                snprintf(out, CYP_NODE_PROP_BUF, "%d", full.end_line);
                 res = out;
             } else if (full.properties_json && full.properties_json[0] == '{') {
-                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
+                const char *jv =
+                    json_extract_prop(full.properties_json, prop, out, CYP_NODE_PROP_BUF);
                 if (jv && jv[0]) {
                     res = out;
                 }
@@ -2162,43 +2166,33 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
     return "";
 }
 
-/* Extract a string value from JSON properties_json by key.
- * Writes result to buf (up to buf_sz). Returns buf if found, "" otherwise.
- * Handles both string values ("key":"value") and numeric values ("key":1.5). */
+/* Extract a value from properties JSON by key. Strings are returned decoded;
+ * every other JSON type is returned as compact JSON (arrays remain complete). */
 static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz) {
+    buf[0] = '\0';
     if (!json || !key) {
-        buf[0] = '\0';
         return buf;
     }
-    /* Build search pattern: "key": */
-    char pattern[CBM_SZ_256];
-    snprintf(pattern, sizeof(pattern), "\"%s\":", key);
-    const char *p = strstr(json, pattern);
-    if (!p) {
-        buf[0] = '\0';
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
         return buf;
     }
-    p += strlen(pattern);
-    /* Skip whitespace */
-    while (*p == ' ' || *p == '\t') {
-        p++;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, key) : NULL;
+    if (!value) {
+        yyjson_doc_free(doc);
+        return buf;
     }
-    if (*p == '"') {
-        /* String value */
-        p++;
-        size_t i = 0;
-        while (*p && *p != '"' && i < buf_sz - SKIP_ONE) {
-            buf[i++] = *p++;
-        }
-        buf[i] = '\0';
+    if (yyjson_is_str(value)) {
+        snprintf(buf, buf_sz, "%s", yyjson_get_str(value));
     } else {
-        /* Numeric or other value */
-        size_t i = 0;
-        while (*p && *p != ',' && *p != '}' && *p != ' ' && i < buf_sz - SKIP_ONE) {
-            buf[i++] = *p++;
+        char *serialized = yyjson_val_write(value, 0, NULL);
+        if (serialized) {
+            snprintf(buf, buf_sz, "%s", serialized);
+            free(serialized);
         }
-        buf[i] = '\0';
     }
+    yyjson_doc_free(doc);
     return buf;
 }
 

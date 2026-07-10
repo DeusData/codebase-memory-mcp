@@ -93,7 +93,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             if (!imp->local_name || !imp->local_name[0] || !imp->module_path) {
                 continue;
             }
-            char *target_qn = cbm_pipeline_fqn_module(ctx->project_name, imp->module_path);
+            char *target_qn = cbm_pipeline_resolve_module(ctx, rel_path, imp->module_path);
             const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
             free(target_qn);
             if (!target) {
@@ -468,6 +468,25 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
         for (int dc = 0; def->decorators[dc]; dc++) {
             resolve_decorator(ctx, node, def->decorators[dc], module_qn, imp_keys, imp_vals,
                               imp_count, decorates_count);
+        }
+    }
+    if (def->angular_imports) {
+        for (int i = 0; def->angular_imports[i]; i++) {
+            const char *target_qn = resolve_as_class(ctx->registry, def->angular_imports[i],
+                                                     module_qn, imp_keys, imp_vals, imp_count);
+            if (!target_qn) {
+                continue;
+            }
+            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_qn(ctx->gbuf, target_qn);
+            if (!target || target->id == node->id) {
+                continue;
+            }
+            char escaped[CBM_SZ_256];
+            char props[CBM_SZ_512];
+            cbm_json_escape(escaped, sizeof(escaped), def->angular_imports[i]);
+            snprintf(props, sizeof(props), "{\"local_name\":\"%s\",\"via\":\"angular_metadata\"}",
+                     escaped);
+            cbm_gbuf_insert_edge(ctx->gbuf, node->id, target->id, "IMPORTS", props);
         }
     }
 }
