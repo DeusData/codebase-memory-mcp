@@ -984,6 +984,7 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
+    cbm_propagate_angular_http_wrappers(&ctx);
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);

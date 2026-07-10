@@ -499,6 +499,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "route_framework", def->route_framework);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -731,7 +732,13 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
         snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", rm,
                  cbm_route_canon_path(def->route_path, cpath, sizeof(cpath)));
         char rprops[CBM_SZ_256];
-        snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
+        if (def->route_framework) {
+            snprintf(rprops, sizeof(rprops),
+                     "{\"method\":\"%s\",\"source\":\"decorator\",\"framework\":\"%s\"}", rm,
+                     def->route_framework);
+        } else {
+            snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", rm);
+        }
         int64_t route_id =
             cbm_gbuf_upsert_node(ws->local_gbuf, "Route", def->route_path, route_qn,
                                  def->file_path ? def->file_path : fi->rel_path, 0, 0, rprops);
@@ -1598,23 +1605,20 @@ static void finalize_and_emit(cbm_gbuf_t *gbuf, int64_t src_id, int64_t tgt_id,
 }
 
 /* Build Route node QN and properties for HTTP/async service edges. */
-static int64_t build_service_route(cbm_gbuf_t *gbuf, const char *arg, const char *method,
-                                   const char *broker, cbm_svc_kind_t svc) {
-    char route_qn[CBM_ROUTE_QN_SIZE];
-    const char *prefix;
-    char cpath[CBM_SZ_256];
-    const char *qpath = arg;
+static int64_t build_service_route(cbm_gbuf_t *gbuf, const cbm_gbuf_t *main_gbuf, const char *arg,
+                                   const char *method, const char *broker, cbm_svc_kind_t svc) {
     if (svc == CBM_SVC_HTTP) {
-        prefix = method ? method : "ANY";
-        qpath = cbm_route_canon_path(arg, cpath, sizeof(cpath));
-    } else {
-        prefix = broker ? broker : "async";
+        int64_t existing = cbm_gbuf_find_http_route(main_gbuf, arg, method);
+        if (existing > 0) {
+            return existing;
+        }
+        return cbm_gbuf_upsert_http_route(gbuf, arg, method);
     }
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    const char *prefix = broker ? broker : "async";
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, arg);
     char route_props[CBM_SZ_256];
-    if (method) {
-        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
-    } else if (broker) {
+    if (broker) {
         snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
     } else {
         snprintf(route_props, sizeof(route_props), "{}");
@@ -1623,16 +1627,17 @@ static int64_t build_service_route(cbm_gbuf_t *gbuf, const char *arg, const char
 }
 
 /* Emit HTTP_CALLS or ASYNC_CALLS edge via Route node. */
-static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
-                                         const CBMCall *call, const cbm_resolution_t *res,
-                                         cbm_svc_kind_t svc, const char *arg) {
+static void emit_http_async_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_t *main_gbuf,
+                                         const cbm_gbuf_node_t *source, const CBMCall *call,
+                                         const cbm_resolution_t *res, cbm_svc_kind_t svc,
+                                         const char *arg) {
     const char *edge_type = (svc == CBM_SVC_HTTP) ? "HTTP_CALLS" : "ASYNC_CALLS";
     const char *method =
         (svc == CBM_SVC_HTTP) ? cbm_service_pattern_http_method(call->callee_name) : NULL;
     const char *broker =
         (svc == CBM_SVC_ASYNC) ? cbm_service_pattern_broker(res->qualified_name) : NULL;
 
-    int64_t route_id = build_service_route(gbuf, arg, method, broker, svc);
+    int64_t route_id = build_service_route(gbuf, main_gbuf, arg, method, broker, svc);
 
     char esc_c[CBM_SZ_256];
     char esc_a[CBM_SZ_256];
@@ -2031,7 +2036,8 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
     bool has_topic = (arg && arg[0] != '\0' && svc == CBM_SVC_ASYNC && strlen(arg) > PP_ESC_SPACE);
 
     if ((svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) && (has_url || has_topic)) {
-        emit_http_async_service_edge(gbuf, source, call, res, svc, arg);
+        emit_http_async_service_edge(gbuf, main_gbuf, source, call, res, svc, arg);
+        return;
     } else if (svc == CBM_SVC_GRPC) {
         emit_grpc_edge(gbuf, source, call, res);
     } else if (svc == CBM_SVC_GRAPHQL) {
@@ -2318,8 +2324,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                     cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                                  .confidence = PP_HALF_CONF,
                                                  .strategy = "service_pattern"};
-                    emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
-                                                 CBM_SVC_HTTP, u);
+                    emit_http_async_service_edge(ws->local_edge_buf, rc->main_gbuf, source_node,
+                                                 call, &fake_res, CBM_SVC_HTTP, u);
                 }
             }
             continue;

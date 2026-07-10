@@ -237,24 +237,13 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
 /* Build route QN and upsert Route node for HTTP/async edge. */
 static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, cbm_svc_kind_t svc,
                                      const char *method, const char *broker) {
+    if (svc == CBM_SVC_HTTP) {
+        return cbm_gbuf_upsert_http_route(ctx->gbuf, url, method);
+    }
     char route_qn[CBM_ROUTE_QN_SIZE];
-    const char *prefix;
-    char cpath[CBM_SZ_256];
-    const char *qpath = url;
-    if (svc == CBM_SVC_HTTP) {
-        prefix = method ? method : "ANY";
-        qpath = cbm_route_canon_path(url, cpath, sizeof(cpath));
-    } else {
-        prefix = broker ? broker : "async";
-    }
-    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    const char *rp;
-    if (svc == CBM_SVC_HTTP) {
-        rp = method ? method : "{}";
-    } else {
-        rp = broker ? broker : "{}";
-    }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
+    const char *prefix = broker ? broker : "async";
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, url);
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, prefix);
 }
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
@@ -450,6 +439,28 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
+    /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the service
+     * signal lives in the callee_name. The registry or LSP can mis-resolve such
+     * a call by its short method name (for example, a synthesized Angular
+     * HttpClient.post call can collide with its local wrapper named `post`).
+     * Classify the full service callee first because its target is a synthesized
+     * route node, not the locally resolved method. Mirrors pass_parallel.c. */
+    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
+    if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
+        const char *cu = call->first_string_arg;
+        bool chas_url = cu && cu[0] != '\0' &&
+                        (cu[0] == '/' || strstr(cu, "://") != NULL ||
+                         (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
+        if (chas_url) {
+            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                        .confidence = PC_SVC_PATTERN_CONF,
+                                        .strategy = "service_pattern",
+                                        .candidate_count = 0};
+            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, csvc, false);
+            return SKIP_ONE;
+        }
+    }
+
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
@@ -467,30 +478,6 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.candidate_count = 1;
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false);
-            return SKIP_ONE;
-        }
-    }
-
-    /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the service
-     * signal lives in the callee_name. The registry can mis-resolve such a call
-     * to a spurious builtin short-name match (e.g. `requests.get` ->
-     * `builtins.dict.get` via "get", strategy unique_name), which is non-empty
-     * and not an HTTP pattern, so BOTH the empty-resolution and resolved-QN
-     * service checks below miss it and the call is dropped. Detect it on the
-     * callee_name FIRST so the HTTP_CALLS/ASYNC_CALLS edge is emitted regardless
-     * (target is a synthesized route node, not the unindexed library). (#523) */
-    cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
-    if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
-        const char *cu = call->first_string_arg;
-        bool chas_url = cu && cu[0] != '\0' &&
-                        (cu[0] == '/' || strstr(cu, "://") != NULL ||
-                         (csvc == CBM_SVC_ASYNC && strlen(cu) > PAIR_LEN));
-        if (chas_url) {
-            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
-                                        .confidence = PC_SVC_PATTERN_CONF,
-                                        .strategy = "service_pattern",
-                                        .candidate_count = 0};
-            emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, csvc, false);
             return SKIP_ONE;
         }
     }

@@ -4279,6 +4279,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     } else if (def.route_path && ctx->language == CBM_LANG_CSHARP) {
         def.route_path =
             compose_aspnet_route(a, class_node, ctx->source, spec, name, def.route_path);
+        if (def.route_path) {
+            def.route_framework = "aspnet";
+        }
     }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 

@@ -34,8 +34,10 @@ enum {
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 
 bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
@@ -155,6 +157,133 @@ static const char *json_extract(const char *json, const char *key, char *buf, in
     return buf;
 }
 
+static bool route_is_aspnet(const cbm_gbuf_node_t *route) {
+    return route && route->label && strcmp(route->label, "Route") == 0 && route->properties_json &&
+           strstr(route->properties_json, "\"framework\":\"aspnet\"") != NULL;
+}
+
+static bool route_has_handler(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *route) {
+    if (!route) {
+        return false;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    return cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &edges, &edge_count) == 0 &&
+           edge_count > 0;
+}
+
+static int aspnet_path_match_score(const char *producer, const char *consumer) {
+    const char *producer_at = producer;
+    const char *consumer_at = consumer;
+    int parameter_substitutions = 0;
+    while (*producer_at || *consumer_at) {
+        if ((*producer_at == '/') != (*consumer_at == '/')) {
+            return -1;
+        }
+        if (*producer_at == '/') {
+            producer_at++;
+            consumer_at++;
+        }
+        const char *producer_end = strchr(producer_at, '/');
+        const char *consumer_end = strchr(consumer_at, '/');
+        size_t producer_len =
+            producer_end ? (size_t)(producer_end - producer_at) : strlen(producer_at);
+        size_t consumer_len =
+            consumer_end ? (size_t)(consumer_end - consumer_at) : strlen(consumer_at);
+        bool producer_parameter =
+            producer_len == PAIR_LEN && producer_at[0] == '{' && producer_at[SKIP_ONE] == '}';
+        if (consumer_len == 0 ||
+            (!producer_parameter && (producer_len != consumer_len ||
+                                     strncasecmp(producer_at, consumer_at, producer_len) != 0))) {
+            return -1;
+        }
+        bool consumer_parameter =
+            consumer_len == PAIR_LEN && consumer_at[0] == '{' && consumer_at[SKIP_ONE] == '}';
+        if (producer_parameter && !consumer_parameter) {
+            parameter_substitutions++;
+        }
+        if (!producer_end || !consumer_end) {
+            return producer_end == NULL && consumer_end == NULL ? parameter_substitutions : -1;
+        }
+        producer_at = producer_end;
+        consumer_at = consumer_end;
+    }
+    return parameter_substitutions;
+}
+
+static int aspnet_route_match_score(const cbm_gbuf_node_t *route, const char *method,
+                                    const char *canonical_path) {
+    if (!route_is_aspnet(route) || !route->name) {
+        return -1;
+    }
+    char route_method[CBM_SZ_16];
+    if (!json_extract(route->properties_json, "method", route_method, sizeof(route_method)) ||
+        strcmp(route_method, method) != 0) {
+        return -1;
+    }
+    char producer_path[CBM_SZ_512];
+    cbm_route_canon_path(route->name, producer_path, sizeof(producer_path));
+    return aspnet_path_match_score(producer_path, canonical_path);
+}
+
+int64_t cbm_gbuf_find_http_route(const cbm_gbuf_t *gb, const char *url, const char *method) {
+    if (!gb || !url || !url[0]) {
+        return 0;
+    }
+    const char *route_method = method && method[0] ? method : "ANY";
+    char canonical_path[CBM_SZ_512];
+    cbm_route_canon_path(url, canonical_path, sizeof(canonical_path));
+
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", route_method, canonical_path);
+    const cbm_gbuf_node_t *exact = cbm_gbuf_find_by_qn(gb, route_qn);
+    if (route_is_aspnet(exact)) {
+        return exact->id;
+    }
+    if (route_has_handler(gb, exact)) {
+        return exact->id;
+    }
+
+    const cbm_gbuf_node_t **routes = NULL;
+    int route_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Route", &routes, &route_count) == 0) {
+        const cbm_gbuf_node_t *best = NULL;
+        int best_score = INT_MAX;
+        for (int i = 0; i < route_count; i++) {
+            int score = aspnet_route_match_score(routes[i], route_method, canonical_path);
+            if (score >= 0 && score < best_score) {
+                best = routes[i];
+                best_score = score;
+            }
+        }
+        if (best) {
+            return best->id;
+        }
+    }
+    if (exact) {
+        return exact->id;
+    }
+    return 0;
+}
+
+int64_t cbm_gbuf_upsert_http_route(cbm_gbuf_t *gb, const char *url, const char *method) {
+    int64_t existing = cbm_gbuf_find_http_route(gb, url, method);
+    if (existing > 0) {
+        return existing;
+    }
+    if (!gb || !url || !url[0]) {
+        return 0;
+    }
+    const char *route_method = method && method[0] ? method : "ANY";
+    char canonical_path[CBM_SZ_512];
+    cbm_route_canon_path(url, canonical_path, sizeof(canonical_path));
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", route_method, canonical_path);
+    char route_props[CBM_SZ_64];
+    snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", route_method);
+    return cbm_gbuf_upsert_node(gb, "Route", url, route_qn, "", 0, 0, route_props);
+}
+
 /* Visitor context for edge scanning */
 typedef struct {
     cbm_gbuf_t *gb;
@@ -191,15 +320,15 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     const char *broker =
         json_extract(edge->properties_json, "broker", broker_buf, sizeof(broker_buf));
 
-    /* Build Route QN */
-    char route_qn[CBM_ROUTE_QN_SIZE];
     if (strcmp(edge->type, "HTTP_CALLS") == 0) {
-        char cpath[CBM_SZ_256];
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
-                 cbm_route_canon_path(url, cpath, sizeof(cpath)));
-    } else {
-        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", broker ? broker : "async", url);
+        cbm_gbuf_upsert_http_route(ctx->gb, url, method);
+        ctx->created++;
+        return;
     }
+
+    /* Build async Route QN */
+    char route_qn[CBM_ROUTE_QN_SIZE];
+    snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", broker ? broker : "async", url);
 
     /* Build properties for Route node */
     char route_props[CBM_SZ_256];
@@ -457,7 +586,14 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
     const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(gb, route_qn);
 
     char rprops[CBM_SZ_256];
-    snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", method);
+    char framework[CBM_SZ_32];
+    if (extract_json_prop(func->properties_json, "route_framework", framework, sizeof(framework))) {
+        snprintf(rprops, sizeof(rprops),
+                 "{\"method\":\"%s\",\"source\":\"decorator\",\"framework\":\"%s\"}", method,
+                 framework);
+    } else {
+        snprintf(rprops, sizeof(rprops), "{\"method\":\"%s\",\"source\":\"decorator\"}", method);
+    }
     int64_t route_id = cbm_gbuf_upsert_node(gb, "Route", path, route_qn,
                                             func->file_path ? func->file_path : "", 0, 0, rprops);
 

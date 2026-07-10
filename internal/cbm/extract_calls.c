@@ -2200,3 +2200,392 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
         extract_cpp_implicit_calls(ctx, node, ts_node_type(node), state->enclosing_func_qn);
     }
 }
+
+static const char *angular_http_sink_method(const CBMCall *call) {
+    static const char prefix[] = "@angular/common/http.HttpClient.";
+    if (!call || !call->callee_name ||
+        strncmp(call->callee_name, prefix, sizeof(prefix) - SKIP_ONE) != 0) {
+        return NULL;
+    }
+    return call->callee_name + sizeof(prefix) - SKIP_ONE;
+}
+
+static bool is_angular_http_client_call(const CBMCall *call) {
+    const char *method = angular_http_sink_method(call);
+    return method && (strcmp(method, "get") == 0 || strcmp(method, "post") == 0 ||
+                      strcmp(method, "put") == 0 || strcmp(method, "delete") == 0 ||
+                      strcmp(method, "patch") == 0 || strcmp(method, "request") == 0);
+}
+
+static bool is_angular_http_sink(const CBMCall *call) {
+    const char *method = angular_http_sink_method(call);
+    return method && strcmp(method, "request") != 0 && is_angular_http_client_call(call);
+}
+
+static bool is_typescript_identifier(const char *text) {
+    if (!text || !(isalpha((unsigned char)text[0]) || text[0] == '_' || text[0] == '$')) {
+        return false;
+    }
+    for (const char *p = text + SKIP_ONE; *p; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '$')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const CBMCallArg *find_positional_call_arg(const CBMCall *call, int index) {
+    if (!call) {
+        return NULL;
+    }
+    for (int i = 0; i < call->arg_count; i++) {
+        if (!call->args[i].keyword && call->args[i].index == index) {
+            return &call->args[i];
+        }
+    }
+    return NULL;
+}
+
+static bool node_is_within_definition(TSNode node, const CBMDefinition *def) {
+    uint32_t start = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    uint32_t end = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    return start >= def->start_line && end <= def->end_line;
+}
+
+static bool node_overlaps_definition(TSNode node, const CBMDefinition *def) {
+    uint32_t start = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    uint32_t end = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    return start <= def->end_line && end >= def->start_line;
+}
+
+static bool node_text_equals(CBMExtractCtx *ctx, TSNode node, const char *expected) {
+    if (ts_node_is_null(node)) {
+        return false;
+    }
+    char *text = cbm_node_text(ctx->arena, node, ctx->source);
+    return text && strcmp(text, expected) == 0;
+}
+
+static bool typescript_identifier_is_reassigned(CBMExtractCtx *ctx, const CBMDefinition *def,
+                                                const char *name) {
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_64);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    while (stack.count > 0) {
+        TSNode current = ts_nstack_pop(&stack);
+        if (!node_overlaps_definition(current, def)) {
+            continue;
+        }
+        if (!node_is_within_definition(current, def)) {
+            ts_nstack_push_children(&stack, ctx->arena, current);
+            continue;
+        }
+        const char *kind = ts_node_type(current);
+        TSNode target = {0};
+        if (strcmp(kind, "assignment_expression") == 0 ||
+            strcmp(kind, "augmented_assignment_expression") == 0) {
+            target = ts_node_child_by_field_name(current, TS_FIELD("left"));
+            if (ts_node_is_null(target) && ts_node_named_child_count(current) > 0) {
+                target = ts_node_named_child(current, 0);
+            }
+        } else if (strcmp(kind, "update_expression") == 0) {
+            target = ts_node_child_by_field_name(current, TS_FIELD("argument"));
+            if (ts_node_is_null(target) && ts_node_named_child_count(current) > 0) {
+                target = ts_node_named_child(current, 0);
+            }
+        }
+        if (!ts_node_is_null(target) && node_text_equals(ctx, target, name)) {
+            return true;
+        }
+        ts_nstack_push_children(&stack, ctx->arena, current);
+    }
+    return false;
+}
+
+static bool variable_declarator_is_const(CBMExtractCtx *ctx, TSNode declarator) {
+    TSNode declaration = ts_node_parent(declarator);
+    if (ts_node_is_null(declaration) ||
+        strcmp(ts_node_type(declaration), "lexical_declaration") != 0) {
+        return false;
+    }
+    char *text = cbm_node_text(ctx->arena, declaration, ctx->source);
+    if (!text) {
+        return false;
+    }
+    while (isspace((unsigned char)*text)) {
+        text++;
+    }
+    return strncmp(text, "const", strlen("const")) == 0 &&
+           !(isalnum((unsigned char)text[strlen("const")]) || text[strlen("const")] == '_' ||
+             text[strlen("const")] == '$');
+}
+
+static TSNode find_const_string_initializer(CBMExtractCtx *ctx, const CBMDefinition *def,
+                                            const char *name, int before_line) {
+    TSNode found = {0};
+    int matches = 0;
+    TSNodeStack stack;
+    ts_nstack_init(&stack, ctx->arena, CBM_SZ_64);
+    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    while (stack.count > 0) {
+        TSNode current = ts_nstack_pop(&stack);
+        uint32_t line = ts_node_start_point(current).row + TS_LINE_OFFSET;
+        if (!node_overlaps_definition(current, def)) {
+            continue;
+        }
+        if (!node_is_within_definition(current, def)) {
+            ts_nstack_push_children(&stack, ctx->arena, current);
+            continue;
+        }
+        if (line >= (uint32_t)before_line) {
+            continue;
+        }
+        if (strcmp(ts_node_type(current), "variable_declarator") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(current, TS_FIELD("name"));
+            if (node_text_equals(ctx, name_node, name)) {
+                matches++;
+                TSNode value_node = ts_node_child_by_field_name(current, TS_FIELD("value"));
+                if (matches == 1 && variable_declarator_is_const(ctx, current) &&
+                    !ts_node_is_null(value_node) && is_string_like(ts_node_type(value_node))) {
+                    found = value_node;
+                } else {
+                    TSNode none = {0};
+                    found = none;
+                }
+            }
+        }
+        ts_nstack_push_children(&stack, ctx->arena, current);
+    }
+    if (matches != 1 || typescript_identifier_is_reassigned(ctx, def, name)) {
+        TSNode none = {0};
+        return none;
+    }
+    return found;
+}
+
+static const CBMDefinition *find_definition_by_qn(const CBMExtractCtx *ctx, const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    for (int i = 0; i < ctx->result->defs.count; i++) {
+        const CBMDefinition *def = &ctx->result->defs.items[i];
+        if (def->qualified_name && strcmp(def->qualified_name, qn) == 0) {
+            return def;
+        }
+    }
+    return NULL;
+}
+
+static const char *resolve_angular_wrapper_argument(CBMExtractCtx *ctx, const CBMCall *caller,
+                                                    int parameter_index) {
+    const CBMCallArg *arg = find_positional_call_arg(caller, parameter_index);
+    if (!arg || !arg->expr) {
+        return NULL;
+    }
+    if (arg->value) {
+        return normalize_typescript_route(ctx, arg->value);
+    }
+    if (!is_typescript_identifier(arg->expr)) {
+        return NULL;
+    }
+    const CBMDefinition *caller_def = find_definition_by_qn(ctx, caller->enclosing_func_qn);
+    if (!caller_def) {
+        return NULL;
+    }
+    TSNode initializer =
+        find_const_string_initializer(ctx, caller_def, arg->expr, caller->start_line);
+    if (ts_node_is_null(initializer)) {
+        return NULL;
+    }
+    char *raw = cbm_node_text(ctx->arena, initializer, ctx->source);
+    return normalize_typescript_route(ctx, raw);
+}
+
+static bool call_targets_wrapper(const CBMCall *call, const CBMDefinition *wrapper) {
+    if (!call || !call->callee_name || !call->enclosing_func_qn || !wrapper->name ||
+        !wrapper->parent_class || call->is_method) {
+        return false;
+    }
+    size_t class_len = strlen(wrapper->parent_class);
+    if (strncmp(call->enclosing_func_qn, wrapper->parent_class, class_len) != 0 ||
+        call->enclosing_func_qn[class_len] != '.') {
+        return false;
+    }
+    if (strcmp(call->callee_name, wrapper->name) == 0) {
+        return true;
+    }
+    static const char self_prefix[] = "this.";
+    return strncmp(call->callee_name, self_prefix, sizeof(self_prefix) - SKIP_ONE) == 0 &&
+           strcmp(call->callee_name + sizeof(self_prefix) - SKIP_ONE, wrapper->name) == 0;
+}
+
+static bool has_synthesized_http_call(const CBMExtractCtx *ctx, const char *caller_qn,
+                                      const char *sink_callee, const char *route) {
+    for (int i = 0; i < ctx->result->calls.count; i++) {
+        const CBMCall *existing = &ctx->result->calls.items[i];
+        if (existing->callee_name && existing->enclosing_func_qn && existing->first_string_arg &&
+            strcmp(existing->callee_name, sink_callee) == 0 &&
+            strcmp(existing->enclosing_func_qn, caller_qn) == 0 &&
+            strcmp(existing->first_string_arg, route) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *skip_typescript_parameter_prefix(const char *start, const char *end) {
+    static const char *modifiers[] = {"public", "private", "protected", "readonly", NULL};
+    while (start < end) {
+        while (start < end && isspace((unsigned char)*start)) {
+            start++;
+        }
+        bool skipped = false;
+        for (int i = 0; modifiers[i]; i++) {
+            size_t len = strlen(modifiers[i]);
+            if ((size_t)(end - start) > len && strncmp(start, modifiers[i], len) == 0 &&
+                isspace((unsigned char)start[len])) {
+                start += len;
+                skipped = true;
+                break;
+            }
+        }
+        if (!skipped) {
+            break;
+        }
+    }
+    if (end - start >= (int)strlen("...") && strncmp(start, "...", strlen("...")) == 0) {
+        start += strlen("...");
+    }
+    return start;
+}
+
+static bool typescript_parameter_segment_matches(const char *start, const char *end,
+                                                 const char *name) {
+    start = skip_typescript_parameter_prefix(start, end);
+    if (start >= end || !(isalpha((unsigned char)*start) || *start == '_' || *start == '$')) {
+        return false;
+    }
+    const char *identifier_end = start + SKIP_ONE;
+    while (identifier_end < end && (isalnum((unsigned char)*identifier_end) ||
+                                    *identifier_end == '_' || *identifier_end == '$')) {
+        identifier_end++;
+    }
+    return (size_t)(identifier_end - start) == strlen(name) &&
+           strncmp(start, name, (size_t)(identifier_end - start)) == 0;
+}
+
+static int typescript_signature_parameter_index(const char *signature, const char *name) {
+    if (!signature || !name) {
+        return -1;
+    }
+    const char *start = strchr(signature, '(');
+    if (!start) {
+        return -1;
+    }
+    start++;
+    const char *segment = start;
+    int index = 0;
+    int nested = 0;
+    char quote = '\0';
+    bool escaped = false;
+    for (const char *p = start; *p; p++) {
+        if (quote) {
+            if (escaped) {
+                escaped = false;
+            } else if (*p == '\\') {
+                escaped = true;
+            } else if (*p == quote) {
+                quote = '\0';
+            }
+            continue;
+        }
+        if (*p == '\'' || *p == '"' || *p == '`') {
+            quote = *p;
+            continue;
+        }
+        if (*p == '(' || *p == '[' || *p == '{' || *p == '<') {
+            nested++;
+            continue;
+        }
+        if (*p == ']' || *p == '}' || *p == '>') {
+            if (nested > 0) {
+                nested--;
+            }
+            continue;
+        }
+        if (*p == ')' && nested > 0) {
+            nested--;
+            continue;
+        }
+        if ((*p == ',' || *p == ')') && nested == 0) {
+            if (typescript_parameter_segment_matches(segment, p, name)) {
+                return index;
+            }
+            if (*p == ')') {
+                break;
+            }
+            segment = p + SKIP_ONE;
+            index++;
+        }
+    }
+    return -1;
+}
+
+void cbm_propagate_angular_http_wrappers(CBMExtractCtx *ctx) {
+    if (!ctx || !is_typescript_language(ctx->language) ||
+        !strstr(ctx->source, "@angular/common/http")) {
+        return;
+    }
+    int original_call_count = ctx->result->calls.count;
+    for (int di = 0; di < ctx->result->defs.count; di++) {
+        const CBMDefinition *wrapper = &ctx->result->defs.items[di];
+        if (!wrapper->label || strcmp(wrapper->label, "Method") != 0 || !wrapper->signature ||
+            !wrapper->parent_class) {
+            continue;
+        }
+        const CBMCall *sink = NULL;
+        int sink_count = 0;
+        for (int ci = 0; ci < original_call_count; ci++) {
+            const CBMCall *call = &ctx->result->calls.items[ci];
+            if (call->enclosing_func_qn && wrapper->qualified_name &&
+                strcmp(call->enclosing_func_qn, wrapper->qualified_name) == 0 &&
+                is_angular_http_client_call(call)) {
+                sink = call;
+                sink_count++;
+            }
+        }
+        if (sink_count != 1 || !is_angular_http_sink(sink)) {
+            continue;
+        }
+        const CBMCallArg *sink_url = find_positional_call_arg(sink, 0);
+        if (!sink_url || !is_typescript_identifier(sink_url->expr)) {
+            continue;
+        }
+        int url_parameter_index =
+            typescript_signature_parameter_index(wrapper->signature, sink_url->expr);
+        if (url_parameter_index < 0 ||
+            typescript_identifier_is_reassigned(ctx, wrapper, sink_url->expr)) {
+            continue;
+        }
+        const char *sink_callee = sink->callee_name;
+        for (int ci = 0; ci < original_call_count; ci++) {
+            const CBMCall *caller = &ctx->result->calls.items[ci];
+            if (!call_targets_wrapper(caller, wrapper)) {
+                continue;
+            }
+            const char *route = resolve_angular_wrapper_argument(ctx, caller, url_parameter_index);
+            if (!route ||
+                has_synthesized_http_call(ctx, caller->enclosing_func_qn, sink_callee, route)) {
+                continue;
+            }
+            CBMCall synthesized = {0};
+            synthesized.callee_name = sink_callee;
+            synthesized.enclosing_func_qn = caller->enclosing_func_qn;
+            synthesized.first_string_arg = route;
+            synthesized.start_line = caller->start_line;
+            synthesized.loop_depth = caller->loop_depth;
+            synthesized.branch_depth = caller->branch_depth;
+            cbm_calls_push(&ctx->result->calls, ctx->arena, synthesized);
+        }
+    }
+}

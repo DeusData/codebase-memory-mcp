@@ -50,6 +50,19 @@ static int has_call_route(CBMFileResult *r, const char *callee, const char *rout
     return 0;
 }
 
+static int has_call_route_from(CBMFileResult *r, const char *caller, const char *callee,
+                               const char *route) {
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, caller) &&
+            call->callee_name && strstr(call->callee_name, callee) && call->first_string_arg &&
+            strcmp(call->first_string_arg, route) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Check if any import with the given module path exists. */
 static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path_substr) {
     for (int i = 0; i < r->imports.count; i++) {
@@ -77,6 +90,18 @@ static int has_method_route(CBMFileResult *r, const char *name, const char *path
         if (strcmp(def->label, "Method") == 0 && strcmp(def->name, name) == 0 && def->route_path &&
             strcmp(def->route_path, path) == 0 && def->route_method &&
             strcmp(def->route_method, method) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int has_method_route_framework(CBMFileResult *r, const char *name, const char *framework) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *def = &r->defs.items[i];
+        if (def->label && strcmp(def->label, "Method") == 0 && def->name &&
+            strcmp(def->name, name) == 0 && def->route_framework &&
+            strcmp(def->route_framework, framework) == 0) {
             return 1;
         }
     }
@@ -176,6 +201,47 @@ TEST(extract_angular_httpclient_routes) {
     ASSERT(has_call_route(r, "HttpClient.get", "/api/v1/features"));
     ASSERT_FALSE(has_call_route(r, "HttpClient.get", "/api/v1/local-only"));
     ASSERT_FALSE(has_call_route(r, "HttpClient.get", "/assets/i18n/{}.json"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_angular_http_wrapper_routes) {
+    CBMFileResult *r =
+        extract("import { HttpClient } from '@angular/common/http';\n"
+                "class ApiService {\n"
+                "  constructor(private http: HttpClient, private config: Config) {}\n"
+                "  post(payload: unknown, apiURL: string) {\n"
+                "    return this.http.post(apiURL, payload);\n"
+                "  }\n"
+                "  save(id: string, payload: unknown) {\n"
+                "    const apiURL = `${this.config.baseUrl}/api/v1/orders/${id}`;\n"
+                "    return this.post(payload, apiURL);\n"
+                "  }\n"
+                "  mutablePost(payload: unknown, apiURL: string) {\n"
+                "    apiURL = '/api/v1/rewritten';\n"
+                "    return this.http.post(apiURL, payload);\n"
+                "  }\n"
+                "  saveMutable(id: string, payload: unknown) {\n"
+                "    const apiURL = `/api/v1/mutable/${id}`;\n"
+                "    return this.mutablePost(payload, apiURL);\n"
+                "  }\n"
+                "  ambiguous(url: string, payload: unknown) {\n"
+                "    this.http.get(url);\n"
+                "    return this.http.post(url, payload);\n"
+                "  }\n"
+                "  saveAmbiguous(id: string, payload: unknown) {\n"
+                "    const apiURL = `/api/v1/ambiguous/${id}`;\n"
+                "    return this.ambiguous(apiURL, payload);\n"
+                "  }\n"
+                "}\n",
+                CBM_LANG_TYPESCRIPT, "t", "api.service.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_route_from(r, "ApiService.save", "HttpClient.post", "/api/v1/orders/{}"));
+    ASSERT_FALSE(
+        has_call_route_from(r, "ApiService.saveMutable", "HttpClient.post", "/api/v1/mutable/{}"));
+    ASSERT_FALSE(has_call_route_from(r, "ApiService.saveAmbiguous", "HttpClient.post",
+                                     "/api/v1/ambiguous/{}"));
     cbm_free_result(r);
     PASS();
 }
@@ -598,6 +664,7 @@ TEST(csharp_aspnet_attribute_routes) {
     ASSERT(has_method_route(r, "List", "/api/v1/Orders", "GET"));
     ASSERT(has_method_route(r, "Get", "/api/v1/Orders/{id}", "GET"));
     ASSERT(has_method_route(r, "Create", "/api/v1/Orders/by-action/Create", "POST"));
+    ASSERT(has_method_route_framework(r, "List", "aspnet"));
     cbm_free_result(r);
     PASS();
 }
@@ -3590,6 +3657,7 @@ SUITE(extraction) {
     RUN_TEST(extract_r_dollar_call_issue219);
     RUN_TEST(extract_ts_factory_object_methods_issue341);
     RUN_TEST(extract_angular_httpclient_routes);
+    RUN_TEST(extract_angular_http_wrapper_routes);
     RUN_TEST(extract_c_macros_issue375);
     RUN_TEST(extract_cpp_macros_issue375);
     RUN_TEST(extract_gdscript_issue186);

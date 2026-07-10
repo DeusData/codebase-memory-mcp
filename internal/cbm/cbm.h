@@ -195,20 +195,23 @@ typedef struct {
     const char **return_types; // NULL-terminated array (NULL if none)
     const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
     const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
-    int complexity;            // cyclomatic complexity
-    int cognitive;             // cognitive complexity (nesting-weighted)
-    int loop_count;            // number of loop constructs in the body
-    int loop_depth;            // max nested-loop depth (bottleneck proxy)
-    bool is_recursive;         // body contains a direct self-call (seed for "recursive")
-    int param_count;           // number of parameters (large = complexity smell)
-    int max_access_depth;      // deepest chained member/subscript access (a.b.c.d)
-    int linear_scan_in_loop;   // count of linear-scan calls (find/contains/indexOf) inside loops
-    int alloc_in_loop;         // count of allocation/append calls inside loops
-    bool recursion_in_loop;    // a self-call occurs inside a loop body
-    bool unguarded_recursion;  // recursive with no self-call guarded by a conditional
-    int lines;                 // body line count
-    uint32_t *fingerprint;     // MinHash fingerprint (arena-allocated, K values) or NULL
-    int fingerprint_k;         // number of hash values (CBM_MINHASH_K or 0)
+
+    const char *route_framework; // Producer framework with routing semantics (e.g., "aspnet")
+
+    int complexity;           // cyclomatic complexity
+    int cognitive;            // cognitive complexity (nesting-weighted)
+    int loop_count;           // number of loop constructs in the body
+    int loop_depth;           // max nested-loop depth (bottleneck proxy)
+    bool is_recursive;        // body contains a direct self-call (seed for "recursive")
+    int param_count;          // number of parameters (large = complexity smell)
+    int max_access_depth;     // deepest chained member/subscript access (a.b.c.d)
+    int linear_scan_in_loop;  // count of linear-scan calls (find/contains/indexOf) inside loops
+    int alloc_in_loop;        // count of allocation/append calls inside loops
+    bool recursion_in_loop;   // a self-call occurs inside a loop body
+    bool unguarded_recursion; // recursive with no self-call guarded by a conditional
+    int lines;                // body line count
+    uint32_t *fingerprint;    // MinHash fingerprint (arena-allocated, K values) or NULL
+    int fingerprint_k;        // number of hash values (CBM_MINHASH_K or 0)
     bool is_exported;
     bool is_abstract;
     bool is_test;
@@ -630,6 +633,7 @@ void cbm_extract_channels(CBMExtractCtx *ctx);
 
 // Single-pass unified extraction (replaces the 7 calls above except defs+imports).
 void cbm_extract_unified(CBMExtractCtx *ctx);
+void cbm_propagate_angular_http_wrappers(CBMExtractCtx *ctx);
 
 // K8s / Kustomize semantic extractor (called when language is CBM_LANG_K8S or CBM_LANG_KUSTOMIZE).
 void cbm_extract_k8s(CBMExtractCtx *ctx);

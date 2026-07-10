@@ -34,6 +34,12 @@
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
 
+/* Reuse an ASP.NET producer Route when method + canonical path differ only by
+ * case; all other producer frameworks remain case-sensitive. Creates a normal
+ * consumer Route when no matching ASP.NET producer exists. */
+int64_t cbm_gbuf_find_http_route(const cbm_gbuf_t *gb, const char *url, const char *method);
+int64_t cbm_gbuf_upsert_http_route(cbm_gbuf_t *gb, const char *url, const char *method);
+
 /* True when a graph node is a structural directory container (Folder/Project)
  * rather than a code node. In a directory-based-module language (Java/Go, see
  * cbm_lang_module_is_dir) a file's module QN equals its directory QN, so an

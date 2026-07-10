@@ -24,6 +24,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
@@ -290,6 +291,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "route_framework", def->route_framework);
 
     /* MinHash fingerprint — append if present and buffer has room. */
     if (def->fingerprint && def->fingerprint_k > 0 &&
@@ -325,6 +327,30 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
+    if (node_id > 0 && def->route_path && def->route_path[0]) {
+        const char *method = def->route_method ? def->route_method : "ANY";
+        char canonical_path[CBM_SZ_256];
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method,
+                 cbm_route_canon_path(def->route_path, canonical_path, sizeof(canonical_path)));
+        char route_props[CBM_SZ_256];
+        if (def->route_framework) {
+            snprintf(route_props, sizeof(route_props),
+                     "{\"method\":\"%s\",\"source\":\"decorator\",\"framework\":\"%s\"}", method,
+                     def->route_framework);
+        } else {
+            snprintf(route_props, sizeof(route_props),
+                     "{\"method\":\"%s\",\"source\":\"decorator\"}", method);
+        }
+        int64_t route_id =
+            cbm_gbuf_upsert_node(ctx->gbuf, "Route", def->route_path, route_qn,
+                                 def->file_path ? def->file_path : rel, 0, 0, route_props);
+        char escaped_handler[CBM_SZ_512];
+        char handles_props[CBM_SZ_512];
+        cbm_json_escape(escaped_handler, sizeof(escaped_handler), def->qualified_name);
+        snprintf(handles_props, sizeof(handles_props), "{\"handler\":\"%s\"}", escaped_handler);
+        cbm_gbuf_insert_edge(ctx->gbuf, node_id, route_id, "HANDLES", handles_props);
+    }
     /* Register callable symbols + every type-like container (Class/Struct/
      * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
      * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/

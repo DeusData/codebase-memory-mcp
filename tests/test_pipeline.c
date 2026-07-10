@@ -1094,16 +1094,15 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     cbm_store_t *s = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s);
 
-    /* (1) Genuine HTTP_CALLS survive under the guard (>= 3):
-     *   - axios.get('/api/orders') -> 2 edges (recognized lib #523 callee bypass
-     *     + detect_url_in_args), and
-     *   - dev.load('/api/data')    -> 1 edge via detect_url_in_args, which runs
-     *     unconditionally after emit_service_edge's branch even when the plain
-     *     fall-through is suppressed.
+    /* (1) Genuine HTTP_CALLS survive under the guard (exactly 2):
+     *   - axios.get('/api/orders') -> 1 classified service edge, and
+     *   - dev.load('/api/data')    -> 1 edge via detect_url_in_args.
+     * Recognized service calls return after their classified edge so the generic
+     * arg fallback cannot create a duplicate ANY-method Route.
      * dev.load is the class the predicate-duplicating guard lost: `.load` is not
      * a route suffix and `dev` is not an HTTP lib, so it was dropped before
-     * emit_service_edge ran (RED on that guard: only axios's 2). */
-    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 3);
+     * emit_service_edge ran. */
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 2);
     /* (2) The verb-suffix + route-path member calls keep their route
      * registrations (edge type CALLS -> a Route node named by the path). These
      * classify as route_registration on main, NOT HTTP_CALLS — Option A preserves

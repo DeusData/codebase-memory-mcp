@@ -142,6 +142,38 @@ static int et_edge_present(const EtFile *files, int nfiles, const char *edge, in
     return got >= floor;
 }
 
+static int et_edge_exact(const EtFile *files, int nfiles, const char *edge, int expected) {
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge) : -1;
+    if (got != expected) {
+        fprintf(stderr, "  [ET-EDGE] FAIL %-20s count=%d expected=%d\n", edge, got, expected);
+    }
+    et_cleanup(&lp, store);
+    return got == expected;
+}
+
+static int et_cross_service_trace_contains(const EtFile *files, int nfiles, const char *function,
+                                           const char *expected) {
+    EtProj lp;
+    cbm_store_t *store = et_index_files(&lp, files, nfiles);
+    char args[700];
+    snprintf(args, sizeof(args),
+             "{\"function_name\":\"%s\",\"project\":\"%s\","
+             "\"direction\":\"outbound\",\"mode\":\"cross_service\"}",
+             function, lp.project ? lp.project : "");
+    char *response =
+        lp.srv ? cbm_mcp_handle_tool(lp.srv, "trace_path", args) : NULL;
+    int ok = response && strstr(response, expected) != NULL;
+    if (!ok) {
+        fprintf(stderr, "  [ET-TRACE] missing %s in %s\n", expected,
+                response ? response : "(null)");
+    }
+    free(response);
+    et_cleanup(&lp, store);
+    return ok;
+}
+
 enum { ET_ROUTE_ASSERT_MAX = 16 };
 
 /* Assert the exact Route node set. Edge-count smoke tests cannot catch partial
@@ -578,6 +610,131 @@ TEST(http_calls_angular_httpclient_ts) {
          "}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+TEST(http_calls_angular_http_wrapper_ts) {
+    static const char *routes[] = {"/api/v1/customers/{}", NULL};
+    static const EtFile f[] = {
+        {"customer.service.ts",
+         "import { HttpClient } from '@angular/common/http';\n\n"
+         "export class CustomerService {\n"
+         "  constructor(private http: HttpClient) {}\n"
+         "  private post(payload: unknown, apiURL: string) {\n"
+         "    return this.http.post(apiURL, payload);\n"
+         "  }\n"
+         "  save(id: string, payload: unknown) {\n"
+         "    const apiURL = `/api/v1/customers/${id}`;\n"
+         "    return this.post(payload, apiURL);\n"
+         "  }\n"
+         "}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 1));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+TEST(http_calls_angular_aspnet_case_insensitive_convergence) {
+    static const char *routes[] = {"/api/v1/Orders/{orderId}",
+                                   "/api/v1/Orders/{orderId}/state/{newState}",
+                                   "/api/v1/Orders/states",
+                                   "/internal/v2/reports", NULL};
+    static const EtFile f[] = {
+        {"Controllers.cs",
+         "[ApiController]\n"
+         "[ApiVersion(\"1.0\")]\n"
+         "[Route(\"api/v{version:apiVersion}/[controller]\")]\n"
+         "public class OrdersController {\n"
+         "    [HttpGet(\"{orderId}\")]\n"
+         "    public string Get(int orderId) { return \"one\"; }\n"
+         "    [HttpGet(\"states\")]\n"
+         "    public string GetStates() { return \"states\"; }\n"
+         "    [HttpPost(\"{orderId}/state/{newState}\")]\n"
+         "    public string SetState(int orderId, string newState) { return newState; }\n"
+         "}\n"
+         "[ApiController]\n"
+         "[ApiVersion(\"2.0\")]\n"
+         "[Route(\"internal/v{version:apiVersion}/reports\")]\n"
+         "public class ReportController {\n"
+         "    [HttpPost]\n"
+         "    public string Create() { return \"created\"; }\n"
+         "}\n"},
+        {"order.service.ts",
+         "import { HttpClient } from '@angular/common/http';\n"
+         "export class OrderService {\n"
+         "  constructor(private http: HttpClient) {}\n"
+         "  loadOrder(id: string) { return this.http.get(`/api/v1/orders/${id}`); }\n"
+         "  loadStates() { return this.http.get('/api/v1/orders/states'); }\n"
+         "  finishOrder(id: string) {\n"
+         "    return this.http.post(`/api/v1/orders/${id}/state/Finished`, {});\n"
+         "  }\n"
+         "}\n"}};
+    ASSERT_TRUE(et_edge_exact(f, 2, "HTTP_CALLS", 3));
+    ASSERT_TRUE(et_edge_exact(f, 2, "HANDLES", 4));
+    ASSERT_TRUE(et_edge_exact(f, 2, "DATA_FLOWS", 3));
+    ASSERT_TRUE(et_routes_exact(f, 2, routes));
+    ASSERT_TRUE(et_cross_service_trace_contains(f, 2, "loadOrder", "OrdersController.Get"));
+    PASS();
+}
+
+TEST(http_calls_angular_aspnet_convergence_parallel) {
+    static const EtFile f[] = {
+        {"OrdersController.cs",
+         "[ApiController]\n"
+         "[Route(\"api/v1/[controller]\")]\n"
+         "public class OrdersController {\n"
+         "    [HttpGet(\"{orderId}\")]\n"
+         "    public string Get(int orderId) { return \"one\"; }\n"
+         "}\n"},
+        {"order.service.ts",
+         "import { HttpClient } from '@angular/common/http';\n"
+         "export class OrderService {\n"
+         "  constructor(private http: HttpClient) {}\n"
+         "  loadOrder(id: string) { return this.http.get(`/api/v1/orders/${id}`); }\n"
+         "}\n"}};
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, f, 2);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    int route_rc =
+        store ? cbm_store_find_nodes_by_label(store, lp.project, "Route", &routes, &route_count) : -1;
+    int http = store ? cbm_store_count_edges_by_type(store, lp.project, "HTTP_CALLS") : -1;
+    int handles = store ? cbm_store_count_edges_by_type(store, lp.project, "HANDLES") : -1;
+    int flows = store ? cbm_store_count_edges_by_type(store, lp.project, "DATA_FLOWS") : -1;
+    int route_ok = route_rc == CBM_STORE_OK && route_count == 1 && routes[0].name &&
+                   strcmp(routes[0].name, "/api/v1/Orders/{orderId}") == 0;
+    if (!route_ok) {
+        fprintf(stderr, "  [ET-ROUTE] parallel rc=%d count=%d http=%d handles=%d flows=%d\n",
+                route_rc, route_count, http, handles, flows);
+        for (int i = 0; i < route_count; i++) {
+            fprintf(stderr, "  [ET-ROUTE]   %s\n", routes[i].name ? routes[i].name : "(null)");
+        }
+    }
+    cbm_store_free_nodes(routes, route_count);
+    et_cleanup(&lp, store);
+    ASSERT_TRUE(route_ok);
+    ASSERT_EQ(http, 1);
+    ASSERT_EQ(handles, 1);
+    ASSERT_EQ(flows, 1);
+    PASS();
+}
+
+TEST(http_calls_non_aspnet_routes_remain_case_sensitive) {
+    static const char *routes[] = {"/API/Items/{item_id}", "/api/items/Fixed", NULL};
+    static const EtFile f[] = {
+        {"api.py",
+         "from fastapi import FastAPI\n"
+         "app = FastAPI()\n\n"
+         "@app.get('/API/Items/{item_id}')\n"
+         "def read_item(item_id: str):\n"
+         "    return {'id': item_id}\n"},
+        {"item.service.ts",
+         "import { HttpClient } from '@angular/common/http';\n"
+         "export class ItemService {\n"
+         "  constructor(private http: HttpClient) {}\n"
+         "  get() { return this.http.get('/api/items/Fixed'); }\n"
+         "}\n"}};
+    ASSERT_TRUE(et_edge_exact(f, 2, "DATA_FLOWS", 0));
+    ASSERT_TRUE(et_routes_exact(f, 2, routes));
     PASS();
 }
 
@@ -1521,6 +1678,10 @@ SUITE(edge_types_probe) {
     RUN_TEST(http_calls_fetch_js);
     RUN_TEST(http_calls_axios_ts);
     RUN_TEST(http_calls_angular_httpclient_ts);
+    RUN_TEST(http_calls_angular_http_wrapper_ts);
+    RUN_TEST(http_calls_angular_aspnet_case_insensitive_convergence);
+    RUN_TEST(http_calls_angular_aspnet_convergence_parallel);
+    RUN_TEST(http_calls_non_aspnet_routes_remain_case_sensitive);
     RUN_TEST(http_calls_requests_python);
     RUN_TEST(http_calls_nethttp_go);
     RUN_TEST(http_calls_resttemplate_java);
