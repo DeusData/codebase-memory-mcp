@@ -746,20 +746,28 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
         return;
     }
 
-    /* Value must be a string literal */
-    if (!is_string_node(ts_node_type(value_node))) {
+    /* Value must be a string literal (template literals flatten to "{}" form) */
+    const char *value_kind = ts_node_type(value_node);
+    const char *flat_value = NULL;
+    if (strcmp(value_kind, "template_string") == 0) {
+        flat_value = cbm_template_string_text(ctx->arena, value_node, ctx->source);
+        if (!flat_value) {
+            return;
+        }
+    } else if (!is_string_node(value_kind)) {
         return;
     }
 
     char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
-    char *value = cbm_node_text(ctx->arena, value_node, ctx->source);
+    char *value =
+        flat_value ? (char *)flat_value : cbm_node_text(ctx->arena, value_node, ctx->source);
     if (!name || !name[0] || !value || !value[0]) {
         return;
     }
 
-    /* Strip quotes from value */
+    /* Strip quotes from value (template values are already unquoted) */
     int vlen = (int)strlen(value);
-    if (vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
+    if (!flat_value && vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
         value = cbm_arena_strndup(ctx->arena, value + SKIP_ONE, (size_t)(vlen - PAIR_LEN));
         if (!value) {
             return;
@@ -789,6 +797,27 @@ static bool is_string_node(const char *kind) {
 
 static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     const char *kind = ts_node_type(node);
+    /* JS/TS template literals: flatten ${...} substitutions to "{}" so URL-ish
+     * template strings become string_refs with the canonical placeholder shape
+     * shared with server route paths (issue #1006). */
+    if (strcmp(kind, "template_string") == 0) {
+        const char *flat = cbm_template_string_text(ctx->arena, node, ctx->source);
+        if (!flat) {
+            return;
+        }
+        int kind_val = cbm_classify_string(flat, (int)strlen(flat));
+        if (kind_val < 0) {
+            return;
+        }
+        CBMStringRef ref = {
+            .value = flat,
+            .enclosing_func_qn =
+                state->enclosing_func_qn ? state->enclosing_func_qn : ctx->module_qn,
+            .kind = (CBMStringRefKind)kind_val,
+        };
+        cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
+        return;
+    }
     if (!is_string_node(kind)) {
         return;
     }
