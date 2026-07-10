@@ -2957,6 +2957,24 @@ TEST(cli_build_args_json_bare_boolean_issue680) {
     PASS();
 }
 
+/* An unknown flag for a KNOWN tool must be rejected loudly, not silently
+ * typed as a string and dropped server-side (#997). GF1 eval: `trace_path
+ * --max-depth 1` was accepted, the real --depth stayed at default 3, and
+ * the trace silently returned hop-2/3 results — silent-wrong output. The
+ * error names the closest valid flag as a suggestion. */
+TEST(cli_build_args_json_unknown_flag_rejected) {
+    char *err = NULL;
+    char *argv[] = {"--max-depth", "1"};
+    char *json = cbm_cli_build_args_json("trace_path", 2, argv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    ASSERT(strstr(err, "unknown flag") != NULL);
+    ASSERT(strstr(err, "max-depth") != NULL);
+    ASSERT(strstr(err, "--depth") != NULL); /* nearest-flag suggestion */
+    free(err);
+    PASS();
+}
+
 /* A repeated array-typed flag accumulates into a JSON array. */
 TEST(cli_build_args_json_repeated_array_issue680) {
     char *err = NULL;
@@ -3226,6 +3244,7 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_string_flag_issue680);
     RUN_TEST(cli_build_args_json_integer_flag_issue680);
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
+    RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
