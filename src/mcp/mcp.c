@@ -55,6 +55,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/limits.h"
 #include "mcp/index_supervisor.h"
+#include "mcp/compact_out.h"
 #include "foundation/str_util.h"
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
@@ -352,11 +353,15 @@ static const tool_def_t TOOLS[] = {
      "(2) name_pattern='.*regex.*' for exact pattern matching; (3) semantic_query=[...] for "
      "vector cosine search that bridges vocabulary (finds 'publish' when you search 'send'). "
      "The three modes are independent and can be combined in a single call. "
-     "PAGINATION: results are capped at limit (default 200) — broader queries are silently "
-     "truncated. The response always includes 'total' (full match count before limit) and "
-     "'has_more' (true when total > offset+returned). Detect truncation with has_more, then "
-     "page by re-calling with offset=offset+limit until has_more is false. Narrow first via "
-     "label/file_pattern/min_degree before paginating large result sets.",
+     "RESPONSE: compact TOON tables by default — `results[N]{qn,label,file,lines,in,out}:` "
+     "header then one row per hit (in/out = edge degrees). Add per-node property columns via "
+     "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); pass format=\"json\" for "
+     "legacy verbose objects (include_connected always uses JSON). "
+     "PAGINATION: results are capped at limit (default 50). The response always includes "
+     "'total' (full match count before limit) and 'has_more' (true when total > "
+     "offset+returned). Detect truncation with has_more, then page by re-calling with "
+     "offset=offset+limit until has_more is false. Narrow first via label/file_pattern/"
+     "min_degree before paginating large result sets.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
@@ -374,11 +379,18 @@ static const tool_def_t TOOLS[] = {
      "Each keyword is scored independently via per-keyword min-cosine; results reflect functions "
      "that score well on ALL keywords. Requires moderate/full index mode. Results appear in the "
      "'semantic_results' field (separate from 'results').\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results per call. Default 200. Response carries "
+     "\"integer\",\"description\":\"Max results per call. Default 50. Response carries "
      "'total' (full match count) and 'has_more' (true if truncated) so callers can "
      "detect the limit and paginate.\"},\"offset\":{\"type\":\"integer\",\"default\":0,"
      "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
-     "increment offset by limit and re-call while has_more is true.\"}},"
+     "increment offset by limit and re-call while has_more is true.\"},"
+     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"description\":\"Response encoding. toon (default): compact header+rows tables, "
+     "~60% fewer tokens. json: legacy verbose per-node objects.\"},"
+     "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
+     "\"Extra per-node property columns for toon output, e.g. complexity, cognitive, "
+     "signature, docstring, return_type, is_test, lines(int). Missing values emit as "
+     "empty cells.\"}},"
      "\"required\":[\"project\"]}"},
 
     {"query_graph", "Query graph",
@@ -1610,7 +1622,7 @@ enum {
     BM25_MIN_BUF = 2, /* minimum buffer size: at least NUL + one char */
     BM25_SEP_RESERVE = 1,
     BM25_QUERY_BUF = 1024,
-    BM25_DEFAULT_LIMIT = 100,
+    BM25_DEFAULT_LIMIT = 50,
     BM25_COL_ID = 0,
     BM25_COL_LABEL = 1,
     BM25_COL_NAME = 2,
@@ -1708,7 +1720,7 @@ static char *bm25_file_pattern_like(const char *file_pattern) {
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
-                         const char *file_pattern, int limit, int offset) {
+                         const char *file_pattern, int limit, int offset, bool toon) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -1802,6 +1814,47 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             }
             sqlite3_finalize(cs);
         }
+    }
+
+    if (toon) {
+        /* TOON: rows are buffered first because the table header carries the
+         * row count, which sqlite only yields by stepping to completion. */
+        cbm_sb_t rows;
+        cbm_sb_init(&rows);
+        int emitted = 0;
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            char lines[CBM_SZ_32];
+            int sl = sqlite3_column_int(stmt, BM25_COL_START);
+            int el = sqlite3_column_int(stmt, BM25_COL_END);
+            if (sl > 0) {
+                snprintf(lines, sizeof(lines), "%d-%d", sl, el > sl ? el : sl);
+            } else {
+                lines[0] = '\0';
+            }
+            cbm_toon_row_begin(&rows);
+            cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_QN), true);
+            cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL),
+                              false);
+            cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_FILE), false);
+            cbm_toon_cell_str(&rows, lines, false);
+            cbm_toon_cell_real(&rows, sqlite3_column_double(stmt, BM25_COL_RANK), false);
+            cbm_toon_row_end(&rows);
+            emitted++;
+        }
+        sqlite3_finalize(stmt);
+        free(file_like);
+
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_toon_scalar_int(&sb, "total", total);
+        cbm_toon_scalar_str(&sb, "search_mode", "bm25");
+        static const char *const cols[] = {"qn", "label", "file", "lines", "rank"};
+        cbm_toon_table_header(&sb, "results", emitted, cols, 5);
+        char *rows_text = cbm_sb_finish(&rows);
+        cbm_sb_append(&sb, rows_text ? rows_text : "");
+        free(rows_text);
+        cbm_toon_scalar_bool(&sb, "has_more", total > offset + emitted);
+        return cbm_sb_finish(&sb);
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -1920,15 +1973,25 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "semantic_results", sem_results);
 }
 
-/* Append the semantic_query vector-search results onto the doc.  Returns
- * true if semantic_query was provided as a non-array (type error — caller
- * should surface to the user). */
-static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args,
-                               cbm_store_t *store, const char *project, int limit) {
+/* Run the semantic_query vector search from raw args. Sets *out_vresults /
+ * *out_vcount (caller frees via cbm_store_free_vector_results when vcount>0).
+ * Returns true if semantic_query was provided as a non-array (type error —
+ * caller should surface to the user). */
+static bool run_semantic_query_core(const char *args, cbm_store_t *store, const char *project,
+                                    int limit, cbm_vector_result_t **out_vresults, int *out_vcount,
+                                    bool *out_present) {
     enum { MAX_KW_SEARCH = 32 };
+    *out_vresults = NULL;
+    *out_vcount = 0;
+    if (out_present) {
+        *out_present = false;
+    }
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
     yyjson_val *sq_val = args_root ? yyjson_obj_get(args_root, "semantic_query") : NULL;
+    if (out_present && sq_val) {
+        *out_present = true;
+    }
     bool type_error = false;
     if (sq_val && !yyjson_is_arr(sq_val)) {
         type_error = true;
@@ -1941,14 +2004,153 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
         if (cbm_store_vector_search(store, project, keywords, ki, sem_limit, &vresults, &vcount) ==
                 CBM_STORE_OK &&
             vcount > 0) {
-            emit_semantic_results(doc, root, vresults, vcount);
-            cbm_store_free_vector_results(vresults, vcount);
+            *out_vresults = vresults;
+            *out_vcount = vcount;
         }
     }
     if (args_doc) {
         yyjson_doc_free(args_doc);
     }
     return type_error;
+}
+
+/* Append the semantic_query vector-search results onto the doc.  Returns
+ * true if semantic_query was provided as a non-array (type error — caller
+ * should surface to the user). */
+static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args,
+                               cbm_store_t *store, const char *project, int limit) {
+    cbm_vector_result_t *vresults = NULL;
+    int vcount = 0;
+    bool type_error =
+        run_semantic_query_core(args, store, project, limit, &vresults, &vcount, NULL);
+    if (vcount > 0) {
+        emit_semantic_results(doc, root, vresults, vcount);
+        cbm_store_free_vector_results(vresults, vcount);
+    }
+    return type_error;
+}
+
+/* ── TOON output for search_graph ───────────────────────────────────
+ * Default response encoding: header+rows tables (compact_out.h). The
+ * verbose per-node JSON objects remain available via format:"json" and
+ * are forced for include_connected=true (nested neighbor lists). */
+
+enum { SG_MAX_EXTRA_FIELDS = 12 };
+
+/* Internal-only node properties never emitted to agents: similarity /
+ * semantic pipeline intermediates (minhash fingerprint, structural profile,
+ * body-token bag). They dominate payload size and carry zero agent value. */
+static bool sg_field_blocked(const char *f) {
+    return strcmp(f, "fp") == 0 || strcmp(f, "sp") == 0 || strcmp(f, "bt") == 0;
+}
+
+/* Parse the `fields` argument (array of property names) into out[] as
+ * pointers owned by the returned doc (caller frees the doc after emission).
+ * Blocked internal fields are silently dropped. */
+static int sg_parse_fields(const char *args, const char *out[], int max_out,
+                           yyjson_doc **out_owner) {
+    *out_owner = NULL;
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    yyjson_val *fv = args_root ? yyjson_obj_get(args_root, "fields") : NULL;
+    if (!fv || !yyjson_is_arr(fv)) {
+        if (args_doc) {
+            yyjson_doc_free(args_doc);
+        }
+        return 0;
+    }
+    int n = 0;
+    size_t idx = 0;
+    size_t max = 0;
+    yyjson_val *item;
+    yyjson_arr_foreach(fv, idx, max, item) {
+        const char *s = yyjson_get_str(item);
+        if (s && s[0] && !sg_field_blocked(s) && n < max_out) {
+            out[n++] = s;
+        }
+    }
+    if (n == 0) {
+        yyjson_doc_free(args_doc);
+        return 0;
+    }
+    *out_owner = args_doc;
+    return n;
+}
+
+/* Append one row's extra-field cells, pulled from the node's properties. */
+static void sg_toon_extra_cells(cbm_sb_t *sb, const char *props_json, const char *const *fields,
+                                int nfields) {
+    yyjson_doc *pd =
+        (props_json && props_json[0]) ? yyjson_read(props_json, strlen(props_json), 0) : NULL;
+    yyjson_val *pr = pd ? yyjson_doc_get_root(pd) : NULL;
+    for (int f = 0; f < nfields; f++) {
+        yyjson_val *v = (pr && yyjson_is_obj(pr)) ? yyjson_obj_get(pr, fields[f]) : NULL;
+        if (v && yyjson_is_str(v)) {
+            cbm_toon_cell_str(sb, yyjson_get_str(v), false);
+        } else if (v && yyjson_is_bool(v)) {
+            cbm_toon_cell_bool(sb, yyjson_get_bool(v), false);
+        } else if (v && yyjson_is_int(v)) {
+            cbm_toon_cell_int(sb, yyjson_get_int(v), false);
+        } else if (v && yyjson_is_real(v)) {
+            cbm_toon_cell_real(sb, yyjson_get_real(v), false);
+        } else {
+            cbm_toon_cell_str(sb, "", false);
+        }
+    }
+    if (pd) {
+        yyjson_doc_free(pd);
+    }
+}
+
+/* "start-end" line range, or empty when the node carries no line info. */
+static void sg_lines_str(char *out, size_t sz, int start, int end) {
+    if (start > 0) {
+        snprintf(out, sz, "%d-%d", start, end > start ? end : start);
+    } else {
+        out[0] = '\0';
+    }
+}
+
+/* Emit the regex-path search results as a TOON table. */
+static void emit_search_results_toon(cbm_sb_t *sb, const cbm_search_output_t *out, int offset,
+                                     const char *const *fields, int nfields) {
+    cbm_toon_scalar_int(sb, "total", out->total);
+    const char *cols[6 + SG_MAX_EXTRA_FIELDS] = {"qn", "label", "file", "lines", "in", "out"};
+    int ncols = 6;
+    for (int f = 0; f < nfields; f++) {
+        cols[ncols++] = fields[f];
+    }
+    cbm_toon_table_header(sb, "results", out->count, cols, ncols);
+    for (int i = 0; i < out->count; i++) {
+        const cbm_search_result_t *sr = &out->results[i];
+        char lines[CBM_SZ_32];
+        sg_lines_str(lines, sizeof(lines), sr->node.start_line, sr->node.end_line);
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, sr->node.qualified_name, true);
+        cbm_toon_cell_str(sb, sr->node.label, false);
+        cbm_toon_cell_str(sb, sr->node.file_path, false);
+        cbm_toon_cell_str(sb, lines, false);
+        cbm_toon_cell_int(sb, sr->in_degree, false);
+        cbm_toon_cell_int(sb, sr->out_degree, false);
+        sg_toon_extra_cells(sb, sr->node.properties_json, fields, nfields);
+        cbm_toon_row_end(sb);
+    }
+    cbm_toon_scalar_bool(sb, "has_more", out->total > offset + out->count);
+}
+
+/* Emit semantic vector-search results as a TOON table. */
+static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *vresults,
+                                       int vcount) {
+    static const char *const cols[] = {"qn", "label", "file", "score"};
+    cbm_toon_table_header(sb, "semantic", vcount, cols, 4);
+    for (int v = 0; v < vcount; v++) {
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, vresults[v].qualified_name, true);
+        cbm_toon_cell_str(sb, vresults[v].label, false);
+        cbm_toon_cell_str(sb, vresults[v].file_path, false);
+        cbm_toon_cell_real(sb, vresults[v].score, false);
+        cbm_toon_row_end(sb);
+    }
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
@@ -1962,6 +2164,16 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return not_indexed;
     }
 
+    /* Response encoding: TOON tables by default (compact, header+rows).
+     * format:"json" restores the legacy verbose per-node objects; nested
+     * neighbor lists (include_connected) need them, so they force JSON. */
+    char *format_arg = cbm_mcp_get_string_arg(args, "format");
+    bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
+    free(format_arg);
+    if (cbm_mcp_get_bool_arg(args, "include_connected")) {
+        legacy_json = true;
+    }
+
     /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
      * and return early.  The regex/vector path below is untouched for all
      * other callers.  If FTS5 is unavailable or the query is empty after
@@ -1971,7 +2183,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_limit, q_offset);
+        char *bm25_json =
+            bm25_search(store, project, query, q_file_pattern, q_limit, q_offset, !legacy_json);
         free(q_file_pattern);
         if (bm25_json) {
             free(query);
@@ -2019,6 +2232,93 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         .min_degree = min_degree,
         .max_degree = max_degree,
     };
+
+    if (!legacy_json) {
+        const char *fields[SG_MAX_EXTRA_FIELDS];
+        yyjson_doc *fields_owner = NULL;
+        int nfields = sg_parse_fields(args, fields, SG_MAX_EXTRA_FIELDS, &fields_owner);
+
+        cbm_vector_result_t *vresults = NULL;
+        int vcount = 0;
+        bool sq_present = false;
+        bool sq_type_error =
+            run_semantic_query_core(args, store, project, limit, &vresults, &vcount, &sq_present);
+        if (!sq_type_error) {
+            /* Semantic-only calls get semantic results only: the legacy
+             * behavior also ran the UNFILTERED regex search and prepended
+             * up to `limit` unrelated enriched nodes to the response. */
+            bool has_filters = label || name_pattern || qn_pattern || file_pattern ||
+                               relationship || exclude_entry_points ||
+                               min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
+            bool semantic_only = sq_present && !has_filters;
+
+            cbm_sb_t sb;
+            cbm_sb_init(&sb);
+            cbm_search_output_t tout = {0};
+            if (!semantic_only) {
+                cbm_store_search(store, &params, &tout);
+                emit_search_results_toon(&sb, &tout, offset, fields, nfields);
+                if (tout.total == 0) {
+                    if (name_pattern && label) {
+                        cbm_toon_scalar_str(&sb, "hint",
+                                            "No results. Try removing the label filter or "
+                                            "broadening the name_pattern regex.");
+                    } else if (name_pattern) {
+                        cbm_toon_scalar_str(
+                            &sb, "hint",
+                            "No nodes match this pattern. Check spelling or try a broader regex.");
+                    } else if (label) {
+                        cbm_toon_scalar_str(&sb, "hint",
+                                            "No nodes with this label. Available labels: "
+                                            "Function, Method, Class, Interface, Route, "
+                                            "Variable, Module, Package, File, Folder.");
+                    }
+                }
+            }
+            if (vcount > 0) {
+                emit_semantic_results_toon(&sb, vresults, vcount);
+            } else if (semantic_only) {
+                static const char *const sem_cols[] = {"qn", "label", "file", "score"};
+                cbm_toon_table_header(&sb, "semantic", 0, sem_cols, 4);
+                cbm_toon_scalar_str(&sb, "hint",
+                                    "No semantic matches. semantic_query needs a moderate/full "
+                                    "index; try broader or fewer keywords.");
+            }
+            if (vcount > 0) {
+                cbm_store_free_vector_results(vresults, vcount);
+            }
+            if (fields_owner) {
+                yyjson_doc_free(fields_owner);
+            }
+            cbm_store_search_free(&tout);
+            free(project);
+            free(label);
+            free(name_pattern);
+            free(qn_pattern);
+            free(file_pattern);
+            free(relationship);
+            char *text = cbm_sb_finish(&sb);
+            char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
+            free(text);
+            return result;
+        }
+        /* semantic_query type error: fall through to the shared error text. */
+        if (fields_owner) {
+            yyjson_doc_free(fields_owner);
+        }
+        free(project);
+        free(label);
+        free(name_pattern);
+        free(qn_pattern);
+        free(file_pattern);
+        free(relationship);
+        return cbm_mcp_text_result(
+            "semantic_query must be an array of keyword strings, e.g. "
+            "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
+            "into individual keywords; each is scored independently via per-keyword "
+            "min-cosine.",
+            true);
+    }
 
     cbm_search_output_t out = {0};
     cbm_store_search(store, &params, &out);

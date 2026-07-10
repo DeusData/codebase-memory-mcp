@@ -739,15 +739,16 @@ static void cleanup_snippet_dir(const char *tmp_dir);
 static char *extract_text_content(const char *mcp_result);
 
 TEST(tool_search_graph_includes_node_properties) {
-    /* search_graph results must surface each node's properties_json
-     * payload so callers don't have to round-trip through get_code_snippet
-     * just to read them. The setup_snippet_server inserts HandleRequest
-     * with a signature/return_type/is_exported property blob; this test
-     * pins that those keys reach the MCP response. */
+    /* Node properties are OPT-IN columns in the default TOON output: the
+     * default row is qn/label/file/lines/degrees only, `fields` adds the
+     * requested property columns, and format:"json" restores the legacy
+     * verbose objects with the full property blob. The setup_snippet_server
+     * inserts HandleRequest with a signature/return_type/is_exported blob. */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
+    /* Default TOON: compact table, no property spill. */
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\","
@@ -756,10 +757,87 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    /* Properties from HandleRequest's properties_json must appear. */
-    ASSERT_NOT_NULL(strstr(inner, "signature"));
+    ASSERT_NOT_NULL(strstr(inner, "results[")); /* TOON table header */
+    ASSERT_NOT_NULL(strstr(inner, "{qn,label,file,lines,in,out}"));
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
+    ASSERT_NULL(strstr(inner, "is_exported"));
+    free(inner);
+    free(resp);
+
+    /* fields:["signature"] adds the column + values. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "{qn,label,file,lines,in,out,signature}"));
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
+    free(inner);
+    free(resp);
+
+    /* format:"json" keeps the legacy verbose objects intact. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"format\":\"json\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"signature\""));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
     ASSERT_NOT_NULL(strstr(inner, "is_exported"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_search_graph_toon_never_leaks_internal_fields) {
+    /* The similarity/semantic pipeline intermediates (fp minhash hex, sp
+     * structural profile, bt body-token bag) dominated the legacy payload
+     * (~45%) and carry zero agent value. GUARD: they never appear in TOON
+     * output — not by default and not even when explicitly requested via
+     * fields (blocklist). */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    /* A node whose properties carry the internal fields with sentinels. */
+    cbm_node_t n = {0};
+    n.project = "test-project";
+    n.label = "Function";
+    n.name = "fpCarrier";
+    n.qualified_name = "test-project.src.fpCarrier";
+    n.file_path = "src/fp.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{\"fp\":\"FPSENTINEL00\",\"sp\":\"SPSENTINEL00\","
+                        "\"bt\":\"BTSENTINEL00\",\"complexity\":7}";
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"name_pattern\":\"fpCarrier\","
+             "\"fields\":[\"fp\",\"sp\",\"bt\",\"complexity\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "fpCarrier"));
+    ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "SPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "BTSENTINEL00"));
+    /* Non-blocked requested field still comes through. */
+    ASSERT_NOT_NULL(strstr(inner, "complexity"));
     free(inner);
     free(resp);
 
@@ -814,8 +892,8 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"file_path\":\"src/lib/status.c\""));
+    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+    ASSERT_NOT_NULL(strstr(inner, "src/lib/status.c"));
     ASSERT_NULL(strstr(inner, "src/components/status.c"));
 
     free(inner);
@@ -5263,6 +5341,7 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);

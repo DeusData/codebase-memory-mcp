@@ -127,7 +127,9 @@ static char *call_tool(const char *tool, const char *args_fmt, ...) {
     return cbm_mcp_handle_tool(g_srv, tool, args);
 }
 
-/* Parse integer from JSON response (handles nested MCP envelope) */
+/* Parse integer from a tool response (handles the nested MCP envelope).
+ * Matches the JSON forms "key":N / \"key\":N and the TOON scalar `key: N`
+ * (search_graph default output since the compact-output change). */
 static int count_in_response(const char *resp, const char *key) {
     if (!resp)
         return -1;
@@ -137,6 +139,10 @@ static int count_in_response(const char *resp, const char *key) {
     if (p)
         return atoi(p + strlen(pattern));
     snprintf(pattern, sizeof(pattern), "\\\"%s\\\":", key);
+    p = strstr(resp, pattern);
+    if (p)
+        return atoi(p + strlen(pattern));
+    snprintf(pattern, sizeof(pattern), "%s: ", key);
     p = strstr(resp, pattern);
     if (p)
         return atoi(p + strlen(pattern));
@@ -928,6 +934,10 @@ static int resp_has_key(const char *resp, const char *key) {
     if (strstr(resp, pattern) != NULL)
         return 1;
     snprintf(pattern, sizeof(pattern), "\\\"%s\\\"", key);
+    if (strstr(resp, pattern) != NULL)
+        return 1;
+    /* TOON scalar form (`key: value`), the search_graph default output. */
+    snprintf(pattern, sizeof(pattern), "%s: ", key);
     return strstr(resp, pattern) != NULL;
 }
 

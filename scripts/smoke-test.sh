@@ -174,7 +174,9 @@ PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.r
 if ! SEARCH=$(cli search_graph --project "$PROJECT" --name-pattern compute); then
   echo "FAIL: search_graph (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-TOTAL=$(echo "$SEARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
+# search_graph default output is TOON (key: value scalars + header/rows tables)
+TOTAL=$(echo "$SEARCH" | sed -n 's/^total: //p' | head -1)
+TOTAL=${TOTAL:-0}
 if [ "$TOTAL" -lt 1 ]; then
   echo "FAIL: search_graph for 'compute' returned 0 results"
   exit 1
@@ -207,7 +209,8 @@ echo "OK: schema has $LABELS node labels"
 if ! FOLDERS=$(cli search_graph --project "$PROJECT" --label Folder); then
   echo "FAIL: search_graph --label Folder exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-FOLDER_COUNT=$(echo "$FOLDERS" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
+FOLDER_COUNT=$(echo "$FOLDERS" | sed -n 's/^total: //p' | head -1)
+FOLDER_COUNT=${FOLDER_COUNT:-0}
 if [ "$FOLDER_COUNT" -lt 2 ]; then
   echo "FAIL: expected at least 2 Folder nodes (src, src/pkg), got $FOLDER_COUNT"
   exit 1
@@ -396,36 +399,39 @@ echo "=== Phase 3h: CLI input-mode guards (flags / stdin / --args-file / --help 
 
 # Small helper: assert its stdin is a JSON object (exit non-zero otherwise).
 assert_json_obj() { python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d,dict) else 1)" 2>/dev/null; }
+# search_graph emits TOON by default: a results/semantic table header proves
+# the tool parsed its typed flags and produced a well-formed response.
+assert_toon_table() { grep -qE '^(results|semantic)\[[0-9]+\]\{'; }
 
-# B1: INTEGER flag — --limit is schema-typed integer; must parse to valid JSON.
+# B1: INTEGER flag — --limit is schema-typed integer; must parse and answer.
 if ! IM_INT=$(cli search_graph --project "$PROJECT" --name-pattern compute --limit 5); then
   echo "FAIL B1: search_graph --limit 5 exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_INT" | assert_json_obj; then
-  echo "OK B1: INTEGER flag (--limit 5) parsed → valid JSON"
+if echo "$IM_INT" | assert_toon_table; then
+  echo "OK B1: INTEGER flag (--limit 5) parsed → TOON results table"
 else
-  echo "FAIL B1: --limit 5 did not produce valid JSON"; echo "$IM_INT" | head -c 300; exit 1
+  echo "FAIL B1: --limit 5 did not produce a TOON results table"; echo "$IM_INT" | head -c 300; exit 1
 fi
 
 # B2: BOOLEAN bare flag — --exclude-entry-points with no value → true; must succeed.
 if ! IM_BOOL=$(cli search_graph --project "$PROJECT" --exclude-entry-points); then
   echo "FAIL B2: search_graph --exclude-entry-points exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_BOOL" | assert_json_obj; then
+if echo "$IM_BOOL" | assert_toon_table; then
   echo "OK B2: BOOLEAN bare flag (--exclude-entry-points) → success"
 else
-  echo "FAIL B2: --exclude-entry-points did not produce valid JSON"; echo "$IM_BOOL" | head -c 300; exit 1
+  echo "FAIL B2: --exclude-entry-points did not produce a TOON results table"; echo "$IM_BOOL" | head -c 300; exit 1
 fi
 
 # B3: ARRAY flag — repeated --semantic-query accumulates into a JSON array.
-# semantic_results may be empty (index-mode dependent); only assert valid JSON.
+# Semantic-only calls emit ONLY the semantic table (may be empty, header stays).
 if ! IM_ARR=$(cli search_graph --project "$PROJECT" --semantic-query send --semantic-query publish); then
   echo "FAIL B3: search_graph repeated --semantic-query exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_ARR" | assert_json_obj; then
-  echo "OK B3: ARRAY flag (repeated --semantic-query) → valid JSON"
+if echo "$IM_ARR" | grep -qE '^semantic\[[0-9]+\]\{'; then
+  echo "OK B3: ARRAY flag (repeated --semantic-query) → semantic TOON table"
 else
-  echo "FAIL B3: repeated --semantic-query did not produce valid JSON"; echo "$IM_ARR" | head -c 300; exit 1
+  echo "FAIL B3: repeated --semantic-query did not produce a semantic table"; echo "$IM_ARR" | head -c 300; exit 1
 fi
 
 # B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
