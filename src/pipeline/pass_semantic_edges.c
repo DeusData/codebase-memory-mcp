@@ -1034,16 +1034,23 @@ static void phase5c_build_lsh_buckets(const uint64_t *signatures, int func_count
 /* Phase 6b: serialize deferred edges from all worker buffers into the graph
  * buffer (sequential because gbuf isn't thread-safe). */
 /* Canonical order for candidate pairs: ascending discovering-func index,
- * then ascending candidate rank — the order a sequential scoring loop over
- * canonically-sorted funcs would have produced. */
+ * then DESCENDING score so the per-node budget admits the strongest edges
+ * first, then ascending partner func index as a stable tie-break (func
+ * indices are sorted by qualified_name in phase 1a, so this is equivalent
+ * to a qn tie-break).  The previous (i, c) key used the candidate's LSH
+ * arrival rank which could vary with scheduling, producing ~50% edge-set
+ * churn across identical runs (#998). */
 static int cmp_deferred_edge_canonical(const void *pa, const void *pb) {
     const deferred_edge_t *a = pa;
     const deferred_edge_t *b = pb;
     if (a->i != b->i) {
         return a->i < b->i ? -1 : 1;
     }
-    if (a->c != b->c) {
-        return a->c < b->c ? -1 : 1;
+    if (a->score != b->score) {
+        return a->score > b->score ? -1 : 1; /* descending */
+    }
+    if (a->j != b->j) {
+        return a->j < b->j ? -1 : 1;
     }
     return 0;
 }
