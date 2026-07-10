@@ -4520,6 +4520,62 @@ static char *cli_heap_msgf(const char *fmt, const char *arg) {
     return cbm_strdup(buf);
 }
 
+/* Levenshtein distance for near-miss flag suggestions (two-row DP; inputs
+ * are schema property names, well under the buffer sizes used here). */
+static int cli_edit_distance(const char *a, const char *b) {
+    enum { CLI_ED_MAX = 128 };
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    if (la >= CLI_ED_MAX || lb >= CLI_ED_MAX) {
+        return CLI_ED_MAX;
+    }
+    int prev[CLI_ED_MAX + 1];
+    int cur[CLI_ED_MAX + 1];
+    for (size_t j = 0; j <= lb; j++) {
+        prev[j] = (int)j;
+    }
+    for (size_t i = 1; i <= la; i++) {
+        cur[0] = (int)i;
+        for (size_t j = 1; j <= lb; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int del = prev[j] + 1;
+            int ins = cur[j - 1] + 1;
+            int sub = prev[j - 1] + cost;
+            int m = del < ins ? del : ins;
+            cur[j] = m < sub ? m : sub;
+        }
+        memcpy(prev, cur, (lb + 1) * sizeof(int));
+    }
+    return prev[lb];
+}
+
+/* Closest schema property to `key` for a "did you mean" suggestion, or NULL
+ * when nothing is plausibly near (distance > half the key length, min 2). */
+static const char *cli_closest_prop(yyjson_val *props, const char *key) {
+    const char *best = NULL;
+    int best_d = 0;
+    size_t idx;
+    size_t max;
+    yyjson_val *k;
+    yyjson_val *v;
+    yyjson_obj_foreach(props, idx, max, k, v) {
+        const char *name = yyjson_get_str(k);
+        if (!name) {
+            continue;
+        }
+        int d = cli_edit_distance(key, name);
+        if (!best || d < best_d) {
+            best = name;
+            best_d = d;
+        }
+    }
+    int limit = (int)(strlen(key) / 2);
+    if (limit < 2) {
+        limit = 2;
+    }
+    return (best && best_d <= limit) ? best : NULL;
+}
+
 /* True if the schema's required[] array contains `key`. */
 static bool cli_schema_required_has(yyjson_val *required, const char *key) {
     if (!required || !yyjson_is_arr(required)) {
@@ -4660,6 +4716,34 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
 
         cli_kebab_to_snake(key);
         const char *type = cli_schema_type(props, key);
+
+        /* Unknown flag for a known tool: reject loudly (#997). Silently
+         * typing it as a string ships it as an ignored JSON arg — the
+         * server applies its default and the caller gets silently-wrong
+         * output (e.g. `trace_path --max-depth 1` traced at depth 3). */
+        if (props && !type) {
+            char kebab_key[CLI_BUF_256];
+            snprintf(kebab_key, sizeof(kebab_key), "%s", key);
+            cli_snake_to_kebab(kebab_key);
+            const char *close = cli_closest_prop(props, key);
+            char suggestion[CLI_BUF_256] = "";
+            if (close) {
+                char close_kebab[CLI_BUF_256];
+                snprintf(close_kebab, sizeof(close_kebab), "%s", close);
+                cli_snake_to_kebab(close_kebab);
+                snprintf(suggestion, sizeof(suggestion), " (did you mean --%s?)", close_kebab);
+            }
+            if (err_out) {
+                char buf[CLI_BUF_512];
+                snprintf(buf, sizeof(buf),
+                         "unknown flag --%s for this tool%s — run 'cli %s --help' for the "
+                         "supported flags",
+                         kebab_key, suggestion, tool_name);
+                *err_out = cbm_strdup(buf);
+            }
+            ok = false;
+            break;
+        }
 
         if (type && strcmp(type, "array") == 0 && !have_value) {
             if (err_out) {

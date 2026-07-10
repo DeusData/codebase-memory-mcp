@@ -805,6 +805,28 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* Method call THROUGH an imported symbol that is itself an indexed node
+ * (`from m import sig; sig.send()`). The import-map value is the symbol QN
+ * and the callee carries a suffix — resolution must return symbol.send, NOT
+ * the bare symbol node. The #979 direct-hit early return swallowed the
+ * suffix whenever the base symbol existed as an exact node, degrading
+ * django-scale graphs by ~11K CALLS/TESTS edges (e.g. every
+ * `user_logged_in.send(...)` bound to the signal VARIABLE instead of
+ * Signal.send). Regression guard for #1000. */
+TEST(resolve_import_map_alias_with_suffix_hits_method) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable");
+    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method");
+    const char *keys[] = {"user_logged_in"};
+    const char *vals[] = {"proj.auth.signals.user_logged_in"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "user_logged_in.send", "proj.auth.views", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.auth.signals.user_logged_in.send");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
+
 SUITE(registry) {
     /* FQN */
     RUN_TEST(fqn_simple);
@@ -838,6 +860,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
+    RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
