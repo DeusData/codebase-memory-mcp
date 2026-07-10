@@ -50,17 +50,17 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char *worktree_root;       /* git toplevel (status paths are relative to it) */
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
-    uint64_t last_status_sig;  /* working-tree status signature (0 = clean) */
+    char *worktree_root;         /* git toplevel (status paths are relative to it) */
+    char last_head[CBM_SZ_64];   /* git HEAD hash */
+    uint64_t last_status_sig;    /* working-tree status signature (0 = clean) */
     uint64_t pending_status_sig; /* signature computed by the latest check */
-    bool is_git;               /* false → skip polling */
-    bool baseline_done;        /* true after first poll */
-    int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
-    uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
-    int file_count;            /* approximate, for interval calc */
-    int interval_ms;           /* adaptive poll interval */
-    int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    bool is_git;                 /* false → skip polling */
+    bool baseline_done;          /* true after first poll */
+    int missing_root_count;      /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
+    uint64_t first_missing_ms;   /* cbm_now_ms() of the streak's first miss (0 = no streak) */
+    int file_count;              /* approximate, for interval calc */
+    int interval_ms;             /* adaptive poll interval */
+    int64_t next_poll_ns;        /* next poll time (monotonic ns) */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
