@@ -859,6 +859,163 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
     cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
 }
 
+// --- URL-builder helpers (issue #1009) ---
+
+/* Map-aware template flatten for builder bodies: a ${...} substitution that is
+ * a bare identifier or a call to an already-recorded name (const or an earlier
+ * builder in the same file) inlines that value; anything else becomes "{}".
+ * The query string is not part of a route's identity, so the result is
+ * truncated at the first '?'. Handles the composed-builder shape
+ * `return \`${basePath(id)}?${params}\``. */
+static const char *builder_template_text(CBMExtractCtx *ctx, TSNode node) {
+    enum { BLD_BUF = 512 };
+    char buf[BLD_BUF];
+    size_t pos = 0;
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *k = ts_node_type(c);
+        const char *piece = NULL;
+        if (strcmp(k, "string_fragment") == 0) {
+            piece = cbm_node_text(ctx->arena, c, ctx->source);
+        } else if (strcmp(k, "template_substitution") == 0) {
+            piece = "{}";
+            if (ts_node_named_child_count(c) > 0) {
+                TSNode expr = ts_node_named_child(c, 0);
+                const char *ek = ts_node_type(expr);
+                TSNode name_node = expr;
+                if (strcmp(ek, "call_expression") == 0) {
+                    name_node = ts_node_child_by_field_name(expr, TS_FIELD("function"));
+                }
+                if (!ts_node_is_null(name_node) &&
+                    strcmp(ts_node_type(name_node), "identifier") == 0) {
+                    char *nm = cbm_node_text(ctx->arena, name_node, ctx->source);
+                    if (nm) {
+                        const CBMStringConstantMap *map = &ctx->string_constants;
+                        for (int mi = 0; mi < map->count; mi++) {
+                            if (map->values[mi] && strcmp(map->names[mi], nm) == 0) {
+                                piece = map->values[mi];
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            continue;
+        }
+        if (!piece) {
+            continue;
+        }
+        size_t pl = strlen(piece);
+        if (pos + pl >= BLD_BUF) {
+            return NULL;
+        }
+        memcpy(buf + pos, piece, pl);
+        pos += pl;
+    }
+    /* Route identity excludes the query string. */
+    for (size_t qi = 0; qi < pos; qi++) {
+        if (buf[qi] == '?') {
+            pos = qi;
+            break;
+        }
+    }
+    if (pos == 0) {
+        return NULL;
+    }
+    return cbm_arena_strndup(ctx->arena, buf, pos);
+}
+
+/* Flatten a string-ish node (plain string or template literal) to text. */
+static const char *url_builder_literal_text(CBMExtractCtx *ctx, TSNode value_node) {
+    const char *kind = ts_node_type(value_node);
+    if (strcmp(kind, "template_string") == 0) {
+        return builder_template_text(ctx, value_node);
+    }
+    if (!is_string_node(kind)) {
+        return NULL;
+    }
+    char *text = cbm_node_text(ctx->arena, value_node, ctx->source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+    int len = (int)strlen(text);
+    if (len >= CBM_QUOTE_PAIR && (text[0] == '"' || text[0] == '\'')) {
+        text = cbm_arena_strndup(ctx->arena, text + SKIP_ONE, (size_t)(len - PAIR_LEN));
+    }
+    return text;
+}
+
+/* Record `name -> url` in the per-file constant map so call-site resolution
+ * (lookup_string_constant) can see it. A builder that returns two DIFFERENT
+ * urls is ambiguous: tombstone it with a NULL value so lookups miss. */
+static void record_url_builder(CBMExtractCtx *ctx, const char *name, const char *url) {
+    if (!name || !name[0] || !url) {
+        return;
+    }
+    CBMStringConstantMap *map = &ctx->string_constants;
+    for (int i = 0; i < map->count; i++) {
+        if (strcmp(map->names[i], name) == 0) {
+            if (map->values[i] && strcmp(map->values[i], url) != 0) {
+                map->values[i] = NULL; /* ambiguous builder */
+            }
+            return;
+        }
+    }
+    if (map->count < CBM_MAX_STRING_CONSTANTS) {
+        map->names[map->count] = (char *)name;
+        map->values[map->count] = (char *)url;
+        map->count++;
+    }
+}
+
+/* URL-builder helper pattern (issue #1009): a small function whose return value
+ * is a URL-shaped literal, consumed as `client(buildPath(id))`. The literal
+ * never appears as a call argument, so first_string_arg resolution cannot see
+ * it; record `functionName -> url` in the same per-file constant map used for
+ * module-level consts and let the call-site call_expression branch resolve it.
+ * Covers `return`-statement bodies and arrow-function expression bodies. */
+static void handle_url_builders(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    const char *kind = ts_node_type(node);
+
+    if (strcmp(kind, "arrow_function") == 0) {
+        TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+        if (ts_node_is_null(body) || strcmp(ts_node_type(body), "statement_block") == 0) {
+            return;
+        }
+        const char *url = url_builder_literal_text(ctx, body);
+        if (!url || url[0] != '/' || cbm_classify_string(url, (int)strlen(url)) != CBM_STRREF_URL) {
+            return;
+        }
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+            if (!ts_node_is_null(name_node)) {
+                record_url_builder(ctx, cbm_node_text(ctx->arena, name_node, ctx->source), url);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(kind, "return_statement") != 0) {
+        return;
+    }
+    if (!state->enclosing_func_qn || state->enclosing_func_qn == ctx->module_qn) {
+        return;
+    }
+    if (ts_node_named_child_count(node) == 0) {
+        return;
+    }
+    const char *url = url_builder_literal_text(ctx, ts_node_named_child(node, 0));
+    if (!url || url[0] != '/' || cbm_classify_string(url, (int)strlen(url)) != CBM_STRREF_URL) {
+        return;
+    }
+    const char *name = strrchr(state->enclosing_func_qn, '.');
+    name = name ? name + 1 : state->enclosing_func_qn;
+    record_url_builder(ctx, name, url);
+}
+
 // --- YAML nested field extraction (D2) ---
 
 /* Recursively walk YAML block_mapping_pair nodes, building dotted key paths.
@@ -1514,6 +1671,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
 
         handle_string_constants(ctx, node, &state);
         handle_objectscript_type_map(ctx, node, &state);
+        handle_url_builders(ctx, node, &state);
         handle_calls(ctx, node, spec, &state);
         handle_usages(ctx, node, spec, &state);
         handle_throws(ctx, node, spec, &state);

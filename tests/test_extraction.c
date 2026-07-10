@@ -2800,6 +2800,63 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     return NULL;
 }
 
+/* Issue #1009: URL-builder helper pattern — a function returning a URL-shaped
+ * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
+ * the per-file constant map and resolved at the call site, for both return
+ * statements and arrow expression bodies. */
+TEST(extract_ts_url_builder_issue1009) {
+    CBMFileResult *r = extract("function thingDetail(id: string): string {\n"
+                               "  return `/api/v1/things/${id}/detail`;\n"
+                               "}\n"
+                               "const arrowPath = (id: string) => `/api/v1/arrows/${id}`;\n"
+                               "export function useThing(id: string) {\n"
+                               "  return apiGet(thingDetail(id));\n"
+                               "}\n"
+                               "export function useArrow(id: string) {\n"
+                               "  return apiFetch(arrowPath(id));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "builders.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c1 = find_call_by_callee(r, "apiGet");
+    ASSERT_NOT_NULL(c1);
+    ASSERT_NOT_NULL(c1->first_string_arg);
+    ASSERT_STR_EQ(c1->first_string_arg, "/api/v1/things/{}/detail");
+    const CBMCall *c2 = find_call_by_callee(r, "apiFetch");
+    ASSERT_NOT_NULL(c2);
+    ASSERT_NOT_NULL(c2->first_string_arg);
+    ASSERT_STR_EQ(c2->first_string_arg, "/api/v1/arrows/{}");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Issue #1009 (composed builders): a builder whose template inlines an earlier
+ * builder's call plus a query string: `return \`${basePath(id)}?${params}\``.
+ * The known-substitution is inlined and the query string is truncated, so the
+ * resolved URL joins the server route exactly. */
+TEST(extract_ts_url_builder_composed_issue1009) {
+    CBMFileResult *r = extract("function activityPath(id: string): string {\n"
+                               "  return `/api/v1/team-members/${id}/activity`;\n"
+                               "}\n"
+                               "function buildPath(id: string, cursor: string): string {\n"
+                               "  const params = new URLSearchParams();\n"
+                               "  params.set('cursor', cursor);\n"
+                               "  return `${activityPath(id)}?${params.toString()}`;\n"
+                               "}\n"
+                               "export function useActivity(id: string, cursor: string) {\n"
+                               "  return apiGet(buildPath(id, cursor));\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "composed.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "apiGet");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/team-members/{}/activity");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1006: JS/TS template-literal URLs must flatten ${...} substitutions
  * to the canonical "{}" placeholder, both as call arguments (HTTP_CALLS) and
  * as URL-shaped string_refs collected from const/return positions. */
@@ -4918,6 +4975,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_url_builder_composed_issue1009);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);

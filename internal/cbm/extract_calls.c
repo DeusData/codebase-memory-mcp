@@ -1763,6 +1763,19 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             }
         }
 
+        /* URL-builder helper call (issue #1009): `client(buildPath(id))` — the
+         * builder's returned URL was recorded in the per-file constant map. */
+        if (strcmp(ak, "call_expression") == 0) {
+            TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+            if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                const char *val = fname ? lookup_string_constant(ctx, fname) : NULL;
+                if (val) {
+                    return val;
+                }
+            }
+        }
+
         if (ai < MAX_POSITIONAL_SCAN) {
             const char *val = extract_positional_url(ctx, arg, ak);
             if (val) {
