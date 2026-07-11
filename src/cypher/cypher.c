@@ -6,7 +6,6 @@
  * RETURN with COUNT/ORDER BY/LIMIT/DISTINCT.
  */
 #include "cypher/cypher.h"
-#include "foundation/compat.h"
 #include "store/store.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
@@ -2948,7 +2947,9 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
 /* Set when a variable-length hop range is clamped to the engine ceiling
  * during the CURRENT execution; cbm_cypher_execute turns it into
  * result->warning so callers can tell "clamped" from "no such path" (#797). */
-static CBM_TLS int g_cypher_depth_clamped = 0;
+/* C11 _Thread_local directly: cypher.c stays windows.h-free (compat.h pulls
+ * in windows.h, whose legacy `far` macro breaks this file's identifiers). */
+static _Thread_local int g_cypher_depth_clamped = 0;
 
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
