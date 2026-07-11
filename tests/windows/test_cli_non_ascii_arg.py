@@ -98,6 +98,28 @@ def main():
         print("non-ASCII argv (supervised): rc=%d" % p.returncode)
         print("  stdout: %s" % out[:200].replace("\n", " "))
         print("  stderr: %s" % err[-200:].replace("\n", " "))
+        # #973 variant: the reporter's exact shape — Traditional-Chinese dir,
+        # FLAG-form --repo-path + --mode fast, supervised. This adds coverage
+        # of the flag->JSON converter and the repo-path canonicalization,
+        # which used ANSI _access/_fullpath (locale-dependent — corrupted CJK
+        # paths on CJK-codepage systems) before the cbm_canonical_path fix.
+        cjk_repo = os.path.join(work, "\u96f7\u9054\u6e2c\u8a66")
+        make_fixture(cjk_repo)
+        env3 = dict(os.environ)
+        env3["CBM_CACHE_DIR"] = os.path.join(work, "cache_cjk")
+        env3.pop("CBM_INDEX_SUPERVISOR", None)
+        p2 = subprocess.run([binary, "cli", "index_repository",
+                             "--repo-path", cjk_repo, "--mode", "fast"],
+                            capture_output=True, timeout=120, env=env3)
+        out2 = (p2.stdout or b"").decode("utf-8", "replace")
+        cjk_ok = '"nodes"' in out2 and '"nodes":0' not in out2.replace(" ", "")
+        print("CJK flag-form (--repo-path, supervised, fast): rc=%d" % p2.returncode)
+        print("  stdout: %s" % out2[:200].replace("\n", " "))
+        if not cjk_ok:
+            print("\nRED: CJK flag-form repo_path was not indexed (#973 — "
+                  "canonicalization or spawn boundary mangled the path).")
+            return 1
+
         if honored:
             print("\nGREEN: CLI honored the non-ASCII repo_path (argv + worker spawn).")
             return 0

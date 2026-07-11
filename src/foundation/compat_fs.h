@@ -53,6 +53,10 @@ void cbm_remove_db_sidecars(const char *db_path);
 /* rename() that replaces an existing destination on every platform
  * (Windows rename fails with EEXIST; this uses MoveFileExW there). */
 int cbm_rename_replace(const char *src, const char *dst);
+/* Canonicalize an EXISTING path (realpath / wide GetFullPathNameW). Locale-
+ * independent on Windows — never routes UTF-8 through the ANSI CRT (#973).
+ * out must be >= 4096 bytes. Returns 1 on success, 0 otherwise. */
+int cbm_canonical_path(const char *path, char *out, size_t out_sz);
 
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);

@@ -714,6 +714,51 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #endif /* _WIN32 */
 
+/* Canonicalize an EXISTING path (collapse `..`, resolve per-OS): realpath on
+ * POSIX; on Windows a wide-path GetFileAttributesW existence check +
+ * GetFullPathNameW. The previous callers used the ANSI CRT (_access/
+ * _fullpath) on UTF-8 input — locale-dependent by construction: on a CJK
+ * system codepage (e.g. Big5) the UTF-8 bytes of a CJK path re-decode into
+ * different characters and canonicalization corrupts the path (#973).
+ * Returns 0 when the path does not exist or cannot be resolved. */
+int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz == 0) {
+        return 0;
+    }
+#ifdef _WIN32
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return 0;
+    }
+    if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
+        free(wpath);
+        return 0;
+    }
+    enum { CANON_WIDE_MAX = 4096 };
+    wchar_t wfull[CANON_WIDE_MAX];
+    DWORD n = GetFullPathNameW(wpath, CANON_WIDE_MAX, wfull, NULL);
+    free(wpath);
+    if (n == 0 || n >= CANON_WIDE_MAX) {
+        return 0;
+    }
+    char *utf8 = cbm_wide_to_utf8(wfull);
+    if (!utf8) {
+        return 0;
+    }
+    size_t len = strlen(utf8);
+    if (len >= out_sz) {
+        free(utf8);
+        return 0;
+    }
+    memcpy(out, utf8, len + 1);
+    free(utf8);
+    return 1;
+#else
+    /* Callers pass >= 4K buffers (>= PATH_MAX on our platforms). */
+    return realpath(path, out) != NULL;
+#endif
+}
+
 /* rename() with overwrite semantics on every platform: POSIX rename already
  * replaces atomically; Windows rename fails with EEXIST when the target
  * exists, so use MoveFileExW(MOVEFILE_REPLACE_EXISTING) there (wide paths —
