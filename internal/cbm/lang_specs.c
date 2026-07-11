@@ -1659,11 +1659,15 @@ static const char *objectscript_routine_module_types[] = {"source_file", NULL};
 
 // ==================== PL/SQL ====================
 // Node names verified against AndreasMaierDe/tree-sitter-plsql grammar.js.
-static const char *plsql_func_types[] = {"create_function",     "create_procedure",
-                                         "function_definition", "procedure_definition",
-                                         "function_declaration", "procedure_declaration", NULL};
-static const char *plsql_class_types[] = {"create_package", "create_package_body", "create_type",
-                                          "create_type_body", "create_trigger", NULL};
+static const char *plsql_func_types[] = {"create_function",
+                                         "create_procedure",
+                                         "function_definition",
+                                         "procedure_definition",
+                                         "function_declaration",
+                                         "procedure_declaration",
+                                         NULL};
+static const char *plsql_class_types[] = {"create_package",   "create_package_body", "create_type",
+                                          "create_type_body", "create_trigger",      NULL};
 static const char *plsql_module_types[] = {"source_file", NULL};
 static const char *plsql_call_types[] = {"ref_call", NULL};
 static const char *plsql_branch_types[] = {"if_statement",
