@@ -4,6 +4,7 @@
  * Covers: JSON-RPC parsing, MCP protocol, tool dispatch, tool handlers.
  */
 #include "../src/foundation/compat.h"
+#include <sqlite3.h>
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
@@ -4964,6 +4965,97 @@ static int idx773_double_index_check(const char *dir_a, const char *dir_b) {
 }
 #endif /* !_WIN32 */
 
+/* #898: the SEQUENTIAL pipeline emitted malformed JSON for brokered
+ * ASYNC_CALLS edges ("broker":"bullmq} — missing closing quote) and stored
+ * the RAW broker/method string as the synthesized Route node's properties
+ * (literally `bullmq` instead of {"broker":"bullmq"}). json_extract over
+ * those rows errors, generated-column indexes fail, and PRAGMA quick_check
+ * aborts with "malformed JSON" — which since the artifact deep-integrity
+ * check also means such caches are refused at import. The parallel path
+ * was correct; both pipelines must emit identical, valid JSON. */
+TEST(sequential_service_edge_props_are_valid_json_issue898) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_seq898_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("mkdtemp failed");
+    }
+    char src_path[CBM_SZ_512];
+    snprintf(src_path, sizeof(src_path), "%s/queue.py", tmp);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    /* celery.Celery("tasks") resolves through the import map to a QN the
+     * service-pattern table classifies as ASYNC with broker "celery". */
+    fputs("import celery\n"
+          "\n"
+          "def enqueue():\n"
+          "    celery.Celery(\"tasks\")\n",
+          f);
+    fclose(f);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    free(resp);
+
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    struct sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(db);
+
+    /* Non-vacuous: the fixture must actually produce a brokered edge. */
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS';", -1,
+                                 &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int async_edges = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_TRUE(async_edges >= 1);
+
+    /* THE BUG: malformed properties on edges (broker quote) and Route nodes
+     * (raw string). Every properties blob must be valid JSON. */
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                 "AND properties != '' AND json_valid(properties)=0;",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int bad_edges = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(bad_edges, 0);
+
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count(*) FROM nodes WHERE properties IS NOT NULL "
+                                 "AND properties != '' AND json_valid(properties)=0;",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int bad_nodes = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(bad_nodes, 0);
+
+    /* Pipeline parity: the broker must be extractable exactly like the
+     * parallel path emits it. */
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS' AND "
+                                 "json_extract(properties,'$.broker')='celery';",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int brokered = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_TRUE(brokered >= 1);
+
+    cbm_mcp_server_free(srv);
+    unlink(src_path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
 TEST(index_second_inprocess_run_survives_issue773) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
@@ -5615,6 +5707,7 @@ SUITE(mcp) {
     RUN_TEST(index_repository_cli_name_override_issue823);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
+    RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);
     RUN_TEST(tool_manage_adr_not_found_rich_error);
