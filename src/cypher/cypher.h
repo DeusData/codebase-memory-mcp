@@ -310,6 +310,10 @@ typedef struct {
     int row_count;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
+    /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-
+     * length hop range was clamped to the engine ceiling (#797) — without
+     * this, a clamped expansion is indistinguishable from "no such path". */
+    char *warning;
 } cbm_cypher_result_t;
 
 /* Execute a Cypher query against a store.

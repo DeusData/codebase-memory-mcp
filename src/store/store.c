@@ -3274,6 +3274,12 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     }
 
     snprintf(sql, sizeof(sql),
+             /* SHORTEST-PATH semantics: the UNION dedupes (node, hop) PAIRS,
+              * so a single self-loop minted every hop level for every node it
+              * could reach — walk-padding that fabricated *k..k Cypher matches
+              * of arbitrary length and exploded the row set to nodes x depth
+              * (#797). MIN(hop) GROUP BY node returns each node once at its
+              * minimal distance. */
              "WITH RECURSIVE bfs(node_id, hop) AS ("
              "  SELECT %lld, 0"
              "  UNION"
@@ -3282,12 +3288,13 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "  JOIN edges e ON %s"
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
              ")"
-             "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop "
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+             "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
              "FROM bfs "
              "JOIN nodes n ON n.id = bfs.node_id "
-             "WHERE bfs.hop > 0 " /* exclude root */
-             "ORDER BY bfs.hop "
+             "WHERE bfs.hop > 0 " /* exclude root at hop 0 (self via a loop still appears) */
+             "GROUP BY n.id "
+             "ORDER BY hop "
              "LIMIT %d;",
              (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
 

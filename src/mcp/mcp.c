@@ -2486,6 +2486,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_toon_row_end(&sb);
         }
         cbm_toon_scalar_int(&sb, "total", result.row_count);
+        if (result.warning) {
+            cbm_toon_scalar_str(&sb, "warning", result.warning);
+        }
         if (result.row_count == 0) {
             cbm_toon_scalar_str(&sb, "hint",
                                 "Query returned no results. Use get_graph_schema() to see "
@@ -2515,6 +2518,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         }
         yyjson_mut_obj_add_val(doc, root, "rows", rows);
         yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        if (result.warning) {
+            yyjson_mut_obj_add_str(doc, root, "warning", result.warning);
+        }
 
         if (result.row_count == 0) {
             yyjson_mut_obj_add_str(
