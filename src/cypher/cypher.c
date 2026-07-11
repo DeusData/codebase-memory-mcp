@@ -755,6 +755,7 @@ static void expr_free(cbm_expr_t *e) {
             safe_str_free(&cur->cond.property);
             safe_str_free(&cur->cond.op);
             safe_str_free(&cur->cond.value);
+            safe_str_free(&cur->cond.coalesce_default);
             for (int i = 0; i < cur->cond.in_value_count; i++) {
                 safe_str_free(&cur->cond.in_values[i]);
             }
@@ -1007,6 +1008,61 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     return expr_leaf(c);
 }
 
+static bool cyp_ci_eq(const char *a, const char *b);
+
+/* Parse the operator + value tail shared by every condition subject
+ * (var[.prop] and coalesce(var.prop, literal)): IS [NOT] NULL, IN [...],
+ * or a comparison operator with a literal value. Consumes/frees *c. */
+static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
+    /* IS NULL / IS NOT NULL */
+    if (check(p, TOK_IS)) {
+        advance(p);
+        if (match(p, TOK_NOT)) {
+            c->op = heap_strdup("IS NOT NULL");
+            expect(p, TOK_NULL_KW);
+        } else {
+            expect(p, TOK_NULL_KW);
+            c->op = heap_strdup("IS NULL");
+        }
+        return expr_leaf(*c);
+    }
+
+    /* IN [...] */
+    if (check(p, TOK_IN)) {
+        return parse_in_list(p, c);
+    }
+
+    /* Standard operators */
+    c->op = parse_comparison_op(p);
+    if (!c->op) {
+        snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
+        safe_str_free(&c->variable);
+        safe_str_free(&c->property);
+        safe_str_free(&c->coalesce_default);
+        return NULL;
+    }
+
+    /* Value */
+    if (check(p, TOK_STRING) || check(p, TOK_NUMBER)) {
+        c->value = heap_strdup(advance(p)->text);
+    } else if (check(p, TOK_TRUE)) {
+        advance(p);
+        c->value = heap_strdup("true");
+    } else if (check(p, TOK_FALSE)) {
+        advance(p);
+        c->value = heap_strdup("false");
+    } else {
+        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
+        safe_str_free(&c->variable);
+        safe_str_free(&c->property);
+        safe_str_free(&c->op);
+        safe_str_free(&c->coalesce_default);
+        return NULL;
+    }
+
+    return expr_leaf(*c);
+}
+
 static cbm_expr_t *parse_condition_expr(parser_t *p) {
     /* Check for NOT prefix at condition level (e.g. NOT n.name CONTAINS "x") */
     bool negated = match(p, TOK_NOT);
@@ -1014,6 +1070,40 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
     /* EXISTS { pattern } predicate (anchored single-hop existence). */
     if (check(p, TOK_EXISTS)) {
         return parse_exists_predicate(p, negated);
+    }
+
+    /* coalesce(var.prop, <literal>) as a null-safe condition subject (#874).
+     * The default literal substitutes a missing/empty property at eval time;
+     * any comparison operator may follow, exactly as with a bare var.prop. */
+    if (check(p, TOK_IDENT) && cyp_ci_eq(peek(p)->text, "coalesce") &&
+        p->pos + SKIP_ONE < p->count && p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
+        advance(p); /* coalesce */
+        advance(p); /* ( */
+        const cbm_token_t *cvar = expect(p, TOK_IDENT);
+        if (!cvar || !expect(p, TOK_DOT)) {
+            return NULL;
+        }
+        const cbm_token_t *cprop = expect(p, TOK_IDENT);
+        if (!cprop || !expect(p, TOK_COMMA)) {
+            return NULL;
+        }
+        if (!check(p, TOK_STRING) && !check(p, TOK_NUMBER)) {
+            return NULL; /* supported form: coalesce(var.prop, literal) */
+        }
+        const cbm_token_t *cdef = peek(p);
+        cbm_condition_t cc = {0};
+        cc.negated = negated;
+        cc.variable = heap_strdup(cvar->text);
+        cc.property = heap_strdup(cprop->text);
+        cc.coalesce_default = heap_strdup(cdef->text);
+        advance(p);
+        if (!expect(p, TOK_RPAREN)) {
+            safe_str_free(&cc.variable);
+            safe_str_free(&cc.property);
+            safe_str_free(&cc.coalesce_default);
+            return NULL;
+        }
+        return parse_condition_op(p, &cc);
     }
 
     const cbm_token_t *var = expect(p, TOK_IDENT);
@@ -1051,51 +1141,7 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
         c.property = NULL;
     }
 
-    /* IS NULL / IS NOT NULL */
-    if (check(p, TOK_IS)) {
-        advance(p);
-        if (match(p, TOK_NOT)) {
-            c.op = heap_strdup("IS NOT NULL");
-            expect(p, TOK_NULL_KW);
-        } else {
-            expect(p, TOK_NULL_KW);
-            c.op = heap_strdup("IS NULL");
-        }
-        return expr_leaf(c);
-    }
-
-    /* IN [...] */
-    if (check(p, TOK_IN)) {
-        return parse_in_list(p, &c);
-    }
-
-    /* Standard operators */
-    c.op = parse_comparison_op(p);
-    if (!c.op) {
-        snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
-        safe_str_free(&c.variable);
-        safe_str_free(&c.property);
-        return NULL;
-    }
-
-    /* Value */
-    if (check(p, TOK_STRING) || check(p, TOK_NUMBER)) {
-        c.value = heap_strdup(advance(p)->text);
-    } else if (check(p, TOK_TRUE)) {
-        advance(p);
-        c.value = heap_strdup("true");
-    } else if (check(p, TOK_FALSE)) {
-        advance(p);
-        c.value = heap_strdup("false");
-    } else {
-        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
-        safe_str_free(&c.variable);
-        safe_str_free(&c.property);
-        safe_str_free(&c.op);
-        return NULL;
-    }
-
-    return expr_leaf(c);
+    return parse_condition_op(p, &c);
 }
 
 /* Atom: ( expr ) | condition */
@@ -2444,6 +2490,11 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     }
 
     const char *actual = resolve_condition_value(c, b);
+    /* coalesce(var.prop, literal) (#874): a missing/empty property value
+     * falls back to the literal default before the operator runs. */
+    if (c->coalesce_default && (!actual || actual[0] == '\0')) {
+        actual = c->coalesce_default;
+    }
     if (!actual) {
         return true;
     }

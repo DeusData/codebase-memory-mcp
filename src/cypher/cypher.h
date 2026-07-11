@@ -188,7 +188,10 @@ typedef struct {
     const char *op; /* "=", "<>", "=~", "CONTAINS", "STARTS WITH", "ENDS WITH",
                        ">", "<", ">=", "<=", "IN", "IS NULL", "IS NOT NULL" */
     const char *value;
-    bool negated;           /* NOT prefix */
+    bool negated; /* NOT prefix */
+    /* coalesce(var.prop, literal) in WHERE (#874): when set, a missing/empty
+     * property value is substituted with this literal before the op runs. */
+    const char *coalesce_default;
     const char **in_values; /* IN [...] list */
     int in_value_count;
     /* EXISTS { (var)-[:value]->() } predicate (op=="EXISTS"): `variable` is the
