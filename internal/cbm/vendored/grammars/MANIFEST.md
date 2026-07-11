@@ -46,6 +46,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | ispc     | added to the C-family declarator-name gate (extends tree-sitter-c) |
 | odin     | `resolve_func_name`: `procedure_declaration` → `identifier` child |
 | pascal   | `resolve_func_name`: `defProc` → `header` (`declProc`) child's `name` field |
+| plsql    | `resolve_func_name`: `fnc_name`/`prc_name`; `extract_class_def`: `package_name`/`type_name`/`trigger_name`; `extract_plsql_callee`: `ref_call` → package-qualified `ref_name_parent.ref_name` |
 | racket   | `extract_lisp_def`: `(define …)` head-symbol forms in `list` |
 | rescript | `resolve_func_name`: `function` (arrow) → enclosing `let_binding`'s `pattern` field |
 | scheme   | `extract_lisp_def`: `(define …)` head-symbol forms in `list` |
