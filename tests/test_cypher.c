@@ -503,6 +503,67 @@ TEST(cypher_exec_where_eq) {
     PASS();
 }
 
+/* #874: coalesce(var.prop, literal) in WHERE — null-safe numeric filters
+ * for audit queries over OPTIONAL graph properties. The parser rejected the
+ * call outright ("unexpected operator"); RETURN-side coalesce already
+ * worked, so only the WHERE leaf needs it. Semantics: when the property is
+ * missing/empty, the literal default is compared instead. */
+TEST(cypher_exec_where_coalesce_issue874) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t a = {.project = "test",
+                    .label = "Function",
+                    .name = "deep_a",
+                    .qualified_name = "test.mod.deep_a",
+                    .file_path = "mod.py",
+                    .start_line = 1,
+                    .end_line = 2,
+                    .properties_json = "{\"transitive_loop_depth\":3}"};
+    cbm_node_t b = {.project = "test",
+                    .label = "Function",
+                    .name = "deep_b",
+                    .qualified_name = "test.mod.deep_b",
+                    .file_path = "mod.py",
+                    .start_line = 3,
+                    .end_line = 4,
+                    .properties_json = "{\"transitive_loop_depth\":1}"};
+    cbm_node_t c = {.project = "test",
+                    .label = "Function",
+                    .name = "plain_c",
+                    .qualified_name = "test.mod.plain_c",
+                    .file_path = "mod.py",
+                    .start_line = 5,
+                    .end_line = 6};
+    ASSERT_GT(cbm_store_upsert_node(s, &a), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &b), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &c), 0);
+
+    /* Default FAILS the predicate: only the node with depth 3 matches. */
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE "
+                                "coalesce(f.transitive_loop_depth, 0) >= 2 "
+                                "RETURN f.qualified_name LIMIT 10",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    cbm_cypher_result_free(&r);
+
+    /* Default PASSES: the property-less node is included via the default. */
+    cbm_cypher_result_t r2 = {0};
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) WHERE "
+                            "coalesce(f.transitive_loop_depth, 9) >= 2 "
+                            "RETURN f.qualified_name LIMIT 10",
+                            "test", 0, &r2);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r2.row_count, 2); /* deep_a (3) + plain_c (default 9) */
+    cbm_cypher_result_free(&r2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_regex) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2548,8 +2609,8 @@ TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit) {
 TEST(cypher_issue873_distinct_limit_dedupes_before_limit) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(
-        s, "MATCH (n) RETURN DISTINCT n.label AS label LIMIT 2", "test", 0, &r);
+    int rc =
+        cbm_cypher_execute(s, "MATCH (n) RETURN DISTINCT n.label AS label LIMIT 2", "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_NULL(r.error);
     ASSERT_EQ(r.row_count, 2);
@@ -2563,8 +2624,8 @@ TEST(cypher_issue873_distinct_order_skip_limit_dedupes_before_skip) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
     int rc = cbm_cypher_execute(
-        s, "MATCH (n) RETURN DISTINCT n.label AS label ORDER BY label SKIP 1 LIMIT 1", "test",
-        0, &r);
+        s, "MATCH (n) RETURN DISTINCT n.label AS label ORDER BY label SKIP 1 LIMIT 1", "test", 0,
+        &r);
     ASSERT_EQ(rc, 0);
     ASSERT_NULL(r.error);
     ASSERT_EQ(r.row_count, 1);
@@ -2721,6 +2782,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_issue252_tointeger);
     RUN_TEST(cypher_issue305_count_star_alias);
     RUN_TEST(cypher_exec_where_eq);
+    RUN_TEST(cypher_exec_where_coalesce_issue874);
     RUN_TEST(cypher_exec_where_regex);
     RUN_TEST(cypher_exec_where_contains);
     RUN_TEST(cypher_exec_where_starts_with);

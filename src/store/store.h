@@ -215,6 +215,9 @@ const char *cbm_store_db_path(const cbm_store_t *s);
  * (projects table has correct types, no corruption indicators).
  * Returns false if corruption is detected — caller should delete and re-index. */
 bool cbm_store_check_integrity(cbm_store_t *s);
+/* Shallow check + PRAGMA quick_check — catches page-level corruption.
+ * O(db size); use on rare paths (artifact import), not hot opens. */
+bool cbm_store_check_integrity_deep(cbm_store_t *s);
 
 /* Open database for a named project in the default cache dir. */
 cbm_store_t *cbm_store_open(const char *project);

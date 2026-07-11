@@ -443,7 +443,109 @@ TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows) {
     PASS();
 }
 
+/* #895: the FAST export path (watcher/incremental auto-update) read the
+ * raw main-file bytes of a live WAL-mode store — committed rows still in
+ * the -wal were missing and mid-checkpoint reads produced torn snapshots
+ * that imported as page-corrupted caches. Export must snapshot
+ * consistently (VACUUM INTO) on BOTH quality levels. */
+TEST(artifact_fast_export_snapshots_live_wal_store) {
+    setup_artifact_test();
+    enum { WAL_NODES = 60 };
+
+    /* Live store: rows committed but NOT checkpointed into the main file —
+     * exactly the state the watcher export runs against. */
+    cbm_store_t *s = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "test-proj", "/tmp/test");
+    for (int i = 0; i < WAL_NODES; i++) {
+        char name[64];
+        char qn[128];
+        snprintf(name, sizeof(name), "walnode_%03d", i);
+        snprintf(qn, sizeof(qn), "test-proj.mod.%s", name);
+        cbm_node_t n = {.project = "test-proj",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "mod.py",
+                        .start_line = i + 1,
+                        .end_line = i + 2};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    }
+
+    /* Export WHILE the writer connection is still open. */
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+    cbm_store_close(s);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported_wal.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    cbm_store_t *imp = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(imp);
+    /* Torn snapshot = the WAL-resident rows are missing. */
+    ASSERT_EQ(cbm_store_count_nodes(imp, "test-proj"), WAL_NODES);
+    cbm_store_close(imp);
+    PASS();
+}
+
+/* #895 (import half): page-level corruption must be refused at import.
+ * The shallow integrity check only sanity-checks the projects table; the
+ * deep variant runs PRAGMA quick_check and catches corrupt pages. */
+TEST(store_deep_integrity_detects_page_corruption) {
+    setup_artifact_test();
+    enum { DEEP_NODES = 800, PAGE = 4096, ZERO_PAGES = 10 };
+    char db2[1024];
+    snprintf(db2, sizeof(db2), "%s/deep.db", g_tmpdir);
+    cbm_store_t *s = cbm_store_open_path(db2);
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "deep", "/tmp/deep");
+    for (int i = 0; i < DEEP_NODES; i++) {
+        char name[64];
+        char qn[192];
+        snprintf(name, sizeof(name), "deep_probe_%04d", i);
+        snprintf(qn, sizeof(qn), "deep.rather.long.module.path.for.page.fill.%s_pad_pad_pad",
+                 name);
+        cbm_node_t n = {.project = "deep",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "deep.py",
+                        .start_line = i + 1,
+                        .end_line = i + 2};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &n) > 0);
+    }
+    cbm_store_close(s);
+
+    /* Healthy file passes the deep check. */
+    cbm_store_t *ok = cbm_store_open_path(db2);
+    ASSERT_NOT_NULL(ok);
+    ASSERT_TRUE(cbm_store_check_integrity_deep(ok));
+    cbm_store_close(ok);
+
+    /* Zero a mid-file band and the deep check must refuse. */
+    FILE *f = fopen(db2, "rb+");
+    ASSERT_NOT_NULL(f);
+    (void)fseek(f, 0, SEEK_END);
+    long pages = ftell(f) / PAGE;
+    ASSERT_TRUE(pages > ZERO_PAGES + 6);
+    char zero[PAGE];
+    memset(zero, 0, sizeof(zero));
+    (void)fseek(f, (pages / 2) * (long)PAGE, SEEK_SET);
+    for (int i = 0; i < ZERO_PAGES; i++) {
+        ASSERT_EQ(fwrite(zero, 1, PAGE, f), (size_t)PAGE);
+    }
+    (void)fclose(f);
+
+    cbm_store_t *bad = cbm_store_open_path(db2);
+    ASSERT_NOT_NULL(bad);
+    ASSERT_FALSE(cbm_store_check_integrity_deep(bad));
+    cbm_store_close(bad);
+    PASS();
+}
+
 SUITE(artifact) {
+    RUN_TEST(artifact_fast_export_snapshots_live_wal_store);
+    RUN_TEST(store_deep_integrity_detects_page_corruption);
     RUN_TEST(artifact_repo_path_shell_safe_accepts_plain_and_spaced);
     RUN_TEST(artifact_repo_path_shell_safe_rejects_injection);
     RUN_TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows);

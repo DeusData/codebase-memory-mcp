@@ -1067,7 +1067,13 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     CBM_PROF_START(t_init);
     cbm_init();
 
-    /* Slab allocator for tree-sitter (thread-safe via TLS). */
+    /* Slab allocator for tree-sitter (thread-safe via TLS). Destroy any
+     * parser this thread still holds BEFORE switching the global ts
+     * allocator: a parser created in the mimalloc epoch (sequential run,
+     * watcher tick) must be freed by the allocator that created it, or its
+     * teardown after the switch routes mi pointers into plain free()
+     * (#773). */
+    cbm_destroy_thread_parser();
     cbm_slab_install();
     CBM_PROF_END("parallel_extract", "1_init_libs", t_init);
 

@@ -146,6 +146,9 @@ static char *ha_build_args(const char *project, const char *token) {
     yyjson_mut_obj_add_str(doc, root, "project", project);
     yyjson_mut_obj_add_str(doc, root, "name_pattern", name_pattern);
     yyjson_mut_obj_add_int(doc, root, "limit", HA_RESULT_LIMIT);
+    /* Programmatic consumer: search_graph defaults to TOON text, but
+     * ha_format_context parses the inner payload as JSON ("results"). */
+    yyjson_mut_obj_add_str(doc, root, "format", "json");
 
     char *out = yyjson_mut_write(doc, 0, NULL);
     yyjson_mut_doc_free(doc);

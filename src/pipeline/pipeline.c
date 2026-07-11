@@ -832,6 +832,14 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         cbm_arena_destroy(&ctx->seq_cross_arena);
         ctx->seq_cross_arena_live = false;
     }
+    /* Destroy this thread's TLS parser: the sequential path parses on the
+     * CALLING thread (usually main), and a parser left alive here was
+     * allocated in the current tree-sitter allocator epoch. A later
+     * parallel run switches the global ts allocator to the slab
+     * (cbm_slab_install); destroying the stale parser then frees
+     * mimalloc-epoch memory through slab_free -> plain free() and libmalloc
+     * aborts — the #773 second-index SIGABRT. */
+    cbm_destroy_thread_parser();
     return rc;
 }
 

@@ -16,6 +16,7 @@
 
 #include "sqlite_writer.h"
 #include "foundation/constants.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 
@@ -2206,6 +2207,10 @@ struct cbm_db_writer {
 };
 
 cbm_db_writer_t *cbm_writer_open(const char *path) {
+    /* Installing a fresh DB generation: drop the destination's leftover
+     * -wal/-shm or a crashed session's WAL gets replayed on top of the
+     * new file at the next open (#897). */
+    cbm_remove_db_sidecars(path);
     FILE *fp = fopen(path, "wb");
     if (!fp) {
         return NULL;

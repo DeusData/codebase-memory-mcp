@@ -88,12 +88,14 @@ def index_and_count(binary, repo, cache):
         out = {"name": p.get("name"), "nodes": p.get("nodes"),
                "edges": p.get("edges")}
         # Definition-level counts prove the parser ran (not just discovery).
-        # query_graph returns {"columns":[...],"rows":[["<n>"]],...}.
+        # query_graph defaults to TOON text; this scripted consumer requests
+        # format="json" ({"columns":[...],"rows":[["<n>"]],...}) explicitly.
         name = p.get("name")
         defs = 0
         for label in ("Function", "Class", "Method"):
             q = "MATCH (n:%s) RETURN count(n)" % label
-            r = s.call_tool("query_graph", {"query": q, "project": name},
+            r = s.call_tool("query_graph",
+                            {"query": q, "project": name, "format": "json"},
                             timeout=60)
             t, _ = s.tool_text(r)
             try:
