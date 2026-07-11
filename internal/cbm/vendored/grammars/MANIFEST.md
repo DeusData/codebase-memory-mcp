@@ -9,12 +9,13 @@ The grammars were originally vendored as bare `parser.c`+`scanner.c` with **no r
 
 ## Summary
 
-- Grammars: **159** — vendored-from-upstream: **142**, first-party/self-maintained: **12**, registry-disagreement: **5** (nim removed 2026-06-12; objectscript_udl + objectscript_routine added 2026-06-24; mojo added 2026-07-01 — see notes below)
-- ABI distribution: **7×** ABI-13 **85×** ABI-14 **64×** ABI-15 (runtime ceiling is ABI 15; never vendor ABI 16 without a runtime upgrade)
+- Grammars: **160** — vendored-from-upstream: **143**, first-party/self-maintained: **12**, registry-disagreement: **5** (nim removed 2026-06-12; objectscript_udl + objectscript_routine added 2026-06-24; mojo added 2026-07-01; plsql added 2026-07-11 — see notes below)
+- ABI distribution: **7×** ABI-13 **86×** ABI-14 **64×** ABI-15 (runtime ceiling is ABI 15; never vendor ABI 16 without a runtime upgrade)
 - Vendored copies missing LICENSE: **0** — all upstream LICENSE files restored 2026-06-11 (first-party grammars carry the project MIT license; `move` uses the Helix-listed upstream tzakian/tree-sitter-move MIT text, `zsh` uses georgeharker/tree-sitter-zsh MIT)
 - `verdict`: VERIFIED-BOTH = our source matches *both* registries; VERIFIED-NVIM/HELIX = matches one; registry-disagreement = registries name a different repo (listed separately); `vendor-maintained` = the language vendor's own grammar, not in nvim/Helix.
 - **objectscript_udl / objectscript_routine** (added 2026-06-24): vendored from [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript) @ `a7ffcdf` — MIT, the InterSystems-official grammars (a niche vendor language, hence `vendor-maintained`, not in nvim-treesitter/Helix). **Re-vendor note:** each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (a verbatim copy of upstream `common/scanner.h`), because this repo's shared `vendored/common/scanner.h` belongs to the cfml/fsharp grammars and differs. The generated `parser.c`/`scanner.c` are otherwise byte-for-byte upstream — on re-vendor, re-apply only that single include rename.
 - **mojo** (added 2026-07-01): vendored from [lsh/tree-sitter-mojo](https://github.com/lsh/tree-sitter-mojo) @ `33193a99afe6` — MIT, ABI 15. Helix tracks `lsh/tree-sitter-mojo` as its Mojo grammar source, but the Helix-pinned commit (`3d7c53b8038f`) no longer resolves in the upstream repository after a force-push, so this vendor uses current upstream `main` rather than the stale registry SHA. Security review covered only the vendored C surface (`parser.c`, `scanner.c`, `tree_sitter/*.h`) plus upstream license/provenance metadata; no package manager hooks, workflow files, prompt/agent instruction files, or generated lockfiles were vendored.
+- **plsql** (added 2026-07-11): vendored from [AndreasMaierDe/tree-sitter-plsql](https://github.com/AndreasMaierDe/tree-sitter-plsql) @ `28aebef209be` — MIT, ABI 14, no external scanner. Not listed in nvim-treesitter/Helix (`vendor-maintained` niche). Known limitation: `CREATE TYPE ... AS OBJECT` currently yields ERROR nodes in this grammar.
 
 > ⚠️ **Pinned commit = the revision nvim-treesitter/Helix vendor** (battle-tested, canonical source), not bleeding-edge HEAD. When re-vendoring, update the pinned commit here.
 
@@ -53,7 +54,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 
 ## Local source patches (applied atop pinned upstream)
 
-The grammars below carry a small local patch to their vendored `scanner.c`, on
+The grammars below carry a small local patch to their vendored sources, on
 top of the pinned upstream commit recorded in the vendoring table below.
 Re-vendoring from upstream must re-apply these.
 
@@ -62,6 +63,7 @@ Re-vendoring from upstream must re-apply these.
 | crystal    | `crystal/scanner.c`, serialize    | guard `memcpy(&buffer[offset], state->literals.contents, literal_content_size)` with `if (literal_content_size > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source on the empty-state serialize round-trip (formal UB, harmless) |
 | rescript   | `rescript/scanner.c`, deserialize | guard `memcpy(state, buffer, n_bytes)` with `if (n_bytes > 0)` | UBSan: zero-length `memcpy` with a NULL `buffer` / `n_bytes == 0` on empty-state deserialize (formal UB, harmless). The sibling serialize copies a fixed `sizeof(ScannerState)` (always > 0, non-NULL src) and needs no guard. |
 | purescript | `purescript/scanner.c`, serialize | guard `memcpy(buffer, indents->data, to_copy)` with `if (to_copy > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source when the indent vector is empty (formal UB, harmless) |
+| plsql      | `plsql/parser.c`, include          | `#include <tree_sitter/parser.h>` → `#include "tree_sitter/parser.h"` | Older ABI-14 generator emits angle brackets; our grammar compile units resolve the per-grammar `tree_sitter/` headers via quoted-include search from the including file's directory |
 
 ## Vendored from verified upstream
 
@@ -157,6 +159,7 @@ Re-vendoring from upstream must re-apply these.
 | perl | 14 | tree-sitter-perl/tree-sitter-perl | `ea9667dc65a8` | VERIFIED-BOTH | ✅ |
 | php | 15 | tree-sitter/tree-sitter-php | `3f2465c217d0` | VERIFIED-BOTH | ✅ |
 | pkl | 15 | apple/tree-sitter-pkl | `f5beed1da8e5` | VERIFIED-BOTH | ✅ |
+| plsql | 14 | AndreasMaierDe/tree-sitter-plsql | `28aebef209be` | vendor-maintained | ✅ |
 | po | 14 | tree-sitter-grammars/tree-sitter-po | `bd860a0f57f6` | VERIFIED-NVIM | ✅ |
 | pony | 14 | tree-sitter-grammars/tree-sitter-pony | `73ff874ae4c9` | VERIFIED-NVIM | ✅ |
 | powershell | 15 | airbus-cert/tree-sitter-powershell | `73800ecc8bdd` | VERIFIED-BOTH | ✅ |
