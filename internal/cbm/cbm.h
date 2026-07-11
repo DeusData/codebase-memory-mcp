@@ -171,6 +171,7 @@ typedef enum {
     CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
     CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
     CBM_LANG_MOJO,      // Mojo
+    CBM_LANG_PLSQL,     // Oracle PL/SQL
     CBM_LANG_COUNT
 } CBMLanguage;
 
