@@ -982,8 +982,8 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
 
-        /* PL/SQL: create_*/function_*/procedure_* carry `fnc_name` / `prc_name`,
-         * not the generic `name` field. */
+        /* PL/SQL: create_function / create_procedure / function_* / procedure_*
+         * carry fnc_name / prc_name, not the generic name field. */
         if (lang == CBM_LANG_PLSQL) {
             TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("fnc_name"));
             if (ts_node_is_null(nm)) {

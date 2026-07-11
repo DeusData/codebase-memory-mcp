@@ -961,6 +961,24 @@ TEST(lang_ext_mojo) {
     PASS();
 }
 
+TEST(lang_ext_plsql) {
+    ASSERT_EQ(cbm_language_for_extension(".pks"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pkb"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pck"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pls"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".plb"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".plsql"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".fnc"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".trg"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".bdy"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".tps"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".tpb"), CBM_LANG_PLSQL);
+    /* .sql stays generic SQL; .prc stays FORM */
+    ASSERT_EQ(cbm_language_for_extension(".sql"), CBM_LANG_SQL);
+    ASSERT_EQ(cbm_language_for_extension(".prc"), CBM_LANG_FORM);
+    PASS();
+}
+
 TEST(lang_ext_squirrel) {
     ASSERT_EQ(cbm_language_for_extension(".nut"), CBM_LANG_SQUIRREL);
     PASS();
@@ -1277,6 +1295,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_cairo);
     RUN_TEST(lang_ext_move);
     RUN_TEST(lang_ext_mojo);
+    RUN_TEST(lang_ext_plsql);
     RUN_TEST(lang_ext_squirrel);
     RUN_TEST(lang_ext_func);
     RUN_TEST(lang_ext_rst);
