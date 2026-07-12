@@ -27,6 +27,7 @@
 #define cbm_chdir _chdir
 #define cbm_getcwd _getcwd
 #else
+#include <signal.h>
 #include <sys/wait.h> /* waitpid — #845 fork+alarm harness */
 #include <unistd.h>
 #define cbm_chdir chdir
@@ -80,6 +81,27 @@ static void cleanup_project_db(const char *cache, const char *project) {
     snprintf(path, sizeof(path), "%s/%s.db-shm", cache, project);
     cbm_unlink(path);
 }
+
+#ifndef _WIN32
+static void close_test_fd(int *fd) {
+    if (*fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+static void wait_or_kill_child(pid_t pid) {
+    if (pid <= 0) {
+        return;
+    }
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, WNOHANG);
+    if (waited == 0) {
+        kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+    }
+}
+#endif
 
 /* ══════════════════════════════════════════════════════════════════
  *  JSON-RPC PARSING
@@ -2378,6 +2400,153 @@ TEST(tool_manage_adr_unified_backend_issue256) {
 
     cbm_mcp_server_free(srv);
     PASS();
+}
+
+TEST(tool_manage_adr_update_waits_for_pipeline_lock) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork-based pipeline lock test is POSIX-only");
+#else
+    const char *fail = NULL;
+    const char *project = "adr-lock-project";
+    int start_pipe[2] = {-1, -1};
+    pid_t pid = -1;
+    bool locked = false;
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-adr-lock-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    if (!setup) {
+        fail = "setup store failed";
+        goto cleanup;
+    }
+    if (cbm_store_upsert_project(setup, project, "/tmp/adr-lock-project") != CBM_STORE_OK) {
+        cbm_store_close(setup);
+        fail = "project setup failed";
+        goto cleanup;
+    }
+    cbm_store_close(setup);
+
+    if (pipe(start_pipe) != 0) {
+        fail = "pipe failed";
+        goto cleanup;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fail = "fork failed";
+        goto cleanup;
+    }
+
+    if (pid == 0) {
+        close(start_pipe[1]);
+        char token = 0;
+        ssize_t nread = read(start_pipe[0], &token, 1);
+        close(start_pipe[0]);
+        if (nread != 1) {
+            _exit(3);
+        }
+        alarm(5);
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (!srv) {
+            _exit(4);
+        }
+        char *resp =
+            cbm_mcp_handle_tool(srv, "manage_adr",
+                                "{\"project\":\"adr-lock-project\",\"mode\":\"update\","
+                                "\"content\":\"## PURPOSE\\nLocked ADR write.\\n\"}");
+        bool ok = resp && strstr(resp, "updated");
+        free(resp);
+        cbm_mcp_server_free(srv);
+        _exit(ok ? 0 : 5);
+    }
+
+    close_test_fd(&start_pipe[0]);
+    if (!cbm_pipeline_lock_project(project)) {
+        fail = "lock failed";
+        goto cleanup;
+    }
+    locked = true;
+    if (write(start_pipe[1], "x", 1) != 1) {
+        fail = "pipe write failed";
+        goto cleanup;
+    }
+    close_test_fd(&start_pipe[1]);
+
+    cbm_usleep(100000);
+    cbm_store_t *pre = cbm_store_open_path(db_path);
+    if (!pre) {
+        fail = "pre-check store open failed";
+        goto cleanup;
+    }
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    if (cbm_store_adr_get(pre, project, &adr) == CBM_STORE_OK) {
+        cbm_store_adr_free(&adr);
+        cbm_store_close(pre);
+        fail = "ADR write completed before lock release";
+        goto cleanup;
+    }
+    cbm_store_close(pre);
+
+    cbm_pipeline_unlock();
+    locked = false;
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) != pid) {
+        fail = "waitpid failed";
+        goto cleanup;
+    }
+    pid = -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail = "child manage_adr update failed";
+        goto cleanup;
+    }
+
+    cbm_store_t *post = cbm_store_open_path(db_path);
+    if (!post) {
+        fail = "post-check store open failed";
+        goto cleanup;
+    }
+    memset(&adr, 0, sizeof(adr));
+    if (cbm_store_adr_get(post, project, &adr) != CBM_STORE_OK) {
+        cbm_store_close(post);
+        fail = "ADR missing after lock release";
+        goto cleanup;
+    }
+    if (!adr.content || !strstr(adr.content, "Locked ADR write.")) {
+        cbm_store_adr_free(&adr);
+        cbm_store_close(post);
+        fail = "ADR content mismatch";
+        goto cleanup;
+    }
+    cbm_store_adr_free(&adr);
+    cbm_store_close(post);
+
+cleanup:
+    if (locked) {
+        cbm_pipeline_unlock();
+    }
+    close_test_fd(&start_pipe[0]);
+    close_test_fd(&start_pipe[1]);
+    wait_or_kill_child(pid);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    cbm_rmdir(cache);
+    if (fail) {
+        FAIL(fail);
+    }
+    PASS();
+#endif
 }
 
 TEST(tool_index_repository_reports_store_backed_adr) {
@@ -5702,6 +5871,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
+    RUN_TEST(tool_manage_adr_update_waits_for_pipeline_lock);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_cli_name_override_issue823);

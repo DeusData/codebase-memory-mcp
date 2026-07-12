@@ -19,7 +19,12 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "foundation/compat_thread.h"
+#include <errno.h>
 #include <fcntl.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
@@ -29,6 +34,64 @@
 /* ── Helper: create temp test repo with known layout ───────────── */
 
 static char g_tmpdir[256];
+
+typedef struct {
+    char tmpdir[256];
+    char old_cache[1024];
+    bool had_old_cache;
+} pipeline_lock_env_t;
+
+static bool pipeline_lock_env_setup(pipeline_lock_env_t *env) {
+    memset(env, 0, sizeof(*env));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    if (old_cache && old_cache[0]) {
+        env->had_old_cache = true;
+        snprintf(env->old_cache, sizeof(env->old_cache), "%s", old_cache);
+    }
+    snprintf(env->tmpdir, sizeof(env->tmpdir), "/tmp/cbm_pipeline_lock_XXXXXX");
+    if (!cbm_mkdtemp(env->tmpdir)) {
+        return false;
+    }
+    if (cbm_setenv("CBM_CACHE_DIR", env->tmpdir, 1) != 0) {
+        th_rmtree(env->tmpdir);
+        env->tmpdir[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static void pipeline_lock_env_restore(pipeline_lock_env_t *env) {
+    if (env->had_old_cache) {
+        cbm_setenv("CBM_CACHE_DIR", env->old_cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    if (env->tmpdir[0]) {
+        th_rmtree(env->tmpdir);
+        env->tmpdir[0] = '\0';
+    }
+}
+
+#ifndef _WIN32
+static void close_test_fd(int *fd) {
+    if (*fd >= 0) {
+        close(*fd);
+        *fd = -1;
+    }
+}
+
+static void wait_or_kill_child(pid_t pid) {
+    if (pid <= 0) {
+        return;
+    }
+    int status = 0;
+    pid_t waited = waitpid(pid, &status, WNOHANG);
+    if (waited == 0) {
+        kill(pid, SIGKILL);
+        (void)waitpid(pid, &status, 0);
+    }
+}
+#endif
 
 /* Create:
  *   /tmp/cbm_test_XXXXXX/
@@ -6044,6 +6107,9 @@ TEST(incremental_kustomize_module_indexed) {
 /* ── Index lock tests ───────────────────────────────────────────── */
 
 TEST(pipeline_lock_try_acquire) {
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
     /* First try-lock should succeed */
     ASSERT_TRUE(cbm_pipeline_try_lock());
     /* Second try-lock should fail (already held) */
@@ -6052,16 +6118,21 @@ TEST(pipeline_lock_try_acquire) {
     cbm_pipeline_unlock();
     ASSERT_TRUE(cbm_pipeline_try_lock());
     cbm_pipeline_unlock();
+    pipeline_lock_env_restore(&env);
     PASS();
 }
 
 TEST(pipeline_lock_blocking) {
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
     /* Lock, then unlock — basic sanity */
-    cbm_pipeline_lock();
+    ASSERT_TRUE(cbm_pipeline_lock());
     cbm_pipeline_unlock();
     /* Should be immediately re-acquirable */
-    cbm_pipeline_lock();
+    ASSERT_TRUE(cbm_pipeline_lock());
     cbm_pipeline_unlock();
+    pipeline_lock_env_restore(&env);
     PASS();
 }
 
@@ -6082,8 +6153,11 @@ static void *try_lock_thread(void *arg) {
 }
 
 TEST(pipeline_lock_contention) {
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
     /* Main thread holds lock, spawned thread should fail try_lock */
-    cbm_pipeline_lock();
+    ASSERT_TRUE(cbm_pipeline_lock());
     atomic_store(&g_thread_acquired, -1);
     atomic_store(&g_thread_done, 0);
 
@@ -6097,12 +6171,16 @@ TEST(pipeline_lock_contention) {
     /* Thread should NOT have acquired the lock */
     ASSERT_EQ(atomic_load(&g_thread_acquired), 0);
     cbm_pipeline_unlock();
+    pipeline_lock_env_restore(&env);
     PASS();
 }
 
 TEST(pipeline_lock_release_allows_contender) {
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
     /* Main thread acquires and releases, then spawned thread should succeed */
-    cbm_pipeline_lock();
+    ASSERT_TRUE(cbm_pipeline_lock());
     cbm_pipeline_unlock();
 
     atomic_store(&g_thread_acquired, -1);
@@ -6115,7 +6193,353 @@ TEST(pipeline_lock_release_allows_contender) {
 
     /* Thread SHOULD have acquired the lock */
     ASSERT_EQ(atomic_load(&g_thread_acquired), 1);
+    pipeline_lock_env_restore(&env);
     PASS();
+}
+
+TEST(pipeline_lock_distinct_projects_in_process_stays_global) {
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
+    const char *fail = NULL;
+    bool locked = false;
+    if (!cbm_pipeline_lock_project("lock-project-a")) {
+        fail = "lock project a failed";
+        goto cleanup;
+    }
+    locked = true;
+    if (cbm_pipeline_try_lock_project("lock-project-b")) {
+        cbm_pipeline_unlock();
+        locked = false;
+        fail = "same-process distinct project unexpectedly acquired";
+        goto cleanup;
+    }
+
+cleanup:
+    if (locked) {
+        cbm_pipeline_unlock();
+    }
+    pipeline_lock_env_restore(&env);
+    if (fail) {
+        FAIL(fail);
+    }
+    PASS();
+}
+
+TEST(pipeline_lock_try_reports_busy_across_processes) {
+#ifdef _WIN32
+    SKIP_PLATFORM("cross-process fork lock test is POSIX-only");
+#else
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
+    const char *fail = NULL;
+    int sync_pipe[2] = {-1, -1};
+    pid_t pid = -1;
+    bool locked = false;
+    int status = 0;
+
+    if (pipe(sync_pipe) != 0) {
+        fail = "pipe failed";
+        goto cleanup;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fail = "fork failed";
+        goto cleanup;
+    }
+
+    if (pid == 0) {
+        close(sync_pipe[1]);
+        char token = 0;
+        ssize_t nread = read(sync_pipe[0], &token, 1);
+        close(sync_pipe[0]);
+        if (nread != 1) {
+            _exit(3);
+        }
+        if (cbm_pipeline_try_lock_project("lock-project")) {
+            cbm_pipeline_unlock();
+            _exit(2);
+        }
+        _exit(0);
+    }
+
+    close_test_fd(&sync_pipe[0]);
+    if (!cbm_pipeline_lock_project("lock-project")) {
+        fail = "lock failed";
+        goto cleanup;
+    }
+    locked = true;
+    if (write(sync_pipe[1], "x", 1) != 1) {
+        fail = "pipe write failed";
+        goto cleanup;
+    }
+    close_test_fd(&sync_pipe[1]);
+
+    if (waitpid(pid, &status, 0) != pid) {
+        fail = "waitpid failed";
+        goto cleanup;
+    }
+    pid = -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail = "child did not report busy lock";
+        goto cleanup;
+    }
+
+cleanup:
+    if (locked) {
+        cbm_pipeline_unlock();
+    }
+    close_test_fd(&sync_pipe[0]);
+    close_test_fd(&sync_pipe[1]);
+    wait_or_kill_child(pid);
+    pipeline_lock_env_restore(&env);
+    if (fail) {
+        FAIL(fail);
+    }
+    PASS();
+#endif
+}
+
+TEST(pipeline_lock_allows_distinct_projects_across_processes) {
+#ifdef _WIN32
+    SKIP_PLATFORM("cross-process fork lock test is POSIX-only");
+#else
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
+    const char *fail = NULL;
+    int sync_pipe[2] = {-1, -1};
+    pid_t pid = -1;
+    bool locked = false;
+    int status = 0;
+
+    if (pipe(sync_pipe) != 0) {
+        fail = "pipe failed";
+        goto cleanup;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fail = "fork failed";
+        goto cleanup;
+    }
+
+    if (pid == 0) {
+        close(sync_pipe[1]);
+        char token = 0;
+        ssize_t nread = read(sync_pipe[0], &token, 1);
+        close(sync_pipe[0]);
+        if (nread != 1) {
+            _exit(3);
+        }
+        if (!cbm_pipeline_try_lock_project("lock-project-b")) {
+            _exit(2);
+        }
+        cbm_pipeline_unlock();
+        _exit(0);
+    }
+
+    close_test_fd(&sync_pipe[0]);
+    if (!cbm_pipeline_lock_project("lock-project-a")) {
+        fail = "lock project a failed";
+        goto cleanup;
+    }
+    locked = true;
+    if (write(sync_pipe[1], "x", 1) != 1) {
+        fail = "pipe write failed";
+        goto cleanup;
+    }
+    close_test_fd(&sync_pipe[1]);
+
+    if (waitpid(pid, &status, 0) != pid) {
+        fail = "waitpid failed";
+        goto cleanup;
+    }
+    pid = -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail = "child did not acquire distinct project lock";
+        goto cleanup;
+    }
+
+cleanup:
+    if (locked) {
+        cbm_pipeline_unlock();
+    }
+    close_test_fd(&sync_pipe[0]);
+    close_test_fd(&sync_pipe[1]);
+    wait_or_kill_child(pid);
+    pipeline_lock_env_restore(&env);
+    if (fail) {
+        FAIL(fail);
+    }
+    PASS();
+#endif
+}
+
+TEST(pipeline_lock_blocking_waits_across_processes) {
+#ifdef _WIN32
+    SKIP_PLATFORM("cross-process fork lock test is POSIX-only");
+#else
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+
+    const char *fail = NULL;
+    int start_pipe[2] = {-1, -1};
+    int acquired_pipe[2] = {-1, -1};
+    pid_t pid = -1;
+    bool locked = false;
+    int status = 0;
+    char token = 0;
+
+    if (pipe(start_pipe) != 0 || pipe(acquired_pipe) != 0) {
+        fail = "pipe failed";
+        goto cleanup;
+    }
+
+    int flags = fcntl(acquired_pipe[0], F_GETFL, 0);
+    if (flags < 0 || fcntl(acquired_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
+        fail = "set nonblocking failed";
+        goto cleanup;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        fail = "fork failed";
+        goto cleanup;
+    }
+
+    if (pid == 0) {
+        close(start_pipe[1]);
+        close(acquired_pipe[0]);
+        char token = 0;
+        ssize_t nread = read(start_pipe[0], &token, 1);
+        close(start_pipe[0]);
+        if (nread != 1) {
+            _exit(3);
+        }
+        alarm(3);
+        if (!cbm_pipeline_lock_project("lock-project")) {
+            _exit(5);
+        }
+        ssize_t nwritten = write(acquired_pipe[1], "y", 1);
+        cbm_pipeline_unlock();
+        close(acquired_pipe[1]);
+        _exit(nwritten == 1 ? 0 : 4);
+    }
+
+    close_test_fd(&start_pipe[0]);
+    close_test_fd(&acquired_pipe[1]);
+    if (!cbm_pipeline_lock_project("lock-project")) {
+        fail = "lock failed";
+        goto cleanup;
+    }
+    locked = true;
+    if (write(start_pipe[1], "x", 1) != 1) {
+        fail = "pipe write failed";
+        goto cleanup;
+    }
+    close_test_fd(&start_pipe[1]);
+
+    cbm_usleep(100000);
+    ssize_t early = read(acquired_pipe[0], &token, 1);
+    if (early != -1 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+        fail = "blocking lock acquired too early";
+        goto cleanup;
+    }
+
+    cbm_pipeline_unlock();
+    locked = false;
+
+    int current_flags = fcntl(acquired_pipe[0], F_GETFL, 0);
+    if (current_flags < 0 ||
+        fcntl(acquired_pipe[0], F_SETFL, current_flags & ~O_NONBLOCK) != 0) {
+        fail = "restore blocking mode failed";
+        goto cleanup;
+    }
+    ssize_t final_read = read(acquired_pipe[0], &token, 1);
+    close_test_fd(&acquired_pipe[0]);
+    if (final_read != 1 || token != 'y') {
+        fail = "child did not acquire after unlock";
+        goto cleanup;
+    }
+
+    if (waitpid(pid, &status, 0) != pid) {
+        fail = "waitpid failed";
+        goto cleanup;
+    }
+    pid = -1;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fail = "child exited unexpectedly";
+        goto cleanup;
+    }
+
+cleanup:
+    if (locked) {
+        cbm_pipeline_unlock();
+    }
+    close_test_fd(&start_pipe[0]);
+    close_test_fd(&start_pipe[1]);
+    close_test_fd(&acquired_pipe[0]);
+    close_test_fd(&acquired_pipe[1]);
+    wait_or_kill_child(pid);
+    pipeline_lock_env_restore(&env);
+    if (fail) {
+        FAIL(fail);
+    }
+    PASS();
+#endif
+}
+
+TEST(pipeline_lock_failure_returns_and_releases_process_lock) {
+#ifdef _WIN32
+    SKIP_PLATFORM("pipeline lock backend failure test requires POSIX file locks");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pipeline_lock_bad_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char bad_cache[512];
+    snprintf(bad_cache, sizeof(bad_cache), "%s/not-a-dir", tmpdir);
+    FILE *fp = fopen(bad_cache, "wb");
+    ASSERT_NOT_NULL(fp);
+    fclose(fp);
+
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *old_copy = old_cache ? strdup(old_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", bad_cache, 1);
+    if (cbm_pipeline_lock()) {
+        cbm_pipeline_unlock();
+        if (old_copy) {
+            cbm_setenv("CBM_CACHE_DIR", old_copy, 1);
+        } else {
+            cbm_unsetenv("CBM_CACHE_DIR");
+        }
+        free(old_copy);
+        remove(bad_cache);
+        cbm_rmdir(tmpdir);
+        FAIL("bad cache lock unexpectedly succeeded");
+    }
+
+    if (old_copy) {
+        cbm_setenv("CBM_CACHE_DIR", old_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(old_copy);
+
+    pipeline_lock_env_t env;
+    ASSERT_TRUE(pipeline_lock_env_setup(&env));
+    ASSERT_TRUE(cbm_pipeline_try_lock());
+    cbm_pipeline_unlock();
+    pipeline_lock_env_restore(&env);
+
+    remove(bad_cache);
+    cbm_rmdir(tmpdir);
+    PASS();
+#endif
 }
 
 /* ── Resource management & internal helper tests ─────────────────── */
@@ -6839,6 +7263,11 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_lock_blocking);
     RUN_TEST(pipeline_lock_contention);
     RUN_TEST(pipeline_lock_release_allows_contender);
+    RUN_TEST(pipeline_lock_distinct_projects_in_process_stays_global);
+    RUN_TEST(pipeline_lock_try_reports_busy_across_processes);
+    RUN_TEST(pipeline_lock_allows_distinct_projects_across_processes);
+    RUN_TEST(pipeline_lock_blocking_waits_across_processes);
+    RUN_TEST(pipeline_lock_failure_returns_and_releases_process_lock);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_null_repo);

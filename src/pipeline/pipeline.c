@@ -41,6 +41,11 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <errno.h>
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
@@ -48,25 +53,153 @@ static inline void *intptr_to_ptr(intptr_t v) {
     return p;
 }
 
-/* ── Global index lock ─────────────────────────────────────────── */
-/* Prevents concurrent pipeline runs on the same DB file.
- * Atomic spinlock: 0 = free, 1 = locked. */
+/* ── Project index lock ────────────────────────────────────────── */
+/* Prevents concurrent rebuilds of the same project DB. The atomic lock handles
+ * threads inside one process; the project-scoped cache-local file lock serializes
+ * independent MCP/CLI processes that share CBM_CACHE_DIR. */
 static atomic_int g_pipeline_busy = 0;
+#ifndef _WIN32
+static int g_pipeline_lock_fd = -1;
+#endif
+
+static bool pipeline_file_lock(const char *project, bool wait) {
+#ifdef _WIN32
+    /* Windows still has only the in-process guard; add a LockFileEx backend
+     * here before claiming cross-process serialization on that platform. */
+    cbm_log_debug("pipeline.lock.win32_noop", "project", project ? project : "(global)");
+    (void)wait;
+    return true;
+#else
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir || !cache_dir[0]) {
+        cache_dir = cbm_tmpdir();
+    }
+    if (!cache_dir || !cache_dir[0]) {
+        cbm_log_warn("pipeline.lock.err", "phase", "cache_dir");
+        return false;
+    }
+    if (!cbm_mkdir_p(cache_dir, CBM_DIR_PERMS)) {
+        cbm_log_warn("pipeline.lock.err", "phase", "mkdir", "path", cache_dir);
+        return false;
+    }
+
+    char lock_path[CBM_SZ_1K];
+    int n;
+    if (project && cbm_validate_project_name(project)) {
+        n = snprintf(lock_path, sizeof(lock_path), "%s/.pipeline.%s.lock", cache_dir, project);
+    } else {
+        n = snprintf(lock_path, sizeof(lock_path), "%s/.pipeline.lock", cache_dir);
+    }
+    if (n <= 0 || (size_t)n >= sizeof(lock_path)) {
+        cbm_log_warn("pipeline.lock.err", "phase", "path", "project",
+                     project ? project : "(global)");
+        return false;
+    }
+
+    int flags = O_RDWR | O_CREAT;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int fd = open(lock_path, flags, 0600);
+#ifdef O_CLOEXEC
+    if (fd < 0 && errno == EINVAL) {
+        fd = open(lock_path, O_RDWR | O_CREAT, 0600);
+    }
+#endif
+    if (fd < 0) {
+        char errbuf[CBM_SZ_64];
+        snprintf(errbuf, sizeof(errbuf), "%d", errno);
+        cbm_log_warn("pipeline.lock.err", "phase", "open", "errno", errbuf);
+        return false;
+    }
+#ifdef FD_CLOEXEC
+    int fd_flags = fcntl(fd, F_GETFD);
+    if (fd_flags >= 0) {
+        (void)fcntl(fd, F_SETFD, fd_flags | FD_CLOEXEC);
+    }
+#endif
+
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_WRLCK;
+    fl.l_whence = SEEK_SET;
+
+    for (;;) {
+        if (fcntl(fd, wait ? F_SETLKW : F_SETLK, &fl) == 0) {
+            g_pipeline_lock_fd = fd;
+            return true;
+        }
+        if (wait && errno == EINTR) {
+            continue;
+        }
+        int err = errno;
+        bool lock_busy = err == EACCES || err == EAGAIN;
+#ifdef EWOULDBLOCK
+        lock_busy = lock_busy || err == EWOULDBLOCK;
+#endif
+        if (!wait && lock_busy) {
+            close(fd);
+            return false;
+        }
+        char errbuf[CBM_SZ_64];
+        snprintf(errbuf, sizeof(errbuf), "%d", err);
+        cbm_log_warn("pipeline.lock.err", "phase", "acquire", "errno", errbuf);
+        close(fd);
+        return false;
+    }
+#endif
+}
+
+static void pipeline_file_unlock(void) {
+#ifndef _WIN32
+    if (g_pipeline_lock_fd < 0) {
+        return;
+    }
+    struct flock fl;
+    memset(&fl, 0, sizeof(fl));
+    fl.l_type = F_UNLCK;
+    fl.l_whence = SEEK_SET;
+    (void)fcntl(g_pipeline_lock_fd, F_SETLK, &fl);
+    close(g_pipeline_lock_fd);
+    g_pipeline_lock_fd = -1;
+#endif
+}
+
+bool cbm_pipeline_try_lock_project(const char *project) {
+    if (atomic_exchange(&g_pipeline_busy, 1) != 0) {
+        return false;
+    }
+    if (!pipeline_file_lock(project, false)) {
+        atomic_store(&g_pipeline_busy, 0);
+        return false;
+    }
+    return true;
+}
 
 bool cbm_pipeline_try_lock(void) {
-    return atomic_exchange(&g_pipeline_busy, 1) == 0;
+    return cbm_pipeline_try_lock_project(NULL);
 }
 
 #define LOCK_SPIN_NS 100000000 /* 100ms between lock retries */
 
-void cbm_pipeline_lock(void) {
+bool cbm_pipeline_lock_project(const char *project) {
     while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
         struct timespec ts = {0, LOCK_SPIN_NS};
         cbm_nanosleep(&ts, NULL);
     }
+    if (!pipeline_file_lock(project, true)) {
+        atomic_store(&g_pipeline_busy, 0);
+        return false;
+    }
+    return true;
+}
+
+bool cbm_pipeline_lock(void) {
+    return cbm_pipeline_lock_project(NULL);
 }
 
 void cbm_pipeline_unlock(void) {
+    pipeline_file_unlock();
     atomic_store(&g_pipeline_busy, 0);
 }
 

@@ -128,16 +128,24 @@ void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out,
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
-/* Try to acquire the global index lock. Returns true if acquired,
- * false if another pipeline is already running (non-blocking).
- * Use this in the watcher — skip reindex if busy. */
+/* Try to acquire the index lock for a project. Returns true if acquired,
+ * false if this process is already running any pipeline or another process is
+ * rebuilding the same project (non-blocking). The cross-process file lock is
+ * project-scoped; the in-process guard remains process-wide because the
+ * pipeline uses process-global state. Use this in the watcher — skip reindex if
+ * busy. */
+bool cbm_pipeline_try_lock_project(const char *project);
 bool cbm_pipeline_try_lock(void);
 
-/* Acquire the global index lock, blocking until available.
- * Use this in MCP handler and autoindex — wait for busy watcher to finish. */
-void cbm_pipeline_lock(void);
+/* Acquire the index lock for a project, blocking until available.
+ * Returns false only when the lock backend cannot be opened/acquired. Inside
+ * one process this still serializes all pipeline runs; across processes it only
+ * waits for the same project. Use this in MCP handler and autoindex — wait for
+ * busy watcher to finish. */
+bool cbm_pipeline_lock_project(const char *project);
+bool cbm_pipeline_lock(void);
 
-/* Release the global index lock. */
+/* Release the held index lock. */
 void cbm_pipeline_unlock(void);
 
 /* ── FQN helpers (used by passes and external callers) ──────────── */

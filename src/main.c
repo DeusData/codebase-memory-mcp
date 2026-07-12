@@ -86,8 +86,9 @@ static void request_shutdown(void) {
             cbm_pipeline_cancel(p);
         }
     }
-    /* Release pipeline lock to prevent stale lock on restart */
-    cbm_pipeline_unlock();
+    /* Do not unlock here: cancellation is cooperative, so cbm_pipeline_run()
+     * may still be writing. The lock owner releases after the run returns; if
+     * the process dies first, the OS releases the file descriptor lock. */
 
     if (g_watcher) {
         cbm_watcher_stop(g_watcher);
@@ -164,12 +165,13 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         return 0;
     }
 
-    /* Non-blocking: skip if another pipeline is already running.
-     * Watcher will retry on next poll cycle (5-60s). */
-    if (!cbm_pipeline_try_lock()) {
+    /* Non-blocking: skip if this project is already being rebuilt. Watcher will
+     * retry on next poll cycle (5-60s). */
+    if (!cbm_pipeline_try_lock_project(project_name)) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
         return 0;
     }
+    cbm_pipeline_unlock();
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
 
@@ -177,17 +179,22 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
      * long-lived server process hands its RSS back to the OS on every cycle
      * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
      * threads abandon at exit). The child writes the DB; the parent only needs the
-     * return code. The pipeline lock (already held) still serialises re-indexes.
+     * return code. The worker takes the project lock; the parent must not keep
+     * it held while waiting, otherwise the child blocks on the same file lock.
      * Degrade to the in-process pipeline when the supervisor is off (kill switch)
      * or the spawn fails. */
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = cbm_mcp_index_run_supervised_path(root_path);
         if (resp) {
             free(resp);
-            cbm_pipeline_unlock();
             return 0;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
+
+    if (!cbm_pipeline_try_lock_project(project_name)) {
+        cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
+        return 0;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
