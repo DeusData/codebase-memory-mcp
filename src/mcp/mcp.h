@@ -2,7 +2,7 @@
  * mcp.h — MCP (Model Context Protocol) server for codebase-memory-mcp.
  *
  * Implements JSON-RPC 2.0 over stdio with the MCP tool calling protocol.
- * Provides 14 graph analysis tools (search, trace, query, index, etc.)
+ * Provides repository graph analysis and user-global knowledge-memory tools.
  */
 #ifndef CBM_MCP_H
 #define CBM_MCP_H

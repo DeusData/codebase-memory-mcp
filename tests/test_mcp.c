@@ -241,7 +241,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* Should contain all repository and Global Memory tools. */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -256,6 +256,14 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
+    ASSERT_NOT_NULL(strstr(json, "memory_ingest"));
+    ASSERT_NOT_NULL(strstr(json, "memory_query"));
+    ASSERT_NOT_NULL(strstr(json, "memory_propose"));
+    ASSERT_NOT_NULL(strstr(json, "memory_commit"));
+    ASSERT_NOT_NULL(strstr(json, "memory_lint"));
+    ASSERT_NOT_NULL(strstr(json, "memory_export"));
+    ASSERT_NOT_NULL(strstr(json, "memory_import"));
+    ASSERT_NOT_NULL(strstr(json, "memory_sync"));
     free(json);
     PASS();
 }
@@ -614,8 +622,18 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
         "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{\"cursor\":\"8\"}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":201"));
-    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"nextCursor\":\"16\""));
     ASSERT_NOT_NULL(strstr(resp, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_query"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"tools/"
+                                      "list\",\"params\":{\"cursor\":\"16\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+    ASSERT_NOT_NULL(strstr(resp, "memory_commit"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_sync"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -964,9 +982,8 @@ TEST(mcp_discovery_methods_return_empty_lists) {
     };
     for (int i = 0; i < 3; i++) {
         char reqbuf[256];
-        snprintf(reqbuf, sizeof(reqbuf),
-                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\"}", 100 + i,
-                 cases[i].method);
+        snprintf(reqbuf, sizeof(reqbuf), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\"}",
+                 100 + i, cases[i].method);
         char *resp = cbm_mcp_server_handle(srv, reqbuf);
         ASSERT_NOT_NULL(resp);
         ASSERT_NULL(strstr(resp, "Method not found"));
@@ -5573,11 +5590,95 @@ TEST(index_repository_honors_allowed_root) {
     PASS();
 }
 
+TEST(global_memory_tools_and_graph_need_no_project) {
+    char home[CBM_SZ_1K];
+    snprintf(home, sizeof(home), "%s/cbm_mcp_memory_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(home)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    const char *previous = getenv("CBM_MEMORY_HOME");
+    char *saved = previous ? strdup(previous) : NULL;
+    cbm_setenv("CBM_MEMORY_HOME", home, 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    char *ingest =
+        srv ? cbm_mcp_handle_tool(srv, "memory_ingest",
+                                  "{\"content\":\"SQLite WAL serializes writers\","
+                                  "\"title\":\"SQLite concurrency\",\"origin\":\"unit-test\"}")
+            : NULL;
+    char *query =
+        srv ? cbm_mcp_handle_tool(srv, "memory_query",
+                                  "{\"query\":\"SQLite concurrency\",\"current_context\":{"
+                                  "\"project\":\"sample\"}}")
+            : NULL;
+    char *schema =
+        srv ? cbm_mcp_handle_tool(srv, "get_graph_schema", "{\"graph\":\"memory\"}") : NULL;
+    char *cypher =
+        srv ? cbm_mcp_handle_tool(srv, "query_graph",
+                                  "{\"graph\":\"memory\",\"query\":\"MATCH (s:MemorySource) "
+                                  "RETURN s.name LIMIT 1\",\"format\":\"json\"}")
+            : NULL;
+    char *lint = srv ? cbm_mcp_handle_tool(srv, "memory_lint", "{}") : NULL;
+
+    bool ingest_ok = ingest && strstr(ingest, "unknown tool") == NULL &&
+                     response_contains_json_fragment(ingest, "\"ok\":true");
+    bool query_ok = query && strstr(query, "unknown tool") == NULL &&
+                    response_contains_json_fragment(query, "\"ok\":true") &&
+                    strstr(query, "\"isError\":false") != NULL;
+    bool schema_ok = schema && response_contains_json_fragment(schema, "\"graph\":\"memory\"");
+    bool cypher_ok = cypher && strstr(cypher, "Memory graph is unavailable") == NULL &&
+                     response_contains_json_fragment(cypher, "\"snapshot_epoch\"");
+    bool lint_ok = lint && strstr(lint, "unknown tool") == NULL;
+
+    free(ingest);
+    free(query);
+    free(schema);
+    free(cypher);
+    free(lint);
+    cbm_mcp_server_free(srv);
+    if (saved) {
+        cbm_setenv("CBM_MEMORY_HOME", saved, 1);
+    } else {
+        cbm_unsetenv("CBM_MEMORY_HOME");
+    }
+    free(saved);
+    th_rmtree(home);
+
+    ASSERT_TRUE(ingest_ok);
+    ASSERT_TRUE(query_ok);
+    ASSERT_TRUE(schema_ok);
+    ASSERT_TRUE(cypher_ok);
+    ASSERT_TRUE(lint_ok);
+    PASS();
+}
+
+TEST(global_memory_tool_schemas_are_registered) {
+    static const char *const names[] = {
+        "memory_ingest", "memory_query",  "memory_propose", "memory_commit",
+        "memory_lint",   "memory_export", "memory_import",  "memory_sync",
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        const char *schema = cbm_mcp_tool_input_schema(names[i]);
+        ASSERT_NOT_NULL(schema);
+        yyjson_doc *doc = yyjson_read(schema, strlen(schema), 0);
+        ASSERT_NOT_NULL(doc);
+        ASSERT_TRUE(yyjson_is_obj(yyjson_doc_get_root(doc)));
+        yyjson_doc_free(doc);
+    }
+    const char *query_schema = cbm_mcp_tool_input_schema("memory_query");
+    ASSERT_NOT_NULL(strstr(query_schema, "\"impact\""));
+    ASSERT_NOT_NULL(strstr(query_schema, "\"reversible\""));
+    ASSERT_NOT_NULL(strstr(query_schema, "\"valid_at\""));
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(mcp) {
+    RUN_TEST(global_memory_tools_and_graph_need_no_project);
+    RUN_TEST(global_memory_tool_schemas_are_registered);
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
     RUN_TEST(index_repository_honors_allowed_root);

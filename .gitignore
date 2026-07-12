@@ -41,6 +41,11 @@ Thumbs.db
 memory/
 reference/
 
+# Production Global Memory module (the broad local-memory rule above otherwise
+# matches src/memory/ as well).
+!/src/memory/
+!/src/memory/**
+
 # Local-only scratch / session notes (never pushed)
 private/
 

@@ -1,0 +1,4 @@
+# SQLite WAL deliberately performs a lock-free header sample and retries after
+# validation or under its cross-process file locks. ThreadSanitizer cannot
+# observe that file-lock protocol. Keep the suppression at the exact reader.
+race:walTryBeginRead

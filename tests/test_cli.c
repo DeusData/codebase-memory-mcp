@@ -23,6 +23,54 @@
 #include <errno.h>
 #include <zlib.h>
 
+/* Internal migration helper kept out of the public CLI API. */
+extern int cbm_cleanup_legacy_codex_instructions(const char *home, bool dry_run);
+
+/* Exact Go-era generated file written to
+ * ~/.codex/instructions/codebase-memory-mcp.md. Its byte hash is used by the
+ * migration so a user-modified file is never deleted. */
+static const char legacy_codex_instructions_v1[] =
+    "# Codebase Knowledge Graph\n"
+    "\n"
+    "This project has a code knowledge graph available via MCP tools. Use it for\n"
+    "structural questions instead of grep — one graph query returns what would take\n"
+    "dozens of file-by-file searches.\n"
+    "\n"
+    "## Finding Code\n"
+    "\n"
+    "- \"Who calls X?\" → use `trace_call_path` with `direction=inbound`\n"
+    "- \"What does X call?\" → use `trace_call_path` with `direction=outbound`\n"
+    "- \"Find functions matching pattern\" → use `search_graph` with `name_pattern`\n"
+    "- \"Find all routes\" → use `search_graph` with `label=Route`\n"
+    "- \"Show codebase structure\" → use `get_graph_schema` for overview\n"
+    "\n"
+    "## Tracing Dependencies\n"
+    "\n"
+    "- Always discover exact names first: `search_graph(name_pattern=\".*Partial.*\")`\n"
+    "- Then trace: `trace_call_path(function_name=\"ExactName\", direction=\"both\")`\n"
+    "- Cross-service HTTP calls: `query_graph(\"MATCH (a)-[r:HTTP_CALLS]->(b) RETURN "
+    "a.name, b.name, r.url_path\")`\n"
+    "- Read source: `get_code_snippet(qualified_name=\"project.path.FunctionName\")`\n"
+    "\n"
+    "## Quality Analysis\n"
+    "\n"
+    "- Dead code: `search_graph` with `max_degree=0`, `exclude_entry_points=true`, "
+    "`relationship=CALLS`, `direction=inbound`\n"
+    "- High fan-out: `search_graph` with `min_degree=10`, `relationship=CALLS`, "
+    "`direction=outbound`\n"
+    "- Change coupling: `query_graph(\"MATCH (a)-[r:FILE_CHANGES_WITH]->(b) WHERE "
+    "r.coupling_score >= 0.5 RETURN ...\")`\n"
+    "\n"
+    "## Important\n"
+    "\n"
+    "- Always check `list_projects` first — run `index_repository` if the project is missing\n"
+    "- Use `search_graph` to discover exact names before `trace_call_path` (it requires "
+    "exact match)\n"
+    "- The graph doesn't index text content — use grep for string literals, error messages, "
+    "config values\n"
+    "- Results default to 10 per page — check `has_more` and use `offset` to paginate\n"
+    "- Use `project` parameter when multiple repos are indexed\n";
+
 /* Helper: create a file with content */
 static int write_test_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
@@ -574,7 +622,9 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "14 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "22 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "Global Memory Retrieval") != NULL);
+    ASSERT(strstr(sk[0].content, "Do not search for an opposing view by default") != NULL);
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -583,11 +633,14 @@ TEST(cli_skill_files_content) {
 }
 
 TEST(cli_codex_instructions) {
-    /* Port of TestCodexInstructionsCreation */
-    const char *instr = cbm_get_codex_instructions();
-    ASSERT_NOT_NULL(instr);
-    ASSERT(strstr(instr, "Codebase Knowledge Graph") != NULL);
-    ASSERT(strstr(instr, "trace_path") != NULL);
+    /* Compatibility getter must not maintain a divergent Codex-only template. */
+    const char *codex = cbm_get_codex_instructions();
+    const char *shared = cbm_get_agent_instructions();
+    ASSERT_NOT_NULL(codex);
+    ASSERT_NOT_NULL(shared);
+    ASSERT(codex == shared);
+    ASSERT(strstr(codex, "Codebase Knowledge Graph") != NULL);
+    ASSERT(strstr(codex, "Global Memory") != NULL);
     PASS();
 }
 
@@ -1758,6 +1811,12 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
     test_mkdirp(dir);
 
+    char legacy_path[512];
+    snprintf(dir, sizeof(dir), "%s/.codex/instructions", tmpdir);
+    test_mkdirp(dir);
+    snprintf(legacy_path, sizeof(legacy_path), "%s/codebase-memory-mcp.md", dir);
+    ASSERT_EQ(write_test_file(legacy_path, legacy_codex_instructions_v1), 0);
+
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
@@ -1766,6 +1825,8 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     ASSERT(strstr(json, "cursor") != NULL);
     ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
     ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    ASSERT(strstr(json, "cleanup_files_planned") != NULL);
+    ASSERT(strstr(json, ".codex/instructions/codebase-memory-mcp.md") != NULL);
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
@@ -1774,7 +1835,8 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(cfg, sizeof(cfg), "%s/.cursor/mcp.json", tmpdir);
     ASSERT(stat(cfg, &st) != 0); /* must not exist */
     snprintf(cfg, sizeof(cfg), "%s/.codex/config.toml", tmpdir);
-    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    ASSERT(stat(cfg, &st) != 0);          /* must not exist */
+    ASSERT_EQ(stat(legacy_path, &st), 0); /* cleanup is planned, not executed */
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2408,6 +2470,76 @@ TEST(cli_agent_instructions_content) {
     ASSERT(strstr(instr, "search_graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
     ASSERT(strstr(instr, "get_code_snippet") != NULL);
+    ASSERT(strstr(instr, "Global Memory") != NULL);
+    ASSERT(strstr(instr, "user-global") != NULL);
+    ASSERT(strstr(instr, "not implicitly injected") != NULL);
+    ASSERT(strstr(instr, "memory_query") != NULL);
+    ASSERT(strstr(instr, "Do not query it for every task") != NULL);
+    ASSERT(strstr(instr, "current_context") != NULL);
+    ASSERT(strstr(instr, "route") != NULL);
+    ASSERT(strstr(instr, "applicability") != NULL);
+    ASSERT(strstr(instr, "freshness") != NULL);
+    ASSERT(strstr(instr, "evidence lineage") != NULL);
+    ASSERT(strstr(instr, "Do not search for an opposing view by default") != NULL);
+    ASSERT(strstr(instr, "memory_ingest") != NULL);
+    ASSERT(strstr(instr, "memory_propose") != NULL);
+    ASSERT(strstr(instr, "memory_commit") != NULL);
+    ASSERT(strstr(instr, "memory_lint") != NULL);
+    ASSERT(strstr(instr, "memory_export") != NULL);
+    ASSERT(strstr(instr, "memory_import") != NULL);
+    ASSERT(strstr(instr, "memory_sync") != NULL);
+    ASSERT(strstr(instr, "explicitly authorizes") != NULL);
+    ASSERT(strstr(instr, "ADRs local") != NULL);
+    ASSERT(strlen(instr) < 4096);
+    PASS();
+}
+
+TEST(cli_legacy_codex_instructions_cleanup) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-legacy-codex-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char legacy_dir[512];
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/.codex/instructions", tmpdir);
+    ASSERT_EQ(test_mkdirp(legacy_dir), 0);
+
+    char legacy_path[768];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/codebase-memory-mcp.md", legacy_dir);
+    ASSERT_EQ(write_test_file(legacy_path, legacy_codex_instructions_v1), 0);
+
+    /* Dry-run reports the cleanup but must not mutate the file. */
+    ASSERT_EQ(cbm_cleanup_legacy_codex_instructions(tmpdir, true), 1);
+    struct stat st;
+    ASSERT_EQ(stat(legacy_path, &st), 0);
+
+    ASSERT_EQ(cbm_cleanup_legacy_codex_instructions(tmpdir, false), 1);
+    ASSERT(stat(legacy_path, &st) != 0);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_legacy_codex_instructions_preserves_modified_file) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-legacy-codex-modified-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char legacy_dir[512];
+    snprintf(legacy_dir, sizeof(legacy_dir), "%s/.codex/instructions", tmpdir);
+    ASSERT_EQ(test_mkdirp(legacy_dir), 0);
+
+    char legacy_path[768];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/codebase-memory-mcp.md", legacy_dir);
+    ASSERT_EQ(write_test_file(legacy_path, "# user-modified instructions\n"), 0);
+
+    ASSERT_EQ(cbm_cleanup_legacy_codex_instructions(tmpdir, false), 0);
+    const char *content = read_test_file(legacy_path);
+    ASSERT_NOT_NULL(content);
+    ASSERT(strstr(content, "user-modified") != NULL);
+
+    test_rmdir_r(tmpdir);
     PASS();
 }
 
@@ -2696,6 +2828,9 @@ TEST(cli_skill_descriptions_directive) {
     for (int i = 0; i < CBM_SKILL_COUNT; i++) {
         ASSERT(strstr(sk[i].content, "Triggers on:") != NULL);
         ASSERT(strstr(sk[i].content, "search_graph") != NULL);
+        ASSERT(strstr(sk[i].content, "global memory") != NULL);
+        ASSERT(strstr(sk[i].content, "memory_query") != NULL);
+        ASSERT(strstr(sk[i].content, "explicitly authorizes") != NULL);
     }
     PASS();
 }
@@ -3212,6 +3347,8 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_instructions_no_duplicate);
     RUN_TEST(cli_remove_instructions);
     RUN_TEST(cli_agent_instructions_content);
+    RUN_TEST(cli_legacy_codex_instructions_cleanup);
+    RUN_TEST(cli_legacy_codex_instructions_preserves_modified_file);
 
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
