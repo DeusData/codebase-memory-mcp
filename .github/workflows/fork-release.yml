@@ -1,0 +1,73 @@
+# Minimal GitHub-only release pipeline for the bogyie fork.
+#
+# This intentionally skips the upstream npm/PyPI/MCP Registry and VirusTotal
+# publishing jobs, which require DeusData-owned credentials. The generated
+# assets and checksums are exactly what install.sh and the self-update command
+# consume from this fork's GitHub Releases page.
+name: Fork Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (for example v0.8.1-bogyie.1)"
+        required: true
+        type: string
+      prerelease:
+        description: "Mark this release as a prerelease"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/_build.yml
+    with:
+      version: ${{ inputs.version }}
+      attest: false
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "invalid release version: $VERSION" >&2
+            exit 1
+          fi
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(
+            "$VERSION"
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "$VERSION"
+            --generate-notes
+          )
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          else
+            args+=(--latest)
+          fi
+          gh release create "${args[@]}" *.tar.gz *.zip checksums.txt

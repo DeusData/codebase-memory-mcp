@@ -29,6 +29,7 @@
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/product.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
@@ -122,7 +123,7 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * targets must come from an auditable backend response, same pattern as
      * the /api/repo-info deep-links). */
     cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+                    lang_buf, CBM_GITHUB_ISSUES_NEW_URL);
 }
 
 /* ── Server state ─────────────────────────────────────────────── */

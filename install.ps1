@@ -10,7 +10,7 @@ $ErrorActionPreference = "Stop"
 # Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-$Repo = "DeusData/codebase-memory-mcp"
+$Repo = "bogyie/codebase-memory-mcp"
 $InstallDir = "$env:LOCALAPPDATA\Programs\codebase-memory-mcp"
 $BinName = "codebase-memory-mcp.exe"
 $BaseUrl = if ($env:CBM_DOWNLOAD_URL) { $env:CBM_DOWNLOAD_URL } else { "https://github.com/$Repo/releases/latest/download" }

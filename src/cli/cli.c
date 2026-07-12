@@ -8,6 +8,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "foundation/product.h"
 #include "foundation/sha256.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
 
@@ -162,11 +163,95 @@ static int parse_semver(const char *v, int out[SEMVER_PARTS]) {
     return count;
 }
 
-static bool has_prerelease(const char *v) {
-    if (*v == 'v' || *v == 'V') {
-        v++;
+static const char *prerelease_suffix(const char *v) {
+    const char *dash = strchr(v, '-');
+    const char *build = strchr(v, '+');
+    if (!dash || (build && dash > build)) {
+        return NULL;
     }
-    return strchr(v, '-') != NULL;
+    return dash + CLI_SKIP_ONE;
+}
+
+static bool identifier_is_numeric(const char *s, size_t len) {
+    if (len == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (!isdigit((unsigned char)s[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Compare SemVer prerelease identifiers without allocating or overflowing.
+ * Numeric identifiers compare numerically, numeric identifiers sort before
+ * text identifiers, and a longer equal prefix has higher precedence. */
+static int compare_prerelease(const char *a, const char *b) {
+    const char *ap = prerelease_suffix(a);
+    const char *bp = prerelease_suffix(b);
+    if (!ap && !bp) {
+        return 0;
+    }
+    if (!ap) {
+        return CLI_TRUE; /* a stable release beats a prerelease */
+    }
+    if (!bp) {
+        return CLI_ERR;
+    }
+
+    for (;;) {
+        const char *ae = ap;
+        const char *be = bp;
+        while (*ae && *ae != '.' && *ae != '+') {
+            ae++;
+        }
+        while (*be && *be != '.' && *be != '+') {
+            be++;
+        }
+        size_t alen = (size_t)(ae - ap);
+        size_t blen = (size_t)(be - bp);
+        bool anum = identifier_is_numeric(ap, alen);
+        bool bnum = identifier_is_numeric(bp, blen);
+        int cmp = 0;
+        if (anum && bnum) {
+            while (alen > CLI_SKIP_ONE && *ap == '0') {
+                ap++;
+                alen--;
+            }
+            while (blen > CLI_SKIP_ONE && *bp == '0') {
+                bp++;
+                blen--;
+            }
+            if (alen != blen) {
+                cmp = alen < blen ? CLI_ERR : CLI_TRUE;
+            } else {
+                cmp = memcmp(ap, bp, alen);
+            }
+        } else if (anum != bnum) {
+            cmp = anum ? CLI_ERR : CLI_TRUE;
+        } else {
+            size_t min_len = alen < blen ? alen : blen;
+            cmp = memcmp(ap, bp, min_len);
+            if (cmp == 0 && alen != blen) {
+                cmp = alen < blen ? CLI_ERR : CLI_TRUE;
+            }
+        }
+        if (cmp != 0) {
+            return cmp;
+        }
+
+        bool a_done = (*ae == '\0' || *ae == '+');
+        bool b_done = (*be == '\0' || *be == '+');
+        if (a_done || b_done) {
+            if (a_done && b_done) {
+                return 0;
+            }
+            return a_done ? CLI_ERR : CLI_TRUE;
+        }
+        ap = ae + CLI_SKIP_ONE;
+        bp = be + CLI_SKIP_ONE;
+    }
 }
 
 int cbm_compare_versions(const char *a, const char *b) {
@@ -181,16 +266,7 @@ int cbm_compare_versions(const char *a, const char *b) {
         }
     }
 
-    /* Same base version — non-dev beats dev */
-    bool a_pre = has_prerelease(a);
-    bool b_pre = has_prerelease(b);
-    if (a_pre && !b_pre) {
-        return CLI_ERR;
-    }
-    if (!a_pre && b_pre) {
-        return CLI_TRUE;
-    }
-    return 0;
+    return compare_prerelease(a, b);
 }
 
 /* ── Shell RC detection ───────────────────────────────────────── */
@@ -3079,9 +3155,8 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     if (dl_base && dl_base[0]) {
         snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt", dl_base);
     } else {
-        snprintf(checksum_url, sizeof(checksum_url), "%s",
-                 "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/"
-                 "checksums.txt");
+        snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt",
+                 CBM_GITHUB_LATEST_DOWNLOAD_URL);
     }
     int rc = cbm_download_to_file_quiet(checksum_url, checksum_file);
     if (rc != 0) {
@@ -4207,7 +4282,7 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
     if (!base_url || !base_url[0]) {
-        base_url = "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download";
+        base_url = CBM_GITHUB_LATEST_DOWNLOAD_URL;
     }
     /* Linux ships a fully-static "-portable" build; the standard linux binary
      * dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
@@ -4322,9 +4397,7 @@ static bool prefix_icase(const char *s, const char *prefix) {
 /* Fetch latest release tag from GitHub via redirect header.
  * Returns heap-allocated tag (e.g. "v0.5.7") or NULL on failure. */
 static char *fetch_latest_tag(void) {
-    FILE *fp = cbm_popen(
-        "curl -sfI https://github.com/DeusData/codebase-memory-mcp/releases/latest 2>/dev/null",
-        "r");
+    FILE *fp = cbm_popen("curl -sfI " CBM_GITHUB_LATEST_RELEASE_URL " 2>/dev/null", "r");
     if (!fp) {
         return NULL;
     }

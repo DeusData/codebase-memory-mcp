@@ -49,6 +49,7 @@ enum {
 #include "foundation/mem.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
+#include "foundation/product.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -7124,7 +7125,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 
 /* ── Background update check ──────────────────────────────────── */
 
-#define UPDATE_CHECK_URL "https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest"
+#define UPDATE_CHECK_URL CBM_GITHUB_API_LATEST_RELEASE_URL
 
 static void *update_check_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
@@ -7166,8 +7167,7 @@ static void *update_check_thread(void *arg) {
         if (cbm_compare_versions(tag_str, current) > 0) {
             snprintf(srv->update_notice, sizeof(srv->update_notice),
                      "Update available: %s -> %s -- run: codebase-memory-mcp update  |  "
-                     "Enjoying codebase-memory-mcp? Please leave a star: "
-                     "https://github.com/DeusData/codebase-memory-mcp",
+                     "Enjoying codebase-memory-mcp? Please leave a star: " CBM_GITHUB_URL,
                      current, tag_str);
             cbm_log_info("update.available", "current", current, "latest", tag_str);
         }

@@ -70,6 +70,9 @@ echo "--- URL audit ---"
 
 # Allowed URL prefixes
 ALLOWED_URLS=(
+    "https://api.github.com/repos/bogyie/codebase-memory-mcp"
+    "https://github.com/bogyie/codebase-memory-mcp"
+    # Upstream attribution and issue references may remain in vendored docs/UI.
     "https://api.github.com/repos/DeusData/codebase-memory-mcp"
     "https://github.com/DeusData/codebase-memory-mcp"
     "http://127.0.0.1"

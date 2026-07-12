@@ -154,6 +154,11 @@ TEST(cli_compare_versions) {
     ASSERT_EQ(cbm_compare_versions("0.2.1-dev", "0.2.1-dev"), 0);
     ASSERT(cbm_compare_versions("0.3.0", "0.2.1-dev") > 0);
     ASSERT(cbm_compare_versions("0.2.0", "0.2.1-dev") < 0);
+    ASSERT(cbm_compare_versions("0.8.1-bogyie.2", "0.8.1-bogyie.1") > 0);
+    ASSERT(cbm_compare_versions("0.8.1-bogyie.9", "0.8.1-bogyie.10") < 0);
+    ASSERT(cbm_compare_versions("0.8.1-bogyie.1", "0.8.1-bogyie.alpha") < 0);
+    ASSERT(cbm_compare_versions("0.8.1-bogyie.1.1", "0.8.1-bogyie.1") > 0);
+    ASSERT_EQ(cbm_compare_versions("v0.8.1-bogyie.1", "0.8.1-bogyie.1+build.7"), 0);
     PASS();
 }
 

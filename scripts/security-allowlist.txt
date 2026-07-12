@@ -50,10 +50,10 @@ src/ui/http_server.c:execl:exec indexing binary in child process
 
 # ── Allowed URLs ───────────────────────────────────────────────────────────
 # Format: URL:justification
-URL:https://api.github.com/repos/DeusData/codebase-memory-mcp/releases/latest:update check
-URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest/download:binary download + checksums
-URL:https://github.com/DeusData/codebase-memory-mcp/releases/latest:version check via redirect header
+URL:https://api.github.com/repos/bogyie/codebase-memory-mcp/releases/latest:update check
+URL:https://github.com/bogyie/codebase-memory-mcp/releases/latest/download:binary download + checksums
+URL:https://github.com/bogyie/codebase-memory-mcp/releases/latest:version check via redirect header
 URL:http://127.0.0.1:UI server binding (localhost only)
 URL:https://www.sqlite.org/c3ref/c_checkpoint_full.html:sqlite WAL checkpoint API doc reference (comment only, not a network call)
-URL:https://github.com/DeusData/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/mcp.c)
+URL:https://github.com/bogyie/codebase-memory-mcp:project repository self-reference in update/star notice (src/mcp/mcp.c)
 URL:https://%s:GitHub blob-URL construction in src/ui/http_server.c cbm_ui_git_web_base — https-forces the repo web base for frontend deep-links (not a network call)
