@@ -7,8 +7,14 @@
  *
  * Per-project state tracks:
  *   - Last git HEAD hash (detects commits, checkout, pull)
+ *   - Dirty-state signature (#937): porcelain entries + per-file size/mtime,
+ *     so a persistently dirty tree reindexes once per distinct state instead
+ *     of on every poll (write amplification)
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
+ *
+ * Baselines are committed only after a successful reindex; busy-skips and
+ * failed runs leave them untouched so the change is retried, never lost.
  *
  * Adaptive interval: 5s base + 1s per 500 files, capped at 60s.
  * Matches the Go watcher's `pollInterval()` logic.
@@ -38,7 +44,7 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char last_head[CBM_SZ_64]; /* git HEAD hash (committed baseline) */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
@@ -46,6 +52,14 @@ typedef struct {
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    /* Dirty-state signature (#937): a persistently dirty worktree must
+     * reindex once per DISTINCT dirty state, not on every poll. Baselines
+     * are committed only after a SUCCESSFUL reindex (busy-skips and failed
+     * runs retry); check_changes stages its observations in the pending_*
+     * fields. 0 = clean tree. */
+    uint64_t last_dirty_sig;      /* committed dirty-state signature */
+    uint64_t pending_dirty_sig;   /* observed at check time */
+    char pending_head[CBM_SZ_64]; /* HEAD observed at check time */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -150,64 +164,144 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return CBM_NOT_FOUND;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
+/* ── Dirty-state signature (#937) ───────────────────────────────── */
+
+#define SIG_FNV_OFFSET 1469598103934665603ULL
+#define SIG_FNV_PRIME 1099511628211ULL
+
+static uint64_t sig_fold(uint64_t h, const void *data, size_t len) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < len; i++) {
+        h ^= p[i];
+        h *= SIG_FNV_PRIME;
+    }
+    return h;
+}
+
+/* Platform-portable mtime_ns (mirrors pipeline_incremental.c). */
+static int64_t sig_stat_mtime_ns(const struct stat *st) {
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * NS_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+/* Fold a listed path's (size, mtime) into the signature so an in-place edit
+ * of an already-dirty file still produces a new signature. A failed stat
+ * (deleted file, quoting artifact) degrades to the entry text alone — the
+ * deletion itself is represented by the porcelain status. */
+static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char *rel) {
+    char abs[CBM_SZ_4K];
+    snprintf(abs, sizeof(abs), "%s/%s", root_path, rel);
+    struct stat st;
+    if (stat(abs, &st) == 0) {
+        int64_t mt = sig_stat_mtime_ns(&st);
+        int64_t sz = (int64_t)st.st_size;
+        h = sig_fold(h, &mt, sizeof(mt));
+        h = sig_fold(h, &sz, sizeof(sz));
+    }
+    return h;
+}
+
+/* Signature of the current dirty state: FNV-1a over the entries of
+ * `git status --porcelain -uall -z` plus each listed path's (size, mtime).
+ * Returns 0 for a clean tree. Two polls over an untouched dirty tree yield
+ * the same value; editing a dirty file, adding/removing one, or reverting
+ * the tree to clean each yield a new one. -uall lists files inside
+ * untracked directories individually (a nested addition under `?? dir/`
+ * would otherwise be invisible); -z gives unquoted NUL-separated paths that
+ * hash identically across polls and stat cleanly. */
+static uint64_t git_dirty_signature(const char *root_path) {
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>%s",
+    snprintf(cmd, sizeof(cmd), "git --no-optional-locks -C \"%s\" status --porcelain -uall -z 2>%s",
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        return false;
+        return 0;
     }
 
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    uint64_t h = SIG_FNV_OFFSET;
+    bool any = false;
+    char entry[CBM_SZ_4K];
+    size_t elen = 0;
+    bool overflow = false;
+    /* Rename/copy entries are followed by a second NUL token (the origin
+     * path) that carries no XY prefix — fold it as text, don't stat it. */
+    bool origin_token = false;
+    int c;
+    for (;;) {
+        c = fgetc(fp);
+        if (c != EOF && c != '\0') {
+            if (elen + 1 < sizeof(entry)) {
+                entry[elen] = (char)c;
+            } else {
+                overflow = true; /* keep hashing prefix; skip stat for entry */
+            }
+            elen++;
+            continue;
         }
-        if (len > 0) {
-            dirty = true;
+        size_t stored = elen < sizeof(entry) ? elen : sizeof(entry) - 1;
+        entry[stored] = '\0';
+        if (stored > 0) {
+            any = true;
+            h = sig_fold(h, entry, stored);
+            h = sig_fold(h, "", 1); /* token separator */
+            if (origin_token) {
+                origin_token = false;
+            } else if (!overflow && stored > 3 && entry[2] == ' ') {
+                if (entry[0] == 'R' || entry[0] == 'C') {
+                    origin_token = true;
+                }
+                h = sig_fold_path_stat(h, root_path, entry + 3);
+            }
+        }
+        elen = 0;
+        overflow = false;
+        if (c == EOF) {
+            break;
         }
     }
     cbm_pclose(fp);
-
-    if (dirty) {
-        return true;
-    }
 
 #if !defined(_WIN32)
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
-     * an inner shell command that cmd.exe cannot pass intact; the parent-repo
-     * status check above already covers the common (non-submodule) case. */
+    /* Submodules (POSIX-only, mirroring git_is_dirty): fold each submodule's
+     * porcelain output with paths re-rooted at the superproject so they stat
+     * correctly. Line mode here (foreach output is line-oriented); rename
+     * lines fail the stat and degrade to text-only. */
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
-             "2>/dev/null",
+             "'git status --porcelain -uall 2>/dev/null | "
+             "sed -e \"s@^\\(..\\) @\\1 $displaypath/@\"' 2>/dev/null",
              root_path);
     fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    if (fp) {
+        char line[CBM_SZ_4K];
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+                line[--len] = '\0';
+            }
+            if (len == 0) {
+                continue;
+            }
+            any = true;
+            h = sig_fold(h, line, len);
+            h = sig_fold(h, "", 1);
+            if (len > 3 && line[2] == ' ') {
+                h = sig_fold_path_stat(h, root_path, line + 3);
+            }
         }
-        if (len > 0) {
-            dirty = true;
-        }
+        cbm_pclose(fp);
     }
-    cbm_pclose(fp);
 #endif
-    return dirty;
+
+    if (!any) {
+        return 0;
+    }
+    return h ? h : 1; /* reserve 0 for "clean" */
 }
 
 /* Count tracked files via git ls-files */
@@ -497,6 +591,11 @@ static void init_baseline(project_state_t *s) {
 
     if (s->is_git) {
         git_head(s->root_path, s->last_head, sizeof(s->last_head));
+        /* last_dirty_sig stays 0 ("clean known"): a tree that is ALREADY
+         * dirty at baseline reindexes once on the first poll — the watcher
+         * cannot know whether that state made it into the DB (e.g. server
+         * restart with a stale artifact). At-least-once, then the signature
+         * gates further polls (#937). */
         s->file_count = git_file_count(s->root_path);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -508,25 +607,41 @@ static void init_baseline(project_state_t *s) {
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
-/* Check if a project has changes. Returns true if reindex needed. */
+/* Check if a project has changes. Returns true if reindex needed.
+ * Must NOT mutate the committed baselines (last_head, last_dirty_sig):
+ * poll_project commits them only after a SUCCESSFUL reindex so that
+ * busy-skips and failed runs retry instead of silently losing the change
+ * (#937). Observations are staged in the pending_* fields. */
 static bool check_changes(project_state_t *s) {
     if (!s->is_git) {
         return false;
     }
 
-    /* Check HEAD movement */
+    bool changed = false;
+
+    /* Check HEAD movement (commit, checkout, pull) */
+    s->pending_head[0] = '\0';
     char head[CBM_SZ_64] = {0};
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
-        if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-            return true;
+        if (s->last_head[0] == '\0') {
+            /* First observed HEAD: adopt as baseline, not a change. */
+            snprintf(s->last_head, sizeof(s->last_head), "%s", head);
+        } else if (strcmp(head, s->last_head) != 0) {
+            changed = true;
         }
-        strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+        snprintf(s->pending_head, sizeof(s->pending_head), "%s", head);
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* Working tree: reindex only when the DIRTY STATE ITSELF changed —
+     * a persistently dirty tree polled while idle must not re-trigger
+     * full reindex/write cycles (#937 write amplification). */
+    uint64_t sig = git_dirty_signature(s->root_path);
+    if (sig != s->last_dirty_sig) {
+        changed = true;
+    }
+    s->pending_dirty_sig = sig;
+
+    return changed;
 }
 
 /* Context for poll_once foreach callback */
@@ -637,11 +752,20 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Commit the baselines OBSERVED AT CHECK TIME — the state whose
+             * reindex just succeeded. A commit/edit landing during the
+             * reindex is deliberately not absorbed: the next poll sees it
+             * as a new delta (at-least-once, never lost). */
+            if (s->pending_head[0] != '\0') {
+                snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
+            }
+            s->last_dirty_sig = s->pending_dirty_sig;
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        } else if (rc > 0) {
+            /* Busy-skip: baseline stays uncommitted, next poll retries. */
+            cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }
