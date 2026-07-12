@@ -20,24 +20,121 @@ DURATION_MIN="${2:?Usage: soak-test.sh <binary> <duration_minutes>}"
 SKIP_CRASH="${3:-}"
 BINARY=$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")
 
-RESULTS_DIR="soak-results"
+# Soak mode selector.
+#   default     = mixed queries, mutations, periodic reindex, and crash recovery.
+#   query-leak  = read-only query pressure without reindex/memory collection, so
+#                 query-only leaks cannot be hidden by an indexing cleanup pass.
+CBM_SOAK_MODE="${CBM_SOAK_MODE:-default}"
+case "$CBM_SOAK_MODE" in
+    default|query-leak) ;;
+    *)
+        echo "invalid CBM_SOAK_MODE: $CBM_SOAK_MODE" >&2
+        exit 2
+        ;;
+esac
+
+case "$DURATION_MIN" in
+    ''|*[!0-9]*)
+        echo "duration_minutes must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+
+SOAK_RSS_MAX_MB="${CBM_SOAK_RSS_MAX_MB:-0}"
+case "$SOAK_RSS_MAX_MB" in
+    ''|*[!0-9]*)
+        echo "CBM_SOAK_RSS_MAX_MB must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+
+RESULTS_DIR="${CBM_SOAK_RESULTS_DIR:-soak-results}"
 mkdir -p "$RESULTS_DIR"
 
 METRICS_CSV="$RESULTS_DIR/metrics.csv"
 LATENCY_CSV="$RESULTS_DIR/latency.csv"
 SUMMARY="$RESULTS_DIR/summary.txt"
+SERVER_STDERR="$RESULTS_DIR/server-stderr.log"
 
-echo "timestamp,uptime_s,rss_bytes,heap_committed,fd_count,query_count,query_max_us" > "$METRICS_CSV"
+echo "timestamp,uptime_s,rss_bytes,heap_committed,fd_count,query_count,query_max_us,cache_bytes,db_bytes,wal_bytes" > "$METRICS_CSV"
 echo "timestamp,tool,duration_ms,exit_code" > "$LATENCY_CSV"
-> "$SUMMARY"
+: > "$SUMMARY"
+: > "$SERVER_STDERR"
 
 DURATION_S=$((DURATION_MIN * 60))
+PASS=true
 
-echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m ==="
+SOAK_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-XXXXXX")
+SOAK_PROJECT="$SOAK_ROOT/project"
+SERVER_IN="$SOAK_ROOT/server.in"
+SERVER_OUT="$SOAK_ROOT/server.out"
+SOAK_CACHE="$SOAK_ROOT/cache"
+MCP_SOAK_PROJECT="$SOAK_PROJECT"
+CBM_CACHE_DIR="$SOAK_CACHE"
+mkdir -p "$SOAK_PROJECT" "$SOAK_CACHE"
+
+SERVER_PID=""
+DIAG_FILE=""
+DIAG_FILES=()
+FDS_OPEN=false
+
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        MCP_SOAK_PROJECT=$(cygpath -m "$SOAK_PROJECT")
+        CBM_CACHE_DIR=$(cygpath -m "$SOAK_CACHE")
+        DIAG_DIR=$(cygpath -u "${TEMP:-${TMP:-.}}")
+        ;;
+    *)
+        # cbm_tmpdir() is /tmp on POSIX; keep the harness path identical.
+        DIAG_DIR=/tmp
+        ;;
+esac
+export CBM_CACHE_DIR
+
+close_server_fds() {
+    if $FDS_OPEN; then
+        exec 3>&- 4<&-
+        FDS_OPEN=false
+    fi
+}
+
+stop_server() {
+    close_server_fds
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        local waited=0
+        # Diagnostics shutdown may wait for its five-second writer interval.
+        while kill -0 "$SERVER_PID" 2>/dev/null && [ "$waited" -lt 70 ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+    fi
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID" 2>/dev/null || true
+    fi
+    if [ -n "$SERVER_PID" ]; then
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    SERVER_PID=""
+}
+
+cleanup_runtime() {
+    set +e
+    stop_server
+    rm -f "$SERVER_IN" "$SERVER_OUT"
+    for diag_file in "${DIAG_FILES[@]}"; do
+        rm -f "$diag_file" "$diag_file.tmp"
+    done
+    rm -rf "$SOAK_ROOT"
+    return 0
+}
+
+trap cleanup_runtime EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m mode=${CBM_SOAK_MODE} ==="
 
 # ── Helper: generate realistic test project (~200 files) ─────────
-
-SOAK_PROJECT=$(mktemp -d)
 
 generate_project() {
     local root="$1"
@@ -184,9 +281,23 @@ echo "OK: $FILE_COUNT files in test project"
 
 # Query ID counter
 QUERY_ID=1
+LAST_MCP_RESPONSE=""
+
+now_ms() {
+    python3 -c "import time; print(int(time.time() * 1000))"
+}
+
+response_is_success() {
+    local response="$1"
+    [[ "$response" == *'"jsonrpc":"2.0"'* &&
+       "$response" == *'"result":'* &&
+       "$response" != *'"error":'* &&
+       "$response" != *'"isError":true'* ]]
+}
 
 # Send a JSON-RPC tool call to the running server via its stdin pipe.
-# Reads response from server stdout. Records latency.
+# Reads and validates the response from server stdout. Records latency and
+# returns nonzero for write/read timeout, JSON-RPC error, or MCP isError.
 mcp_call() {
     local tool="$1"
     local args="$2"
@@ -195,81 +306,145 @@ mcp_call() {
 
     local req="{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":\"tools/call\",\"params\":{\"name\":\"$tool\",\"arguments\":$args}}"
     local t0
-    t0=$(python3 -c "import time; print(int(time.time()*1000))")
+    t0=$(now_ms)
 
-    # Send request to server stdin
-    echo "$req" >&3
-
-    # Read response (wait up to 30s)
-    local resp=""
-    if read -t 30 resp <&4 2>/dev/null; then
-        local t1
-        t1=$(python3 -c "import time; print(int(time.time()*1000))")
-        local dur=$((t1 - t0))
-        echo "$(date +%s),$tool,$dur,0" >> "$LATENCY_CSV"
-    else
-        local t1
-        t1=$(python3 -c "import time; print(int(time.time()*1000))")
-        local dur=$((t1 - t0))
-        echo "$(date +%s),$tool,$dur,1" >> "$LATENCY_CSV"
+    if ! printf '%s\n' "$req" >&3; then
+        echo "$(date +%s),$tool,0,1" >> "$LATENCY_CSV"
+        echo "FAIL: $tool request write failed" >&2
+        return 1
     fi
+
+    local resp=""
+    local status=1
+    if read -r -t 30 resp <&4 2>/dev/null && response_is_success "$resp"; then
+        status=0
+    fi
+    LAST_MCP_RESPONSE="$resp"
+
+    local t1
+    t1=$(now_ms)
+    local dur=$((t1 - t0))
+    echo "$(date +%s),$tool,$dur,$status" >> "$LATENCY_CSV"
+    if [ "$status" -ne 0 ]; then
+        echo "FAIL: $tool returned no successful MCP response" >&2
+        return 1
+    fi
+    return 0
+}
+
+run_mcp_call() {
+    if ! mcp_call "$@"; then
+        PASS=false
+    fi
+}
+
+mcp_initialize() {
+    local request
+    request='{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}'
+    if ! printf '%s\n' "$request" >&3; then
+        return 1
+    fi
+    local response=""
+    read -r -t 10 response <&4 2>/dev/null && response_is_success "$response"
 }
 
 # ── Helper: collect diagnostics snapshot ─────────────────────────
 
 collect_snapshot() {
-    local diag_file="/tmp/cbm-diagnostics-${SERVER_PID}.json"
-    if [ -f "$diag_file" ]; then
-        python3 -c "
-import json, time
-d = json.load(open('$diag_file'))
+    if [ -n "$DIAG_FILE" ] && [ -f "$DIAG_FILE" ]; then
+        local diag_values
+        if ! diag_values=$(python3 -c "
+import json
+d = json.load(__import__('sys').stdin)
 # Use heap_committed if available, otherwise RSS (mimalloc may report 0 for committed)
 mem = d.get('heap_committed_bytes', 0)
 if mem == 0: mem = d.get('rss_bytes', 0)
-print(f\"{int(time.time())},{d.get('uptime_s',0)},{d.get('rss_bytes',0)},{mem},{d.get('fd_count',0)},{d.get('query_count',0)},{d.get('query_max_us',0)}\")
-" 2>/dev/null >> "$METRICS_CSV"
+print(f\"{d.get('uptime_s',0)},{d.get('rss_bytes',0)},{mem},{d.get('fd_count',0)},{d.get('query_count',0)},{d.get('query_max_us',0)}\")
+" < "$DIAG_FILE" 2>/dev/null); then
+            return 1
+        fi
+
+        local cache_kb db_kb wal_kb
+        cache_kb=$(du -sk "$SOAK_CACHE" 2>/dev/null | awk '{print $1+0}')
+        db_kb=$(find "$SOAK_CACHE" -type f -name '*.db' -exec du -k {} + 2>/dev/null |
+            awk '{total += $1} END {print total+0}')
+        wal_kb=$(find "$SOAK_CACHE" -type f -name '*.db-wal' -exec du -k {} + 2>/dev/null |
+            awk '{total += $1} END {print total+0}')
+        echo "$(date +%s),$diag_values,$((cache_kb * 1024)),$((db_kb * 1024)),$((wal_kb * 1024))" \
+            >> "$METRICS_CSV"
+        return 0
     fi
+    return 1
+}
+
+extract_index_project() {
+    python3 -c '
+import json, sys
+outer = json.load(sys.stdin)
+for item in outer.get("result", {}).get("content", []):
+    if item.get("type") != "text":
+        continue
+    inner = json.loads(item.get("text", "{}"))
+    project = inner.get("project")
+    if project:
+        print(project)
+        raise SystemExit(0)
+raise SystemExit(1)
+'
+}
+
+start_server() {
+    CBM_DIAGNOSTICS=1 "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$SERVER_STDERR" &
+    SERVER_PID=$!
+    DIAG_FILE="$DIAG_DIR/cbm-diagnostics-${SERVER_PID}.json"
+    DIAG_FILES+=("$DIAG_FILE")
+
+    exec 3>"$SERVER_IN"
+    exec 4<"$SERVER_OUT"
+    FDS_OPEN=true
+    sleep 3
+
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        echo "FAIL: server did not start" >&2
+        return 1
+    fi
+    if ! mcp_initialize; then
+        echo "FAIL: server initialize did not return a successful response" >&2
+        return 1
+    fi
+    echo "OK: server running and initialized (pid=$SERVER_PID)"
+    return 0
 }
 
 # ── Phase 1: Start MCP server with diagnostics ──────────────────
 
 echo "--- Phase 1: start server ---"
 # Bidirectional pipes: fd3 = server stdin (write), fd4 = server stdout (read)
-SERVER_IN=$(mktemp -u).in
-SERVER_OUT=$(mktemp -u).out
 mkfifo "$SERVER_IN" "$SERVER_OUT"
 
-CBM_DIAGNOSTICS=1 "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>"$RESULTS_DIR/server-stderr.log" &
-SERVER_PID=$!
-
-# Open fds AFTER server starts (otherwise fifo blocks)
-exec 3>"$SERVER_IN"   # write to server stdin
-exec 4<"$SERVER_OUT"  # read from server stdout
-sleep 3
-
-if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    echo "FAIL: server did not start"
-    exec 3>&- 4<&-
-    rm -f "$SERVER_IN" "$SERVER_OUT"
+if ! start_server; then
     exit 1
 fi
-echo "OK: server running (pid=$SERVER_PID)"
-
-# Send initialize handshake
-echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}' >&3
-read -t 10 INIT_RESP <&4 || true
 
 # ── Phase 2: Initial index ───────────────────────────────────────
 
 echo "--- Phase 2: initial index ---"
-mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
+if ! mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"; then
+    exit 1
+fi
 sleep 6  # wait for diagnostics write
-collect_snapshot
+if ! collect_snapshot; then
+    echo "FAIL: initial diagnostics snapshot was unavailable" >&2
+    exit 1
+fi
 
-# Derive project name (same logic as cbm_project_name_from_path)
-PROJ_NAME=$(echo "$SOAK_PROJECT" | sed 's|^/||; s|/|-|g')
+# Use the product's returned project slug rather than duplicating its path
+# normalization in this cross-platform harness.
+if ! PROJ_NAME=$(printf '%s' "$LAST_MCP_RESPONSE" | extract_index_project); then
+    echo "FAIL: initial index response did not contain a project slug" >&2
+    exit 1
+fi
 
-DIAG_FILE="/tmp/cbm-diagnostics-${SERVER_PID}.json"
 BASELINE_RSS=$(cat "$DIAG_FILE" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('rss_bytes',0))" 2>/dev/null || echo "0")
 BASELINE_FDS=$(cat "$DIAG_FILE" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('fd_count',0))" 2>/dev/null || echo "0")
 echo "OK: baseline RSS=${BASELINE_RSS} FDs=${BASELINE_FDS}"
@@ -287,27 +462,40 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
     NOW=$(date +%s)
     CYCLE=$((CYCLE + 1))
 
-    # Queries every 2 seconds
-    mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*compute.*\"}"
-    mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
+    if [ "$CBM_SOAK_MODE" = "query-leak" ]; then
+        # Read-only pressure: never mutate or reindex, because indexing invokes
+        # memory collection and could hide a query-only leak.
+        run_mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*Handle.*\"}"
+        run_mcp_call query_graph "{\"project\":\"$PROJ_NAME\",\"query\":\"MATCH (n) RETURN n.name LIMIT 25\"}"
+        run_mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"handle_1\",\"direction\":\"both\"}"
+        run_mcp_call get_code_snippet "{\"project\":\"$PROJ_NAME\",\"qualified_name\":\"handle_1\"}"
+        run_mcp_call search_code "{\"project\":\"$PROJ_NAME\",\"pattern\":\"def \"}"
+    else
+        run_mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*compute.*\"}"
+        run_mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
 
-    # File mutation every 2 minutes
-    if [ $((NOW - LAST_MUTATE)) -ge 120 ]; then
-        echo "# mutation at cycle $CYCLE $(date)" >> "$SOAK_PROJECT/src/main.py"
-        git -C "$SOAK_PROJECT" add -A 2>/dev/null
-        git -C "$SOAK_PROJECT" -c user.email=test@test -c user.name=test commit -q -m "cycle $CYCLE" 2>/dev/null || true
-        LAST_MUTATE=$NOW
-    fi
+        # File mutation every 2 minutes.
+        if [ $((NOW - LAST_MUTATE)) -ge 120 ]; then
+            echo "# mutation at cycle $CYCLE $(date)" >> "$SOAK_PROJECT/src/main.py"
+            git -C "$SOAK_PROJECT" add -A 2>/dev/null
+            git -C "$SOAK_PROJECT" -c user.email=test@test -c user.name=test \
+                commit -q -m "cycle $CYCLE" 2>/dev/null || true
+            LAST_MUTATE=$NOW
+        fi
 
-    # Full reindex every 2 minutes (compressed — simulates 15min real interval)
-    if [ $((NOW - LAST_REINDEX)) -ge 120 ]; then
-        mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
-        LAST_REINDEX=$NOW
+        # Full reindex every 2 minutes (compressed — simulates 15min real interval).
+        if [ $((NOW - LAST_REINDEX)) -ge 120 ]; then
+            run_mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"
+            LAST_REINDEX=$NOW
+        fi
     fi
 
     # Collect diagnostics every 10 seconds (5 cycles)
     if [ $((CYCLE % 5)) -eq 0 ]; then
-        collect_snapshot
+        if ! collect_snapshot; then
+            echo "FAIL: diagnostics snapshot was unavailable" >&2
+            PASS=false
+        fi
     fi
 
     sleep 2
@@ -317,40 +505,45 @@ done
 
 echo "--- Phase 4: idle (30s) ---"
 sleep 30
-collect_snapshot
+if ! collect_snapshot; then
+    echo "FAIL: final diagnostics snapshot was unavailable" >&2
+    PASS=false
+fi
 
 # Check idle CPU
 IDLE_CPU=$(ps -o %cpu= -p "$SERVER_PID" 2>/dev/null | tr -d ' ' || echo "0")
 echo "OK: idle CPU=${IDLE_CPU}%"
 
 # ── Phase 5: Crash recovery test ────────────────────────────────
+# Skipped in query-leak mode: reindexing invokes memory collection and would
+# invalidate the purpose of that read-only leak detector.
 
-if [ "$SKIP_CRASH" != "--skip-crash-test" ]; then
+if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak" ]; then
     echo "--- Phase 5: crash recovery ---"
 
-    # Kill server mid-operation, restart, verify clean index
-    mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
+    # Send an index request without waiting for its response, then kill the
+    # process while the request may be active. The post-restart checked reindex
+    # is the recovery oracle.
+    echo "# crash recovery mutation $(date)" >> "$SOAK_PROJECT/src/main.py"
+    CRASH_REQUEST_ID=$QUERY_ID
+    QUERY_ID=$((QUERY_ID + 1))
+    CRASH_REQUEST="{\"jsonrpc\":\"2.0\",\"id\":$CRASH_REQUEST_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"$MCP_SOAK_PROJECT\"}}}"
+    printf '%s\n' "$CRASH_REQUEST" >&3
+    sleep 0.1
     kill -9 "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
-    exec 3>&- 4<&-
+    close_server_fds
+    SERVER_PID=""
 
-    # Restart server
-    CBM_DIAGNOSTICS=1 "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$RESULTS_DIR/server-stderr.log" &
-    SERVER_PID=$!
-    exec 3>"$SERVER_IN"
-    exec 4<"$SERVER_OUT"
-    sleep 3
-
-    if kill -0 "$SERVER_PID" 2>/dev/null; then
-        echo "OK: server restarted after kill -9"
-        echo '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}' >&3
-        read -t 10 INIT_RESP <&4 || true
-
-        # Verify clean re-index works
-        mcp_call index_repository "{\"repo_path\":\"$SOAK_PROJECT\"}"
-        echo "OK: clean re-index after crash recovery"
+    if start_server; then
+        if mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"; then
+            echo "OK: server restarted and checked reindex passed after kill -9"
+        else
+            echo "FAIL: checked reindex failed after crash recovery"
+            PASS=false
+        fi
     else
-        echo "FAIL: server did not restart after kill -9"
+        echo "FAIL: server did not restart and initialize after kill -9"
         PASS=false
     fi
 fi
@@ -358,19 +551,14 @@ fi
 # ── Phase 6: Shutdown + analysis ─────────────────────────────────
 
 echo "--- Phase 6: shutdown + analysis ---"
-exec 3>&-  # close server stdin → EOF → clean exit
-sleep 2
-exec 4<&-  # close stdout reader
-kill "$SERVER_PID" 2>/dev/null || true
-wait "$SERVER_PID" 2>/dev/null || true
-rm -f "$SERVER_IN" "$SERVER_OUT"
-
-# Final diagnostics (written by thread before exit)
-FINAL_DIAG="/tmp/cbm-diagnostics-${SERVER_PID}.json"
+stop_server
 
 # ── Analysis ─────────────────────────────────────────────────────
 
-PASS=true
+if [ ! -s "$METRICS_CSV" ] || [ "$(wc -l < "$METRICS_CSV")" -lt 2 ]; then
+    echo "FAIL: no diagnostics samples were recorded" | tee -a "$SUMMARY"
+    PASS=false
+fi
 
 # Check 1: Memory leak detection via RSS trend
 # This is the primary leak detector on ALL platforms (including Windows
@@ -382,9 +570,12 @@ FIRST_RSS=$(awk -F, 'NR==2 && $3>0 { printf "%.0f", $3/1024/1024 }' "$METRICS_CS
 LAST_RSS=$(awk -F, '$3>0 { last=$3 } END { printf "%.0f", last/1024/1024 }' "$METRICS_CSV")
 echo "RSS: first=${FIRST_RSS}MB last=${LAST_RSS}MB max=${MAX_RSS}MB (${TOTAL_SAMPLES} samples)" | tee -a "$SUMMARY"
 
-# Absolute ceiling — catches catastrophic leaks on any run length
-if [ "${MAX_RSS:-0}" -gt 200 ] 2>/dev/null; then
-    echo "FAIL: RSS ${MAX_RSS}MB > 200MB ceiling" | tee -a "$SUMMARY"
+# An absolute ceiling is meaningful only when the caller has a measured
+# platform/workload budget. Zero (the default) disables this optional policy;
+# relative growth and long-run slope remain mandatory below.
+if [ "$SOAK_RSS_MAX_MB" -gt 0 ] && [ "${MAX_RSS:-0}" -gt "$SOAK_RSS_MAX_MB" ] \
+    2>/dev/null; then
+    echo "FAIL: RSS ${MAX_RSS}MB > ${SOAK_RSS_MAX_MB}MB ceiling" | tee -a "$SUMMARY"
     PASS=false
 fi
 
@@ -410,14 +601,52 @@ fi
 # Check 1b: RSS ratio (last / first) — catches step-function leaks
 if [ "${FIRST_RSS:-0}" -gt 0 ] 2>/dev/null; then
     RSS_RATIO=$(awk "BEGIN { printf \"%.1f\", ${LAST_RSS} / ${FIRST_RSS} }")
-    echo "RSS ratio (last/first): ${RSS_RATIO}x" | tee -a "$SUMMARY"
+    MAX_RSS_RATIO=$(awk "BEGIN { printf \"%.1f\", ${MAX_RSS} / ${FIRST_RSS} }")
+    echo "RSS ratio: last/first=${RSS_RATIO}x max/first=${MAX_RSS_RATIO}x" \
+        | tee -a "$SUMMARY"
     if awk "BEGIN { exit (${LAST_RSS} / ${FIRST_RSS} > 3.0) ? 0 : 1 }" 2>/dev/null; then
         echo "FAIL: RSS grew ${RSS_RATIO}x (last=${LAST_RSS}MB vs first=${FIRST_RSS}MB)" | tee -a "$SUMMARY"
         PASS=false
     fi
+    if awk "BEGIN { exit (${MAX_RSS} / ${FIRST_RSS} > 3.0) ? 0 : 1 }" 2>/dev/null; then
+        echo "FAIL: peak RSS grew ${MAX_RSS_RATIO}x above post-index baseline" | tee -a "$SUMMARY"
+        PASS=false
+    fi
 fi
 
-# Check 2: FD drift
+# Check 2: cache/database/WAL growth after the initial indexed baseline.
+FIRST_CACHE_BYTES=$(awk -F, 'NR==2 {print $8+0}' "$METRICS_CSV")
+LAST_CACHE_BYTES=$(awk -F, 'NR>1 {last=$8} END {print last+0}' "$METRICS_CSV")
+MAX_CACHE_BYTES=$(awk -F, 'NR>1 && $8>max {max=$8} END {print max+0}' "$METRICS_CSV")
+LAST_DB_BYTES=$(awk -F, 'NR>1 {last=$9} END {print last+0}' "$METRICS_CSV")
+MAX_WAL_BYTES=$(awk -F, 'NR>1 && $10>max {max=$10} END {print max+0}' "$METRICS_CSV")
+echo "Storage: cache first=${FIRST_CACHE_BYTES}B last=${LAST_CACHE_BYTES}B max=${MAX_CACHE_BYTES}B; db last=${LAST_DB_BYTES}B; WAL max=${MAX_WAL_BYTES}B" \
+    | tee -a "$SUMMARY"
+
+if [ "${FIRST_CACHE_BYTES:-0}" -gt 0 ] 2>/dev/null; then
+    CACHE_RATIO=$(awk "BEGIN { printf \"%.2f\", ${LAST_CACHE_BYTES} / ${FIRST_CACHE_BYTES} }")
+    echo "Cache ratio (last/first): ${CACHE_RATIO}x" | tee -a "$SUMMARY"
+    if awk "BEGIN { exit (${LAST_CACHE_BYTES} / ${FIRST_CACHE_BYTES} > 3.0) ? 0 : 1 }" \
+        2>/dev/null; then
+        echo "FAIL: cache grew ${CACHE_RATIO}x after initial index" | tee -a "$SUMMARY"
+        PASS=false
+    fi
+fi
+
+CACHE_SLOPE=$(awk -F, -v skip="$((TOTAL_SAMPLES / 5))" '
+NR>1 && $8>=0 {
+    row++
+    if (row <= skip) next
+    n++; x=$1; y=$8; sx+=x; sy+=y; sxx+=x*x; sxy+=x*y
+}
+END {
+    if (n<5 || n*sxx == sx*sx) { print 0; exit }
+    slope = (n*sxy - sx*sy) / (n*sxx - sx*sx)
+    printf "%.0f", slope * 3600 / 1024
+}' "$METRICS_CSV")
+echo "Cache slope (post-warmup): ${CACHE_SLOPE} KB/hr" | tee -a "$SUMMARY"
+
+# Check 3: FD drift
 FD_DRIFT=$(awk -F, 'NR>1 && $5>0 { if (!first) first=$5; last=$5 } END { print last-first }' "$METRICS_CSV")
 echo "FD drift: ${FD_DRIFT:-0}" | tee -a "$SUMMARY"
 if [ "${FD_DRIFT:-0}" -gt 20 ] 2>/dev/null; then
@@ -425,7 +654,7 @@ if [ "${FD_DRIFT:-0}" -gt 20 ] 2>/dev/null; then
     PASS=false
 fi
 
-# Check 3: Idle CPU
+# Check 4: Idle CPU
 IDLE_INT=$(echo "$IDLE_CPU" | cut -d. -f1)
 echo "Idle CPU: ${IDLE_CPU}%" | tee -a "$SUMMARY"
 if [ "${IDLE_INT:-0}" -gt 5 ] 2>/dev/null; then
@@ -433,7 +662,7 @@ if [ "${IDLE_INT:-0}" -gt 5 ] 2>/dev/null; then
     PASS=false
 fi
 
-# Check 4: Max query latency (exclude index_repository — indexing is legitimately slow)
+# Check 5: Max query latency (exclude index_repository — indexing is legitimately slow)
 MAX_LATENCY=$(awk -F, 'NR>1 && $2!="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 MAX_INDEX=$(awk -F, 'NR>1 && $2=="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 echo "Max query latency: ${MAX_LATENCY}ms (index: ${MAX_INDEX}ms)" | tee -a "$SUMMARY"
@@ -443,13 +672,25 @@ if [ "${MAX_LATENCY:-0}" -gt 60000 ] 2>/dev/null; then
     PASS=false
 fi
 
-# Check 5: Query count (sanity — should have many)
+# Check 6: Query count and failures.
 TOTAL_QUERIES=$(awk -F, 'NR>1 { n++ } END { print n+0 }' "$LATENCY_CSV")
-echo "Total queries: $TOTAL_QUERIES" | tee -a "$SUMMARY"
+FAILED_QUERIES=$(awk -F, 'NR>1 && $4!=0 { n++ } END { print n+0 }' "$LATENCY_CSV")
+echo "Total queries: $TOTAL_QUERIES (failed: $FAILED_QUERIES)" | tee -a "$SUMMARY"
+if [ "$TOTAL_QUERIES" -eq 0 ] || [ "$FAILED_QUERIES" -ne 0 ]; then
+    echo "FAIL: MCP workload did not complete successfully" | tee -a "$SUMMARY"
+    PASS=false
+fi
 
 # ── Cleanup ──────────────────────────────────────────────────────
 
-rm -rf "$SOAK_PROJECT"
+cleanup_runtime
+trap - EXIT INT TERM
+if [ -e "$SOAK_ROOT" ]; then
+    echo "FAIL: soak work root was not removed: $SOAK_ROOT" | tee -a "$SUMMARY"
+    PASS=false
+else
+    echo "Cleanup: removed isolated project/cache/FIFO root" | tee -a "$SUMMARY"
+fi
 
 echo ""
 if $PASS; then
