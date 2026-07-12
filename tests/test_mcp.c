@@ -1132,6 +1132,83 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
+TEST(tool_search_graph_bm25_soft_source_first_ranking) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "bm25-source-first";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/bm25-source-first");
+
+    cbm_node_t node = {0};
+    node.project = proj;
+    node.label = "Function";
+    node.name = "hydrateCache";
+    node.start_line = 1;
+    node.end_line = 3;
+
+    node.qualified_name = "bm25.vendor.hydrateCache";
+    node.file_path = "vendored/cache.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.qualified_name = "bm25.test.hydrateCache";
+    node.file_path = "tests/cache_test.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.qualified_name = "bm25.source.hydrateCache";
+    node.file_path = "src/cache.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.name = "testSentinelGamma";
+    node.qualified_name = "bm25.test.testSentinelGamma";
+    node.file_path = "tests/only_test.c";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    cbm_store_exec(st, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    ASSERT_EQ(cbm_store_exec(st,
+                             "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                             "file_path) "
+                             "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                             "FROM nodes;"),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":553,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
+        "\"query\":\"hydrate cache\",\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *source_pos = strstr(inner, "src/cache.c");
+    const char *test_pos = strstr(inner, "tests/cache_test.c");
+    const char *vendor_pos = strstr(inner, "vendored/cache.c");
+    ASSERT_NOT_NULL(source_pos);
+    ASSERT_NOT_NULL(test_pos);
+    ASSERT_NOT_NULL(vendor_pos);
+    ASSERT_TRUE(source_pos < test_pos);
+    ASSERT_TRUE(test_pos < vendor_pos);
+    ASSERT_NOT_NULL(strstr(inner, "total_scope: candidate_window"));
+    ASSERT_NOT_NULL(strstr(inner, "ranking_policy: source_first_soft_penalty"));
+    ASSERT_NOT_NULL(strstr(inner, "scope"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"bm25-source-first\","
+        "\"query\":\"sentinel gamma\",\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "tests/only_test.c"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* MCP discovery methods this server doesn't populate must return EMPTY
  * lists, not -32601 Method-not-found: clients like Cline probe
  * resources/list + prompts/list + resources/templates/list on connect and
@@ -6095,6 +6172,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(tool_search_graph_bm25_soft_source_first_ranking);
     RUN_TEST(mcp_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);

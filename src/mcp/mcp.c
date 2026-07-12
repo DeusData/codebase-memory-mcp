@@ -363,17 +363,20 @@ static const tool_def_t TOOLS[] = {
      "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); pass format=\"json\" for "
      "legacy verbose objects (include_connected always uses JSON). "
      "PAGINATION: results are capped at limit (default 50). The response always includes "
-     "'total' (full match count before limit) and 'has_more' (true when total > "
+     "'total' and 'has_more' (true when total > "
      "offset+returned). Detect truncation with has_more, then page by re-calling with "
      "offset=offset+limit until has_more is false. Narrow first via label/file_pattern/"
-     "min_degree before paginating large result sets.",
+     "min_degree before paginating large result sets. For bounded BM25 queries, total_scope and "
+     "candidate_window make the count boundary explicit.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
      "indexed as individual words (updateCloudClient → update, cloud, client). Results are "
-     "ranked with structural boosting: Functions/Methods +10, Routes +8, Classes/Interfaces +5. "
-     "Noise labels (File/Folder/Module/Variable) are filtered out. When provided, name_pattern "
-     "is ignored.\"},"
+     "ranked with soft source-first penalties: tests and vendored/generated paths remain "
+     "searchable but rank below equivalent source hits. Structural boosts still apply: "
+     "Functions/Methods +10, Routes +8, Classes/Interfaces +5. Noise labels "
+     "(File/Folder/Module/Variable) are filtered out. BM25 results include source_scope. When "
+     "provided, name_pattern is ignored.\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
@@ -2222,6 +2225,7 @@ enum {
     BM25_COL_START = 5,
     BM25_COL_END = 6,
     BM25_COL_RANK = 7,
+    BM25_COL_SCOPE = 8,
     BM25_BIND_QUERY = 1,
     BM25_BIND_PROJECT = 2,
     BM25_BIND_LIMIT = 3,
@@ -2338,21 +2342,46 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * from the FTS5 index, then join/filter/boost only those rows.  bm25() returns a
      * NEGATIVE score (lower = more relevant). */
     const char *sql =
-        "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
-        "       (fts.base_rank "
-        "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
+        "SELECT scored.id, scored.label, scored.name, scored.qualified_name, scored.file_path, "
+        "       scored.start_line, scored.end_line, "
+        "       scored.structural_rank + "
+        "         CASE scored.source_scope WHEN 'test' THEN 6.0 "
+        "                                  WHEN 'vendor_generated' THEN 12.0 "
+        "                                  ELSE 0.0 END AS rank, "
+        "       scored.source_scope "
+        "FROM ("
+        "  SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
+        "         (fts.base_rank - "
+        "          CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN ('Class','Interface','Type','Enum') THEN 5.0 "
-        "               ELSE 0.0 END) AS rank "
-        "FROM ("
-        "    SELECT rowid, bm25(nodes_fts) AS base_rank"
-        "    FROM nodes_fts WHERE nodes_fts MATCH ?1"
-        "    ORDER BY base_rank LIMIT ?5"
-        ") fts "
-        "JOIN nodes n ON n.id = fts.rowid "
-        "WHERE n.project = ?2 "
-        "  AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
-        "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
+        "               ELSE 0.0 END) AS structural_rank, "
+        "         CASE "
+        "           WHEN n.file_path LIKE 'vendor/%' OR n.file_path LIKE '%/vendor/%' "
+        "             OR n.file_path LIKE 'vendored/%' OR n.file_path LIKE '%/vendored/%' "
+        "             OR n.file_path LIKE 'node_modules/%' "
+        "             OR n.file_path LIKE '%/node_modules/%' "
+        "             OR n.file_path LIKE 'third_party/%' OR n.file_path LIKE '%/third_party/%' "
+        "             OR n.file_path LIKE 'build/%' OR n.file_path LIKE '%/build/%' "
+        "             OR n.file_path LIKE 'dist/%' OR n.file_path LIKE '%/dist/%' "
+        "             OR n.file_path LIKE 'target/%' OR n.file_path LIKE '%/target/%' "
+        "             OR n.file_path LIKE '%/generated/%' THEN 'vendor_generated' "
+        "           WHEN n.file_path LIKE 'test/%' OR n.file_path LIKE '%/test/%' "
+        "             OR n.file_path LIKE 'tests/%' OR n.file_path LIKE '%/tests/%' "
+        "             OR n.file_path LIKE 'spec/%' OR n.file_path LIKE '%/spec/%' "
+        "             OR n.file_path LIKE '%_test.%' OR n.file_path LIKE '%.test.%' "
+        "             OR n.file_path LIKE '%.spec.%' THEN 'test' "
+        "           ELSE 'source' END AS source_scope "
+        "  FROM ("
+        "      SELECT rowid, bm25(nodes_fts) AS base_rank"
+        "      FROM nodes_fts WHERE nodes_fts MATCH ?1"
+        "      ORDER BY base_rank LIMIT ?5"
+        "  ) fts "
+        "  JOIN nodes n ON n.id = fts.rowid "
+        "  WHERE n.project = ?2 "
+        "    AND n.label NOT IN ('File','Folder','Module','Section','Variable','Project') "
+        "    AND (?6 IS NULL OR n.file_path LIKE ?6) "
+        ") scored "
         "ORDER BY rank "
         "LIMIT ?3 OFFSET ?4";
 
@@ -2429,6 +2458,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
             cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_FILE), false);
             cbm_toon_cell_str(&rows, lines, false);
             cbm_toon_cell_real(&rows, sqlite3_column_double(stmt, BM25_COL_RANK), false);
+            cbm_toon_cell_str(&rows, (const char *)sqlite3_column_text(stmt, BM25_COL_SCOPE), false);
             cbm_toon_row_end(&rows);
             emitted++;
         }
@@ -2438,9 +2468,12 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         cbm_sb_t sb;
         cbm_sb_init(&sb);
         cbm_toon_scalar_int(&sb, "total", total);
+        cbm_toon_scalar_str(&sb, "total_scope", "candidate_window");
+        cbm_toon_scalar_int(&sb, "candidate_window", BM25_INNER_LIMIT);
         cbm_toon_scalar_str(&sb, "search_mode", "bm25");
-        static const char *const cols[] = {"qn", "label", "file", "lines", "rank"};
-        cbm_toon_table_header(&sb, "results", emitted, cols, 5);
+        cbm_toon_scalar_str(&sb, "ranking_policy", "source_first_soft_penalty");
+        static const char *const cols[] = {"qn", "label", "file", "lines", "rank", "scope"};
+        cbm_toon_table_header(&sb, "results", emitted, cols, 6);
         char *rows_text = cbm_sb_finish(&rows);
         cbm_sb_append(&sb, rows_text ? rows_text : "");
         free(rows_text);
@@ -2452,7 +2485,10 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_int(doc, root, "total", total);
+    yyjson_mut_obj_add_str(doc, root, "total_scope", "candidate_window");
+    yyjson_mut_obj_add_int(doc, root, "candidate_window", BM25_INNER_LIMIT);
     yyjson_mut_obj_add_str(doc, root, "search_mode", "bm25");
+    yyjson_mut_obj_add_str(doc, root, "ranking_policy", "source_first_soft_penalty");
 
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     int emitted = 0;
@@ -2469,6 +2505,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
         yyjson_mut_obj_add_int(doc, item, "start_line", sqlite3_column_int(stmt, BM25_COL_START));
         yyjson_mut_obj_add_int(doc, item, "end_line", sqlite3_column_int(stmt, BM25_COL_END));
         yyjson_mut_obj_add_real(doc, item, "rank", sqlite3_column_double(stmt, BM25_COL_RANK));
+        yyjson_mut_obj_add_strcpy(doc, item, "source_scope",
+                                  (const char *)sqlite3_column_text(stmt, BM25_COL_SCOPE));
         yyjson_mut_arr_add_val(results, item);
         emitted++;
     }
