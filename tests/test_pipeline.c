@@ -9262,6 +9262,28 @@ static int write_incremental_c_header_impl_marker(int marker) {
     return th_write_file(path, body);
 }
 
+static int write_incremental_c_source_extra_call(int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/shared.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "#include \"shared.h\"\n\n"
+                 "static int shared_extra(void) {\n"
+                 "    return %d;\n"
+                 "}\n\n"
+                 "int shared_value(void) {\n"
+                 "    return SHARED_MARKER + shared_extra();\n"
+                 "}\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
 static int write_incremental_two_header_additive_fixture(int alpha_marker, int beta_marker,
                                                          bool include_extra) {
     enum {
@@ -10901,7 +10923,7 @@ TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild) {
     cbm_pipeline_free(p);
     ASSERT_NOT_NULL(project);
 
-    ASSERT_EQ(write_incremental_c_header_impl_marker(CBM_SZ_16), 0);
+    ASSERT_EQ(write_incremental_c_source_extra_call(CBM_SZ_16), 0);
 
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
@@ -10928,6 +10950,68 @@ TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "C source full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_configured_c_source_frontier_cap_allows_bounded_exact) {
+    enum { PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED = CBM_SZ_16 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+    ASSERT_EQ(write_incremental_c_header_second_level_callers(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d",
+                     PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_source_extra_call(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, CBM_ALLOC_ONE);
+    ASSERT_GT(stats.affected_paths, CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT(stats.affected_paths <= PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED);
+    ASSERT_EQ(stats.published_paths, stats.affected_paths);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "configured C source exact update differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -15768,6 +15852,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild);
+    RUN_TEST(incremental_fast_configured_c_source_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
     RUN_TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_visible);
     RUN_TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved);
