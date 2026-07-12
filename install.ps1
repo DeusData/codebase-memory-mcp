@@ -47,6 +47,7 @@ $Url = "$BaseUrl/$Archive"
 # Download
 $TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "cbm-install-$(Get-Random)"
 New-Item -ItemType Directory -Path $TmpDir -Force | Out-Null
+try {
 
 Write-Host "Downloading $Archive..."
 try {
@@ -102,26 +103,42 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 $Dest = Join-Path $InstallDir $BinName
 
 # Handle replace-if-running (rename-aside)
+$OldDest = $null
 if (Test-Path $Dest) {
-    $OldDest = "$Dest.old"
-    Remove-Item $OldDest -Force -ErrorAction SilentlyContinue
+    $OldCandidate = "$Dest.old"
+    Remove-Item $OldCandidate -Force -ErrorAction SilentlyContinue
     try {
-        Rename-Item $Dest $OldDest -ErrorAction Stop
+        Rename-Item $Dest $OldCandidate -ErrorAction Stop
+        $OldDest = $OldCandidate
     } catch {
-        Write-Host "warning: could not rename existing binary (may be in use)"
+        Write-Host "error: could not preserve existing binary for rollback: $_" -ForegroundColor Red
+        exit 1
     }
 }
 
-Copy-Item $DlBin $Dest -Force
-
-# Verify
+# Copy and verify before discarding the rollback candidate. Native executable
+# failures do not throw automatically in Windows PowerShell, so check the exit
+# code explicitly and restore the prior binary on every failed replacement.
 try {
+    Copy-Item $DlBin $Dest -Force
     $ver = & $Dest --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "installed binary exited with code $LASTEXITCODE"
+    }
     Write-Host "Installed: $ver"
 } catch {
-    Write-Host "error: installed binary failed to run" -ForegroundColor Red
-    Remove-Item -Recurse -Force $TmpDir
+    Write-Host "error: installed binary failed to run: $_" -ForegroundColor Red
+    if ($OldDest -and (Test-Path $OldDest)) {
+        Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+        Move-Item $OldDest $Dest -Force
+        Write-Host "Restored previous binary."
+    } elseif (Test-Path $Dest) {
+        Remove-Item $Dest -Force -ErrorAction SilentlyContinue
+    }
     exit 1
+}
+if ($OldDest -and (Test-Path $OldDest)) {
+    Remove-Item $OldDest -Force
 }
 
 # Configure agents
@@ -147,8 +164,8 @@ if ($UserPath -notlike "*$InstallDir*") {
     Write-Host "Added $InstallDir to user PATH"
 }
 
-# Cleanup
-Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
-
 Write-Host ""
 Write-Host "Done! Restart your terminal and coding agent to start using codebase-memory-mcp."
+} finally {
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+}

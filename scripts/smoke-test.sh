@@ -1586,6 +1586,9 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   PS1_TEST_HOME=$(mktemp -d)
   PS1_TEST_DIR=$(mktemp -d)
   mkdir -p "$PS1_TEST_HOME/.claude"
+  # Seed an existing install so the E2E path exercises rename-aside replacement
+  # and proves the successful installer does not orphan its rollback binary.
+  cp "$BINARY" "$PS1_TEST_DIR/codebase-memory-mcp.exe"
 
   # Convert MSYS paths to Windows paths for PowerShell
   if command -v cygpath &>/dev/null; then
@@ -1601,8 +1604,11 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   fi
 
   # 13f: run install.ps1
-  HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" \
-    powershell.exe -ExecutionPolicy ByPass -File "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1 || true
+  if ! HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" \
+    powershell.exe -ExecutionPolicy ByPass -File "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1; then
+    echo "FAIL 13f: install.ps1 returned an error"
+    exit 1
+  fi
 
   # 13g: binary placed
   PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp.exe"
@@ -1623,6 +1629,13 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
     echo "FAIL 13h: installed binary doesn't run"
     exit 1
   fi
+
+  # 13i: successful replacement must consume its rollback candidate.
+  if [ -e "$PS1_TEST_DIR/codebase-memory-mcp.exe.old" ]; then
+    echo "FAIL 13i: install.ps1 left an orphaned .old binary"
+    exit 1
+  fi
+  echo "OK 13i: install.ps1 cleaned replacement backup"
 
   rm -rf "$PS1_TEST_HOME" "$PS1_TEST_DIR"
 else
