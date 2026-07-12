@@ -41,7 +41,18 @@
 #define HA_MIN_TOKEN 4            /* skip short/noisy patterns before any work */
 #define HA_MAX_TOKEN 96
 #define HA_RESULT_LIMIT 5
-#define HA_MAX_WALKUP 8             /* cwd may be a subdir of the indexed root  */
+#define HA_MAX_WALKUP 8 /* cwd may be a subdir of the indexed root  */
+
+/* ── Hard deadline ────────────────────────────────────────────────
+ * A slow SQLite open or query must never stall the agent. When the timer
+ * fires we _exit(0) immediately. Output is written exactly once at the very
+ * end, so firing mid-work simply yields a clean no-op (no partial JSON).
+ *
+ * Observability (#858): a fired deadline is otherwise indistinguishable from
+ * "no matches", so the handler first write()s a pre-formatted breadcrumb to
+ * ~/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log (fd and message
+ * prepared at arm time — only async-signal-safe write/_exit in the handler). */
+#ifndef _WIN32
 #define HA_DEADLINE_DEFAULT_MS 2000 /* in-process budget; see ha_deadline_ms()  */
 #define HA_DEADLINE_MIN_MS 50
 #define HA_DEADLINE_MAX_MS 10000
@@ -50,7 +61,8 @@
  * starts (SQLite/mmap open under load), so augmentation never appeared in
  * real sessions (0/24 observed) while manual warm invocations worked. The
  * budget is now generous by default and env-configurable; the settings.json
- * hook "timeout" remains the outer backstop. */
+ * hook "timeout" remains the outer backstop (and alone governs Windows,
+ * where this whole in-process deadline block is compiled out). */
 static int ha_deadline_ms(void) {
     const char *env = getenv("CBM_HOOK_DEADLINE_MS");
     if (!env || !env[0]) {
@@ -66,16 +78,6 @@ static int ha_deadline_ms(void) {
     return v;
 }
 
-/* ── Hard deadline ────────────────────────────────────────────────
- * A slow SQLite open or query must never stall the agent. When the timer
- * fires we _exit(0) immediately. Output is written exactly once at the very
- * end, so firing mid-work simply yields a clean no-op (no partial JSON).
- *
- * Observability (#858): a fired deadline is otherwise indistinguishable from
- * "no matches", so the handler first write()s a pre-formatted breadcrumb to
- * ~/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log (fd and message
- * prepared at arm time — only async-signal-safe write/_exit in the handler). */
-#ifndef _WIN32
 static int g_ha_crumb_fd = -1;
 static char g_ha_crumb_msg[160];
 static size_t g_ha_crumb_len = 0;
