@@ -912,6 +912,10 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
                        "parse_partial");
         }
+        if (result->yaml_config_path_truncated) {
+            pp_err_add(errs, fi->rel_path, "nested YAML config paths capped at 512",
+                       "config_path_truncated");
+        }
 
         /* Create definition nodes in local gbuf */
         for (int d = 0; d < result->defs.count; d++) {

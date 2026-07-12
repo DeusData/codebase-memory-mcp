@@ -3081,7 +3081,6 @@ static bool prompt_yn(const char *question) {
 #define SHA256_HEX_LEN CBM_SZ_64
 #define SHA256_BUF_SIZE (SHA256_HEX_LEN + CLI_SKIP_ONE)
 /* Minimum line length in checksums.txt: 64 hex + 2 spaces + 1 char filename */
-#define CHECKSUM_LINE_MIN (SHA256_HEX_LEN + 2)
 
 /* Compute the SHA-256 of a file in-process (no external hashing tool — those
  * differ per OS, may be absent, and mis-quote paths under cmd.exe). Writes a
@@ -3179,6 +3178,49 @@ static int cbm_kill_other_instances(void) {
 
 /* Download checksums.txt and verify the archive integrity.
  * Returns: 0 = verified OK, 1 = mismatch (FAIL), -1 = could not verify (warning). */
+bool cbm_parse_release_checksum(const char *line, const char *archive_name, char *out,
+                                size_t out_size) {
+    if (out && out_size > 0) {
+        out[0] = '\0';
+    }
+    if (!line || !archive_name || !archive_name[0] || !out || out_size < SHA256_BUF_SIZE) {
+        return false;
+    }
+    size_t line_len = strlen(line);
+    if (line_len <= SHA256_HEX_LEN ||
+        (line[SHA256_HEX_LEN] != ' ' && line[SHA256_HEX_LEN] != '\t')) {
+        return false;
+    }
+    for (int i = 0; i < SHA256_HEX_LEN; i++) {
+        unsigned char c = (unsigned char)line[i];
+        if (!isxdigit(c)) {
+            return false;
+        }
+        out[i] = (char)tolower(c);
+    }
+    out[SHA256_HEX_LEN] = '\0';
+
+    const char *filename = line + SHA256_HEX_LEN;
+    while (*filename == ' ' || *filename == '\t') {
+        filename++;
+    }
+    if (*filename == '*') {
+        filename++;
+    }
+    size_t filename_len = strlen(filename);
+    while (filename_len > 0 &&
+           (filename[filename_len - SKIP_ONE] == '\r' ||
+            filename[filename_len - SKIP_ONE] == '\n')) {
+        filename_len--;
+    }
+    if (filename_len != strlen(archive_name) ||
+        strncmp(filename, archive_name, filename_len) != 0) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
 static int verify_download_checksum(const char *archive_path, const char *archive_name) {
     char checksum_file[CLI_BUF_256];
     snprintf(checksum_file, sizeof(checksum_file), "%s/cbm-checksums.txt", cbm_tmpdir());
@@ -3195,8 +3237,7 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     }
     int rc = cbm_download_to_file_quiet(checksum_url, checksum_file);
     if (rc != 0) {
-        (void)fprintf(stderr,
-                      "warning: could not download checksums.txt — skipping verification\n");
+        (void)fprintf(stderr, "error: could not download checksums.txt\n");
         cbm_unlink(checksum_file);
         return CLI_ERR;
     }
@@ -3210,17 +3251,14 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     char expected[SHA256_BUF_SIZE] = {0};
     char line[CLI_BUF_512];
     while (fgets(line, sizeof(line), fp)) {
-        /* Format: <CBM_SZ_64-char sha256>  <filename>\n */
-        if (strlen(line) > CHECKSUM_LINE_MIN && strstr(line, archive_name)) {
-            memcpy(expected, line, SHA256_HEX_LEN);
-            expected[SHA256_HEX_LEN] = '\0';
+        if (cbm_parse_release_checksum(line, archive_name, expected, sizeof(expected))) {
             break;
         }
     }
     (void)fclose(fp);
 
     if (expected[0] == '\0') {
-        (void)fprintf(stderr, "warning: %s not found in checksums.txt\n", archive_name);
+        (void)fprintf(stderr, "error: exact checksum entry for %s not found\n", archive_name);
         return CLI_ERR;
     }
 
@@ -3842,6 +3880,110 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     }
 }
 
+static bool install_receipt_value(const char *receipt, const char *key, char *out, size_t out_sz) {
+    if (!receipt || !key || !out || out_sz == 0) {
+        return false;
+    }
+    size_t key_len = strlen(key);
+    const char *line = receipt;
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        size_t line_len = end ? (size_t)(end - line) : strlen(line);
+        if (line_len > 0 && line[line_len - SKIP_ONE] == '\r') {
+            line_len--;
+        }
+        if (line_len > key_len + SKIP_ONE && strncmp(line, key, key_len) == 0 &&
+            line[key_len] == '=') {
+            size_t value_len = line_len - key_len - SKIP_ONE;
+            if (value_len == 0 || value_len >= out_sz) {
+                return false;
+            }
+            memcpy(out, line + key_len + SKIP_ONE, value_len);
+            out[value_len] = '\0';
+            return true;
+        }
+        if (!end) {
+            break;
+        }
+        line = end + SKIP_ONE;
+    }
+    return false;
+}
+
+int cbm_resolve_update_target(const char *home, const char *self_path, char *out, size_t out_size) {
+    if (!home || !home[0] || !self_path || !self_path[0] || !out || out_size == 0) {
+        return CLI_ERR;
+    }
+    out[0] = '\0';
+
+    char receipt_path[CLI_BUF_1K];
+    snprintf(receipt_path, sizeof(receipt_path), "%s/.config/codebase-memory-mcp/install.conf",
+             home);
+    size_t receipt_len = 0;
+    char *receipt = read_file_str(receipt_path, &receipt_len);
+    if (receipt && receipt_len > 0) {
+        const char *receipt_view = receipt;
+        if (receipt_len >= 3 && (unsigned char)receipt[0] == 0xef &&
+            (unsigned char)receipt[1] == 0xbb && (unsigned char)receipt[2] == 0xbf) {
+            receipt_view += 3;
+        }
+        char format[CLI_BUF_8] = {0};
+        char method[CLI_BUF_32] = {0};
+        char repository[CLI_BUF_256] = {0};
+        char install_path[CLI_BUF_1K] = {0};
+        bool valid = install_receipt_value(receipt_view, "format", format, sizeof(format)) &&
+                     strcmp(format, "1") == 0 &&
+                     install_receipt_value(receipt_view, "method", method, sizeof(method)) &&
+                     strcmp(method, "official-script") == 0 &&
+                     install_receipt_value(receipt_view, "repository", repository,
+                                           sizeof(repository)) &&
+                     strcmp(repository, CBM_GITHUB_REPOSITORY) == 0 &&
+                     install_receipt_value(receipt_view, "install_path", install_path,
+                                           sizeof(install_path));
+        free(receipt);
+        if (!valid || strchr(install_path, '\n') || strchr(install_path, '\r') ||
+            strlen(install_path) >= out_size || !cbm_same_file(self_path, install_path)) {
+            return CLI_ERR;
+        }
+        snprintf(out, out_size, "%s", install_path);
+        return out[0] ? CLI_OK : CLI_ERR;
+    }
+    free(receipt);
+
+    /* Backward-compatible fallback for `codebase-memory-mcp install`, which
+     * owns the canonical target even before install receipts existed. Do not
+     * infer ownership for Homebrew/npm/PyPI or arbitrary PATH entries. */
+    char canonical[CLI_BUF_1K];
+#ifdef _WIN32
+    snprintf(canonical, sizeof(canonical), "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+    snprintf(canonical, sizeof(canonical), "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+    if (!cbm_same_file(self_path, canonical)) {
+        return CLI_ERR;
+    }
+    if (strlen(canonical) >= out_size) {
+        return CLI_ERR;
+    }
+    snprintf(out, out_size, "%s", canonical);
+    return CLI_OK;
+}
+
+static void parent_dir_copy(const char *path, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s", path ? path : "");
+    cbm_normalize_path_sep(out);
+    char *slash = strrchr(out, '/');
+    if (slash) {
+        if (slash == out) {
+            slash[SKIP_ONE] = '\0';
+        } else {
+            *slash = '\0';
+        }
+    } else {
+        out[0] = '\0';
+    }
+}
+
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
  * the config / instruction / hook files `install` WOULD write, produced by
  * running the real install dispatch in record-only mode (no mutation, no
@@ -3930,6 +4072,7 @@ int cbm_cmd_install(int argc, char **argv) {
     bool force = false;
     bool plan = false;
     bool reset_indexes = false;
+    bool managed_path = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -3939,6 +4082,9 @@ int cbm_cmd_install(int argc, char **argv) {
         }
         if (strcmp(argv[i], "--plan") == 0) {
             plan = true;
+        }
+        if (strcmp(argv[i], "--managed-path") == 0) {
+            managed_path = true;
         }
         /* Opt-in: delete existing indexes during install. Default preserves
          * the indexed graph (#607). Only this flag triggers deletion. */
@@ -3995,11 +4141,15 @@ int cbm_cmd_install(int argc, char **argv) {
     cbm_detect_self_path(self_path, sizeof(self_path), home);
 
     char bin_target[CLI_BUF_1K];
+    if (managed_path) {
+        snprintf(bin_target, sizeof(bin_target), "%s", self_path);
+    } else {
 #ifdef _WIN32
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", home);
+        snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe", home);
 #else
-    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
+        snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", home);
 #endif
+    }
 
     if (!cbm_same_file(self_path, bin_target)) {
         struct stat tgt_st;
@@ -4051,7 +4201,7 @@ int cbm_cmd_install(int argc, char **argv) {
 
     /* Step 4: Ensure PATH */
     char bin_dir[CLI_BUF_1K];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    parent_dir_copy(bin_target, bin_dir, sizeof(bin_dir));
     const char *rc = cbm_detect_shell_rc(home);
     if (rc[0]) {
         int path_rc = cbm_ensure_path(bin_dir, rc, dry_run);
@@ -4588,6 +4738,16 @@ int cbm_cmd_update(int argc, char **argv) {
         return 0;
     }
 
+    char self_path[CLI_BUF_1K] = {0};
+    char bin_dest[CLI_BUF_1K] = {0};
+    cbm_detect_self_path(self_path, sizeof(self_path), home);
+    if (cbm_resolve_update_target(home, self_path, bin_dest, sizeof(bin_dest)) != CLI_OK) {
+        (void)fprintf(stderr,
+                      "error: this installation is not owned by the official installer.\n"
+                      "Update it with its package manager, or reinstall using install.sh/install.ps1.\n");
+        return CLI_TRUE;
+    }
+
     /* Step 1: Check for existing indexes */
     if (update_clear_indexes(home, dry_run) != 0) {
         return CLI_TRUE;
@@ -4618,7 +4778,7 @@ int cbm_cmd_update(int argc, char **argv) {
 
     if (dry_run) {
         printf("\n(dry-run — skipping download, extraction, and binary replacement)\n");
-        printf("  target: %s/.local/bin/codebase-memory-mcp\n", home);
+        printf("  target: %s\n", bin_dest);
         printf("  variant: %s\n", variant_label);
         printf("  os/arch: %s/%s\n", os, arch);
         printf("\nUpdate dry-run complete.\n");
@@ -4627,14 +4787,8 @@ int cbm_cmd_update(int argc, char **argv) {
     }
 
     /* Step 4-5: Download, verify, and install binary */
-    char bin_dest[CLI_BUF_1K];
-#ifdef _WIN32
-    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp.exe", home);
-#else
-    snprintf(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp", home);
-#endif
     char bin_dir[CLI_BUF_1K];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    parent_dir_copy(bin_dest, bin_dir, sizeof(bin_dir));
     cbm_mkdir_p(bin_dir, CLI_OCTAL_PERM);
 
     int rc = download_verify_install(url, ext, os, arch, want_ui, bin_dest);

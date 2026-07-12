@@ -1015,8 +1015,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     } else if (check_store) {
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-    /* Capture any ADR before deleting the DB so the full-reindex rebuild can
+    cbm_log_info("pipeline.route", "path", "reindex", "action", "staging replacement db");
+    /* Capture any ADR before rebuilding so the staged full-reindex can
      * restore it (project_summaries is otherwise lost). Issue #516. */
     {
         cbm_store_t *adr_store = cbm_store_open_path(db_path);
@@ -1032,13 +1032,9 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
             cbm_store_close(adr_store);
         }
     }
-    cbm_unlink(db_path);
-    char wal[PL_WAL_BUF];
-    char shm[PL_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    /* Keep the last completed database in place. dump_and_persist_hashes writes
+     * the replacement to a sibling staging path and atomically installs it only
+     * after hashes, coverage, FTS and the completion marker all succeed. */
     free(db_path);
     return CBM_NOT_FOUND;
 }
@@ -1082,20 +1078,35 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
      * committed_nodes at 0, so the #334 plausibility gate never fired. */
     p->committed_nodes = cbm_gbuf_node_count(p->gbuf);
     p->committed_edges = cbm_gbuf_edge_count(p->gbuf);
-    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+    char staged_path[CBM_SZ_2K];
+    if (snprintf(staged_path, sizeof(staged_path), "%s.building", db_path) >=
+        (int)sizeof(staged_path)) {
+        return CBM_STORE_ERR;
+    }
+    cbm_unlink(staged_path);
+    cbm_remove_db_sidecars(staged_path);
+
+    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, staged_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
+        cbm_unlink(staged_path);
+        cbm_remove_db_sidecars(staged_path);
         return rc;
     }
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
     /* Persist-tail spans (phase "persist"): attribute the ~60s that lands here
      * AFTER cbm_gbuf_dump_to_sqlite returns. Active only under CBM_PROFILE. */
     CBM_PROF_START(t_reopen);
-    cbm_store_t *hash_store = cbm_store_open_path(db_path);
+    cbm_store_t *hash_store = cbm_store_open_path(staged_path);
     CBM_PROF_END("persist", "1_reopen", t_reopen);
     if (hash_store) {
+        bool persist_ok = true;
         CBM_PROF_START(t_delhash);
-        cbm_store_delete_file_hashes(hash_store, p->project_name);
+        if (cbm_store_delete_file_hashes(hash_store, p->project_name) != CBM_STORE_OK) {
+            persist_ok = false;
+            cbm_log_error("pipeline.err", "phase", "delete_file_hashes", "project",
+                          p->project_name);
+        }
         CBM_PROF_END("persist", "2_delete_file_hashes", t_delhash);
 
         /* Restore the ADR captured before the dump. Surface a failed restore
@@ -1103,6 +1114,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         CBM_PROF_START(t_adr);
         if (p->saved_adr) {
             if (cbm_store_adr_store(hash_store, p->project_name, p->saved_adr) != CBM_STORE_OK) {
+                persist_ok = false;
                 cbm_log_error("pipeline.err", "phase", "adr_restore", "project", p->project_name);
             }
         }
@@ -1128,9 +1140,14 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                     fhashes[fh_n].mtime_ns = stat_mtime_ns(&fst);
                     fhashes[fh_n].size = fst.st_size;
                     fh_n++;
+                } else {
+                    persist_ok = false;
+                    cbm_log_error("pipeline.err", "phase", "stat_file_hash", "path",
+                                  files[i].rel_path);
                 }
             }
             if (cbm_store_upsert_file_hash_batch(hash_store, fhashes, fh_n) != CBM_STORE_OK) {
+                persist_ok = false;
                 cbm_log_error("pipeline.err", "phase", "persist_file_hashes", "project",
                               p->project_name);
             }
@@ -1140,8 +1157,13 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             for (int i = 0; i < file_count; i++) {
                 struct stat fst;
                 if (stat(files[i].path, &fst) == 0) {
-                    cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
-                                               stat_mtime_ns(&fst), fst.st_size);
+                    if (cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path,
+                                                   "", stat_mtime_ns(&fst), fst.st_size) !=
+                        CBM_STORE_OK) {
+                        persist_ok = false;
+                    }
+                } else {
+                    persist_ok = false;
                 }
             }
         }
@@ -1180,10 +1202,15 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                 }
                 if (cbm_store_coverage_replace(hash_store, p->project_name, cov, cn) !=
                     CBM_STORE_OK) {
+                    persist_ok = false;
                     cbm_log_error("pipeline.err", "phase", "persist_coverage", "project",
                                   p->project_name);
                 }
                 free(cov);
+            } else {
+                persist_ok = false;
+                cbm_log_error("pipeline.err", "phase", "persist_coverage_oom", "project",
+                              p->project_name);
             }
         }
         if (p->ignored_total > p->ignored_count) {
@@ -1197,33 +1224,56 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
          * Falls back to plain names if cbm_camel_split is unavailable (which
          * shouldn't happen because we always register it, but we stay defensive). */
         CBM_PROF_START(t_fts);
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
+        if (cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
+            CBM_STORE_OK) {
+            persist_ok = false;
+        }
+        if (persist_ok && cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
                            "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
                            "FROM nodes;") != CBM_STORE_OK) {
-            cbm_store_exec(hash_store,
+            if (cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+                               "SELECT id, name, qualified_name, label, file_path FROM nodes;") !=
+                CBM_STORE_OK) {
+                persist_ok = false;
+            }
         }
         CBM_PROF_END("persist", "5_fts_backfill", t_fts);
 
         /* Publish the completion marker last. Cached MCP readers use this to
          * distinguish a fully persisted graph from a DB being rebuilt. */
-        if (cbm_store_mark_index_complete(hash_store, p->project_name) != CBM_STORE_OK) {
+        if (!persist_ok ||
+            cbm_store_mark_index_complete(hash_store, p->project_name) != CBM_STORE_OK ||
+            cbm_store_checkpoint(hash_store) != CBM_STORE_OK) {
             cbm_log_error("pipeline.err", "phase", "publish_snapshot", "project",
                           p->project_name);
             cbm_store_close(hash_store);
+            cbm_unlink(staged_path);
+            cbm_remove_db_sidecars(staged_path);
             free(p->saved_adr);
             p->saved_adr = NULL;
             return CBM_STORE_ERR;
         }
 
         cbm_store_close(hash_store);
+        cbm_remove_db_sidecars(staged_path);
+        cbm_remove_db_sidecars(db_path);
+        if (cbm_rename_replace(staged_path, db_path) != 0) {
+            cbm_log_error("pipeline.err", "phase", "install_snapshot", "project",
+                          p->project_name);
+            cbm_unlink(staged_path);
+            cbm_remove_db_sidecars(staged_path);
+            free(p->saved_adr);
+            p->saved_adr = NULL;
+            return CBM_STORE_ERR;
+        }
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     } else {
         cbm_log_error("pipeline.err", "phase", "reopen_persisted_db", "project",
                       p->project_name);
+        cbm_unlink(staged_path);
+        cbm_remove_db_sidecars(staged_path);
         free(p->saved_adr);
         p->saved_adr = NULL;
         return CBM_STORE_ERR;

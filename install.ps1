@@ -30,6 +30,10 @@ foreach ($arg in $args) {
     if ($arg -eq "--skip-config") { $SkipConfig = $true }
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
+if ($InstallDir -match "[`r`n]") {
+    Write-Host "error: install directory must not contain newlines" -ForegroundColor Red
+    exit 1
+}
 
 # Detect the OS architecture. RuntimeInformation.OSArchitecture reports the real
 # OS arch (Arm64) even from an x64 process running under emulation on ARM64 --
@@ -81,25 +85,31 @@ try {
 }
 
 
-# Checksum verification
+# Checksum verification. Official installs fail closed.
 $ChecksumUrl = "$BaseUrl/checksums.txt"
 try {
     Invoke-WebRequest -Uri $ChecksumUrl -OutFile "$TmpDir\checksums.txt" -UseBasicParsing
     $checksumLine = Get-Content "$TmpDir\checksums.txt" | Where-Object { $_ -like "*$Archive*" }
-    if ($checksumLine) {
-        $expected = ($checksumLine -split '\s+')[0]
-        $actual = (Get-FileHash -Path "$TmpDir\$Archive" -Algorithm SHA256).Hash.ToLower()
-        if ($expected -ne $actual) {
-            Write-Host "error: CHECKSUM MISMATCH!" -ForegroundColor Red
-            Write-Host "  expected: $expected"
-            Write-Host "  actual:   $actual"
-            Remove-Item -Recurse -Force $TmpDir
-            exit 1
-        }
-        Write-Host "Checksum verified."
+    if (-not $checksumLine) {
+        throw "checksum entry missing for $Archive"
     }
+    $exactLine = $checksumLine | Where-Object { ($_ -split '\s+', 2)[1] -eq $Archive } | Select-Object -First 1
+    if (-not $exactLine) {
+        throw "exact checksum entry missing for $Archive"
+    }
+    $expected = ($exactLine -split '\s+')[0].ToLower()
+    if ($expected -notmatch '^[0-9a-f]{64}$') {
+        throw "invalid SHA-256 checksum entry for $Archive"
+    }
+    $actual = (Get-FileHash -Path "$TmpDir\$Archive" -Algorithm SHA256).Hash.ToLower()
+    if ($expected -ne $actual) {
+        throw "CHECKSUM MISMATCH (expected $expected, actual $actual)"
+    }
+    Write-Host "Checksum verified."
 } catch {
-    Write-Host "warning: could not verify checksum (non-fatal)"
+    Write-Host "error: checksum verification failed: $_" -ForegroundColor Red
+    Remove-Item -Recurse -Force $TmpDir -ErrorAction SilentlyContinue
+    exit 1
 }
 
 # Extract
@@ -122,6 +132,7 @@ if (-not (Test-Path $DlBin)) {
 
 # Install
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
+$InstallDir = (Resolve-Path -LiteralPath $InstallDir).Path
 $Dest = Join-Path $InstallDir $BinName
 
 # Handle replace-if-running (rename-aside)
@@ -147,6 +158,19 @@ try {
     exit 1
 }
 
+# Record the path owned by the official installer. Self-update refuses to
+# overwrite package-manager binaries when this receipt is absent.
+$ManifestDir = Join-Path $HOME ".config\codebase-memory-mcp"
+$Manifest = Join-Path $ManifestDir "install.conf"
+New-Item -ItemType Directory -Path $ManifestDir -Force | Out-Null
+@(
+    "format=1"
+    "method=official-script"
+    "repository=$Repo"
+    "variant=$Variant"
+    "install_path=$Dest"
+) | Set-Content -Path $Manifest -Encoding UTF8
+
 # Configure agents
 if ($SkipConfig) {
     Write-Host ""
@@ -154,7 +178,7 @@ if ($SkipConfig) {
 } else {
     Write-Host ""
     Write-Host "Configuring coding agents..."
-    & $Dest install -y 2>&1 | Write-Host
+    & $Dest install -y --managed-path 2>&1 | Write-Host
     if ($LASTEXITCODE -ne 0) {
         Write-Host ""
         Write-Host "error: agent configuration failed (exit code $LASTEXITCODE)" -ForegroundColor Red

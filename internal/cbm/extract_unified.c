@@ -642,12 +642,16 @@ static void emit_yaml_leaf_value(CBMExtractCtx *ctx, TSNode val, const char *pat
 enum { YAML_CONFIG_DEF_CAP = 512 };
 
 static void emit_yaml_nested_definition(CBMExtractCtx *ctx, TSNode pair, const char *name,
-                                        const char *path, int *emitted) {
+                                        const char *path) {
     const char *base = strrchr(ctx->rel_path, '/');
     base = base ? base + SKIP_ONE : ctx->rel_path;
-    if (!path || !strchr(path, '.') || *emitted >= YAML_CONFIG_DEF_CAP ||
-        strcmp(base, "values.yaml") == 0 || strcmp(base, "values.yml") == 0) {
+    if (!path || !strchr(path, '.') || strcmp(base, "values.yaml") == 0 ||
+        strcmp(base, "values.yml") == 0) {
         return; /* top-level keys are emitted by extract_vars_config */
+    }
+    if (ctx->result->yaml_config_defs_emitted >= YAML_CONFIG_DEF_CAP) {
+        ctx->result->yaml_config_path_truncated = true;
+        return;
     }
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
@@ -660,7 +664,7 @@ static void emit_yaml_nested_definition(CBMExtractCtx *ctx, TSNode pair, const c
     def.start_line = ts_node_start_point(pair).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(pair).row + TS_LINE_OFFSET;
     cbm_defs_push(&ctx->result->defs, ctx->arena, def);
-    (*emitted)++;
+    ctx->result->yaml_config_defs_emitted++;
 }
 
 typedef struct {
@@ -685,7 +689,6 @@ static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_fra
 static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_prefix) {
     yaml_walk_frame_t stack[YAML_WALK_STACK_CAP];
     int top = 0;
-    int emitted_config_defs = 0;
     stack[top++] = (yaml_walk_frame_t){root, root_prefix};
 
     while (top > 0) {
@@ -708,7 +711,7 @@ static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_
             }
             const char *path =
                 prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, key_text) : key_text;
-            emit_yaml_nested_definition(ctx, child, key_text, path, &emitted_config_defs);
+            emit_yaml_nested_definition(ctx, child, key_text, path);
             TSNode val = ts_node_child_by_field_name(child, TS_FIELD("value"));
             if (ts_node_is_null(val)) {
                 continue;

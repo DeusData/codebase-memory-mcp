@@ -136,6 +136,17 @@ TEST(gbuf_delete_by_label) {
     ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.bar"));
     ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "pkg.Baz"));
 
+    /* Reusing a deleted QN must not revive the tombstoned node during a later
+     * dump/flush. This is the incremental Design Context replacement shape. */
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "foo2", "pkg.foo", "new.go", 1, 3, "{}"),
+              0);
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 2);
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_gbuf_flush_to_store(gb, store), 0);
+    ASSERT_EQ(cbm_store_count_nodes(store, "test"), 2);
+    cbm_store_close(store);
+
     cbm_gbuf_free(gb);
     PASS();
 }

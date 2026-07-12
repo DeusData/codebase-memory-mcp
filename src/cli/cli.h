@@ -10,6 +10,7 @@
 #define CBM_CLI_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* ── Version ──────────────────────────────────────────────────── */
 
@@ -41,6 +42,17 @@ int cbm_cli_print_tool_help(const char *tool_name);
  * Returns >0 if a > b, <0 if a < b, 0 if equal.
  * Handles v-prefix and -dev suffix. */
 int cbm_compare_versions(const char *a, const char *b);
+
+/* Parse one checksums.txt line and return the normalized SHA-256 only when the
+ * filename is an exact match. Accepts the common "hash  file" and
+ * "hash *file" forms. */
+bool cbm_parse_release_checksum(const char *line, const char *archive_name, char *out,
+                                size_t out_size);
+
+/* Resolve the binary path owned by the official installer. A valid install
+ * receipt wins; without one, only the canonical ~/.local/bin target is
+ * self-updatable. Returns 0 on success, -1 for unmanaged installations. */
+int cbm_resolve_update_target(const char *home, const char *self_path, char *out, size_t out_size);
 
 /* ── Shell RC detection ───────────────────────────────────────── */
 

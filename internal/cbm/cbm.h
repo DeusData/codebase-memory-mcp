@@ -459,6 +459,8 @@ typedef struct {
     bool parse_incomplete;
     const char *error_ranges;
     int error_region_count;
+    int yaml_config_defs_emitted;      // nested YAML config-path definitions retained
+    bool yaml_config_path_truncated;   // per-file YAML_CONFIG_DEF_CAP was reached
     bool is_test_file;
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)

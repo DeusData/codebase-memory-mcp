@@ -933,6 +933,38 @@ TEST(yaml_variables) {
     PASS();
 }
 
+TEST(yaml_config_path_cap_is_shared_across_documents) {
+    size_t cap = 65536;
+    char *source = malloc(cap);
+    ASSERT_NOT_NULL(source);
+    size_t pos = 0;
+    pos += (size_t)snprintf(source + pos, cap - pos, "---\nfirst:\n");
+    for (int i = 0; i < 300; i++) {
+        pos += (size_t)snprintf(source + pos, cap - pos, "  key_%03d: value\n", i);
+    }
+    pos += (size_t)snprintf(source + pos, cap - pos, "---\nsecond:\n");
+    for (int i = 0; i < 300; i++) {
+        pos += (size_t)snprintf(source + pos, cap - pos, "  key_%03d: value\n", i);
+    }
+    ASSERT_LT(pos, cap);
+
+    CBMFileResult *r = extract(source, CBM_LANG_YAML, "t", "multi.yml");
+    free(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->yaml_config_defs_emitted, 512);
+    ASSERT_TRUE(r->yaml_config_path_truncated);
+    int config_defs = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].config_path && strchr(r->defs.items[i].config_path, '.')) {
+            config_defs++;
+        }
+    }
+    ASSERT_EQ(config_defs, 512);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- HCL --- */
 TEST(hcl_blocks) {
     CBMFileResult *r = extract("resource \"aws_instance\" \"web\" {\n  ami = \"abc-123\"\n  "
@@ -3586,6 +3618,7 @@ SUITE(extraction) {
 
     /* Markup/Config */
     RUN_TEST(yaml_variables);
+    RUN_TEST(yaml_config_path_cap_is_shared_across_documents);
     RUN_TEST(hcl_blocks);
     RUN_TEST(sql_create_table);
     RUN_TEST(dockerfile_stages);

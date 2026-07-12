@@ -1281,6 +1281,119 @@ TEST(cli_install_same_file_guard_issue472) {
     PASS();
 }
 
+TEST(cli_update_target_uses_official_install_receipt) {
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-update-receipt-XXXXXX");
+    if (!cbm_mkdtemp(home))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/codebase-memory-mcp", home);
+    ASSERT(cbm_mkdir_p(config_dir, 0755) >= 0);
+    char receipt[512];
+    snprintf(receipt, sizeof(receipt), "%s/install.conf", config_dir);
+    char managed_dir[512];
+    snprintf(managed_dir, sizeof(managed_dir), "%s/custom/bin", home);
+    ASSERT(cbm_mkdir_p(managed_dir, 0755) >= 0);
+    char managed[512];
+    snprintf(managed, sizeof(managed), "%s/custom/bin/codebase-memory-mcp", home);
+    write_test_file(managed, "managed binary");
+    char body[1400];
+    snprintf(body, sizeof(body),
+             "\xef\xbb\xbf"
+             "format=1\nmethod=official-script\nrepository=bogyie/codebase-memory-mcp\n"
+             "variant=ui\ninstall_path=%s\n",
+             managed);
+    write_test_file(receipt, body);
+
+    char out[1024];
+    ASSERT_EQ(cbm_resolve_update_target(home, managed, out, sizeof(out)),
+              0);
+    ASSERT_STR_EQ(out, managed);
+
+    test_rmdir_r(home);
+    PASS();
+}
+
+TEST(cli_update_target_rejects_unmanaged_binary) {
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-update-unmanaged-XXXXXX");
+    if (!cbm_mkdtemp(home))
+        FAIL("cbm_mkdtemp failed");
+
+    char out[1024];
+    ASSERT(cbm_resolve_update_target(home, "/opt/homebrew/bin/codebase-memory-mcp", out,
+                                     sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+
+    test_rmdir_r(home);
+    PASS();
+}
+
+TEST(cli_update_target_rejects_stale_official_receipt) {
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-update-stale-receipt-XXXXXX");
+    if (!cbm_mkdtemp(home))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/codebase-memory-mcp", home);
+    ASSERT(cbm_mkdir_p(config_dir, 0755) >= 0);
+    char receipt[512];
+    snprintf(receipt, sizeof(receipt), "%s/install.conf", config_dir);
+    char managed[512];
+    snprintf(managed, sizeof(managed), "%s/old/codebase-memory-mcp", home);
+    char managed_dir[512];
+    snprintf(managed_dir, sizeof(managed_dir), "%s/old", home);
+    ASSERT(cbm_mkdir_p(managed_dir, 0755) >= 0);
+    write_test_file(managed, "old official binary");
+    char body[1400];
+    snprintf(body, sizeof(body),
+             "format=1\nmethod=official-script\nrepository=bogyie/codebase-memory-mcp\n"
+             "variant=standard\ninstall_path=%s\n",
+             managed);
+    write_test_file(receipt, body);
+
+    char package_managed[512];
+    snprintf(package_managed, sizeof(package_managed), "%s/package/codebase-memory-mcp", home);
+    char package_dir[512];
+    snprintf(package_dir, sizeof(package_dir), "%s/package", home);
+    ASSERT(cbm_mkdir_p(package_dir, 0755) >= 0);
+    write_test_file(package_managed, "package manager binary");
+
+    char out[1024];
+    ASSERT(cbm_resolve_update_target(home, package_managed, out, sizeof(out)) != 0);
+    ASSERT_STR_EQ(out, "");
+
+    test_rmdir_r(home);
+    PASS();
+}
+
+TEST(cli_update_target_accepts_canonical_legacy_install) {
+    char home[256];
+    snprintf(home, sizeof(home), "/tmp/cli-update-canonical-XXXXXX");
+    if (!cbm_mkdtemp(home))
+        FAIL("cbm_mkdtemp failed");
+
+    char bin_dir[512];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
+    ASSERT(cbm_mkdir_p(bin_dir, 0755) >= 0);
+    char canonical[512];
+#ifdef _WIN32
+    snprintf(canonical, sizeof(canonical), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(canonical, sizeof(canonical), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(canonical, "legacy managed binary");
+
+    char out[1024];
+    ASSERT_EQ(cbm_resolve_update_target(home, canonical, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, canonical);
+
+    test_rmdir_r(home);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Tar.gz extraction tests (port of update_test.go)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -3212,12 +3325,38 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+TEST(cli_release_checksum_requires_exact_valid_entry) {
+    const char *digest = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const char *archive = "codebase-memory-mcp-darwin-arm64.tar.gz";
+    char line[256];
+    char out[65];
+
+    snprintf(line, sizeof(line), "%s  %s\n", digest, archive);
+    ASSERT_TRUE(cbm_parse_release_checksum(line, archive, out, sizeof(out)));
+    ASSERT_STR_EQ(out, digest);
+
+    snprintf(line, sizeof(line), "%s *%s\r\n", digest, archive);
+    ASSERT_TRUE(cbm_parse_release_checksum(line, archive, out, sizeof(out)));
+    ASSERT_STR_EQ(out, digest);
+
+    snprintf(line, sizeof(line), "%s  %s.signature\n", digest, archive);
+    ASSERT_FALSE(cbm_parse_release_checksum(line, archive, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "");
+
+    snprintf(line, sizeof(line), "z%s  %s\n", digest + 1, archive);
+    ASSERT_FALSE(cbm_parse_release_checksum(line, archive, out, sizeof(out)));
+    ASSERT_STR_EQ(out, "");
+
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
 SUITE(cli) {
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_release_checksum_requires_exact_valid_entry);
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);
@@ -3297,6 +3436,10 @@ SUITE(cli) {
     /* Binary swap on install --force (#472) */
     RUN_TEST(cli_install_copies_binary_to_target_issue472);
     RUN_TEST(cli_install_same_file_guard_issue472);
+    RUN_TEST(cli_update_target_uses_official_install_receipt);
+    RUN_TEST(cli_update_target_rejects_unmanaged_binary);
+    RUN_TEST(cli_update_target_rejects_stale_official_receipt);
+    RUN_TEST(cli_update_target_accepts_canonical_legacy_install);
 
     /* YAML parser (7 unit tests) */
     RUN_TEST(cli_yaml_parse_simple);

@@ -45,6 +45,7 @@ for arg in "$@"; do
             ;;
     esac
 done
+
 # Handle --dir <path> (space-separated)
 prev=""
 for arg in "$@"; do
@@ -53,6 +54,9 @@ for arg in "$@"; do
     fi
     prev="$arg"
 done
+case "$INSTALL_DIR" in
+    *$'\n'*|*$'\r'*) echo "error: install directory must not contain newlines" >&2; exit 1 ;;
+esac
 
 detect_os() {
     case "$(uname -s)" in
@@ -125,28 +129,46 @@ else
     exit 1
 fi
 
-# Checksum verification
+# Checksum verification. Official installs fail closed: downloading the archive
+# and downloading/verifying its release checksum are one trust operation.
 CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
-if curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
-    EXPECTED=$(grep "$ARCHIVE" "$DLDIR/checksums.txt" | awk '{print $1}')
-    if [ -n "$EXPECTED" ]; then
-        if command -v sha256sum &>/dev/null; then
-            ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        elif command -v shasum &>/dev/null; then
-            ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        else
-            ACTUAL=""
-        fi
-        if [ -n "$ACTUAL" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
-            echo "  expected: $EXPECTED" >&2
-            echo "  actual:   $ACTUAL" >&2
-            exit 1
-        elif [ -n "$ACTUAL" ]; then
-            echo "Checksum verified."
-        fi
-    fi
+if command -v curl &>/dev/null; then
+    curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" || {
+        echo "error: could not download checksums.txt; refusing unverified install" >&2
+        exit 1
+    }
+elif command -v wget &>/dev/null; then
+    wget -q -O "$DLDIR/checksums.txt" "$CHECKSUM_URL" || {
+        echo "error: could not download checksums.txt; refusing unverified install" >&2
+        exit 1
+    }
+else
+    echo "error: curl or wget required for checksum verification" >&2
+    exit 1
 fi
+EXPECTED=$(awk -v archive="$ARCHIVE" '$2 == archive { print $1; exit }' "$DLDIR/checksums.txt")
+case "$EXPECTED" in
+    ''|*[!0-9A-Fa-f]*) echo "error: valid checksum entry missing for $ARCHIVE" >&2; exit 1 ;;
+esac
+if [ "${#EXPECTED}" -ne 64 ]; then
+    echo "error: invalid SHA-256 checksum entry for $ARCHIVE" >&2
+    exit 1
+fi
+if command -v sha256sum &>/dev/null; then
+    ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
+elif command -v shasum &>/dev/null; then
+    ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
+else
+    echo "error: sha256sum or shasum is required; refusing unverified install" >&2
+    exit 1
+fi
+if [ "$(printf '%s' "$EXPECTED" | tr 'A-F' 'a-f')" != "$(printf '%s' "$ACTUAL" | tr 'A-F' 'a-f')" ]; then
+    echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
+    echo "  expected: $EXPECTED" >&2
+    echo "  actual:   $ACTUAL" >&2
+    exit 1
+fi
+echo "Checksum verified."
 
 # Extract
 echo "Extracting..."
@@ -172,6 +194,7 @@ fi
 
 # Install
 mkdir -p "$INSTALL_DIR"
+INSTALL_DIR=$(cd "$INSTALL_DIR" && pwd -P)
 DEST="$INSTALL_DIR/codebase-memory-mcp"
 if [ -f "$DEST" ]; then
     rm -f "$DEST"
@@ -189,6 +212,21 @@ VERSION=$("$DEST" --version 2>&1) || {
 }
 echo "Installed: $VERSION"
 
+# Record the path owned by the official installer. Self-update reads this
+# receipt and refuses to overwrite package-manager binaries without one.
+MANIFEST_DIR="$HOME/.config/codebase-memory-mcp"
+MANIFEST="$MANIFEST_DIR/install.conf"
+mkdir -p "$MANIFEST_DIR"
+(
+    umask 077
+    printf '%s\n' \
+        'format=1' \
+        'method=official-script' \
+        "repository=$REPO" \
+        "variant=$VARIANT" \
+        "install_path=$DEST" > "$MANIFEST"
+)
+
 # Configure agents
 if [ "$SKIP_CONFIG" = true ]; then
     echo ""
@@ -196,7 +234,7 @@ if [ "$SKIP_CONFIG" = true ]; then
 else
     echo ""
     echo "Configuring coding agents..."
-    "$DEST" install -y 2>&1 || {
+    "$DEST" install -y --managed-path 2>&1 || {
         echo ""
         echo "Agent configuration failed (non-fatal)."
         echo "Run manually: codebase-memory-mcp install"

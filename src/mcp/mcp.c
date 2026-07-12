@@ -5968,13 +5968,25 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     bool stale_source = indexed_version && live_version &&
                         (indexed_mtime_ns != mcp_stat_mtime_ns(&live_stat) ||
                          indexed_size != (int64_t)live_stat.st_size);
-    yyjson_mut_obj_add_str(doc, root_obj, "source_state",
-                           stale_source ? "stale_worktree" : indexed_version ? "current" : "unknown");
+    const char *source_state = "unknown";
+    if (indexed_version && (!live_version || !source)) {
+        source_state = "missing_worktree";
+    } else if (stale_source) {
+        source_state = "stale_worktree";
+    } else if (indexed_version) {
+        source_state = "current";
+    }
+    yyjson_mut_obj_add_str(doc, root_obj, "source_state", source_state);
     if (stale_source) {
         yyjson_mut_obj_add_str(
             doc, root_obj, "source_warning",
             "The graph line range comes from an older file version. Source is read from the live "
             "worktree and may no longer correspond to this symbol; re-index before relying on it.");
+    } else if (indexed_version && (!live_version || !source)) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source_warning",
+            "The indexed file is missing or unreadable in the live worktree. Re-index before "
+            "relying on this symbol.");
     }
 
     if (source) {

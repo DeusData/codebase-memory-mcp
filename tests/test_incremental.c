@@ -821,6 +821,8 @@ TEST(incr_accuracy_vs_full) {
     int incr_nodes = get_node_count();
     int incr_edges = get_edge_count();
     int incr_calls = get_edge_count_by_type("CALLS");
+    int incr_design_systems = count_by_label("DesignSystem");
+    int incr_design_tokens = count_by_label("DesignToken");
 
     /* Delete DB, force full reindex */
     unlink(g_dbpath);
@@ -831,14 +833,19 @@ TEST(incr_accuracy_vs_full) {
     int full_nodes = get_node_count();
     int full_edges = get_edge_count();
     int full_calls = get_edge_count_by_type("CALLS");
+    int full_design_systems = count_by_label("DesignSystem");
+    int full_design_tokens = count_by_label("DesignToken");
 
     /* Within tight tolerance (±2 for dedup timing differences) */
+    printf("    [accuracy] incr: %d nodes/%d edges/design=%d+%d, full: %d nodes/%d "
+           "edges/design=%d+%d\n",
+           incr_nodes, incr_edges, incr_design_systems, incr_design_tokens, full_nodes, full_edges,
+           full_design_systems, full_design_tokens);
     ASSERT_LTE(abs(full_nodes - incr_nodes), 2);
     ASSERT_LTE(abs(full_nodes - incr_nodes), 50);
     ASSERT_LTE(abs(full_calls - incr_calls), 2);
-
-    printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges\n", incr_nodes,
-           incr_edges, full_nodes, full_edges);
+    ASSERT_EQ(full_design_systems, incr_design_systems);
+    ASSERT_EQ(full_design_tokens, incr_design_tokens);
 
     delete_file_at("fastapi/incr_accuracy.py");
     PASS();

@@ -3781,6 +3781,28 @@ TEST(snippet_stale_worktree_is_explicit) {
     PASS();
 }
 
+TEST(snippet_missing_worktree_is_not_current) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    ASSERT_EQ(cbm_unlink(src_path), 0);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"missing_worktree\""));
+    ASSERT_NULL(strstr(resp, "\"source_state\":\"current\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_warning\""));
+    ASSERT_NOT_NULL(strstr(resp, "missing or unreadable"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(snippet_long_physical_lines_are_counted_once_and_bounded) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -6319,6 +6341,7 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
     RUN_TEST(snippet_stale_worktree_is_explicit);
+    RUN_TEST(snippet_missing_worktree_is_not_current);
     RUN_TEST(snippet_long_physical_lines_are_counted_once_and_bounded);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);

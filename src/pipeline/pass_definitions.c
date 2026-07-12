@@ -595,6 +595,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                                         result->error_ranges ? result->error_ranges : "unknown",
                                         "parse_partial");
         }
+        if (result->yaml_config_path_truncated) {
+            cbm_pipeline_add_file_error(ctx->pipeline, rel,
+                                        "nested YAML config paths capped at 512",
+                                        "config_path_truncated");
+        }
 
         /* Create nodes for each definition */
         for (int d = 0; d < result->defs.count; d++) {

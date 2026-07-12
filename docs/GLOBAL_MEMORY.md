@@ -155,9 +155,11 @@ hash), never raw node IDs from a project database.
 diagnostic query from becoming an implicit durable write.
 
 After a repository index completes, the indexer publishes an opaque graph generation only after
-file hashes, coverage metadata, and FTS are durable. Long-running MCP readers keep serving their
-previous complete snapshot while a replacement is being built, then reopen after the completion
-marker appears. CodeRef validation runs against that completed graph. It updates only references
+file hashes, coverage metadata, and FTS are durable. Replacements are built in a sibling staging
+database and atomically installed only after the completion marker and checkpoint succeed. A
+failed rebuild therefore leaves the previous completed database at its published path. Long-running
+MCP readers keep serving that snapshot while a replacement is being built, then reopen after the
+completed file is installed. CodeRef validation runs against that completed graph. It updates only references
 whose resolved/missing result actually changed; a no-op reindex therefore does not create a Memory
 epoch or CodeRef revision. Connected memory is marked for review only when validation detects a
 real resolution change.

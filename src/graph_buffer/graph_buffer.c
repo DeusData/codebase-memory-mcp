@@ -826,17 +826,23 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
     /* Build hash set of deleted node IDs for O(1) lookup */
     CBMHashTable *deleted_set = cbm_ht_create(arr->count);
     for (int i = 0; i < arr->count; i++) {
-        const cbm_gbuf_node_t *n = arr->items[i];
+        cbm_gbuf_node_t *n = (cbm_gbuf_node_t *)arr->items[i];
 
         char id_buf[CBM_SZ_32];
         make_id_key(id_buf, sizeof(id_buf), n->id);
         cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
 
-        /* Remove from primary indexes */
+        /* Remove from secondary and primary indexes. Keep the tombstoned node
+         * allocated until gbuf teardown, but clear its QN so inserting a
+         * replacement with the same QN cannot make the old node look live to
+         * foreach/dump/flush scans. This mirrors delete_by_file. */
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
         }
+        free(n->qualified_name);
+        n->qualified_name = NULL;
     }
 
     /* Clear the label array */
