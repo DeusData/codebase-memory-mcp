@@ -336,6 +336,105 @@ TEST(tool_get_design_context_returns_curated_graph) {
     PASS();
 }
 
+TEST(tool_get_design_context_paginates_and_matches_scope_exactly) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "design-page-test";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/design-page-test"), 0);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t zeta = {.project = project,
+                       .label = "DesignToken",
+                       .name = "zeta",
+                       .qualified_name = "design-page-test.design.token.root.color.zeta",
+                       .file_path = "design/zeta.tokens.json",
+                       .start_line = 1,
+                       .end_line = 1,
+                       .properties_json = "{\"scope\":\"root\",\"token_path\":\"color.zeta\"}"};
+    cbm_node_t alpha = {.project = project,
+                        .label = "DesignToken",
+                        .name = "alpha",
+                        .qualified_name = "design-page-test.design.token.root.color.alpha",
+                        .file_path = "design/alpha.tokens.json",
+                        .start_line = 1,
+                        .end_line = 1,
+                        .properties_json = "{\"scope\":\"root\",\"token_path\":\"color.alpha\"}"};
+    cbm_node_t application = {
+        .project = project,
+        .label = "DesignToken",
+        .name = "collision",
+        .qualified_name = "design-page-test.design.token.packages.application.color.collision",
+        .file_path = "packages/application/design/tokens.tokens.json",
+        .start_line = 1,
+        .end_line = 1,
+        .properties_json =
+            "{\"scope\":\"packages.application\",\"token_path\":\"color.collision\"}"};
+    int64_t zeta_id = cbm_store_upsert_node(store, &zeta);
+    int64_t alpha_id = cbm_store_upsert_node(store, &alpha);
+    ASSERT_GT(zeta_id, 0);
+    ASSERT_GT(alpha_id, 0);
+    ASSERT_GT(cbm_store_upsert_node(store, &application), 0);
+
+    for (int i = 0; i < 5; i++) {
+        char name[32], qn[128], path[64];
+        snprintf(name, sizeof(name), "usage-%d.css", i);
+        snprintf(qn, sizeof(qn), "design-page-test.file.usage-%d", i);
+        snprintf(path, sizeof(path), "src/usage-%d.css", i);
+        cbm_node_t file = {.project = project,
+                           .label = "File",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = path,
+                           .start_line = 1,
+                           .end_line = 1,
+                           .properties_json = "{}"};
+        int64_t file_id = cbm_store_upsert_node(store, &file);
+        cbm_edge_t usage = {.project = project,
+                            .source_id = file_id,
+                            .target_id = alpha_id,
+                            .type = "USES_TOKEN",
+                            .properties_json = "{}"};
+        ASSERT_GT(cbm_store_insert_edge(store, &usage), 0);
+    }
+
+    char *first = cbm_mcp_handle_tool(
+        srv, "get_design_context",
+        "{\"project\":\"design-page-test\",\"scope\":\"root\",\"token\":\"color.\","
+        "\"limit\":1,\"include_usages\":false}");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(strstr(first, "color.alpha"));
+    ASSERT_NULL(strstr(first, "color.zeta"));
+    ASSERT_TRUE(response_contains_json_fragment(first, "\"has_more\":true"));
+    free(first);
+
+    char *second = cbm_mcp_handle_tool(
+        srv, "get_design_context",
+        "{\"project\":\"design-page-test\",\"scope\":\"root\",\"token\":\"color.\","
+        "\"limit\":1,\"offset\":1,\"include_usages\":false}");
+    ASSERT_NOT_NULL(second);
+    ASSERT_NOT_NULL(strstr(second, "color.zeta"));
+    ASSERT_NULL(strstr(second, "color.alpha"));
+    free(second);
+
+    char *exact_scope = cbm_mcp_handle_tool(
+        srv, "get_design_context", "{\"project\":\"design-page-test\",\"scope\":\"packages.app\"}");
+    ASSERT_NOT_NULL(exact_scope);
+    ASSERT_NULL(strstr(exact_scope, "packages.application.color.collision"));
+    ASSERT_TRUE(response_contains_json_fragment(exact_scope, "\"tokens\":0"));
+    free(exact_scope);
+
+    char *relations = cbm_mcp_handle_tool(
+        srv, "get_design_context",
+        "{\"project\":\"design-page-test\",\"token\":\"color.alpha\",\"limit\":1}");
+    ASSERT_NOT_NULL(relations);
+    ASSERT_TRUE(response_contains_json_fragment(relations, "\"has_more_relations\":true"));
+    ASSERT_TRUE(response_contains_json_fragment(relations, "\"returned_relations\":4"));
+    free(relations);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(mcp_tools_list_latest_metadata) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
@@ -5845,6 +5944,7 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_design_context_returns_curated_graph);
+    RUN_TEST(tool_get_design_context_paginates_and_matches_scope_exactly);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
     RUN_TEST(tool_get_architecture_overview_compact_subset_pr560);
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
