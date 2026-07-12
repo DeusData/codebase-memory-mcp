@@ -4,6 +4,7 @@
  * Ported from internal/store/store_test.go (TestSearch, TestBFS, etc.)
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/log.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
@@ -12,6 +13,15 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+
+static char trail_log[1024];
+
+static void capture_trail_log(const char *line) {
+    size_t used = strlen(trail_log);
+    if (used < sizeof(trail_log) - 1) {
+        snprintf(trail_log + used, sizeof(trail_log) - used, "%s\n", line);
+    }
+}
 
 /* Helper: create a typical graph for search/traversal tests.
  *
@@ -993,7 +1003,7 @@ TEST(store_bfs_with_risk_labels) {
     PASS();
 }
 
-TEST(store_bfs_caps_recursive_cte_rows) {
+TEST(store_bfs_reachability_is_not_trail_capped) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
 
@@ -1019,8 +1029,48 @@ TEST(store_bfs_caps_recursive_cte_rows) {
     cbm_traverse_result_t result = {0};
     int rc = cbm_store_bfs(s, root_id, "outbound", types, 1, 1, 5000, &result);
     ASSERT_EQ(rc, CBM_STORE_OK);
-    ASSERT_TRUE(result.visited_count > 0);
-    ASSERT_TRUE(result.visited_count < NODE_COUNT);
+    ASSERT_EQ(result.visited_count, NODE_COUNT);
+
+    cbm_store_traverse_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_bfs_trail_warns_when_path_rows_are_truncated) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    int64_t ids[14];
+    for (int i = 0; i < 14; i++) {
+        char name[16];
+        snprintf(name, sizeof(name), "node-%d", i);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = name,
+                           .file_path = "graph.c"};
+        ids[i] = cbm_store_upsert_node(s, &node);
+    }
+    for (int source = 0; source < 13; source++) {
+        for (int target = source + 1; target < 14; target++) {
+            cbm_edge_t edge = {.project = "test",
+                               .source_id = ids[source],
+                               .target_id = ids[target],
+                               .type = "CALLS"};
+            cbm_store_insert_edge(s, &edge);
+        }
+    }
+
+    trail_log[0] = '\0';
+    cbm_log_set_sink(capture_trail_log);
+    const char *types[] = {"CALLS"};
+    cbm_traverse_result_t result = {0};
+    int rc = cbm_store_bfs_trail(s, ids[0], "outbound", types, 1, 10, 5000, &result);
+    cbm_log_set_sink(NULL);
+
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_TRUE(strstr(trail_log, "cypher.trail_truncated") != NULL);
+    ASSERT_TRUE(strstr(trail_log, "result=partial") != NULL);
 
     cbm_store_traverse_free(&result);
     cbm_store_close(s);
@@ -1544,7 +1594,8 @@ SUITE(store_search) {
     RUN_TEST(store_cross_service_detection);
     RUN_TEST(store_deduplicate_hops);
     RUN_TEST(store_bfs_with_risk_labels);
-    RUN_TEST(store_bfs_caps_recursive_cte_rows);
+    RUN_TEST(store_bfs_reachability_is_not_trail_capped);
+    RUN_TEST(store_bfs_trail_warns_when_path_rows_are_truncated);
     RUN_TEST(store_bfs_cross_service_summary);
     RUN_TEST(store_glob_to_like);
     RUN_TEST(store_extract_like_hints);

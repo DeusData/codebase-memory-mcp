@@ -507,6 +507,11 @@ void cbm_store_search_free(cbm_search_output_t *out);
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
 
+/* Variable-length Cypher traversal with relationship-trail semantics. */
+int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
+                        const char **edge_types, int edge_type_count, int max_depth,
+                        int max_results, cbm_traverse_result_t *out);
+
 /* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
  * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
  * seed set; canonical (hop,id) order; *truncated set when the max_results
