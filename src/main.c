@@ -159,16 +159,18 @@ static void *http_thread(void *arg) {
 static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
     (void)user_data;
 
-    /* Skip indexing if shutdown is in progress */
+    /* Skip indexing if shutdown is in progress (skipped, not indexed) */
     if (atomic_load(&g_shutdown)) {
-        return 0;
+        return 1;
     }
 
-    /* Non-blocking: skip if another pipeline is already running.
-     * Watcher will retry on next poll cycle (5-60s). */
+    /* Non-blocking: skip if another pipeline is already running. The
+     * positive return keeps the watcher's baselines uncommitted so the
+     * change is retried on the next poll cycle (5-60s) instead of being
+     * recorded as seen and lost (#937). */
     if (!cbm_pipeline_try_lock()) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
+        return 1;
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
