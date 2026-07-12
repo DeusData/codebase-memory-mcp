@@ -2679,24 +2679,28 @@ TEST(pipeline_parallel_env_access_matches_sequential) {
     ASSERT_EQ(par_rc, 0);
     ASSERT_NOT_NULL(project);
 
-    char source_qn[CBM_SZ_512];
-    n = snprintf(source_qn, sizeof(source_qn), "%s.src.env", project);
+    char env_source_qn[CBM_SZ_512];
+    n = snprintf(env_source_qn, sizeof(env_source_qn), "%s.src.env.load_temp", project);
     ASSERT_GT(n, 0);
-    ASSERT_LT((size_t)n, sizeof(source_qn));
+    ASSERT_LT((size_t)n, sizeof(env_source_qn));
     const char *env_qn = "__env__CBM_TEST_PARALLEL_ENV";
 
-    ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, source_qn, "CONFIGURES",
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, env_source_qn, "CONFIGURES",
                                                     env_qn));
-    ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, source_qn, "CONFIGURES",
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, env_source_qn, "CONFIGURES",
                                                     env_qn));
+    char call_source_qn[CBM_SZ_512];
+    n = snprintf(call_source_qn, sizeof(call_source_qn), "%s.src.env.load_home", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(call_source_qn));
     char call_target_qn[CBM_SZ_512];
     n = snprintf(call_target_qn, sizeof(call_target_qn), "%s.src.env.cbm_safe_getenv", project);
     ASSERT_GT(n, 0);
     ASSERT_LT((size_t)n, sizeof(call_target_qn));
-    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(seq_db, project, source_qn,
+    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(seq_db, project, call_source_qn,
                                                         "CONFIGURES", call_target_qn,
                                                         "\"args\":["));
-    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(par_db, project, source_qn,
+    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(par_db, project, call_source_qn,
                                                         "CONFIGURES", call_target_qn,
                                                         "\"args\":["));
 
@@ -10839,9 +10843,13 @@ TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
     ASSERT_EQ(run_rc, 0);
     ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
     ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
-    ASSERT(strstr(logs,
-                  "msg=incremental.fallback reason=frontier_too_large "
-                  "scope=c_family_header") != NULL);
+    char fallback_log[CBM_SZ_128];
+    n = snprintf(fallback_log, sizeof(fallback_log),
+                 "msg=incremental.fallback reason=%s scope=%s",
+                 CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE,
+                 CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fallback_log));
+    ASSERT(strstr(logs, fallback_log) != NULL);
     ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
     ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
     cbm_pipeline_free(p);
@@ -10866,6 +10874,60 @@ TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
         g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
     if (diff_rc != 0) {
         FAIL(diff_err[0] ? diff_err : "C header full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+    ASSERT_EQ(write_incremental_c_header_second_level_callers(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_impl_marker(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    char fallback_log[CBM_SZ_128];
+    int n = snprintf(fallback_log, sizeof(fallback_log),
+                     "msg=incremental.fallback reason=%s scope=%s",
+                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE,
+                     CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fallback_log));
+    ASSERT(strstr(logs, fallback_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C source full fallback differed from fresh rebuild");
     }
     ASSERT_EQ(diff_rc, 0);
 
@@ -15705,6 +15767,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
+    RUN_TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
     RUN_TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_visible);
     RUN_TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved);
