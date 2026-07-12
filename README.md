@@ -375,7 +375,7 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 
 | Agent | MCP Config | Instructions | Hooks |
 |-------|-----------|-------------|-------|
-| Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob graph augment, non-blocking) |
+| Claude Code | `.claude/.mcp.json` | Consolidated Skill | PreToolUse (Grep/Glob graph augment, non-blocking) |
 | Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | SessionStart reminder |
 | Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) + SessionStart reminder |
 | Zed | `settings.json` (JSONC) | — | — |
@@ -386,6 +386,17 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | VS Code | `Code/User/mcp.json` | — | — |
 | OpenClaw | `openclaw.json` | — | — |
 | Kiro | `.kiro/settings/mcp.json` | — | — |
+
+Managed instruction blocks cover both code-graph discovery and conditional Global Memory use.
+`install` and `update` replace only the `codebase-memory-mcp` marker block and preserve content
+outside it. Global Memory is not queried automatically: agents are instructed to retrieve it only
+when cross-project knowledge is materially relevant, validate applicability/freshness/evidence,
+and persist or share global data only when the current task explicitly authorizes it.
+
+Older releases wrote a standalone Codex file at
+`~/.codex/instructions/codebase-memory-mcp.md`. During install, update, or uninstall, a
+byte-for-byte known generated version is removed to prevent duplicate instructions. Modified or
+unrecognized content is preserved and reported for manual review.
 
 **Hooks are structurally non-blocking** (exit code 0, every failure path).
 For Claude Code, the `PreToolUse` hook intercepts `Grep`/`Glob` (never `Read` —

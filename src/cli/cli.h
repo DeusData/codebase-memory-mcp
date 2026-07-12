@@ -250,9 +250,10 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path);
  * Checks if already present. Returns 0 on success, 1 if already present. */
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
 
-/* ── Codex instructions (legacy, wraps cbm_get_agent_instructions) ── */
+/* ── Codex instructions compatibility API ────────────────────── */
 
-/* Get the Codex CLI instructions content. */
+/* Legacy compatibility getter. Returns the same canonical content as
+ * cbm_get_agent_instructions(); new callers should use that function. */
 const char *cbm_get_codex_instructions(void);
 
 /* ── Tar.gz extraction ────────────────────────────────────────── */

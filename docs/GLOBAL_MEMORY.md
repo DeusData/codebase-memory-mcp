@@ -127,6 +127,19 @@ recover pending outbox entries after a crash.
 `query_graph` and `get_graph_schema` accept `graph="memory"`; code and missed graphs continue to
 require a project while the memory graph does not.
 
+## Agent instruction contract
+
+Installed agent guidance treats Global Memory as conditional, user-global context rather than an
+automatic prompt dependency. Agents query it only when prior cross-project facts, decisions, or
+experiences are materially relevant, pass current repository/task constraints as context, and
+inspect route, applicability, freshness, evidence lineage, and conflicts before reuse. An opposing
+view is not searched for by default; verification effort follows the returned route and impact.
+
+Global writes require authorization from the current task and must remain durable, scoped, and
+auditable. Repository-specific details and ADRs stay local unless explicitly promoted. Export,
+import, and synchronization are explicit operations because bundles include raw source bytes and
+may contain sensitive data.
+
 ## Code graph integration
 
 Memory stores symbolic `CodeRef` values (project, qualified name, file, and optional commit/tree

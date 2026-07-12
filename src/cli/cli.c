@@ -530,12 +530,14 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 static const char skill_content[] =
     "---\n"
     "name: codebase-memory\n"
-    "description: Use the codebase knowledge graph for structural code queries. "
+    "description: Use the codebase knowledge graph for structural code queries and Global "
+    "Memory for durable cross-project knowledge. "
     "Triggers on: explore the codebase, understand the architecture, what functions exist, "
     "show me the structure, who calls this function, what does X call, trace the call chain, "
     "find callers of, show dependencies, impact analysis, dead code, unused functions, "
     "high fan-out, refactor candidates, code quality audit, graph query syntax, "
-    "Cypher query examples, edge types, how to use search_graph.\n"
+    "Cypher query examples, edge types, how to use search_graph, global memory, prior "
+    "cross-project decisions, reusable experience, memory_query.\n"
     "---\n"
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
@@ -584,6 +586,10 @@ static const char skill_content[] =
     "`deliberate` only when the returned uncertainty and impact justify it.\n"
     "- Repetition, retrieval frequency, and graph centrality are audit-priority signals, "
     "never evidence that a claim is true.\n"
+    "- Persist only durable, scoped knowledge when the current task explicitly authorizes a "
+    "Global Memory write. Keep repository ADRs local unless explicitly promoted.\n"
+    "- Use `memory_export`, `memory_import`, or `memory_sync` only on explicit request; bundles "
+    "include raw sources and may be sensitive.\n"
     "\n"
     "## 22 MCP Tools\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
@@ -616,20 +622,6 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
 
-static const char codex_instructions_content[] =
-    "# Codebase Knowledge Graph\n"
-    "\n"
-    "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
-    "Use the MCP tools to explore and understand the code:\n"
-    "\n"
-    "- `search_graph` — find functions, classes, routes by pattern\n"
-    "- `trace_path` — trace who calls a function or what it calls\n"
-    "- `get_code_snippet` — read function source code\n"
-    "- `query_graph` — run Cypher queries for complex patterns\n"
-    "- `get_architecture` — high-level project summary\n"
-    "\n"
-    "Always prefer graph tools over grep for code discovery.\n";
-
 /* Old skill names — cleaned up during install to remove stale directories. */
 static const char *old_skill_names[] = {
     "codebase-memory-exploring",
@@ -645,10 +637,6 @@ static const cbm_skill_t skills[CBM_SKILL_COUNT] = {
 
 const cbm_skill_t *cbm_get_skills(void) {
     return skills;
-}
-
-const char *cbm_get_codex_instructions(void) {
-    return codex_instructions_content;
 }
 
 /* ── Recursive mkdir (via compat_fs) ──────────────────────────── */
@@ -1355,10 +1343,32 @@ static const char agent_instructions_content[] =
     "## Examples\n"
     "- Find a handler: `search_graph(name_pattern=\".*OrderHandler.*\")`\n"
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
-    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n";
+    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n"
+    "\n"
+    "## Global Memory\n"
+    "Global Memory is user-global and repository-independent. It is not implicitly injected.\n"
+    "- Use `memory_query` only when prior cross-project facts, decisions, or experiences could "
+    "materially help. Do not query it for every task.\n"
+    "- Include the current repository and task constraints in `current_context`. Before reuse, "
+    "inspect the returned `route`, applicability, freshness, evidence lineage, and conflicts. "
+    "Do not search for an opposing view by default; follow `verify`, `experiment`, "
+    "`deliberate`, or `abstain` when the route calls for it.\n"
+    "- Global writes affect every project. Persist only durable, scoped knowledge when the "
+    "current task explicitly authorizes it. When evidence exists, use `memory_ingest`; curate "
+    "changes through `memory_propose` then `memory_commit`. On conflict, reread and repropose "
+    "instead of forcing last-write-wins.\n"
+    "- Keep repository-specific details and ADRs local unless explicitly promoted. Use "
+    "`memory_lint` to audit memory. Use `memory_export`, `memory_import`, or `memory_sync` only "
+    "on explicit request; shared bundles include raw sources and may be sensitive.\n";
 
 const char *cbm_get_agent_instructions(void) {
     return agent_instructions_content;
+}
+
+/* Legacy public compatibility getter. Codex now consumes the same managed
+ * AGENTS.md content as every other supported instruction-file agent. */
+const char *cbm_get_codex_instructions(void) {
+    return cbm_get_agent_instructions();
 }
 
 /* ── Instructions file upsert ─────────────────────────────────── */
@@ -3283,7 +3293,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
  * behavior (it is the same code path with mutations disabled). */
 typedef struct {
     char agent[CLI_BUF_32];
-    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook */
+    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook | cleanup */
     char path[CLI_BUF_1K];
 } cbm_plan_entry_t;
 
@@ -3313,6 +3323,68 @@ static void plan_record(const char *agent, const char *kind, const char *path) {
     snprintf(e->agent, sizeof(e->agent), "%s", agent);
     snprintf(e->kind, sizeof(e->kind), "%s", kind);
     snprintf(e->path, sizeof(e->path), "%s", path);
+}
+
+#define LEGACY_CODEX_INSTRUCTIONS_RELATIVE_PATH ".codex/instructions/codebase-memory-mcp.md"
+#define LEGACY_CODEX_INSTRUCTIONS_SHA256 \
+    "7fb17c8373ff9b12886f0a701f4061986bd6fedbc39cebf93eed767b7e4de7bf"
+
+/* Remove the exact product-generated Go-era Codex instructions file. Unknown
+ * content is preserved because users may have edited the legacy file. This is
+ * intentionally not part of the public CLI API; tests link it directly.
+ * Returns 1 when removal is performed/planned, 0 when no safe cleanup applies,
+ * and -1 on an operational error. */
+int cbm_cleanup_legacy_codex_instructions(const char *home, bool dry_run);
+int cbm_cleanup_legacy_codex_instructions(const char *home, bool dry_run) {
+    if (!home || !home[0]) {
+        return CLI_ERR;
+    }
+
+    char path[CLI_BUF_1K];
+    int n = snprintf(path, sizeof(path), "%s/%s", home, LEGACY_CODEX_INSTRUCTIONS_RELATIVE_PATH);
+    if (n < 0 || n >= (int)sizeof(path)) {
+        return CLI_ERR;
+    }
+    if (!cbm_file_exists(path)) {
+        return CLI_OK;
+    }
+
+    size_t content_len = 0;
+    char *content = read_file_str(path, &content_len);
+    if (!content) {
+        if (!g_install_plan) {
+            (void)fprintf(stderr, "warning: cannot inspect legacy Codex instructions: %s\n", path);
+        }
+        return CLI_ERR;
+    }
+
+    char digest[CBM_SHA256_HEX_LEN + CLI_SKIP_ONE];
+    cbm_sha256_hex(content, content_len, digest);
+    free(content);
+
+    if (strcmp(digest, LEGACY_CODEX_INSTRUCTIONS_SHA256) != 0) {
+        if (!g_install_plan) {
+            (void)fprintf(stderr, "note: preserving modified legacy Codex instructions: %s\n",
+                          path);
+        }
+        return CLI_OK;
+    }
+
+    if (g_install_plan) {
+        plan_record("Codex CLI", "cleanup", path);
+        return CLI_TRUE;
+    }
+    if (dry_run) {
+        printf("Codex CLI: would remove legacy generated instructions: %s\n", path);
+        return CLI_TRUE;
+    }
+    if (cbm_unlink(path) != 0) {
+        (void)fprintf(stderr, "warning: failed to remove legacy Codex instructions: %s\n", path);
+        return CLI_ERR;
+    }
+
+    printf("Codex CLI: removed legacy generated instructions: %s\n", path);
+    return CLI_TRUE;
 }
 
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
@@ -3416,7 +3488,7 @@ static void install_generic_agent_config(const char *label, const char *binary_p
     printf("  mcp: %s\n", config_path);
     if (instr_path) {
         if (!dry_run) {
-            cbm_upsert_instructions(instr_path, agent_instructions_content);
+            cbm_upsert_instructions(instr_path, cbm_get_agent_instructions());
         }
         printf("  instructions: %s\n", instr_path);
     }
@@ -3449,6 +3521,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         char ip[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.codex/config.toml", home);
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
+        (void)cbm_cleanup_legacy_codex_instructions(home, dry_run);
         install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
                                      cbm_upsert_codex_mcp);
         /* Choose the hook target: if ~/.codex/hooks.json already exists, the
@@ -3520,7 +3593,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         } else {
             printf("Aider:\n");
             if (!dry_run) {
-                cbm_upsert_instructions(ip, agent_instructions_content);
+                cbm_upsert_instructions(ip, cbm_get_agent_instructions());
             }
             printf("  instructions: %s\n", ip);
         }
@@ -3809,10 +3882,13 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_val *configs = yyjson_mut_arr(doc);
     yyjson_mut_val *instrs = yyjson_mut_arr(doc);
     yyjson_mut_val *hooks = yyjson_mut_arr(doc);
+    yyjson_mut_val *cleanups = yyjson_mut_arr(doc);
     for (int i = 0; i < plan.count; i++) {
         cbm_plan_entry_t *e = &plan.items[i];
         if (strcmp(e->kind, "mcp_config") == 0) {
             yyjson_mut_arr_add_strcpy(doc, configs, e->path);
+        } else if (strcmp(e->kind, "cleanup") == 0) {
+            yyjson_mut_arr_add_strcpy(doc, cleanups, e->path);
         } else if (strcmp(e->kind, "hook") == 0) {
             yyjson_mut_val *h = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, h, "agent", e->agent);
@@ -3825,6 +3901,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_obj_add_val(doc, root, "config_files_planned", configs);
     yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
+    yyjson_mut_obj_add_val(doc, root, "cleanup_files_planned", cleanups);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
     yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
@@ -4069,6 +4146,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         if (!dry_run) {
             cbm_remove_codex_hooks(cp);
         }
+        (void)cbm_cleanup_legacy_codex_instructions(home, dry_run);
     }
     if (agents->gemini) {
         uninstall_gemini_config(home, dry_run);

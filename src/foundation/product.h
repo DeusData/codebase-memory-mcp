@@ -18,7 +18,7 @@
 #define CBM_GITHUB_RELEASES_URL CBM_GITHUB_URL "/releases"
 #define CBM_GITHUB_LATEST_RELEASE_URL CBM_GITHUB_RELEASES_URL "/latest"
 #define CBM_GITHUB_LATEST_DOWNLOAD_URL CBM_GITHUB_LATEST_RELEASE_URL "/download"
-#define CBM_GITHUB_API_LATEST_RELEASE_URL                                                   \
+#define CBM_GITHUB_API_LATEST_RELEASE_URL \
     "https://api.github.com/repos/" CBM_GITHUB_REPOSITORY "/releases/latest"
 #define CBM_GITHUB_ISSUES_NEW_URL CBM_GITHUB_URL "/issues/new"
 
