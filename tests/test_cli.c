@@ -2467,7 +2467,12 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
 
     char script_path[512];
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/.claude/hooks/cbm-code-discovery-gate.cmd",
+             tmpdir);
+#else
     snprintf(script_path, sizeof(script_path), "%s/.claude/hooks/cbm-code-discovery-gate", tmpdir);
+#endif
     const char *data = read_test_file(script_path);
     ASSERT_NOT_NULL(data);
     /* No predictable temp/state file and no PPID-derived path. */
@@ -2475,6 +2480,63 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     ASSERT(strstr(data, "PPID") == NULL);
     /* It delegates to the stateless compiled augmenter (stdout only). */
     ASSERT(strstr(data, "hook-augment") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* #929: on Windows, extensionless bash shims under .claude/hooks trigger the
+ * "How do you want to open this file?" dialog when editors (Cursor) scan the
+ * dir, and cannot execute without bash. Windows must install .cmd scripts
+ * (and remove the extensionless legacy twin on upgrade); POSIX keeps the
+ * extensionless bash form with no .cmd twin. */
+TEST(cli_hook_scripts_platform_shape_issue929) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook929-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+
+#ifdef _WIN32
+    /* Upgrade path: pre-create the pre-#929 extensionless file; the install
+     * must remove it so the Open-With trigger disappears. */
+    cbm_mkdir_p(hooks_dir, 0755);
+    char legacy_path[512];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(legacy_path, "#!/bin/bash\nexit 0\n");
+#endif
+
+    cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+
+    char script_path[512];
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    const char *data = read_test_file(script_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strncmp(data, "@echo off", 9) == 0); /* cmd, not bash */
+    ASSERT(strstr(data, "hook-augment") != NULL);
+    /* Legacy extensionless twin removed on upgrade. */
+    FILE *lf = fopen(legacy_path, "r");
+    if (lf) {
+        fclose(lf);
+        FAIL("legacy extensionless hook file still present after install");
+    }
+#else
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    const char *data = read_test_file(script_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strncmp(data, "#!/usr/bin/env bash", 19) == 0);
+    /* No .cmd twin on POSIX. */
+    char cmd_path[512];
+    snprintf(cmd_path, sizeof(cmd_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    FILE *cf = fopen(cmd_path, "r");
+    if (cf) {
+        fclose(cf);
+        FAIL(".cmd twin must not exist on POSIX");
+    }
+#endif
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -3302,6 +3364,7 @@ SUITE(cli) {
 
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
+    RUN_TEST(cli_hook_scripts_platform_shape_issue929);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_upsert_claude_hook_fresh);
