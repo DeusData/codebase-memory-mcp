@@ -4646,6 +4646,37 @@ static void extract_destructured_vars(CBMExtractCtx *ctx, TSNode pattern, TSNode
     }
 }
 
+/* True for `require("...")` call_expressions with a string-literal path — the
+ * CommonJS import form that extract_imports records with local_name = the
+ * enclosing declarator's identifier. Same string-argument kinds as
+ * process_commonjs_require so the two stay in lockstep. */
+static bool is_require_import_call(TSNode value, const char *source, CBMArena *a) {
+    if (strcmp(ts_node_type(value), "call_expression") != 0) {
+        return false;
+    }
+    TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0) {
+        return false;
+    }
+    char *fn_name = cbm_node_text(a, fn, source);
+    if (!fn_name || strcmp(fn_name, "require") != 0) {
+        return false;
+    }
+    TSNode args = ts_node_child_by_field_name(value, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return false;
+    }
+    uint32_t argc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < argc; i++) {
+        const char *ak = ts_node_type(ts_node_named_child(args, i));
+        if (strcmp(ak, "string") == 0 || strcmp(ak, "string_literal") == 0 ||
+            strcmp(ak, "template_string") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -4654,6 +4685,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         if (strcmp(ts_node_type(child), "variable_declarator") != 0) {
             continue;
         }
+        bool is_require = false;
         TSNode value = ts_node_child_by_field_name(child, TS_FIELD("value"));
         if (!ts_node_is_null(value)) {
             const char *vk = ts_node_type(value);
@@ -4661,6 +4693,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 strcmp(vk, "generator_function") == 0) {
                 continue;
             }
+            is_require = is_require_import_call(value, ctx->source, a);
         }
         TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
         if (!ts_node_is_null(vname)) {
@@ -4670,6 +4703,15 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
             if (strcmp(nk, "object_pattern") == 0 || strcmp(nk, "array_pattern") == 0) {
                 extract_destructured_vars(ctx, vname, child, a);
             } else {
+                /* `const foo = require('./foo')` is an import binding, not a
+                 * definition — extract_imports records local_name="foo". A
+                 * Variable node here shadows call resolution onto the alias
+                 * and orphans the imported callee (#871); ESM `import`
+                 * bindings emit no Variable either. Destructured requires
+                 * keep theirs: the import row only records the module. */
+                if (is_require) {
+                    continue;
+                }
                 push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
             }
         }
