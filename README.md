@@ -17,7 +17,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 22 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -38,7 +38,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **22 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, Global Memory, and more.
 
 ## Quick Start
 
@@ -365,7 +365,7 @@ Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 14 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 22 tools.
 
 </details>
 
@@ -411,6 +411,8 @@ codebase-memory-mcp cli list_projects
 codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*", "label": "Function"}'
 codebase-memory-mcp cli trace_path '{"project": "my-project", "function_name": "Search", "direction": "both"}'
 codebase-memory-mcp cli query_graph '{"project": "my-project", "query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
+codebase-memory-mcp cli memory_query '{"query": "SQLite write concurrency", "current_context": {"project": "my-project"}}'
+codebase-memory-mcp cli query_graph '{"graph": "memory", "query": "MATCH (c:Claim) RETURN c.name LIMIT 5"}'
 codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "Function"}' | jq '.results[].name'
 ```
 
@@ -439,6 +441,25 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
+
+### Global Memory
+
+Global Memory is user-local and repository-independent. Immutable source objects live under
+`raw/`, committed wiki revisions are materialized under `wiki/`, and a hidden SQLite graph keeps
+provenance, bitemporal claim state, proposals, activities, and full-text search. Set
+`CBM_MEMORY_HOME` to override the platform data-directory default. See
+[Global Memory Architecture](docs/GLOBAL_MEMORY.md) for its epistemic and concurrency contracts.
+
+| Tool | Description |
+|------|-------------|
+| `memory_ingest` | Deduplicate and retain an immutable raw source with provenance. |
+| `memory_query` | Applicability-first search, lookup, timeline, and as-of retrieval. |
+| `memory_propose` | Stage revision-aware page, claim, decision, experience, preference, relation, or CodeRef operations. |
+| `memory_commit` | Atomically commit a proposal using entity revisions and an idempotent operation ID. |
+| `memory_lint` | Check epistemic, temporal, graph, materialization, bias, and CodeRef health. |
+| `memory_export` | Write a deterministic portable logical bundle. |
+| `memory_import` | Merge a bundle with an explicit conflict policy; never swaps the live database. |
+| `memory_sync` | Use Git (including an optional GitHub remote) as bundle transport. |
 
 ## Graph Data Model
 
@@ -488,6 +509,7 @@ codebase-memory-mcp config reset auto_index              # reset to default
 |----------|---------|-------------|
 | `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
+| `CBM_MEMORY_HOME` | *(platform user-data directory)* | Override the Global Memory root containing immutable `raw/` sources, materialized `wiki/` pages, its hidden database, exports, and Git sync worktree. This is intentionally separate from the disposable project-index cache. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Logs go to stderr; stdout is reserved for MCP JSON-RPC. |
@@ -586,8 +608,9 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (14 tools, JSON-RPC 2.0, session detection, auto-index)
-  cli/                Install/uninstall/update/config (10 agents, hooks, instructions)
+  mcp/                MCP server (22 tools, JSON-RPC 2.0, session detection, auto-index)
+  memory/             User-global raw sources, wiki graph, retrieval, maintenance, and sharing
+  cli/                Install/uninstall/update/config (11 agents, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor

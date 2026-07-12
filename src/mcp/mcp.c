@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with code-graph and Global Memory tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -61,6 +61,8 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "memory/memory.h"
+#include "memory/memory_share.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -412,6 +414,9 @@ static const tool_def_t TOOLS[] = {
      "Find all hot-path candidates in one query, e.g. MATCH (f:Function) WHERE "
      "f.transitive_loop_depth >= 3 OR f.linear_scan_in_loop >= 1 RETURN f.qualified_name, "
      "f.transitive_loop_depth, f.linear_scan_in_loop ORDER BY f.transitive_loop_depth DESC. "
+     "MEMORY GRAPH: pass graph=\"memory\" to query the user-global memory graph without a "
+     "project argument. MEMORY node properties preserve epistemic kind, scope, status, and "
+     "temporal metadata; centrality and usage are never evidence of truth. "
      "MISSED GRAPH: pass graph=\"missed\" to query the best-effort miss graph instead — the "
      "file structure of ONLY the files the indexer could NOT fully index (Project → Folder → "
      "File nodes with CONTAINS_FOLDER/CONTAINS_FILE edges; each File carries kind "
@@ -421,14 +426,15 @@ static const tool_def_t TOOLS[] = {
      "NOT a completeness guarantee.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\"},"
-     "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\"],\"default\":\"code\","
-     "\"description\":\"Which graph to query: the code knowledge graph (default) or the "
-     "missed graph (only files not fully indexed, laid out as their file structure).\"},"
+     "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"missed\",\"memory\"],\"default\":"
+     "\"code\","
+     "\"description\":\"Which graph to query: code (default), missed coverage, or user-global "
+     "memory. project is not required for memory.\"},"
      "\"max_rows\":{\"type\":\"integer\","
      "\"description\":"
      "\"Optional row limit. Default: unlimited up to a 100k row "
      "ceiling. No offset support — use search_graph for paginated browsing.\"}},"
-     "\"required\":[\"query\",\"project\"]}"},
+     "\"required\":[\"query\"]}"},
 
     {"trace_path", "Trace path",
      "Trace paths through the code graph. Modes: calls (callers/callees), data_flow (value "
@@ -470,9 +476,10 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"boolean\",\"default\":false}},\"required\":[\"qualified_name\",\"project\"]}"},
 
     {"get_graph_schema", "Get graph schema",
-     "Get the schema of the knowledge graph (node labels, edge types)",
-     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
-     "\"project\"]}"},
+     "Get node labels, edge types, and properties for a repository or Global Memory graph.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"graph\":{\"type\":\"string\",\"enum\":[\"code\",\"memory\"],\"default\":\"code\","
+     "\"description\":\"Global Memory does not require project.\"}}}"},
 
     {"get_architecture", "Get architecture",
      "Get high-level architecture overview. DEFAULT (no aspects) is a compact summary — "
@@ -559,6 +566,84 @@ static const tool_def_t TOOLS[] = {
      "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
      "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
+
+    {"memory_ingest", "Ingest Global Memory source",
+     "Store an immutable, content-addressed raw source with provenance. Repeated content is "
+     "deduplicated and never gains truth weight merely through repetition.",
+     "{\"type\":\"object\",\"properties\":{\"content\":{\"type\":\"string\"},\"path\":{"
+     "\"type\":\"string\"},\"title\":{\"type\":\"string\"},\"origin\":{\"type\":\"string\"},"
+     "\"media_type\":{\"type\":\"string\"},\"publisher\":{\"type\":\"string\"},"
+     "\"published_at\":{\"type\":\"string\"},\"retrieved_at\":{\"type\":\"string\"},"
+     "\"metadata\":{\"type\":\"object\"},\"revision_of\":{\"type\":\"string\"}},"
+     "\"oneOf\":[{\"required\":[\"content\"]},{\"required\":[\"path\"]}]}"},
+    {"memory_query", "Query Global Memory",
+     "Applicability-first retrieval over raw sources, wiki revisions, claims, decisions, "
+     "experiences, and preferences. Returns snapshot epoch, freshness/conflict warnings, "
+     "evidence lineage, and a reuse/verify/experiment/deliberate/abstain route; it does not "
+     "statically require an opposing view.",
+     "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"mode\":{"
+     "\"type\":\"string\",\"enum\":[\"search\",\"get\",\"overview\",\"neighbors\","
+     "\"path\",\"timeline\",\"as_of\"],\"default\":\"search\"},\"entity_id\":{"
+     "\"type\":\"string\"},\"id\":{\"type\":\"string\"},\"entity_kind\":{"
+     "\"type\":\"string\",\"enum\":[\"source\",\"page\",\"claim\",\"decision\","
+     "\"experience\",\"preference\",\"code_ref\"]},\"start_id\":{"
+     "\"type\":\"string\"},\"target_id\":{\"type\":\"string\"},\"hops\":{"
+     "\"type\":\"integer\",\"minimum\":1,\"maximum\":6},\"current_context\":{"
+     "\"type\":\"object\",\"description\":\"Structured context compared with recorded scope, "
+     "applicability, and invalidation conditions.\"},"
+     "\"freshness\":{\"type\":\"string\",\"enum\":[\"prefer_current\",\"require_current\"]},"
+     "\"impact\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\"]},"
+     "\"reversible\":{\"type\":\"boolean\"},\"as_of\":{\"type\":\"string\"},"
+     "\"valid_at\":{\"type\":\"string\"},\"known_at\":{\"type\":\"string\"},"
+     "\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":100}}}"},
+
+    {"memory_propose", "Propose Global Memory update",
+     "Stage revision-aware operations without holding a database transaction while an Agent "
+     "reasons. Operations support pages, claims, decisions, experiences, preferences, links, "
+     "and symbolic code references.",
+     "{\"type\":\"object\",\"properties\":{\"proposal_id\":{\"type\":\"string\"},"
+     "\"base_epoch\":{\"type\":\"integer\"},\"agent_id\":{\"type\":\"string\"},"
+     "\"session_id\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"},"
+     "\"expected_revisions\":{\"type\":\"object\"},\"operations\":{\"type\":\"array\","
+     "\"minItems\":1,\"items\":{\"type\":\"object\"}}},\"required\":[\"operations\"]}"},
+
+    {"memory_commit", "Commit Global Memory proposal",
+     "Atomically commit a proposal using entity revision compare-and-swap and an idempotent "
+     "operation ID. Semantic conflicts are rejected; last-write-wins is not used.",
+     "{\"type\":\"object\",\"properties\":{\"proposal_id\":{\"type\":\"string\"},"
+     "\"operation_id\":{\"type\":\"string\"},\"agent_id\":{\"type\":\"string\"},"
+     "\"session_id\":{\"type\":\"string\"},\"user_approved\":{\"type\":\"boolean\"}},"
+     "\"required\":[\"proposal_id\",\"operation_id\"]}"},
+
+    {"memory_lint", "Lint Global Memory",
+     "Audit unsupported or stale claims, epistemic confusion, source lineage, contradictions, "
+     "temporal overlap, retrieval concentration, proposal conflicts, outbox state, and CodeRefs.",
+     "{\"type\":\"object\",\"properties\":{\"checks\":{\"type\":\"array\",\"items\":{"
+     "\"type\":\"string\"}},\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":1000},"
+     "\"apply\":{\"type\":\"boolean\",\"default\":false},\"current_project\":{"
+     "\"type\":\"string\"}}}"},
+
+    {"memory_export", "Export Global Memory",
+     "Write a deterministic logical bundle containing canonical rows and immutable raw objects.",
+     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}"},
+
+    {"memory_import", "Import Global Memory",
+     "Transactionally merge a logical bundle; the live database is never swapped. Semantic "
+     "conflicts remain proposals rather than being resolved by last-write-wins.",
+     "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"policy\":{"
+     "\"type\":\"string\",\"enum\":[\"reject\",\"keep_local\",\"keep_remote\",\"newest\"],"
+     "\"default\":\"reject\"}}}"},
+
+    {"memory_sync", "Synchronize Global Memory",
+     "Use Git, including an optional GitHub HTTPS/SSH remote, only as transport for the "
+     "deterministic bundle. Merge policy is applied by memory_import, not Git text merge.",
+     "{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":["
+     "\"init\",\"status\",\"pull\",\"push\",\"configure_remote\"]},\"remote\":{"
+     "\"type\":\"string\"},\"remote_name\":{\"type\":\"string\",\"default\":\"origin\"},"
+     "\"branch\":{\"type\":\"string\",\"default\":\"cbm-memory\"},\"policy\":{\"type\":"
+     "\"string\",\"enum\":[\"reject\",\"keep_local\",\"keep_remote\",\"newest\"]},"
+     "\"allow_local_remote\":{\"type\":\"boolean\",\"default\":false}},"
+     "\"required\":[\"action\"]}"},
 };
 
 static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
@@ -897,6 +982,7 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
 
 struct cbm_mcp_server {
     cbm_store_t *store;             /* currently open project store (or NULL) */
+    cbm_memory_t *memory;           /* independent user-global memory handle (lazy) */
     bool owns_store;                /* true if we opened the store */
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last time resolve_store was called for a named project */
@@ -976,9 +1062,24 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
     }
+    cbm_memory_close(srv->memory);
     free(srv->current_project);
     free(srv->active_request_id_str);
     free(srv);
+}
+
+/* Global Memory is deliberately not part of the per-project store cache: it
+ * remains available while repositories switch or their idle handles are
+ * evicted.  The MCP event loop is single-threaded, so one lazy handle is safe;
+ * watcher/background paths open their own handles. */
+static cbm_memory_t *resolve_memory(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return NULL;
+    }
+    if (!srv->memory) {
+        srv->memory = cbm_memory_open(NULL);
+    }
+    return srv->memory;
 }
 
 /* ── Idle store eviction ──────────────────────────────────────── */
@@ -1515,8 +1616,22 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
 }
 
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
-    char *project = get_project_arg(args);
-    cbm_store_t *store = resolve_store(srv, project);
+    char *graph_arg = cbm_mcp_get_string_arg(args, "graph");
+    bool memory_graph = graph_arg && strcmp(graph_arg, "memory") == 0;
+    if (graph_arg && strcmp(graph_arg, "code") != 0 && !memory_graph) {
+        free(graph_arg);
+        return cbm_mcp_text_result("graph must be \"code\" or \"memory\"", true);
+    }
+    free(graph_arg);
+
+    char *project = memory_graph ? heap_strdup(CBM_MEMORY_PROJECT) : get_project_arg(args);
+    cbm_memory_t *memory = memory_graph ? resolve_memory(srv) : NULL;
+    cbm_store_t *store =
+        memory_graph ? cbm_memory_graph_store(memory) : resolve_store(srv, project);
+    if (memory_graph && !store) {
+        free(project);
+        return cbm_mcp_text_result("Global Memory graph is unavailable", true);
+    }
     REQUIRE_STORE(store, project);
 
     char *not_indexed = verify_project_indexed(store, project);
@@ -1531,6 +1646,10 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "graph", memory_graph ? "memory" : "code");
+    if (memory_graph) {
+        yyjson_mut_obj_add_sint(doc, root, "snapshot_epoch", cbm_memory_snapshot_epoch(memory));
+    }
 
     yyjson_mut_val *labels = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.node_label_count; i++) {
@@ -1560,9 +1679,11 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);
 
-    /* Check ADR presence */
+    /* ADRs are repository-scoped. A promoted ADR appears as a memory Decision
+     * with provenance and must never mutate the original implicitly. */
     cbm_project_t proj_info = {0};
-    if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
+    if (!memory_graph && cbm_store_get_project(store, project, &proj_info) == 0 &&
+        proj_info.root_path) {
         bool adr_exists = project_has_adr(store, project, proj_info.root_path);
         yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
         if (!adr_exists) {
@@ -2413,27 +2534,38 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "query");
-    char *project = get_project_arg(args);
-    cbm_store_t *store = resolve_store(srv, project);
     int max_rows = cbm_mcp_get_int_arg(args, "max_rows", 0);
 
-    /* graph="missed" (#963): run the SAME cypher against the derived
-     * miss-graph view (shadow project "<project>::missed") instead of the
-     * code graph — file structure of not-fully-indexed files only. */
     char *graph_arg = cbm_mcp_get_string_arg(args, "graph");
     bool missed_graph = graph_arg && strcmp(graph_arg, "missed") == 0;
+    bool memory_graph = graph_arg && strcmp(graph_arg, "memory") == 0;
+    bool invalid_graph =
+        graph_arg && strcmp(graph_arg, "code") != 0 && !missed_graph && !memory_graph;
     free(graph_arg);
 
     if (!query) {
-        free(project);
         return cbm_mcp_text_result("query is required", true);
     }
+    if (invalid_graph) {
+        free(query);
+        return cbm_mcp_text_result("graph must be \"code\", \"missed\", or \"memory\"", true);
+    }
+
+    /* graph="memory" is user-global and intentionally needs no repository.
+     * graph="missed" (#963) uses the derived shadow project; code retains the
+     * existing session-project fallback. */
+    char *project = memory_graph ? heap_strdup(CBM_MEMORY_PROJECT) : get_project_arg(args);
     if (missed_graph && !project) {
         free(query);
         return cbm_mcp_text_result("project is required when graph=\"missed\"", true);
     }
+    cbm_memory_t *memory = memory_graph ? resolve_memory(srv) : NULL;
+    cbm_store_t *store =
+        memory_graph ? cbm_memory_graph_store(memory) : resolve_store(srv, project);
     if (!store) {
-        char *_err = build_project_list_error("project not found or not indexed");
+        char *_err = memory_graph
+                         ? heap_strdup("Global Memory graph is unavailable; check CBM_MEMORY_HOME")
+                         : build_project_list_error("project not found or not indexed");
         char *_res = cbm_mcp_text_result(_err, true);
         free(_err);
         free(project);
@@ -2487,6 +2619,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_toon_row_end(&sb);
         }
         cbm_toon_scalar_int(&sb, "total", result.row_count);
+        if (memory_graph) {
+            cbm_toon_scalar_int(&sb, "snapshot_epoch", cbm_memory_snapshot_epoch(memory));
+        }
         if (result.warning) {
             cbm_toon_scalar_str(&sb, "warning", result.warning);
         }
@@ -2519,6 +2654,9 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         }
         yyjson_mut_obj_add_val(doc, root, "rows", rows);
         yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        if (memory_graph) {
+            yyjson_mut_obj_add_sint(doc, root, "snapshot_epoch", cbm_memory_snapshot_epoch(memory));
+        }
         if (result.warning) {
             yyjson_mut_obj_add_str(doc, root, "warning", result.warning);
         }
@@ -4788,6 +4926,44 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
+/* A successful explicit index has the same Global Memory semantics as a
+ * watcher re-index: references remain symbolic, linked memory becomes review
+ * required, and resolution is refreshed against the newly written code DB.
+ * Failures are deliberately non-fatal to repository indexing. */
+static void memory_after_project_index(cbm_mcp_server_t *srv, const char *project) {
+    if (!srv || !project || !cbm_validate_project_name(project)) {
+        return;
+    }
+    cbm_memory_t *memory = resolve_memory(srv);
+    if (!memory) {
+        cbm_log_warn("memory.index_refresh.err", "project", project);
+        return;
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = doc ? yyjson_mut_obj(doc) : NULL;
+    if (doc && root) {
+        yyjson_mut_doc_set_root(doc, root);
+        yyjson_mut_obj_add_strcpy(doc, root, "project", project);
+        yyjson_mut_obj_add_str(doc, root, "reason", "index_repository");
+        char *args = yy_doc_to_str(doc);
+        if (args) {
+            char *marked = cbm_memory_mark_code_changes_json(memory, args);
+            free(marked);
+            free(args);
+        }
+    }
+    yyjson_mut_doc_free(doc);
+
+    char path[CBM_SZ_2K];
+    project_db_path(project, path, sizeof(path));
+    cbm_store_t *code_store = path[0] ? cbm_store_open_path_query(path) : NULL;
+    if (code_store) {
+        (void)cbm_memory_validate_code_refs(memory, code_store, project);
+        cbm_store_close(code_store);
+    }
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
      * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
@@ -4903,6 +5079,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(srv->current_project);
     srv->current_project = NULL;
+
+    if (rc == 0) {
+        memory_after_project_index(srv, project_name);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -6616,6 +6796,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char line[CBM_SZ_1K];
     int file_count = 0;
+    char **changed_paths = NULL;
+    int changed_path_count = 0;
+    int changed_cap = 0;
 
     while (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
@@ -6647,6 +6830,20 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
         yyjson_mut_arr_add_strcpy(doc, changed, path_line);
         file_count++;
+        if (changed_path_count == changed_cap) {
+            int next_cap = changed_cap ? changed_cap * 2 : CBM_SZ_16;
+            char **next = realloc(changed_paths, (size_t)next_cap * sizeof(*next));
+            if (next) {
+                changed_paths = next;
+                changed_cap = next_cap;
+            }
+        }
+        if (changed_path_count < changed_cap) {
+            char *saved_path = heap_strdup(path_line);
+            if (saved_path) {
+                changed_paths[changed_path_count++] = saved_path;
+            }
+        }
 
         if (want_symbols) {
             detect_add_impacted_symbols(store, project, path_line, doc, impacted);
@@ -6668,6 +6865,58 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     yyjson_mut_obj_add_int(doc, root_obj, "changed_count", file_count);
     yyjson_mut_obj_add_val(doc, root_obj, "impacted_symbols", impacted);
     yyjson_mut_obj_add_int(doc, root_obj, "depth", depth);
+
+    /* A diff invalidates applicability assumptions; it does not automatically
+     * make a linked memory false. Persist review_required/dirty markers and
+     * expose the result alongside the ordinary impact response. */
+    if (file_count > 0 && changed_paths) {
+        yyjson_mut_doc *memory_doc = yyjson_mut_doc_new(NULL);
+        yyjson_mut_val *memory_root = memory_doc ? yyjson_mut_obj(memory_doc) : NULL;
+        if (memory_doc && memory_root) {
+            yyjson_mut_doc_set_root(memory_doc, memory_root);
+            yyjson_mut_obj_add_strcpy(memory_doc, memory_root, "project", project);
+            yyjson_mut_obj_add_str(memory_doc, memory_root, "reason", "detect_changes");
+            yyjson_mut_val *files = yyjson_mut_arr(memory_doc);
+            for (int i = 0; i < changed_path_count; i++) {
+                if (changed_paths[i]) {
+                    yyjson_mut_arr_add_strcpy(memory_doc, files, changed_paths[i]);
+                }
+            }
+            yyjson_mut_obj_add_val(memory_doc, memory_root, "files", files);
+            char *memory_args = yy_doc_to_str(memory_doc);
+            cbm_memory_t *memory = resolve_memory(srv);
+            char *memory_json = memory && memory_args
+                                    ? cbm_memory_mark_code_changes_json(memory, memory_args)
+                                    : NULL;
+            if (memory_json) {
+                yyjson_doc *result_doc = yyjson_read(memory_json, strlen(memory_json), 0);
+                if (result_doc && yyjson_is_obj(yyjson_doc_get_root(result_doc))) {
+                    yyjson_mut_val *copy =
+                        yyjson_val_mut_copy(doc, yyjson_doc_get_root(result_doc));
+                    yyjson_mut_obj_add_val(doc, root_obj, "global_memory", copy);
+                } else {
+                    yyjson_mut_obj_add_str(doc, root_obj, "memory_warning",
+                                           "Global Memory dirty result was invalid");
+                }
+                if (result_doc) {
+                    yyjson_doc_free(result_doc);
+                }
+            } else {
+                yyjson_mut_obj_add_str(doc, root_obj, "memory_warning",
+                                       "Global Memory was unavailable; code impact is unchanged");
+            }
+            free(memory_json);
+            free(memory_args);
+        }
+        if (memory_doc) {
+            yyjson_mut_doc_free(memory_doc);
+        }
+    }
+
+    for (int i = 0; i < changed_path_count; i++) {
+        free(changed_paths[i]);
+    }
+    free(changed_paths);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -6895,6 +7144,78 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ── Global Memory tools ──────────────────────────────────────── */
+
+typedef char *(*memory_json_fn)(cbm_memory_t *memory, const char *args_json);
+
+static bool memory_json_is_error(const char *json) {
+    if (!json) {
+        return true;
+    }
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return true;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *ok = yyjson_is_obj(root) ? yyjson_obj_get(root, "ok") : NULL;
+    bool failed = ok && yyjson_is_bool(ok) && !yyjson_get_bool(ok);
+    yyjson_doc_free(doc);
+    return failed;
+}
+
+static char *handle_memory_json(cbm_mcp_server_t *srv, const char *args, memory_json_fn fn) {
+    cbm_memory_t *memory = resolve_memory(srv);
+    if (!memory) {
+        return cbm_mcp_text_result(
+            "Global Memory is unavailable; check CBM_MEMORY_HOME and directory permissions", true);
+    }
+    char *json = fn(memory, args ? args : "{}");
+    if (!json) {
+        return cbm_mcp_text_result("Global Memory operation failed internally", true);
+    }
+    bool is_error = memory_json_is_error(json);
+    char *result = cbm_mcp_text_result(json, is_error);
+    free(json);
+    return result;
+}
+
+static char *handle_memory_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args) {
+    if (strcmp(tool_name, "memory_ingest") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_ingest_json);
+    }
+    if (strcmp(tool_name, "memory_query") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_query_json);
+    }
+    if (strcmp(tool_name, "memory_propose") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_propose_json);
+    }
+    if (strcmp(tool_name, "memory_commit") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_commit_json);
+    }
+    if (strcmp(tool_name, "memory_lint") == 0) {
+        char *project = cbm_mcp_get_string_arg(args, "current_project");
+        if (project) {
+            cbm_memory_t *memory = resolve_memory(srv);
+            cbm_store_t *code_store = resolve_store(srv, project);
+            if (memory && code_store) {
+                (void)cbm_memory_validate_code_refs(memory, code_store, project);
+            }
+            free(project);
+        }
+        return handle_memory_json(srv, args, cbm_memory_lint_json);
+    }
+    if (strcmp(tool_name, "memory_export") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_export_json);
+    }
+    if (strcmp(tool_name, "memory_import") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_import_json);
+    }
+    if (strcmp(tool_name, "memory_sync") == 0) {
+        return handle_memory_json(srv, args, cbm_memory_sync_json);
+    }
+    return cbm_mcp_text_result("unknown Global Memory tool", true);
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -6945,6 +7266,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
+    }
+    if (strncmp(tool_name, "memory_", SLEN("memory_")) == 0) {
+        return handle_memory_tool(srv, tool_name, args_json);
     }
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);

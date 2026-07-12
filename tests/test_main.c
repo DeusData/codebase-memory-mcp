@@ -14,6 +14,7 @@ int tf_skip_count = 0;
 #include "foundation/mem.h"       /* cbm_mem_init — worker budget */
 #include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
+#include "test_helpers.h"         /* th_rmtree — isolate user-global memory in tests */
 #include <sqlite3.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -164,6 +165,8 @@ extern void suite_store_nodes(void);
 extern void suite_store_edges(void);
 extern void suite_store_search(void);
 extern void suite_cypher(void);
+extern void suite_memory(void);
+extern void suite_memory_share(void);
 extern void suite_mcp(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
@@ -268,6 +271,17 @@ int main(int argc, char **argv) {
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
 
+    /* No test — including detect_changes integration tests — may touch the
+     * developer's real Global Memory. Child workers inherit this isolated home. */
+    char test_memory_home[1024];
+    snprintf(test_memory_home, sizeof(test_memory_home), "%s/cbm_test_memory_XXXXXX", cbm_tmpdir());
+    bool test_memory_home_created = cbm_mkdtemp(test_memory_home) != NULL;
+    if (!test_memory_home_created) {
+        fprintf(stderr, "cannot create isolated CBM_MEMORY_HOME for tests\n");
+        return 1;
+    }
+    cbm_setenv("CBM_MEMORY_HOME", test_memory_home, 1);
+
     g_suite_argc = argc;
     g_suite_argv = argv;
     printf("\n  codebase-memory-mcp  C test suite\n");
@@ -304,6 +318,10 @@ int main(int argc, char **argv) {
 
     /* Cypher (M6) */
     RUN_SELECTED_SUITE(cypher);
+
+    /* User-global knowledge memory */
+    RUN_SELECTED_SUITE(memory);
+    RUN_SELECTED_SUITE(memory_share);
 
     /* MCP Server (M9) */
     RUN_SELECTED_SUITE(mcp);
@@ -430,5 +448,8 @@ int main(int argc, char **argv) {
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();
     sqlite3_shutdown();
+    if (test_memory_home_created) {
+        th_rmtree(test_memory_home);
+    }
     TEST_SUMMARY();
 }
