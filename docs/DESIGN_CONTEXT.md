@@ -58,9 +58,11 @@ silently redefine tokens; aliases and resolver contexts should express overrides
 
 ### DTCG token files
 
-Standard JSON files ending in `.tokens.json` are parsed using the Design Tokens Community Group
-2025.10 format, including group-level `$type`, `$root`, `$value`, `$description`, and `{token.path}`
-aliases.
+Standard JSON files ending in `.tokens.json` are structurally indexed using the Design Tokens
+Community Group 2025.10 format. The built-in reader recognizes group-level `$type`, explicit
+`$root` token paths, `$value`, `$description`, token `$ref`, group `$extends`, and `{token.path}`
+aliases. `$ref` and `$extends` are preserved as source metadata; the index does not evaluate JSON
+Pointers, deep-merge groups, or produce a resolved token set.
 
 ```json
 {
@@ -82,6 +84,10 @@ Files must be standard JSON. JSONC comments are not accepted by the built-in par
 Files ending in `.resolver.json` with `version: "2025.10"` produce `DesignMode` nodes for modifier
 contexts and `OVERRIDES` edges to already indexed local token sources. The index records resolver
 metadata; it is not a conforming token-resolution/build engine.
+
+Each `OVERRIDES` edge carries the source-specific value, token path, source path, source order, and
+modifier order. A light and dark source may therefore define the same canonical token path without
+losing either value. `resolutionOrder` is retained as ordering metadata, not executed as a build.
 
 Only repository-local references are followed for graph linking. Absolute paths, parent traversal,
 URLs, and other URI schemes are never fetched. Same-document references remain visible in resolver
@@ -116,6 +122,18 @@ Primary actions must remain distinguishable without relying on color alone.
 
 Keep frontmatter intentionally simple. Rich narrative belongs in Markdown; machine-transformable
 values belong in DTCG token files.
+
+Typography entries are indexed as composite tokens. For example, the fields below become one
+`typography.h1` token rather than separate `typography.h1.fontFamily` and
+`typography.h1.fontSize` tokens:
+
+```yaml
+typography:
+  h1:
+    fontFamily: Inter
+    fontSize: 32px
+    fontWeight: 700
+```
 
 ### CSS and SCSS
 
@@ -161,10 +179,16 @@ After `index_repository`, use the curated tool first:
 get_design_context(project="my-project")
 get_design_context(project="my-project", scope="packages.app", token="color.action")
 get_design_context(project="my-project", component="button")
+get_design_context(project="my-project", limit=200, offset=200, relation_offset=800)
 ```
 
-It returns project-local systems, tokens, components, modes, and their core relations. For broader
-exploration, use graph tools:
+`scope` is an exact match, so `packages.app` does not include `packages.application`. Results are
+ordered by qualified name and return `filtered_total`, `has_more_by_type`, and
+`has_more_relations`; advance `offset` and `relation_offset` until both node and relation pages are
+complete. The Design tab performs this paging automatically.
+
+The tool returns project-local systems, tokens, components, modes, and their core relations. For
+broader exploration, use graph tools:
 
 ```text
 search_graph(project="my-project", label="DesignToken", name_pattern=".*action.*")

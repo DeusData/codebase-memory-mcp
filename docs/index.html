@@ -668,8 +668,10 @@
             Dedicated design tools remain responsible for authoring and CSS generation. The indexer reads the
             artifacts committed to the repository, connects them as <code>DesignSystem</code>,
             <code>DesignToken</code>, <code>DesignComponent</code>, and <code>DesignMode</code> nodes, and exposes
-            them through <code>get_design_context</code> and the UI's Design tab. It never fetches remote resolver
-            sources and never copies project design data into Global Memory automatically.
+            them through the paginated <code>get_design_context</code> API and the UI's Design tab. Mode-specific
+            values stay attached to <code>OVERRIDES</code> relationships, while DTCG <code>$ref</code> and
+            <code>$extends</code> remain structural metadata rather than triggering a token build. It never fetches
+            remote resolver sources and never copies project design data into Global Memory automatically.
         </p>
         <p style="margin-top: 16px;">
             <a href="https://github.com/bogyie/codebase-memory-mcp/blob/main/docs/DESIGN_CONTEXT.md">Read the repository layout and adoption guide →</a>
