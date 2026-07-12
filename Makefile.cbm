@@ -450,6 +450,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_issue581.c \
     tests/repro/repro_issue787.c \
     tests/repro/repro_issue842.c \
+    tests/repro/repro_issue964.c \
     tests/repro/repro_invariant_calls.c \
     tests/repro/repro_invariant_graph.c \
     tests/repro/repro_invariant_breadth.c \
