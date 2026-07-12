@@ -1459,6 +1459,11 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
 
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count) {
+    if (!s) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
     return find_nodes_generic(s, &s->stmt_find_nodes_by_name,
                               "SELECT id, project, label, name, qualified_name, file_path, "
                               "start_line, end_line, properties FROM nodes "
@@ -1468,6 +1473,11 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
 
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count) {
+    if (!s) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
     return find_nodes_generic(s, &s->stmt_find_nodes_by_label,
                               "SELECT id, project, label, name, qualified_name, file_path, "
                               "start_line, end_line, properties FROM nodes "
@@ -1477,6 +1487,11 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
 
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count) {
+    if (!s) {
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
     return find_nodes_generic(s, &s->stmt_find_nodes_by_file,
                               "SELECT id, project, label, name, qualified_name, file_path, "
                               "start_line, end_line, properties FROM nodes "
