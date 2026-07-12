@@ -29,30 +29,26 @@ static int agent_remove_callback(cbm_agent_client_id_t id, const char *config_pa
 
 static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] = {
     {CBM_AGENT_CLIENT_QODER, "qoder", "Qoder CLI", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT |
-         CBM_AGENT_CAP_HOOK | CBM_AGENT_CAP_PLUGIN,
-     "qodercli", agent_install_callback, agent_remove_callback},
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK, "qodercli",
+     agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_KIMI, "kimi", "Kimi Code CLI", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_HOOK |
-         CBM_AGENT_CAP_PLUGIN,
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_HOOK,
      "kimi", agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_GITLAB_DUO, "gitlab-duo", "GitLab Duo CLI", CBM_AGENT_STABLE,
      CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_HOOK, "duo", agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_ROVO_DEV, "rovo-dev", "Rovo Dev CLI", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "rovodev",
-     agent_install_callback, agent_remove_callback},
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+     "rovodev", agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_AMP, "amp", "Amp", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_PLUGIN,
-     "amp", agent_install_callback, agent_remove_callback},
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL, "amp",
+     agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_DEVIN, "devin", "Devin CLI / Local", CBM_AGENT_STABLE,
      CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_HOOK,
      "devin", agent_install_callback, agent_remove_callback},
-    {CBM_AGENT_CLIENT_TABNINE, "tabnine", "Tabnine", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL, "tabnine",
+    {CBM_AGENT_CLIENT_TABNINE, "tabnine", "Tabnine", CBM_AGENT_STABLE, CBM_AGENT_CAP_MCP, "tabnine",
      agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_CONTINUE, "continue", "Continue / cn", CBM_AGENT_CONDITIONAL,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
-     "cn", agent_install_callback, agent_remove_callback},
+     CBM_AGENT_CAP_MCP, "cn", agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_VISUAL_STUDIO, "visual-studio", "Visual Studio", CBM_AGENT_CONDITIONAL,
      CBM_AGENT_CAP_MCP, "devenv", agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_TRAE, "trae", "TRAE", CBM_AGENT_CONDITIONAL, CBM_AGENT_CAP_MCP, NULL,
@@ -677,6 +673,19 @@ bool cbm_agent_client_detect(cbm_agent_client_id_t id,
     return (marker_resolved == 0 && agent_path_exists(options, marker_path)) ||
            (resolved == 0 && agent_path_exists(options, path)) ||
            agent_command_exists(options, profile->detection_command);
+}
+
+bool cbm_agent_client_cleanup_candidate(cbm_agent_client_id_t id,
+                                        const cbm_agent_client_resolve_options_t *options) {
+    if (cbm_agent_client_detect(id, options)) {
+        return true;
+    }
+    if (id != CBM_AGENT_CLIENT_VISUAL_STUDIO || !options || !options->is_windows) {
+        return false;
+    }
+    char path[1024];
+    return cbm_agent_client_resolve_path(id, options, path, sizeof(path)) == 0 &&
+           agent_path_exists(options, path);
 }
 
 typedef struct {

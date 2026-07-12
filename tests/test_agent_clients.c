@@ -159,13 +159,36 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
     };
+    static const uint32_t expected_capabilities[] = {
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_HOOK,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_HOOK,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_HOOK,
+        CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+        CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
+        CBM_AGENT_CAP_MCP,
+    };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));
+    ASSERT_EQ(CBM_AGENT_CLIENT_COUNT,
+              sizeof(expected_capabilities) / sizeof(expected_capabilities[0]));
     for (size_t i = 0U; i < CBM_AGENT_CLIENT_COUNT; i++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(i);
         ASSERT_NOT_NULL(profile);
         ASSERT_EQ(profile->id, (cbm_agent_client_id_t)i);
         ASSERT_STR_EQ(profile->stable_id, expected[i]);
+        ASSERT_EQ(profile->capabilities, expected_capabilities[i]);
         ASSERT_NOT_NULL(profile->display_name);
         if (profile->id == CBM_AGENT_CLIENT_PI) {
             ASSERT(!(profile->capabilities & CBM_AGENT_CAP_MCP));
@@ -182,6 +205,30 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
     ASSERT_NULL(cbm_agent_client_by_id(CBM_AGENT_CLIENT_COUNT));
     ASSERT_NULL(cbm_agent_client_by_stable_id("glab"));
     ASSERT_EQ(cbm_agent_client_by_id(CBM_AGENT_CLIENT_TRAE)->stability, CBM_AGENT_CONDITIONAL);
+    PASS();
+}
+
+TEST(agent_clients_visual_studio_cleanup_survives_missing_command) {
+    agent_probe_t probe = {.paths = {"/home/tester/.mcp.json"}, .path_count = 1U};
+    cbm_agent_client_resolve_options_t options = agent_options(&probe);
+    options.is_windows = true;
+    ASSERT(!cbm_agent_client_detect(CBM_AGENT_CLIENT_VISUAL_STUDIO, &options));
+    ASSERT(cbm_agent_client_cleanup_candidate(CBM_AGENT_CLIENT_VISUAL_STUDIO, &options));
+
+    const char *foreign = "{\"servers\":{\"codebase-memory-mcp\":{\"type\":\"stdio\","
+                          "\"command\":\"C:/User/tool.exe\",\"args\":[]}}}\n";
+    char *dir = NULL;
+    char *path = agent_fixture(foreign, &dir);
+    ASSERT_NOT_NULL(path);
+    ASSERT_EQ(cbm_agent_client_remove_mcp(CBM_AGENT_CLIENT_VISUAL_STUDIO, path,
+                                          "C:/Tools/codebase-memory-mcp.exe"),
+              CBM_AGENT_EDIT_FOREIGN);
+    char *after = agent_read(path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, foreign);
+    free(after);
+    free(path);
+    th_cleanup(dir);
     PASS();
 }
 
@@ -1015,6 +1062,7 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_rovo_override_rejects_absolute_paths_outside_user_root);
     RUN_TEST(agent_clients_rovo_compatibility_prefers_existing_documented_filename);
     RUN_TEST(agent_clients_detection_avoids_generic_binary_false_positives);
+    RUN_TEST(agent_clients_visual_studio_cleanup_survives_missing_command);
     RUN_TEST(agent_clients_detect_installed_client_directories_before_mcp_exists);
     RUN_TEST(agent_clients_marker_detection_remains_fail_closed_for_conditional_clients);
     RUN_TEST(agent_clients_roo_code_requires_an_explicit_existing_config);

@@ -1131,6 +1131,75 @@ int cbm_text_ensure_owned_document(const char *file_path, const char *owned_cont
     return result;
 }
 
+static int text_matches_candidate(const char *data, size_t data_len, const char *candidate,
+                                  bool *matches) {
+    size_t candidate_len = 0U;
+    if (!matches || text_bounded_strlen(candidate, TEXT_MAX_BYTES, &candidate_len) != TEXT_OK ||
+        text_validate_bytes(candidate, candidate_len, 1) != TEXT_OK) {
+        return TEXT_ERROR;
+    }
+    *matches = data_len == candidate_len &&
+               (data_len == 0U || memcmp(data, candidate, data_len) == 0);
+    return TEXT_OK;
+}
+
+int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
+                                    const char *const *released_contents,
+                                    size_t released_count) {
+    size_t current_len = 0U;
+    if (!text_valid_path(file_path) ||
+        text_bounded_strlen(current_content, TEXT_MAX_BYTES, &current_len) != TEXT_OK ||
+        text_validate_bytes(current_content, current_len, 1) != TEXT_OK ||
+        (released_count > 0U && !released_contents)) {
+        return TEXT_ERROR;
+    }
+    for (size_t i = 0U; i < released_count; i++) {
+        bool ignored = false;
+        if (text_matches_candidate("", 0U, released_contents[i], &ignored) != TEXT_OK) {
+            return TEXT_ERROR;
+        }
+    }
+
+    char *old_data = NULL;
+    size_t old_len = 0U;
+    text_file_snapshot_t snapshot;
+    if (text_read_file(file_path, &old_data, &old_len, &snapshot) != TEXT_OK ||
+        text_validate_bytes(old_data, old_len, 1) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (!snapshot.exists) {
+        int result = text_write_atomic(file_path, current_content, current_len, old_data, old_len,
+                                       &snapshot);
+        free(old_data);
+        return result;
+    }
+
+    bool matches = false;
+    if (text_matches_candidate(old_data, old_len, current_content, &matches) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (matches) {
+        free(old_data);
+        return TEXT_OK;
+    }
+    for (size_t i = 0U; i < released_count; i++) {
+        if (text_matches_candidate(old_data, old_len, released_contents[i], &matches) != TEXT_OK) {
+            free(old_data);
+            return TEXT_ERROR;
+        }
+        if (matches) {
+            int result = text_write_atomic(file_path, current_content, current_len, old_data,
+                                           old_len, &snapshot);
+            free(old_data);
+            return result;
+        }
+    }
+    free(old_data);
+    return TEXT_UNOWNED;
+}
+
 int cbm_text_remove_owned_document(const char *file_path, const char *expected_owned_content) {
     size_t expected_len = 0U;
     if (!text_valid_path(file_path) ||
@@ -1152,6 +1221,55 @@ int cbm_text_remove_owned_document(const char *file_path, const char *expected_o
     }
     if (old_len != expected_len ||
         (old_len != 0U && memcmp(old_data, expected_owned_content, old_len) != 0)) {
+        free(old_data);
+        return TEXT_UNOWNED;
+    }
+    int result = text_delete_file(file_path, old_data, old_len, &snapshot);
+    free(old_data);
+    return result;
+}
+
+int cbm_text_remove_owned_document_any(const char *file_path, const char *current_content,
+                                       const char *const *released_contents,
+                                       size_t released_count) {
+    if (!text_valid_path(file_path) || (released_count > 0U && !released_contents)) {
+        return TEXT_ERROR;
+    }
+    bool ignored = false;
+    if (text_matches_candidate("", 0U, current_content, &ignored) != TEXT_OK) {
+        return TEXT_ERROR;
+    }
+    for (size_t i = 0U; i < released_count; i++) {
+        if (text_matches_candidate("", 0U, released_contents[i], &ignored) != TEXT_OK) {
+            return TEXT_ERROR;
+        }
+    }
+
+    char *old_data = NULL;
+    size_t old_len = 0U;
+    text_file_snapshot_t snapshot;
+    if (text_read_file(file_path, &old_data, &old_len, &snapshot) != TEXT_OK ||
+        text_validate_bytes(old_data, old_len, 1) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (!snapshot.exists) {
+        free(old_data);
+        return TEXT_OK;
+    }
+
+    bool matches = false;
+    if (text_matches_candidate(old_data, old_len, current_content, &matches) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    for (size_t i = 0U; !matches && i < released_count; i++) {
+        if (text_matches_candidate(old_data, old_len, released_contents[i], &matches) != TEXT_OK) {
+            free(old_data);
+            return TEXT_ERROR;
+        }
+    }
+    if (!matches) {
         free(old_data);
         return TEXT_UNOWNED;
     }

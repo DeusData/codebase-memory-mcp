@@ -264,6 +264,35 @@ TEST(config_text_owned_document_write_remove_exact_only) {
     PASS();
 }
 
+TEST(config_text_owned_document_migrates_exact_releases_only) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    const char *current = "name: codebase-memory\ntier: verify\n";
+    const char *released[] = {"name: codebase-memory\n", "name: codebase-memory\nlegacy: 2\n"};
+    const char *modified = "name: codebase-memory\nuser-note: keep\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+
+    ASSERT_EQ(cbm_text_migrate_owned_document(path, current, released, 2U), 0);
+    ASSERT(cte_assert_bytes(path, current, strlen(current)));
+
+    ASSERT_EQ(th_write_file(path, released[1]), 0);
+    ASSERT_EQ(cbm_text_migrate_owned_document(path, current, released, 2U), 0);
+    ASSERT(cte_assert_bytes(path, current, strlen(current)));
+
+    ASSERT_EQ(th_write_file(path, modified), 0);
+    ASSERT_EQ(cbm_text_migrate_owned_document(path, current, released, 2U), 1);
+    ASSERT(cte_assert_bytes(path, modified, strlen(modified)));
+
+    ASSERT_EQ(cbm_text_remove_owned_document_any(path, current, released, 2U), 1);
+    ASSERT(cte_assert_bytes(path, modified, strlen(modified)));
+    ASSERT_EQ(th_write_file(path, released[0]), 0);
+    ASSERT_EQ(cbm_text_remove_owned_document_any(path, current, released, 2U), 0);
+    ASSERT_FALSE(cte_path_exists(path));
+
+    th_cleanup(dir);
+    PASS();
+}
+
 TEST(config_text_rejects_invalid_utf8_and_controls) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
@@ -513,6 +542,7 @@ SUITE(config_text_edit) {
     RUN_TEST(config_text_managed_malformed_markers_fail_closed);
     RUN_TEST(config_text_managed_rejects_unsafe_markers_and_owned_content);
     RUN_TEST(config_text_owned_document_write_remove_exact_only);
+    RUN_TEST(config_text_owned_document_migrates_exact_releases_only);
     RUN_TEST(config_text_rejects_invalid_utf8_and_controls);
     RUN_TEST(config_text_rejects_oversized_existing_file);
     RUN_TEST(config_text_rejects_non_regular_paths);

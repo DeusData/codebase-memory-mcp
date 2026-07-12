@@ -8,6 +8,7 @@
  *   --help          Print usage and exit
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
+ *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
  *
  * Signal handling: SIGTERM/SIGINT trigger graceful shutdown.
  * Watcher runs in a background thread, polling for git changes.
@@ -519,6 +520,7 @@ static void print_help(void) {
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
     printf("\nSupported automatic/conditional client surfaces (43):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
@@ -701,6 +703,13 @@ int main(int argc, char **argv) {
     if (subcmd >= 0) {
         return subcmd;
     }
+    cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
+    if (cbm_mcp_parse_tool_profile_args(argc, argv, &tool_profile) != 0) {
+        (void)fprintf(stderr, "codebase-memory-mcp: --tool-profile requires the supported value "
+                              "'analysis' or 'scout'\n");
+        return 2;
+    }
+    bool restricted_tool_profile = tool_profile != CBM_MCP_TOOL_PROFILE_ALL;
 
     /* parent-death watchdog — distilled from #407 (fixes #406). Start it early so
      * an orphaned server exits even if it dies before reaching the MCP loop. A
@@ -736,7 +745,7 @@ int main(int argc, char **argv) {
     cbm_ui_config_t ui_cfg;
     cbm_ui_config_load(&ui_cfg);
     bool explicit_ui_enable = false;
-    if (parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
+    if (!restricted_tool_profile && parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
         cbm_ui_config_save(&ui_cfg);
     }
     /* If the user explicitly asked for the UI but this binary has no embedded
@@ -758,7 +767,7 @@ int main(int argc, char **argv) {
     char config_dir[CBM_SZ_1K];
     const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
-    if (cfg_home) {
+    if (cfg_home && !restricted_tool_profile) {
         snprintf(config_dir, sizeof(config_dir), "%s", cbm_resolve_cache_dir());
         runtime_config = cbm_config_open(config_dir);
     }
@@ -776,17 +785,23 @@ int main(int argc, char **argv) {
 #endif
         return SKIP_ONE;
     }
+    cbm_mcp_server_set_tool_profile(g_server, tool_profile);
 
     /* Create and start watcher in background thread */
     /* Initialize log mutex before any threads are created */
     cbm_ui_log_init();
 
-    cbm_store_t *watch_store = cbm_store_open_memory();
-    g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
+    cbm_store_t *watch_store = NULL;
+    if (!restricted_tool_profile) {
+        watch_store = cbm_store_open_memory();
+        g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
+    }
 
     /* Wire watcher + config into MCP server for session auto-index */
-    cbm_mcp_server_set_watcher(g_server, g_watcher);
-    cbm_mcp_server_set_config(g_server, runtime_config);
+    if (!restricted_tool_profile) {
+        cbm_mcp_server_set_watcher(g_server, g_watcher);
+        cbm_mcp_server_set_config(g_server, runtime_config);
+    }
     cbm_thread_t watcher_tid;
     bool watcher_started = false;
 
@@ -800,7 +815,8 @@ int main(int argc, char **argv) {
     cbm_thread_t http_tid;
     bool http_started = false;
 
-    if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
+    if (cbm_mcp_tool_profile_allows_http(tool_profile) && ui_cfg.ui_enabled &&
+        CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
             cbm_http_server_set_watcher(g_http_server, g_watcher);
@@ -808,7 +824,8 @@ int main(int argc, char **argv) {
                 http_started = true;
             }
         }
-    } else if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT == 0) {
+    } else if (cbm_mcp_tool_profile_allows_http(tool_profile) && ui_cfg.ui_enabled &&
+               CBM_EMBEDDED_FILE_COUNT == 0) {
         cbm_log_warn("ui.no_assets", "hint", "rebuild with: make -f Makefile.cbm cbm-with-ui");
     }
 
@@ -837,7 +854,9 @@ int main(int argc, char **argv) {
         cbm_thread_join(&watcher_tid);
     }
     cbm_watcher_free(g_watcher);
-    cbm_store_close(watch_store);
+    if (watch_store) {
+        cbm_store_close(watch_store);
+    }
     cbm_mcp_server_free(g_server);
     cbm_config_close(runtime_config);
 

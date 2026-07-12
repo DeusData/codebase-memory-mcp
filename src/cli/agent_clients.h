@@ -101,6 +101,8 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
                                   size_t path_out_size);
 bool cbm_agent_client_detect(cbm_agent_client_id_t id,
                              const cbm_agent_client_resolve_options_t *options);
+bool cbm_agent_client_cleanup_candidate(cbm_agent_client_id_t id,
+                                        const cbm_agent_client_resolve_options_t *options);
 
 /* config_path must already have been resolved. The adapter never guesses a
  * target here. Existing same-name foreign entries fail closed with

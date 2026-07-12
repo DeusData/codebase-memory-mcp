@@ -184,13 +184,27 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
 #ifdef CBM_CLI_ENABLE_TEST_API
 int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool windows, char *command,
                                             size_t command_size, char *shell, size_t shell_size);
+int cbm_build_qoder_hook_command_for_testing(const char *binary_path, bool windows, char *command,
+                                             size_t command_size, char *shell, size_t shell_size);
 bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool windows);
+void cbm_hook_sanitize_metadata_for_testing(const char *input, char *output, size_t output_size);
 int cbm_upsert_qwen_lifecycle_hooks_for_testing(const char *settings_path, const char *binary_path,
                                                 bool windows);
+int cbm_upsert_qoder_context_hooks_for_testing(const char *settings_path,
+                                               const char *binary_path);
+int cbm_remove_qoder_context_hooks_for_testing(const char *settings_path,
+                                               const char *binary_path);
 /* Explicit lifecycle adapter seam for hook protocols whose output envelope is
  * not Claude/Gemini-compatible. Returns allocated JSON or NULL to fail open. */
 char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char *forced_event,
                                                   const char *dialect);
+char *cbm_hook_augment_tool_json_for_testing(const char *input, const char *dialect,
+                                             const char *context, char *path, size_t path_size);
+bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
+                                                       const char *forced_event);
+bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
+                                        bool case_insensitive);
+const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */

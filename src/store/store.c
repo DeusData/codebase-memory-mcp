@@ -283,6 +283,20 @@ static int init_schema(cbm_store_t *s) {
         "  kind TEXT NOT NULL,"
         "  detail TEXT DEFAULT '',"
         "  PRIMARY KEY (project, rel_path, kind)"
+        ");"
+        /* One row per completed coverage persistence attempt. Kept separate
+         * from projects so existing graph/artifact schema stays compatible and
+         * a missing row unambiguously means coverage metadata is unavailable. */
+        "CREATE TABLE IF NOT EXISTS index_coverage_meta ("
+        "  project TEXT PRIMARY KEY REFERENCES projects(name) ON DELETE CASCADE,"
+        "  generation TEXT NOT NULL,"
+        "  index_mode TEXT NOT NULL,"
+        "  recorded_at TEXT NOT NULL,"
+        "  recording_status TEXT NOT NULL,"
+        "  ignored_files_stored INTEGER NOT NULL DEFAULT 0,"
+        "  ignored_files_total INTEGER NOT NULL DEFAULT 0,"
+        "  coverage_version INTEGER NOT NULL DEFAULT 1,"
+        "  hash_records_complete INTEGER NOT NULL DEFAULT 0"
         ");";
 
     int rc = exec_sql(s, ddl);
@@ -1218,9 +1232,39 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
 }
 
 int cbm_store_delete_project(cbm_store_t *s, const char *name) {
+    if (!s || !s->db || !name) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, "BEGIN;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    static const char *cleanup_sql[] = {
+        "DELETE FROM index_coverage WHERE project = ?1;",
+        "DELETE FROM index_coverage_meta WHERE project = ?1;",
+        "DELETE FROM projects WHERE name = ?1 || '::missed';",
+    };
+    for (size_t i = 0; i < sizeof(cleanup_sql) / sizeof(cleanup_sql[0]); i++) {
+        sqlite3_stmt *cleanup = NULL;
+        if (sqlite3_prepare_v2(s->db, cleanup_sql[i], CBM_NOT_FOUND, &cleanup, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "delete project coverage prepare");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+        bind_text(cleanup, SKIP_ONE, name);
+        int cleanup_rc = sqlite3_step(cleanup);
+        sqlite3_finalize(cleanup);
+        if (cleanup_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "delete project coverage");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+    }
+
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_delete_project, "DELETE FROM projects WHERE name = ?1;");
     if (!stmt) {
+        (void)exec_sql(s, "ROLLBACK;");
         return CBM_STORE_ERR;
     }
 
@@ -1228,9 +1272,10 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "delete_project");
+        (void)exec_sql(s, "ROLLBACK;");
         return CBM_STORE_ERR;
     }
-    return CBM_STORE_OK;
+    return exec_sql(s, "COMMIT;");
 }
 
 /* ── Node CRUD ──────────────────────────────────────────────────── */
@@ -1898,6 +1943,59 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
     return CBM_STORE_OK;
 }
 
+void cbm_store_clear_file_hash(cbm_file_hash_t *hash) {
+    if (!hash) {
+        return;
+    }
+    free((char *)hash->project);
+    free((char *)hash->rel_path);
+    free((char *)hash->sha256);
+    memset(hash, 0, sizeof(*hash));
+}
+
+int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
+                            cbm_file_hash_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project || !rel_path) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT project, rel_path, sha256, mtime_ns, size "
+                           "FROM file_hashes WHERE project = ?1 AND rel_path = ?2;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "file hash get exact prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        out->rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        out->sha256 = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+        out->mtime_ns = sqlite3_column_int64(stmt, ST_COL_3);
+        out->size = sqlite3_column_int64(stmt, CBM_SZ_4);
+        sqlite3_finalize(stmt);
+        if (!out->project || !out->rel_path || !out->sha256) {
+            cbm_store_clear_file_hash(out);
+            return CBM_STORE_ERR;
+        }
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "file hash get exact");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_NOT_FOUND;
+}
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_delete_file_hash,
@@ -1959,7 +2057,7 @@ static void cov_json_escape(char *dst, size_t dstsz, const char *src) {
  * {kind, detail}. Queryable via query_graph(graph="missed") with zero
  * cypher-engine changes; the real project's graph gains no rows. Derived
  * data — rebuilt from the authoritative (post-prune) table contents. */
-static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
+static int cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     char covproj[CBM_SZ_512];
     cbm_store_coverage_shadow_project(covproj, sizeof(covproj), project);
 
@@ -1968,18 +2066,28 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                                   "DELETE FROM nodes WHERE project = ?1;"};
     for (int w = 0; w < 2; w++) {
         sqlite3_stmt *del = NULL;
-        if (sqlite3_prepare_v2(s->db, wipes[w], CBM_NOT_FOUND, &del, NULL) == SQLITE_OK) {
-            bind_text(del, SKIP_ONE, covproj);
-            (void)sqlite3_step(del);
-            sqlite3_finalize(del);
+        if (sqlite3_prepare_v2(s->db, wipes[w], CBM_NOT_FOUND, &del, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage shadow wipe prepare");
+            return CBM_STORE_ERR;
+        }
+        bind_text(del, SKIP_ONE, covproj);
+        int wipe_rc = sqlite3_step(del);
+        sqlite3_finalize(del);
+        if (wipe_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "coverage shadow wipe");
+            return CBM_STORE_ERR;
         }
     }
 
     cbm_coverage_row_t *rows = NULL;
     int count = 0;
-    if (cbm_store_coverage_get(s, project, &rows, &count) != CBM_STORE_OK || count == 0) {
+    if (cbm_store_coverage_get(s, project, &rows, &count) != CBM_STORE_OK) {
         cbm_store_free_coverage(rows, count);
-        return;
+        return CBM_STORE_ERR;
+    }
+    if (count == 0) {
+        cbm_store_free_coverage(rows, count);
+        return CBM_STORE_OK;
     }
     /* Only FAILURE rows materialize in the miss graph; a project whose only
      * coverage rows are by-design not_indexed_* entries gets NO graph (not
@@ -1992,7 +2100,7 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     }
     if (failure_count == 0) {
         cbm_store_free_coverage(rows, count);
-        return;
+        return CBM_STORE_OK;
     }
 
     /* nodes.project has an FK to projects(name) (enforced: foreign_keys=ON),
@@ -2000,7 +2108,7 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
      * scans the cache directory for .db files, not this table. */
     if (cbm_store_upsert_project(s, covproj, "") != CBM_STORE_OK) {
         cbm_store_free_coverage(rows, count);
-        return;
+        return CBM_STORE_ERR;
     }
 
     cbm_node_t root = {.project = covproj,
@@ -2009,10 +2117,14 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                        .qualified_name = covproj,
                        .properties_json = "{}"};
     int64_t root_id = cbm_store_upsert_node(s, &root);
+    if (root_id <= 0) {
+        cbm_store_free_coverage(rows, count);
+        return CBM_STORE_ERR;
+    }
 
     for (int i = 0; i < count; i++) {
         const char *rel = rows[i].rel_path;
-        if (!rel || !rel[0] || root_id <= 0) {
+        if (!rel || !rel[0]) {
             continue;
         }
         /* The missed graph shows FAILURES ("we did not manage") only —
@@ -2041,15 +2153,20 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                                  .properties_json = "{}"};
             int64_t fid = cbm_store_upsert_node(s, &folder);
             *p = '/';
-            if (fid > 0) {
-                cbm_edge_t e = {.project = covproj,
-                                .source_id = parent,
-                                .target_id = fid,
-                                .type = "CONTAINS_FOLDER",
-                                .properties_json = "{}"};
-                (void)cbm_store_insert_edge(s, &e);
-                parent = fid;
+            if (fid <= 0) {
+                cbm_store_free_coverage(rows, count);
+                return CBM_STORE_ERR;
             }
+            cbm_edge_t e = {.project = covproj,
+                            .source_id = parent,
+                            .target_id = fid,
+                            .type = "CONTAINS_FOLDER",
+                            .properties_json = "{}"};
+            if (cbm_store_insert_edge(s, &e) <= 0) {
+                cbm_store_free_coverage(rows, count);
+                return CBM_STORE_ERR;
+            }
+            parent = fid;
         }
 
         const char *base = strrchr(rel, '/');
@@ -2065,21 +2182,28 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
                            .file_path = rel,
                            .properties_json = props};
         int64_t file_id = cbm_store_upsert_node(s, &file);
-        if (file_id > 0) {
-            cbm_edge_t e = {.project = covproj,
-                            .source_id = parent,
-                            .target_id = file_id,
-                            .type = "CONTAINS_FILE",
-                            .properties_json = "{}"};
-            (void)cbm_store_insert_edge(s, &e);
+        if (file_id <= 0) {
+            cbm_store_free_coverage(rows, count);
+            return CBM_STORE_ERR;
+        }
+        cbm_edge_t e = {.project = covproj,
+                        .source_id = parent,
+                        .target_id = file_id,
+                        .type = "CONTAINS_FILE",
+                        .properties_json = "{}"};
+        if (cbm_store_insert_edge(s, &e) <= 0) {
+            cbm_store_free_coverage(rows, count);
+            return CBM_STORE_ERR;
         }
     }
     cbm_store_free_coverage(rows, count);
+    return CBM_STORE_OK;
 }
 
-int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,
-                               int count) {
-    if (!s || !s->db || !project) {
+int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
+                                  const cbm_coverage_row_t *rows, int count,
+                                  const cbm_coverage_meta_t *meta) {
+    if (!s || !s->db || !project || count < 0 || (count > 0 && !rows)) {
         return CBM_STORE_ERR;
     }
     if (exec_sql(s, "BEGIN;") != CBM_STORE_OK) {
@@ -2137,15 +2261,240 @@ int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_co
                            "DELETE FROM index_coverage WHERE project = ?1 "
                            "AND kind NOT LIKE 'not_indexed%' AND rel_path NOT IN "
                            "(SELECT rel_path FROM file_hashes WHERE project = ?1);",
-                           CBM_NOT_FOUND, &prune, NULL) == SQLITE_OK) {
-        bind_text(prune, SKIP_ONE, project);
-        (void)sqlite3_step(prune);
-        sqlite3_finalize(prune);
+                           CBM_NOT_FOUND, &prune, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage prune prepare");
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
     }
+    bind_text(prune, SKIP_ONE, project);
+    int prune_rc = sqlite3_step(prune);
+    sqlite3_finalize(prune);
+    if (prune_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage prune");
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
+
+    if (meta) {
+        char recorded_at[CBM_SZ_64];
+        if (meta->recorded_at && meta->recorded_at[0]) {
+            snprintf(recorded_at, sizeof(recorded_at), "%s", meta->recorded_at);
+        } else {
+            iso_now(recorded_at, sizeof(recorded_at));
+        }
+        const char *generation =
+            meta->generation && meta->generation[0] ? meta->generation : recorded_at;
+        const char *index_mode =
+            meta->index_mode && meta->index_mode[0] ? meta->index_mode : "unknown";
+        const char *recording_status = meta->recording_status && meta->recording_status[0]
+                                           ? meta->recording_status
+                                           : "unavailable";
+        int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
+        int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
+        int coverage_version = meta->coverage_version > 0 ? meta->coverage_version : 1;
+
+        sqlite3_stmt *up_meta = NULL;
+        if (sqlite3_prepare_v2(
+                s->db,
+                "INSERT INTO index_coverage_meta "
+                "(project, generation, index_mode, recorded_at, recording_status, "
+                " ignored_files_stored, ignored_files_total, coverage_version, "
+                " hash_records_complete) "
+                "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) "
+                "ON CONFLICT(project) DO UPDATE SET generation=?2, index_mode=?3, "
+                "recorded_at=?4, recording_status=?5, ignored_files_stored=?6, "
+                "ignored_files_total=?7, coverage_version=?8, hash_records_complete=?9;",
+                CBM_NOT_FOUND, &up_meta, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta upsert prepare");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+        bind_text(up_meta, SKIP_ONE, project);
+        bind_text(up_meta, ST_COL_2, generation);
+        bind_text(up_meta, ST_COL_3, index_mode);
+        bind_text(up_meta, CBM_SZ_4, recorded_at);
+        bind_text(up_meta, CBM_SZ_5, recording_status);
+        sqlite3_bind_int(up_meta, 6, ignored_stored);
+        sqlite3_bind_int(up_meta, 7, ignored_total);
+        sqlite3_bind_int(up_meta, 8, coverage_version);
+        sqlite3_bind_int(up_meta, 9, meta->hash_records_complete ? 1 : 0);
+        int meta_rc = sqlite3_step(up_meta);
+        sqlite3_finalize(up_meta);
+        if (meta_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "coverage meta upsert");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+    } else {
+        sqlite3_stmt *del_meta = NULL;
+        if (sqlite3_prepare_v2(s->db,
+                               "DELETE FROM index_coverage_meta WHERE project = ?1;",
+                               CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "coverage meta delete prepare");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+        bind_text(del_meta, SKIP_ONE, project);
+        int meta_rc = sqlite3_step(del_meta);
+        sqlite3_finalize(del_meta);
+        if (meta_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "coverage meta delete");
+            (void)exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+    }
+
     /* Rebuild the derived miss-graph view from the now-authoritative table
      * contents (same transaction — the table and its view stay in step). */
-    cov_rebuild_shadow_graph(s, project);
+    if (cov_rebuild_shadow_graph(s, project) != CBM_STORE_OK) {
+        (void)exec_sql(s, "ROLLBACK;");
+        return CBM_STORE_ERR;
+    }
     return exec_sql(s, "COMMIT;");
+}
+
+int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,
+                               int count) {
+    return cbm_store_coverage_replace_ex(s, project, rows, count, NULL);
+}
+
+static int coverage_query_rows(cbm_store_t *s, const char *project, const char *selector,
+                               const char *sql, cbm_coverage_row_t **out, int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project || !selector || !sql) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage targeted prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, selector);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_coverage_row_t *arr = malloc((size_t)cap * sizeof(*arr));
+    if (!arr) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(*arr));
+        }
+        memset(&arr[n], 0, sizeof(arr[n]));
+        arr[n].rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        arr[n].kind = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        arr[n].detail = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+        if (!arr[n].rel_path || !arr[n].kind || !arr[n].detail) {
+            sqlite3_finalize(stmt);
+            cbm_store_free_coverage(arr, n + 1);
+            return CBM_STORE_ERR;
+        }
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    if (scan_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage targeted scan");
+        cbm_store_free_coverage(arr, n);
+        return CBM_STORE_ERR;
+    }
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char *rel_path,
+                                cbm_coverage_row_t **out, int *count) {
+    static const char sql[] =
+        "SELECT rel_path, kind, detail FROM index_coverage "
+        "WHERE project = ?1 AND (rel_path = ?2 OR "
+        " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2) "
+        "  AND substr(?2, 1, length(rel_path)) = rel_path "
+        "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
+        "ORDER BY length(rel_path) DESC, rel_path, kind;";
+    return coverage_query_rows(s, project, rel_path, sql, out, count);
+}
+
+int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
+                                 cbm_coverage_row_t **out, int *count) {
+    static const char sql[] =
+        "SELECT rel_path, kind, detail FROM index_coverage "
+        "WHERE project = ?1 AND (length(?2) = 0 OR rel_path = ?2 OR "
+        " (length(rel_path) > length(?2) "
+        "  AND substr(rel_path, 1, length(?2)) = ?2 "
+        "  AND substr(rel_path, length(?2) + 1, 1) = '/') OR "
+        " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2) "
+        "  AND substr(?2, 1, length(rel_path)) = rel_path "
+        "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
+        "ORDER BY rel_path, kind;";
+    return coverage_query_rows(s, project, scope, sql, out, count);
+}
+
+void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {
+    if (!meta) {
+        return;
+    }
+    free((char *)meta->project);
+    free((char *)meta->generation);
+    free((char *)meta->index_mode);
+    free((char *)meta->recorded_at);
+    free((char *)meta->recording_status);
+    memset(meta, 0, sizeof(*meta));
+}
+
+int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(
+            s->db,
+            "SELECT project, generation, index_mode, recorded_at, recording_status, "
+            "ignored_files_stored, ignored_files_total, coverage_version, "
+            "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
+            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "coverage meta get prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
+        out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        out->generation = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+        out->index_mode = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+        out->recorded_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+        out->recording_status = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
+        out->ignored_files_stored = sqlite3_column_int(stmt, CBM_SZ_5);
+        out->ignored_files_total = sqlite3_column_int(stmt, 6);
+        out->coverage_version = sqlite3_column_int(stmt, 7);
+        out->hash_records_complete = sqlite3_column_int(stmt, 8) != 0;
+        sqlite3_finalize(stmt);
+        if (!out->project || !out->generation || !out->index_mode || !out->recorded_at ||
+            !out->recording_status) {
+            cbm_store_coverage_meta_clear(out);
+            return CBM_STORE_ERR;
+        }
+        return CBM_STORE_OK;
+    }
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "coverage meta get");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_NOT_FOUND;
 }
 
 int cbm_store_coverage_get(cbm_store_t *s, const char *project, cbm_coverage_row_t **out,

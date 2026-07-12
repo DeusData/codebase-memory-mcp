@@ -56,7 +56,7 @@
       "featureList": [
         "Indexes 158 programming languages via vendored tree-sitter grammars",
         "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
-        "14 MCP tools for structural search, call-path tracing, and Cypher graph queries",
+        "15 MCP tools for structural search, call-path tracing, targeted coverage checks, and Cypher graph queries",
         "Semantic vector code search via bundled nomic-embed-code embeddings (no API key, fully local)",
         "Semantic graph edges (SEMANTICALLY_RELATED) and near-clone detection (SIMILAR_TO, MinHash + LSH)",
         "Cross-service linking for HTTP, gRPC, GraphQL, tRPC, and pub/sub channels with confidence scoring",
@@ -542,10 +542,12 @@
             <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
         </p>
         <p class="muted">
-            Lifecycle installation follows documented context contracts: Kimi uses <code>UserPromptSubmit</code>;
+            Lifecycle installation follows documented context contracts: Qoder uses <code>SessionStart</code>,
+            <code>SubagentStart</code>, and post-<code>Read</code> coverage, including its documented Windows
+            PowerShell executor. Kimi uses <code>UserPromptSubmit</code>;
             on macOS/Linux, GitLab Duo gets a fail-open user <code>SessionStart</code>, while Devin gets
             <code>UserPromptSubmit</code>, <code>PostCompaction</code>, and a deduplicated <code>SessionStart</code>
-            when Claude does not already provide it. Qoder, GitLab Duo, Devin, and Factory hooks are withheld on
+            when Claude does not already provide it. GitLab Duo, Devin, and Factory hooks are withheld on
             Windows where no deterministic shell/executor contract is documented. Cline's auto-activating file hooks
             are withheld because their context output is not reliably consumed; CodeBuddy's beta hooks are not
             auto-installed; Junie's EAP
@@ -553,9 +555,16 @@
             the documented events cannot safely provide race-free MCP context to read-only subagents.
         </p>
         <p class="muted">
-            Claude, Gemini, Kiro, Qwen, CodeBuddy, KiloCode, Mistral Vibe, Qoder, Junie, and Factory receive documented
-            graph profiles with the narrowest tool/server filters their schemas support. KiloCode and Vibe use explicit
-            read-only query-tool allowlists rather than server wildcards. Cursor, Rovo, Pochi, and Cline use explicit
+            Documented custom-agent formats receive three exact-owned evidence tiers: Scout for narrow provisional
+            discovery, Verify as the task-directed default, and Auditor for bounded, paginated, current-generation
+            verification. Every direct tier calls <code>check_index_coverage</code> for cited paths and relevant scopes,
+            then reads flagged ranges or skipped files directly. Kiro and Junie use positive-allowlist
+            <code>--tool-profile scout</code> and <code>--tool-profile analysis</code> server surfaces;
+            Junie selects dedicated named aliases because its subagent schema filters by server.
+            Qoder combines named-server selection with exact tier-specific MCP tool IDs. Factory uses
+            exact registered tool IDs without its additive whole-server <code>mcpServers</code> field.
+            A foreign Junie alias is preserved and causes the installed profiles to fail closed to parent handoff.
+            Cursor, Rovo, Augment, Pochi, and Cline use explicit
             parent handoff where direct child MCP is unavailable or unsafe; Pochi is limited to <code>readFile</code>.
             Neither IBM Bob surface receives an invented hook or custom agent. Amazon Q Developer
             IDE defaults to <code>~/.aws/amazonq/default.json</code> while preserving either existing documented
@@ -729,8 +738,8 @@
                 <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
-                <h3>14 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 7 more.</p>
+                <h3>15 MCP tools</h3>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>check_index_coverage</code>, <code>manage_adr</code>, and 7 more.</p>
             </div>
             <div class="feature">
                 <h3>Cypher graph queries</h3>
