@@ -147,8 +147,20 @@ may contain sensitive data.
 ## Code graph integration
 
 Memory stores symbolic `CodeRef` values (project, qualified name, file, and optional commit/tree
-hash), never raw node IDs from a project database. Index and change-detection paths validate
-references and mark connected memory dirty when referenced files/symbols change or disappear.
+hash), never raw node IDs from a project database.
+
+`detect_changes` is observational: it reports changed files and impacted symbols and returns
+`global_memory_updated: false`. It does not open, dirty, or revise Global Memory. This keeps a
+diagnostic query from becoming an implicit durable write.
+
+After a repository index completes, the indexer publishes an opaque graph generation only after
+file hashes, coverage metadata, and FTS are durable. Long-running MCP readers keep serving their
+previous complete snapshot while a replacement is being built, then reopen after the completion
+marker appears. CodeRef validation runs against that completed graph. It updates only references
+whose resolved/missing result actually changed; a no-op reindex therefore does not create a Memory
+epoch or CodeRef revision. Connected memory is marked for review only when validation detects a
+real resolution change.
+
 Repository ADRs remain repository-scoped unless explicitly promoted through a memory proposal.
 
 ## Maintenance

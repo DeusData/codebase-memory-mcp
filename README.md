@@ -472,7 +472,7 @@ concurrency, and sharing contracts.
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
-| `index_status` | Check indexing status of a project. |
+| `index_status` | Check project health, coverage, and the latest completed snapshot generation. |
 
 ### Querying
 
@@ -480,7 +480,7 @@ concurrency, and sharing contracts.
 |------|-------------|
 | `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
 | `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
-| `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
+| `detect_changes` | Read-only mapping from git diff to affected symbols + blast radius. Never writes Global Memory. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
@@ -498,6 +498,12 @@ provenance, bitemporal claim state, proposals, activities, and full-text search.
 `CBM_MEMORY_HOME` to override the platform data-directory default. See
 [Using Global Memory](docs/GLOBAL_MEMORY_GUIDE.md) for task-oriented workflows and
 [Global Memory Architecture](docs/GLOBAL_MEMORY.md) for its epistemic and concurrency contracts.
+
+Code discovery and durable memory writes have separate contracts. `detect_changes` is strictly
+observational. After a successful repository index, CodeRefs are validated against the completed
+graph directly; unchanged resolution is a no-op and does not create a Memory epoch or revision.
+Project graph readers switch generations only after hashes, coverage, and FTS have been published,
+and `index_status` exposes `snapshot_complete` plus the opaque `index_generation`.
 
 | Tool | Description |
 |------|-------------|

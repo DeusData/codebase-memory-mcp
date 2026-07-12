@@ -486,6 +486,7 @@
             <a href="#hybrid-lsp">Hybrid LSP</a>
             <a href="#semantic-search">Semantic search</a>
             <a href="#design-context">Design Context</a>
+            <a href="#memory-safety">Memory safety</a>
             <a href="#releases">Releases</a>
             <a href="#faq">FAQ</a>
             <a class="nav-cta nav-star" href="https://github.com/bogyie/codebase-memory-mcp" title="Star codebase-memory-mcp on GitHub" aria-label="Star this project on GitHub">★ Star on GitHub</a>
@@ -855,6 +856,31 @@
                 <p><code>manage_adr</code> persists architectural decisions alongside the graph, so design rationale survives across sessions and teammates.</p>
             </div>
         </div>
+    </section>
+
+    <section id="memory-safety">
+        <h2>How do code indexing and Global Memory interact?</h2>
+        <p class="lead">
+            Code discovery is observational. Durable memory changes stay explicit, while completed graph
+            snapshots keep long-running MCP sessions fresh without exposing a half-built index.
+        </p>
+        <div class="features">
+            <div class="feature">
+                <h3>Read-only change detection</h3>
+                <p><code>detect_changes</code> reports changed files and impacted symbols without writing Global Memory. Its response includes <code>global_memory_updated: false</code>.</p>
+            </div>
+            <div class="feature">
+                <h3>No-op-safe CodeRefs</h3>
+                <p>After a successful index, symbolic CodeRefs are validated directly. Unchanged resolution does not create a new Memory epoch or revision.</p>
+            </div>
+            <div class="feature">
+                <h3>Published graph generations</h3>
+                <p>Hashes, coverage, and FTS finish before a generation is published. Active readers switch only to a completed snapshot; the Projects UI shows its status and generation.</p>
+            </div>
+        </div>
+        <p style="margin-top: 16px;">
+            <a href="GLOBAL_MEMORY.md">Read the full Global Memory contract →</a>
+        </p>
     </section>
 
     <section id="releases">
