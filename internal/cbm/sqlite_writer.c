@@ -2211,7 +2211,11 @@ cbm_db_writer_t *cbm_writer_open(const char *path) {
      * -wal/-shm or a crashed session's WAL gets replayed on top of the
      * new file at the next open (#897). */
     cbm_remove_db_sidecars(path);
-    FILE *fp = fopen(path, "wb");
+    /* cbm_fopen, not raw fopen: the cache dir lives under the user profile,
+     * and an ANSI-CP fopen fails to create the DB on non-ASCII Windows
+     * profiles — the reported phase=dump failure (#996). Everything around
+     * this call (cbm_mkdir_p, sqlite3_open_v2 reopen) is already wide-safe. */
+    FILE *fp = cbm_fopen(path, "wb");
     if (!fp) {
         return NULL;
     }

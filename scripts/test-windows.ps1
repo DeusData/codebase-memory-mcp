@@ -14,6 +14,7 @@
                     They must stay GREEN (exit 0); a RED (exit 1) means the fix
                     regressed and fails this runner.
                       * test_non_ascii_path.py    guards #636/#357 (fixed by #700)
+                      * test_non_ascii_cache_dump.py guards #996 (writer cbm_fopen)
                       * test_hook_augment.py      guards #618      (fixed by #619)
                       * test_ui_drive_listing.py  guards #548      (roots field)
                       * test_cli_non_ascii_arg.py guards #423/#20  (wide-argv main())
@@ -104,6 +105,7 @@ $env:CBM_INDEX_SUPERVISOR = "0" # in-process indexing (see .DESCRIPTION)
 # (exit 2) and is skipped rather than failed.
 $guards = @(
     "tests\windows\test_non_ascii_path.py",
+    "tests\windows\test_non_ascii_cache_dump.py",
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py"
