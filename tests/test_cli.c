@@ -519,6 +519,137 @@ TEST(cli_uninstall_removes_skills) {
     PASS();
 }
 
+/* ── uninstall command safety (#1038) ─────────────────────────── */
+
+/* Test seam from cli.c: force prompt_yn() auto-answer (1=yes, -1=no, 0=prompt). */
+extern void cbm_set_auto_answer_for_test(int value);
+
+static bool test_path_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Create a fake install under home: binary + Claude MCP config.
+ * Writes the binary path into bin_path. Returns 0 on success. */
+static int setup_fake_install(const char *home, char *bin_path, size_t bin_sz) {
+#ifdef _WIN32
+    snprintf(bin_path, bin_sz, "%s/.local/bin/codebase-memory-mcp.exe", home);
+#else
+    snprintf(bin_path, bin_sz, "%s/.local/bin/codebase-memory-mcp", home);
+#endif
+    if (th_write_file(bin_path, "fake-binary") != 0)
+        return -1;
+    char mcp[1024];
+    snprintf(mcp, sizeof(mcp), "%s/.claude/.mcp.json", home);
+    return th_write_file(mcp, "{\"mcpServers\":{\"codebase-memory-mcp\":{\"command\":\"x\"}}}");
+}
+
+TEST(cli_uninstall_help_not_destructive) {
+    /* Repro of #1038: `uninstall --help` used to run a full uninstall. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-unhelp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *raw = getenv("HOME");
+    char *old_home = raw ? strdup(raw) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char bin_path[1024];
+    int setup_rc = setup_fake_install(tmpdir, bin_path, sizeof(bin_path));
+
+    char help_flag[] = "--help";
+    char *argv_help[] = {help_flag};
+    int rc = cbm_cmd_uninstall(1, argv_help);
+    bool bin_kept = test_path_exists(bin_path);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else
+        cbm_unsetenv("HOME");
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(setup_rc, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT(bin_kept);
+    PASS();
+}
+
+TEST(cli_uninstall_unknown_flag_rejected) {
+    /* A typo like `--dryrun` must error out, not run a real uninstall (#1038). */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-unflag-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *raw = getenv("HOME");
+    char *old_home = raw ? strdup(raw) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char bin_path[1024];
+    int setup_rc = setup_fake_install(tmpdir, bin_path, sizeof(bin_path));
+
+    char typo_flag[] = "--dryrun";
+    char *argv_typo[] = {typo_flag};
+    int rc = cbm_cmd_uninstall(1, argv_typo);
+    bool bin_kept = test_path_exists(bin_path);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else
+        cbm_unsetenv("HOME");
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(setup_rc, 0);
+    ASSERT_EQ(rc, 1);
+    ASSERT(bin_kept);
+    PASS();
+}
+
+TEST(cli_uninstall_confirmation_gate) {
+    /* Declined prompt aborts; -y proceeds and removes the binary (#1038). */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-unconf-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *raw = getenv("HOME");
+    char *old_home = raw ? strdup(raw) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char bin_path[1024];
+    int setup_rc = setup_fake_install(tmpdir, bin_path, sizeof(bin_path));
+
+    /* Auto-answer "no": uninstall must cancel without touching files */
+    cbm_set_auto_answer_for_test(-1);
+    int rc_no = cbm_cmd_uninstall(0, NULL);
+    bool bin_after_no = test_path_exists(bin_path);
+
+    /* -y: proceeds and removes the fake binary */
+    cbm_set_auto_answer_for_test(0);
+    char yes_flag[] = "-y";
+    char *argv_yes[] = {yes_flag};
+    int rc_yes = cbm_cmd_uninstall(1, argv_yes);
+    bool bin_after_yes = test_path_exists(bin_path);
+    cbm_set_auto_answer_for_test(0);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else
+        cbm_unsetenv("HOME");
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(setup_rc, 0);
+    ASSERT_EQ(rc_no, 1);
+    ASSERT(bin_after_no);
+    ASSERT_EQ(rc_yes, 0);
+    ASSERT(!bin_after_yes);
+    PASS();
+}
+
 TEST(cli_remove_old_monolithic_skill) {
     /* Port of TestRemoveOldMonolithicSkill */
     char tmpdir[256];
@@ -3101,6 +3232,9 @@ SUITE(cli) {
     RUN_TEST(cli_skill_idempotent);
     RUN_TEST(cli_skill_force_overwrite);
     RUN_TEST(cli_uninstall_removes_skills);
+    RUN_TEST(cli_uninstall_help_not_destructive);
+    RUN_TEST(cli_uninstall_unknown_flag_rejected);
+    RUN_TEST(cli_uninstall_confirmation_gate);
     RUN_TEST(cli_remove_old_monolithic_skill);
     RUN_TEST(cli_skill_files_content);
     RUN_TEST(cli_codex_instructions);
