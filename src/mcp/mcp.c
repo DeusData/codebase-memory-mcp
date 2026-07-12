@@ -4570,7 +4570,16 @@ static void free_node_contents(cbm_node_t *n) {
 
 /* ── Helper: read lines [start, end] from a file ─────────────── */
 
-static char *read_file_lines(const char *path, int start, int end) {
+enum { SNIPPET_SOURCE_MAX_BYTES = 16 * 1024 };
+
+static char *read_file_lines_ex(const char *path, int start, int end, bool *truncated,
+                                size_t *bytes_read) {
+    if (truncated) {
+        *truncated = false;
+    }
+    if (bytes_read) {
+        *bytes_read = 0;
+    }
     FILE *fp = cbm_fopen(path, "r");
     if (!fp) {
         return NULL;
@@ -4582,23 +4591,37 @@ static char *read_file_lines(const char *path, int start, int end) {
     buf[0] = '\0';
 
     char line[CBM_SZ_2K];
-    int lineno = 0;
+    int lineno = 1;
     while (fgets(line, sizeof(line), fp)) {
-        lineno++;
-        if (lineno < start) {
-            continue;
-        }
         if (lineno > end) {
             break;
         }
         size_t ll = strlen(line);
-        while (len + ll + SKIP_ONE > cap) {
-            cap *= PAIR_LEN;
-            buf = safe_realloc(buf, cap);
+        if (lineno >= start) {
+            size_t remaining = SNIPPET_SOURCE_MAX_BYTES - len;
+            size_t copy_len = ll < remaining ? ll : remaining;
+            while (len + copy_len + SKIP_ONE > cap) {
+                cap *= PAIR_LEN;
+                if (cap > SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE) {
+                    cap = SNIPPET_SOURCE_MAX_BYTES + SKIP_ONE;
+                }
+                buf = safe_realloc(buf, cap);
+            }
+            memcpy(buf + len, line, copy_len);
+            len += copy_len;
+            buf[len] = '\0';
+            if (copy_len < ll || len == SNIPPET_SOURCE_MAX_BYTES) {
+                if (truncated) {
+                    *truncated = true;
+                }
+                break;
+            }
         }
-        memcpy(buf + len, line, ll);
-        len += ll;
-        buf[len] = '\0';
+        /* fgets may return multiple chunks for one physical line. Advance the
+         * line number only after the newline, not once per buffer chunk. */
+        if (ll > 0 && line[ll - SKIP_ONE] == '\n') {
+            lineno++;
+        }
     }
 
     (void)fclose(fp);
@@ -4606,7 +4629,14 @@ static char *read_file_lines(const char *path, int start, int end) {
         free(buf);
         return NULL;
     }
+    if (bytes_read) {
+        *bytes_read = len;
+    }
     return buf;
+}
+
+static char *read_file_lines(const char *path, int start, int end) {
+    return read_file_lines_ex(path, start, end, NULL, NULL);
 }
 
 /* ── Helper: get project root_path from store ─────────────────── */
@@ -5713,7 +5743,8 @@ bool cbm_path_within_root(const char *root_path, const char *abs_path) {
 }
 
 static char *resolve_snippet_source(const char *root_path, const char *file_path, int start,
-                                    int end, char **out_abs_path) {
+                                    int end, char **out_abs_path, bool *truncated,
+                                    size_t *bytes_read) {
     *out_abs_path = NULL;
     if (!root_path || !file_path) {
         return NULL;
@@ -5724,7 +5755,7 @@ static char *resolve_snippet_source(const char *root_path, const char *file_path
 
     *out_abs_path = abs_path;
     if (cbm_path_within_root(root_path, abs_path)) {
-        return read_file_lines(abs_path, start, end);
+        return read_file_lines_ex(abs_path, start, end, truncated, bytes_read);
     }
     return NULL;
 }
@@ -5852,7 +5883,10 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     int start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     int end = node->end_line > start ? node->end_line : start + SNIPPET_DEFAULT_LINES;
     char *abs_path = NULL;
-    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path);
+    bool source_truncated = false;
+    size_t source_bytes = 0;
+    char *source = resolve_snippet_source(root_path, node->file_path, start, end, &abs_path,
+                                          &source_truncated, &source_bytes);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
@@ -5872,6 +5906,29 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     yyjson_mut_obj_add_str(doc, root_obj, "file_path", display_path);
     yyjson_mut_obj_add_int(doc, root_obj, "start_line", start);
     yyjson_mut_obj_add_int(doc, root_obj, "end_line", end);
+    yyjson_mut_obj_add_bool(doc, root_obj, "source_truncated", source_truncated);
+    yyjson_mut_obj_add_uint(doc, root_obj, "source_bytes", source_bytes);
+    yyjson_mut_obj_add_str(doc, root_obj, "line_range_source", "indexed_graph");
+
+    int64_t indexed_mtime_ns = 0;
+    int64_t indexed_size = 0;
+    struct stat live_stat;
+    bool indexed_version =
+        node->project && node->file_path &&
+        cbm_store_get_file_version(srv->store, node->project, node->file_path, &indexed_mtime_ns,
+                                   &indexed_size, NULL) == CBM_STORE_OK;
+    bool live_version = abs_path && stat(abs_path, &live_stat) == 0;
+    bool stale_source = indexed_version && live_version &&
+                        (indexed_mtime_ns != mcp_stat_mtime_ns(&live_stat) ||
+                         indexed_size != (int64_t)live_stat.st_size);
+    yyjson_mut_obj_add_str(doc, root_obj, "source_state",
+                           stale_source ? "stale_worktree" : indexed_version ? "current" : "unknown");
+    if (stale_source) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "source_warning",
+            "The graph line range comes from an older file version. Source is read from the live "
+            "worktree and may no longer correspond to this symbol; re-index before relying on it.");
+    }
 
     if (source) {
         char *safe_source = sanitize_utf8_lossy(source);

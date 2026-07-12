@@ -397,6 +397,12 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
 
+/* Fetch the indexed version metadata for one file without allocating the
+ * complete project hash list. sha256_out may be NULL; when provided, caller
+ * owns the returned string. */
+int cbm_store_get_file_version(cbm_store_t *s, const char *project, const char *rel_path,
+                               int64_t *mtime_ns, int64_t *size, char **sha256_out);
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 
 int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);

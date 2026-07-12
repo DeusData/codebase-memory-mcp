@@ -3104,6 +3104,16 @@ TEST(parse_file_uri_invalid) {
  * Writes a source file to tmp_dir/project/main.go.
  * Caller must free the server with cbm_mcp_server_free and
  * unlink the source file + rmdir manually. */
+static int64_t snippet_test_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return (int64_t)st->st_mtimespec.tv_sec * 1000000000LL + st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * 1000000000LL;
+#else
+    return (int64_t)st->st_mtim.tv_sec * 1000000000LL + st->st_mtim.tv_nsec;
+#endif
+}
+
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     /* Create temp dir */
     snprintf(tmp_dir, tmp_sz, "/tmp/cbm_snippet_test_XXXXXX");
@@ -3149,6 +3159,11 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     const char *proj_name = "test-project";
     cbm_mcp_server_set_project(srv, proj_name);
     cbm_store_upsert_project(st, proj_name, proj_dir);
+    struct stat source_stat;
+    if (stat(src_path, &source_stat) == 0) {
+        cbm_store_upsert_file_hash(st, proj_name, "main.go", "",
+                                   snippet_test_mtime_ns(&source_stat), source_stat.st_size);
+    }
 
     /* Create nodes */
     cbm_node_t n_hr = {0};
@@ -3298,6 +3313,8 @@ TEST(snippet_exact_qn) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"name\":\"HandleRequest\""));
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"current\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_truncated\":false"));
     /* Exact match should NOT have match_method */
     ASSERT_NULL(strstr(resp, "\"match_method\""));
     /* No property-blob spill: the source IS the payload (signature and
@@ -3616,6 +3633,74 @@ TEST(snippet_source_invalid_utf8) {
 
     free(resp);
     free(raw);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_stale_worktree_is_explicit) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+    FILE *fp = fopen(src_path, "a");
+    ASSERT_NOT_NULL(fp);
+    fputs("\n// live edit after indexing\n", fp);
+    fclose(fp);
+
+    char *resp =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"source_state\":\"stale_worktree\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"source_warning\""));
+    ASSERT_NOT_NULL(strstr(resp, "re-index before relying on it"));
+    ASSERT_NOT_NULL(strstr(resp, "\"line_range_source\":\"indexed_graph\""));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(snippet_long_physical_lines_are_counted_once_and_bounded) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char src_path[512];
+    snprintf(src_path, sizeof(src_path), "%s/project/main.go", tmp);
+
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    for (int i = 0; i < 20000; i++) {
+        fputc('x', fp);
+    }
+    fputs("\n\nfunc HandleRequest() error {\n\treturn nil\n}\n", fp);
+    fclose(fp);
+    char *physical =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(physical);
+    ASSERT_NOT_NULL(strstr(physical, "func HandleRequest() error"));
+    ASSERT_NOT_NULL(strstr(physical, "\"source_truncated\":false"));
+    free(physical);
+
+    fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("package main\n\n", fp);
+    for (int i = 0; i < 20000; i++) {
+        fputc('y', fp);
+    }
+    fputs("\n", fp);
+    fclose(fp);
+    char *bounded =
+        call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
+                          "\"project\":\"test-project\"}");
+    ASSERT_NOT_NULL(bounded);
+    ASSERT_NOT_NULL(strstr(bounded, "\"source_truncated\":true"));
+    ASSERT_NOT_NULL(strstr(bounded, "\"source_bytes\":16384"));
+    free(bounded);
+
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
     PASS();
@@ -6113,6 +6198,8 @@ SUITE(mcp) {
     RUN_TEST(snippet_include_neighbors_default);
     RUN_TEST(snippet_include_neighbors_enabled);
     RUN_TEST(snippet_source_invalid_utf8);
+    RUN_TEST(snippet_stale_worktree_is_explicit);
+    RUN_TEST(snippet_long_physical_lines_are_counted_once_and_bounded);
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);

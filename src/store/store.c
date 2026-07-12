@@ -1891,6 +1891,52 @@ int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash
     return CBM_STORE_OK;
 }
 
+int cbm_store_get_file_version(cbm_store_t *s, const char *project, const char *rel_path,
+                               int64_t *mtime_ns, int64_t *size, char **sha256_out) {
+    if (mtime_ns) {
+        *mtime_ns = 0;
+    }
+    if (size) {
+        *size = 0;
+    }
+    if (sha256_out) {
+        *sha256_out = NULL;
+    }
+    if (!s || !s->db || !project || !rel_path || !mtime_ns || !size) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT mtime_ns,size,sha256 FROM file_hashes "
+                           "WHERE project=?1 AND rel_path=?2;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "file version prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, ST_COL_2, rel_path);
+    int step = sqlite3_step(stmt);
+    int rc = CBM_STORE_NOT_FOUND;
+    if (step == SQLITE_ROW) {
+        *mtime_ns = sqlite3_column_int64(stmt, 0);
+        *size = sqlite3_column_int64(stmt, 1);
+        if (sha256_out) {
+            *sha256_out = heap_strdup((const char *)sqlite3_column_text(stmt, 2));
+            if (!*sha256_out) {
+                rc = CBM_STORE_ERR;
+                sqlite3_finalize(stmt);
+                return rc;
+            }
+        }
+        rc = CBM_STORE_OK;
+    } else if (step != SQLITE_DONE) {
+        store_set_error_sqlite(s, "file version read");
+        rc = CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_delete_file_hash,
