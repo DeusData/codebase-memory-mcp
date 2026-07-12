@@ -4449,6 +4449,14 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
 
     /* (1) control: filename == internal name */
     ASSERT_TRUE(issue704_make_db(cache, "alpha704.db", "alpha704", "alphaFunc704"));
+    /* Coverage materializes a second internal projects row in the same DB.
+     * list_projects must ignore this derived graph and still advertise alpha. */
+    char alpha_path[700];
+    snprintf(alpha_path, sizeof(alpha_path), "%s/alpha704.db", cache);
+    cbm_store_t *alpha_store = cbm_store_open_path(alpha_path);
+    ASSERT_NOT_NULL(alpha_store);
+    ASSERT_EQ(cbm_store_upsert_project(alpha_store, "alpha704::missed", ""), CBM_STORE_OK);
+    cbm_store_close(alpha_store);
 
     /* (2) DRIFT: build beta704.db (internal "beta704") then rename the file to
      *     gamma704.db, so filename "gamma704" != internal "beta704". */
@@ -4526,18 +4534,16 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     } else {
         cbm_unsetenv("CBM_CACHE_DIR");
     }
-    char a_path[700];
-    snprintf(a_path, sizeof(a_path), "%s/alpha704.db", cache);
     char corrupt_path[720];
     snprintf(corrupt_path, sizeof(corrupt_path), "%s.corrupt", ghost_path);
-    cbm_unlink(a_path);
+    cbm_unlink(alpha_path);
     cbm_unlink(gamma_path);
     cbm_unlink(ghost_path);
     cbm_unlink(corrupt_path); /* ghost may be quarantined by resolve_store */
     char side[740];
-    snprintf(side, sizeof(side), "%s-wal", a_path);
+    snprintf(side, sizeof(side), "%s-wal", alpha_path);
     cbm_unlink(side);
-    snprintf(side, sizeof(side), "%s-shm", a_path);
+    snprintf(side, sizeof(side), "%s-shm", alpha_path);
     cbm_unlink(side);
     snprintf(side, sizeof(side), "%s-wal", gamma_path);
     cbm_unlink(side);

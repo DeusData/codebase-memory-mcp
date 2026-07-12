@@ -1565,10 +1565,27 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     cbm_project_t *projs = NULL;
     int n = 0;
     bool ok = false;
-    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
-        projs[0].name[0]) {
-        snprintf(name_out, name_sz, "%s", projs[0].name);
-        ok = true;
+    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
+        const char *base_project = NULL;
+        int base_count = 0;
+        static const char missed_suffix[] = "::missed";
+        for (int i = 0; i < n; i++) {
+            const char *candidate = projs[i].name;
+            if (!candidate || !candidate[0]) {
+                continue;
+            }
+            size_t len = strlen(candidate);
+            size_t suffix_len = sizeof(missed_suffix) - SKIP_ONE;
+            if (len >= suffix_len && strcmp(candidate + len - suffix_len, missed_suffix) == 0) {
+                continue; /* derived coverage graph, not a separately addressable project */
+            }
+            base_project = candidate;
+            base_count++;
+        }
+        if (base_count == 1 && strlen(base_project) < name_sz) {
+            snprintf(name_out, name_sz, "%s", base_project);
+            ok = true;
+        }
     }
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {

@@ -1663,6 +1663,9 @@ TEST(store_coverage_roundtrip_prune_shadow) {
     ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test::missed", "File", &nodes, &nc), CBM_STORE_OK);
     ASSERT_EQ(nc, 0);
     cbm_store_free_nodes(nodes, nc);
+    cbm_project_t shadow = {0};
+    ASSERT(cbm_store_get_project(s, "test::missed", &shadow) != CBM_STORE_OK);
+    cbm_project_free_fields(&shadow);
 
     cbm_store_close(s);
     PASS();

@@ -2013,6 +2013,10 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
             sqlite3_finalize(del);
         }
     }
+    /* The projects row is derived too. Remove it before rebuilding so a run
+     * whose current coverage has no failures does not leave a stale
+     * <project>::missed entry behind. It is re-created below when needed. */
+    (void)cbm_store_delete_project(s, covproj);
 
     cbm_coverage_row_t *rows = NULL;
     int count = 0;
@@ -2035,8 +2039,8 @@ static void cov_rebuild_shadow_graph(cbm_store_t *s, const char *project) {
     }
 
     /* nodes.project has an FK to projects(name) (enforced: foreign_keys=ON),
-     * so the shadow project needs its row. Invisible to list_projects, which
-     * scans the cache directory for .db files, not this table. */
+     * so the shadow project needs its row. list_projects scans DB files and
+     * explicitly ignores the ::missed internal row when resolving each file. */
     if (cbm_store_upsert_project(s, covproj, "") != CBM_STORE_OK) {
         cbm_store_free_coverage(rows, count);
         return;
