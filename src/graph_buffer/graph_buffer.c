@@ -911,6 +911,33 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     return deleted_count;
 }
 
+int cbm_gbuf_delete_node_by_id(cbm_gbuf_t *gb, int64_t id) {
+    if (!gb || id <= 0 || id >= gb->by_id_cap) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_gbuf_node_t *node = gb->by_id[id];
+    if (!node || !node->qualified_name || !cbm_ht_get(gb->node_by_qn, node->qualified_name)) {
+        return 0;
+    }
+
+    remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, node->label), id);
+    remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, node->name), id);
+    cbm_ht_delete(gb->node_by_qn, node->qualified_name);
+    gb->by_id[id] = NULL;
+
+    CBMHashTable *deleted_set = cbm_ht_create(SKIP_ONE);
+    char id_buf[CBM_SZ_32];
+    make_id_key(id_buf, sizeof(id_buf), id);
+    cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+    cascade_delete_edges(gb, deleted_set);
+    cbm_ht_foreach(deleted_set, free_key_only, NULL);
+    cbm_ht_free(deleted_set);
+
+    free(node->qualified_name);
+    node->qualified_name = NULL;
+    return 1;
+}
+
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
     if (!gb || !db_path || !project) {
         return CBM_NOT_FOUND;

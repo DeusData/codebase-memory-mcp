@@ -79,6 +79,10 @@ const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn)
 /* Find a node by temp ID. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_id(const cbm_gbuf_t *gb, int64_t id);
 
+/* Tombstone one node and cascade its edges. Returns 1 when deleted, 0 when
+ * already absent, or CBM_NOT_FOUND for invalid input. */
+int cbm_gbuf_delete_node_by_id(cbm_gbuf_t *gb, int64_t id);
+
 /* Find nodes by label. Sets *out and *count. Caller does NOT free.
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_find_by_label(const cbm_gbuf_t *gb, const char *label, const cbm_gbuf_node_t ***out,

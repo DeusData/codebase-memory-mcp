@@ -112,8 +112,50 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
     PASS();
 }
 
+TEST(infrascan_call_literal_routes_follow_source_occurrences) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_occurrences");
+    ASSERT_NOT_NULL(gb);
+    int64_t library = cbm_gbuf_upsert_node(gb, "Function", "get", "requests.get", "vendor.py", 1,
+                                           2, "{}");
+    int64_t first =
+        cbm_gbuf_upsert_node(gb, "Function", "first", "test.first", "first.py", 1, 3, "{}");
+    int64_t second =
+        cbm_gbuf_upsert_node(gb, "Function", "second", "test.second", "second.py", 1, 3, "{}");
+    const char *props =
+        "{\"callee\":\"requests.get\",\"url_path\":\"/api/shared\",\"method\":\"GET\"}";
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, first, library, "HTTP_CALLS", props), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, second, library, "HTTP_CALLS", props), 0);
+
+    cbm_pipeline_create_route_nodes(gb);
+    const cbm_gbuf_node_t *route = cbm_gbuf_find_by_qn(gb, "__route__GET__/api/shared");
+    ASSERT_NOT_NULL(route);
+    ASSERT_NOT_NULL(strstr(route->properties_json, "\"origin\":\"call_literal\""));
+    const cbm_gbuf_edge_t **occurrences = NULL;
+    int occurrence_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_target_type(gb, route->id, "HTTP_CALLS", &occurrences,
+                                                 &occurrence_count),
+              0);
+    ASSERT_EQ(occurrence_count, 2);
+
+    ASSERT_EQ(cbm_gbuf_delete_by_file(gb, "first.py"), 1);
+    cbm_pipeline_create_route_nodes(gb);
+    route = cbm_gbuf_find_by_qn(gb, "__route__GET__/api/shared");
+    ASSERT_NOT_NULL(route);
+    ASSERT_EQ(cbm_gbuf_find_edges_by_target_type(gb, route->id, "HTTP_CALLS", &occurrences,
+                                                 &occurrence_count),
+              0);
+    ASSERT_EQ(occurrence_count, 1);
+
+    ASSERT_EQ(cbm_gbuf_delete_by_file(gb, "second.py"), 1);
+    cbm_pipeline_create_route_nodes(gb);
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/api/shared"));
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
+    RUN_TEST(infrascan_call_literal_routes_follow_source_occurrences);
 }

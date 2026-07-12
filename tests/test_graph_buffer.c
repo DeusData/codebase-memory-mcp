@@ -140,6 +140,23 @@ TEST(gbuf_delete_by_label) {
     PASS();
 }
 
+TEST(gbuf_delete_node_by_id_cascades_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("p", "/tmp/p");
+    int64_t caller = cbm_gbuf_upsert_node(gb, "Function", "caller", "p.caller", "a.c", 1, 2,
+                                          "{}");
+    int64_t route = cbm_gbuf_upsert_node(gb, "Route", "/x", "__route__GET__/x", "", 0, 0,
+                                         "{\"origin\":\"call_literal\"}");
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, caller, route, "HTTP_CALLS", "{}"), 0);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 1);
+    ASSERT_EQ(cbm_gbuf_delete_node_by_id(gb, route), 1);
+    ASSERT_NULL(cbm_gbuf_find_by_id(gb, route));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "__route__GET__/x"));
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 0);
+    ASSERT_EQ(cbm_gbuf_delete_node_by_id(gb, route), 0);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* ── Edge operations ───────────────────────────────────────────── */
 
 TEST(gbuf_insert_edge) {
@@ -1020,6 +1037,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_label);
     RUN_TEST(gbuf_find_by_name);
     RUN_TEST(gbuf_delete_by_label);
+    RUN_TEST(gbuf_delete_node_by_id_cascades_edges);
     RUN_TEST(gbuf_insert_edge);
     RUN_TEST(gbuf_edge_dedup);
     RUN_TEST(gbuf_imports_multi_symbol_dedup);

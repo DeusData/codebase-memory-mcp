@@ -8,7 +8,8 @@
  *   1. Scans all HTTP_CALLS/ASYNC_CALLS edges
  *   2. Extracts url_path from edge properties
  *   3. Creates Route nodes with deterministic QNs (__route__METHOD__/path)
- *   4. Re-targets edges from library function → Route node
+ *   4. Adds caller→Route occurrence edges after edge iteration
+ *   5. Prunes synthetic Routes only after their last occurrence disappears
  *
  * Route nodes are the rendezvous point for cross-service communication:
  *   Service A: checkout() → HTTP_CALLS → Route("POST /api/orders")
@@ -155,11 +156,82 @@ static const char *json_extract(const char *json, const char *key, char *buf, in
     return buf;
 }
 
-/* Visitor context for edge scanning */
+typedef struct {
+    int64_t source_id;
+    char *edge_type;
+    char *url;
+    char *route_qn;
+    char *route_props;
+    char *edge_props;
+} pending_route_t;
+
+/* Visitor context for edge scanning. Edges cannot be inserted while the
+ * edge array is being visited, so call-site occurrences are materialized in
+ * a second phase. */
 typedef struct {
     cbm_gbuf_t *gb;
     int created;
+    pending_route_t *pending;
+    int pending_count;
+    int pending_cap;
 } route_ctx_t;
+
+static char *route_copy(const char *value) {
+    const char *source = value ? value : "";
+    size_t len = strlen(source) + SKIP_ONE;
+    char *copy = malloc(len);
+    if (copy) {
+        memcpy(copy, source, len);
+    }
+    return copy;
+}
+
+static void route_pending_add(route_ctx_t *ctx, const cbm_gbuf_edge_t *edge, const char *url,
+                              const char *route_qn, const char *route_props) {
+    if (ctx->pending_count == ctx->pending_cap) {
+        int next_cap = ctx->pending_cap ? ctx->pending_cap * PAIR_LEN : CBM_SZ_16;
+        pending_route_t *next =
+            realloc(ctx->pending, (size_t)next_cap * sizeof(*ctx->pending));
+        if (!next) {
+            return;
+        }
+        ctx->pending = next;
+        ctx->pending_cap = next_cap;
+    }
+    pending_route_t *pending = &ctx->pending[ctx->pending_count];
+    memset(pending, 0, sizeof(*pending));
+    pending->source_id = edge->source_id;
+    pending->edge_type = route_copy(edge->type);
+    pending->url = route_copy(url);
+    pending->route_qn = route_copy(route_qn);
+    pending->route_props = route_copy(route_props);
+    pending->edge_props = route_copy(edge->properties_json ? edge->properties_json : "{}");
+    if (!pending->edge_type || !pending->url || !pending->route_qn || !pending->route_props ||
+        !pending->edge_props) {
+        free(pending->edge_type);
+        free(pending->url);
+        free(pending->route_qn);
+        free(pending->route_props);
+        free(pending->edge_props);
+        memset(pending, 0, sizeof(*pending));
+        return;
+    }
+    ctx->pending_count++;
+}
+
+static void route_pending_free(route_ctx_t *ctx) {
+    for (int i = 0; i < ctx->pending_count; i++) {
+        free(ctx->pending[i].edge_type);
+        free(ctx->pending[i].url);
+        free(ctx->pending[i].route_qn);
+        free(ctx->pending[i].route_props);
+        free(ctx->pending[i].edge_props);
+    }
+    free(ctx->pending);
+    ctx->pending = NULL;
+    ctx->pending_count = 0;
+    ctx->pending_cap = 0;
+}
 
 static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     route_ctx_t *ctx = (route_ctx_t *)userdata;
@@ -167,6 +239,10 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     /* Only process HTTP_CALLS and ASYNC_CALLS */
     if (strcmp(edge->type, "HTTP_CALLS") != 0 && strcmp(edge->type, "ASYNC_CALLS") != 0) {
         return;
+    }
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(ctx->gb, edge->target_id);
+    if (target && target->label && strcmp(target->label, "Route") == 0) {
+        return; /* already a caller→Route occurrence edge */
     }
 
     /* Extract url_path from properties */
@@ -204,24 +280,70 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
     /* Build properties for Route node */
     char route_props[CBM_SZ_256];
     if (method) {
-        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
+        snprintf(route_props, sizeof(route_props),
+                 "{\"method\":\"%s\",\"origin\":\"call_literal\"}", method);
     } else if (broker) {
-        snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
+        snprintf(route_props, sizeof(route_props),
+                 "{\"broker\":\"%s\",\"origin\":\"call_literal\"}", broker);
     } else {
-        snprintf(route_props, sizeof(route_props), "{}");
+        snprintf(route_props, sizeof(route_props), "{\"origin\":\"call_literal\"}");
     }
 
-    /* Create or find Route node (deduped by QN) */
-    cbm_gbuf_upsert_node(ctx->gb, "Route", url, route_qn, "", 0, 0, route_props);
-    ctx->created++;
+    route_pending_add(ctx, edge, url, route_qn, route_props);
+}
 
-    /* Note: we do NOT re-target the edge here because modifying edges during
-     * iteration is unsafe. The edge stays pointing to the library function.
-     * The URL-in-args detection in pass_parallel will create Route→handler HANDLES
-     * edge separately. The caller→Route edge is created by pass_calls for
-     * the sequential path; for the parallel path, the caller→library edge
-     * with url_path in properties is sufficient for query_graph to find
-     * the Route via: caller → HTTP_CALLS(url_path="/api/x") + Route("/api/x"). */
+static void materialize_call_routes(route_ctx_t *ctx) {
+    for (int i = 0; i < ctx->pending_count; i++) {
+        pending_route_t *pending = &ctx->pending[i];
+        const cbm_gbuf_node_t *existing = cbm_gbuf_find_by_qn(ctx->gb, pending->route_qn);
+        int64_t route_id = existing ? existing->id : 0;
+        if (!route_id) {
+            route_id = cbm_gbuf_upsert_node(ctx->gb, "Route", pending->url, pending->route_qn, "",
+                                            0, 0, pending->route_props);
+            if (route_id > 0) {
+                ctx->created++;
+            }
+        }
+        if (route_id > 0) {
+            (void)cbm_gbuf_insert_edge(ctx->gb, pending->source_id, route_id, pending->edge_type,
+                                       pending->edge_props);
+        }
+    }
+}
+
+static int prune_orphan_call_routes(cbm_gbuf_t *gb) {
+    const cbm_gbuf_node_t **routes = NULL;
+    int route_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Route", &routes, &route_count) != 0 || route_count == 0) {
+        return 0;
+    }
+    int64_t *ids = malloc((size_t)route_count * sizeof(*ids));
+    if (!ids) {
+        return 0;
+    }
+    int id_count = 0;
+    for (int i = 0; i < route_count; i++) {
+        const cbm_gbuf_node_t *route = routes[i];
+        if (!route->properties_json ||
+            !strstr(route->properties_json, "\"origin\":\"call_literal\"")) {
+            continue;
+        }
+        const cbm_gbuf_edge_t **edges = NULL;
+        int http_count = 0;
+        int async_count = 0;
+        (void)cbm_gbuf_find_edges_by_target_type(gb, route->id, "HTTP_CALLS", &edges, &http_count);
+        (void)cbm_gbuf_find_edges_by_target_type(gb, route->id, "ASYNC_CALLS", &edges,
+                                                 &async_count);
+        if (http_count == 0 && async_count == 0) {
+            ids[id_count++] = route->id;
+        }
+    }
+    int pruned = 0;
+    for (int i = 0; i < id_count; i++) {
+        pruned += cbm_gbuf_delete_node_by_id(gb, ids[i]) > 0;
+    }
+    free(ids);
+    return pruned;
 }
 
 /* Extract URL path from full URL: "https://host/path/" → "/path/" */
@@ -1198,15 +1320,24 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     route_ctx_t ctx = {.gb = gb, .created = 0};
     cbm_gbuf_foreach_edge(gb, route_edge_visitor, &ctx);
 
-    if (ctx.created > 0) {
+    /* Prefer real handler/decorator Route nodes when their QN matches a call
+     * literal. This avoids a synthetic empty-file node winning same-QN upsert
+     * ordering before the source-backed route exists. */
+    ensure_decorator_routes(gb);
+    materialize_call_routes(&ctx);
+    int pruned = prune_orphan_call_routes(gb);
+    route_pending_free(&ctx);
+
+    if (ctx.created > 0 || pruned > 0) {
         char buf[CBM_SZ_16];
+        char prune_buf[CBM_SZ_16];
         snprintf(buf, sizeof(buf), "%d", ctx.created);
-        cbm_log_info("pass.route_nodes", "created", buf);
+        snprintf(prune_buf, sizeof(prune_buf), "%d", pruned);
+        cbm_log_info("pass.route_nodes", "created", buf, "pruned", prune_buf);
     }
 
     /* Phase 2a: ensure all functions with route_path have Route+HANDLES.
      * Handles incremental mode where unchanged files don't re-extract. */
-    ensure_decorator_routes(gb);
 
     /* Phase 2b: connect prefix Routes to decorator handler Functions.
      * Must run BEFORE match_infra_routes so infra matching can find
