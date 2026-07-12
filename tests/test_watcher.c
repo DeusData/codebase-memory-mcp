@@ -764,6 +764,60 @@ TEST(watcher_non_git_skips) {
     PASS();
 }
 
+TEST(watcher_nested_non_git_skips) {
+    /* A non-git folder nested under an unrelated ancestor git repo must be
+     * treated as non-git (#937/#841): `git rev-parse` answers from the
+     * ancestor, and since every file in the folder is untracked there, the
+     * old code saw a permanently-dirty tree and re-indexed on EVERY poll. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_nest_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* Ancestor is a real git repo... */
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "tracked.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add tracked.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    /* ...but the WATCHED folder inside it has no .git and no tracked files. */
+    char subdir[512];
+    snprintf(subdir, sizeof(subdir), "%s/myproject", tmpdir);
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/main.py", subdir);
+        th_write_file(_p, "def main(): pass\n");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "nested-nongit", subdir);
+    index_call_count = 0;
+
+    /* Baseline — must classify as non-git despite the git ancestor */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Untracked-in-ancestor files exist the whole time; polls must stay
+     * quiet instead of re-indexing every cycle. */
+    for (int i = 0; i < 3; i++) {
+        cbm_watcher_touch(w, "nested-nongit");
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  ADAPTIVE INTERVAL BEHAVIOR
  * ══════════════════════════════════════════════════════════════════ */
@@ -880,7 +934,7 @@ TEST(watcher_git_removed_no_crash) {
         th_rmtree(_p);
     }
 
-    /* Poll — should not crash, git_head() and git_is_dirty() fail gracefully */
+    /* Poll — should not crash, git_head() and git_status_signature() fail gracefully */
     cbm_watcher_touch(w, "rmgit-repo");
     cbm_watcher_poll_once(w);
     /* No assertion on index_call_count — behavior is implementation-defined.
@@ -893,8 +947,9 @@ TEST(watcher_git_removed_no_crash) {
 }
 
 TEST(watcher_continued_dirty) {
-    /* If working tree stays dirty, each poll should re-trigger reindex.
-     * Port of repeated git sentinel detection behavior. */
+    /* A tree that merely STAYS dirty must NOT re-trigger on every poll —
+     * that was #937 (continuous re-index churn / disk write amplification).
+     * Only a signature movement (new edit, add/remove, HEAD move) triggers. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -932,7 +987,22 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty — should detect again */
+    /* Still dirty but UNCHANGED — must NOT re-trigger (#937: the old
+     * boolean dirty check re-indexed on every poll, forever). */
+    cbm_watcher_touch(w, "cont-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+    cbm_watcher_touch(w, "cont-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* A FURTHER edit to the already-dirty file moves the signature
+     * (size/mtime are mixed in) → detected again. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "dirtier\n");
+    }
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 2);
@@ -1918,6 +1988,7 @@ SUITE(watcher) {
 
     /* Non-git project */
     RUN_TEST(watcher_non_git_skips);
+    RUN_TEST(watcher_nested_non_git_skips);
 
     /* Adaptive interval behavior */
     RUN_TEST(watcher_interval_blocks_repoll);

@@ -157,6 +157,14 @@ int cbm_discover_ex2(const char *repo_path, const cbm_discover_opts_t *opts, cbm
                      cbm_ignored_file_t **ignored_out, int *ignored_count_out,
                      int *ignored_total_out);
 
+/* Count indexable files under repo_path with an early exit: stops walking as
+ * soon as the count exceeds `limit` and returns limit + 1 (#713). Honors the
+ * hardcoded skip dirs, suffix filters, and language gate (mode FULL), but not
+ * gitignore — over-counting only makes a size guard more conservative. Used
+ * as the auto-index OOM guard for roots where `git ls-files` has no answer
+ * (non-git folders). Returns 0 on a missing/invalid root. */
+int cbm_discover_count_files(const char *repo_path, int limit);
+
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);
 

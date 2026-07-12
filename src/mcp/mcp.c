@@ -44,6 +44,7 @@ enum {
 #include "pipeline/pipeline.h"
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
+#include "discover/discover.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
@@ -7094,26 +7095,52 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         return;
     }
 
-    /* Quick file count check to avoid OOM on massive repos */
+    /* File-count guard against OOM on massive roots (#713). For git repos,
+     * count tracked files via `git ls-files`, tallying newlines in C — the
+     * old `| wc -l` pipe used single quotes (passed through literally by
+     * cmd.exe) and `wc` (absent on Windows), so it silently returned nothing
+     * there. For non-git roots — where ls-files reports 0 files and the old
+     * guard could NEVER fire, letting auto-index eat tens of GB on large
+     * code folders — fall back to a bounded native walk that honors the same
+     * skip dirs and language gate as discovery and stops at the limit. */
     if (!cbm_validate_shell_arg(srv->session_root)) {
         cbm_log_warn("autoindex.skip", "reason", "path contains shell metacharacters");
         return;
     }
+#ifdef _WIN32
+    const char *ai_null_dev = "NUL";
+#else
+    const char *ai_null_dev = "/dev/null";
+#endif
+    int count = 0;
     char cmd[CBM_SZ_1K];
-    snprintf(cmd, sizeof(cmd), "git -C '%s' ls-files 2>/dev/null | wc -l", srv->session_root);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" ls-files 2>%s", srv->session_root, ai_null_dev);
     FILE *fp = cbm_popen(cmd, "r");
     if (fp) {
-        char line[CBM_SZ_64];
-        if (fgets(line, sizeof(line), fp)) {
-            int count = (int)strtol(line, NULL, CBM_DECIMAL_BASE);
-            if (count > file_limit) {
-                cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", line, "limit",
-                             CBM_CONFIG_AUTO_INDEX_LIMIT);
-                cbm_pclose(fp);
-                return;
+        char buf[CBM_SZ_1K];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+            for (size_t i = 0; i < n; i++) {
+                if (buf[i] == '\n') {
+                    count++;
+                }
             }
         }
-        cbm_pclose(fp);
+        if (cbm_pclose(fp) != 0) {
+            count = 0; /* not a git repo (or git failed) → use the walk below */
+        }
+    }
+    if (count == 0) {
+        count = cbm_discover_count_files(srv->session_root, file_limit);
+    }
+    if (count > file_limit) {
+        char count_str[CBM_SZ_32];
+        char limit_str[CBM_SZ_32];
+        snprintf(count_str, sizeof(count_str), "%d", count);
+        snprintf(limit_str, sizeof(limit_str), "%d", file_limit);
+        cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_str, "limit",
+                     limit_str);
+        return;
     }
 
     /* Launch auto-index in background */

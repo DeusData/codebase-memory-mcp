@@ -327,6 +327,37 @@ TEST(discover_simple) {
     PASS();
 }
 
+TEST(discover_count_files_bounded) {
+    /* #713: the auto-index guard for non-git roots — counts indexable files
+     * natively (git ls-files answers 0 there) and stops early at the limit. */
+    char *base = th_mktempdir("cbm_disc_count");
+    ASSERT(base != NULL);
+
+    th_write_file(TH_PATH(base, "a.go"), "package main\n");
+    th_write_file(TH_PATH(base, "sub/b.py"), "print(1)\n");
+    th_write_file(TH_PATH(base, "sub/c.py"), "print(2)\n");
+    th_write_file(TH_PATH(base, "icon.png"), "binary\n");          /* suffix-skipped */
+    th_write_file(TH_PATH(base, "notes.xyzzy"), "no language\n");  /* no grammar */
+    th_write_file(TH_PATH(base, "node_modules/d.js"), "x\n");      /* skip dir */
+
+    /* Full count: only the 3 indexable sources. */
+    ASSERT_EQ(cbm_discover_count_files(base, 100), 3);
+
+    /* Early exit: limit 1 → walk stops at 2 (limit + 1), not the true total. */
+    ASSERT_EQ(cbm_discover_count_files(base, 1), 2);
+
+    /* Exceeds ⇔ returned value > limit; equal-to-limit does not exceed. */
+    ASSERT_EQ(cbm_discover_count_files(base, 3), 3);
+
+    /* Edge cases. */
+    ASSERT_EQ(cbm_discover_count_files(NULL, 100), 0);
+    ASSERT_EQ(cbm_discover_count_files(TH_PATH(base, "missing"), 100), 0);
+    ASSERT_EQ(cbm_discover_count_files(base, -1), 0);
+
+    th_cleanup(base);
+    PASS();
+}
+
 TEST(discover_skips_git_dir) {
     char *base = th_mktempdir("cbm_disc_git");
     ASSERT(base != NULL);
@@ -1314,6 +1345,7 @@ SUITE(discover) {
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
+    RUN_TEST(discover_count_files_bounded);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);

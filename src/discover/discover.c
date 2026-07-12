@@ -1080,6 +1080,93 @@ void cbm_discover_free_excluded(char **excluded, int count) {
     free(excluded);
 }
 
+/* ── Bounded file counting (#713) ─────────────────────────────────
+ * Count the indexable files under repo_path without building a result list,
+ * stopping as soon as the count exceeds `limit`. Serves as the auto-index
+ * OOM guard for non-git roots, where `git ls-files` cannot provide a count.
+ * Honors the same hardcoded skip dirs, suffix filters, and language gate as
+ * full discovery (mode FULL) but deliberately NOT gitignore: over-counting
+ * only makes the guard more conservative, and this path must stay cheap. */
+int cbm_discover_count_files(const char *repo_path, int limit) {
+    if (!repo_path || !repo_path[0] || limit < 0) {
+        return 0;
+    }
+
+    struct stat st;
+    if (wide_stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        return 0;
+    }
+
+    /* Dynamic stack of absolute directory paths (heap-owned). */
+    int cap = CBM_SZ_64;
+    char **stack = malloc((size_t)cap * sizeof(char *));
+    if (!stack) {
+        return 0;
+    }
+    stack[0] = strdup(repo_path);
+    if (!stack[0]) {
+        free(stack);
+        return 0;
+    }
+    int top = 1;
+
+    int count = 0;
+    while (top > 0 && count <= limit) {
+        char *dir = stack[--top];
+        cbm_dir_t *d = cbm_opendir(dir);
+        if (!d) {
+            free(dir);
+            continue;
+        }
+
+        cbm_dirent_t *entry;
+        while (count <= limit && (entry = cbm_readdir(d)) != NULL) {
+            if (entry->is_dir) {
+                if (cbm_should_skip_dir(entry->name, CBM_MODE_FULL)) {
+                    continue;
+                }
+                char sub[CBM_SZ_4K];
+                snprintf(sub, sizeof(sub), "%s/%s", dir, entry->name);
+                /* safe_stat skips symlinks / junctions so the walk cannot
+                 * cycle or escape the root — same policy as discovery. */
+                struct stat sst;
+                if (safe_stat(sub, &sst) != 0 || !S_ISDIR(sst.st_mode)) {
+                    continue;
+                }
+                if (top >= cap) {
+                    int new_cap = cap * PAIR_LEN;
+                    char **grown = realloc(stack, (size_t)new_cap * sizeof(char *));
+                    if (!grown) {
+                        continue; /* OOM: skip subtree — count stays a lower bound */
+                    }
+                    stack = grown;
+                    cap = new_cap;
+                }
+                char *copy = strdup(sub);
+                if (copy) {
+                    stack[top++] = copy;
+                }
+            } else {
+                if (cbm_has_ignored_suffix(entry->name, CBM_MODE_FULL)) {
+                    continue;
+                }
+                if (cbm_language_for_filename(entry->name) == CBM_LANG_COUNT) {
+                    continue;
+                }
+                count++;
+            }
+        }
+        cbm_closedir(d);
+        free(dir);
+    }
+
+    for (int i = 0; i < top; i++) {
+        free(stack[i]);
+    }
+    free(stack);
+    return count;
+}
+
 void cbm_discover_free_ignored(cbm_ignored_file_t *ignored, int count) {
     if (!ignored) {
         return;

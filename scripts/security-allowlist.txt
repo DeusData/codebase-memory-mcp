@@ -19,8 +19,9 @@ src/cli/cli.c:popen:sha256 checksum computation via shasum
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
 src/watcher/watcher.c:system:git repo detection (is_git_repo)
 src/watcher/watcher.c:cbm_popen:git HEAD hash (git_head)
-src/watcher/watcher.c:cbm_popen:git working tree status (git_is_dirty)
+src/watcher/watcher.c:cbm_popen:git working tree status signature (git_status_signature)
 src/watcher/watcher.c:cbm_popen:git file count (git_file_count)
+src/watcher/watcher.c:cbm_popen:git toplevel resolution (git_show_toplevel)
 src/watcher/watcher.c:popen:via cbm_popen wrapper calls
 
 # ── Git context: git metadata resolution (repo paths validated via cbm_validate_shell_arg) ──

@@ -3,12 +3,24 @@
  *
  * Strategy: git status + HEAD tracking (the most reliable approach).
  * For non-git projects, the watcher skips polling (no fsnotify/dirmtime yet).
- *
+ * A directory is treated as git only when it has its own .git entry or at
+ * least one tracked file: `git rev-parse` alone walks UP the tree, so a
+ * plain non-git folder nested under an unrelated ancestor repo used to be
+ * misclassified as git — and, being entirely untracked, looked permanently
+ * dirty (#937/#841).
  *
  * Per-project state tracks:
  *   - Last git HEAD hash (detects commits, checkout, pull)
+ *   - Last working-tree status signature (detects content changes)
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
+ *
+ * Change detection is signature-based, not dirty-based: a poll triggers a
+ * re-index only when the status signature (porcelain output + mtime/size of
+ * each listed file) CHANGES, so a tree that merely STAYS dirty no longer
+ * re-indexes on every poll cycle (#937 write amplification). Status is
+ * scoped to the watched subtree (`-- .`) so a monorepo sub-package does not
+ * re-index on sibling churn.
  *
  * Adaptive interval: 5s base + 1s per 500 files, capped at 60s.
  * Matches the Go watcher's `pollInterval()` logic.
@@ -38,14 +50,17 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
-    bool is_git;               /* false → skip polling */
-    bool baseline_done;        /* true after first poll */
-    int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
-    uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
-    int file_count;            /* approximate, for interval calc */
-    int interval_ms;           /* adaptive poll interval */
-    int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    char *worktree_root;         /* git toplevel (status paths are relative to it) */
+    char last_head[CBM_SZ_64];   /* git HEAD hash */
+    uint64_t last_status_sig;    /* working-tree status signature (0 = clean) */
+    uint64_t pending_status_sig; /* signature computed by the latest check */
+    bool is_git;                 /* false → skip polling */
+    bool baseline_done;          /* true after first poll */
+    int missing_root_count;      /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
+    uint64_t first_missing_ms;   /* cbm_now_ms() of the streak's first miss (0 = no streak) */
+    int file_count;              /* approximate, for interval calc */
+    int interval_ms;             /* adaptive poll interval */
+    int64_t next_poll_ns;        /* next poll time (monotonic ns) */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -150,64 +165,169 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return CBM_NOT_FOUND;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
+/* Resolve the repo toplevel for root_path. Uses --show-cdup — the RELATIVE
+ * walk-up from root_path to the toplevel (empty when root_path IS the
+ * toplevel) — joined onto root_path, so the result keeps the caller's path
+ * form. --show-toplevel is unusable here: MSYS/Cygwin git prints POSIX-mapped
+ * absolute paths (/tmp/...) that a native stat() cannot resolve, so
+ * git_status_signature silently lost its mtime/size mix-in on Windows.
+ * Returns a heap copy or NULL. */
+static char *git_show_toplevel(const char *root_path) {
     char cmd[CBM_SZ_1K];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" rev-parse --show-cdup 2>%s", root_path,
+             WATCHER_NULDEV);
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return NULL;
+    }
+    char line[CBM_SZ_1K];
+    line[0] = '\0';
+    if (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r' ||
+                           line[len - SKIP_ONE] == '/')) {
+            line[--len] = '\0';
+        }
+    }
+    if (cbm_pclose(fp) != 0) {
+        return NULL;
+    }
+    if (line[0] == '\0') {
+        return strdup(root_path); /* root_path is the toplevel itself */
+    }
+    char joined[CBM_SZ_2K];
+    int n = snprintf(joined, sizeof(joined), "%s/%s", root_path, line);
+    if (n <= 0 || n >= (int)sizeof(joined)) {
+        return NULL;
+    }
+    return strdup(joined);
+}
+
+/* True when root_path has its OWN .git entry (directory, or the gitlink file
+ * of a linked worktree) — i.e. root_path is itself a repo root. */
+static bool has_dot_git(const char *root_path) {
+    char path[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/.git", root_path);
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* ── Working-tree status signature ──────────────────────────────────
+ * FNV-1a hash over `git status --porcelain` output scoped to the watched
+ * subtree, mixing in the mtime + size of every listed path. Two properties
+ * the old boolean "is dirty?" check lacked (#937):
+ *   - a tree that merely STAYS dirty hashes to the same value, so persistent
+ *     untracked/modified files no longer re-index on every poll;
+ *   - a repeated edit to an already-dirty file changes its mtime, so the
+ *     signature still moves and the change is picked up.
+ * Returns 0 for a clean tree; dirty trees always return nonzero. */
+
+#define FNV_OFFSET 1469598103934665603ULL
+#define FNV_PRIME 1099511628211ULL
+
+static void sig_mix(uint64_t *h, const void *data, size_t len) {
+    const unsigned char *p = data;
+    for (size_t i = 0; i < len; i++) {
+        *h = (*h ^ p[i]) * FNV_PRIME;
+    }
+}
+
+/* Extract the pathname from one porcelain-v1 status line ("XY path",
+ * "?? path", "R  old -> new"). Returns NULL when the line is too short. */
+static const char *status_line_path(const char *line) {
+    if (strlen(line) < 4) { /* "XY " + at least one path char */
+        return NULL;
+    }
+    const char *path = line + 3;
+    const char *arrow = strstr(path, " -> ");
+    if (arrow) {
+        path = arrow + 4; /* rename: stat the new name */
+    }
+    return path;
+}
+
+static uint64_t git_status_signature(const char *root_path, const char *worktree_root) {
+    char cmd[CBM_SZ_1K];
+    /* `-- .` scopes status to the watched subtree so a monorepo sub-package
+     * does not churn on sibling changes. --untracked-files=all lists files
+     * inside untracked directories individually so their mtimes are seen. */
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>%s",
+             "--untracked-files=all -- . 2>%s",
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        return false;
+        return 0;
     }
 
-    char line[CBM_SZ_256];
-    bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
+    uint64_t h = FNV_OFFSET;
+    bool any = false;
+    char line[CBM_SZ_1K];
+    while (fgets(line, sizeof(line), fp)) {
         size_t len = strlen(line);
         while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
             line[--len] = '\0';
         }
-        if (len > 0) {
-            dirty = true;
+        if (len == 0) {
+            continue;
+        }
+        any = true;
+        sig_mix(&h, line, len);
+
+        /* Mix in mtime + size so edits to an already-listed file move the
+         * signature. Porcelain paths are relative to the repo toplevel.
+         * Quoted paths (core.quotepath escapes) and stat failures simply
+         * skip this step — the line hash above still covers add/remove. */
+        const char *rel = status_line_path(line);
+        if (rel && rel[0] != '"' && worktree_root && worktree_root[0]) {
+            char abs[CBM_SZ_2K];
+            int n = snprintf(abs, sizeof(abs), "%s/%s", worktree_root, rel);
+            struct stat st;
+            if (n > 0 && n < (int)sizeof(abs) && stat(abs, &st) == 0) {
+                int64_t mtime = (int64_t)st.st_mtime;
+                int64_t size = (int64_t)st.st_size;
+                sig_mix(&h, &mtime, sizeof(mtime));
+                sig_mix(&h, &size, sizeof(size));
+            }
         }
     }
     cbm_pclose(fp);
 
-    if (dirty) {
-        return true;
-    }
-
 #if !defined(_WIN32)
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
-     * an inner shell command that cmd.exe cannot pass intact; the parent-repo
-     * status check above already covers the common (non-submodule) case. */
+    /* Submodules: uncommitted changes inside a submodule are invisible to
+     * the parent's git status. Hash the foreach output too (POSIX-only:
+     * foreach takes an inner shell command that cmd.exe cannot pass intact). */
     snprintf(cmd, sizeof(cmd),
              "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
+             "'git status --porcelain --untracked-files=normal 2>/dev/null; echo \"$sm_path\"' "
              "2>/dev/null",
              root_path);
     fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    if (fp) {
+        bool sub_any = false;
+        while (fgets(line, sizeof(line), fp)) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+                line[--len] = '\0';
+            }
+            /* Porcelain lines start with a 2-char code; the bare $sm_path
+             * separator lines only matter once real status lines exist. */
+            if (len > 2 && (line[2] == ' ' || strstr(line, " -> "))) {
+                sub_any = true;
+            }
+            if (len > 0) {
+                sig_mix(&h, line, len);
+            }
         }
-        if (len > 0) {
-            dirty = true;
-        }
+        cbm_pclose(fp);
+        any = any || sub_any;
     }
-    cbm_pclose(fp);
 #endif
-    return dirty;
+
+    if (!any) {
+        return 0;
+    }
+    return h ? h : 1; /* dirty must never collide with the clean value 0 */
 }
 
 /* Count tracked files via git ls-files */
@@ -254,6 +374,7 @@ static void state_free(project_state_t *s) {
     }
     free(s->project_name);
     free(s->root_path);
+    free(s->worktree_root);
     free(s);
 }
 
@@ -496,9 +617,29 @@ static void init_baseline(project_state_t *s) {
     s->baseline_done = true;
 
     if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
         s->file_count = git_file_count(s->root_path);
+        /* `git rev-parse` walks UP the tree, so a plain non-git folder nested
+         * under an unrelated ancestor repo answers "git" too. Such a folder
+         * has no .git of its own and zero tracked files — every file in it is
+         * untracked in the ancestor, which made the old dirty check fire on
+         * EVERY poll and re-index forever (#937/#841). Treat it as non-git.
+         * A freshly-initialized empty repo root keeps its own .git and stays
+         * watched; a monorepo sub-package keeps its tracked files ditto. */
+        if (s->file_count == 0 && !has_dot_git(s->root_path)) {
+            s->is_git = false;
+        }
+    }
+
+    if (s->is_git) {
+        git_head(s->root_path, s->last_head, sizeof(s->last_head));
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        free(s->worktree_root);
+        s->worktree_root = git_show_toplevel(s->root_path);
+        /* Deliberately NOT snapshotting the status signature here: it stays
+         * 0 ("clean"), so a tree already dirty at registration re-indexes
+         * ONCE on the first poll — edits racing the initial index are never
+         * missed — and then settles (the signature is committed after that
+         * re-index, so persistent dirt does not loop, #937). */
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
     } else {
@@ -515,18 +656,23 @@ static bool check_changes(project_state_t *s) {
     }
 
     /* Check HEAD movement */
+    bool head_moved = false;
     char head[CBM_SZ_64] = {0};
     if (git_head(s->root_path, head, sizeof(head)) == 0) {
         if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
             /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-            return true;
+            head_moved = true;
         }
         strncpy(s->last_head, head, sizeof(s->last_head) - 1);
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* Check working tree: trigger only when the status SIGNATURE moves, not
+     * whenever the tree is merely dirty — a persistently dirty tree used to
+     * re-index on every single poll (#937). The signature is committed to
+     * last_status_sig only after a successful re-index, so a failed run is
+     * retried on the next poll. */
+    s->pending_status_sig = git_status_signature(s->root_path, s->worktree_root);
+    return head_moved || s->pending_status_sig != s->last_status_sig;
 }
 
 /* Context for poll_once foreach callback */
@@ -639,6 +785,9 @@ static void poll_project(const char *key, void *val, void *ud) {
             ctx->reindexed++;
             /* Update HEAD after successful reindex */
             git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Commit the PRE-index signature: files that changed while the
+             * pipeline ran hash differently on the next poll and re-trigger. */
+            s->last_status_sig = s->pending_status_sig;
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
