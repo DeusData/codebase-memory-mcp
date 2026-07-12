@@ -215,6 +215,10 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "capabilities"));
     ASSERT_NOT_NULL(strstr(json, "tools"));
     ASSERT_NOT_NULL(strstr(json, "\"listChanged\":false"));
+    ASSERT_NOT_NULL(strstr(json, "\"prompts\":{\"listChanged\":false}"));
+    ASSERT_NOT_NULL(strstr(json, "\"instructions\":"));
+    ASSERT_NOT_NULL(strstr(json, "search_graph"));
+    ASSERT_NOT_NULL(strstr(json, "auto-refresh"));
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
     free(json);
 
@@ -267,6 +271,83 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Index repository\""));
     ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
     ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
+    free(json);
+    PASS();
+}
+
+TEST(mcp_tools_have_behavior_annotations) {
+    struct {
+        const char *name;
+        bool read_only;
+        bool destructive;
+        bool idempotent;
+        bool open_world;
+    } expected[] = {
+        {"index_repository", false, false, true, false},
+        /* These query tools can reach resolve_store(), whose corrupt-store
+         * recovery quarantines/removes database files. Keep the annotations
+         * conservative until query resolution is strictly non-mutating. */
+        {"search_graph", false, true, true, false},
+        {"query_graph", false, true, true, false},
+        {"trace_path", false, true, true, false},
+        {"get_code_snippet", false, true, true, false},
+        {"get_graph_schema", false, true, true, false},
+        {"get_architecture", false, true, true, false},
+        {"search_code", false, true, true, false},
+        {"list_projects", true, false, true, false},
+        {"delete_project", false, true, true, false},
+        {"index_status", false, true, true, false},
+        {"detect_changes", false, true, true, false},
+        {"manage_adr", false, true, false, false},
+        {"ingest_traces", false, false, false, false},
+    };
+
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_EQ(yyjson_arr_size(tools), sizeof(expected) / sizeof(expected[0]));
+
+    size_t matched = 0;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *tool;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        yyjson_val *name_val = yyjson_obj_get(tool, "name");
+        yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+        ASSERT_NOT_NULL(name_val);
+        ASSERT_NOT_NULL(annotations);
+        ASSERT_TRUE(yyjson_is_obj(annotations));
+
+        const char *name = yyjson_get_str(name_val);
+        bool found = false;
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            if (strcmp(name, expected[i].name) != 0) {
+                continue;
+            }
+            yyjson_val *read_only = yyjson_obj_get(annotations, "readOnlyHint");
+            yyjson_val *destructive = yyjson_obj_get(annotations, "destructiveHint");
+            yyjson_val *idempotent = yyjson_obj_get(annotations, "idempotentHint");
+            yyjson_val *open_world = yyjson_obj_get(annotations, "openWorldHint");
+            ASSERT_TRUE(yyjson_is_bool(read_only));
+            ASSERT_TRUE(yyjson_is_bool(destructive));
+            ASSERT_TRUE(yyjson_is_bool(idempotent));
+            ASSERT_TRUE(yyjson_is_bool(open_world));
+            ASSERT_EQ(yyjson_get_bool(read_only), expected[i].read_only);
+            ASSERT_EQ(yyjson_get_bool(destructive), expected[i].destructive);
+            ASSERT_EQ(yyjson_get_bool(idempotent), expected[i].idempotent);
+            ASSERT_EQ(yyjson_get_bool(open_world), expected[i].open_world);
+            found = true;
+            matched++;
+            break;
+        }
+        ASSERT_TRUE(found);
+    }
+
+    ASSERT_EQ(matched, sizeof(expected) / sizeof(expected[0]));
+    yyjson_doc_free(doc);
     free(json);
     PASS();
 }
@@ -622,6 +703,118 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     PASS();
 }
 
+TEST(server_handle_prompts_list_workflows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"prompts/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"explore_codebase\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"review_change_impact\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"project\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"question\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"change\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"base_branch\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"required\":true"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_prompts_get_workflows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":204,\"method\":\"prompts/get\","
+             "\"params\":{\"name\":\"explore_codebase\",\"arguments\":{"
+             "\"project\":\"payments\",\"question\":\"How are refunds routed?\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"role\":\"user\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"type\":\"text\""));
+    ASSERT_NOT_NULL(strstr(resp, "payments"));
+    ASSERT_NOT_NULL(strstr(resp, "How are refunds routed?"));
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_path"));
+    ASSERT_NOT_NULL(strstr(resp, "get_code_snippet"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":205,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                   "\"project\":\"payments\",\"change\":\"refund retry policy\","
+                                   "\"base_branch\":\"develop\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "refund retry policy"));
+    ASSERT_NOT_NULL(strstr(resp, "develop"));
+    ASSERT_NOT_NULL(strstr(resp, "detect_changes"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_path"));
+    ASSERT_NOT_NULL(strstr(resp, "include_tests"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_prompts_get_validates_arguments) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":206,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"unknown\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid prompt name"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":207,\"method\":\"prompts/get\","
+                                      "\"params\":{\"name\":\"explore_codebase\",\"arguments\":{"
+                                      "\"project\":\"payments\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Missing required prompt arguments"));
+    free(resp);
+
+    /* Optional means it may be omitted, not that an explicitly invalid value
+     * may be silently substituted. */
+    resp = cbm_mcp_server_handle(srv,
+                                 "{\"jsonrpc\":\"2.0\",\"id\":208,\"method\":\"prompts/get\","
+                                 "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                 "\"project\":\"payments\",\"change\":\"refund retry policy\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "base_branch \\\"main\\\""));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":209,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                   "\"project\":\"payments\",\"change\":\"refund retry policy\","
+                                   "\"base_branch\":\"\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid prompt arguments"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":210,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                   "\"project\":\"payments\",\"change\":\"refund retry policy\","
+                                   "\"base_branch\":17}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid prompt arguments"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(server_handle_logs_request_without_params) {
     mcp_log_buf[0] = '\0';
     CBMLogLevel prev_level = cbm_log_get_level();
@@ -946,11 +1139,10 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     PASS();
 }
 
-/* MCP discovery methods this server doesn't populate must return EMPTY
- * lists, not -32601 Method-not-found: clients like Cline probe
- * resources/list + prompts/list + resources/templates/list on connect and
- * surface the errors as a failed connection (#958). */
-TEST(mcp_discovery_methods_return_empty_lists) {
+/* Resource discovery methods this server doesn't populate must return EMPTY
+ * lists, not -32601 Method-not-found: clients like Cline probe them on connect
+ * and surface the errors as a failed connection (#958). */
+TEST(mcp_resource_discovery_methods_return_empty_lists) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
 
@@ -959,14 +1151,12 @@ TEST(mcp_discovery_methods_return_empty_lists) {
         const char *want;
     } cases[] = {
         {"resources/list", "\"resources\":[]"},
-        {"prompts/list", "\"prompts\":[]"},
         {"resources/templates/list", "\"resourceTemplates\":[]"},
     };
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 2; i++) {
         char reqbuf[256];
-        snprintf(reqbuf, sizeof(reqbuf),
-                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\"}", 100 + i,
-                 cases[i].method);
+        snprintf(reqbuf, sizeof(reqbuf), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\"}",
+                 100 + i, cases[i].method);
         char *resp = cbm_mcp_server_handle(srv, reqbuf);
         ASSERT_NOT_NULL(resp);
         ASSERT_NULL(strstr(resp, "Method not found"));
@@ -5705,6 +5895,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_latest_metadata);
+    RUN_TEST(mcp_tools_have_behavior_annotations);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
@@ -5741,6 +5932,9 @@ SUITE(mcp) {
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
     RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
+    RUN_TEST(server_handle_prompts_list_workflows);
+    RUN_TEST(server_handle_prompts_get_workflows);
+    RUN_TEST(server_handle_prompts_get_validates_arguments);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
 
@@ -5758,7 +5952,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
-    RUN_TEST(mcp_discovery_methods_return_empty_lists);
+    RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);

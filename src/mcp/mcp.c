@@ -95,6 +95,8 @@ enum {
 /* JSON-RPC 2.0 standard error codes */
 #define JSONRPC_PARSE_ERROR (-32700)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
+#define JSONRPC_INVALID_PARAMS (-32602)
+#define JSONRPC_INTERNAL_ERROR (-32603)
 
 /* ── Helpers ────────────────────────────────────────────────────── */
 
@@ -564,6 +566,36 @@ static const int TOOL_COUNT = sizeof(TOOLS) / sizeof(TOOLS[0]);
 
 static const char MCP_TOOL_OUTPUT_SCHEMA[] = "{\"type\":\"object\",\"additionalProperties\":true}";
 
+typedef struct {
+    const char *name;
+    bool read_only;
+    bool destructive;
+    bool idempotent;
+    bool open_world;
+} tool_annotation_def_t;
+
+/* Tool annotations are deliberately explicit. All tools operate on the local
+ * repository/index domain, so none cross an open-world trust boundary. */
+static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
+    {"index_repository", false, false, true, false}, {"search_graph", false, true, true, false},
+    {"query_graph", false, true, true, false},       {"trace_path", false, true, true, false},
+    {"get_code_snippet", false, true, true, false},  {"get_graph_schema", false, true, true, false},
+    {"get_architecture", false, true, true, false},  {"search_code", false, true, true, false},
+    {"list_projects", true, false, true, false},     {"delete_project", false, true, true, false},
+    {"index_status", false, true, true, false},      {"detect_changes", false, true, true, false},
+    {"manage_adr", false, true, false, false},       {"ingest_traces", false, false, false, false},
+};
+
+static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
+    size_t count = sizeof(TOOL_ANNOTATIONS) / sizeof(TOOL_ANNOTATIONS[0]);
+    for (size_t i = 0; i < count; i++) {
+        if (strcmp(TOOL_ANNOTATIONS[i].name, name) == 0) {
+            return &TOOL_ANNOTATIONS[i];
+        }
+    }
+    return NULL;
+}
+
 static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,
                                 const char *schema_json) {
     yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
@@ -584,6 +616,14 @@ static void mcp_add_tool_def(yyjson_mut_doc *doc, yyjson_mut_val *tools, int i) 
 
     mcp_add_json_schema(doc, tool, "inputSchema", TOOLS[i].input_schema);
     mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
+
+    const tool_annotation_def_t *def = mcp_tool_annotations(TOOLS[i].name);
+    yyjson_mut_val *annotations = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, annotations, "readOnlyHint", def ? def->read_only : false);
+    yyjson_mut_obj_add_bool(doc, annotations, "destructiveHint", def ? def->destructive : true);
+    yyjson_mut_obj_add_bool(doc, annotations, "idempotentHint", def ? def->idempotent : false);
+    yyjson_mut_obj_add_bool(doc, annotations, "openWorldHint", def ? def->open_world : true);
+    yyjson_mut_obj_add_val(doc, tool, "annotations", annotations);
 
     yyjson_mut_arr_add_val(tools, tool);
 }
@@ -692,6 +732,184 @@ static char *cbm_mcp_tools_list_page(const char *params_json) {
     return cbm_mcp_tools_list_range(offset, MCP_TOOLS_PAGE_SIZE, true);
 }
 
+/* ── Prompt definitions ───────────────────────────────────────── */
+
+static void mcp_add_prompt_argument(yyjson_mut_doc *doc, yyjson_mut_val *arguments,
+                                    const char *name, const char *title, const char *description,
+                                    bool required) {
+    yyjson_mut_val *argument = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, argument, "name", name);
+    yyjson_mut_obj_add_str(doc, argument, "title", title);
+    yyjson_mut_obj_add_str(doc, argument, "description", description);
+    yyjson_mut_obj_add_bool(doc, argument, "required", required);
+    yyjson_mut_arr_add_val(arguments, argument);
+}
+
+static char *cbm_mcp_prompts_list(void) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *prompts = yyjson_mut_arr(doc);
+
+    yyjson_mut_val *explore = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, explore, "name", "explore_codebase");
+    yyjson_mut_obj_add_str(doc, explore, "title", "Explore codebase");
+    yyjson_mut_obj_add_str(doc, explore, "description",
+                           "Explore a codebase with graph-first structural discovery.");
+    yyjson_mut_val *explore_arguments = yyjson_mut_arr(doc);
+    mcp_add_prompt_argument(doc, explore_arguments, "project", "Project",
+                            "Indexed project name from list_projects.", true);
+    mcp_add_prompt_argument(doc, explore_arguments, "question", "Question",
+                            "Architecture or implementation question to investigate.", true);
+    yyjson_mut_obj_add_val(doc, explore, "arguments", explore_arguments);
+    yyjson_mut_arr_add_val(prompts, explore);
+
+    yyjson_mut_val *review = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, review, "name", "review_change_impact");
+    yyjson_mut_obj_add_str(doc, review, "title", "Review change impact");
+    yyjson_mut_obj_add_str(doc, review, "description",
+                           "Review affected callers, tests, boundaries, and risks.");
+    yyjson_mut_val *review_arguments = yyjson_mut_arr(doc);
+    mcp_add_prompt_argument(doc, review_arguments, "project", "Project",
+                            "Indexed project name from list_projects.", true);
+    mcp_add_prompt_argument(doc, review_arguments, "change", "Change",
+                            "Change, symbol, or area whose impact should be reviewed.", true);
+    mcp_add_prompt_argument(doc, review_arguments, "base_branch", "Base branch",
+                            "Git branch or ref for detect_changes; defaults to main.", false);
+    yyjson_mut_obj_add_val(doc, review, "arguments", review_arguments);
+    yyjson_mut_arr_add_val(prompts, review);
+
+    yyjson_mut_obj_add_val(doc, root, "prompts", prompts);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static const char *mcp_prompt_string_argument(yyjson_val *arguments, const char *name) {
+    if (!arguments || !yyjson_is_obj(arguments)) {
+        return NULL;
+    }
+    yyjson_val *value = yyjson_obj_get(arguments, name);
+    if (!value || !yyjson_is_str(value)) {
+        return NULL;
+    }
+    const char *text = yyjson_get_str(value);
+    return text && text[0] ? text : NULL;
+}
+
+static char *mcp_prompt_result(const char *description, const char *text) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "description", description);
+
+    yyjson_mut_val *messages = yyjson_mut_arr(doc);
+    yyjson_mut_val *message = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, message, "role", "user");
+    yyjson_mut_val *content = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, content, "type", "text");
+    yyjson_mut_obj_add_str(doc, content, "text", text);
+    yyjson_mut_obj_add_val(doc, message, "content", content);
+    yyjson_mut_arr_add_val(messages, message);
+    yyjson_mut_obj_add_val(doc, root, "messages", messages);
+
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static char *mcp_prompt_error_json(int code, const char *message) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "code", code);
+    yyjson_mut_obj_add_str(doc, root, "message", message);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
+static char *cbm_mcp_prompt_get(const char *params_json, char **error_json) {
+    *error_json = NULL;
+    yyjson_doc *params_doc = params_json ? yyjson_read(params_json, strlen(params_json), 0) : NULL;
+    yyjson_val *params = params_doc ? yyjson_doc_get_root(params_doc) : NULL;
+    yyjson_val *name_value =
+        params && yyjson_is_obj(params) ? yyjson_obj_get(params, "name") : NULL;
+    if (!name_value || !yyjson_is_str(name_value)) {
+        *error_json = mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Invalid prompt name");
+        if (params_doc) {
+            yyjson_doc_free(params_doc);
+        }
+        return NULL;
+    }
+
+    const char *name = yyjson_get_str(name_value);
+    bool is_explore = strcmp(name, "explore_codebase") == 0;
+    bool is_review = strcmp(name, "review_change_impact") == 0;
+    if (!is_explore && !is_review) {
+        *error_json = mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Invalid prompt name");
+        yyjson_doc_free(params_doc);
+        return NULL;
+    }
+
+    yyjson_val *arguments = yyjson_obj_get(params, "arguments");
+    const char *project = mcp_prompt_string_argument(arguments, "project");
+    const char *request = mcp_prompt_string_argument(arguments, is_explore ? "question" : "change");
+    if (!project || !request) {
+        *error_json =
+            mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Missing required prompt arguments");
+        yyjson_doc_free(params_doc);
+        return NULL;
+    }
+
+    const char *base_branch = "main";
+    yyjson_val *base_branch_value = is_review && arguments && yyjson_is_obj(arguments)
+                                        ? yyjson_obj_get(arguments, "base_branch")
+                                        : NULL;
+    if (base_branch_value) {
+        if (!yyjson_is_str(base_branch_value) || !yyjson_get_str(base_branch_value)[0]) {
+            *error_json = mcp_prompt_error_json(JSONRPC_INVALID_PARAMS, "Invalid prompt arguments");
+            yyjson_doc_free(params_doc);
+            return NULL;
+        }
+        base_branch = yyjson_get_str(base_branch_value);
+    }
+
+    static const char EXPLORE_TEMPLATE[] =
+        "Explore project \"%s\" to answer: %s\n\n"
+        "Use graph tools first: search_graph to find relevant symbols, get_code_snippet for "
+        "exact source, and trace_path(direction=\"both\") for callers and callees. Use "
+        "get_architecture for broad orientation and query_graph only for multi-hop patterns. "
+        "Check has_more and paginate. Fall back to search_code or grep only for literal or "
+        "non-code text, or where graph coverage is incomplete.";
+    static const char REVIEW_TEMPLATE[] =
+        "Review change impact in project \"%s\" for: %s\n\n"
+        "Use detect_changes with base_branch \"%s\", then trace_path(direction=\"both\", "
+        "include_tests=true) for affected callers, callees, and tests. Read exact definitions "
+        "with get_code_snippet and use query_graph for cross-boundary patterns. Report affected "
+        "callers, tests, boundaries, and risks; do not modify files.";
+
+    size_t text_size = strlen(project) + strlen(request) + strlen(base_branch) +
+                       (is_explore ? sizeof(EXPLORE_TEMPLATE) : sizeof(REVIEW_TEMPLATE));
+    char *text = malloc(text_size);
+    if (!text) {
+        *error_json = mcp_prompt_error_json(JSONRPC_INTERNAL_ERROR, "Internal error");
+        yyjson_doc_free(params_doc);
+        return NULL;
+    }
+    if (is_explore) {
+        snprintf(text, text_size, EXPLORE_TEMPLATE, project, request);
+    } else {
+        snprintf(text, text_size, REVIEW_TEMPLATE, project, request, base_branch);
+    }
+
+    char *result = mcp_prompt_result(
+        is_explore ? "Graph-first codebase exploration" : "Graph-first change-impact review", text);
+    free(text);
+    yyjson_doc_free(params_doc);
+    return result;
+}
+
 /* Supported protocol versions, newest first. The server picks the newest
  * version that it shares with the client (per MCP spec version negotiation). */
 static const char *SUPPORTED_PROTOCOL_VERSIONS[] = {
@@ -702,6 +920,16 @@ static const char *SUPPORTED_PROTOCOL_VERSIONS[] = {
 };
 static const int SUPPORTED_VERSION_COUNT =
     (int)(sizeof(SUPPORTED_PROTOCOL_VERSIONS) / sizeof(SUPPORTED_PROTOCOL_VERSIONS[0]));
+
+static const char MCP_SERVER_INSTRUCTIONS[] =
+    "Use graph tools first for structural code discovery: search_graph to find symbols, "
+    "trace_path for callers and callees, get_code_snippet for exact source, query_graph for "
+    "complex multi-hop patterns, and get_architecture for orientation. Use search_code or "
+    "filesystem grep for literal or non-code text, or when graph coverage is insufficient. "
+    "Call list_projects before initial use and index_repository only when a repository is not "
+    "indexed or to force immediate freshness after a large external update. Once indexed, "
+    "watched projects auto-refresh in the background; use index_status to check freshness and "
+    "coverage. Check has_more or nextCursor and paginate when present.";
 
 char *cbm_mcp_initialize_response(const char *params_json) {
     /* Determine protocol version: if client requests a version we support,
@@ -739,7 +967,11 @@ char *cbm_mcp_initialize_response(const char *params_json) {
     yyjson_mut_val *tools_cap = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_bool(doc, tools_cap, "listChanged", false);
     yyjson_mut_obj_add_val(doc, caps, "tools", tools_cap);
+    yyjson_mut_val *prompts_cap = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, prompts_cap, "listChanged", false);
+    yyjson_mut_obj_add_val(doc, caps, "prompts", prompts_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
+    yyjson_mut_obj_add_str(doc, root, "instructions", MCP_SERVER_INSTRUCTIONS);
 
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -1445,7 +1677,8 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
 /* Open a .db file briefly, collect node/edge counts and root_path,
  * then append a JSON entry to arr. */
 static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, int64_t size_bytes) {
+                                     const char *name, size_t name_len, int64_t size_bytes,
+                                     bool metadata_only) {
     (void)name_len;
 
     char full_path[CBM_SZ_2K];
@@ -1462,8 +1695,12 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         return; /* ghost / unreadable — not a resolvable project */
     }
 
-    int nodes = cbm_store_count_nodes(pstore, project_name);
-    int edges = cbm_store_count_edges(pstore, project_name);
+    int nodes = 0;
+    int edges = 0;
+    if (!metadata_only) {
+        nodes = cbm_store_count_nodes(pstore, project_name);
+        edges = cbm_store_count_edges(pstore, project_name);
+    }
     char root_path_buf[CBM_SZ_1K] = "";
     cbm_project_t proj = {0};
     if (cbm_store_get_project(pstore, project_name, &proj) == CBM_STORE_OK) {
@@ -1481,7 +1718,7 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
      * disambiguates same-repo projects). The 12-field git block — mostly
      * null for non-git roots — cost ~10KB across a full cache and is one
      * index_status call away for the project you actually care about. */
-    if (root_path_buf[0]) {
+    if (!metadata_only && root_path_buf[0]) {
         cbm_git_context_t gctx = {0};
         (void)cbm_git_context_resolve(root_path_buf, &gctx);
         if (gctx.is_git && gctx.branch) {
@@ -1489,9 +1726,11 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
         }
         cbm_git_context_free(&gctx);
     }
-    yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
-    yyjson_mut_obj_add_int(doc, p, "edges", edges);
-    yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
+    if (!metadata_only) {
+        yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
+        yyjson_mut_obj_add_int(doc, p, "edges", edges);
+        yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
+    }
     yyjson_mut_arr_add_val(arr, p);
 }
 
@@ -1499,7 +1738,15 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
  * Each project is a single .db file — no central registry needed. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)srv;
-    (void)args;
+    bool metadata_only = false;
+    yyjson_doc *args_doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    yyjson_val *metadata_value =
+        args_root && yyjson_is_obj(args_root) ? yyjson_obj_get(args_root, "metadata_only") : NULL;
+    metadata_only = metadata_value && yyjson_is_true(metadata_value);
+    if (args_doc) {
+        yyjson_doc_free(args_doc);
+    }
 
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
@@ -1534,7 +1781,7 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         if (size_bytes < 0) {
             continue;
         }
-        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes);
+        build_project_json_entry(doc, arr, dir_path, name, len, size_bytes, metadata_only);
     }
     cbm_closedir(d);
 
@@ -7317,6 +7564,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     struct timespec req_t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &req_t0);
     char *result_json = NULL;
+    char *request_error_json = NULL;
     bool request_logged = false;
 
     if (strcmp(req.method, "initialize") == 0) {
@@ -7327,15 +7575,16 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "ping") == 0) {
         result_json = heap_strdup("{}");
     } else if (strcmp(req.method, "resources/list") == 0) {
-        /* This server exposes no resources/prompts, but clients (Cline,
-         * others) probe these on connect regardless of declared
-         * capabilities and surface -32601 as a failed connection (#958).
-         * Empty lists are the interoperable answer. */
+        /* This server exposes no resources, but clients probe these on
+         * connect regardless of declared capabilities and surface -32601 as
+         * a failed connection (#958). Empty lists are interoperable. */
         result_json = heap_strdup("{\"resources\":[]}");
     } else if (strcmp(req.method, "resources/templates/list") == 0) {
         result_json = heap_strdup("{\"resourceTemplates\":[]}");
     } else if (strcmp(req.method, "prompts/list") == 0) {
-        result_json = heap_strdup("{\"prompts\":[]}");
+        result_json = cbm_mcp_prompts_list();
+    } else if (strcmp(req.method, "prompts/get") == 0) {
+        result_json = cbm_mcp_prompt_get(req.params_raw, &request_error_json);
     } else if (strcmp(req.method, "tools/list") == 0) {
         result_json = cbm_mcp_tools_list_page(req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
@@ -7382,6 +7631,23 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
                            ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
         cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        cbm_jsonrpc_request_free(&req);
+        return err;
+    }
+
+    if (request_error_json) {
+        cbm_jsonrpc_response_t err_resp = {
+            .id = req.id,
+            .id_str = req.id_str,
+            .error_json = request_error_json,
+        };
+        char *err = cbm_jsonrpc_format_response(&err_resp);
+        struct timespec t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
+                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        free(request_error_json);
         cbm_jsonrpc_request_free(&req);
         return err;
     }

@@ -519,9 +519,21 @@ static void print_help(void) {
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
-    printf("\nSupported agents (auto-detected):\n");
+    printf("\nSupported automatic/conditional client surfaces (43):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
-    printf("  Antigravity, Aider, KiloCode, Kiro\n");
+    printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
+    printf("  Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands,\n");
+    printf("  Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush,\n");
+    printf("  Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI,\n");
+    printf("  Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn,\n");
+    printf("  Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE,\n");
+    printf("  CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi,\n");
+    printf("  Sourcegraph Cody\n");
+    printf("  Conditional/explicit targets are changed only when their documented\n");
+    printf("  platform, marker, or explicit existing config path is present.\n");
+    printf("  Manual/UI MCP boundaries: Qodo, Warp, JetBrains AI/ACP, Replit,\n");
+    printf("  Plandex, SWE-agent, BLACKBOX, GitHub cloud agents, Jules,\n");
+    printf("  CodeRabbit.\n");
     printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
     printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
     printf("  list_projects, delete_project, index_status, detect_changes,\n");
@@ -554,7 +566,7 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
-            return cbm_cmd_hook_augment();
+            return cbm_cmd_hook_augment(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);

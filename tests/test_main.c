@@ -123,17 +123,20 @@ static int tf_maybe_run_socket_probe(int argc, char **argv) {
 
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
+static bool *g_suite_arg_matched = NULL;
 
 static bool suite_requested(const char *name) {
     if (g_suite_argc <= 1) {
         return true;
     }
+    bool requested = false;
     for (int i = 1; i < g_suite_argc; i++) {
         if (strcmp(g_suite_argv[i], name) == 0) {
-            return true;
+            g_suite_arg_matched[i] = true;
+            requested = true;
         }
     }
-    return false;
+    return requested;
 }
 
 #define RUN_SELECTED_SUITE(name)      \
@@ -207,6 +210,11 @@ extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
+extern void suite_agent_clients(void);
+extern void suite_config_json_like(void);
+extern void suite_config_toml_edit(void);
+extern void suite_config_yaml_edit(void);
+extern void suite_config_text_edit(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
@@ -270,6 +278,13 @@ int main(int argc, char **argv) {
 
     g_suite_argc = argc;
     g_suite_argv = argv;
+    if (argc > 1) {
+        g_suite_arg_matched = calloc((size_t)argc, sizeof(*g_suite_arg_matched));
+        if (!g_suite_arg_matched) {
+            fprintf(stderr, "Failed to allocate test-suite argument tracking\n");
+            return 1;
+        }
+    }
     printf("\n  codebase-memory-mcp  C test suite\n");
 
     /* Foundation */
@@ -372,6 +387,11 @@ int main(int argc, char **argv) {
 
     /* CLI (install, update, config) */
     RUN_SELECTED_SUITE(cli);
+    RUN_SELECTED_SUITE(agent_clients);
+    RUN_SELECTED_SUITE(config_json_like);
+    RUN_SELECTED_SUITE(config_toml_edit);
+    RUN_SELECTED_SUITE(config_yaml_edit);
+    RUN_SELECTED_SUITE(config_text_edit);
 
     /* System info + worker pool (parallelism) */
     RUN_SELECTED_SUITE(system_info);
@@ -426,6 +446,23 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(grammar_probe_g);
 
     RUN_SELECTED_SUITE(incremental);
+
+    bool any_suite_matched = false;
+    for (int i = 1; i < g_suite_argc; i++) {
+        any_suite_matched = any_suite_matched || g_suite_arg_matched[i];
+    }
+    fflush(stdout);
+    for (int i = 1; i < g_suite_argc; i++) {
+        if (!g_suite_arg_matched[i]) {
+            fprintf(stderr, "Unknown test suite: %s\n", g_suite_argv[i]);
+            tf_fail_count++;
+        }
+    }
+    if (g_suite_argc > 1 && !any_suite_matched) {
+        fprintf(stderr, "No matching test suites requested\n");
+    }
+    free(g_suite_arg_matched);
+    g_suite_arg_matched = NULL;
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();
