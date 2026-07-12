@@ -3450,6 +3450,64 @@ TEST(extract_js_member_call_flags_is_method) {
     PASS();
 }
 
+/* #961: a C function whose body braces are split across #ifdef/#else
+ * branches (one open brace per branch, a single shared close) parses with
+ * an ERROR region on the raw source — both branches are present at once —
+ * and the defs walk silently dropped the function while its callers stayed
+ * (cbm_path_within_root, handle_process_kill). The preprocessed second
+ * pass (simplecpp picks one branch, same-file token lines stay aligned)
+ * must recover the definition with its original line. */
+TEST(extract_c_ifdef_split_brace_fn_recovered_issue961) {
+    CBMFileResult *r = extract("static int a(void) { return 1; }\n"
+                               "static int b(void) { return 2; }\n"
+                               "int split_brace_fn(int x) {\n"
+                               "#ifdef _WIN32\n"
+                               "    if (a() && b()) {\n"
+                               "#else\n"
+                               "    if (a() || b()) {\n"
+                               "#endif\n"
+                               "        x += 1;\n"
+                               "    }\n"
+                               "    return x;\n"
+                               "}\n"
+                               "int after_fn(int x) { return x; }\n",
+                               CBM_LANG_C, "t", "split.c");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def(r, "split_brace_fn");
+    if (!d) {
+        fprintf(stderr, "  [961] FAIL split_brace_fn dropped (defs walk lost the "
+                        "#ifdef-split function)\n");
+    }
+    ASSERT_NOT_NULL(d);
+    ASSERT_EQ((int)d->start_line, 3);
+    /* Error recovery must stay localized: neighbours extract either way. */
+    ASSERT_NOT_NULL(find_def(r, "a"));
+    ASSERT_NOT_NULL(find_def(r, "after_fn"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #961 inverse guard: a clean C file must not gain duplicate or phantom
+ * defs from the recovery path (it only engages on raw-parse ERROR regions). */
+TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
+    CBMFileResult *r = extract("#ifdef _WIN32\n"
+                               "static int w(void) { return 1; }\n"
+                               "#else\n"
+                               "static int u(void) { return 2; }\n"
+                               "#endif\n"
+                               "int use(int x) { return x; }\n",
+                               CBM_LANG_C, "t", "clean.c");
+    ASSERT_NOT_NULL(r);
+    int use_count = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "use") == 0)
+            use_count++;
+    }
+    ASSERT_EQ(use_count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
  * C-stack frame that overflowed small thread stacks (the reporter's crash was in
  * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
@@ -3870,6 +3928,8 @@ SUITE(extraction) {
     RUN_TEST(complexity_go_method_receiver_self_recursion);
     RUN_TEST(complexity_delegation_receivers_not_recursive_issue876);
     RUN_TEST(complexity_access_depth_and_params);
+    RUN_TEST(extract_c_ifdef_split_brace_fn_recovered_issue961);
+    RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
 

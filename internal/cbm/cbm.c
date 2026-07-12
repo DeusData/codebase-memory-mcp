@@ -817,6 +817,38 @@ static bool cbm_region_is_recovered(uint32_t rs, uint32_t re, const CBMDefArray 
     return covered_to >= re;
 }
 
+/* #961: true when 1-based `line` of `src` contains `name` (used to verify a
+ * def recovered from EXPANDED source really lives on that ORIGINAL line —
+ * rejects header-inlined defs whose physical expanded lines alias unrelated
+ * raw lines when compile_commands include paths are present). */
+static bool cbm_line_contains(const char *src, int src_len, uint32_t line, const char *name) {
+    if (!src || !name || !name[0] || line == 0) {
+        return false;
+    }
+    uint32_t cur = 1;
+    int i = 0;
+    while (i < src_len && cur < line) {
+        if (src[i] == '\n') {
+            cur++;
+        }
+        i++;
+    }
+    if (cur != line) {
+        return false;
+    }
+    int end = i;
+    while (end < src_len && src[end] != '\n') {
+        end++;
+    }
+    size_t nlen = strlen(name);
+    for (int j = i; j + (int)nlen <= end; j++) {
+        if (strncmp(src + j, name, nlen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs) {
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
@@ -1102,6 +1134,52 @@ static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
                     // block). Runs in every mode.
                     cbm_run_c_lsp(a, result, expanded, expanded_len, pp_root,
                                   language != CBM_LANG_C);
+
+                    /* #961: a def whose body braces are split across
+                     * #ifdef/#else branches parses as an ERROR region on the
+                     * RAW source (both branches present at once -> unbalanced
+                     * braces), so the raw defs walk silently dropped it. The
+                     * expanded tree parses clean (simplecpp picked one
+                     * branch) and same-file token lines stay aligned, so
+                     * recover defs from it — adopting ONLY those that
+                     * intersect a raw ERROR region, whose name is visible on
+                     * the raw source line, and whose QN the raw pass did not
+                     * already extract. */
+                    if (ts_node_has_error(root)) {
+                        cbm_error_regions_t raw_regs = {{0}, {0}, 0};
+                        cbm_collect_error_regions(root, &raw_regs);
+                        if (raw_regs.count > 0) {
+                            int defs_before = result->defs.count;
+                            cbm_extract_definitions(&pp_ctx);
+                            int w = defs_before;
+                            for (int i = defs_before; i < result->defs.count; i++) {
+                                CBMDefinition *d = &result->defs.items[i];
+                                bool adopt = false;
+                                for (int rj = 0; rj < raw_regs.count && !adopt; rj++) {
+                                    if (d->start_line <= raw_regs.ends[rj] &&
+                                        d->end_line >= raw_regs.starts[rj]) {
+                                        adopt = true;
+                                    }
+                                }
+                                if (adopt &&
+                                    (!d->name || !cbm_line_contains(source, source_len,
+                                                                    d->start_line, d->name))) {
+                                    adopt = false;
+                                }
+                                for (int j = 0; j < defs_before && adopt; j++) {
+                                    const char *q = result->defs.items[j].qualified_name;
+                                    if (q && d->qualified_name &&
+                                        strcmp(q, d->qualified_name) == 0) {
+                                        adopt = false;
+                                    }
+                                }
+                                if (adopt) {
+                                    result->defs.items[w++] = *d;
+                                }
+                            }
+                            result->defs.count = w;
+                        }
+                    }
 
                     ts_tree_delete(pp_tree);
                 }
