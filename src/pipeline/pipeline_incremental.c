@@ -91,6 +91,20 @@ static bool incr_changed_all_c_family_headers(const cbm_file_info_t *changed_fil
     return true;
 }
 
+static bool incr_changed_contains_c_family_source(const cbm_file_info_t *changed_files,
+                                                  int changed_count) {
+    if (!changed_files || changed_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        if (cbm_pipeline_is_c_family_source(changed_files[i].language,
+                                            changed_files[i].rel_path)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool incr_language_has_scoped_overlay_parity(CBMLanguage lang) {
     switch (lang) {
     case CBM_LANG_GO:
@@ -2587,7 +2601,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         incr_classification_free(&cls);
         cbm_store_close(store);
         cbm_log_info("incremental.fallback", "reason",
-                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE, "scope", "c_family_header");
+                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE, "scope",
+                     CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER);
+        return CBM_NOT_FOUND;
+    }
+    if (strcmp(exact_reason ? exact_reason : "",
+               CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE) == 0 &&
+        incr_changed_contains_c_family_source(changed_files, ci)) {
+        incr_classification_free(&cls);
+        cbm_store_close(store);
+        cbm_log_info("incremental.fallback", "reason",
+                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE, "scope",
+                     CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE);
         return CBM_NOT_FOUND;
     }
     if (strcmp(exact_reason ? exact_reason : "",

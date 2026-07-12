@@ -513,6 +513,8 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
 #define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
+#define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER "c_family_header"
+#define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE "c_family_source"
 #define CBM_PIPELINE_DELTA_REASON_PREFLIGHT_ERROR "preflight_error"
 #define CBM_PIPELINE_DELTA_REASON_CROSS_FILE_NODE_QN_COLLISION "cross_file_node_qn_collision"
 #define CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR "header_type_impl_pair"
@@ -608,6 +610,7 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
 bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path);
+bool cbm_pipeline_is_c_family_source(CBMLanguage lang, const char *rel_path);
 bool cbm_pipeline_delta_edge_type_is_recomputed(const char *type);
 int cbm_pipeline_copy_delta_node(const cbm_node_t *src, cbm_node_t *dst);
 int cbm_pipeline_copy_delta_edge(const cbm_store_delta_edge_t *src,

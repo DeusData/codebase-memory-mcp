@@ -6423,6 +6423,13 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
     const char *publish_reason = cbm_pipeline_publish_reason(p);
     atomic_store_explicit(&srv->active_pipeline, NULL, memory_order_release);
+    /* Refresh the watcher baseline before releasing the pipeline lock. Otherwise
+     * a poll that observes the explicit edit can acquire the lock in the gap
+     * below and launch a redundant full-mode reindex before the later response
+     * bookkeeping reaches cbm_watcher_mark_indexed(). */
+    if (rc == 0 && srv->watcher) {
+        cbm_watcher_mark_indexed(srv->watcher, project_name, repo_path);
+    }
     cbm_pipeline_unlock();
     CBM_PROF_END("index_repository", "pipeline_locked_run", prof_index_locked_run);
 
@@ -6487,12 +6494,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                 store, project_name, srv->config, graph_changed, deps_reindexed,
                 cbm_rank_refresh_publish_from_pipeline(publish_kind));
             CBM_PROF_END("index_repository", "rank_refresh", prof_index_rank_refresh);
-            /* Explicit indexing just observed the current worktree state. Refresh
-             * the watcher baseline so it does not immediately reindex the same
-             * dirty status after this response. */
-            if (srv->watcher)
-                cbm_watcher_mark_indexed(srv->watcher, project_name, repo_path);
-
             CBM_PROF_START(prof_index_counts);
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);

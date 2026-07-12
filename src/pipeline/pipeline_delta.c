@@ -81,12 +81,39 @@ static char *delta_strdup(const char *s) {
     return cbm_strdup(s ? s : "");
 }
 
+static bool cbm_pipeline_is_c_lsp_family_language(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA;
+}
+
 bool cbm_pipeline_is_c_family_header(CBMLanguage lang, const char *rel_path) {
-    (void)lang;
-    return rel_path && (cbm_str_ends_with(rel_path, ".h") || cbm_str_ends_with(rel_path, ".hh") ||
-                        cbm_str_ends_with(rel_path, ".hpp") ||
-                        cbm_str_ends_with(rel_path, ".hxx") ||
-                        cbm_str_ends_with(rel_path, ".cuh"));
+    if (!rel_path) {
+        return false;
+    }
+    if (lang != CBM_LANG_COUNT && !cbm_pipeline_is_c_lsp_family_language(lang)) {
+        return false;
+    }
+    return cbm_str_ends_with(rel_path, ".h") || cbm_str_ends_with(rel_path, ".hh") ||
+           cbm_str_ends_with(rel_path, ".hpp") || cbm_str_ends_with(rel_path, ".hxx") ||
+           cbm_str_ends_with(rel_path, ".cuh");
+}
+
+bool cbm_pipeline_is_c_family_source(CBMLanguage lang, const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    if (cbm_pipeline_is_c_family_header(lang, rel_path)) {
+        return false;
+    }
+    if (cbm_pipeline_is_c_lsp_family_language(lang)) {
+        return true;
+    }
+    if (lang != CBM_LANG_COUNT) {
+        return false;
+    }
+    return cbm_str_ends_with(rel_path, ".c") || cbm_str_ends_with(rel_path, ".cc") ||
+           cbm_str_ends_with(rel_path, ".ccm") || cbm_str_ends_with(rel_path, ".cpp") ||
+           cbm_str_ends_with(rel_path, ".cppm") || cbm_str_ends_with(rel_path, ".cxx") ||
+           cbm_str_ends_with(rel_path, ".ixx") || cbm_str_ends_with(rel_path, ".cu");
 }
 
 const char *cbm_pipeline_file_delta_pass_fingerprint(void) {
