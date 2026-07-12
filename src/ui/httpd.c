@@ -3,7 +3,7 @@
  *
  * Original implementation written for this project from RFC 9112 and the
  * needs of our endpoints (see httpd.h for the full design constraints:
- * single-threaded, localhost-only, strict CRLF, Connection: close).
+ * single-threaded, IPv4-only, strict CRLF, Connection: close).
  */
 #include "ui/httpd.h"
 
@@ -46,6 +46,7 @@ typedef int cbm_sock_t;
 struct cbm_httpd {
     cbm_sock_t fd;
     int port;
+    char host[CBM_HTTPD_HOST_MAX];
     int recv_deadline_ms;
 };
 
@@ -111,7 +112,7 @@ static int send_all(cbm_sock_t fd, const void *data, size_t len) {
 
 /* ── Listener ─────────────────────────────────────────────────── */
 
-cbm_httpd_t *cbm_httpd_listen(int port) {
+cbm_httpd_t *cbm_httpd_listen(const char *host, int port) {
 #ifdef _WIN32
     static atomic_int wsa_started = 0;
     int expected = 0;
@@ -135,12 +136,16 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 #endif
 
-    /* Loopback only — never any other interface. */
+    /* The caller validates host for CLI/config use; validate again at the
+     * transport boundary so this API cannot accidentally resolve hostnames. */
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_port = htons((unsigned short)port);
-    addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 */
+    if (!host || inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
+        cbm_sock_close(fd);
+        return NULL;
+    }
 
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 16) != 0) {
         cbm_sock_close(fd);
@@ -162,12 +167,17 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     }
     d->fd = fd;
     d->port = (int)ntohs(bound.sin_port);
+    snprintf(d->host, sizeof(d->host), "%s", host);
     d->recv_deadline_ms = CBM_HTTP_RECV_DEADLINE_MS;
     return d;
 }
 
 int cbm_httpd_port(const cbm_httpd_t *d) {
     return d ? d->port : -1;
+}
+
+const char *cbm_httpd_host(const cbm_httpd_t *d) {
+    return d ? d->host : NULL;
 }
 
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms) {

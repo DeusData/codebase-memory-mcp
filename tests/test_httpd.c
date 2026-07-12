@@ -376,10 +376,11 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
 /* ── Transport integration (listener only) ────────────────────── */
 
 TEST(httpd_listen_ephemeral_port) {
-    cbm_httpd_t *d = cbm_httpd_listen(0);
+    cbm_httpd_t *d = cbm_httpd_listen("127.0.0.1", 0);
     ASSERT_NOT_NULL(d);
     int port = cbm_httpd_port(d);
     ASSERT_GT(port, 0);
+    ASSERT_STR_EQ(cbm_httpd_host(d), "127.0.0.1");
     /* accept with a short timeout and no client → NULL, promptly */
     cbm_http_conn_t *c = cbm_httpd_accept(d, 50);
     ASSERT_NULL(c);
@@ -388,11 +389,27 @@ TEST(httpd_listen_ephemeral_port) {
 }
 
 TEST(httpd_listen_port_collision_returns_null) {
-    cbm_httpd_t *d1 = cbm_httpd_listen(0);
+    cbm_httpd_t *d1 = cbm_httpd_listen("127.0.0.1", 0);
     ASSERT_NOT_NULL(d1);
-    cbm_httpd_t *d2 = cbm_httpd_listen(cbm_httpd_port(d1));
+    cbm_httpd_t *d2 = cbm_httpd_listen("127.0.0.1", cbm_httpd_port(d1));
     ASSERT_NULL(d2);
     cbm_httpd_close(d1);
+    PASS();
+}
+
+TEST(httpd_listen_all_interfaces) {
+    cbm_httpd_t *d = cbm_httpd_listen("0.0.0.0", 0);
+    ASSERT_NOT_NULL(d);
+    ASSERT_GT(cbm_httpd_port(d), 0);
+    ASSERT_STR_EQ(cbm_httpd_host(d), "0.0.0.0");
+    cbm_httpd_close(d);
+    PASS();
+}
+
+TEST(httpd_listen_rejects_invalid_host) {
+    ASSERT_NULL(cbm_httpd_listen("", 0));
+    ASSERT_NULL(cbm_httpd_listen("localhost", 0));
+    ASSERT_NULL(cbm_httpd_listen("999.1.1.1", 0));
     PASS();
 }
 
@@ -409,7 +426,7 @@ static void *th_server_thread(void *arg) {
 }
 
 static int th_server_start(th_server_t *ts) {
-    ts->srv = cbm_http_server_new(0);
+    ts->srv = cbm_http_server_new("127.0.0.1", 0);
     if (!ts->srv)
         return -1;
     if (cbm_thread_create(&ts->tid, 0, th_server_thread, ts->srv) != 0) {
@@ -420,7 +437,7 @@ static int th_server_start(th_server_t *ts) {
 }
 
 static int th_server_start_with_watcher(th_server_t *ts, cbm_watcher_t *watcher) {
-    ts->srv = cbm_http_server_new(0);
+    ts->srv = cbm_http_server_new("127.0.0.1", 0);
     if (!ts->srv)
         return -1;
     cbm_http_server_set_watcher(ts->srv, watcher);
@@ -1093,6 +1110,7 @@ TEST(git_context_resolve_no_hang_under_live_ui_sockets) {
 TEST(ui_server_rejects_non_loopback_host) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
+    ASSERT_STR_EQ(cbm_http_server_host(ts.srv), "127.0.0.1");
     int port = cbm_http_server_port(ts.srv);
     char resp[4096];
 
@@ -1195,6 +1213,8 @@ SUITE(httpd) {
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
     RUN_TEST(httpd_listen_port_collision_returns_null);
+    RUN_TEST(httpd_listen_all_interfaces);
+    RUN_TEST(httpd_listen_rejects_invalid_host);
 
     /* Full UI server */
     RUN_TEST(ui_server_rejects_non_loopback_host);

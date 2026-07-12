@@ -61,9 +61,10 @@ done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 # ── 1b. Raw network calls (must not exist) ──────────────────────
 #
 # The graph-UI HTTP server (src/ui/httpd.c) is the one component that owns a
-# listening socket. It is first-party, binds 127.0.0.1 only, and is audited
-# separately by scripts/security-ui.sh (binding + CORS checks), so it is
-# exempt from this scan. No other source file may make raw network calls.
+# listening socket. It binds 127.0.0.1 by default; non-loopback binding requires
+# an explicit validated numeric IPv4 configuration and is audited separately by
+# scripts/security-ui.sh (binding + warning + CORS checks). No other source file
+# may make raw network calls.
 
 echo ""
 echo "--- Scanning for raw network calls (must not exist) ---"

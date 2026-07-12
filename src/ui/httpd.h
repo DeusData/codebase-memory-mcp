@@ -2,14 +2,14 @@
  * httpd.h — First-party HTTP/1.1 server transport for the graph UI.
  *
  * Original implementation written for this project from RFC 9112 and the
- * needs of the graph-UI endpoints. Localhost-only by construction.
+ * needs of the graph-UI endpoints. IPv4-only by construction.
  *
  * Design constraints (deliberate — do not "improve" without reading this):
  *   - SINGLE-THREADED, sequential request handling. The routing layer
  *     (http_server.c) keeps per-request state in static buffers; a thread
  *     pool would break it. One stalled client can hold the loop for at most
- *     the receive deadline (default 5 s) — acceptable for a localhost tool.
- *   - Binds 127.0.0.1 only (IPv4 loopback). Never any other interface.
+ *     the receive deadline (default 5 s) — acceptable for a local tool.
+ *   - Binds the validated numeric IPv4 address selected by the UI config.
  *   - Every response carries explicit Content-Length and "Connection: close";
  *     keep-alive is intentionally NOT implemented (smaller parsing surface;
  *     loopback reconnects are sub-millisecond). Known trade-off: on Windows,
@@ -41,6 +41,8 @@
 typedef struct cbm_httpd cbm_httpd_t;         /* listener */
 typedef struct cbm_http_conn cbm_http_conn_t; /* accepted connection */
 
+#define CBM_HTTPD_HOST_MAX 16 /* INET_ADDRSTRLEN */
+
 /* A parsed request. `path` and `query` are raw (NOT percent-decoded).
  * `origin` and `accept_language` are the header values consumed by the
  * routing layer ("" when absent). `body` is heap-allocated, NUL-terminated. */
@@ -57,12 +59,15 @@ typedef struct {
 
 /* ── Listener lifecycle ───────────────────────────────────────── */
 
-/* Listen on 127.0.0.1:<port>. port 0 binds an ephemeral port (tests).
- * Returns NULL if the port is unavailable. */
-cbm_httpd_t *cbm_httpd_listen(int port);
+/* Listen on numeric IPv4 host:<port>. port 0 binds an ephemeral port (tests).
+ * Returns NULL if the host/port is invalid or unavailable. */
+cbm_httpd_t *cbm_httpd_listen(const char *host, int port);
 
 /* The actually-bound port (differs from the requested one for port 0). */
 int cbm_httpd_port(const cbm_httpd_t *d);
+
+/* The configured IPv4 host used for the bind. */
+const char *cbm_httpd_host(const cbm_httpd_t *d);
 
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms);

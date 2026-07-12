@@ -10,11 +10,12 @@
  *   GET/POST /api/... → UI support endpoints (layout, index, browse, …)
  *   *                 → 404
  *
- * Runs in a background pthread. Binds to 127.0.0.1 only (see httpd.c).
+ * Runs in a background pthread. Binds to the configured IPv4 address (see httpd.c).
  * Has its own cbm_mcp_server_t with a separate SQLite connection (WAL reader).
  */
 #include "ui/http_server.h"
 #include "ui/httpd.h"
+#include "ui/config.h"
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
@@ -133,6 +134,7 @@ struct cbm_http_server {
     struct cbm_watcher *watcher; /* external watcher ref (not owned) */
     atomic_int stop_flag;
     int port;
+    char host[CBM_UI_HOST_MAX];
     bool listener_ok;
 };
 
@@ -1848,11 +1850,16 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 
 /* ── Public API ───────────────────────────────────────────────── */
 
-cbm_http_server_t *cbm_http_server_new(int port) {
+cbm_http_server_t *cbm_http_server_new(const char *host, int port) {
     cbm_http_server_t *srv = calloc(1, sizeof(*srv));
     if (!srv)
         return NULL;
 
+    if (!cbm_ui_host_is_valid(host)) {
+        free(srv);
+        return NULL;
+    }
+    snprintf(srv->host, sizeof(srv->host), "%s", host);
     srv->port = port;
     atomic_store(&srv->stop_flag, 0);
 
@@ -1864,8 +1871,7 @@ cbm_http_server_t *cbm_http_server_new(int port) {
         return NULL;
     }
 
-    /* Bind to localhost only (httpd refuses anything else by construction) */
-    srv->listener = cbm_httpd_listen(port);
+    srv->listener = cbm_httpd_listen(srv->host, port);
     if (!srv->listener) {
         char port_str[16];
         snprintf(port_str, sizeof(port_str), "%d", port);
@@ -1877,12 +1883,25 @@ cbm_http_server_t *cbm_http_server_new(int port) {
     }
 
     srv->port = cbm_httpd_port(srv->listener);
+    snprintf(srv->host, sizeof(srv->host), "%s", cbm_httpd_host(srv->listener));
     srv->listener_ok = true;
+
+    if (!cbm_ui_host_is_loopback(srv->host)) {
+        const char *scope = strcmp(srv->host, "0.0.0.0") == 0 ? " (all interfaces)" : "";
+        (void)fprintf(stderr,
+                      "\nWARNING: Graph UI is listening on %s:%d%s.\n"
+                      "The UI has no authentication, is reachable over the network, and may "
+                      "expose codebase graph data and UI actions.\n"
+                      "Protect it with a firewall or trusted network. Prefer binding to a "
+                      "specific LAN IP rather than 0.0.0.0.\n\n",
+                      srv->host, srv->port, scope);
+        (void)fflush(stderr);
+    }
 
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%d", srv->port);
     char url[64];
-    snprintf(url, sizeof(url), "http://127.0.0.1:%d", srv->port);
+    snprintf(url, sizeof(url), "http://%s:%d", srv->host, srv->port);
     cbm_log_info("ui.serving", "url", url, "port", port_str);
 
     return srv;
@@ -1938,6 +1957,10 @@ bool cbm_http_server_is_running(const cbm_http_server_t *srv) {
 
 int cbm_http_server_port(const cbm_http_server_t *srv) {
     return (srv && srv->listener_ok) ? srv->port : -1;
+}
+
+const char *cbm_http_server_host(const cbm_http_server_t *srv) {
+    return (srv && srv->listener_ok) ? srv->host : NULL;
 }
 
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms) {

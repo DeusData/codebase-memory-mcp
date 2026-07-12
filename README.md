@@ -114,10 +114,18 @@ The UI ships as a separate `ui` build (it embeds the frontend). The default inst
 Then run it:
 
 ```bash
-codebase-memory-mcp --ui=true --port=9749
+codebase-memory-mcp --ui=true --host=127.0.0.1 --port=9749
 ```
 
 Open `http://localhost:9749` in your browser. The UI runs as a background thread alongside the MCP server — it's available whenever your agent is connected.
+
+The default host is `127.0.0.1` and is persisted with the UI port. To share the UI on a trusted LAN, bind a specific local address:
+
+```bash
+codebase-memory-mcp --ui=true --host=192.168.88.26 --port=9749
+```
+
+Use `--host=0.0.0.0` only when you need all interfaces. The UI has no authentication; a non-loopback bind is reachable over the network and may expose codebase graph data and UI actions. Protect it with a firewall or trusted network, and prefer a specific LAN IP over `0.0.0.0`.
 
 ### Auto-Index
 

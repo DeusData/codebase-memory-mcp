@@ -1,7 +1,7 @@
 /*
  * http_server.h — Embedded HTTP server for the graph visualization UI.
  *
- * Binds to 127.0.0.1:<port> only (localhost).
+ * Binds to a validated numeric IPv4 host:<port>; localhost remains the default.
  * Serves embedded frontend assets and proxies /rpc to a dedicated
  * read-only cbm_mcp_server_t instance.
  *
@@ -16,10 +16,10 @@
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
 
-/* Create an HTTP server on the given port.
+/* Create an HTTP server on the given numeric IPv4 host and port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
  * Returns NULL on failure (e.g. port in use). */
-cbm_http_server_t *cbm_http_server_new(int port);
+cbm_http_server_t *cbm_http_server_new(const char *host, int port);
 
 /* Free the HTTP server (call after thread has been joined). */
 void cbm_http_server_free(cbm_http_server_t *srv);
@@ -36,6 +36,9 @@ bool cbm_http_server_is_running(const cbm_http_server_t *srv);
 
 /* The actually-bound port (useful when constructed with port 0 in tests). */
 int cbm_http_server_port(const cbm_http_server_t *srv);
+
+/* The configured IPv4 host used for the bind. */
+const char *cbm_http_server_host(const cbm_http_server_t *srv);
 
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);

@@ -8,6 +8,7 @@
  *   --help          Print usage and exit
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
+ *   --host=IPv4     Set HTTP UI host (persisted, default 127.0.0.1)
  *
  * Signal handling: SIGTERM/SIGINT trigger graceful shutdown.
  * Watcher runs in a background thread, polling for git changes.
@@ -28,6 +29,7 @@ enum {
     MAIN_CLI_ARGC = 2,
     MAIN_FLAG_OFF = 5, /* strlen("--ui=") */
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
+    MAIN_HOST_OFF = 7, /* strlen("--host=") */
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
@@ -517,6 +519,7 @@ static void print_help(void) {
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("  --host=<IPv4> Set UI host (default 127.0.0.1, persisted)\n");
     printf("\nSupported agents (auto-detected):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, Kiro\n");
@@ -570,8 +573,10 @@ static int handle_subcommand(int argc, char **argv) {
     return CBM_NOT_FOUND;
 }
 
-/* Parse --ui= and --port= flags. Returns true if config was modified. */
-static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg, bool *explicit_enable) {
+/* Parse --ui=, --port=, and --host= flags. Returns -1 on invalid input,
+ * 0 when unchanged, and 1 when config was modified. */
+static int parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg, bool *explicit_enable,
+                          char *error, size_t error_size) {
     bool changed = false;
     for (int i = SKIP_ONE; i < argc; i++) {
         if (strncmp(argv[i], "--ui=", SLEN("--ui=")) == 0) {
@@ -588,8 +593,22 @@ static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg, bool *ex
                 changed = true;
             }
         }
+        if (strcmp(argv[i], "--host") == 0) {
+            snprintf(error, error_size, "--host requires a numeric IPv4 value (use --host=<IPv4>)");
+            return -1;
+        }
+        if (strncmp(argv[i], "--host=", SLEN("--host=")) == 0) {
+            const char *host = argv[i] + MAIN_HOST_OFF;
+            if (!cbm_ui_host_is_valid(host)) {
+                snprintf(error, error_size,
+                         "invalid --host value '%s'; expected a numeric IPv4 address", host);
+                return -1;
+            }
+            snprintf(cfg->ui_host, sizeof(cfg->ui_host), "%s", host);
+            changed = true;
+        }
     }
-    return changed;
+    return changed ? 1 : 0;
 }
 
 /* Install platform-specific signal handlers. */
@@ -722,7 +741,14 @@ int main(int argc, char **argv) {
     cbm_ui_config_t ui_cfg;
     cbm_ui_config_load(&ui_cfg);
     bool explicit_ui_enable = false;
-    if (parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
+    char ui_flag_error[256];
+    int ui_flags_rc = parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable, ui_flag_error,
+                                     sizeof(ui_flag_error));
+    if (ui_flags_rc < 0) {
+        (void)fprintf(stderr, "codebase-memory-mcp: %s\n", ui_flag_error);
+        return 2;
+    }
+    if (ui_flags_rc > 0) {
         cbm_ui_config_save(&ui_cfg);
     }
     /* If the user explicitly asked for the UI but this binary has no embedded
@@ -787,7 +813,7 @@ int main(int argc, char **argv) {
     bool http_started = false;
 
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
-        g_http_server = cbm_http_server_new(ui_cfg.ui_port);
+        g_http_server = cbm_http_server_new(ui_cfg.ui_host, ui_cfg.ui_port);
         if (g_http_server) {
             cbm_http_server_set_watcher(g_http_server, g_watcher);
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {

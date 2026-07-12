@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Audits:
 #   A. Frontend asset scan (embedded JS/CSS/HTML or graph-ui/dist/)
-#   B. HTTP server binding (must be 127.0.0.1 only)
+#   B. HTTP server binding (localhost by default; non-loopback is explicit)
 #   C. RPC proxy scope (no system()/popen() in HTTP handler path)
 #   D. CORS check (no wildcard Access-Control-Allow-Origin)
 #
@@ -139,6 +139,9 @@ echo "--- B. HTTP server binding check ---"
 # audit would go blind, so that is a hard failure, not a skip.
 HTTPD="$ROOT/src/ui/httpd.c"
 HTTP_SERVER="$ROOT/src/ui/http_server.c"
+UI_CONFIG="$ROOT/src/ui/config.h"
+UI_CONFIG_C="$ROOT/src/ui/config.c"
+MAIN="$ROOT/src/main.c"
 for f in "$HTTPD" "$HTTP_SERVER"; do
     if [[ ! -f "$f" ]]; then
         echo "BLOCKED: expected UI server source missing: $f"
@@ -147,20 +150,37 @@ for f in "$HTTPD" "$HTTP_SERVER"; do
 done
 
 if [[ -f "$HTTPD" ]]; then
-    # Must bind to 127.0.0.1 only
-    if grep -q '127\.0\.0\.1' "$HTTPD"; then
-        echo "OK: Server binds to 127.0.0.1"
+    # The safe default must remain localhost, including when loading an old
+    # config file that has no host field.
+    if [[ -f "$UI_CONFIG" ]] && grep -qE '#define CBM_UI_DEFAULT_HOST "127\.0\.0\.1"' "$UI_CONFIG" && \
+       [[ -f "$UI_CONFIG_C" ]] && grep -q 'CBM_UI_DEFAULT_HOST' "$UI_CONFIG_C"; then
+        echo "OK: Default UI host is 127.0.0.1"
     else
-        echo "BLOCKED: No 127.0.0.1 binding found in httpd.c"
+        echo "BLOCKED: Default UI host is not provably 127.0.0.1"
         FAIL=1
     fi
 
-    # Must NOT bind to 0.0.0.0 or INADDR_ANY
-    if cat "$HTTPD" "$HTTP_SERVER" 2>/dev/null | grep -E '0\.0\.0\.0|INADDR_ANY|in6addr_any' | grep -v '^\s*//' | grep -v '^\s*\*' > /dev/null 2>&1; then
-        echo "BLOCKED: Server may bind to all interfaces (0.0.0.0/INADDR_ANY found)"
-        FAIL=1
+    # Non-loopback binding must travel through the explicit numeric IPv4 flag
+    # and the validated host parameter; this prevents implicit exposure.
+    if grep -q '"--host="' "$MAIN" && grep -q 'cbm_ui_host_is_valid' "$MAIN" && \
+       grep -q 'cbm_httpd_listen(const char \*host, int port)' "$HTTPD" && \
+       grep -q 'inet_pton(AF_INET' "$HTTPD"; then
+        echo "OK: Non-loopback binding requires explicit validated IPv4 configuration"
     else
-        echo "OK: No 0.0.0.0/INADDR_ANY binding"
+        echo "BLOCKED: Host configuration does not prove explicit validated IPv4 binding"
+        FAIL=1
+    fi
+
+    # A non-loopback bind must be visibly warned about at the point of use.
+    if grep -q 'cbm_ui_host_is_loopback' "$HTTP_SERVER" && \
+       grep -qi 'no authentication' "$HTTP_SERVER" && \
+       grep -qi 'reachable over the network' "$HTTP_SERVER" && \
+       grep -qi 'codebase graph data' "$HTTP_SERVER" && \
+       grep -qi 'firewall' "$HTTP_SERVER"; then
+        echo "OK: Non-loopback binding emits a prominent security warning"
+    else
+        echo "BLOCKED: Non-loopback security warning is missing or incomplete"
+        FAIL=1
     fi
 fi
 

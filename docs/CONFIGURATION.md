@@ -9,7 +9,7 @@ This page documents the configuration files that `codebase-memory-mcp` reads or 
 | Global custom extension mapping | `$XDG_CONFIG_HOME/codebase-memory-mcp/config.json` | JSON | Falls back to `~/.config/codebase-memory-mcp/config.json` when `XDG_CONFIG_HOME` is unset. |
 | Per-project custom extension mapping | `{repo_root}/.codebase-memory.json` | JSON | Overrides conflicting global `extra_extensions` entries. |
 | CLI-managed runtime settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/_config.db` | SQLite | Written by `codebase-memory-mcp config set/reset`. |
-| UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled` and `ui_port`. |
+| UI settings | `${CBM_CACHE_DIR:-~/.cache/codebase-memory-mcp}/config.json` | JSON | Stores `ui_enabled`, `ui_port`, and numeric IPv4 `ui_host`. |
 
 ## 1. Custom File Extension Mapping
 
@@ -95,13 +95,35 @@ Current format:
 ```json
 {
   "ui_enabled": false,
-  "ui_port": 9749
+  "ui_port": 9749,
+  "ui_host": "127.0.0.1"
 }
 ```
 
 Notes:
 
 - If the UI-enabled binary has embedded assets and no UI config file exists yet, the UI auto-enables on first run.
+- `ui_host` defaults to `127.0.0.1`; config files written before this field existed remain localhost-only.
+- `--host=<IPv4>` accepts numeric IPv4 addresses only and persists the setting, just like `--port`.
+- Localhost-only UI:
+
+  ```bash
+  codebase-memory-mcp --ui=true --host=127.0.0.1 --port=9749
+  ```
+
+- Specific LAN interface (recommended when sharing on a trusted network):
+
+  ```bash
+  codebase-memory-mcp --ui=true --host=192.168.88.26 --port=9749
+  ```
+
+- All interfaces:
+
+  ```bash
+  codebase-memory-mcp --ui=true --host=0.0.0.0 --port=9749
+  ```
+
+  Binding to a non-loopback address prints a warning because the UI has no authentication, is reachable over the network, and may expose codebase graph data and UI actions. Protect it with a firewall or trusted network; prefer a specific LAN IP over `0.0.0.0`.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 
 ## 4. Environment Variables

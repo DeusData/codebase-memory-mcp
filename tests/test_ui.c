@@ -41,6 +41,7 @@ TEST(config_load_defaults) {
 
     ASSERT_FALSE(cfg.ui_enabled);
     ASSERT_EQ(cfg.ui_port, 9749);
+    ASSERT_STR_EQ(cfg.ui_host, CBM_UI_DEFAULT_HOST);
 
     /* Restore HOME */
     if (old_home) {
@@ -61,7 +62,7 @@ TEST(config_save_and_reload) {
     cbm_setenv("HOME", td, 1);
 
     /* Save */
-    cbm_ui_config_t cfg = {.ui_enabled = true, .ui_port = 8080};
+    cbm_ui_config_t cfg = {.ui_enabled = true, .ui_port = 8080, .ui_host = "192.168.88.26"};
     cbm_ui_config_save(&cfg);
 
     /* Reload */
@@ -70,6 +71,7 @@ TEST(config_save_and_reload) {
 
     ASSERT_TRUE(loaded.ui_enabled);
     ASSERT_EQ(loaded.ui_port, 8080);
+    ASSERT_STR_EQ(loaded.ui_host, "192.168.88.26");
 
     if (old_home) {
         cbm_setenv("HOME", old_home, 1);
@@ -89,11 +91,11 @@ TEST(config_overwrite) {
     cbm_setenv("HOME", td, 1);
 
     /* Save with ui_enabled=true */
-    cbm_ui_config_t cfg1 = {.ui_enabled = true, .ui_port = 9749};
+    cbm_ui_config_t cfg1 = {.ui_enabled = true, .ui_port = 9749, .ui_host = "0.0.0.0"};
     cbm_ui_config_save(&cfg1);
 
     /* Overwrite with ui_enabled=false */
-    cbm_ui_config_t cfg2 = {.ui_enabled = false, .ui_port = 9749};
+    cbm_ui_config_t cfg2 = {.ui_enabled = false, .ui_port = 9749, .ui_host = "127.0.0.1"};
     cbm_ui_config_save(&cfg2);
 
     /* Reload should show false */
@@ -137,6 +139,7 @@ TEST(config_corrupt_file) {
     cbm_ui_config_load(&cfg);
     ASSERT_FALSE(cfg.ui_enabled);
     ASSERT_EQ(cfg.ui_port, 9749);
+    ASSERT_STR_EQ(cfg.ui_host, CBM_UI_DEFAULT_HOST);
 
     if (old_home) {
         cbm_setenv("HOME", old_home, 1);
@@ -172,12 +175,27 @@ TEST(config_missing_fields) {
     cbm_ui_config_load(&cfg);
     ASSERT_FALSE(cfg.ui_enabled); /* defaults for missing field */
     ASSERT_EQ(cfg.ui_port, 5555); /* present field loaded */
+    ASSERT_STR_EQ(cfg.ui_host, CBM_UI_DEFAULT_HOST); /* old config remains localhost-only */
 
     if (old_home) {
         cbm_setenv("HOME", old_home, 1);
         free(old_home);
     }
 
+    PASS();
+}
+
+TEST(config_host_validation_and_loopback) {
+    ASSERT_TRUE(cbm_ui_host_is_valid("127.0.0.1"));
+    ASSERT_TRUE(cbm_ui_host_is_valid("0.0.0.0"));
+    ASSERT_TRUE(cbm_ui_host_is_valid("192.168.88.26"));
+    ASSERT_FALSE(cbm_ui_host_is_valid(""));
+    ASSERT_FALSE(cbm_ui_host_is_valid("localhost"));
+    ASSERT_FALSE(cbm_ui_host_is_valid("999.1.1.1"));
+    ASSERT_TRUE(cbm_ui_host_is_loopback("127.0.0.1"));
+    ASSERT_TRUE(cbm_ui_host_is_loopback("127.0.0.2"));
+    ASSERT_FALSE(cbm_ui_host_is_loopback("0.0.0.0"));
+    ASSERT_FALSE(cbm_ui_host_is_loopback("192.168.88.26"));
     PASS();
 }
 
@@ -790,6 +808,7 @@ SUITE(ui) {
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);
+    RUN_TEST(config_host_validation_and_loopback);
 
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);
