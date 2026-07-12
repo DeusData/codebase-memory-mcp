@@ -70,8 +70,7 @@ typedef struct {
 
 static void et_to_fwd_slashes(char *p) {
     for (; *p; p++) {
-        if (*p == '\\')
-            *p = '/';
+        if (*p == '\\') *p = '/';
     }
 }
 
@@ -79,8 +78,7 @@ static void et_to_fwd_slashes(char *p) {
 static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) {
     memset(lp, 0, sizeof(*lp));
     snprintf(lp->tmpdir, sizeof(lp->tmpdir), "/tmp/cbm_et_XXXXXX");
-    if (!cbm_mkdtemp(lp->tmpdir))
-        return NULL;
+    if (!cbm_mkdtemp(lp->tmpdir)) return NULL;
     et_to_fwd_slashes(lp->tmpdir);
 
     for (int i = 0; i < nfiles; i++) {
@@ -93,19 +91,16 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
             *slash = '/';
         }
         FILE *f = fopen(path, "wb");
-        if (!f)
-            return NULL;
+        if (!f) return NULL;
         fputs(files[i].content, f);
         fclose(f);
     }
 
     lp->project = cbm_project_name_from_path(lp->tmpdir);
-    if (!lp->project)
-        return NULL;
+    if (!lp->project) return NULL;
 
     const char *home = getenv("HOME");
-    if (!home)
-        home = "/tmp";
+    if (!home) home = "/tmp";
     char cache_dir[512];
     snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
@@ -113,34 +108,26 @@ static cbm_store_t *et_index_files(EtProj *lp, const EtFile *files, int nfiles) 
     unlink(lp->dbpath);
 
     lp->srv = cbm_mcp_server_new(NULL);
-    if (!lp->srv)
-        return NULL;
+    if (!lp->srv) return NULL;
 
     char args[700];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
-    if (resp)
-        free(resp);
+    if (resp) free(resp);
 
     return cbm_store_open_path(lp->dbpath);
 }
 
 static void et_cleanup(EtProj *lp, cbm_store_t *store) {
-    if (store)
-        cbm_store_close(store);
-    if (lp->srv) {
-        cbm_mcp_server_free(lp->srv);
-        lp->srv = NULL;
-    }
-    free(lp->project);
-    lp->project = NULL;
+    if (store) cbm_store_close(store);
+    if (lp->srv) { cbm_mcp_server_free(lp->srv); lp->srv = NULL; }
+    free(lp->project); lp->project = NULL;
     th_rmtree(lp->tmpdir);
     unlink(lp->dbpath);
     char wal[600], shm[600];
     snprintf(wal, sizeof(wal), "%s-wal", lp->dbpath);
     snprintf(shm, sizeof(shm), "%s-shm", lp->dbpath);
-    unlink(wal);
-    unlink(shm);
+    unlink(wal); unlink(shm);
 }
 
 /* Assert edge_type count >= floor; dump diagnostic on failure. */
@@ -224,12 +211,11 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
     static char pad_body[ET_PARALLEL_PAD][64];
     EtFile files[ET_PAD_MAX] = {0};
     int n = 0;
-    for (int i = 0; i < n_mean; i++)
-        files[n++] = meaningful[i];
+    for (int i = 0; i < n_mean; i++) files[n++] = meaningful[i];
     for (int i = 0; i < ET_PARALLEL_PAD; i++) {
         snprintf(pad_name[i], sizeof(pad_name[i]), "pad/pad_%02d.py", i);
         snprintf(pad_body[i], sizeof(pad_body[i]), "def pad_%02d():\n    return %d\n", i, i);
-        files[n].name = pad_name[i];
+        files[n].name    = pad_name[i];
         files[n].content = pad_body[i];
         n++;
     }
@@ -253,10 +239,10 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
  * Included here as baseline sanity guard for this file. */
 TEST(handles_flask_python) {
     static const EtFile f[] = {
-        {"app.py", "from flask import Flask\n\napp = Flask(__name__)\n\n\n"
-                   "@app.route(\"/items\")\ndef list_items():\n    return {\"items\": []}\n\n\n"
-                   "@app.route(\"/items/<int:item_id>\")\ndef get_item(item_id):\n    return "
-                   "{\"id\": item_id}\n"}};
+        {"app.py",
+         "from flask import Flask\n\napp = Flask(__name__)\n\n\n"
+         "@app.route(\"/items\")\ndef list_items():\n    return {\"items\": []}\n\n\n"
+         "@app.route(\"/items/<int:item_id>\")\ndef get_item(item_id):\n    return {\"id\": item_id}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -277,13 +263,14 @@ TEST(handles_fastapi_python) {
  * Phase 2a emitted 0 Route/HANDLES edges (this asserts >=1 → RED without the
  * fix, GREEN with it). Direction-agnostic count via cbm_store_count_edges_by_type. */
 TEST(handles_drf_action_python) {
-    static const EtFile f[] = {{"viewsets.py",
-                                "from rest_framework.decorators import action\n"
-                                "from rest_framework.viewsets import ViewSet\n\n"
-                                "class CustomerTaskViewSet(ViewSet):\n"
-                                "    @action(detail=True, methods=[\"post\"])\n"
-                                "    def approve_draft_with_charge(self, request, pk=None):\n"
-                                "        pass\n"}};
+    static const EtFile f[] = {
+        {"viewsets.py",
+         "from rest_framework.decorators import action\n"
+         "from rest_framework.viewsets import ViewSet\n\n"
+         "class CustomerTaskViewSet(ViewSet):\n"
+         "    @action(detail=True, methods=[\"post\"])\n"
+         "    def approve_draft_with_charge(self, request, pk=None):\n"
+         "        pass\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -300,11 +287,12 @@ TEST(handles_express_ts) {
         {"express/router.ts",
          "export function expressGet(p: string, h: any): any { return h; }\n"
          "export function expressPost(p: string, h: any): any { return h; }\n"},
-        {"users.ts", "import { expressGet, expressPost } from './express/router';\n\n"
-                     "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
-                     "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
-                     "expressGet('/users', listUsers);\n"
-                     "expressPost('/users', createUser);\n"}};
+        {"users.ts",
+         "import { expressGet, expressPost } from './express/router';\n\n"
+         "function listUsers(req: any, res: any) {\n    res.json([]);\n}\n\n"
+         "function createUser(req: any, res: any) {\n    res.json({});\n}\n\n"
+         "expressGet('/users', listUsers);\n"
+         "expressPost('/users', createUser);\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -328,21 +316,23 @@ TEST(handles_fastify_js) {
 
 /* Go net/http + gin — local gin.Engine wrapper whose QN contains "gin." */
 TEST(handles_gin_go) {
-    static const EtFile f[] = {{"gin/engine.go",
-                                "package gin\n\n"
-                                "type Engine struct{}\n\n"
-                                "func Default() *Engine {\n    return &Engine{}\n}\n\n"
-                                "func (e *Engine) GET(path string, handler interface{}) {}\n"
-                                "func (e *Engine) POST(path string, handler interface{}) {}\n"},
-                               {"main.go", "package main\n\n"
-                                           "import \"gin\"\n\n"
-                                           "func listOrders(w interface{}, r interface{}) {}\n\n"
-                                           "func createOrder(w interface{}, r interface{}) {}\n\n"
-                                           "func main() {\n"
-                                           "    r := gin.Default()\n"
-                                           "    r.GET(\"/orders\", listOrders)\n"
-                                           "    r.POST(\"/orders\", createOrder)\n"
-                                           "}\n"}};
+    static const EtFile f[] = {
+        {"gin/engine.go",
+         "package gin\n\n"
+         "type Engine struct{}\n\n"
+         "func Default() *Engine {\n    return &Engine{}\n}\n\n"
+         "func (e *Engine) GET(path string, handler interface{}) {}\n"
+         "func (e *Engine) POST(path string, handler interface{}) {}\n"},
+        {"main.go",
+         "package main\n\n"
+         "import \"gin\"\n\n"
+         "func listOrders(w interface{}, r interface{}) {}\n\n"
+         "func createOrder(w interface{}, r interface{}) {}\n\n"
+         "func main() {\n"
+         "    r := gin.Default()\n"
+         "    r.GET(\"/orders\", listOrders)\n"
+         "    r.POST(\"/orders\", createOrder)\n"
+         "}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -353,17 +343,18 @@ TEST(handles_gin_go) {
  * ("/api/orders"). */
 TEST(handles_spring_java) {
     static const char *routes[] = {"/api/orders", "/api/orders/{id}", NULL};
-    static const EtFile f[] = {{"OrderController.java",
-                                "package com.example;\n\n"
-                                "import org.springframework.web.bind.annotation.RequestMapping;\n"
-                                "import org.springframework.web.bind.annotation.GetMapping;\n\n"
-                                "@RequestMapping(\"/api\")\npublic class OrderController {\n"
-                                "    @GetMapping(\"/orders\")\n"
-                                "    public String listOrders() {\n"
-                                "        return \"orders\";\n    }\n\n"
-                                "    @GetMapping(\"/orders/{id}\")\n"
-                                "    public String getOrder(int id) {\n"
-                                "        return \"order:\" + id;\n    }\n}\n"}};
+    static const EtFile f[] = {
+        {"OrderController.java",
+         "package com.example;\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping;\n"
+         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+         "    @GetMapping(\"/orders\")\n"
+         "    public String listOrders() {\n"
+         "        return \"orders\";\n    }\n\n"
+         "    @GetMapping(\"/orders/{id}\")\n"
+         "    public String getOrder(int id) {\n"
+         "        return \"order:\" + id;\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
@@ -401,21 +392,21 @@ TEST(handles_spring_kotlin) {
  * method group) is not captured by extract_handler_arg for C#. */
 TEST(handles_aspnet_csharp) {
     static const EtFile f[] = {
-        {"Microsoft/AspNetCore/Builder.cs", "namespace Microsoft.AspNetCore {\n"
-                                            "    class WebApp {\n"
-                                            "        public static string MapGet(string path, "
-                                            "System.Func<string> handler) { return handler(); }\n"
-                                            "        public static string MapPost(string path, "
-                                            "System.Func<string> handler) { return handler(); }\n"
-                                            "    }\n}\n"},
-        {"Program.cs", "using Microsoft.AspNetCore;\n\n"
-                       "namespace App {\n"
-                       "    class Program {\n"
-                       "        static void Main() {\n"
-                       "            WebApp.MapGet(\"/products\", GetProducts);\n"
-                       "            WebApp.MapPost(\"/products\", CreateProduct);\n        }\n"
-                       "        static string GetProducts() { return \"[]\"; }\n"
-                       "        static string CreateProduct() { return \"{}\" ; }\n    }\n}\n"}};
+        {"Microsoft/AspNetCore/Builder.cs",
+         "namespace Microsoft.AspNetCore {\n"
+         "    class WebApp {\n"
+         "        public static string MapGet(string path, System.Func<string> handler) { return handler(); }\n"
+         "        public static string MapPost(string path, System.Func<string> handler) { return handler(); }\n"
+         "    }\n}\n"},
+        {"Program.cs",
+         "using Microsoft.AspNetCore;\n\n"
+         "namespace App {\n"
+         "    class Program {\n"
+         "        static void Main() {\n"
+         "            WebApp.MapGet(\"/products\", GetProducts);\n"
+         "            WebApp.MapPost(\"/products\", CreateProduct);\n        }\n"
+         "        static string GetProducts() { return \"[]\"; }\n"
+         "        static string CreateProduct() { return \"{}\" ; }\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -434,11 +425,12 @@ TEST(handles_laravel_php) {
          "class Route {\n"
          "    public static function get($path, $handler) { return $handler; }\n"
          "    public static function post($path, $handler) { return $handler; }\n}\n"},
-        {"routes/web.php", "<?php\nuse Laravel\\Route;\n\n"
-                           "function showUsers() { return ['users' => []]; }\n"
-                           "function storeUser() { return ['stored' => true]; }\n\n"
-                           "Route::get('/users', 'showUsers');\n"
-                           "Route::post('/users', 'storeUser');\n"}};
+        {"routes/web.php",
+         "<?php\nuse Laravel\\Route;\n\n"
+         "function showUsers() { return ['users' => []]; }\n"
+         "function storeUser() { return ['stored' => true]; }\n\n"
+         "Route::get('/users', 'showUsers');\n"
+         "Route::post('/users', 'storeUser');\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -454,19 +446,20 @@ TEST(handles_laravel_php) {
 TEST(handles_laravel_facade_routes_issue952) {
     static const char *routes[] = {"/api/welcome", "/users/me", "/users/login",
                                    "/companies/tenants/list", NULL};
-    static const EtFile f[] = {{"routes/api.php",
-                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
-                                "Route::get('/api/welcome', WelcomeController::class);\n"
-                                "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
-                                "->group(function (): void {\n"
-                                "    Route::get('/me', GetCurrentUserController::class);\n"
-                                "    Route::post('/login', LoginUserController::class);\n"
-                                "});\n"
-                                "Route::prefix('companies')->group(function (): void {\n"
-                                "    Route::prefix('tenants')->group(function (): void {\n"
-                                "        Route::get('/list', ListTenantsController::class);\n"
-                                "    });\n"
-                                "});\n"}};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::get('/api/welcome', WelcomeController::class);\n"
+         "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
+         "->group(function (): void {\n"
+         "    Route::get('/me', GetCurrentUserController::class);\n"
+         "    Route::post('/login', LoginUserController::class);\n"
+         "});\n"
+         "Route::prefix('companies')->group(function (): void {\n"
+         "    Route::prefix('tenants')->group(function (): void {\n"
+         "        Route::get('/list', ListTenantsController::class);\n"
+         "    });\n"
+         "});\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -477,12 +470,13 @@ TEST(handles_laravel_facade_routes_issue952) {
  * slash. */
 TEST(handles_laravel_facade_no_junk_routes_issue952) {
     static const char *routes[] = {"/real", NULL};
-    static const EtFile f[] = {{"routes/api.php",
-                                "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
-                                "use Illuminate\\Support\\Facades\\Cache;\n\n"
-                                "Route::get('/real', RealController::class);\n"
-                                "$v = Cache::get('users.count');\n"
-                                "$w = Cache::get('/leading/slash/key');\n"}};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('/real', RealController::class);\n"
+         "$v = Cache::get('users.count');\n"
+         "$w = Cache::get('/leading/slash/key');\n"}};
     ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
@@ -493,16 +487,18 @@ TEST(handles_laravel_facade_no_junk_routes_issue952) {
  * carries the "ActionDispatch" route-registration substring → ROUTE_REG → HANDLES. */
 TEST(handles_rails_ruby) {
     static const EtFile f[] = {
-        {"ActionDispatch/Routing.rb", "module ActionDispatch\n  module Routing\n"
-                                      "    class Mapper\n"
-                                      "      def get(path, handler); end\n"
-                                      "      def post(path, handler); end\n"
-                                      "    end\n  end\nend\n"},
-        {"config/routes.rb", "require_relative '../ActionDispatch/Routing'\n\n"
-                             "mapper = ActionDispatch::Routing::Mapper.new\n\n"
-                             "def list_items; end\ndef create_item; end\n\n"
-                             "mapper.get '/items', list_items\n"
-                             "mapper.post '/items', create_item\n"}};
+        {"ActionDispatch/Routing.rb",
+         "module ActionDispatch\n  module Routing\n"
+         "    class Mapper\n"
+         "      def get(path, handler); end\n"
+         "      def post(path, handler); end\n"
+         "    end\n  end\nend\n"},
+        {"config/routes.rb",
+         "require_relative '../ActionDispatch/Routing'\n\n"
+         "mapper = ActionDispatch::Routing::Mapper.new\n\n"
+         "def list_items; end\ndef create_item; end\n\n"
+         "mapper.get '/items', list_items\n"
+         "mapper.post '/items', create_item\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
     PASS();
 }
@@ -513,15 +509,16 @@ TEST(handles_rails_ruby) {
  * cross-file `actix_web::get` would NOT (Rust lsp_cross unwired + '::' path not
  * resolved by the generic resolver). */
 TEST(handles_actix_rust) {
-    static const EtFile f[] = {{"actix_web_app.rs",
-                                "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
-                                "    format!(\"{}\", path)\n}\n\n"
-                                "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
-                                "    format!(\"{}\", path)\n}\n\n"
-                                "fn list_widgets() {}\nfn create_widget() {}\n\n"
-                                "fn main() {\n"
-                                "    actix_web_get(\"/widgets\", list_widgets);\n"
-                                "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
+    static const EtFile f[] = {
+        {"actix_web_app.rs",
+         "pub fn actix_web_get(path: &str, handler: fn()) -> String {\n"
+         "    format!(\"{}\", path)\n}\n\n"
+         "pub fn actix_web_post(path: &str, handler: fn()) -> String {\n"
+         "    format!(\"{}\", path)\n}\n\n"
+         "fn list_widgets() {}\nfn create_widget() {}\n\n"
+         "fn main() {\n"
+         "    actix_web_get(\"/widgets\", list_widgets);\n"
+         "    actix_web_post(\"/widgets\", create_widget);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 1));
     PASS();
 }
@@ -555,15 +552,17 @@ TEST(http_calls_fetch_js) {
 /* axios (TypeScript) — "axios" substring in QN */
 TEST(http_calls_axios_ts) {
     static const EtFile f[] = {
-        {"axios.ts", "export function axiosGet(url: string): Promise<any> {\n"
-                     "    return Promise.resolve({ data: {} });\n}\n\n"
-                     "export function axiosPost(url: string, data: any): Promise<any> {\n"
-                     "    return Promise.resolve({ data });\n}\n"},
-        {"client.ts", "import { axiosGet, axiosPost } from './axios';\n\n"
-                      "export async function getOrders(): Promise<any> {\n"
-                      "    return axiosGet('/api/orders');\n}\n\n"
-                      "export async function submitOrder(payload: any): Promise<any> {\n"
-                      "    return axiosPost('/api/orders', payload);\n}\n"}};
+        {"axios.ts",
+         "export function axiosGet(url: string): Promise<any> {\n"
+         "    return Promise.resolve({ data: {} });\n}\n\n"
+         "export function axiosPost(url: string, data: any): Promise<any> {\n"
+         "    return Promise.resolve({ data });\n}\n"},
+        {"client.ts",
+         "import { axiosGet, axiosPost } from './axios';\n\n"
+         "export async function getOrders(): Promise<any> {\n"
+         "    return axiosGet('/api/orders');\n}\n\n"
+         "export async function submitOrder(payload: any): Promise<any> {\n"
+         "    return axiosPost('/api/orders', payload);\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
 }
@@ -595,12 +594,13 @@ TEST(http_calls_nethttp_go) {
          "package resty\n\n"
          "func Get(url string) (interface{}, error) { return nil, nil }\n"
          "func Post(url string, body interface{}) (interface{}, error) { return nil, nil }\n"},
-        {"catalog/service.go", "package catalog\n\n"
-                               "import \"resty\"\n\n"
-                               "func ListProducts() (interface{}, error) {\n"
-                               "    return resty.Get(\"/api/products\")\n}\n\n"
-                               "func CreateProduct(body interface{}) (interface{}, error) {\n"
-                               "    return resty.Post(\"/api/products\", body)\n}\n"}};
+        {"catalog/service.go",
+         "package catalog\n\n"
+         "import \"resty\"\n\n"
+         "func ListProducts() (interface{}, error) {\n"
+         "    return resty.Get(\"/api/products\")\n}\n\n"
+         "func CreateProduct(body interface{}) (interface{}, error) {\n"
+         "    return resty.Post(\"/api/products\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
 }
@@ -612,8 +612,7 @@ TEST(http_calls_resttemplate_java) {
          "package http;\n\n"
          "public class RestTemplate {\n"
          "    public Object getForObject(String url, Class<?> responseType) { return null; }\n"
-         "    public Object postForObject(String url, Object req, Class<?> responseType) { return "
-         "null; }\n"
+         "    public Object postForObject(String url, Object req, Class<?> responseType) { return null; }\n"
          "}\n"},
         {"OrderClient.java",
          "package client;\n\n"
@@ -648,8 +647,7 @@ TEST(http_calls_restsharp_csharp) {
          "namespace Services {\n"
          "    class ProductService {\n"
          "        public string GetProducts() { return RestClient.Get(\"/products\"); }\n"
-         "        public string AddProduct(object p) { return RestClient.Post(\"/products\", p); "
-         "}\n"
+         "        public string AddProduct(object p) { return RestClient.Post(\"/products\", p); }\n"
          "    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HTTP_CALLS", 1));
     PASS();
@@ -658,9 +656,10 @@ TEST(http_calls_restsharp_csharp) {
 /* HTTParty (Ruby) — "HTTParty" substring in resolved QN */
 TEST(http_calls_httparty_ruby) {
     static const EtFile f[] = {
-        {"HTTParty.rb", "module HTTParty\n"
-                        "  def self.get(url, opts = {}); end\n"
-                        "  def self.post(url, opts = {}); end\nend\n"},
+        {"HTTParty.rb",
+         "module HTTParty\n"
+         "  def self.get(url, opts = {}); end\n"
+         "  def self.post(url, opts = {}); end\nend\n"},
         {"user_client.rb",
          "require_relative 'HTTParty'\n\n"
          "def fetch_users\n  HTTParty.get('/api/users')\nend\n\n"
@@ -706,8 +705,7 @@ TEST(http_calls_reqwest_rust) {
     static const EtFile f[] = {
         {"reqwest_api.rs",
          "pub fn reqwest_get(url: &str) -> String {\n    url.to_string()\n}\n\n"
-         "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, "
-         "body)\n}\n\n"
+         "pub fn reqwest_post(url: &str, body: &str) -> String {\n    format!(\"{}{}\", url, body)\n}\n\n"
          "pub fn fetch_items() -> String {\n    reqwest_get(\"/api/items\")\n}\n\n"
          "pub fn push_item(body: &str) -> String {\n    reqwest_post(\"/api/items\", body)\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HTTP_CALLS", 1));
@@ -729,11 +727,12 @@ TEST(async_calls_celery_python) {
          "    def task(self):\n        def decorator(fn): return fn\n        return decorator\n\n"
          "    def send_task(self, name, args=None): return (name, args)\n\n"
          "app = Celery()\n"},
-        {"tasks/order_tasks.py", "from celery.app import app\n\n\n"
-                                 "def dispatch_order_created(order_id):\n"
-                                 "    return app.send_task('order_created', args=[order_id])\n\n\n"
-                                 "def dispatch_order_shipped(order_id):\n"
-                                 "    return app.send_task('order_shipped', args=[order_id])\n"}};
+        {"tasks/order_tasks.py",
+         "from celery.app import app\n\n\n"
+         "def dispatch_order_created(order_id):\n"
+         "    return app.send_task('order_created', args=[order_id])\n\n\n"
+         "def dispatch_order_shipped(order_id):\n"
+         "    return app.send_task('order_shipped', args=[order_id])\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
     PASS();
 }
@@ -741,8 +740,9 @@ TEST(async_calls_celery_python) {
 /* Sidekiq (Ruby) — "Sidekiq" substring in resolved QN */
 TEST(async_calls_sidekiq_ruby) {
     static const EtFile f[] = {
-        {"Sidekiq/Worker.rb", "module Sidekiq\n  module Worker\n"
-                              "    def self.perform_async(*args); end\n  end\nend\n"},
+        {"Sidekiq/Worker.rb",
+         "module Sidekiq\n  module Worker\n"
+         "    def self.perform_async(*args); end\n  end\nend\n"},
         {"workers/notification_worker.rb",
          "require_relative '../Sidekiq/Worker'\n\n"
          "class NotificationWorker\n"
@@ -760,11 +760,12 @@ TEST(async_calls_kafkajs_ts) {
     static const EtFile f[] = {
         {"kafkajs/producer.ts",
          "export function kafkajsProduce(topic: string, message: any): void {}\n"},
-        {"events/order_events.ts", "import { kafkajsProduce } from '../kafkajs/producer';\n\n"
-                                   "export function emitOrderCreated(orderId: string): void {\n"
-                                   "    kafkajsProduce('order-created', { orderId });\n}\n\n"
-                                   "export function emitOrderCancelled(orderId: string): void {\n"
-                                   "    kafkajsProduce('order-cancelled', { orderId });\n}\n"}};
+        {"events/order_events.ts",
+         "import { kafkajsProduce } from '../kafkajs/producer';\n\n"
+         "export function emitOrderCreated(orderId: string): void {\n"
+         "    kafkajsProduce('order-created', { orderId });\n}\n\n"
+         "export function emitOrderCancelled(orderId: string): void {\n"
+         "    kafkajsProduce('order-cancelled', { orderId });\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
     PASS();
 }
@@ -787,13 +788,14 @@ TEST(async_calls_sqs_go) {
          "type SQS struct{}\n\n"
          "func New() *SQS { return &SQS{} }\n\n"
          "func (s *SQS) SendMessage(input *SendMessageInput) error { return nil }\n"},
-        {"queue/dispatcher.go", "package queue\n\n"
-                                "import \"aws-sdk-go/service/sqs\"\n\n"
-                                "func DispatchOrderEvent(queueUrl, body string) error {\n"
-                                "    client := sqs.New()\n"
-                                "    return client.SendMessage(&sqs.SendMessageInput{\n"
-                                "        QueueUrl:    queueUrl,\n"
-                                "        MessageBody: body,\n    })\n}\n"}};
+        {"queue/dispatcher.go",
+         "package queue\n\n"
+         "import \"aws-sdk-go/service/sqs\"\n\n"
+         "func DispatchOrderEvent(queueUrl, body string) error {\n"
+         "    client := sqs.New()\n"
+         "    return client.SendMessage(&sqs.SendMessageInput{\n"
+         "        QueueUrl:    queueUrl,\n"
+         "        MessageBody: body,\n    })\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
     PASS();
 }
@@ -801,15 +803,17 @@ TEST(async_calls_sqs_go) {
 /* BullMQ (JavaScript) — "bullmq" substring in resolved QN */
 TEST(async_calls_bullmq_js) {
     static const EtFile f[] = {
-        {"bullmq/queue.js", "class bullmqQueue {\n"
-                            "    add(jobName, data) { return { jobName, data }; }\n}\n\n"
-                            "module.exports = { bullmqQueue };\n"},
-        {"jobs/mailer.js", "const { bullmqQueue } = require('./bullmq/queue');\n\n"
-                           "const mailQueue = new bullmqQueue();\n\n"
-                           "function scheduleWelcomeEmail(userId) {\n"
-                           "    return mailQueue.add('welcome-email', { userId });\n}\n\n"
-                           "function schedulePasswordReset(userId) {\n"
-                           "    return mailQueue.add('password-reset', { userId });\n}\n"}};
+        {"bullmq/queue.js",
+         "class bullmqQueue {\n"
+         "    add(jobName, data) { return { jobName, data }; }\n}\n\n"
+         "module.exports = { bullmqQueue };\n"},
+        {"jobs/mailer.js",
+         "const { bullmqQueue } = require('./bullmq/queue');\n\n"
+         "const mailQueue = new bullmqQueue();\n\n"
+         "function scheduleWelcomeEmail(userId) {\n"
+         "    return mailQueue.add('welcome-email', { userId });\n}\n\n"
+         "function schedulePasswordReset(userId) {\n"
+         "    return mailQueue.add('password-reset', { userId });\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "ASYNC_CALLS", 1));
     PASS();
 }
@@ -866,13 +870,14 @@ TEST(throws_java) {
  * the THROWS edge resolution never gets a usable exception name. */
 TEST(throws_kotlin) {
     static const EtFile meaningful[] = {
-        {"Service.kt", "class NotFoundException(msg: String) : Exception(msg)\n\n"
-                       "fun findItem(id: Int): String {\n"
-                       "    if (id < 0) throw NotFoundException(\"item not found: $id\")\n"
-                       "    return \"item:$id\"\n}\n\n"
-                       "fun getCategory(name: String): String {\n"
-                       "    if (name.isEmpty()) throw NotFoundException(\"category missing\")\n"
-                       "    return name\n}\n"}};
+        {"Service.kt",
+         "class NotFoundException(msg: String) : Exception(msg)\n\n"
+         "fun findItem(id: Int): String {\n"
+         "    if (id < 0) throw NotFoundException(\"item not found: $id\")\n"
+         "    return \"item:$id\"\n}\n\n"
+         "fun getCategory(name: String): String {\n"
+         "    if (name.isEmpty()) throw NotFoundException(\"category missing\")\n"
+         "    return name\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -888,16 +893,17 @@ TEST(throws_kotlin) {
 /* Python — `raise ValidationException(...)` — checked (no Error/Panic) */
 TEST(throws_python) {
     static const EtFile meaningful[] = {
-        {"validate.py", "class ValidationException(Exception):\n"
-                        "    pass\n\n\n"
-                        "def validate_email(email):\n"
-                        "    if '@' not in email:\n"
-                        "        raise ValidationException('invalid email: ' + email)\n"
-                        "    return email\n\n\n"
-                        "def validate_age(age):\n"
-                        "    if age < 0:\n"
-                        "        raise ValidationException('age must be non-negative')\n"
-                        "    return age\n"}};
+        {"validate.py",
+         "class ValidationException(Exception):\n"
+         "    pass\n\n\n"
+         "def validate_email(email):\n"
+         "    if '@' not in email:\n"
+         "        raise ValidationException('invalid email: ' + email)\n"
+         "    return email\n\n\n"
+         "def validate_age(age):\n"
+         "    if age < 0:\n"
+         "        raise ValidationException('age must be non-negative')\n"
+         "    return age\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -913,15 +919,17 @@ TEST(throws_python) {
 /* TypeScript — `throw new HttpException(...)` — checked (no Error/Panic) */
 TEST(throws_typescript) {
     static const EtFile meaningful[] = {
-        {"exceptions.ts", "export class HttpException {\n"
-                          "    constructor(public status: number, public message: string) {}\n}\n"},
-        {"controller.ts", "import { HttpException } from './exceptions';\n\n"
-                          "export function getUser(id: number): string {\n"
-                          "    if (id <= 0) throw new HttpException(404, 'User not found');\n"
-                          "    return `user:${id}`;\n}\n\n"
-                          "export function updateUser(id: number, name: string): string {\n"
-                          "    if (!name) throw new HttpException(400, 'Name required');\n"
-                          "    return `updated:${id}`;\n}\n"}};
+        {"exceptions.ts",
+         "export class HttpException {\n"
+         "    constructor(public status: number, public message: string) {}\n}\n"},
+        {"controller.ts",
+         "import { HttpException } from './exceptions';\n\n"
+         "export function getUser(id: number): string {\n"
+         "    if (id <= 0) throw new HttpException(404, 'User not found');\n"
+         "    return `user:${id}`;\n}\n\n"
+         "export function updateUser(id: number, name: string): string {\n"
+         "    if (!name) throw new HttpException(400, 'Name required');\n"
+         "    return `updated:${id}`;\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -990,13 +998,14 @@ TEST(throws_php) {
 /* Scala — `throw new RecordException(...)` — checked */
 TEST(throws_scala) {
     static const EtFile meaningful[] = {
-        {"Records.scala", "class RecordException(msg: String) extends Exception(msg)\n\n"
-                          "def parseRecord(raw: String): String = {\n"
-                          "    if (raw.isEmpty) throw new RecordException(\"empty record\")\n"
-                          "    raw.trim\n}\n\n"
-                          "def validateRecord(raw: String): Boolean = {\n"
-                          "    if (raw.length < 2) throw new RecordException(\"too short\")\n"
-                          "    true\n}\n"}};
+        {"Records.scala",
+         "class RecordException(msg: String) extends Exception(msg)\n\n"
+         "def parseRecord(raw: String): String = {\n"
+         "    if (raw.isEmpty) throw new RecordException(\"empty record\")\n"
+         "    raw.trim\n}\n\n"
+         "def validateRecord(raw: String): Boolean = {\n"
+         "    if (raw.length < 2) throw new RecordException(\"too short\")\n"
+         "    true\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1016,16 +1025,17 @@ TEST(throws_scala) {
 
 /* Python — `raise ValueError(...)` — runtime exception */
 TEST(raises_python) {
-    static const EtFile meaningful[] = {{"parser.py",
-                                         "class ValueError(Exception):\n    pass\n\n\n"
-                                         "def parse_int(s):\n"
-                                         "    if not s.isdigit():\n"
-                                         "        raise ValueError('not a digit: ' + s)\n"
-                                         "    return int(s)\n\n\n"
-                                         "def parse_float(s):\n"
-                                         "    try:\n        return float(s)\n"
-                                         "    except Exception:\n"
-                                         "        raise ValueError('not a float: ' + s)\n"}};
+    static const EtFile meaningful[] = {
+        {"parser.py",
+         "class ValueError(Exception):\n    pass\n\n\n"
+         "def parse_int(s):\n"
+         "    if not s.isdigit():\n"
+         "        raise ValueError('not a digit: ' + s)\n"
+         "    return int(s)\n\n\n"
+         "def parse_float(s):\n"
+         "    try:\n        return float(s)\n"
+         "    except Exception:\n"
+         "        raise ValueError('not a float: ' + s)\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1041,15 +1051,17 @@ TEST(raises_python) {
 /* TypeScript — `throw new TypeError(...)` — runtime exception */
 TEST(raises_typescript) {
     static const EtFile meaningful[] = {
-        {"validators.ts", "export class TypeError {\n"
-                          "    constructor(public message: string) {}\n}\n"},
-        {"parser.ts", "import { TypeError } from './validators';\n\n"
-                      "export function parseNumber(val: unknown): number {\n"
-                      "    if (typeof val !== 'number') throw new TypeError('not a number');\n"
-                      "    return val as number;\n}\n\n"
-                      "export function parseString(val: unknown): string {\n"
-                      "    if (typeof val !== 'string') throw new TypeError('not a string');\n"
-                      "    return val as string;\n}\n"}};
+        {"validators.ts",
+         "export class TypeError {\n"
+         "    constructor(public message: string) {}\n}\n"},
+        {"parser.ts",
+         "import { TypeError } from './validators';\n\n"
+         "export function parseNumber(val: unknown): number {\n"
+         "    if (typeof val !== 'number') throw new TypeError('not a number');\n"
+         "    return val as number;\n}\n\n"
+         "export function parseString(val: unknown): string {\n"
+         "    if (typeof val !== 'string') throw new TypeError('not a string');\n"
+         "    return val as string;\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1069,13 +1081,14 @@ TEST(raises_typescript) {
  * exception identifier from a Kotlin throw_expression→call_expression. */
 TEST(raises_kotlin) {
     static const EtFile meaningful[] = {
-        {"Errors.kt", "class IllegalArgumentError(msg: String) : RuntimeException(msg)\n\n"
-                      "fun requirePositive(n: Int): Int {\n"
-                      "    if (n <= 0) throw IllegalArgumentError(\"expected positive, got $n\")\n"
-                      "    return n\n}\n\n"
-                      "fun requireNonEmpty(s: String): String {\n"
-                      "    if (s.isEmpty()) throw IllegalArgumentError(\"string is empty\")\n"
-                      "    return s\n}\n"}};
+        {"Errors.kt",
+         "class IllegalArgumentError(msg: String) : RuntimeException(msg)\n\n"
+         "fun requirePositive(n: Int): Int {\n"
+         "    if (n <= 0) throw IllegalArgumentError(\"expected positive, got $n\")\n"
+         "    return n\n}\n\n"
+         "fun requireNonEmpty(s: String): String {\n"
+         "    if (s.isEmpty()) throw IllegalArgumentError(\"string is empty\")\n"
+         "    return s\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1158,12 +1171,14 @@ TEST(raises_php) {
 
 /* Python — simple module-level variable assignment */
 TEST(writes_python) {
-    static const EtFile meaningful[] = {{"state.py", "registry = {}\n\n\n"
-                                                     "def register(key, value):\n"
-                                                     "    registry = {key: value}\n"
-                                                     "    return registry\n\n\n"
-                                                     "def clear_registry():\n"
-                                                     "    registry = {}\n"}};
+    static const EtFile meaningful[] = {
+        {"state.py",
+         "registry = {}\n\n\n"
+         "def register(key, value):\n"
+         "    registry = {key: value}\n"
+         "    return registry\n\n\n"
+         "def clear_registry():\n"
+         "    registry = {}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1178,13 +1193,15 @@ TEST(writes_python) {
 
 /* Go — short_var_declaration and assignment_statement */
 TEST(writes_go) {
-    static const EtFile meaningful[] = {{"cache.go", "package cache\n\n"
-                                                     "var store map[string]string\n\n"
-                                                     "func Set(key, value string) {\n"
-                                                     "    store = make(map[string]string)\n"
-                                                     "    store[key] = value\n}\n\n"
-                                                     "func Reset() {\n"
-                                                     "    store = nil\n}\n"}};
+    static const EtFile meaningful[] = {
+        {"cache.go",
+         "package cache\n\n"
+         "var store map[string]string\n\n"
+         "func Set(key, value string) {\n"
+         "    store = make(map[string]string)\n"
+         "    store[key] = value\n}\n\n"
+         "func Reset() {\n"
+         "    store = nil\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1200,14 +1217,15 @@ TEST(writes_go) {
 /* Java — field assignment inside a method */
 TEST(writes_java) {
     static const EtFile meaningful[] = {
-        {"Counter.java", "package app;\n\n"
-                         "class Counter {\n"
-                         "    private int count = 0;\n\n"
-                         "    public void increment() {\n"
-                         "        count = count + 1;\n    }\n\n"
-                         "    public void reset() {\n"
-                         "        count = 0;\n    }\n\n"
-                         "    public int get() {\n        return count;\n    }\n}\n"}};
+        {"Counter.java",
+         "package app;\n\n"
+         "class Counter {\n"
+         "    private int count = 0;\n\n"
+         "    public void increment() {\n"
+         "        count = count + 1;\n    }\n\n"
+         "    public void reset() {\n"
+         "        count = 0;\n    }\n\n"
+         "    public int get() {\n        return count;\n    }\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1222,14 +1240,15 @@ TEST(writes_java) {
 
 /* Rust — local variable assignment (assignment_expression) */
 TEST(writes_rust) {
-    static const EtFile meaningful[] = {{"accumulator.rs",
-                                         "pub struct Accumulator {\n    pub total: i64,\n}\n\n"
-                                         "impl Accumulator {\n"
-                                         "    pub fn add(&mut self, n: i64) {\n"
-                                         "        let total = self.total + n;\n"
-                                         "        self.total = total;\n    }\n\n"
-                                         "    pub fn clear(&mut self) {\n"
-                                         "        self.total = 0;\n    }\n}\n"}};
+    static const EtFile meaningful[] = {
+        {"accumulator.rs",
+         "pub struct Accumulator {\n    pub total: i64,\n}\n\n"
+         "impl Accumulator {\n"
+         "    pub fn add(&mut self, n: i64) {\n"
+         "        let total = self.total + n;\n"
+         "        self.total = total;\n    }\n\n"
+         "    pub fn clear(&mut self) {\n"
+         "        self.total = 0;\n    }\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1244,15 +1263,16 @@ TEST(writes_rust) {
 
 /* C# — property assignment inside methods */
 TEST(writes_csharp) {
-    static const EtFile meaningful[] = {{"Config.cs",
-                                         "namespace App {\n"
-                                         "    class Config {\n"
-                                         "        public string Host = \"localhost\";\n"
-                                         "        public int Port = 8080;\n\n"
-                                         "        public void SetHost(string host) {\n"
-                                         "            Host = host;\n        }\n\n"
-                                         "        public void SetPort(int port) {\n"
-                                         "            Port = port;\n        }\n    }\n}\n"}};
+    static const EtFile meaningful[] = {
+        {"Config.cs",
+         "namespace App {\n"
+         "    class Config {\n"
+         "        public string Host = \"localhost\";\n"
+         "        public int Port = 8080;\n\n"
+         "        public void SetHost(string host) {\n"
+         "            Host = host;\n        }\n\n"
+         "        public void SetPort(int port) {\n"
+         "            Port = port;\n        }\n    }\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
@@ -1284,11 +1304,12 @@ TEST(writes_csharp) {
  * the receiver type's QN for Go methods. */
 TEST(defines_method_go) {
     static const EtFile f[] = {
-        {"service.go", "package svc\n\n"
-                       "type OrderService struct {\n    db interface{}\n}\n\n"
-                       "func (s *OrderService) Create(name string) string {\n    return name\n}\n\n"
-                       "func (s *OrderService) Delete(id int) bool {\n    return id > 0\n}\n\n"
-                       "func (s *OrderService) List() []string {\n    return nil\n}\n"}};
+        {"service.go",
+         "package svc\n\n"
+         "type OrderService struct {\n    db interface{}\n}\n\n"
+         "func (s *OrderService) Create(name string) string {\n    return name\n}\n\n"
+         "func (s *OrderService) Delete(id int) bool {\n    return id > 0\n}\n\n"
+         "func (s *OrderService) List() []string {\n    return nil\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -1310,61 +1331,66 @@ TEST(defines_method_rust) {
 
 /* Java — class with instance and static methods */
 TEST(defines_method_java) {
-    static const EtFile f[] = {{"Account.java",
-                                "package bank;\n\n"
-                                "public class Account {\n"
-                                "    private double balance;\n\n"
-                                "    public Account(double initial) { this.balance = initial; }\n\n"
-                                "    public void deposit(double amount) { balance += amount; }\n"
-                                "    public boolean withdraw(double amount) {\n"
-                                "        if (amount > balance) return false;\n"
-                                "        balance -= amount;\n        return true;\n    }\n"
-                                "    public double getBalance() { return balance; }\n}\n"}};
+    static const EtFile f[] = {
+        {"Account.java",
+         "package bank;\n\n"
+         "public class Account {\n"
+         "    private double balance;\n\n"
+         "    public Account(double initial) { this.balance = initial; }\n\n"
+         "    public void deposit(double amount) { balance += amount; }\n"
+         "    public boolean withdraw(double amount) {\n"
+         "        if (amount > balance) return false;\n"
+         "        balance -= amount;\n        return true;\n    }\n"
+         "    public double getBalance() { return balance; }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* C# — class with multiple methods */
 TEST(defines_method_csharp) {
-    static const EtFile f[] = {{"Queue.cs",
-                                "using System.Collections.Generic;\n\n"
-                                "namespace Collections {\n"
-                                "    public class Queue<T> {\n"
-                                "        private List<T> items = new List<T>();\n\n"
-                                "        public void Enqueue(T item) { items.Add(item); }\n"
-                                "        public T Dequeue() {\n"
-                                "            T item = items[0];\n"
-                                "            items.RemoveAt(0);\n"
-                                "            return item;\n        }\n"
-                                "        public int Count() { return items.Count; }\n    }\n}\n"}};
+    static const EtFile f[] = {
+        {"Queue.cs",
+         "using System.Collections.Generic;\n\n"
+         "namespace Collections {\n"
+         "    public class Queue<T> {\n"
+         "        private List<T> items = new List<T>();\n\n"
+         "        public void Enqueue(T item) { items.Add(item); }\n"
+         "        public T Dequeue() {\n"
+         "            T item = items[0];\n"
+         "            items.RemoveAt(0);\n"
+         "            return item;\n        }\n"
+         "        public int Count() { return items.Count; }\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* PHP — class with methods */
 TEST(defines_method_php) {
-    static const EtFile f[] = {{"Cart.php",
-                                "<?php\n\n"
-                                "class Cart {\n"
-                                "    private array $items = [];\n\n"
-                                "    public function add(string $sku, int $qty): void {\n"
-                                "        $this->items[$sku] = $qty;\n    }\n\n"
-                                "    public function remove(string $sku): void {\n"
-                                "        unset($this->items[$sku]);\n    }\n\n"
-                                "    public function total(): int {\n"
-                                "        return array_sum($this->items);\n    }\n}\n"}};
+    static const EtFile f[] = {
+        {"Cart.php",
+         "<?php\n\n"
+         "class Cart {\n"
+         "    private array $items = [];\n\n"
+         "    public function add(string $sku, int $qty): void {\n"
+         "        $this->items[$sku] = $qty;\n    }\n\n"
+         "    public function remove(string $sku): void {\n"
+         "        unset($this->items[$sku]);\n    }\n\n"
+         "    public function total(): int {\n"
+         "        return array_sum($this->items);\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
 
 /* Ruby — class with instance methods */
 TEST(defines_method_ruby) {
-    static const EtFile f[] = {{"stack.rb", "class Stack\n"
-                                            "  def initialize\n    @items = []\n  end\n\n"
-                                            "  def push(item)\n    @items.push(item)\n  end\n\n"
-                                            "  def pop\n    @items.pop\n  end\n\n"
-                                            "  def peek\n    @items.last\n  end\n\n"
-                                            "  def empty?\n    @items.empty?\n  end\nend\n"}};
+    static const EtFile f[] = {
+        {"stack.rb",
+         "class Stack\n"
+         "  def initialize\n    @items = []\n  end\n\n"
+         "  def push(item)\n    @items.push(item)\n  end\n\n"
+         "  def pop\n    @items.pop\n  end\n\n"
+         "  def peek\n    @items.last\n  end\n\n"
+         "  def empty?\n    @items.empty?\n  end\nend\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -1372,12 +1398,13 @@ TEST(defines_method_ruby) {
 /* Kotlin — class with methods */
 TEST(defines_method_kotlin) {
     static const EtFile f[] = {
-        {"Wallet.kt", "class Wallet(private var balance: Double) {\n"
-                      "    fun deposit(amount: Double) {\n        balance += amount\n    }\n\n"
-                      "    fun withdraw(amount: Double): Boolean {\n"
-                      "        if (amount > balance) return false\n"
-                      "        balance -= amount\n        return true\n    }\n\n"
-                      "    fun getBalance(): Double = balance\n}\n"}};
+        {"Wallet.kt",
+         "class Wallet(private var balance: Double) {\n"
+         "    fun deposit(amount: Double) {\n        balance += amount\n    }\n\n"
+         "    fun withdraw(amount: Double): Boolean {\n"
+         "        if (amount > balance) return false\n"
+         "        balance -= amount\n        return true\n    }\n\n"
+         "    fun getBalance(): Double = balance\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -1385,15 +1412,13 @@ TEST(defines_method_kotlin) {
 /* TypeScript — class with methods and constructor */
 TEST(defines_method_typescript) {
     static const EtFile f[] = {
-        {"Logger.ts", "export class Logger {\n"
-                      "    private prefix: string;\n\n"
-                      "    constructor(prefix: string) {\n        this.prefix = prefix;\n    }\n\n"
-                      "    info(msg: string): void {\n        console.log(`[${this.prefix}] INFO: "
-                      "${msg}`);\n    }\n\n"
-                      "    warn(msg: string): void {\n        console.warn(`[${this.prefix}] WARN: "
-                      "${msg}`);\n    }\n\n"
-                      "    error(msg: string): void {\n        console.error(`[${this.prefix}] "
-                      "ERR: ${msg}`);\n    }\n}\n"}};
+        {"Logger.ts",
+         "export class Logger {\n"
+         "    private prefix: string;\n\n"
+         "    constructor(prefix: string) {\n        this.prefix = prefix;\n    }\n\n"
+         "    info(msg: string): void {\n        console.log(`[${this.prefix}] INFO: ${msg}`);\n    }\n\n"
+         "    warn(msg: string): void {\n        console.warn(`[${this.prefix}] WARN: ${msg}`);\n    }\n\n"
+         "    error(msg: string): void {\n        console.error(`[${this.prefix}] ERR: ${msg}`);\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "DEFINES_METHOD", 1));
     PASS();
 }
@@ -1427,28 +1452,29 @@ TEST(defines_method_scala) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(override_go_interface) {
-    static const EtFile meaningful[] = {{"shapes.go",
-                                         "package shapes\n\n"
-                                         "type Shape interface {\n"
-                                         "    Area() float64\n    Perimeter() float64\n}\n\n"
-                                         "type Circle struct {\n    Radius float64\n}\n\n"
-                                         "func (c *Circle) Area() float64 {\n"
-                                         "    return 3.14159 * c.Radius * c.Radius\n}\n\n"
-                                         "func (c *Circle) Perimeter() float64 {\n"
-                                         "    return 2.0 * 3.14159 * c.Radius\n}\n\n"
-                                         "type Rectangle struct {\n    Width, Height float64\n}\n\n"
-                                         "func (r *Rectangle) Area() float64 {\n"
-                                         "    return r.Width * r.Height\n}\n\n"
-                                         "func (r *Rectangle) Perimeter() float64 {\n"
-                                         "    return 2.0 * (r.Width + r.Height)\n}\n"}};
+    static const EtFile meaningful[] = {
+        {"shapes.go",
+         "package shapes\n\n"
+         "type Shape interface {\n"
+         "    Area() float64\n    Perimeter() float64\n}\n\n"
+         "type Circle struct {\n    Radius float64\n}\n\n"
+         "func (c *Circle) Area() float64 {\n"
+         "    return 3.14159 * c.Radius * c.Radius\n}\n\n"
+         "func (c *Circle) Perimeter() float64 {\n"
+         "    return 2.0 * 3.14159 * c.Radius\n}\n\n"
+         "type Rectangle struct {\n    Width, Height float64\n}\n\n"
+         "func (r *Rectangle) Area() float64 {\n"
+         "    return r.Width * r.Height\n}\n\n"
+         "func (r *Rectangle) Perimeter() float64 {\n"
+         "    return 2.0 * (r.Width + r.Height)\n}\n"}};
     EtProj lp;
     cbm_store_t *store =
         et_index_parallel(&lp, meaningful, (int)(sizeof(meaningful) / sizeof(meaningful[0])));
     int override_edges = store ? cbm_store_count_edges_by_type(store, lp.project, "OVERRIDE") : -1;
-    int implements = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS") : -1;
+    int implements     = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPLEMENTS") : -1;
     if (override_edges < 1 || implements < 1) {
-        fprintf(stderr, "  [ET-OVERRIDE] Go: OVERRIDE=%d IMPLEMENTS=%d\n", override_edges,
-                implements);
+        fprintf(stderr, "  [ET-OVERRIDE] Go: OVERRIDE=%d IMPLEMENTS=%d\n",
+                override_edges, implements);
     }
     et_cleanup(&lp, store);
     /* Both IMPLEMENTS (struct→interface) and OVERRIDE (method→interface-method) expected. */
