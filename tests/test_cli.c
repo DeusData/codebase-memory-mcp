@@ -2260,6 +2260,23 @@ TEST(cli_upsert_antigravity_mcp_replace) {
  *  Group C: Instructions File Upsert
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* #1032: Aider has no MCP support, but its installed CONVENTIONS.md told the
+ * model to call MCP tools it cannot invoke (search_graph(...) style). The
+ * Aider variant must teach the runnable CLI form instead. */
+TEST(cli_aider_instructions_are_cli_form_issue1032) {
+    const char *content = cbm_get_aider_instructions();
+    ASSERT_NOT_NULL(content);
+    /* Every discovery example is a runnable CLI command... */
+    ASSERT(strstr(content, "codebase-memory-mcp cli search_graph") != NULL);
+    ASSERT(strstr(content, "codebase-memory-mcp cli trace_path") != NULL);
+    ASSERT(strstr(content, "codebase-memory-mcp cli index_repository") != NULL);
+    /* ...and no bare MCP-call syntax remains to mislead the model. */
+    ASSERT_NULL(strstr(content, "search_graph(name_pattern"));
+    /* States the constraint explicitly. */
+    ASSERT(strstr(content, "no MCP support") != NULL);
+    PASS();
+}
+
 TEST(cli_upsert_instructions_fresh) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-instr-XXXXXX");
@@ -3201,6 +3218,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_antigravity_mcp_replace);
 
     /* Instructions file upsert (6 tests — group C) */
+    RUN_TEST(cli_aider_instructions_are_cli_form_issue1032);
     RUN_TEST(cli_upsert_instructions_fresh);
     RUN_TEST(cli_upsert_instructions_existing);
     RUN_TEST(cli_upsert_instructions_replace);

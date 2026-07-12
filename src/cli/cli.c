@@ -1268,6 +1268,46 @@ static const char agent_instructions_content[] =
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
     "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n";
 
+/* #1032: Aider has NO MCP support — it reads CONVENTIONS.md but can only run
+ * shell commands. Installing the MCP-tool-centric instructions above told the
+ * model to call tools it cannot invoke. Aider gets a CLI-form variant: the
+ * exact same discovery priority, expressed as runnable `codebase-memory-mcp
+ * cli` commands (usable via Aider's /run or auto-approved shell). */
+static const char aider_instructions_content[] =
+    "# Codebase Knowledge Graph (codebase-memory-mcp)\n"
+    "\n"
+    "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
+    "Aider has no MCP support, so invoke the graph through the CLI (e.g. via /run).\n"
+    "ALWAYS prefer these commands over grep/glob/file-search for code discovery.\n"
+    "\n"
+    "## Priority Order (CLI form)\n"
+    "1. Find functions/classes/routes:\n"
+    "   codebase-memory-mcp cli search_graph "
+    "'{\"project\":\"<name>\",\"name_pattern\":\".*Foo.*\"}'\n"
+    "2. Who calls X / what does X call:\n"
+    "   codebase-memory-mcp cli trace_path "
+    "'{\"project\":\"<name>\",\"function_name\":\"Foo\",\"direction\":\"both\"}'\n"
+    "3. Read a specific function/class:\n"
+    "   codebase-memory-mcp cli get_code_snippet "
+    "'{\"project\":\"<name>\",\"qualified_name\":\"<qn>\"}'\n"
+    "4. Complex patterns (Cypher):\n"
+    "   codebase-memory-mcp cli query_graph '{\"project\":\"<name>\",\"query\":\"MATCH ...\"}'\n"
+    "5. Project overview:\n"
+    "   codebase-memory-mcp cli get_architecture '{\"project\":\"<name>\"}'\n"
+    "\n"
+    "First use in a repo: codebase-memory-mcp cli index_repository '{\"repo_path\":\"<abs "
+    "path>\"}'\n"
+    "List indexed projects (for <name>): codebase-memory-mcp cli list_projects '{}'\n"
+    "\n"
+    "## When to fall back to grep/glob\n"
+    "- Searching for string literals, error messages, config values\n"
+    "- Searching non-code files (Dockerfiles, shell scripts, configs)\n"
+    "- When the CLI returns insufficient results\n";
+
+const char *cbm_get_aider_instructions(void) {
+    return aider_instructions_content;
+}
+
 const char *cbm_get_agent_instructions(void) {
     return agent_instructions_content;
 }
@@ -3432,7 +3472,8 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         } else {
             printf("Aider:\n");
             if (!dry_run) {
-                cbm_upsert_instructions(ip, agent_instructions_content);
+                /* #1032: Aider cannot call MCP tools — CLI-form instructions. */
+                cbm_upsert_instructions(ip, aider_instructions_content);
             }
             printf("  instructions: %s\n", ip);
         }

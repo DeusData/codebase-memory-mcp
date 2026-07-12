@@ -204,6 +204,9 @@ int cbm_remove_instructions(const char *path);
 /* Get the shared agent instructions content (markdown). */
 const char *cbm_get_agent_instructions(void);
 
+/* #1032: Aider variant — CLI-form discovery commands (Aider has no MCP). */
+const char *cbm_get_aider_instructions(void);
+
 /* ── Pre-tool hook management ─────────────────────────────────── */
 
 /* Upsert a PreToolUse hook in ~/.claude/settings.json for Claude Code.
