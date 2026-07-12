@@ -1209,6 +1209,47 @@ TEST(tool_search_graph_bm25_soft_source_first_ranking) {
     PASS();
 }
 
+TEST(tool_search_graph_filters_dotted_config_path) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "config-path-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/config-path-search");
+
+    cbm_node_t node = {0};
+    node.project = proj;
+    node.label = "Variable";
+    node.name = "timeout";
+    node.file_path = "config.yml";
+    node.start_line = 3;
+    node.end_line = 3;
+    node.qualified_name = "config.services.api.timeout";
+    node.properties_json = "{\"config_path\":\"services.api.timeout\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    node.qualified_name = "config.services.worker.timeout";
+    node.properties_json = "{\"config_path\":\"services.worker.timeout\"}";
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\",\"params\":{"
+        "\"name\":\"search_graph\",\"arguments\":{\"project\":\"config-path-search\","
+        "\"config_path\":\"services\\\\.api\\\\.timeout\","
+        "\"fields\":[\"config_path\"],\"limit\":10}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "config.services.api.timeout"));
+    ASSERT_NOT_NULL(strstr(inner, "services.api.timeout"));
+    ASSERT_NULL(strstr(inner, "config.services.worker.timeout"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* MCP discovery methods this server doesn't populate must return EMPTY
  * lists, not -32601 Method-not-found: clients like Cline probe
  * resources/list + prompts/list + resources/templates/list on connect and
@@ -6173,6 +6214,7 @@ SUITE(mcp) {
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_soft_source_first_ranking);
+    RUN_TEST(tool_search_graph_filters_dotted_config_path);
     RUN_TEST(mcp_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);

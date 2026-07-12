@@ -3048,6 +3048,11 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
         where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx, "n.qualified_name",
                         params->qn_pattern, params->case_sensitive);
     }
+    if (params->config_path) {
+        where_add_regex(where, where_sz, wlen, nparams, binds, bind_idx,
+                        "json_extract(n.properties,'$.config_path')", params->config_path,
+                        params->case_sensitive);
+    }
     if (params->file_pattern) {
         char *lp = cbm_glob_to_like(params->file_pattern);
         /* A file_pattern with no glob wildcards is treated as a path-substring

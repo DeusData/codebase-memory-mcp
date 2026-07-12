@@ -636,6 +636,33 @@ static void emit_yaml_leaf_value(CBMExtractCtx *ctx, TSNode val, const char *pat
     cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
 }
 
+/* The generic definition walker sees YAML's top-level mapping pairs but does
+ * not descend through block_node wrappers. Preserve nested keys here using the
+ * same Variable shape, without storing their potentially sensitive values. */
+enum { YAML_CONFIG_DEF_CAP = 512 };
+
+static void emit_yaml_nested_definition(CBMExtractCtx *ctx, TSNode pair, const char *name,
+                                        const char *path, int *emitted) {
+    const char *base = strrchr(ctx->rel_path, '/');
+    base = base ? base + SKIP_ONE : ctx->rel_path;
+    if (!path || !strchr(path, '.') || *emitted >= YAML_CONFIG_DEF_CAP ||
+        strcmp(base, "values.yaml") == 0 || strcmp(base, "values.yml") == 0) {
+        return; /* top-level keys are emitted by extract_vars_config */
+    }
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name =
+        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, path, ctx->language);
+    def.label = "Variable";
+    def.file_path = ctx->rel_path;
+    def.config_path = path;
+    def.start_line = ts_node_start_point(pair).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(pair).row + TS_LINE_OFFSET;
+    cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+    (*emitted)++;
+}
+
 typedef struct {
     TSNode node;
     const char *prefix;
@@ -658,6 +685,7 @@ static void push_yaml_block_children(TSNode val, const char *path, yaml_walk_fra
 static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_prefix) {
     yaml_walk_frame_t stack[YAML_WALK_STACK_CAP];
     int top = 0;
+    int emitted_config_defs = 0;
     stack[top++] = (yaml_walk_frame_t){root, root_prefix};
 
     while (top > 0) {
@@ -680,6 +708,7 @@ static void walk_yaml_mapping(CBMExtractCtx *ctx, TSNode root, const char *root_
             }
             const char *path =
                 prefix ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, key_text) : key_text;
+            emit_yaml_nested_definition(ctx, child, key_text, path, &emitted_config_defs);
             TSNode val = ts_node_child_by_field_name(child, TS_FIELD("value"));
             if (ts_node_is_null(val)) {
                 continue;
@@ -1050,17 +1079,18 @@ static void handle_yaml_nested(CBMExtractCtx *ctx, TSNode node) {
     if (strcmp(kind, "block_mapping") != 0) {
         return;
     }
-    /* Only process root-level block_mapping (depth 0 or 1) */
+    /* Process only the outermost mapping. walk_yaml_mapping already descends
+     * recursively; starting again from nested block_node mappings duplicates
+     * paths at several granularities. */
     TSNode parent = ts_node_parent(node);
-    if (ts_node_is_null(parent)) {
-        walk_yaml_mapping(ctx, node, NULL);
-    } else {
-        const char *pk = ts_node_type(parent);
-        if (strcmp(pk, "stream") == 0 || strcmp(pk, "document") == 0 ||
-            strcmp(pk, "block_node") == 0) {
-            walk_yaml_mapping(ctx, node, NULL);
+    TSNode cursor = parent;
+    while (!ts_node_is_null(cursor)) {
+        if (strcmp(ts_node_type(cursor), "block_mapping_pair") == 0) {
+            return;
         }
+        cursor = ts_node_parent(cursor);
     }
+    walk_yaml_mapping(ctx, node, NULL);
 }
 
 // --- Main unified cursor walk ---

@@ -108,6 +108,7 @@ typedef struct {
     const char *name_pattern; /* regex on name, NULL = any */
     const char *qn_pattern;   /* regex on qualified_name, NULL = any */
     const char *file_pattern; /* glob on file_path, NULL = any */
+    const char *config_path;  /* regex on properties.config_path, NULL = any */
     const char *relationship; /* edge type filter, NULL = any */
     const char *direction;    /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;           /* -1 = no filter (default), 0+ = minimum */

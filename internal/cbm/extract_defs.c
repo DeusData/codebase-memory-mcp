@@ -4465,7 +4465,8 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 // --- Variable extraction ---
 
 // Helper to push a Variable definition
-static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
+static void push_var_def_with_config_path(CBMExtractCtx *ctx, const char *name, TSNode node,
+                                          const char *config_path) {
     if (!name || !name[0] || strcmp(name, "_") == 0) {
         return;
     }
@@ -4475,14 +4476,19 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     def.name = name;
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
-    def.qualified_name =
-        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+    def.qualified_name = cbm_fqn_compute_source_lang(
+        a, ctx->project, ctx->rel_path, config_path ? config_path : name, ctx->language);
     def.label = "Variable";
     def.file_path = ctx->rel_path;
+    def.config_path = config_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = cbm_is_exported(name, ctx->language);
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
+    push_var_def_with_config_path(ctx, name, node, NULL);
 }
 
 // Helper: extract name from a declarator chain (C/C++/ObjC)
@@ -5070,7 +5076,8 @@ static void extract_vars_config(CBMExtractCtx *ctx, TSNode node, CBMArena *a, co
     case CBM_LANG_YAML: {
         TSNode key = ts_node_child_by_field_name(node, TS_FIELD("key"));
         if (!ts_node_is_null(key)) {
-            push_var_def(ctx, cbm_node_text(a, key, ctx->source), node);
+            const char *name = cbm_node_text(a, key, ctx->source);
+            push_var_def_with_config_path(ctx, name, node, name);
         }
         break;
     }

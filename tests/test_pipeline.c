@@ -627,6 +627,57 @@ TEST(pipeline_definitions_properties) {
     PASS();
 }
 
+TEST(pipeline_yaml_config_paths_remain_distinct) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/config.yml", g_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "services:\n  api:\n    timeout: 30\n  worker:\n    timeout: 60\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test_config_paths.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_node_t *vars = NULL;
+    int var_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, cbm_pipeline_project_name(p), "Variable", &vars,
+                                            &var_count),
+              CBM_STORE_OK);
+
+    int timeout_count = 0;
+    bool saw_api = false;
+    bool saw_worker = false;
+    for (int i = 0; i < var_count; i++) {
+        if (strcmp(vars[i].name, "timeout") != 0) {
+            continue;
+        }
+        timeout_count++;
+        ASSERT_NOT_NULL(vars[i].properties_json);
+        saw_api |= strstr(vars[i].properties_json,
+                          "\"config_path\":\"services.api.timeout\"") != NULL;
+        saw_worker |= strstr(vars[i].properties_json,
+                             "\"config_path\":\"services.worker.timeout\"") != NULL;
+    }
+    ASSERT_EQ(timeout_count, 2);
+    ASSERT_TRUE(saw_api);
+    ASSERT_TRUE(saw_worker);
+
+    cbm_store_free_nodes(vars, var_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Node properties must remain VALID JSON even when a definition's serialized
  * properties exceed the fixed 2 KB build buffer. Found on the Linux kernel:
  * 135 nodes (50-param functions with struct-typed signatures) had properties
@@ -6865,6 +6916,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_function_nodes);
     RUN_TEST(pipeline_definitions_defines_edges);
     RUN_TEST(pipeline_definitions_properties);
+    RUN_TEST(pipeline_yaml_config_paths_remain_distinct);
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
     RUN_TEST(pipeline_edge_props_valid_json);
     /* Complexity propagation pass (Tier B) */

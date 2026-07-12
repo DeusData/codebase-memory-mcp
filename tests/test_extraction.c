@@ -911,8 +911,24 @@ TEST(yaml_variables) {
                 CBM_LANG_YAML, "t", "config.yml");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
-    /* YAML should extract top-level keys as variables */
+    /* YAML keeps the leaf name for linking, while the stable identity records
+     * the full nested path so repeated leaf keys do not collapse. */
     ASSERT_GT(r->defs.count, 0);
+    const CBMDefinition *host = NULL;
+    const CBMDefinition *port = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "host") == 0) {
+            host = &r->defs.items[i];
+        } else if (strcmp(r->defs.items[i].name, "port") == 0) {
+            port = &r->defs.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(host);
+    ASSERT_NOT_NULL(port);
+    ASSERT_STR_EQ(host->config_path, "database.host");
+    ASSERT_STR_EQ(port->config_path, "database.port");
+    ASSERT_NOT_NULL(strstr(host->qualified_name, "database.host"));
+    ASSERT_NOT_NULL(strstr(port->qualified_name, "database.port"));
     cbm_free_result(r);
     PASS();
 }

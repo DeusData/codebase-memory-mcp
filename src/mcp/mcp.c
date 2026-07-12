@@ -379,6 +379,8 @@ static const tool_def_t TOOLS[] = {
      "provided, name_pattern is ignored.\"},"
      "\"label\":{\"type\":\"string\"},\"name_pattern\":{\"type\":\"string\"},\"qn_pattern\":{"
      "\"type\":\"string\"},\"file_pattern\":{\"type\":\"string\"},"
+     "\"config_path\":{\"type\":\"string\",\"description\":\"Case-insensitive regex on "
+     "the dotted config_path recorded for nested YAML keys. Values are never indexed.\"},"
      "\"relationship\":{\"type\":\"string\"},\"min_degree\":{\"type\":\"integer\"},"
      "\"max_degree\":{\"type\":\"integer\"},\"exclude_entry_points\":{\"type\":\"boolean\"},"
      "\"include_connected\":{\"type\":\"boolean\"},\"semantic_query\":{"
@@ -2829,6 +2831,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
+    char *config_path = cbm_mcp_get_string_arg(args, "config_path");
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
     bool exclude_entry_points = cbm_mcp_get_bool_arg(args, "exclude_entry_points");
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
@@ -2843,6 +2846,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(name_pattern);
         free(qn_pattern);
         free(file_pattern);
+        free(config_path);
         free(relationship);
         return cbm_mcp_text_result("relationship must be uppercase letters and underscores", true);
     }
@@ -2853,6 +2857,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         .name_pattern = name_pattern,
         .qn_pattern = qn_pattern,
         .file_pattern = file_pattern,
+        .config_path = config_path,
         .relationship = relationship,
         .exclude_entry_points = exclude_entry_points,
         .include_connected = include_connected,
@@ -2876,7 +2881,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             /* Semantic-only calls get semantic results only: the legacy
              * behavior also ran the UNFILTERED regex search and prepended
              * up to `limit` unrelated enriched nodes to the response. */
-            bool has_filters = label || name_pattern || qn_pattern || file_pattern ||
+            bool has_filters = label || name_pattern || qn_pattern || file_pattern || config_path ||
                                relationship || exclude_entry_points ||
                                min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
             bool semantic_only = sq_present && !has_filters;
@@ -2925,6 +2930,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             free(name_pattern);
             free(qn_pattern);
             free(file_pattern);
+            free(config_path);
             free(relationship);
             char *text = cbm_sb_finish(&sb);
             char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
@@ -2940,6 +2946,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(name_pattern);
         free(qn_pattern);
         free(file_pattern);
+        free(config_path);
         free(relationship);
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
@@ -2993,6 +3000,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(name_pattern);
         free(qn_pattern);
         free(file_pattern);
+        free(config_path);
         free(relationship);
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
@@ -3017,6 +3025,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     free(name_pattern);
     free(qn_pattern);
     free(file_pattern);
+    free(config_path);
     free(relationship);
 
     char *result = cbm_mcp_text_result(json, false);
