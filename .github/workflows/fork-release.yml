@@ -24,6 +24,13 @@ permissions:
 
 jobs:
   build:
+    # Reusable workflows cannot elevate permissions beyond their caller.
+    # _build.yml declares these scopes because it can optionally attest
+    # artifacts, so the caller must grant them even when attest=false.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_build.yml
     with:
       version: ${{ inputs.version }}
