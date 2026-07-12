@@ -187,6 +187,9 @@ bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p);
 cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p);
 const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind);
 const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p);
+/* True when the most recent FULL publish was reached by attempting an
+ * incremental route first and safely falling back to a replacement rebuild. */
+bool cbm_pipeline_incremental_fallback(const cbm_pipeline_t *p);
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */

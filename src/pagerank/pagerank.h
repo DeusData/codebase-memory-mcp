@@ -40,10 +40,12 @@ typedef enum {
     CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT = 1,
     CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT = 2,
     CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_NOOP = 3,
+    CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK = 4,
 } cbm_rank_refresh_publish_t;
 
 cbm_rank_refresh_publish_t
-cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind);
+cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind,
+                                       bool incremental_fallback);
 
 /* Config keys for edge type weights (all doubles, override via `config set`) */
 #define CBM_CONFIG_EDGE_WEIGHT_CALLS          "edge_weight_calls"

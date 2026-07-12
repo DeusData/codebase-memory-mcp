@@ -226,13 +226,15 @@ static bool rank_refresh_policy_allows_defer(cbm_rank_refresh_policy_t policy,
     }
     if (policy == CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL) {
         return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT ||
-               publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT;
+               publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT ||
+               publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK;
     }
     return false;
 }
 
 cbm_rank_refresh_publish_t
-cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind) {
+cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind,
+                                       bool incremental_fallback) {
     switch (publish_kind) {
     case CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT:
         return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT;
@@ -241,6 +243,8 @@ cbm_rank_refresh_publish_from_pipeline(cbm_pipeline_publish_kind_t publish_kind)
     case CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP:
         return CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_NOOP;
     case CBM_PIPELINE_PUBLISH_FULL:
+        return incremental_fallback ? CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK
+                                    : CBM_RANK_REFRESH_PUBLISH_FULL;
     case CBM_PIPELINE_PUBLISH_NONE:
     default:
         return CBM_RANK_REFRESH_PUBLISH_FULL;

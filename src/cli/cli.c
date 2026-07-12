@@ -3049,12 +3049,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "When to recompute PageRank/LinkRank after indexing",
      CBM_RANK_REFRESH_EAGER "|" CBM_RANK_REFRESH_STALE_ON_EXACT "|"
      CBM_RANK_REFRESH_STALE_ON_INCREMENTAL,
-     "'stale_on_incremental' (default): incremental publishes may defer rank recompute after marking "
-     "rank views stale; search/trace omit stale rank until a full/eager refresh. "
+     "'stale_on_incremental' (default): incremental publishes, including safe full fallbacks, may "
+     "defer rank recompute after marking rank views stale; search/trace omit stale rank until a "
+     "later refresh. "
      "'eager': recompute after graph changes, dependency reindexes, or missing rank views. "
      "'stale_on_exact': exact incremental graph deltas may skip synchronous rank recompute only after "
-     "rank views are marked stale. 'stale_on_incremental': also allows containment incremental publishes "
-     "to defer; search/trace then omit stale rank until a refresh runs."},
+     "rank views are marked stale. 'stale_on_incremental': also allows containment publishes and full "
+     "rebuilds reached through incremental fallback to defer; search/trace then omit stale rank until "
+     "a refresh runs."},
     {"edge_weight_calls", "1.0", NULL, "PageRank",
      "How much importance flows along direct function/method call edges (CALLS)",
      "0.0-100.0",
