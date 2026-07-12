@@ -852,6 +852,46 @@ TEST(store_node_batch_empty) {
     PASS();
 }
 
+TEST(store_node_batch_in_transaction_bulk_rollback) {
+    enum { STORE_NODE_BATCH_TX_COUNT = 40 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t nodes[STORE_NODE_BATCH_TX_COUNT];
+    int64_t ids[STORE_NODE_BATCH_TX_COUNT];
+    char names[STORE_NODE_BATCH_TX_COUNT][CBM_SZ_32];
+    char qns[STORE_NODE_BATCH_TX_COUNT][CBM_SZ_64];
+    for (int i = 0; i < STORE_NODE_BATCH_TX_COUNT; i++) {
+        snprintf(names[i], sizeof(names[i]), "tx_func_%d", i);
+        snprintf(qns[i], sizeof(qns[i]), "test.tx.func_%d", i);
+        nodes[i] = (cbm_node_t){
+            .project = "test",
+            .label = "Function",
+            .name = names[i],
+            .qualified_name = qns[i],
+            .file_path = "tx.c",
+            .start_line = i + 1,
+            .end_line = i + 1,
+            .properties_json = "{}",
+        };
+    }
+
+    ASSERT_EQ(cbm_store_begin(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_node_batch_in_transaction(s, nodes, STORE_NODE_BATCH_TX_COUNT,
+                                                        ids),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), STORE_NODE_BATCH_TX_COUNT);
+    for (int i = 0; i < STORE_NODE_BATCH_TX_COUNT; i++) {
+        ASSERT_GT(ids[i], 0);
+    }
+    ASSERT_EQ(cbm_store_rollback(s), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Cascade delete ─────────────────────────────────────────────── */
 
 TEST(store_cascade_delete) {
@@ -6130,6 +6170,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_delete_by_label);
     RUN_TEST(store_node_batch_upsert);
     RUN_TEST(store_node_batch_empty);
+    RUN_TEST(store_node_batch_in_transaction_bulk_rollback);
     RUN_TEST(store_cascade_delete);
     RUN_TEST(store_file_hash_crud);
     RUN_TEST(store_file_hash_upsert_rejects_null_required_fields);
