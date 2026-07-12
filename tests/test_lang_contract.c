@@ -1217,11 +1217,12 @@ static int calls_edge_targets(cbm_store_t *store, const char *project, const cha
         if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) != CBM_STORE_OK)
             continue;
         const char *qn = tgt.qualified_name;
-        if (!qn || !tgt.label || strcmp(tgt.label, label) != 0)
-            continue;
-        size_t ql = strlen(qn);
-        if (ql >= sl && strcmp(qn + ql - sl, qn_suffix) == 0)
-            found = 1;
+        if (qn && tgt.label && strcmp(tgt.label, label) == 0) {
+            size_t ql = strlen(qn);
+            if (ql >= sl && strcmp(qn + ql - sl, qn_suffix) == 0)
+                found = 1;
+        }
+        cbm_node_free_fields(&tgt);
     }
     cbm_store_free_edges(edges, n);
     return found;
