@@ -17,6 +17,8 @@
  */
 
 #include "cli/cli.h"
+#include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include "foundation/mem.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
@@ -29,6 +31,7 @@
 #include <string.h>
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -38,21 +41,84 @@
 #define HA_MIN_TOKEN 4            /* skip short/noisy patterns before any work */
 #define HA_MAX_TOKEN 96
 #define HA_RESULT_LIMIT 5
-#define HA_MAX_WALKUP 8    /* cwd may be a subdir of the indexed root  */
-#define HA_DEADLINE_MS 300 /* hard in-process budget (see also: the    */
-                           /* settings.json "timeout" backstop)        */
+#define HA_MAX_WALKUP 8             /* cwd may be a subdir of the indexed root  */
+#define HA_DEADLINE_DEFAULT_MS 2000 /* in-process budget; see ha_deadline_ms()  */
+#define HA_DEADLINE_MIN_MS 50
+#define HA_DEADLINE_MAX_MS 10000
+
+/* #858: the original 300ms budget silently self-terminated on real cold
+ * starts (SQLite/mmap open under load), so augmentation never appeared in
+ * real sessions (0/24 observed) while manual warm invocations worked. The
+ * budget is now generous by default and env-configurable; the settings.json
+ * hook "timeout" remains the outer backstop. */
+static int ha_deadline_ms(void) {
+    const char *env = getenv("CBM_HOOK_DEADLINE_MS");
+    if (!env || !env[0]) {
+        return HA_DEADLINE_DEFAULT_MS;
+    }
+    int v = atoi(env);
+    if (v < HA_DEADLINE_MIN_MS) {
+        return HA_DEADLINE_MIN_MS;
+    }
+    if (v > HA_DEADLINE_MAX_MS) {
+        return HA_DEADLINE_MAX_MS;
+    }
+    return v;
+}
 
 /* ── Hard deadline ────────────────────────────────────────────────
  * A slow SQLite open or query must never stall the agent. When the timer
  * fires we _exit(0) immediately. Output is written exactly once at the very
- * end, so firing mid-work simply yields a clean no-op (no partial JSON). */
+ * end, so firing mid-work simply yields a clean no-op (no partial JSON).
+ *
+ * Observability (#858): a fired deadline is otherwise indistinguishable from
+ * "no matches", so the handler first write()s a pre-formatted breadcrumb to
+ * ~/.cache/codebase-memory-mcp/logs/hook-augment-timeouts.log (fd and message
+ * prepared at arm time — only async-signal-safe write/_exit in the handler). */
 #ifndef _WIN32
+static int g_ha_crumb_fd = -1;
+static char g_ha_crumb_msg[160];
+static size_t g_ha_crumb_len = 0;
+
 static void ha_deadline_exit(int sig) {
     (void)sig;
+    if (g_ha_crumb_fd >= 0 && g_ha_crumb_len > 0) {
+        ssize_t w = write(g_ha_crumb_fd, g_ha_crumb_msg, g_ha_crumb_len);
+        (void)w;
+    }
     _exit(0);
 }
 
+static void ha_open_crumb_log(int deadline_ms) {
+    const char *override = getenv("CBM_HOOK_TIMEOUT_LOG"); /* tests + power users */
+    char path[CBM_SZ_1K];
+    if (override && override[0]) {
+        snprintf(path, sizeof(path), "%s", override);
+    } else {
+        const char *home = getenv("HOME");
+        if (!home || !home[0]) {
+            return;
+        }
+        char dir[CBM_SZ_1K];
+        snprintf(dir, sizeof(dir), "%s/.cache/codebase-memory-mcp/logs", home);
+        cbm_mkdir_p(dir, 0755);
+        snprintf(path, sizeof(path), "%s/hook-augment-timeouts.log", dir);
+    }
+    g_ha_crumb_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (g_ha_crumb_fd < 0) {
+        return;
+    }
+    int n = snprintf(g_ha_crumb_msg, sizeof(g_ha_crumb_msg),
+                     "hook-augment: deadline_exceeded ms=%d pid=%ld (raise via "
+                     "CBM_HOOK_DEADLINE_MS)\n",
+                     deadline_ms, (long)getpid());
+    g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
+}
+
 static void ha_arm_deadline(void) {
+    int ms = ha_deadline_ms();
+    ha_open_crumb_log(ms);
+
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = ha_deadline_exit;
@@ -60,8 +126,8 @@ static void ha_arm_deadline(void) {
 
     struct itimerval it;
     memset(&it, 0, sizeof(it));
-    it.it_value.tv_sec = HA_DEADLINE_MS / 1000;
-    it.it_value.tv_usec = (HA_DEADLINE_MS % 1000) * 1000;
+    it.it_value.tv_sec = ms / 1000;
+    it.it_value.tv_usec = (ms % 1000) * 1000;
     setitimer(ITIMER_REAL, &it, NULL);
 }
 #else

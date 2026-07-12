@@ -20,6 +20,9 @@
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include <errno.h>
 #include <zlib.h>
 
@@ -2497,6 +2500,77 @@ TEST(cli_hook_augment_path_is_abs) {
     PASS();
 }
 
+/* #858: a fired hook-augment deadline used to be a SILENT _exit(0) —
+ * indistinguishable from "no matches" — and the 300ms default self-terminated
+ * on real cold starts, so augmentation never appeared in real sessions
+ * (0/24 observed). The deadline is now env-configurable
+ * (CBM_HOOK_DEADLINE_MS, generous default) and a fired deadline leaves an
+ * observable breadcrumb in a local log. Deterministic reproduction: stdin is
+ * a pipe with a live writer that never sends data, so ha_read_stdin blocks
+ * past a 60ms deadline and the timer must fire, breadcrumb, and _exit(0). */
+TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process SIGALRM deadline is POSIX-only (settings.json timeout on Windows)");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hookdl-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char logpath[512];
+    snprintf(logpath, sizeof(logpath), "%s/timeouts.log", tmpdir);
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: hook-augment with a 60ms deadline and stdin that blocks
+         * forever (parent keeps the write end open, sends nothing). */
+        close(fds[1]);
+        dup2(fds[0], 0);
+        close(fds[0]);
+        setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
+        setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
+        alarm(10); /* backstop: never hang the suite */
+        _exit(cbm_cmd_hook_augment());
+    }
+    ASSERT_GT(pid, 0);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    close(fds[1]);
+
+    /* The deadline must have fired as a clean exit 0 (fail-open, no signal). */
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    /* RED before the fix: no breadcrumb existed — a fired deadline was
+     * indistinguishable from a no-match run. GREEN: the log names the
+     * deadline and the knob. */
+    FILE *f = fopen(logpath, "r");
+    if (!f) {
+        fprintf(stderr, "  [858] FAIL no timeout breadcrumb written to %s\n", logpath);
+    }
+    ASSERT_NOT_NULL(f);
+    char line[256] = "";
+    char *got = fgets(line, sizeof(line), f);
+    fclose(f);
+    ASSERT_NOT_NULL(got);
+    ASSERT(strstr(line, "deadline_exceeded") != NULL);
+    ASSERT(strstr(line, "CBM_HOOK_DEADLINE_MS") != NULL);
+
+    cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
+    cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
+}
+
 TEST(cli_upsert_claude_hook_existing) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-XXXXXX");
@@ -3229,6 +3303,7 @@ SUITE(cli) {
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
     RUN_TEST(cli_hook_augment_path_is_abs);
+    RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_upsert_claude_hook_replace);
