@@ -47,7 +47,8 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Nightly callers pass 240 minutes; include build, idle, and analysis headroom.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install deps (Linux)
@@ -67,7 +68,7 @@ jobs:
 
   soak-quick-windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
@@ -125,7 +126,8 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # ASan runs a fixed 15-minute workload, but ARM builds and teardown can be slow.
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install deps (Linux)
@@ -150,7 +152,7 @@ jobs:
   soak-asan-windows:
     if: ${{ inputs.run_asan }}
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
