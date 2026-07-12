@@ -1202,6 +1202,67 @@ TEST(contract_edge_imports_alias_resolves_real_file_issue767) {
     PASS();
 }
 
+/* True if some CALLS edge's TARGET node carries `label` and a QN ending with
+ * `qn_suffix` — i.e. the call resolved to that specific definition. */
+static int calls_edge_targets(cbm_store_t *store, const char *project, const char *label,
+                              const char *qn_suffix) {
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK)
+        return 0;
+    int found = 0;
+    size_t sl = strlen(qn_suffix);
+    for (int i = 0; i < n && !found; i++) {
+        cbm_node_t tgt;
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) != CBM_STORE_OK)
+            continue;
+        const char *qn = tgt.qualified_name;
+        if (!qn || !tgt.label || strcmp(tgt.label, label) != 0)
+            continue;
+        size_t ql = strlen(qn);
+        if (ql >= sl && strcmp(qn + ql - sl, qn_suffix) == 0)
+            found = 1;
+    }
+    cbm_store_free_edges(edges, n);
+    return found;
+}
+
+/* #871: a CommonJS require() binding shadowed call resolution. `const doThing
+ * = require("../bs/doThing")` emitted a Variable def for `doThing` in the
+ * importing module, so the call `doThing(...)` resolved to that same-module
+ * Variable (an import ALIAS, not a definition) instead of following the
+ * recorded import to the exported function — which stayed at zero inbound
+ * CALLS (the reporter's disconnected-node symptom). ESM `import` bindings
+ * never materialize as Variables; the identifier-bound require form must
+ * behave identically: no shadowing Variable, CALLS edge lands on the real
+ * Function. Fixture = the reporter's exact two-file repro. */
+TEST(contract_edge_commonjs_require_call_resolves_issue871) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"src/bs/doThing.js",
+         "module.exports = async function doThing({ id }) {\n  return id;\n};\n"},
+        {"src/mutations/doThing.js",
+         "const doThing = require(\"../bs/doThing\");\n\n"
+         "module.exports = async (parent, args) => {\n  return doThing({ id: args.id });\n};\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    /* The call resolves THROUGH the require to the exported function. */
+    int resolved = calls_edge_targets(store, lp.project, "Function", ".bs.doThing.doThing");
+    /* The alias must not swallow the call: no CALLS edge may terminate on a
+     * Variable in the importing module (ESM parity: the binding is an import,
+     * not a definition). */
+    int shadowed = calls_edge_targets(store, lp.project, "Variable", ".mutations.doThing.doThing");
+    if (!resolved || shadowed) {
+        fprintf(stderr, "  [871] FAIL resolved=%d shadowed=%d (require binding must resolve to "
+                        "the exported Function, not the local alias Variable)\n",
+                resolved, shadowed);
+    }
+    ASSERT_TRUE(resolved);
+    ASSERT_TRUE(!shadowed);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* DEPENDS_ON — Helm Chart.yaml `dependencies:` -> per-dependency Chart node.
  * Basename must be exactly "Chart.yaml"; pass_k8s runs in both pipeline paths. */
 TEST(contract_edge_depends_on) {
@@ -1411,6 +1472,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_workspaces_imports_issue408);
     RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
     RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
+    RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);
