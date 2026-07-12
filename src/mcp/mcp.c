@@ -6421,6 +6421,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
+    bool incremental_fallback = cbm_pipeline_incremental_fallback(p);
     const char *publish_reason = cbm_pipeline_publish_reason(p);
     atomic_store_explicit(&srv->active_pipeline, NULL, memory_order_release);
     /* Refresh the watcher baseline before releasing the pipeline lock. Otherwise
@@ -6465,6 +6466,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "publish_reason", publish_reason);
     }
     yyjson_mut_obj_add_bool(doc, root, "graph_changed", graph_changed);
+    yyjson_mut_obj_add_bool(doc, root, "incremental_fallback", incremental_fallback);
     add_pipeline_exact_delta_stats(doc, root, cbm_pipeline_exact_delta_stats(p));
 
     if (rc == 0) {
@@ -6492,7 +6494,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             CBM_PROF_START(prof_index_rank_refresh);
             (void)cbm_pagerank_refresh_after_publish(
                 store, project_name, srv->config, graph_changed, deps_reindexed,
-                cbm_rank_refresh_publish_from_pipeline(publish_kind));
+                cbm_rank_refresh_publish_from_pipeline(publish_kind, incremental_fallback));
             CBM_PROF_END("index_repository", "rank_refresh", prof_index_rank_refresh);
             CBM_PROF_START(prof_index_counts);
             int nodes = cbm_store_count_nodes(store, project_name);
@@ -9160,6 +9162,7 @@ static void *autoindex_thread(void *arg) {
     int rc = cbm_pipeline_run(p);
     bool graph_changed = cbm_pipeline_graph_changed(p);
     cbm_pipeline_publish_kind_t publish_kind = cbm_pipeline_publish_kind(p);
+    bool incremental_fallback = cbm_pipeline_incremental_fallback(p);
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
@@ -9174,7 +9177,7 @@ static void *autoindex_thread(void *arg) {
                 effective_dep_limit, NULL);
             (void)cbm_pagerank_refresh_after_publish(
                 store, srv->session_project, srv->config, graph_changed, deps_reindexed,
-                cbm_rank_refresh_publish_from_pipeline(publish_kind));
+                cbm_rank_refresh_publish_from_pipeline(publish_kind, incremental_fallback));
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);

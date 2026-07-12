@@ -10519,6 +10519,7 @@ TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_FALSE(cbm_pipeline_incremental_fallback(p));
     char *project = cbm_strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
     ASSERT_NOT_NULL(project);
@@ -10874,6 +10875,7 @@ TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
     ASSERT(strstr(logs, fallback_log) != NULL);
     ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
     ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    ASSERT_TRUE(cbm_pipeline_incremental_fallback(p));
     cbm_pipeline_free(p);
 
     int skipped_nodes = 0;

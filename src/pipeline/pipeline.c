@@ -140,6 +140,7 @@ struct cbm_pipeline {
     bool graph_changed;
     cbm_pipeline_publish_kind_t publish_kind;
     char *publish_reason;
+    bool incremental_fallback;
     cbm_pipeline_exact_delta_stats_t exact_delta_stats;
 };
 
@@ -215,6 +216,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
     p->publish_reason = NULL;
+    p->incremental_fallback = false;
     p->exact_delta_stats.changed_paths = -1;
     p->exact_delta_stats.affected_paths = -1;
     p->exact_delta_stats.published_paths = -1;
@@ -636,6 +638,10 @@ cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p) {
     return p ? p->publish_reason : NULL;
+}
+
+bool cbm_pipeline_incremental_fallback(const cbm_pipeline_t *p) {
+    return p && p->publish_kind == CBM_PIPELINE_PUBLISH_FULL && p->incremental_fallback;
 }
 
 bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p) {
@@ -1449,6 +1455,9 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
             if (rc == CBM_NOT_FOUND && out_replace_project) {
                 *out_replace_project = true;
             }
+            if (rc == CBM_NOT_FOUND) {
+                p->incremental_fallback = true;
+            }
             free(db_path);
             return rc;
         }
@@ -1662,6 +1671,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     p->graph_changed = false;
     p->publish_kind = CBM_PIPELINE_PUBLISH_NONE;
+    p->incremental_fallback = false;
     cbm_pipeline_set_publish_reason(p, NULL);
     cbm_pipeline_set_exact_delta_stats(p, -1, -1, -1);
     p->committed_nodes = -1;
