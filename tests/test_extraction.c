@@ -812,6 +812,25 @@ TEST(ts_class) {
     PASS();
 }
 
+TEST(body_tokens_type_identifier) {
+    CBMFileResult *r = extract("function serialize(obj: MyModel): SerializedResult {\n"
+                               "  const result: SerializedResult = new SerializedResult();\n"
+                               "  return result;\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "serial.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, "serialize") == 0) {
+            ASSERT_NOT_NULL(r->defs.items[i].body_tokens);
+            ASSERT(strstr(r->defs.items[i].body_tokens, "SerializedResult") != NULL);
+            break;
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Lua --- */
 TEST(lua_function) {
     CBMFileResult *r = extract(
@@ -4462,6 +4481,7 @@ SUITE(extraction) {
     RUN_TEST(js_class);
     RUN_TEST(ts_function);
     RUN_TEST(ts_class);
+    RUN_TEST(body_tokens_type_identifier);
     RUN_TEST(lua_function);
     RUN_TEST(bash_function);
     RUN_TEST(perl_function);
