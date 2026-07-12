@@ -45,6 +45,55 @@ interface DesignContextResponse {
   relations: DesignRelation[];
   returned_relations: number;
   has_more: boolean;
+  has_more_relations?: boolean;
+  filtered_total?: { systems: number; tokens: number; components: number; modes: number };
+  has_more_by_type?: { systems: boolean; tokens: boolean; components: boolean; modes: boolean };
+}
+
+const DESIGN_PAGE_LIMIT = 1000;
+
+function mergeByKey<T>(current: T[], incoming: T[], key: (item: T) => string): T[] {
+  const merged = new Map(current.map((item) => [key(item), item]));
+  incoming.forEach((item) => merged.set(key(item), item));
+  return [...merged.values()];
+}
+
+async function loadDesignContext(project: string): Promise<DesignContextResponse> {
+  let offset = 0;
+  let relationOffset = 0;
+  let result: DesignContextResponse | null = null;
+  let hasMoreNodes = true;
+  let hasMoreRelations = true;
+
+  while (hasMoreNodes || hasMoreRelations) {
+    const page = await callTool<DesignContextResponse>("get_design_context", {
+      project,
+      limit: DESIGN_PAGE_LIMIT,
+      offset,
+      relation_offset: relationOffset,
+    });
+    if (!result) {
+      result = { ...page, systems: [], tokens: [], components: [], modes: [], relations: [] };
+    }
+    result.systems = mergeByKey(result.systems, page.systems, (node) => node.qualified_name);
+    result.tokens = mergeByKey(result.tokens, page.tokens, (node) => node.qualified_name);
+    result.components = mergeByKey(result.components, page.components, (node) => node.qualified_name);
+    result.modes = mergeByKey(result.modes, page.modes, (node) => node.qualified_name);
+    result.relations = mergeByKey(
+      result.relations,
+      page.relations,
+      (relation) => `${relation.type}:${relation.source}:${relation.target}:${JSON.stringify(relation.properties ?? {})}`,
+    );
+    hasMoreNodes = page.has_more;
+    hasMoreRelations = page.has_more_relations ?? false;
+    if (hasMoreNodes) offset += DESIGN_PAGE_LIMIT;
+    if (hasMoreRelations) relationOffset += page.returned_relations || DESIGN_PAGE_LIMIT * 4;
+  }
+  if (!result) throw new Error("Design context returned no pages");
+  result.returned_relations = result.relations.length;
+  result.has_more = false;
+  result.has_more_relations = false;
+  return result;
 }
 
 function tokenColor(node: DesignNode): string | null {
@@ -102,7 +151,7 @@ export function DesignTab({ project }: { project: string | null }) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    callTool<DesignContextResponse>("get_design_context", { project, limit: 1000 })
+    loadDesignContext(project)
       .then((response) => {
         if (!cancelled) setData(response);
       })
@@ -123,9 +172,18 @@ export function DesignTab({ project }: { project: string | null }) {
     return (data?.tokens ?? []).filter((token) => {
       const haystack = `${token.name} ${token.qualified_name} ${token.properties?.token_path ?? ""}`.toLowerCase();
       const tokenScope = (token.properties?.scope ?? "root").toLowerCase();
-      return (!needle || haystack.includes(needle)) && (!scopeNeedle || tokenScope.includes(scopeNeedle));
+      return (!needle || haystack.includes(needle)) && (!scopeNeedle || tokenScope === scopeNeedle);
     });
   }, [data, query, scope]);
+
+  const filteredComponents = useMemo(
+    () => (data?.components ?? []).filter((node) => !scope || (node.properties?.scope ?? "root") === scope),
+    [data, scope],
+  );
+  const filteredModes = useMemo(
+    () => (data?.modes ?? []).filter((node) => !scope || (node.properties?.scope ?? "root") === scope),
+    [data, scope],
+  );
 
   const selected = filteredTokens.find((token) => token.qualified_name === selectedQn) ?? filteredTokens[0];
   const selectedRelations = selected
@@ -199,7 +257,7 @@ export function DesignTab({ project }: { project: string | null }) {
 
                   <p className="mt-6 text-[10px] uppercase tracking-[0.16em] text-foreground/30">{t.design.components}</p>
                   <div className="mt-2 space-y-1">
-                    {data.components.map((component) => (
+                    {filteredComponents.map((component) => (
                       <div key={component.qualified_name} className="rounded-lg bg-white/[0.025] px-3 py-2">
                         <p className="text-[11px] text-foreground/65">{component.name}</p>
                         <p className="mt-0.5 truncate font-mono text-[9px] text-foreground/25">{component.file_path}</p>
@@ -207,11 +265,11 @@ export function DesignTab({ project }: { project: string | null }) {
                     ))}
                   </div>
 
-                  {data.modes.length > 0 && (
+                  {filteredModes.length > 0 && (
                     <>
                       <p className="mt-6 text-[10px] uppercase tracking-[0.16em] text-foreground/30">{t.design.modes}</p>
                       <div className="mt-2 space-y-1">
-                        {data.modes.map((mode) => (
+                        {filteredModes.map((mode) => (
                           <div key={mode.qualified_name} className="rounded-lg border border-primary/10 bg-primary/[0.035] px-3 py-2">
                             <div className="flex items-center justify-between gap-2">
                               <p className="truncate text-[11px] text-foreground/65">{mode.name}</p>
@@ -294,6 +352,9 @@ export function DesignTab({ project }: { project: string | null }) {
                             <div key={`${relation.type}-${index}`} className="rounded-lg border border-white/[0.04] bg-white/[0.02] px-3 py-2">
                               <p className="text-[9px] uppercase tracking-wider text-primary/60">{outgoing ? "→" : "←"} {relation.type.replace(/_/g, " ")}</p>
                               <p className="mt-1 truncate font-mono text-[9px] text-foreground/35" title={peer}>{shortQualifiedName(peer)}</p>
+                              {typeof relation.properties?.value === "string" && (
+                                <p className="mt-1 break-all font-mono text-[9px] text-foreground/50">{relation.properties.value}</p>
+                              )}
                             </div>
                           );
                         })}

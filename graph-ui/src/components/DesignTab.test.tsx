@@ -104,7 +104,12 @@ describe("DesignTab", () => {
     expect((await screen.findAllByText("color.action")).length).toBeGreaterThan(0);
     expect(screen.getByText("button-primary")).toBeInTheDocument();
     expect(screen.getByText(/USES TOKEN/)).toBeInTheDocument();
-    expect(callToolMock).toHaveBeenCalledWith("get_design_context", { project: "demo", limit: 1000 });
+    expect(callToolMock).toHaveBeenCalledWith("get_design_context", {
+      project: "demo",
+      limit: 1000,
+      offset: 0,
+      relation_offset: 0,
+    });
 
     fireEvent.change(screen.getByPlaceholderText("Search token names and paths..."), {
       target: { value: "spacing" },
@@ -117,5 +122,88 @@ describe("DesignTab", () => {
     render(<DesignTab project={null} />);
     expect(screen.getByText("Select a project to inspect its design context.")).toBeInTheDocument();
     expect(callToolMock).not.toHaveBeenCalled();
+  });
+
+  it("loads every page and applies exact scope filtering to all artifact types", async () => {
+    const pageOne = {
+      ...RESPONSE,
+      total: { systems: 2, tokens: 2, components: 2, modes: 2 },
+      systems: [
+        {
+          id: 10,
+          name: "App",
+          qualified_name: "demo.design.system.packages.app",
+          file_path: "packages/app/DESIGN.md",
+          line: 1,
+          properties: { scope: "packages.app", provenance: "authoritative" },
+        },
+        {
+          id: 11,
+          name: "Application",
+          qualified_name: "demo.design.system.packages.application",
+          file_path: "packages/application/DESIGN.md",
+          line: 1,
+          properties: { scope: "packages.application", provenance: "authoritative" },
+        },
+      ],
+      tokens: [
+        { ...RESPONSE.tokens[0], properties: { ...RESPONSE.tokens[0].properties, scope: "packages.app" } },
+      ],
+      components: [
+        { ...RESPONSE.components[0], name: "app-button", properties: { scope: "packages.app" } },
+        {
+          ...RESPONSE.components[0],
+          id: 12,
+          name: "application-button",
+          qualified_name: "demo.design.component.packages.application.button",
+          properties: { scope: "packages.application" },
+        },
+      ],
+      modes: [
+        {
+          id: 13,
+          name: "theme: app",
+          qualified_name: "demo.design.mode.packages.app.theme.app",
+          file_path: "packages/app/theme.resolver.json",
+          line: 1,
+          properties: { scope: "packages.app", modifier: "theme", context: "app" },
+        },
+        {
+          id: 14,
+          name: "theme: application",
+          qualified_name: "demo.design.mode.packages.application.theme.application",
+          file_path: "packages/application/theme.resolver.json",
+          line: 1,
+          properties: { scope: "packages.application", modifier: "theme", context: "application" },
+        },
+      ],
+      has_more: true,
+    };
+    const pageTwo = {
+      ...RESPONSE,
+      total: pageOne.total,
+      systems: [],
+      tokens: [
+        { ...RESPONSE.tokens[1], properties: { ...RESPONSE.tokens[1].properties, scope: "packages.application" } },
+      ],
+      components: [],
+      modes: [],
+      relations: [],
+      returned_relations: 0,
+      has_more: false,
+    };
+    callToolMock.mockImplementation((_tool: string, args: { offset: number }) =>
+      Promise.resolve(args.offset === 0 ? pageOne : pageTwo),
+    );
+
+    render(<DesignTab project="demo" />);
+    expect(await screen.findByText("app-button")).toBeInTheDocument();
+    expect(screen.getByText("application-button")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /App packages\.app/ }));
+    expect(screen.getByText("app-button")).toBeInTheDocument();
+    expect(screen.queryByText("application-button")).not.toBeInTheDocument();
+    expect(screen.getByText("theme: app")).toBeInTheDocument();
+    expect(screen.queryByText("theme: application")).not.toBeInTheDocument();
+    expect(callToolMock).toHaveBeenCalledTimes(2);
   });
 });
