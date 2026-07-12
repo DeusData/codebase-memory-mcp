@@ -2033,6 +2033,9 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
 
     CBM_PROF_START(t_flush_total);
     int64_t *temp_to_real = NULL;
+    int64_t *temp_node_ids = NULL;
+    int64_t *store_node_ids = NULL;
+    cbm_node_t *store_nodes = NULL;
     cbm_edge_t *store_edges = NULL;
     const char *phase = "begin_bulk";
     CBM_PROF_START(t_begin_bulk);
@@ -2092,8 +2095,25 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         goto fail;
     }
 
-    phase = "upsert_nodes";
-    CBM_PROF_START(t_upsert_nodes);
+    if (gb->nodes.count > 0) {
+        if ((size_t)gb->nodes.count > SIZE_MAX / sizeof(*store_nodes) ||
+            (size_t)gb->nodes.count > SIZE_MAX / sizeof(*store_node_ids) ||
+            (size_t)gb->nodes.count > SIZE_MAX / sizeof(*temp_node_ids)) {
+            phase = "alloc_node_batch";
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        store_nodes = malloc((size_t)gb->nodes.count * sizeof(*store_nodes));
+        store_node_ids = malloc((size_t)gb->nodes.count * sizeof(*store_node_ids));
+        temp_node_ids = malloc((size_t)gb->nodes.count * sizeof(*temp_node_ids));
+        if (!store_nodes || !store_node_ids || !temp_node_ids) {
+            phase = "alloc_node_batch";
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+    }
+
+    int valid_node_count = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
 
@@ -2102,7 +2122,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             continue;
         }
 
-        cbm_node_t sn = {
+        store_nodes[valid_node_count] = (cbm_node_t){
             .project = gb->project,
             .label = n->label,
             .name = n->name,
@@ -2112,16 +2132,30 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .end_line = n->end_line,
             .properties_json = n->properties_json,
         };
-        int64_t real_id = cbm_store_upsert_node(store, &sn);
+        temp_node_ids[valid_node_count] = n->id;
+        valid_node_count++;
+    }
+
+    phase = "upsert_nodes";
+    CBM_PROF_START(t_upsert_nodes);
+    rc = cbm_store_upsert_node_batch_in_transaction(store, store_nodes, valid_node_count,
+                                                    store_node_ids);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    for (int i = 0; i < valid_node_count; i++) {
+        int64_t real_id = store_node_ids[i];
         if (real_id <= 0) {
             rc = CBM_STORE_ERR;
             goto fail;
         }
-        if (n->id < max_temp_id) {
-            temp_to_real[n->id] = real_id;
+        if (temp_node_ids[i] <= 0 || temp_node_ids[i] >= max_temp_id) {
+            rc = CBM_STORE_ERR;
+            goto fail;
         }
+        temp_to_real[temp_node_ids[i]] = real_id;
     }
-    CBM_PROF_END_N("gbuf_flush", "5_upsert_nodes", t_upsert_nodes, gb->nodes.count);
+    CBM_PROF_END_N("gbuf_flush", "5_upsert_nodes", t_upsert_nodes, valid_node_count);
 
     /* Insert all edges with remapped IDs */
     phase = "insert_edges";
@@ -2186,6 +2220,9 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
     CBM_PROF_END_N("gbuf_flush", "TOTAL", t_flush_total, gb->nodes.count + gb->edges.count);
 
     free(temp_to_real);
+    free(temp_node_ids);
+    free(store_node_ids);
+    free(store_nodes);
     free(store_edges);
     return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
 
@@ -2199,6 +2236,9 @@ fail:
     (void)cbm_store_rollback(store);
     (void)cbm_store_end_bulk(store);
     free(temp_to_real);
+    free(temp_node_ids);
+    free(store_node_ids);
+    free(store_nodes);
     free(store_edges);
     return rc;
 }

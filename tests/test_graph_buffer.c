@@ -1428,6 +1428,7 @@ TEST(gbuf_flush_bulk_edges_preserves_buffer_properties) {
     cbm_store_t *store = cbm_store_open_memory();
     ASSERT_NOT_NULL(store);
     ASSERT_EQ(cbm_gbuf_flush_to_store(gb, store), 0);
+    ASSERT_EQ(cbm_store_count_nodes(store, "proj"), 40);
     ASSERT_EQ(cbm_store_count_edges(store, "proj"), 35);
 
     cbm_node_t first = {0};

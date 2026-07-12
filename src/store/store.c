@@ -63,6 +63,7 @@ enum {
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
     ST_ARCH_PATH_LIKE_EXTRA = 3, /* "/%" plus NUL */
+    ST_NODE_BATCH_BULK_MIN = CBM_SZ_32,
     ST_DELTA_EDGE_BULK_MIN = CBM_SZ_32,
 };
 
@@ -2418,24 +2419,185 @@ int cbm_store_delete_nodes_by_label(cbm_store_t *s, const char *project, const c
 
 /* ── Node batch ─────────────────────────────────────────────────── */
 
-int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int count,
-                                int64_t *out_ids) {
-    if (count == 0) {
-        return CBM_STORE_OK;
-    }
-
-    exec_sql(s, "BEGIN IMMEDIATE;");
+static int store_upsert_node_batch_loop(cbm_store_t *s, const cbm_node_t *nodes, int count,
+                                        int64_t *out_ids) {
     for (int i = 0; i < count; i++) {
         int64_t id = cbm_store_upsert_node(s, &nodes[i]);
         if (id == CBM_STORE_ERR) {
-            exec_sql(s, "ROLLBACK;");
             return CBM_STORE_ERR;
         }
         if (out_ids) {
             out_ids[i] = id;
         }
     }
-    exec_sql(s, "COMMIT;");
+    return CBM_STORE_OK;
+}
+
+static int store_prepare_node_batch_temp(cbm_store_t *s) {
+    static const char create_sql[] =
+        "CREATE TEMP TABLE IF NOT EXISTS cbm_node_batch_tmp("
+        "seq INTEGER PRIMARY KEY,"
+        "project TEXT NOT NULL,"
+        "label TEXT NOT NULL,"
+        "name TEXT NOT NULL,"
+        "qualified_name TEXT NOT NULL,"
+        "file_path TEXT NOT NULL,"
+        "start_line INTEGER NOT NULL,"
+        "end_line INTEGER NOT NULL,"
+        "properties TEXT NOT NULL);";
+    int rc = exec_sql(s, create_sql);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    return exec_sql(s, "DELETE FROM cbm_node_batch_tmp;");
+}
+
+static int store_fill_node_batch_temp(cbm_store_t *s, const cbm_node_t *nodes, int count) {
+    static const char insert_sql[] =
+        "INSERT INTO cbm_node_batch_tmp"
+        "(seq, project, label, name, qualified_name, file_path, start_line, end_line, properties) "
+        "VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, insert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "fill_node_batch_temp prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < count; i++) {
+        sqlite3_bind_int(stmt, ST_COL_1, i);
+        bind_text(stmt, ST_COL_2, safe_str(nodes[i].project));
+        bind_text(stmt, ST_COL_3, safe_str(nodes[i].label));
+        bind_text(stmt, ST_COL_4, safe_str(nodes[i].name));
+        bind_text(stmt, ST_COL_5, safe_str(nodes[i].qualified_name));
+        bind_text(stmt, ST_COL_6, safe_str(nodes[i].file_path));
+        sqlite3_bind_int(stmt, ST_COL_7, nodes[i].start_line);
+        sqlite3_bind_int(stmt, ST_COL_8, nodes[i].end_line);
+        bind_text(stmt, ST_COL_9, safe_props(nodes[i].properties_json));
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "fill_node_batch_temp");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_collect_node_batch_ids(cbm_store_t *s, int count, int64_t *out_ids) {
+    if (!out_ids) {
+        return CBM_STORE_OK;
+    }
+    static const char select_sql[] =
+        "SELECT t.seq, n.id FROM cbm_node_batch_tmp t "
+        "JOIN nodes n ON n.project = t.project AND n.qualified_name = t.qualified_name "
+        "ORDER BY t.seq;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, select_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "collect_node_batch_ids prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int found = 0;
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int seq = sqlite3_column_int(stmt, 0);
+        int64_t id = sqlite3_column_int64(stmt, SKIP_ONE);
+        if (seq < 0 || seq >= count || id <= 0) {
+            sqlite3_finalize(stmt);
+            store_set_error(s, "collect_node_batch_ids invalid row");
+            return CBM_STORE_ERR;
+        }
+        out_ids[seq] = id;
+        found++;
+    }
+    if (step_rc != SQLITE_DONE || found != count) {
+        if (step_rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "collect_node_batch_ids");
+        } else {
+            store_set_error(s, "collect_node_batch_ids incomplete");
+        }
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+static int store_upsert_node_batch_bulk(cbm_store_t *s, const cbm_node_t *nodes, int count,
+                                        int64_t *out_ids) {
+    int rc = store_prepare_node_batch_temp(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = store_fill_node_batch_temp(s, nodes, count);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    static const char upsert_sql[] =
+        "INSERT INTO nodes(project, label, name, qualified_name, file_path, start_line, end_line, "
+        "properties) "
+        "SELECT project, label, name, qualified_name, file_path, start_line, end_line, properties "
+        "FROM cbm_node_batch_tmp WHERE true ORDER BY seq "
+        "ON CONFLICT(project, qualified_name) DO UPDATE SET "
+        "label=excluded.label, name=excluded.name, file_path=excluded.file_path, "
+        "start_line=excluded.start_line, end_line=excluded.end_line, "
+        "properties=excluded.properties;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, upsert_sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "upsert_node_batch_bulk prepare");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_node_batch_bulk");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    return store_collect_node_batch_ids(s, count, out_ids);
+}
+
+int cbm_store_upsert_node_batch_in_transaction(cbm_store_t *s, const cbm_node_t *nodes,
+                                               int count, int64_t *out_ids) {
+    if (count == 0) {
+        return CBM_STORE_OK;
+    }
+    if (!s || !s->db || !nodes || count < 0) {
+        return CBM_STORE_ERR;
+    }
+    if (out_ids) {
+        memset(out_ids, 0, (size_t)count * sizeof(*out_ids));
+    }
+    if (count >= ST_NODE_BATCH_BULK_MIN) {
+        return store_upsert_node_batch_bulk(s, nodes, count, out_ids);
+    }
+    return store_upsert_node_batch_loop(s, nodes, count, out_ids);
+}
+
+int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int count,
+                                int64_t *out_ids) {
+    if (count == 0) {
+        return CBM_STORE_OK;
+    }
+    if (!s || !s->db || !nodes || count < 0) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_begin(s);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = cbm_store_upsert_node_batch_in_transaction(s, nodes, count, out_ids);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
+    rc = cbm_store_commit(s);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_rollback(s);
+        return rc;
+    }
     return CBM_STORE_OK;
 }
 

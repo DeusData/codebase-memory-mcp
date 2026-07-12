@@ -467,6 +467,10 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n);
 int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int count,
                                 int64_t *out_ids);
 
+/* Upsert nodes inside a transaction owned by the caller. */
+int cbm_store_upsert_node_batch_in_transaction(cbm_store_t *s, const cbm_node_t *nodes,
+                                               int count, int64_t *out_ids);
+
 /* Find node by primary key. Returns CBM_STORE_OK or CBM_STORE_NOT_FOUND. */
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out);
 
