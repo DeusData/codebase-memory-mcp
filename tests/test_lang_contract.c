@@ -24,6 +24,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -1495,7 +1496,9 @@ TEST(contract_edge_parallel_service_edges) {
         {"gql.py", "def gql(query_string):\n    return query_string\n"},
         {"client.py",
          "from gql import gql\n\n\ndef fetch_user():\n"
-         "    return gql(\"query GetUser { user { id name } }\")\n\n\n"
+         /* The embedded quote makes GRAPHQL_CALLS properties invalid JSON unless
+          * the parser-derived operation is escaped before interpolation. */
+         "    return gql(\"\"\"query GetUser {\n  user(name: \"quoted\") { id name }\n}\"\"\")\n\n\n"
          "def create_user():\n"
          "    return gql(\"mutation CreateUser { addUser(name: \\\"x\\\") { id } }\")\n"},
         /* TRPC_CALLS: local createTRPCProxyClient (same-module resolution). */
@@ -1536,6 +1539,19 @@ TEST(contract_edge_parallel_service_edges) {
     int grpc = store ? cbm_store_count_edges_by_type(store, lp.project, "GRPC_CALLS") : -1;
     int trpc = store ? cbm_store_count_edges_by_type(store, lp.project, "TRPC_CALLS") : -1;
     int infra = store ? cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS") : -1;
+    int invalid_props = -1;
+    if (store) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3 *db = cbm_store_get_db(store);
+        if (db && sqlite3_prepare_v2(db,
+                                    "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                    "AND properties != '' AND json_valid(properties)=0;",
+                                    -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            invalid_props = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
     if (graphql < 1 || grpc < 1 || trpc < 1 || infra < 1) {
         fprintf(stderr,
                 "  [EDGE] parallel-service: GRAPHQL_CALLS=%d GRPC_CALLS=%d TRPC_CALLS=%d "
@@ -1548,6 +1564,7 @@ TEST(contract_edge_parallel_service_edges) {
     ASSERT_TRUE(grpc >= 1);
     ASSERT_TRUE(trpc >= 1);
     ASSERT_TRUE(infra >= 1);
+    ASSERT_EQ(invalid_props, 0);
     PASS();
 }
 
