@@ -792,6 +792,10 @@
                 <p>Trace callers and callees across files and packages with import-aware, type-inferred resolution. BFS traversal up to depth 5.</p>
             </div>
             <div class="feature">
+                <h3>Source-first BM25 search</h3>
+                <p>Natural-language graph search softly prioritizes source files over equivalent test and vendored/generated hits without hiding them. Results expose their source scope, and bounded candidate-window counts are explicit.</p>
+            </div>
+            <div class="feature">
                 <h3>Dead-code detection</h3>
                 <p>Find functions with zero callers, with smart filtering that excludes entry points like route handlers, <code>main()</code>, and framework decorators.</p>
             </div>
