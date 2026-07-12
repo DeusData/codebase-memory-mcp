@@ -5,8 +5,9 @@
 #include "extract_unified.h"
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
-#include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include "service_patterns.h" // cbm_service_pattern_route_method (#952)
+#include "tree_sitter/api.h"  // TSNode, ts_node_*
+#include <stdint.h>           // uint32_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -463,7 +464,8 @@ static char *extract_scripting_callee(CBMArena *a, TSNode node, const char *sour
         if (ts_node_is_null(func_node)) {
             func_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
         }
-        return ts_node_is_null(func_node) ? NULL : cbm_node_text(a, func_node, source);
+        char *pn = ts_node_is_null(func_node) ? NULL : cbm_node_text(a, func_node, source);
+        return pn;
     }
     if (lang == CBM_LANG_KOTLIN && ts_node_child_count(node) > 0) {
         return cbm_node_text(a, ts_node_child(node, 0), source);
@@ -1194,6 +1196,126 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
 }
 
 // Extract callee name from a call node
+/* #952: compose Laravel group prefixes into a route path. Walks UP from a
+ * route-registration call: every enclosing anonymous function that is the
+ * argument of a `->group(...)` member call contributes the `prefix('...')`
+ * (or `Route::prefix('...')`) found on that group call's receiver chain.
+ * Chain methods that don't shape the path (middleware, name, as, domain)
+ * are skipped. Outer groups accumulate before inner ones; nested groups
+ * compose left-to-right. Returns the composed path (arena) or NULL when no
+ * enclosing group carries a prefix. */
+enum { PHP_GROUP_WALK_MAX = 64, PHP_PREFIX_PARTS_MAX = 8 };
+
+static const char *php_chain_prefix_arg(CBMArena *a, TSNode call_node, const char *source) {
+    /* call_node is a member_call_expression / scoped_call_expression whose
+     * name is `prefix`; return its first string argument (unquoted). */
+    TSNode args = ts_node_child_by_field_name(call_node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        TSNode inner = arg;
+        if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
+            inner = ts_node_named_child(arg, 0);
+        }
+        if (strcmp(ts_node_type(inner), "string") == 0 ||
+            strcmp(ts_node_type(inner), "encapsed_string") == 0) {
+            char *txt = cbm_node_text(a, inner, source);
+            if (txt && txt[0]) {
+                size_t len = strlen(txt);
+                if (len >= 2 && (txt[0] == '\'' || txt[0] == '"')) {
+                    txt[len - 1] = '\0';
+                    txt++;
+                }
+                return txt[0] ? txt : NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const char *source) {
+    const char *parts[PHP_PREFIX_PARTS_MAX];
+    int part_count = 0;
+    TSNode cur = ts_node_parent(node);
+    for (int depth = 0; depth < PHP_GROUP_WALK_MAX && !ts_node_is_null(cur); depth++) {
+        if (strcmp(ts_node_type(cur), "anonymous_function") == 0 ||
+            strcmp(ts_node_type(cur), "arrow_function") == 0) {
+            /* Is this closure the argument of a ->group(...) call? Walk to
+             * the enclosing call and check its method name. */
+            TSNode p = ts_node_parent(cur);
+            while (!ts_node_is_null(p) && strcmp(ts_node_type(p), "member_call_expression") != 0 &&
+                   strcmp(ts_node_type(p), "scoped_call_expression") != 0) {
+                if (strcmp(ts_node_type(p), "statement") == 0 ||
+                    strcmp(ts_node_type(p), "expression_statement") == 0) {
+                    break; /* left the argument position */
+                }
+                p = ts_node_parent(p);
+            }
+            if (!ts_node_is_null(p) && (strcmp(ts_node_type(p), "member_call_expression") == 0 ||
+                                        strcmp(ts_node_type(p), "scoped_call_expression") == 0)) {
+                TSNode gname = ts_node_child_by_field_name(p, TS_FIELD("name"));
+                char *gtxt = ts_node_is_null(gname) ? NULL : cbm_node_text(a, gname, source);
+                if (gtxt && strcmp(gtxt, "group") == 0) {
+                    /* Scan the receiver chain for prefix('...'). */
+                    TSNode recv = ts_node_child_by_field_name(p, TS_FIELD("object"));
+                    for (int hops = 0; hops < PHP_GROUP_WALK_MAX && !ts_node_is_null(recv);
+                         hops++) {
+                        const char *rk = ts_node_type(recv);
+                        if (strcmp(rk, "member_call_expression") == 0 ||
+                            strcmp(rk, "scoped_call_expression") == 0) {
+                            TSNode rname = ts_node_child_by_field_name(recv, TS_FIELD("name"));
+                            char *rtxt =
+                                ts_node_is_null(rname) ? NULL : cbm_node_text(a, rname, source);
+                            if (rtxt && strcmp(rtxt, "prefix") == 0) {
+                                const char *pf = php_chain_prefix_arg(a, recv, source);
+                                if (pf && part_count < PHP_PREFIX_PARTS_MAX) {
+                                    parts[part_count++] = pf; /* inner-first */
+                                }
+                                break;
+                            }
+                            recv = ts_node_child_by_field_name(recv, TS_FIELD("object"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        cur = ts_node_parent(cur);
+    }
+    if (part_count == 0) {
+        return NULL;
+    }
+    /* parts[] is inner-first; compose outer-first. Ensure exactly one '/'
+     * between segments and a leading '/'. */
+    char buf[CBM_SZ_256];
+    size_t pos = 0;
+    for (int i = part_count - 1; i >= 0; i--) {
+        const char *seg = parts[i];
+        while (*seg == '/') {
+            seg++;
+        }
+        size_t sl = strlen(seg);
+        if (sl == 0) {
+            continue;
+        }
+        if (pos + sl + 2 >= sizeof(buf)) {
+            return NULL; /* oversized — leave path un-prefixed */
+        }
+        buf[pos++] = '/';
+        memcpy(buf + pos, seg, sl);
+        pos += sl;
+        while (pos > 1 && buf[pos - 1] == '/') {
+            pos--; /* strip trailing slash per segment */
+        }
+    }
+    buf[pos] = '\0';
+    return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
+}
+
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang) {
     // Lean 4: skip type-position applies
     if (lang == CBM_LANG_LEAN && strcmp(ts_node_type(node), "apply") == 0) {
@@ -1232,6 +1354,31 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
                 char *rt = cbm_node_text(a, recv, source);
                 if (rt && rt[0]) {
                     return rt;
+                }
+            }
+        }
+    }
+
+    /* #952: PHP facade route registrations (`Route::get(...)`, a
+     * scoped_call_expression) must carry the scope in the callee text — the
+     * empty-resolution route fallback keys on the "::get" suffix table, and
+     * the bare "get" that generic field resolution would return deliberately
+     * never matches (every $obj->get() would become a route). Runs BEFORE
+     * field-based resolution, which short-circuits on the `name` field.
+     * Gated to the literal `Route` scope AND a route-method match: any other
+     * scope (Cache::get) would suffix-match "::get" too and mint junk routes
+     * from slash-prefixed keys. Known limitation: aliased facade imports are
+     * not recognized. */
+    if (lang == CBM_LANG_PHP && strcmp(ts_node_type(node), "scoped_call_expression") == 0) {
+        TSNode scope = ts_node_child_by_field_name(node, TS_FIELD("scope"));
+        TSNode mname = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        if (!ts_node_is_null(scope) && !ts_node_is_null(mname)) {
+            char *sc = cbm_node_text(a, scope, source);
+            char *mn = cbm_node_text(a, mname, source);
+            if (sc && mn && strcmp(sc, "Route") == 0) {
+                char *qual = cbm_arena_sprintf(a, "%s::%s", sc, mn);
+                if (qual && cbm_service_pattern_route_method(qual) != NULL) {
+                    return qual;
                 }
             }
         }
@@ -1948,6 +2095,24 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
+                /* #952: routes registered inside Laravel `prefix()->group()`
+                 * closures must carry the composed path — the resolve passes
+                 * only see the flat CBMCall, so the enclosing chain can only
+                 * be read here where the AST still exists. */
+                if (ctx->language == CBM_LANG_PHP && call.first_string_arg &&
+                    call.first_string_arg[0] == '/' && call.callee_name &&
+                    cbm_service_pattern_route_method(call.callee_name) != NULL) {
+                    const char *gp = php_group_prefix_for_call(ctx->arena, node, ctx->source);
+                    if (gp && gp[0]) {
+                        const char *rel = call.first_string_arg;
+                        while (*rel == '/') {
+                            rel++;
+                        }
+                        call.first_string_arg =
+                            rel[0] ? cbm_arena_sprintf(ctx->arena, "%s/%s", gp, rel)
+                                   : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
+                    }
+                }
                 if (call.first_string_arg && call.first_string_arg[0] == '/') {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
