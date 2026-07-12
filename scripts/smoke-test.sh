@@ -977,22 +977,39 @@ fi
 echo "OK 8d: Claude Code PreToolUse hook (matcher=Grep|Glob|Read)"
 
 # 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
-if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
-  GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate"
-  if [ ! -x "$GATE_SCRIPT" ]; then
-    echo "FAIL 8e: shim script not executable or missing"
-    exit 1
-  fi
-  if grep -q 'exit 2' "$GATE_SCRIPT"; then
-    echo "FAIL 8e: shim contains 'exit 2' — must never block"
-    exit 1
-  fi
-  if ! grep -q 'hook-augment' "$GATE_SCRIPT"; then
-    echo "FAIL 8e: shim missing 'hook-augment' delegation"
-    exit 1
-  fi
-  echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
+# #929: Windows installs a .cmd script (extensionless bash shims triggered the
+# Open-With dialog); the old `!= "MINGW64_NT"` gate never matched the real
+# uname (MINGW64_NT-10.0-...), so this check silently ran the POSIX branch on
+# Windows. Branch by platform prefix instead.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate.cmd"
+    if [ ! -f "$GATE_SCRIPT" ]; then
+      echo "FAIL 8e: .cmd shim missing on Windows"
+      exit 1
+    fi
+    if [ -f "$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate" ]; then
+      echo "FAIL 8e: legacy extensionless shim still installed on Windows"
+      exit 1
+    fi
+    ;;
+  *)
+    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate"
+    if [ ! -x "$GATE_SCRIPT" ]; then
+      echo "FAIL 8e: shim script not executable or missing"
+      exit 1
+    fi
+    ;;
+esac
+if grep -q 'exit 2' "$GATE_SCRIPT"; then
+  echo "FAIL 8e: shim contains 'exit 2' — must never block"
+  exit 1
 fi
+if ! grep -q 'hook-augment' "$GATE_SCRIPT"; then
+  echo "FAIL 8e: shim missing 'hook-augment' delegation"
+  exit 1
+fi
+echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
 
 # 8f-8h: Codex TOML
 if ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$FAKE_HOME/.codex/config.toml"; then
