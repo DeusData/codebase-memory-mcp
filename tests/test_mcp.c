@@ -1634,6 +1634,105 @@ TEST(tool_search_graph_accepts_project_name_alias_issue640) {
     PASS();
 }
 
+/* #1025: agents pass the repo FOLDER name ("codebase-memory-mcp"), but
+ * indexed project names derive from the full path
+ * (E:\project\graph\x -> "E-project-graph-x"), so exact lookup fails with
+ * "project not found" while list_projects clearly shows the project. A
+ * passed name that matches exactly ONE indexed project as a segment-aligned
+ * tail ("-<name>" suffix) must resolve to it; zero or several matches keep
+ * the existing error. Runs against real cache-dir .db files (the resolution
+ * scans filenames), so this test indexes real fixtures under an overridden
+ * CBM_CACHE_DIR. */
+static void i1025_write_repo(const char *dir, const char *fn_name) {
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/mod.py", dir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "def %s(x):\n    return x + 1\n", fn_name);
+    fclose(f);
+}
+
+TEST(tool_project_arg_resolves_unique_tail_issue1025) {
+    char repo_a[CBM_SZ_256];
+    char repo_b[CBM_SZ_256];
+    char repo_c[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo_a, sizeof(repo_a), "/tmp/cbm-i1025a-XXXXXX");
+    snprintf(repo_b, sizeof(repo_b), "/tmp/cbm-i1025b-XXXXXX");
+    snprintf(repo_c, sizeof(repo_c), "/tmp/cbm-i1025c-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i1025d-XXXXXX");
+    if (!cbm_mkdtemp(repo_a) || !cbm_mkdtemp(repo_b) || !cbm_mkdtemp(repo_c) ||
+        !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    i1025_write_repo(repo_a, "unique_tail_target");
+    i1025_write_repo(repo_b, "amb_one");
+    i1025_write_repo(repo_c, "amb_two");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"name\":\"E-project-graph-suffix1025\"}", repo_a);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"F-alpha-amb1025\"}", repo_b);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"G-beta-amb1025\"}", repo_c);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* 1. Unique tail resolves (RED today: "project not found"). */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"suffix1025\",\"name_pattern\":\".*target.*\"}");
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1025] FAIL unique tail did not resolve: %.200s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "unique_tail_target"));
+    free(r);
+
+    /* 2. Ambiguous tail stays an error (never guess between projects). */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"amb1025\",\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    /* 3. Exact full name keeps working unchanged. */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"E-project-graph-suffix1025\","
+                            "\"name_pattern\":\".*target.*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo_a);
+    th_rmtree(repo_b);
+    th_rmtree(repo_c);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -5679,6 +5778,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
+    RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

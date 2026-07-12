@@ -840,6 +840,67 @@ static char *normalize_project_arg(char *project) {
     return project;
 }
 
+/* Forward decls — defined below alongside store resolution. */
+static const char *cache_dir(char *buf, size_t bufsz);
+static bool is_project_db_file(const char *name, size_t len);
+bool cbm_validate_project_name(const char *project);
+
+/* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
+ * but indexed project names derive from the full path
+ * (E:\project\graph\x -> "E-project-graph-x"), so the exact lookup fails
+ * while list_projects clearly shows the project. When no <project>.db exists,
+ * scan cache-dir FILENAMES for a segment-aligned tail match ("-<project>.db"):
+ * exactly one match adopts the full name; zero or several keep the original so
+ * the existing not-found error (which lists all candidates) fires. Filename-
+ * level only — internal-name drift stays #704's fallback in resolve_store. */
+static char *resolve_project_tail(char *project) {
+    if (!project || !cbm_validate_project_name(project)) {
+        return project;
+    }
+    char dir[CBM_SZ_1K];
+    cache_dir(dir, sizeof(dir));
+    char exact[CBM_SZ_2K];
+    snprintf(exact, sizeof(exact), "%s/%s.db", dir, project);
+    if (cbm_file_exists(exact)) {
+        return project; /* exact name — untouched fast path */
+    }
+    size_t plen = strlen(project);
+    char match[CBM_SZ_1K] = "";
+    int matches = 0;
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return project;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        size_t stem_len = len - MCP_DB_EXT; /* strip ".db" */
+        if (stem_len <= plen + 1 || stem_len >= sizeof(match)) {
+            continue;
+        }
+        if (n[stem_len - plen - 1] != '-' || strncmp(n + stem_len - plen, project, plen) != 0) {
+            continue;
+        }
+        matches++;
+        if (matches > 1) {
+            break; /* ambiguous — keep the original name */
+        }
+        memcpy(match, n, stem_len);
+        match[stem_len] = '\0';
+    }
+    cbm_closedir(d);
+    if (matches == 1) {
+        cbm_log_info("mcp.project_tail_resolved", "passed", project, "resolved", match);
+        free(project);
+        return heap_strdup(match);
+    }
+    return project;
+}
+
 /* Resolve the project argument, accepting the canonical "project" key plus the
  * aliases a caller naturally reaches for (#640): list_projects surfaces the
  * field as "name" and the not-found hint says "pass the project name", so
@@ -857,7 +918,7 @@ static char *get_project_arg(const char *args_json) {
     if (!p) {
         p = cbm_mcp_get_string_arg(args_json, "projectName");
     }
-    return normalize_project_arg(p);
+    return resolve_project_tail(normalize_project_arg(p));
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
