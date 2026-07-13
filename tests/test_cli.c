@@ -6455,7 +6455,7 @@ TEST(cli_mcp_installers_preserve_foreign_same_name_entries) {
 TEST(cli_installer_rejects_symlinked_agent_roots) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX symlink parent-chain contract");
-#endif
+#else
     char tmpdir[256];
     char qoder_target[256];
     char junie_target[256];
@@ -6509,6 +6509,7 @@ TEST(cli_installer_rejects_symlinked_agent_roots) {
     if (!refused)
         FAIL("installer must not follow symlinked agent roots outside the selected home");
     PASS();
+#endif
 }
 
 TEST(cli_claude_hook_scripts_shell_quote_binary_path) {
@@ -7371,7 +7372,11 @@ TEST(cli_uninstall_removes_claude_hook_scripts) {
         char path[640];
         struct stat state;
         snprintf(path, sizeof(path), "%s/hooks/%s", config_dir, names[i]);
+#ifdef _WIN32
+        removed = removed && stat(path, &state) != 0;
+#else
         removed = removed && lstat(path, &state) != 0;
+#endif
     }
 
     restore_test_env("HOME", saved_home);
