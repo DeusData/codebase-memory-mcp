@@ -1401,13 +1401,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         _rc_t0 = extract_now_ns();
         const cbm_gbuf_node_t *lsp_target = NULL;
+        bool lsp_target_unindexed = false;
         if (lsp) {
             /* Canonicalise to the gbuf node's QN so res.qualified_name matches
              * the gbuf even when the cross-file fallback had to prefix the
-             * project name. If neither lookup hits, leave res.qualified_name
-             * empty — the LSP was confident but its target isn't in the gbuf
-             * (external/unindexed), so drop the edge rather than fall back to
-             * the registry resolver, matching prior single-lookup semantics. */
+             * project name. A missing graph target may be an external symbol
+             * or an internal declaration QN whose canonical definition has a
+             * different QN, so the shared registry fallback and containment
+             * guard below must classify it exactly as the sequential route. */
             lsp_target =
                 cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name, lsp->callee_qn);
             if (lsp_target) {
@@ -1416,8 +1417,11 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 res.confidence = (double)lsp->confidence;
                 res.candidate_count = 1;
                 ws->lsp_overrides++;
+            } else {
+                lsp_target_unindexed = true;
             }
-        } else {
+        }
+        if (!lsp || lsp_target_unindexed) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
@@ -1429,6 +1433,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                          source_node->id);
         atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+
+        if (lsp_target_unindexed && !cbm_lsp_resolution_targets_project(lsp, rc->project_name) &&
+            cbm_registry_strategy_is_weak_short_name(res.strategy) &&
+            !cbm_registry_is_import_reachable(res.qualified_name, imp_vals, imp_count)) {
+            continue;
+        }
 
         /* Perl call-graph noise guard (#476), mirroring the sequential pass
          * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/

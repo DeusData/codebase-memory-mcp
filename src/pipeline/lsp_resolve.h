@@ -294,4 +294,27 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
     return cbm_gbuf_find_by_qn(gbuf, buf);
 }
 
+/* Whether an unresolved LSP target is explicitly inside the indexed project.
+ *
+ * Cross-file registries can resolve a declaration to a project-qualified QN
+ * that is not itself a graph node. C/C++ forward declarations are the common
+ * case: the declaration QN belongs to the caller translation unit while the
+ * canonical definition node belongs to another file. In that case the textual
+ * registry resolver remains a valid canonical-definition fallback.
+ *
+ * Unqualified targets are deliberately not assumed to be internal. Python and
+ * other language resolvers use those QNs for third-party libraries (for example
+ * starlette.routing.Route), where a weak short-name fallback would manufacture
+ * a project edge. Explicit `external.*` targets are also excluded naturally.
+ */
+static inline bool cbm_lsp_resolution_targets_project(const CBMResolvedCall *resolution,
+                                                      const char *project_name) {
+    if (!resolution || !resolution->callee_qn || !project_name || !project_name[0]) {
+        return false;
+    }
+    size_t project_len = strlen(project_name);
+    return strncmp(resolution->callee_qn, project_name, project_len) == 0 &&
+           resolution->callee_qn[project_len] == '.';
+}
+
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */
