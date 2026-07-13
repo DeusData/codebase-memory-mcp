@@ -49,6 +49,21 @@ static char *security_read_file(const char *path) {
     return content;
 }
 
+static void security_normalize_crlf(char *content) {
+    if (!content) {
+        return;
+    }
+    char *read_cursor = content;
+    char *write_cursor = content;
+    while (*read_cursor) {
+        if (read_cursor[0] == '\r' && read_cursor[1] == '\n') {
+            read_cursor++;
+        }
+        *write_cursor++ = *read_cursor++;
+    }
+    *write_cursor = '\0';
+}
+
 TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed) {
     FILE *checksums = fopen("scripts/vendored-checksums.txt", "r");
     ASSERT_NOT_NULL(checksums);
@@ -68,6 +83,7 @@ TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed) {
 
     char *script = security_read_file("scripts/security-vendored.sh");
     ASSERT_NOT_NULL(script);
+    security_normalize_crlf(script);
     ASSERT_NOT_NULL(strstr(script, "MISSING=$((MISSING + 1))\n        CONTENT_DRIFT=1"));
     ASSERT_NOT_NULL(
         strstr(script,

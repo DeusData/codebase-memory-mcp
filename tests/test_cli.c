@@ -30,7 +30,7 @@
 
 /* Helper: create a file with content */
 static int write_test_file(const char *path, const char *content) {
-    FILE *f = fopen(path, "w");
+    FILE *f = cbm_fopen(path, "wb");
     if (!f)
         return -1;
     fprintf(f, "%s", content);
