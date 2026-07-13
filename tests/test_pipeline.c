@@ -8094,6 +8094,58 @@ TEST(pipeline_external_lsp_target_suppresses_suffix_fallback) {
     PASS();
 }
 
+TEST(pipeline_internal_lsp_declaration_keeps_canonical_registry_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Function", "run", "proj.main.run", "main.c", 1, 10, "{}");
+    int64_t target_id =
+        cbm_gbuf_upsert_node(gb, "Function", "add", "proj.util.add", "util.c", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_registry_add(reg, "add", "proj.util.add", "Function");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "add", .enclosing_func_qn = "proj.main.run", .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMResolvedCall resolved = {.caller_qn = "proj.main.run",
+                                .callee_qn = "proj.main.add",
+                                .strategy = "lsp_direct",
+                                .confidence = 0.95f};
+    cbm_resolvedcall_push(&result.resolved_calls, &result.arena, resolved);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {
+        {.path = "/tmp/proj/main.c", .rel_path = "main.c", .language = CBM_LANG_C}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0]->target_id, target_id);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(pipeline_python_file_self_call_suppresses_weak_suffix_fallback) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     cbm_registry_t *reg = cbm_registry_new();
@@ -15927,6 +15979,7 @@ SUITE(pipeline) {
     RUN_TEST(registry_confidence_suffix_match);
     RUN_TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback);
     RUN_TEST(pipeline_external_lsp_target_suppresses_suffix_fallback);
+    RUN_TEST(pipeline_internal_lsp_declaration_keeps_canonical_registry_fallback);
     RUN_TEST(pipeline_python_file_self_call_suppresses_weak_suffix_fallback);
     RUN_TEST(pipeline_python_file_dotted_call_suppresses_weak_suffix_fallback);
     RUN_TEST(pipeline_python_file_dotted_call_keeps_import_reachable_suffix_fallback);
