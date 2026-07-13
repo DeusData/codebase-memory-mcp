@@ -32,6 +32,17 @@
 #include <math.h>
 #include <unistd.h>
 
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || \
+    __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define TF_SANITIZER_ACTIVE 1
+#else
+#define TF_SANITIZER_ACTIVE 0
+#endif
+
 /* Resolve the on-disk cache dir — honors the CBM_CACHE_DIR env var (used by the
  * test runner to isolate each run into a per-run temp dir) and otherwise falls
  * back to ~/.cache/codebase-memory-mcp. Defined in foundation/platform.c.

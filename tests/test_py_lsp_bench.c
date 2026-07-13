@@ -217,8 +217,13 @@ static double elapsed_ms(struct timespec t0, struct timespec t1) {
     return s * 1000.0 + ns / 1000000.0;
 }
 
+enum {
+    PYLSP_BENCH_NATIVE_MAX_ELAPSED_MS = 150,
+    PYLSP_BENCH_SANITIZER_MAX_ELAPSED_MS = 1500,
+};
+
 TEST(pylsp_bench_resolution_ratio) {
-    /* Perf benchmark: time-budgeted. Under ASan+UBSan the budget is scaled up
+    /* Perf benchmark: time-budgeted. Under sanitizer instrumentation the budget is scaled up
      * (see the sanitizer-aware budget below) and the result is freed before
      * asserting so a budget miss doesn't leak. */
     int slen = (int)strlen(bench_source);
@@ -255,14 +260,12 @@ TEST(pylsp_bench_resolution_ratio) {
         ASSERT_GTE(resolved * 2, calls);
     }
 
-    /* Time budget. ASan+UBSan instrumentation slows the parse ~5-10×, so
-     * scale the budget when a sanitizer is active. Native: 150 ms for a
-     * ~200-line fixture; sanitized: 1500 ms. */
-#ifdef __SANITIZE_ADDRESS__
-    ASSERT(ms < 1500.0);
-#else
-    ASSERT(ms < 150.0);
-#endif
+    /* Instrumentation changes wall-clock cost without changing the native
+     * regression ceiling. Keep both budgets explicit and shared sanitizer
+     * detection portable across GCC and Clang. */
+    const double max_elapsed_ms = TF_SANITIZER_ACTIVE ? PYLSP_BENCH_SANITIZER_MAX_ELAPSED_MS
+                                                      : PYLSP_BENCH_NATIVE_MAX_ELAPSED_MS;
+    ASSERT(ms < max_elapsed_ms);
     PASS();
 }
 
