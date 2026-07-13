@@ -48,6 +48,33 @@ case "$SOAK_RSS_MAX_MB" in
         ;;
 esac
 
+SOAK_IDLE_SECONDS="${CBM_SOAK_IDLE_SECONDS:-30}"
+SOAK_IDLE_CPU_MAX_PERCENT="${CBM_SOAK_IDLE_CPU_MAX_PERCENT:-5}"
+SOAK_RESPONSE_TIMEOUT_SECONDS="${CBM_SOAK_RESPONSE_TIMEOUT_SECONDS:-60}"
+for positive_setting in "$SOAK_IDLE_SECONDS" "$SOAK_RESPONSE_TIMEOUT_SECONDS"; do
+    case "$positive_setting" in
+        ''|*[!0-9]*)
+            echo "CBM_SOAK_IDLE_SECONDS and CBM_SOAK_RESPONSE_TIMEOUT_SECONDS must be integers" >&2
+            exit 2
+            ;;
+    esac
+done
+if [ "$SOAK_IDLE_SECONDS" -eq 0 ] || [ "$SOAK_RESPONSE_TIMEOUT_SECONDS" -eq 0 ]; then
+    echo "CBM_SOAK_IDLE_SECONDS and CBM_SOAK_RESPONSE_TIMEOUT_SECONDS must be positive" >&2
+    exit 2
+fi
+case "$SOAK_IDLE_CPU_MAX_PERCENT" in
+    ''|*[!0-9]*)
+        echo "CBM_SOAK_IDLE_CPU_MAX_PERCENT must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+
+DIAGNOSTICS_REFRESH_ATTEMPTS=20
+DIAGNOSTICS_REFRESH_POLL_SECONDS=0.5
+MILLISECONDS_PER_SECOND=1000
+CPU_PERCENT_SCALE=100
+
 RESULTS_DIR="${CBM_SOAK_RESULTS_DIR:-soak-results}"
 mkdir -p "$RESULTS_DIR"
 
@@ -131,6 +158,10 @@ cleanup_runtime() {
 trap cleanup_runtime EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+# Convert writes to a closed server pipe into ordinary command failures. Each
+# protocol write is checked below so a dead server is reported without the
+# harness itself being terminated by SIGPIPE.
+trap '' PIPE
 
 echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m mode=${CBM_SOAK_MODE} ==="
 
@@ -316,7 +347,8 @@ mcp_call() {
 
     local resp=""
     local status=1
-    if read -r -t 30 resp <&4 2>/dev/null && response_is_success "$resp"; then
+    if read -r -t "$SOAK_RESPONSE_TIMEOUT_SECONDS" resp <&4 2>/dev/null &&
+        response_is_success "$resp"; then
         status=0
     fi
     LAST_MCP_RESPONSE="$resp"
@@ -336,6 +368,15 @@ run_mcp_call() {
     if ! mcp_call "$@"; then
         PASS=false
     fi
+}
+
+require_server_running() {
+    local phase_name="$1"
+    if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        return 0
+    fi
+    echo "FAIL: server exited during $phase_name" >&2
+    return 1
 }
 
 mcp_initialize() {
@@ -377,6 +418,23 @@ print(f\"{d.get('uptime_s',0)},{d.get('rss_bytes',0)},{mem},{d.get('fd_count',0)
     return 1
 }
 
+read_idle_cpu_sample() {
+    if [ -z "$DIAG_FILE" ] || [ ! -f "$DIAG_FILE" ]; then
+        return 1
+    fi
+    python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+uptime_s = d.get("uptime_s")
+user_cpu_ms = d.get("process_user_cpu_ms")
+system_cpu_ms = d.get("process_system_cpu_ms")
+if not all(isinstance(value, int) and value >= 0
+           for value in (uptime_s, user_cpu_ms, system_cpu_ms)):
+    raise SystemExit(1)
+print(f"{uptime_s},{user_cpu_ms + system_cpu_ms}")
+' < "$DIAG_FILE" 2>/dev/null
+}
+
 extract_index_project() {
     python3 -c '
 import json, sys
@@ -394,7 +452,12 @@ raise SystemExit(1)
 }
 
 start_server() {
-    CBM_DIAGNOSTICS=1 "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$SERVER_STDERR" &
+    # This harness drives explicit index_repository calls against its isolated
+    # fixture. Disable the product's configured session-CWD auto-index so an
+    # unrelated checkout cannot contend for the global pipeline lock or pollute
+    # the soak cache and idle-resource measurements.
+    CBM_AUTO_INDEX=false CBM_DIAGNOSTICS=1 \
+        "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$SERVER_STDERR" &
     SERVER_PID=$!
     DIAG_FILE="$DIAG_DIR/cbm-diagnostics-${SERVER_PID}.json"
     DIAG_FILES+=("$DIAG_FILE")
@@ -433,6 +496,9 @@ if ! mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"; then
     exit 1
 fi
 sleep 6  # wait for diagnostics write
+if ! require_server_running "initial indexing"; then
+    exit 1
+fi
 if ! collect_snapshot; then
     echo "FAIL: initial diagnostics snapshot was unavailable" >&2
     exit 1
@@ -503,16 +569,60 @@ done
 
 # ── Phase 4: Idle period + final snapshot ────────────────────────
 
-echo "--- Phase 4: idle (30s) ---"
-sleep 30
+echo "--- Phase 4: idle (${SOAK_IDLE_SECONDS}s) ---"
+IDLE_CPU="0"
+IDLE_OBSERVED_SECONDS=0
+IDLE_START_SAMPLE=""
+if ! IDLE_START_SAMPLE=$(read_idle_cpu_sample); then
+    echo "FAIL: idle CPU baseline diagnostics were unavailable" >&2
+    PASS=false
+fi
+
+sleep "$SOAK_IDLE_SECONDS"
+
+IDLE_END_SAMPLE=""
+if [ -n "$IDLE_START_SAMPLE" ]; then
+    IDLE_START_UPTIME=${IDLE_START_SAMPLE%%,*}
+    IDLE_START_CPU_MS=${IDLE_START_SAMPLE#*,}
+    IDLE_TARGET_UPTIME=$((IDLE_START_UPTIME + SOAK_IDLE_SECONDS))
+    for ((attempt = 0; attempt < DIAGNOSTICS_REFRESH_ATTEMPTS; attempt++)); do
+        if candidate_sample=$(read_idle_cpu_sample); then
+            candidate_uptime=${candidate_sample%%,*}
+            if [ "$candidate_uptime" -ge "$IDLE_TARGET_UPTIME" ]; then
+                IDLE_END_SAMPLE=$candidate_sample
+                break
+            fi
+        fi
+        sleep "$DIAGNOSTICS_REFRESH_POLL_SECONDS"
+    done
+fi
+
+if [ -z "$IDLE_END_SAMPLE" ]; then
+    echo "FAIL: idle CPU completion diagnostics were unavailable" >&2
+    PASS=false
+else
+    IDLE_END_UPTIME=${IDLE_END_SAMPLE%%,*}
+    IDLE_END_CPU_MS=${IDLE_END_SAMPLE#*,}
+    IDLE_OBSERVED_SECONDS=$((IDLE_END_UPTIME - IDLE_START_UPTIME))
+    IDLE_PROCESS_CPU_MS=$((IDLE_END_CPU_MS - IDLE_START_CPU_MS))
+    if [ "$IDLE_OBSERVED_SECONDS" -le 0 ] || [ "$IDLE_PROCESS_CPU_MS" -lt 0 ]; then
+        echo "FAIL: idle CPU diagnostics were not monotonic" >&2
+        PASS=false
+    else
+        IDLE_CPU=$(awk -v cpu_ms="$IDLE_PROCESS_CPU_MS" \
+            -v wall_s="$IDLE_OBSERVED_SECONDS" \
+            -v ms_per_s="$MILLISECONDS_PER_SECOND" \
+            -v percent_scale="$CPU_PERCENT_SCALE" \
+            'BEGIN { printf "%.1f", (cpu_ms / (wall_s * ms_per_s)) * percent_scale }')
+    fi
+fi
+
 if ! collect_snapshot; then
     echo "FAIL: final diagnostics snapshot was unavailable" >&2
     PASS=false
 fi
 
-# Check idle CPU
-IDLE_CPU=$(ps -o %cpu= -p "$SERVER_PID" 2>/dev/null | tr -d ' ' || echo "0")
-echo "OK: idle CPU=${IDLE_CPU}%"
+echo "OK: idle CPU=${IDLE_CPU}% over ${IDLE_OBSERVED_SECONDS}s"
 
 # ── Phase 5: Crash recovery test ────────────────────────────────
 # Skipped in query-leak mode: reindexing invokes memory collection and would
@@ -528,7 +638,10 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
     CRASH_REQUEST_ID=$QUERY_ID
     QUERY_ID=$((QUERY_ID + 1))
     CRASH_REQUEST="{\"jsonrpc\":\"2.0\",\"id\":$CRASH_REQUEST_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"$MCP_SOAK_PROJECT\"}}}"
-    printf '%s\n' "$CRASH_REQUEST" >&3
+    if ! printf '%s\n' "$CRASH_REQUEST" >&3; then
+        echo "FAIL: crash-recovery index request write failed" >&2
+        PASS=false
+    fi
     sleep 0.1
     kill -9 "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
@@ -654,11 +767,12 @@ if [ "${FD_DRIFT:-0}" -gt 20 ] 2>/dev/null; then
     PASS=false
 fi
 
-# Check 4: Idle CPU
-IDLE_INT=$(echo "$IDLE_CPU" | cut -d. -f1)
-echo "Idle CPU: ${IDLE_CPU}%" | tee -a "$SUMMARY"
-if [ "${IDLE_INT:-0}" -gt 5 ] 2>/dev/null; then
-    echo "FAIL: idle CPU ${IDLE_CPU}% > 5%" | tee -a "$SUMMARY"
+# Check 4: Idle CPU measured from process CPU-time deltas across the configured
+# idle interval. A lifetime ps %cpu sample incorrectly includes initial indexing.
+echo "Idle CPU: ${IDLE_CPU}% over ${IDLE_OBSERVED_SECONDS}s" | tee -a "$SUMMARY"
+if awk -v measured="$IDLE_CPU" -v ceiling="$SOAK_IDLE_CPU_MAX_PERCENT" \
+    'BEGIN { exit measured > ceiling ? 0 : 1 }' 2>/dev/null; then
+    echo "FAIL: idle CPU ${IDLE_CPU}% > ${SOAK_IDLE_CPU_MAX_PERCENT}%" | tee -a "$SUMMARY"
     PASS=false
 fi
 

@@ -121,6 +121,8 @@ static void write_diagnostics(void) {
     int n = snprintf(json, sizeof(json),
                      "{\n"
                      "  \"uptime_s\": %ld,\n"
+                     "  \"process_user_cpu_ms\": %zu,\n"
+                     "  \"process_system_cpu_ms\": %zu,\n"
                      "  \"rss_bytes\": %zu,\n"
                      "  \"peak_rss_bytes\": %zu,\n"
                      "  \"heap_committed_bytes\": %zu,\n"
@@ -134,8 +136,8 @@ static void write_diagnostics(void) {
                      "  \"query_max_us\": %lld,\n"
                      "  \"pid\": %d\n"
                      "}\n",
-                     uptime, current_rss, peak_rss, current_commit, peak_commit, page_faults, fds,
-                     qcount, qerrors, qtime, qavg, qmax, (int)getpid());
+                     uptime, user_ms, sys_ms, current_rss, peak_rss, current_commit, peak_commit,
+                     page_faults, fds, qcount, qerrors, qtime, qavg, qmax, (int)getpid());
     if (n < 0 || (size_t)n >= sizeof(json)) {
         return;
     }
