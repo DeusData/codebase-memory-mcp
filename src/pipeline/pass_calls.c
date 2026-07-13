@@ -279,11 +279,6 @@ static const cbm_gbuf_node_t *calls_lsp_target_node(cbm_pipeline_ctx_t *ctx,
     return cbm_pipeline_find_node_by_qn(ctx, buf);
 }
 
-static bool calls_is_python_super_init(const CBMCall *call, CBMLanguage lang) {
-    return lang == CBM_LANG_PYTHON && call && call->callee_name &&
-           strcmp(call->callee_name, "super().__init__") == 0;
-}
-
 static bool calls_suppress_python_file_weak_dotted_match(const cbm_gbuf_node_t *source,
                                                          const CBMCall *call,
                                                          const cbm_resolution_t *res,
@@ -382,11 +377,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                         res.strategy)) {
         return 0;
     }
-    if (lsp && calls_is_python_super_init(call, lang) && res.strategy &&
-        strcmp(res.strategy, "suffix_match") == 0) {
-        /* Python super().__init__ often resolves to an external base via LSP.
-         * If that target is not indexed, a weak suffix guess can point back to
-         * an unrelated local __init__ and create a false recursive edge. */
+    if (cbm_pipeline_should_suppress_python_super_init_suffix_match(call, lang, &res)) {
         return 0;
     }
     const cbm_gbuf_node_t *target_node = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);

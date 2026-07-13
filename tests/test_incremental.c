@@ -59,6 +59,7 @@ enum {
     INCR_ACCURACY_NODE_TOLERANCE = 2,
     INCR_ACCURACY_EDGE_TOLERANCE = 50,
     INCR_ACCURACY_CALL_TOLERANCE = 2,
+    INCR_FORMATTER_MAX_FILES = 50,
     INCR_FULL_INDEX_MAX_RSS_DELTA_MB = 2048,
     INCR_INSTRUMENTED_TIMEOUT_MULTIPLIER = 4,
 };
@@ -788,34 +789,69 @@ TEST(incr_formatter_run) {
     int edges_before = get_edge_count();
     int calls_before = get_edge_count_by_type("CALLS");
 
-    /* Simulate formatter: touch 50 files */
-    reformat_files("fastapi", 50);
+    /* Simulate a semantics-preserving formatter batch. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
+    int reformat_rc = reformat_files("fastapi", INCR_FORMATTER_MAX_FILES);
 
     double ms = 0;
     size_t peak_mb = 0;
     resp = index_repo_timed(&ms, &peak_mb);
-    ASSERT(resp != NULL);
-    ASSERT(strstr(resp, "indexed") != NULL);
+    int incremental_response_ok = resp != NULL && strstr(resp, "indexed") != NULL;
     free(resp);
 
-    /* Graph should be nearly identical — formatter adds no functions.
-     * Warn on >10% variance (can happen with sparse checkout / smaller repos). */
+    /* Counts diagnose drift, but canonical incremental/full identity below is
+     * the pass/fail contract. Appending comments does not change semantics. */
     int node_diff = abs(get_node_count() - nodes_before);
     int edge_diff = abs(get_edge_count() - edges_before);
-    if (node_diff > nodes_before / 10 || edge_diff > edges_before / 10) {
-        printf("    [PERF WARNING] formatter drift: node_diff=%d (max %d), edge_diff=%d (max %d)\n",
-               node_diff, nodes_before / 10, edge_diff, edges_before / 10);
-    }
-
-    /* CALLS edges: reformatting changes line numbers which affects resolution. */
     int calls_diff = abs(get_edge_count_by_type("CALLS") - calls_before);
-    if (calls_diff > calls_before / 4) {
-        printf("    [PERF WARNING] CALLS drift: %d (max %d)\n", calls_diff, calls_before / 4);
+
+    char incremental_snapshot_path[CBM_SZ_512];
+    int snapshot_path_len = snprintf(incremental_snapshot_path, sizeof(incremental_snapshot_path),
+                                     "%s/incr_formatter_incremental.db", g_tmpdir);
+    int snapshot_path_ok =
+        snapshot_path_len > 0 && (size_t)snapshot_path_len < sizeof(incremental_snapshot_path);
+    int snapshot_rc = CBM_STORE_ERR;
+    int full_response_ok = 0;
+    int canonical_graph_diff_rc = CBM_NOT_FOUND;
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+
+    if (incremental_response_ok && snapshot_path_ok) {
+        cbm_unlink(incremental_snapshot_path);
+        snapshot_rc = dump_current_store_to_file(incremental_snapshot_path);
+    }
+    if (snapshot_rc == CBM_STORE_OK) {
+        cbm_unlink(g_dbpath);
+        resp = index_repo();
+        full_response_ok = resp != NULL && strstr(resp, "indexed") != NULL;
+        free(resp);
+    }
+    if (full_response_ok) {
+        canonical_graph_diff_rc = cbm_test_compare_canonical_graphs(
+            incremental_snapshot_path, g_dbpath, g_project, canonical_graph_diff_error,
+            sizeof(canonical_graph_diff_error));
+    }
+    if (canonical_graph_diff_rc != 0 && snapshot_rc == CBM_STORE_OK && full_response_ok) {
+        printf("    [formatter:canonical-diff] %s\n", canonical_graph_diff_error);
+        preserve_accuracy_artifacts(incremental_snapshot_path, "formatter-canonical-diff");
     }
 
-    printf("    [perf] reformat 50 files: %.0fms, node_diff=%d edge_diff=%d\n", ms, node_diff,
-           edge_diff);
+    cbm_unlink(incremental_snapshot_path);
+    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
 
+    printf("    [perf] reformat up to %d files: %.0fms, node_diff=%d edge_diff=%d "
+           "calls_diff=%d\n",
+           INCR_FORMATTER_MAX_FILES, ms, node_diff, edge_diff, calls_diff);
+
+    ASSERT_EQ(reformat_rc, 0);
+    ASSERT(incremental_response_ok);
+    ASSERT(snapshot_path_ok);
+    ASSERT_EQ(snapshot_rc, CBM_STORE_OK);
+    ASSERT(full_response_ok);
+    ASSERT_EQ(restore_config_rc, 0);
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 

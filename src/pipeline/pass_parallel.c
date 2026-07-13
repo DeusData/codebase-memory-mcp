@@ -1453,6 +1453,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
+        if (cbm_pipeline_should_suppress_python_super_init_suffix_match(call, lang, &res)) {
+            continue;
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
