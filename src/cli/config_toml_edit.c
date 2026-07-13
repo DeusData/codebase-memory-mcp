@@ -518,14 +518,9 @@ static int toml_read_file(const char *path, char **out_data, size_t *out_len,
     return TOML_EDIT_OK;
 }
 
+#ifndef _WIN32
 static char *toml_parent_directory(const char *path) {
     const char *separator = strrchr(path, '/');
-#ifdef _WIN32
-    const char *backslash = strrchr(path, '\\');
-    if (!separator || (backslash && backslash > separator)) {
-        separator = backslash;
-    }
-#endif
     if (!separator) {
         return cbm_strdup(".");
     }
@@ -534,6 +529,7 @@ static char *toml_parent_directory(const char *path) {
     }
     return cbm_strndup(path, (size_t)(separator - path));
 }
+#endif
 
 static int toml_snapshot_matches_path(const char *path, const char *old_data, size_t old_len,
                                       const toml_file_snapshot_t *expected) {

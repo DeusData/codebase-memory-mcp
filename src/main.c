@@ -704,7 +704,7 @@ int main(int argc, char **argv) {
         return subcmd;
     }
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
-    if (cbm_mcp_parse_tool_profile_args(argc, argv, &tool_profile) != 0) {
+    if (cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) != 0) {
         (void)fprintf(stderr, "codebase-memory-mcp: --tool-profile requires the supported value "
                               "'analysis' or 'scout'\n");
         return 2;
@@ -795,10 +795,7 @@ int main(int argc, char **argv) {
     if (!restricted_tool_profile) {
         watch_store = cbm_store_open_memory();
         g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
-    }
-
-    /* Wire watcher + config into MCP server for session auto-index */
-    if (!restricted_tool_profile) {
+        /* Wire watcher + config into MCP server for session auto-index. */
         cbm_mcp_server_set_watcher(g_server, g_watcher);
         cbm_mcp_server_set_config(g_server, runtime_config);
     }

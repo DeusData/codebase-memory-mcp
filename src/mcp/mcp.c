@@ -692,7 +692,7 @@ static const char *mcp_tool_profile_name(cbm_mcp_tool_profile_t profile) {
     return profile == CBM_MCP_TOOL_PROFILE_SCOUT ? "scout" : "analysis";
 }
 
-int cbm_mcp_parse_tool_profile_args(int argc, char *const argv[],
+int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
                                     cbm_mcp_tool_profile_t *profile_out) {
     if (argc < 0 || !argv || !profile_out) {
         return -1;

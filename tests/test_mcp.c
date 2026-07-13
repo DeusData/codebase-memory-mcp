@@ -826,13 +826,13 @@ TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
 
 TEST(analysis_profile_arguments_fail_closed_and_disable_http) {
     cbm_mcp_tool_profile_t profile = CBM_MCP_TOOL_PROFILE_ALL;
-    char *no_profile[] = {"codebase-memory-mcp"};
-    char *analysis_equals[] = {"codebase-memory-mcp", "--tool-profile=analysis"};
-    char *analysis_pair[] = {"codebase-memory-mcp", "--tool-profile", "analysis"};
-    char *scout_equals[] = {"codebase-memory-mcp", "--tool-profile=scout"};
-    char *unknown_equals[] = {"codebase-memory-mcp", "--tool-profile=analaysis"};
-    char *unknown_pair[] = {"codebase-memory-mcp", "--tool-profile", "all"};
-    char *missing_value[] = {"codebase-memory-mcp", "--tool-profile"};
+    const char *no_profile[] = {"codebase-memory-mcp"};
+    const char *analysis_equals[] = {"codebase-memory-mcp", "--tool-profile=analysis"};
+    const char *analysis_pair[] = {"codebase-memory-mcp", "--tool-profile", "analysis"};
+    const char *scout_equals[] = {"codebase-memory-mcp", "--tool-profile=scout"};
+    const char *unknown_equals[] = {"codebase-memory-mcp", "--tool-profile=analaysis"};
+    const char *unknown_pair[] = {"codebase-memory-mcp", "--tool-profile", "all"};
+    const char *missing_value[] = {"codebase-memory-mcp", "--tool-profile"};
 
     ASSERT_EQ(cbm_mcp_parse_tool_profile_args(1, no_profile, &profile), 0);
     ASSERT_EQ(profile, CBM_MCP_TOOL_PROFILE_ALL);

@@ -102,7 +102,7 @@ typedef enum {
 
 /* Parse the process-level tool-profile flag. Explicit malformed or unknown
  * values fail closed with -1; absence selects the full default surface. */
-int cbm_mcp_parse_tool_profile_args(int argc, char *const argv[],
+int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
                                     cbm_mcp_tool_profile_t *profile_out);
 
 /* Restricted servers must not start a second unrestricted HTTP/RPC surface. */

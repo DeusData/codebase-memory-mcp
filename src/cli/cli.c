@@ -3798,10 +3798,12 @@ static const char cmm_subagent_script_prefix[] =
     "# Fail-open: it never blocks or logs hook/prompt content.\n"
     "BIN=";
 
+#ifndef _WIN32
 static const char cmm_hook_script_suffix[] = "\n"
                                              "[ -x \"$BIN\" ] || exit 0\n"
                                              "\"$BIN\" hook-augment 2>/dev/null\n"
                                              "exit 0\n";
+#endif
 
 #ifdef _WIN32
 static int cbm_escape_batch_value(const char *value, char *escaped, size_t escaped_size) {
@@ -4275,6 +4277,7 @@ int cbm_remove_gemini_hooks(const char *settings_path) {
 
 #define GEMINI_HOOK_TIMEOUT_MS 5000
 
+#ifndef _WIN32
 static int cbm_upsert_gemini_coverage_hook(const char *settings_path, const char *binary_path) {
     char command[CLI_BUF_8K];
     if (cbm_build_augment_dialect_command(binary_path, "gemini", command, sizeof(command)) !=
@@ -4304,6 +4307,7 @@ static int cbm_remove_gemini_coverage_hook(const char *settings_path, const char
         .match_command_exact = command,
     });
 }
+#endif
 
 /* Gemini CLI SessionStart reminder. settings.json uses the same
  * hooks.<Event>[].hooks[] JSON shape as Claude, so it reuses upsert_hooks_json. */
