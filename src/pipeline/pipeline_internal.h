@@ -26,8 +26,11 @@
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Maximum tree-sitter parse time per file. Instrumented builds may override
+ * this at compile time because sanitizer bookkeeping materially slows parsing. */
+#ifndef CBM_EXTRACT_BUDGET
 #define CBM_EXTRACT_BUDGET 5000000
+#endif
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768

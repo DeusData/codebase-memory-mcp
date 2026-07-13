@@ -364,6 +364,66 @@ TEST(parallel_empty_files) {
     PASS();
 }
 
+TEST(extraction_errors_fail_parallel_and_sequential_paths) {
+    char dir[256];
+    snprintf(dir, sizeof(dir), "/tmp/cbm_extract_error_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/input.txt", dir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fclose(f);
+
+    cbm_file_info_t file = {
+        .path = path,
+        .rel_path = (char *)"input.txt",
+        .language = CBM_LANG_PYTHON,
+    };
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("extract-error", dir);
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(gbuf);
+    ASSERT_NOT_NULL(registry);
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "extract-error",
+        .repo_path = dir,
+        .gbuf = gbuf,
+        .registry = registry,
+        .cancelled = &cancelled,
+        .pkgmap_preseeded = true,
+    };
+
+    CBMFileResult *cache[1] = {NULL};
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, 1);
+    ASSERT_EQ(cbm_parallel_extract(&ctx, &file, 1, cache, &shared_ids, 1), 0);
+    ASSERT_NOT_NULL(cache[0]);
+    ASSERT_FALSE(cache[0]->has_error);
+    int nodes_after_empty = cbm_gbuf_node_count(gbuf);
+    cbm_free_result(cache[0]);
+    cache[0] = NULL;
+
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("content\n", f);
+    fclose(f);
+    file.language = (CBMLanguage)-1;
+    ASSERT_NEQ(cbm_parallel_extract(&ctx, &file, 1, cache, &shared_ids, 1), 0);
+    ASSERT_NULL(cache[0]);
+    ASSERT_EQ(cbm_gbuf_node_count(gbuf), nodes_after_empty);
+
+    ASSERT_NEQ(cbm_pipeline_pass_definitions(&ctx, &file, 1), 0);
+    ASSERT_EQ(cbm_gbuf_node_count(gbuf), nodes_after_empty);
+
+    cbm_registry_free(registry);
+    cbm_gbuf_free(gbuf);
+    unlink(path);
+    rmdir(dir);
+    PASS();
+}
+
 /* ── Regression: args JSON must not overflow the props buffer ──────── */
 
 /* A call with many long string arguments makes append_args_json()'s running
@@ -1461,6 +1521,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_full_pipeline_worker_count_parity_64_files);
     RUN_TEST(parallel_empty_files);
+    RUN_TEST(extraction_errors_fail_parallel_and_sequential_paths);
     RUN_TEST(parallel_args_json_no_overflow);
     RUN_TEST(parallel_unresolved_route_suffix_does_not_emit_self_call);
     RUN_TEST(parallel_top_level_raise_matches_sequential_no_file_fallback);

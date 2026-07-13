@@ -70,13 +70,22 @@ static const char *INCR_TEST_FASTAPI_TAG = "0.99.1";
 static const char *INCR_TEST_FASTAPI_COMMIT = "dd4e78ca7b09abdf0d4646fe4697316c021a8b2e";
 static const char *INCR_TEST_FASTAPI_DEFAULT_CACHE_NAME = "cbm-test-fastapi-0.99.1-cache";
 
-static bool incr_memory_debug_allocator_active(void) {
+#ifndef __has_feature
+#define __has_feature(x) 0
+#endif
+
+static bool incr_memory_instrumentation_active(void) {
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || \
+    __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+    return true;
+#else
     const char *scribble = getenv("MallocScribble");
     const char *pre_scribble = getenv("MallocPreScribble");
     const char *guard_malloc = getenv("DYLD_INSERT_LIBRARIES");
     return (scribble && strcmp(scribble, "1") == 0) ||
            (pre_scribble && strcmp(pre_scribble, "1") == 0) ||
            (guard_malloc && strstr(guard_malloc, "libgmalloc") != NULL);
+#endif
 }
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -646,8 +655,8 @@ TEST(incr_full_index) {
      * Diagnostic allocators intentionally inflate RSS, so they report instead
      * of failing this production memory guard. */
     size_t rss_delta_mb = peak_mb - (g_rss_before_full / (1024 * 1024));
-    if (incr_memory_debug_allocator_active()) {
-        printf("    [perf note] full index rss_delta=%zuMB under debug allocator "
+    if (incr_memory_instrumentation_active()) {
+        printf("    [perf note] full index rss_delta=%zuMB under memory instrumentation "
                "(normal limit=%dMB)\n",
                rss_delta_mb, INCR_FULL_INDEX_MAX_RSS_DELTA_MB);
     } else {
