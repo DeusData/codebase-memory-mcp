@@ -404,6 +404,7 @@ typedef struct {
     double semantic_threshold;         /* <=0 uses semantic default 0.75 */
     double githistory_min_coupling;    /* <=0 uses git-history default 0.3 */
     double lsp_confidence_floor;       /* <=0 uses LSP default 0.6 */
+    int64_t extract_timeout_micros;    /* bounded tree-sitter parse deadline */
 
     /* Extraction result cache (sequential pipeline optimization).
      * When non-NULL, pass_definitions stores results here instead of freeing,
@@ -436,6 +437,13 @@ typedef struct {
     int store_backed_all_file_count;
     int store_backed_lsp_scope_cap;
 } cbm_pipeline_ctx_t;
+
+static inline int64_t cbm_pipeline_ctx_extract_timeout(const cbm_pipeline_ctx_t *ctx) {
+    return ctx && ctx->extract_timeout_micros > 0 ? ctx->extract_timeout_micros
+                                                  : CBM_EXTRACT_BUDGET;
+}
+
+int64_t cbm_pipeline_extract_timeout_micros(const cbm_pipeline_t *p);
 
 static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
     return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;

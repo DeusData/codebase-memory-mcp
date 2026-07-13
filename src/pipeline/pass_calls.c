@@ -410,9 +410,10 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file_with_options(
-        src, slen, fi->language, ctx->project_name, fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL,
-        cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
+    CBMFileResult *r =
+        cbm_extract_file_with_options(src, slen, fi->language, ctx->project_name, fi->rel_path,
+                                      cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                                      cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
     free(src);
     if (r) {
         *owned = true;

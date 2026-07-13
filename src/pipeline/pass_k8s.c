@@ -108,10 +108,10 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
         int src_len = 0;
         char *source = k8s_read_file(path, &src_len);
         if (source) {
-            res = cbm_extract_file_with_options(
-                source, src_len, CBM_LANG_KUSTOMIZE, ctx->project_name, rel_path,
-                CBM_EXTRACT_BUDGET, NULL, NULL,
-                cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
+            res = cbm_extract_file_with_options(source, src_len, CBM_LANG_KUSTOMIZE,
+                                                ctx->project_name, rel_path,
+                                                cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                                                cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
             free(source);
             allocated = true;
         }
@@ -377,9 +377,10 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const
     (void)path; /* retained for symmetry; source is always provided now */
     int resource_count = 0;
 
-    CBMFileResult *res = cbm_extract_file_with_options(
-        source, src_len, CBM_LANG_K8S, ctx->project_name, rel_path, CBM_EXTRACT_BUDGET, NULL, NULL,
-        cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
+    CBMFileResult *res =
+        cbm_extract_file_with_options(source, src_len, CBM_LANG_K8S, ctx->project_name, rel_path,
+                                      cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                                      cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
     if (!res) {
         return;
     }

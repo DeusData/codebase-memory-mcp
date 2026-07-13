@@ -462,8 +462,8 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Extract */
         CBMFileResult *result = cbm_extract_file_with_options(
-            source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-            NULL /* no extra defines or include paths */,
+            source, source_len, lang, ctx->project_name, rel, cbm_pipeline_ctx_extract_timeout(ctx),
+            NULL, NULL /* no extra defines or include paths */,
             cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
         free(source);
 

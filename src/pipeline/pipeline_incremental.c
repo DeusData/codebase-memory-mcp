@@ -1732,6 +1732,7 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         .semantic_threshold = cbm_pipeline_semantic_threshold(p),
         .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
+        .extract_timeout_micros = cbm_pipeline_extract_timeout_micros(p),
         .path_aliases = path_aliases,
         .pkgmap_preseeded = true,
         .result_cache = result_cache,
@@ -2096,6 +2097,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         .semantic_threshold = cbm_pipeline_semantic_threshold(p),
         .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
+        .extract_timeout_micros = cbm_pipeline_extract_timeout_micros(p),
         .path_aliases = path_aliases,
         .pkgmap_preseeded = true,
         .result_cache = result_cache,
@@ -2751,6 +2753,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .semantic_threshold = cbm_pipeline_semantic_threshold(p),
         .githistory_min_coupling = cbm_pipeline_githistory_min_coupling(p),
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
+        .extract_timeout_micros = cbm_pipeline_extract_timeout_micros(p),
         .path_aliases = path_aliases,
     };
 

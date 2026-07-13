@@ -60,6 +60,7 @@ enum {
     INCR_ACCURACY_EDGE_TOLERANCE = 50,
     INCR_ACCURACY_CALL_TOLERANCE = 2,
     INCR_FULL_INDEX_MAX_RSS_DELTA_MB = 2048,
+    INCR_INSTRUMENTED_TIMEOUT_MULTIPLIER = 4,
 };
 
 static const char *INCR_TEST_ARTIFACT_ENV = "CBM_TEST_ARTIFACT_DIR";
@@ -592,6 +593,12 @@ static int incremental_setup(void) {
         return -1;
     }
     cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "always");
+    if (incr_memory_instrumentation_active()) {
+        char timeout_ms[CBM_SZ_32];
+        snprintf(timeout_ms, sizeof(timeout_ms), "%d",
+                 CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS * INCR_INSTRUMENTED_TIMEOUT_MULTIPLIER);
+        cbm_config_set(g_cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, timeout_ms);
+    }
     cbm_mcp_server_set_config(g_srv, g_cfg);
 
     g_rss_before_full = cbm_mem_rss();
