@@ -3084,6 +3084,49 @@ static bool prompt_yn(const char *question) {
     return (buf[0] == 'y' || buf[0] == 'Y') ? true : false;
 }
 
+/* ── Subcommand help ──────────────────────────────────────────── */
+
+/* Mutating subcommands (install/uninstall/update) must never run when the
+ * user asked for usage: `uninstall --help` used to perform a real uninstall
+ * because unknown flags were silently ignored (#1038). */
+static bool cmd_wants_help(int argc, char **argv) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void print_install_usage(void) {
+    printf("Usage: codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
+    printf("                                   [--plan] [--reset-indexes]\n\n");
+    printf("  -y, --yes        Answer yes to all prompts\n");
+    printf("  -n, --no         Answer no to all prompts\n");
+    printf("  --force          Overwrite existing skills and config entries\n");
+    printf("  --dry-run        Show what would change without modifying files\n");
+    printf("  --plan           Print machine-readable install plan (no changes)\n");
+    printf("  --reset-indexes  Delete existing indexes during install\n");
+}
+
+static void print_uninstall_usage(void) {
+    printf("Usage: codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n\n");
+    printf("  -y, --yes   Answer yes to all prompts (required without a terminal)\n");
+    printf("  -n, --no    Answer no to all prompts (aborts the uninstall)\n");
+    printf("  --dry-run   Show what would be removed without modifying files\n");
+}
+
+static void print_update_usage(void) {
+    printf("Usage: codebase-memory-mcp update [-y|-n] [--force] [--dry-run]\n");
+    printf("                                  [--standard|--ui]\n\n");
+    printf("  -y, --yes     Answer yes to all prompts\n");
+    printf("  -n, --no      Answer no to all prompts\n");
+    printf("  --force       Update even if already on the latest version\n");
+    printf("  --dry-run     Show what would change without modifying files\n");
+    printf("  --standard    Select the standard variant\n");
+    printf("  --ui          Select the UI variant\n");
+}
+
 /* ── SHA-256 checksum verification ─────────────────────────────── */
 
 /* SHA-256 hex digest: 64 hex chars + NUL */
@@ -3869,6 +3912,10 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
 }
 
 int cbm_cmd_install(int argc, char **argv) {
+    if (cmd_wants_help(argc, argv)) {
+        print_install_usage();
+        return 0;
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
@@ -4206,11 +4253,22 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
 }
 
 int cbm_cmd_uninstall(int argc, char **argv) {
+    if (cmd_wants_help(argc, argv)) {
+        print_uninstall_usage();
+        return 0;
+    }
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
+        } else if (strcmp(argv[i], "-y") != 0 && strcmp(argv[i], "--yes") != 0 &&
+                   strcmp(argv[i], "-n") != 0 && strcmp(argv[i], "--no") != 0) {
+            /* Unknown flags must not fall through to a destructive uninstall:
+             * `uninstall --dryrun` (typo) used to perform a REAL uninstall (#1038). */
+            (void)fprintf(stderr, "error: unknown uninstall option: %s\n\n", argv[i]);
+            print_uninstall_usage();
+            return CLI_TRUE;
         }
     }
 
@@ -4221,6 +4279,15 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     }
 
     printf("codebase-memory-mcp uninstall\n\n");
+
+    /* Removing agent configs and the binary is destructive: gate it on
+     * explicit confirmation. Non-interactive callers must pass -y;
+     * prompt_yn() fails closed without a terminal (#1038). */
+    if (!dry_run &&
+        !prompt_yn("Remove codebase-memory-mcp from all detected agents and delete the binary?")) {
+        printf("Uninstall cancelled. No files were modified.\n");
+        return CLI_TRUE;
+    }
 
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (agents.claude_code) {
@@ -4503,6 +4570,10 @@ static bool check_already_latest(void) {
 }
 
 int cbm_cmd_update(int argc, char **argv) {
+    if (cmd_wants_help(argc, argv)) {
+        print_update_usage();
+        return 0;
+    }
     parse_auto_answer(argc, argv);
 
     bool dry_run = false;
