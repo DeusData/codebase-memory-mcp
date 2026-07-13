@@ -91,7 +91,7 @@ static char *read_file(const char *path, int *out_len) {
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size < 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
         (void)fclose(f);
         return NULL;
     }
@@ -529,9 +529,14 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
-        if (!result) {
+        if (!result || result->has_error) {
             log_extract_fail(sort_pos, file_elapsed_ms, fi->rel_path);
+            if (result && result->error_msg) {
+                cbm_log_error("parallel.extract.file.error", "path", fi->rel_path, "error",
+                              result->error_msg);
+            }
             free_source(source);
+            cbm_free_result(result);
             ws->errors++;
             continue;
         }
@@ -728,10 +733,10 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     int total_nodes = 0;
     int total_errors = 0;
     for (int i = 0; i < worker_count; i++) {
+        total_errors += workers[i].errors;
         if (workers[i].local_gbuf) {
             cbm_gbuf_merge(ctx->gbuf, workers[i].local_gbuf);
             total_nodes += workers[i].nodes_created;
-            total_errors += workers[i].errors;
             cbm_gbuf_free(workers[i].local_gbuf);
         }
     }
@@ -750,7 +755,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_log_info("parallel.extract.done", "nodes", itoa_log(total_nodes), "errors",
                  itoa_log(total_errors));
-    return 0;
+    return total_errors == 0 ? 0 : CBM_NOT_FOUND;
 }
 
 /* ── Phase 3B: Serial Registry Build ─────────────────────────────── */

@@ -42,7 +42,7 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 ||
+    if (size < 0 ||
         size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) { /* CBM_PERCENT MB sanity limit */
         (void)fclose(f);
         return NULL;
@@ -457,7 +457,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         char *source = read_file(path, &source_len);
         if (!source) {
             errors++;
-            continue;
+            break;
         }
 
         /* Extract */
@@ -467,9 +467,13 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
         free(source);
 
-        if (!result) {
+        if (!result || result->has_error) {
+            if (result && result->error_msg) {
+                cbm_log_error("definitions.extract.error", "path", rel, "error", result->error_msg);
+            }
+            cbm_free_result(result);
             errors++;
-            continue;
+            break;
         }
 
         /* Create nodes for each definition */
@@ -500,7 +504,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * nodes for every file are in the graph, walk the cache again to
      * create IMPORTS / channel edges. Imports resolve against the full
      * project graph. */
-    if (local_cache) {
+    if (local_cache && errors == 0) {
         /* Build a namespace/package → File-QN map so that namespace imports
          * (C# `using`, Java/Kotlin `import`, PHP `use`) resolve to the file
          * that declares the namespace. */
@@ -527,18 +531,18 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
-        if (owns_local_cache) {
-            for (int i = 0; i < file_count; i++) {
-                if (local_cache[i]) {
-                    cbm_free_result(local_cache[i]);
-                }
+    }
+    if (owns_local_cache) {
+        for (int i = 0; i < file_count; i++) {
+            if (local_cache[i]) {
+                cbm_free_result(local_cache[i]);
             }
-            free(local_cache);
         }
+        free(local_cache);
     }
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",
                  itoa_log(errors));
-    return 0;
+    return errors == 0 ? 0 : CBM_NOT_FOUND;
 }
