@@ -1635,6 +1635,71 @@ static int incr_expand_regular_changed_frontier(cbm_store_t *store, const char *
     return CBM_STORE_OK;
 }
 
+static const char incr_structure_folder_label[] = "Folder";
+static const char incr_overlay_reason_new_structure_context[] = "new_structure_context";
+
+static bool incr_store_has_canonical_folder_path(cbm_store_t *store, const char *project,
+                                                 const char *folder_path) {
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int find_rc = cbm_store_find_nodes_by_file(store, project, folder_path, &nodes, &node_count);
+    bool found_folder = false;
+    if (find_rc == CBM_STORE_OK) {
+        for (int node_index = 0; node_index < node_count; node_index++) {
+            if (nodes[node_index].label &&
+                strcmp(nodes[node_index].label, incr_structure_folder_label) == 0) {
+                found_folder = true;
+                break;
+            }
+        }
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    return found_folder;
+}
+
+static bool incr_overlay_requires_canonical_structure_publish(cbm_store_t *store,
+                                                              const char *project,
+                                                              const cbm_file_info_t *changed_files,
+                                                              int changed_count) {
+    if (!store || !project || !changed_files || changed_count <= 0) {
+        return true;
+    }
+    for (int file_index = 0; file_index < changed_count; file_index++) {
+        const char *rel_path = changed_files[file_index].rel_path;
+        if (!rel_path || !rel_path[0]) {
+            return true;
+        }
+        const char *last_separator = strrchr(rel_path, '/');
+        if (!last_separator) {
+            continue;
+        }
+        size_t parent_path_len = (size_t)(last_separator - rel_path);
+        if (parent_path_len == 0 || parent_path_len >= CBM_PATH_MAX) {
+            return true;
+        }
+        char parent_path[CBM_PATH_MAX];
+        memcpy(parent_path, rel_path, parent_path_len);
+        parent_path[parent_path_len] = '\0';
+
+        for (char *separator = parent_path;; separator++) {
+            separator = strchr(separator, '/');
+            if (!separator) {
+                if (!incr_store_has_canonical_folder_path(store, project, parent_path)) {
+                    return true;
+                }
+                break;
+            }
+            *separator = '\0';
+            bool found_folder = incr_store_has_canonical_folder_path(store, project, parent_path);
+            *separator = '/';
+            if (!found_folder) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
                                          const char *project, cbm_file_info_t *changed_files,
                                          int changed_count, int deleted_count,
@@ -1650,6 +1715,12 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
     if (!cbm_pipeline_overlay_publish_small_deltas(p) || deleted_count != 0 ||
         changed_count > cbm_pipeline_exact_max_changed_paths(p) ||
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST || changed_count > max_affected_paths) {
+        return CBM_STORE_OK;
+    }
+    if (incr_overlay_requires_canonical_structure_publish(store, project, changed_files,
+                                                          changed_count)) {
+        cbm_log_info("incremental.overlay.fallback", "reason",
+                     incr_overlay_reason_new_structure_context);
         return CBM_STORE_OK;
     }
     if (incr_changed_has_scoped_overlay_gap(changed_files, changed_count)) {
@@ -2260,9 +2331,17 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     const char *prior_reason = cbm_pipeline_publish_reason(p);
     bool overlay_publish_already_failed =
         prior_reason && strcmp(prior_reason, "overlay_publish_error") == 0;
+    bool overlay_publish_enabled = cbm_pipeline_overlay_publish_small_deltas(p);
     bool header_overlay_unsafe = incr_changed_contains_c_family_header(changed_files, changed_count);
+    bool requires_canonical_structure_publish =
+        overlay_publish_enabled && incr_overlay_requires_canonical_structure_publish(
+                                       store, project, changed_files, changed_count);
+    if (requires_canonical_structure_publish) {
+        cbm_log_info("incremental.overlay.fallback", "reason",
+                     incr_overlay_reason_new_structure_context);
+    }
     if (!graph_noop_candidate && !header_overlay_unsafe && !scoped_overlay_gap &&
-        cbm_pipeline_overlay_publish_small_deltas(p) &&
+        !requires_canonical_structure_publish && overlay_publish_enabled &&
         !overlay_publish_already_failed) {
         int64_t base_generation = 0;
         int64_t overlay_generation = 0;
