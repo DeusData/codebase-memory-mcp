@@ -9881,36 +9881,37 @@ static int pipeline_store_count_file_rows_sql(const char *db_path, const char *p
     return rc;
 }
 
-static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_path,
-                                                             const char *db_path,
-                                                             const char *project,
-                                                             cbm_config_t *cfg, char *err,
-                                                             size_t err_sz) {
-    char exact_db[CBM_SZ_512];
-    int n = snprintf(exact_db, sizeof(exact_db), "%s/exact-upsert.db", repo_path);
-    if (n < 0 || (size_t)n >= sizeof(exact_db)) {
+static int pipeline_compare_current_db_to_fresh_rebuild(const char *repo_path, const char *db_path,
+                                                        const char *project,
+                                                        cbm_index_mode_t rebuild_mode,
+                                                        cbm_config_t *cfg, char *err,
+                                                        size_t err_sz) {
+    char incremental_snapshot_db[CBM_SZ_512];
+    int n = snprintf(incremental_snapshot_db, sizeof(incremental_snapshot_db),
+                     "%s/canonical-incremental-snapshot.db", repo_path);
+    if (n < 0 || (size_t)n >= sizeof(incremental_snapshot_db)) {
         if (err && err_sz > 0) {
-            snprintf(err, err_sz, "exact snapshot path overflow");
+            snprintf(err, err_sz, "canonical incremental snapshot path overflow");
         }
         return CBM_STORE_ERR;
     }
-    cbm_unlink(exact_db);
-    int rc = pipeline_dump_store_file_to_file(db_path, exact_db);
+    cbm_unlink(incremental_snapshot_db);
+    int rc = pipeline_dump_store_file_to_file(db_path, incremental_snapshot_db);
     if (rc != CBM_STORE_OK) {
         if (err && err_sz > 0) {
-            snprintf(err, err_sz, "exact snapshot dump failed: rc=%d", rc);
+            snprintf(err, err_sz, "canonical incremental snapshot dump failed: rc=%d", rc);
         }
-        cbm_unlink(exact_db);
+        cbm_unlink(incremental_snapshot_db);
         return rc;
     }
 
     cbm_unlink(db_path);
-    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FAST);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, rebuild_mode);
     if (!p) {
         if (err && err_sz > 0) {
-            snprintf(err, err_sz, "fresh FAST pipeline allocation failed");
+            snprintf(err, err_sz, "fresh mode %d pipeline allocation failed", rebuild_mode);
         }
-        cbm_unlink(exact_db);
+        cbm_unlink(incremental_snapshot_db);
         return CBM_STORE_ERR;
     }
     cbm_pipeline_apply_config(p, cfg);
@@ -9918,17 +9919,25 @@ static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_pa
     cbm_pipeline_free(p);
     if (run_rc != 0) {
         if (err && err_sz > 0) {
-            snprintf(err, err_sz, "fresh FAST rebuild failed: rc=%d", run_rc);
+            snprintf(err, err_sz, "fresh mode %d rebuild failed: rc=%d", rebuild_mode, run_rc);
         }
-        cbm_unlink(exact_db);
+        cbm_unlink(incremental_snapshot_db);
         return CBM_STORE_ERR;
     }
 
-    rc = cbm_test_compare_canonical_graphs(exact_db, db_path, project, err, err_sz);
+    rc = cbm_test_compare_canonical_graphs(incremental_snapshot_db, db_path, project, err, err_sz);
     if (rc == 0) {
-        cbm_unlink(exact_db);
+        cbm_unlink(incremental_snapshot_db);
     }
     return rc;
+}
+
+static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_path,
+                                                             const char *db_path,
+                                                             const char *project, cbm_config_t *cfg,
+                                                             char *err, size_t err_sz) {
+    return pipeline_compare_current_db_to_fresh_rebuild(repo_path, db_path, project, CBM_MODE_FAST,
+                                                        cfg, err, err_sz);
 }
 
 static int pipeline_gbuf_count_usage_edge(const cbm_gbuf_t *gb, const char *source_qn,
@@ -13817,9 +13826,18 @@ TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
               CBM_STORE_OK);
     ASSERT_EQ(generation, CBM_PIPELINE_COMPAT_GENERATION);
 
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+    int canonical_graph_diff_rc = pipeline_compare_current_db_to_fresh_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, CBM_MODE_FULL, cfg, canonical_graph_diff_error,
+        sizeof(canonical_graph_diff_error));
+    if (canonical_graph_diff_rc != 0) {
+        printf("    [full-mode:canonical-diff] %s\n", canonical_graph_diff_error);
+    }
+
     free(project);
     cbm_config_close(cfg);
     cleanup_incremental_repo();
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 
@@ -14225,6 +14243,9 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
     cbm_config_t *cfg = incremental_test_config(tmpdir);
     ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
 
     char path[512];
     FILE *f;
@@ -14348,6 +14369,14 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     ASSERT_GT(cbm_store_count_nodes(s, dep_project), 0);
     cbm_store_close(s);
 
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+    int canonical_graph_diff_rc = pipeline_compare_current_db_to_fresh_rebuild(
+        tmpdir, dbpath, project, CBM_MODE_FULL, cfg, canonical_graph_diff_error,
+        sizeof(canonical_graph_diff_error));
+    if (canonical_graph_diff_rc != 0) {
+        printf("    [full-to-fast-mode:canonical-diff] %s\n", canonical_graph_diff_error);
+    }
+
     /* Step 4: actually delete tools/util.go from disk and full-reindex.
      * Now it really is gone, so its nodes should be purged. This pins the
      * other half of the contract: the stat-based check correctly identifies
@@ -14373,6 +14402,7 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     free(project);
     cbm_config_close(cfg);
     th_rmtree(tmpdir);
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 
