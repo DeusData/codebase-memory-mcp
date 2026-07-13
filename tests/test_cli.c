@@ -8276,6 +8276,8 @@ TEST(cli_hook_scripts_platform_shape_issue929) {
     const char *data = read_test_file(script_path);
     ASSERT_NOT_NULL(data);
     ASSERT(strncmp(data, "@echo off", 9) == 0); /* cmd, not bash */
+    ASSERT(strstr(data, "setlocal DisableDelayedExpansion") != NULL);
+    ASSERT(strstr(data, "#!/usr/bin/env bash") == NULL);
     ASSERT(strstr(data, "hook-augment") != NULL);
     /* Legacy extensionless twin removed on upgrade. */
     FILE *lf = fopen(legacy_path, "r");
@@ -8358,7 +8360,7 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
         setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
         setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
         alarm(10); /* backstop: never hang the suite */
-        _exit(cbm_cmd_hook_augment());
+        _exit(cbm_cmd_hook_augment(0, NULL));
     }
     ASSERT_GT(pid, 0);
     close(fds[0]);

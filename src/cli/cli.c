@@ -3736,8 +3736,59 @@ static const char cmm_hook_script_suffix[] = "\n"
                                              "\"$BIN\" hook-augment 2>/dev/null\n"
                                              "exit 0\n";
 
+#ifdef _WIN32
+static int cbm_escape_batch_value(const char *value, char *escaped, size_t escaped_size) {
+    if (!value || !escaped || escaped_size == 0U) {
+        return CLI_ERR;
+    }
+    size_t out = 0U;
+    for (const unsigned char *cursor = (const unsigned char *)value; *cursor; cursor++) {
+        if (*cursor < 0x20U || *cursor == 0x7fU || *cursor == '"') {
+            return CLI_ERR;
+        }
+        size_t needed = (*cursor == '%' || *cursor == '^') ? 2U : 1U;
+        if (out + needed >= escaped_size) {
+            return CLI_ERR;
+        }
+        if (needed == 2U) {
+            escaped[out++] = (char)*cursor;
+        }
+        escaped[out++] = (char)*cursor;
+    }
+    escaped[out] = '\0';
+    return CLI_OK;
+}
+#endif
+
 static int cbm_build_current_hook_script(const char *prefix, const char *binary_path, char *script,
                                          size_t script_size) {
+#ifdef _WIN32
+    char escaped_binary[CLI_BUF_8K];
+    if (!prefix || !binary_path || !script ||
+        cbm_escape_batch_value(binary_path, escaped_binary, sizeof(escaped_binary)) != CLI_OK) {
+        return CLI_ERR;
+    }
+    const char *description = NULL;
+    if (strcmp(prefix, cmm_gate_script_prefix) == 0) {
+        description = "PreToolUse search and read coverage adapter";
+    } else if (strcmp(prefix, cmm_session_script_prefix) == 0) {
+        description = "SessionStart context adapter";
+    } else if (strcmp(prefix, cmm_subagent_script_prefix) == 0) {
+        description = "SubagentStart context adapter";
+    } else {
+        return CLI_ERR;
+    }
+    int written = snprintf(script, script_size,
+                           "@echo off\r\n"
+                           "setlocal DisableDelayedExpansion\r\n"
+                           "REM %s installed by codebase-memory-mcp.\r\n"
+                           "REM Fail-open: it never blocks or logs hook or prompt content.\r\n"
+                           "set \"BIN=%s\"\r\n"
+                           "if not exist \"%%BIN%%\" exit /b 0\r\n"
+                           "\"%%BIN%%\" hook-augment 2>NUL\r\n"
+                           "exit /b 0\r\n",
+                           description, escaped_binary);
+#else
     char quoted_binary[CLI_BUF_8K];
     if (!prefix || !binary_path || !script ||
         cbm_shell_quote_word(binary_path, quoted_binary, sizeof(quoted_binary)) != CLI_OK) {
@@ -3745,6 +3796,7 @@ static int cbm_build_current_hook_script(const char *prefix, const char *binary_
     }
     int written =
         snprintf(script, script_size, "%s%s%s", prefix, quoted_binary, cmm_hook_script_suffix);
+#endif
     return written > 0 && (size_t)written < script_size ? CLI_OK : CLI_ERR;
 }
 
