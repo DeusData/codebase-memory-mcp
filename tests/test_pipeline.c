@@ -12176,6 +12176,9 @@ TEST(incremental_fast_new_folder_exact_delta_parity) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+        0);
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
@@ -12198,7 +12201,12 @@ TEST(incremental_fast_new_folder_exact_delta_parity) {
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
-    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
     cbm_pipeline_free(p);
 
     ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "FolderLeaf"));
