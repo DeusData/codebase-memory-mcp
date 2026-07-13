@@ -1160,9 +1160,29 @@ TEST(incr_batch_add_delete) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(incr_db_deleted_recovery) {
-    int nodes_before = get_node_count();
+    /* Recovery is an exact graph oracle, so establish an eager-derived
+     * baseline instead of comparing the configured stale-on-incremental view
+     * with a clean rebuild that necessarily refreshes global semantic edges. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
+    write_file_at("tests/incr_recovery_refresh.py",
+                  "def incr_recovery_refresh():\n    return 'recovery'\n");
+    char *baseline_response = index_repo();
+    ASSERT(baseline_response != NULL);
+    ASSERT(strstr(baseline_response, "indexed") != NULL);
+    free(baseline_response);
 
-    unlink(g_dbpath);
+    char recovery_baseline_path[CBM_SZ_512];
+    int recovery_baseline_path_len =
+        snprintf(recovery_baseline_path, sizeof(recovery_baseline_path),
+                 "%s/incr_db_deleted_recovery_baseline.db", g_tmpdir);
+    ASSERT_GT(recovery_baseline_path_len, 0);
+    ASSERT_LT((size_t)recovery_baseline_path_len, sizeof(recovery_baseline_path));
+    cbm_unlink(recovery_baseline_path);
+    ASSERT_EQ(dump_current_store_to_file(recovery_baseline_path), CBM_STORE_OK);
+
+    ASSERT_EQ(cbm_unlink(g_dbpath), 0);
 
     double ms = 0;
     size_t peak_mb = 0;
@@ -1171,13 +1191,23 @@ TEST(incr_db_deleted_recovery) {
     ASSERT(strstr(resp, "indexed") != NULL);
     free(resp);
 
-    /* Full reindex must produce similar count */
-    int nodes_after = get_node_count();
-    int diff_pct = abs(nodes_after - nodes_before) * 100 / nodes_before;
-    ASSERT_LT(diff_pct, 5);
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+    int canonical_graph_diff_rc = cbm_test_compare_canonical_graphs(
+        recovery_baseline_path, g_dbpath, g_project, canonical_graph_diff_error,
+        sizeof(canonical_graph_diff_error));
+    if (canonical_graph_diff_rc != 0) {
+        printf("    [db-recovery:canonical-diff] %s\n", canonical_graph_diff_error);
+        preserve_accuracy_artifacts(recovery_baseline_path, "db-recovery-canonical-diff");
+    }
+    cbm_unlink(recovery_baseline_path);
+    delete_file_at("tests/incr_recovery_refresh.py");
+    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
 
     printf("    [perf] db recovery (full reindex): %.0fms, peak=%zuMB\n", ms, peak_mb);
 
+    ASSERT_EQ(restore_config_rc, 0);
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 

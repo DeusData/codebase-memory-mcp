@@ -1200,6 +1200,64 @@ int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count
     return deleted_count;
 }
 
+int cbm_gbuf_prune_orphan_folders(cbm_gbuf_t *gb) {
+    static const char folder_label[] = "Folder";
+    static const char contains_file_edge[] = "CONTAINS_FILE";
+    static const char contains_folder_edge[] = "CONTAINS_FOLDER";
+    if (!gb) {
+        return GB_ERR;
+    }
+
+    int total_pruned = 0;
+    for (;;) {
+        const cbm_gbuf_node_t **folders = NULL;
+        int folder_count = 0;
+        if (cbm_gbuf_find_by_label(gb, folder_label, &folders, &folder_count) != 0) {
+            return GB_ERR;
+        }
+        if (folder_count == 0) {
+            return total_pruned;
+        }
+
+        const char **orphan_folder_paths =
+            malloc((size_t)folder_count * sizeof(*orphan_folder_paths));
+        if (!orphan_folder_paths) {
+            return GB_ERR;
+        }
+        int orphan_folder_count = 0;
+        for (int i = 0; i < folder_count; i++) {
+            const cbm_gbuf_node_t *folder = folders[i];
+            if (!folder || !folder->file_path || folder->file_path[0] == '\0') {
+                continue;
+            }
+            const cbm_gbuf_edge_t **edges = NULL;
+            int contained_file_count = 0;
+            int contained_folder_count = 0;
+            if (cbm_gbuf_find_edges_by_source_type(gb, folder->id, contains_file_edge, &edges,
+                                                   &contained_file_count) != 0 ||
+                cbm_gbuf_find_edges_by_source_type(gb, folder->id, contains_folder_edge, &edges,
+                                                   &contained_folder_count) != 0) {
+                free(orphan_folder_paths);
+                return GB_ERR;
+            }
+            if (contained_file_count == 0 && contained_folder_count == 0) {
+                orphan_folder_paths[orphan_folder_count++] = folder->file_path;
+            }
+        }
+        if (orphan_folder_count == 0) {
+            free(orphan_folder_paths);
+            return total_pruned;
+        }
+
+        int pruned = cbm_gbuf_delete_by_paths(gb, orphan_folder_paths, orphan_folder_count);
+        free(orphan_folder_paths);
+        if (pruned <= 0) {
+            return pruned < 0 ? pruned : GB_ERR;
+        }
+        total_pruned += pruned;
+    }
+}
+
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
     if (!gb || !db_path || !project) {
         return CBM_NOT_FOUND;

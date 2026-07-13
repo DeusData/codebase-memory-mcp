@@ -2803,6 +2803,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                      itoa_buf_incr(edge_cap.count), "elapsed_ms",
                      itoa_buf_incr((int)elapsed_ms_incr(t)));
         incr_free_edge_capture(&edge_cap);
+
+        if (cls.deleted_count > 0) {
+            int pruned_orphan_folders = cbm_gbuf_prune_orphan_folders(existing);
+            if (pruned_orphan_folders < 0) {
+                cbm_log_error("incremental.err", "phase", "prune_orphan_folders", "rc",
+                              itoa_buf_incr(pruned_orphan_folders));
+                pipeline_rc = pruned_orphan_folders;
+            } else {
+                cbm_log_info("incremental.structure_prune", "orphan_folders",
+                             itoa_buf_incr(pruned_orphan_folders));
+            }
+        }
     }
     if (pipeline_rc == 0) {
         if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_POSTPASS)) {
