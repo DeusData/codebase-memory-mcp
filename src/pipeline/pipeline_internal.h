@@ -413,6 +413,11 @@ typedef struct {
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
 
+    /* True when the caller already installed a repo-wide package map and
+     * retains ownership of that exact pointer. Parallel extraction must not
+     * replace it: caller cleanup compares and frees the preseeded map. */
+    bool pkgmap_preseeded;
+
     /* Exact-delta scratch optimization: when set on the single-threaded exact
      * upsert route, resolvers may materialize referenced unchanged nodes from
      * the store on demand instead of preloading every stored symbol node. The

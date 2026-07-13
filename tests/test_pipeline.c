@@ -9091,6 +9091,19 @@ static int setup_incremental_parallel_repo(void) {
             return -1;
         }
     }
+    char manifest_path[CBM_PATH_MAX];
+    n = snprintf(manifest_path, sizeof(manifest_path), "%s/go.mod", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(manifest_path)) {
+        return -1;
+    }
+    FILE *manifest = fopen(manifest_path, "w");
+    if (!manifest) {
+        return -1;
+    }
+    fprintf(manifest, "module example.com/incremental-parallel\n\ngo 1.21\n");
+    if (fclose(manifest) != 0) {
+        return -1;
+    }
     return 0;
 }
 
@@ -13966,6 +13979,29 @@ TEST(incremental_parallel_extract_failure_keeps_existing_db) {
     PASS();
 }
 
+TEST(incremental_parallel_success_releases_package_map) {
+    ASSERT_EQ(setup_incremental_parallel_repo(), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(rewrite_incremental_parallel_repo(), 0);
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_NULL(cbm_pipeline_get_pkgmap());
+
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_parallel_registry_failure_keeps_existing_db) {
     ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_REGISTRY), 0);
     PASS();
@@ -15946,6 +15982,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_postpass_failure_keeps_existing_db);
     RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
     RUN_TEST(incremental_parallel_extract_failure_keeps_existing_db);
+    RUN_TEST(incremental_parallel_success_releases_package_map);
     RUN_TEST(incremental_parallel_registry_failure_keeps_existing_db);
     RUN_TEST(incremental_parallel_resolve_failure_keeps_existing_db);
     RUN_TEST(incremental_classify_deleted_failure_keeps_existing_db);
