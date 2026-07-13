@@ -774,7 +774,7 @@ static int incr_classification_build(cbm_pipeline_t *p, cbm_store_t *store, cons
  *
  * Fix: snapshot the inbound cross-file edges into changed files BEFORE the
  * purge, keyed by endpoint qualified_name (stable across re-parse), then
- * re-link them AFTER re-resolution + post-passes. Notes:
+ * re-link them AFTER re-resolution and BEFORE graph-wide post-passes. Notes:
  *   - Only edges whose target is in a changed file and whose source is NOT
  *     are snapshotted; edges out of a changed file are regenerated when that
  *     file is re-resolved.
@@ -2770,7 +2770,20 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     }
 
     if (pipeline_rc == 0) {
+        /* Full sequential indexing resolves imports with a repository-wide
+         * package map. Preseed the same map for containment incremental so a
+         * changed-file batch cannot resolve identical imports to broader
+         * module nodes merely because it stayed below the parallel threshold. */
+        CBMHashTable *incremental_pkgmap =
+            cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), files, file_count, project);
+        cbm_pipeline_set_pkgmap(incremental_pkgmap);
+        ctx.pkgmap_preseeded = true;
         pipeline_rc = run_extract_resolve(&ctx, changed_files, ci);
+        ctx.pkgmap_preseeded = false;
+        if (cbm_pipeline_get_pkgmap() == incremental_pkgmap) {
+            cbm_pipeline_set_pkgmap(NULL);
+        }
+        cbm_pkgmap_free(incremental_pkgmap);
     }
     if (pipeline_rc == 0) {
         pipeline_rc = cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
@@ -2778,6 +2791,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cbm_log_error("incremental.err", "phase", "incr_k8s", "rc",
                           itoa_buf_incr(pipeline_rc));
         }
+    }
+    if (pipeline_rc == 0) {
+        /* Restore the complete base graph before graph-wide derived passes.
+         * Semantic edges consume inbound and outbound CALLS as contextual
+         * features, so restoring afterward would persist correct CALLS while
+         * deriving SEMANTICALLY_RELATED from an incomplete transient graph. */
+        cbm_clock_gettime(CLOCK_MONOTONIC, &t);
+        int relinked = incr_restore_inbound_edges(existing, &edge_cap);
+        cbm_log_info("incremental.edge_relink", "relinked", itoa_buf_incr(relinked), "captured",
+                     itoa_buf_incr(edge_cap.count), "elapsed_ms",
+                     itoa_buf_incr((int)elapsed_ms_incr(t)));
+        incr_free_edge_capture(&edge_cap);
     }
     if (pipeline_rc == 0) {
         if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_POSTPASS)) {
@@ -2800,16 +2825,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_gbuf_free(existing);
         return pipeline_rc;
     }
-
-    /* Re-link inbound cross-file edges that the purge orphaned. Runs after
-     * re-resolution AND post-passes so the freshly re-created target nodes
-     * exist and nothing downstream clobbers the restored edges; insert_edge
-     * dedups, so any edge the resolver already recreated is a no-op. */
-    cbm_clock_gettime(CLOCK_MONOTONIC, &t);
-    int relinked = incr_restore_inbound_edges(existing, &edge_cap);
-    cbm_log_info("incremental.edge_relink", "relinked", itoa_buf_incr(relinked), "captured",
-                 itoa_buf_incr(edge_cap.count), "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t)));
-    incr_free_edge_capture(&edge_cap);
 
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
     cbm_pipeline_pass_complexity(&ctx);

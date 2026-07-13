@@ -36,6 +36,8 @@
 #define CBM_ROUTE_QN_SIZE 768
 #define CBM_ROUTE_DEFAULT_METHOD "ANY"
 #define CBM_ROUTE_DEFAULT_ASYNC_BROKER "async"
+#define CBM_PYTHON_SUPER_INIT_CALLEE "super().__init__"
+#define CBM_REGISTRY_STRATEGY_SUFFIX_MATCH "suffix_match"
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
@@ -145,6 +147,18 @@ static inline bool cbm_pipeline_label_is_import_target(const char *label) {
 static inline bool cbm_pipeline_node_is_callable_scope(const cbm_gbuf_node_t *node) {
     return node && node->label &&
            (strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0);
+}
+
+/* A textual `super().__init__` does not identify a local constructor without
+ * receiver-type information. A registry suffix match can therefore select an
+ * unrelated project Method merely because it is named `__init__`. Keep
+ * higher-confidence same-module/import matches and indexed LSP targets; reject
+ * only this ambiguous fallback identically in sequential and parallel passes. */
+static inline bool cbm_pipeline_should_suppress_python_super_init_suffix_match(
+    const CBMCall *call, CBMLanguage language, const cbm_resolution_t *resolution) {
+    return language == CBM_LANG_PYTHON && call && call->callee_name && resolution &&
+           resolution->strategy && strcmp(call->callee_name, CBM_PYTHON_SUPER_INIT_CALLEE) == 0 &&
+           strcmp(resolution->strategy, CBM_REGISTRY_STRATEGY_SUFFIX_MATCH) == 0;
 }
 
 /* Time unit conversions */

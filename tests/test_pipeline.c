@@ -8034,6 +8034,58 @@ TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback) {
     PASS();
 }
 
+TEST(pipeline_python_super_init_without_lsp_suppresses_weak_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "Method", "__init__", "proj.app.Child.__init__",
+                                             "app.py", 1, 10, "{}");
+    int64_t unrelated_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.other.Unrelated.__init__", "other.py", 1, 10, "{}");
+    int64_t second_unrelated_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.third.AlsoUnrelated.__init__", "third.py", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(unrelated_target_id, 0);
+    ASSERT_GT(second_unrelated_target_id, 0);
+    cbm_registry_add(reg, "__init__", "proj.other.Unrelated.__init__", "Method");
+    cbm_registry_add(reg, "__init__", "proj.third.AlsoUnrelated.__init__", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "super().__init__",
+                    .enclosing_func_qn = "proj.app.Child.__init__",
+                    .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {
+        {.path = "/tmp/proj/app.py", .rel_path = "app.py", .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(pipeline_external_lsp_target_suppresses_suffix_fallback) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     cbm_registry_t *reg = cbm_registry_new();
@@ -15978,6 +16030,7 @@ SUITE(pipeline) {
     RUN_TEST(registry_confidence_unique_name);
     RUN_TEST(registry_confidence_suffix_match);
     RUN_TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback);
+    RUN_TEST(pipeline_python_super_init_without_lsp_suppresses_weak_suffix_fallback);
     RUN_TEST(pipeline_external_lsp_target_suppresses_suffix_fallback);
     RUN_TEST(pipeline_internal_lsp_declaration_keeps_canonical_registry_fallback);
     RUN_TEST(pipeline_python_file_self_call_suppresses_weak_suffix_fallback);
