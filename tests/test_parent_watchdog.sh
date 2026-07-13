@@ -12,6 +12,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="${ROOT}/build/c/codebase-memory-mcp"
+CHILD_START_ATTEMPTS=50
+CHILD_START_POLL_SECONDS=0.1
+CHILD_READY_LOG_PATTERN='msg=mem.init'
+WATCHDOG_EXIT_TIMEOUT_SECONDS=6
+WATCHDOG_EXIT_POLL_SECONDS=0.2
 
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
@@ -44,7 +49,7 @@ cat >"${tmpdir}/wrapper.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 exec 3<>"${FIFO}"
-"${CBM_BINARY}" <&3 >/dev/null 2>"${TMPDIR_PATH}/child.err" &
+CBM_LOG_LEVEL=info "${CBM_BINARY}" <&3 >/dev/null 2>"${TMPDIR_PATH}/child.err" &
 echo "$!" >"${TMPDIR_PATH}/child.pid"
 wait
 SH
@@ -56,9 +61,9 @@ CBM_BINARY="${BINARY}" FIFO="${tmpdir}/stdin" TMPDIR_PATH="${tmpdir}" \
 wrapper_pid=$!
 
 # Wait for the child PID file to appear.
-for _ in {1..50}; do
+for ((attempt = 0; attempt < CHILD_START_ATTEMPTS; attempt++)); do
   [[ -s "${tmpdir}/child.pid" ]] && break
-  sleep 0.1
+  sleep "${CHILD_START_POLL_SECONDS}"
 done
 
 if [[ ! -s "${tmpdir}/child.pid" ]]; then
@@ -73,17 +78,38 @@ if ! kill -0 "${child_pid}" 2>/dev/null; then
   exit 3
 fi
 
+# Publishing the child PID happens immediately after fork, before main() has
+# necessarily captured its initial parent PID. Killing the wrapper at that
+# point races startup: the child can observe ppid==1 and deliberately disable
+# the watchdog. mem.init is emitted after watchdog creation, so it is the
+# readiness barrier for a deterministic parent-death assertion.
+for ((attempt = 0; attempt < CHILD_START_ATTEMPTS; attempt++)); do
+  grep -q "${CHILD_READY_LOG_PATTERN}" "${tmpdir}/child.err" 2>/dev/null && break
+  if ! kill -0 "${child_pid}" 2>/dev/null; then
+    echo "child exited before watchdog initialization" >&2
+    [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+    exit 3
+  fi
+  sleep "${CHILD_START_POLL_SECONDS}"
+done
+
+if ! grep -q "${CHILD_READY_LOG_PATTERN}" "${tmpdir}/child.err" 2>/dev/null; then
+  echo "child did not initialize the parent watchdog" >&2
+  [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+  exit 3
+fi
+
 # Kill the wrapper parent: the orphaned child must now self-exit.
 kill -9 "${wrapper_pid}"
 wait "${wrapper_pid}" 2>/dev/null || true
 
-deadline=$((SECONDS + 6))
+deadline=$((SECONDS + WATCHDOG_EXIT_TIMEOUT_SECONDS))
 while (( SECONDS < deadline )); do
   if ! kill -0 "${child_pid}" 2>/dev/null; then
     echo "ok: child ${child_pid} exited after parent death"
     exit 0
   fi
-  sleep 0.2
+  sleep "${WATCHDOG_EXIT_POLL_SECONDS}"
 done
 
 echo "codebase-memory-mcp child ${child_pid} survived parent death" >&2
