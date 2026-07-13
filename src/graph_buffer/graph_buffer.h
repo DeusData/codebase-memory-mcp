@@ -113,6 +113,12 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
  * Keys borrowed (not freed). Returns total nodes deleted, or negative on setup failure. */
 int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count);
 
+/* Iteratively remove Folder nodes with no outgoing file or child-folder
+ * containment edge. Returns the number of pruned nodes, or a negative error.
+ * Used after incremental file deletion so in-memory containment matches a
+ * clean structure rebuild, including nested folders that become empty. */
+int cbm_gbuf_prune_orphan_folders(cbm_gbuf_t *gb);
+
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project);

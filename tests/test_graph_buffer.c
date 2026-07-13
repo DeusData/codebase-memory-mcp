@@ -718,6 +718,38 @@ TEST(gbuf_delete_by_paths_cascades_edges) {
     PASS();
 }
 
+TEST(gbuf_prune_orphan_folders_removes_nested_empty_context) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t project = cbm_gbuf_upsert_node(gb, "Project", "test", "test", "", 0, 0, "{}");
+    int64_t source_folder =
+        cbm_gbuf_upsert_node(gb, "Folder", "src", "test.src", "src", 0, 0, "{}");
+    int64_t package_folder =
+        cbm_gbuf_upsert_node(gb, "Folder", "pkg", "test.src.pkg", "src/pkg", 0, 0, "{}");
+    int64_t file =
+        cbm_gbuf_upsert_node(gb, "File", "a.go", "test.src.pkg.a", "src/pkg/a.go", 0, 0, "{}");
+    ASSERT_GT(project, 0);
+    ASSERT_GT(source_folder, 0);
+    ASSERT_GT(package_folder, 0);
+    ASSERT_GT(file, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, project, source_folder, "CONTAINS_FOLDER", "{}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, source_folder, package_folder, "CONTAINS_FOLDER", "{}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, package_folder, file, "CONTAINS_FILE", "{}"), 0);
+
+    ASSERT_EQ(cbm_gbuf_prune_orphan_folders(gb), 0);
+    ASSERT_EQ(cbm_gbuf_delete_by_file(gb, "src/pkg/a.go"), 1);
+    ASSERT_EQ(cbm_gbuf_prune_orphan_folders(gb), 2);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(gb, "test"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.src"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(gb, "test.src.pkg"));
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count(gb), 0);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_node_count_empty) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     ASSERT_EQ(cbm_gbuf_node_count(gb), 0);
@@ -1663,6 +1695,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_find_by_name_multiple);
     RUN_TEST(gbuf_delete_by_label_cascades_edges);
     RUN_TEST(gbuf_delete_by_paths_cascades_edges);
+    RUN_TEST(gbuf_prune_orphan_folders_removes_nested_empty_context);
     RUN_TEST(gbuf_node_count_empty);
     RUN_TEST(gbuf_upsert_100_nodes_stress);
 
