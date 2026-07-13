@@ -2230,15 +2230,49 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
         p++;
     }
     if (*p == '"') {
-        /* String value */
+        /* String value — honor backslash escapes: without this, an embedded \"
+         * cuts the value short at the first escaped quote. */
         p++;
         size_t i = 0;
         while (*p && *p != '"' && i < buf_sz - SKIP_ONE) {
+            if (*p == '\\' && p[SKIP_ONE] && i + SKIP_ONE < buf_sz - SKIP_ONE) {
+                buf[i++] = *p++; /* keep the escape pair intact */
+            }
             buf[i++] = *p++;
         }
         buf[i] = '\0';
+    } else if (*p == '[' || *p == '{') {
+        /* Array/object value — copy the whole balanced construct. A scan-to-comma
+         * truncates at the first comma INSIDE the value: e.g. a decorators array
+         * ["@Roles('OWNER', 'ADMIN')","@Get()"] came back as ["@Roles('OWNER'. */
+        char open = *p;
+        char close = (open == '[') ? ']' : '}';
+        int depth = 0;
+        int in_str = 0;
+        size_t i = 0;
+        while (*p && i < buf_sz - SKIP_ONE) {
+            char c = *p;
+            if (in_str) {
+                if (c == '\\' && p[SKIP_ONE] && i + SKIP_ONE < buf_sz - SKIP_ONE) {
+                    buf[i++] = *p++; /* escape pair stays intact */
+                } else if (c == '"') {
+                    in_str = 0;
+                }
+            } else if (c == '"') {
+                in_str = 1;
+            } else if (c == open) {
+                depth++;
+            } else if (c == close) {
+                depth--;
+            }
+            buf[i++] = *p++;
+            if (!in_str && depth == 0) {
+                break; /* outer bracket closed */
+            }
+        }
+        buf[i] = '\0';
     } else {
-        /* Numeric or other value */
+        /* Numeric or other scalar value */
         size_t i = 0;
         while (*p && *p != ',' && *p != '}' && *p != ' ' && i < buf_sz - SKIP_ONE) {
             buf[i++] = *p++;

@@ -2794,6 +2794,59 @@ TEST(cypher_multi_prop_projection_no_alias) {
  * forked child so a stack overwrite (ASan abort, or a raw segfault) shows up
  * as a killing signal instead of taking down the whole runner; the bounded
  * path returns an ordinary error and the child exits cleanly. */
+/* Property projection must return the WHOLE value of composite properties.
+ * json_extract_prop() scanned a non-string value up to the first ',' — so an
+ * array/object property was truncated at its first INTERNAL comma. Real-world
+ * hit: a NestJS handler's decorators
+ *   ["@Roles('OWNER', 'ADMIN')","@Get()"]
+ * projected as ["@Roles('OWNER'   — unusable for route/authz queries. */
+TEST(cypher_exec_prop_array_with_internal_commas) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Method",
+                    .name = "findAll",
+                    .qualified_name = "test.PacienteController.findAll",
+                    .file_path = "paciente.controller.ts",
+                    .properties_json =
+                        "{\"decorators\":[\"@Roles('OWNER', 'ADMIN')\",\"@Get()\"],\"lines\":3}"};
+    cbm_store_upsert_node(s, &n);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (m:Method) RETURN m.decorators, m.lines", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    /* whole array, commas and all — was ["@Roles('OWNER' before the fix */
+    ASSERT_STR_EQ(r.rows[0][0], "[\"@Roles('OWNER', 'ADMIN')\",\"@Get()\"]");
+    ASSERT_STR_EQ(r.rows[0][1], "3"); /* scalar sibling still parses */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A string property must not end at an ESCAPED quote: the scan stopped at the
+ * first '"' regardless of a preceding backslash, cutting the value short. */
+TEST(cypher_exec_prop_string_with_escaped_quote) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "parse",
+                    .qualified_name = "test.parse",
+                    .file_path = "p.ts",
+                    .properties_json = "{\"signature\":\"(sep: \\\"a,b\\\") => void\"}"};
+    cbm_store_upsert_node(s, &n);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.signature", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "(sep: \\\"a,b\\\") => void"); /* was: (sep: \ */
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_wide_return_projection_bounded) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork crash-isolation is POSIX-only; the parse-time bound is platform-agnostic");
@@ -2994,4 +3047,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_unwind);
     RUN_TEST(cypher_parse_unwind_var);
     RUN_TEST(cypher_wide_return_projection_bounded);
+    /* Composite property projection (arrays/objects, escaped quotes) */
+    RUN_TEST(cypher_exec_prop_array_with_internal_commas);
+    RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
 }
