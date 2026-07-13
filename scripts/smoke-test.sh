@@ -1010,10 +1010,35 @@ HOME="$FAKE_HOME" \
 # Helper for JSON validation (pipe file to python — avoids MSYS2 path translation issues)
 json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""; }
 
-# Helper: compare command paths (handles Windows D:\... vs POSIX /tmp/... mismatch)
-path_match() {
+# Helper: compare exact paths across native Windows and MSYS2 spellings.
+exact_path_match() {
   [ "$1" = "$2" ] && return 0
+  if command -v cygpath >/dev/null 2>&1; then
+    local first second
+    first=$(cygpath -am "$1" 2>/dev/null || true)
+    second=$(cygpath -am "$2" 2>/dev/null || true)
+    [ -n "$first" ] && [ "$first" = "$second" ] && return 0
+  fi
+  return 1
+}
+
+# Command paths retain a basename fallback for platforms without a native path
+# converter. Configuration references use exact_path_match instead.
+path_match() {
+  exact_path_match "$1" "$2" && return 0
   [ "$(basename "$1" 2>/dev/null)" = "$(basename "$2" 2>/dev/null)" ] && return 0
+  return 1
+}
+
+json_instructions_contain_path() {
+  local config="$1"
+  local expected="$2"
+  local candidate
+  while IFS= read -r candidate; do
+    exact_path_match "$candidate" "$expected" && return 0
+  done < <(cat "$config" 2>/dev/null | python3 -c \
+    "import json,sys; d=json.load(sys.stdin); print(*d.get('instructions', []), sep='\\n')" \
+    2>/dev/null)
   return 1
 }
 
@@ -1352,8 +1377,7 @@ if [ ! -f "$KILO_RULE" ]; then
   echo "FAIL 8u: KiloCode rules file missing"
   exit 1
 fi
-KILO_REF=$(json_get "$KILO_CFG" "str('$KILO_RULE' in d.get('instructions', []))")
-if [ "$KILO_REF" != "True" ]; then
+if ! json_instructions_contain_path "$KILO_CFG" "$KILO_RULE"; then
   echo "FAIL 8u: KiloCode config does not load its installed rule"
   exit 1
 fi
@@ -2267,8 +2291,7 @@ if CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p
   echo "FAIL 9l: Crush context path remains"
   exit 1
 fi
-if KILO_REF=$(json_get "$KILO_CFG" "str('$KILO_RULE' in d.get('instructions', []))") &&
-   [ "$KILO_REF" = "True" ]; then
+if json_instructions_contain_path "$KILO_CFG" "$KILO_RULE"; then
   echo "FAIL 9l: Kilo instruction reference remains"
   exit 1
 fi
