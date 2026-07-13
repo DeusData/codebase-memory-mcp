@@ -1012,11 +1012,14 @@ json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys
 
 # Helper: compare exact paths across native Windows and MSYS2 spellings.
 exact_path_match() {
-  [ "$1" = "$2" ] && return 0
+  local first="${1%$'\r'}"
+  local second="${2%$'\r'}"
+  [ "$first" = "$second" ] && return 0
   if command -v cygpath >/dev/null 2>&1; then
-    local first second
-    first=$(cygpath -am "$1" 2>/dev/null || true)
-    second=$(cygpath -am "$2" 2>/dev/null || true)
+    first=$(cygpath -am "$first" 2>/dev/null || true)
+    second=$(cygpath -am "$second" 2>/dev/null || true)
+    first=$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')
+    second=$(printf '%s' "$second" | tr '[:upper:]' '[:lower:]')
     [ -n "$first" ] && [ "$first" = "$second" ] && return 0
   fi
   return 1
@@ -1034,10 +1037,10 @@ json_instructions_contain_path() {
   local config="$1"
   local expected="$2"
   local candidate
-  while IFS= read -r candidate; do
+  while IFS= read -r -d '' candidate; do
     exact_path_match "$candidate" "$expected" && return 0
   done < <(cat "$config" 2>/dev/null | python3 -c \
-    "import json,sys; d=json.load(sys.stdin); print(*d.get('instructions', []), sep='\\n')" \
+    "import json,sys; d=json.load(sys.stdin); sys.stdout.buffer.write(b''.join(p.encode('utf-8') + b'\\0' for p in d.get('instructions', []) if isinstance(p, str)))" \
     2>/dev/null)
   return 1
 }
@@ -1378,6 +1381,8 @@ if [ ! -f "$KILO_RULE" ]; then
   exit 1
 fi
 if ! json_instructions_contain_path "$KILO_CFG" "$KILO_RULE"; then
+  KILO_REFS=$(json_get "$KILO_CFG" "repr(d.get('instructions', []))")
+  printf "DEBUG 8u: expected=%q refs=%s\n" "$KILO_RULE" "$KILO_REFS"
   echo "FAIL 8u: KiloCode config does not load its installed rule"
   exit 1
 fi
