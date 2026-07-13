@@ -10,6 +10,7 @@ int tf_skip_count = 0;
 int tf_filter_count = 0;
 
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/profile.h"
@@ -120,6 +121,40 @@ extern void cbm_kind_in_set_free_cache(void);
 #define TEST_CACHE_DIR_CAP CBM_PATH_MAX
 /* cbm_setenv() overwrite flag: nonzero = replace an existing value. */
 #define ENV_OVERWRITE 1
+/* Test-only injection used to prove cleanup failures make the runner red. */
+#define TEST_CACHE_CLEANUP_FAIL_ENV "CBM_TEST_FAIL_CACHE_CLEANUP"
+
+static char test_cache_dir[TEST_CACHE_DIR_CAP];
+
+static int cleanup_test_cache(void) {
+    /* Preserve failed/crashed runs for diagnosis; green runs own and remove
+     * only the isolated cache root created below. Forked tests use _exit(), so
+     * child processes do not run this inherited atexit handler. */
+    if (tf_fail_count != 0 || !test_cache_dir[0]) {
+        return 0;
+    }
+    if (getenv(TEST_CACHE_CLEANUP_FAIL_ENV)) {
+        return -1;
+    }
+    if (th_rmtree(test_cache_dir) != 0) {
+        return -1;
+    }
+    test_cache_dir[0] = '\0';
+    return 0;
+}
+
+static void cleanup_test_cache_at_exit(void) {
+    if (cleanup_test_cache() != 0) {
+        fprintf(stderr, "warning: failed to remove test cache: %s\n", test_cache_dir);
+    }
+}
+
+static void require_test_cache_cleanup(void) {
+    if (cleanup_test_cache() != 0) {
+        fprintf(stderr, "failed to remove test cache: %s\n", test_cache_dir);
+        tf_fail_count++;
+    }
+}
 
 int main(void) {
     cbm_profile_init();
@@ -138,11 +173,17 @@ int main(void) {
      * path (pipeline.c + mcp.c) honors CBM_CACHE_DIR regardless. */
     const char *no_iso = getenv("CBM_TEST_NO_ISOLATE");
     if (!no_iso || no_iso[0] == '\0') {
-        static char test_cache_dir[TEST_CACHE_DIR_CAP];
         int n = snprintf(test_cache_dir, sizeof(test_cache_dir), "%s/cbm-test-cache-XXXXXX",
                          cbm_tmpdir());
-        if (n >= 0 && (size_t)n < sizeof(test_cache_dir) && cbm_mkdtemp(test_cache_dir)) {
-            cbm_setenv("CBM_CACHE_DIR", test_cache_dir, ENV_OVERWRITE);
+        if (n < 0 || (size_t)n >= sizeof(test_cache_dir) || !cbm_mkdtemp(test_cache_dir)) {
+            fprintf(stderr, "failed to create isolated test cache\n");
+            return 1;
+        }
+        if (cbm_setenv("CBM_CACHE_DIR", test_cache_dir, ENV_OVERWRITE) != 0 ||
+            atexit(cleanup_test_cache_at_exit) != 0) {
+            fprintf(stderr, "failed to initialize isolated test cache\n");
+            th_cleanup(test_cache_dir);
+            return 1;
         }
     }
 
@@ -246,6 +287,7 @@ int main(void) {
         if (strstr("grammar_probe_f", only_suite)) RUN_SUITE(grammar_probe_f);
         if (strstr("grammar_probe_g", only_suite)) RUN_SUITE(grammar_probe_g);
         if (strstr("incremental", only_suite)) RUN_SUITE(incremental);
+        require_test_cache_cleanup();
         TEST_SUMMARY();
         return 0;
     }
@@ -417,5 +459,6 @@ int main(void) {
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();
     sqlite3_shutdown();
+    require_test_cache_cleanup();
     TEST_SUMMARY();
 }
