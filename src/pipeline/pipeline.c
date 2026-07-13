@@ -112,6 +112,7 @@ struct cbm_pipeline {
     double semantic_threshold;
     double githistory_min_coupling;
     double lsp_confidence_floor;
+    int64_t extract_timeout_micros;
     cbm_incremental_reindex_policy_t incremental_reindex;
     cbm_overlay_publish_policy_t overlay_publish;
     cbm_incremental_derived_refresh_policy_t incremental_derived_refresh;
@@ -205,6 +206,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->semantic_threshold = 0.0;
     p->githistory_min_coupling = 0.0;
     p->lsp_confidence_floor = 0.0;
+    p->extract_timeout_micros = CBM_EXTRACT_BUDGET;
     p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
     p->overlay_publish = CBM_OVERLAY_PUBLISH_OFF;
     p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
@@ -346,6 +348,15 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
         cbm_pipeline_set_lsp_confidence_floor(p, lsp_floor);
     }
 
+    int extract_timeout_ms = cbm_config_get_int(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS,
+                                                CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS);
+    if (extract_timeout_ms < CBM_CONFIG_EXTRACT_TIMEOUT_MIN_MS) {
+        extract_timeout_ms = CBM_CONFIG_EXTRACT_TIMEOUT_MIN_MS;
+    } else if (extract_timeout_ms > CBM_CONFIG_EXTRACT_TIMEOUT_MAX_MS) {
+        extract_timeout_ms = CBM_CONFIG_EXTRACT_TIMEOUT_MAX_MS;
+    }
+    p->extract_timeout_micros = (int64_t)extract_timeout_ms * 1000;
+
     const char *incremental =
         cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_OFF);
     if (incremental && strcmp(incremental, CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS) == 0) {
@@ -403,6 +414,10 @@ double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p) {
 
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p) {
     return p ? p->lsp_confidence_floor : 0.0;
+}
+
+int64_t cbm_pipeline_extract_timeout_micros(const cbm_pipeline_t *p) {
+    return p ? p->extract_timeout_micros : CBM_EXTRACT_BUDGET;
 }
 
 int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p) {
@@ -1765,6 +1780,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .semantic_threshold = p->semantic_threshold,
         .githistory_min_coupling = p->githistory_min_coupling,
         .lsp_confidence_floor = p->lsp_confidence_floor,
+        .extract_timeout_micros = p->extract_timeout_micros,
         .path_aliases = path_aliases,
     };
 

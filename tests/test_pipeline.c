@@ -14608,6 +14608,7 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, "0.76"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.31"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, "0.61"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "17000"), 0);
     char max_changed[CBM_SZ_32];
     char max_affected[CBM_SZ_32];
     int n = snprintf(max_changed, sizeof(max_changed), "%d", PIPELINE_TEST_EXACT_MAX_CHANGED);
@@ -14633,10 +14634,20 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) < 0.32);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) > 0.60);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
+    ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p), 17000000);
     ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
     ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
     ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
     ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p));
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p),
+              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_MIN_MS * 1000);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "999999"), 0);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p),
+              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_MAX_MS * 1000);
 
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
@@ -14897,6 +14908,15 @@ TEST(config_registry_includes_incremental_reindex_policy) {
     ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_REINDEX_OFF);
     ASSERT_STR_EQ(entry->category, "Indexing");
     ASSERT_STR_EQ(entry->range, "fast|always|off");
+    PASS();
+}
+
+TEST(config_registry_includes_extract_timeout) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_EXTRACT_TIMEOUT_MS);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "100-120000");
     PASS();
 }
 
@@ -15670,6 +15690,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_batch_rejects_invalid_token_stride);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(config_registry_includes_extract_timeout);
     RUN_TEST(config_registry_includes_overlay_publish_policy);
     RUN_TEST(config_registry_includes_overlay_compaction_policy);
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);

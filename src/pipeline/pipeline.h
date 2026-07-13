@@ -105,6 +105,11 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_SEMANTIC_THRESHOLD "semantic_threshold"
 #define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
 #define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
+#define CBM_CONFIG_EXTRACT_TIMEOUT_MS "extract_timeout_ms"
+#define CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS 5000
+#define CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT "5000"
+#define CBM_CONFIG_EXTRACT_TIMEOUT_MIN_MS 100
+#define CBM_CONFIG_EXTRACT_TIMEOUT_MAX_MS 120000
 #define CBM_CONFIG_INCREMENTAL_REINDEX "incremental_reindex"
 #define CBM_CONFIG_INCREMENTAL_REINDEX_OFF "off"
 #define CBM_CONFIG_INCREMENTAL_REINDEX_FAST "fast"

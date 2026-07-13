@@ -2860,6 +2860,9 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config registry ──────────────────────────────────────────── */
 
+/* Hand-wrapped for readable help text; automatic formatting makes this table
+ * substantially narrower and churns unrelated entries. */
+// clang-format off
 const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     /* ── Indexing ── */
     {"auto_index", "true", "CBM_AUTO_INDEX", "Indexing",
@@ -2871,6 +2874,10 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "0-10000000",
      "Protects against accidentally indexing huge monorepos. Raise for large codebases. "
      "Set 0 to disable the limit and always index regardless of repo size."},
+    {CBM_CONFIG_EXTRACT_TIMEOUT_MS, CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT, NULL, "Indexing",
+     "Per-file tree-sitter parse deadline in milliseconds",
+     "100-120000",
+     "Bounds pathological parses. A timeout fails the indexing transaction and preserves the prior database; raise only for measured large-file workloads or instrumented tests."},
     {"reindex_on_startup", "false", "CBM_REINDEX_ON_STARTUP", "Indexing",
      "Re-index stale projects when server starts",
      "true|false",
@@ -3225,6 +3232,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Set 0 for unlimited if you need complete large-package analysis."},
     {NULL, NULL, NULL, NULL, NULL, NULL, NULL} /* sentinel */
 };
+// clang-format on
 
 /* Get config value with env var override priority: env > db > default.
  * Looks up the registry entry for the key to find the env var name. */
