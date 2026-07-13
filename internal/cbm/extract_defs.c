@@ -1797,6 +1797,18 @@ static int collect_modifier_decorators(CBMArena *a, TSNode modifiers, const char
     return idx;
 }
 
+/* Comments are NAMED nodes in tree-sitter, so a comment interleaved in a
+ * decorator run would end the walk and silently drop every decorator above it:
+ *
+ *   @Post('login')                    <-- lost
+ *   @HttpCode(HttpStatus.OK)          <-- lost
+ *   // why this route is throttled    <-- walk stopped here
+ *   @Throttle({ ... })                <-- kept
+ *   async login(...)
+ *
+ * Documenting a decorator must not make it disappear from the graph, so treat
+ * comments as transparent — like the anonymous tokens already skipped below.
+ * (is_comment_node() is defined above, near the docstring helpers.) */
 static const char **extract_decorators(CBMArena *a, TSNode node, const char *source,
                                        CBMLanguage lang, const CBMLangSpec *spec) {
     if (!spec->decorator_node_types || !spec->decorator_node_types[0]) {
@@ -1808,10 +1820,11 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     while (!ts_node_is_null(prev)) {
         if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
             count++;
-        } else if (ts_node_is_named(prev)) {
+        } else if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
             /* A real preceding construct ends the decorator run. Anonymous
              * tokens (e.g. TS `export` between `@Decorator` and the
-             * `class_declaration`) are skipped so the decorator is still seen. */
+             * `class_declaration`) and comments are skipped so the decorator
+             * is still seen. */
             break;
         }
         prev = ts_node_prev_sibling(prev);
@@ -1848,7 +1861,7 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     while (!ts_node_is_null(prev) && idx < count) {
         if (cbm_kind_in_set(prev, spec->decorator_node_types)) {
             result[idx++] = cbm_node_text(a, prev, source);
-        } else if (ts_node_is_named(prev)) {
+        } else if (ts_node_is_named(prev) && !is_comment_node(ts_node_type(prev))) {
             break;
         }
         prev = ts_node_prev_sibling(prev);
