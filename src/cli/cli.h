@@ -95,6 +95,11 @@ int cbm_install_skills(const char *skills_dir, bool force, bool dry_run);
  * Returns count of skills removed. */
 int cbm_remove_skills(const char *skills_dir, bool dry_run);
 
+/* Install/remove Codex user skills in ~/.agents/skills.
+ * Returns count of skills written/removed. */
+int cbm_install_codex_skills(const char *home_dir, bool force, bool dry_run);
+int cbm_remove_codex_skills(const char *home_dir, bool dry_run);
+
 /* Remove old monolithic skill dir if it exists.
  * Returns true if it was removed. */
 bool cbm_remove_old_monolithic_skill(const char *skills_dir, bool dry_run);

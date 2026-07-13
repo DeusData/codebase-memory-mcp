@@ -1029,6 +1029,14 @@ if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] || ! grep -q 'codebase-memory-mcp' "$F
 fi
 echo "OK 8i: Codex instructions"
 
+# 8i2: Codex user skill
+CODEX_SKILL_FILE="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
+if [ ! -s "$CODEX_SKILL_FILE" ] || ! grep -q 'Quick Decision Matrix' "$CODEX_SKILL_FILE"; then
+  echo "FAIL 8i2: Codex codebase-memory skill missing or incomplete"
+  exit 1
+fi
+echo "OK 8i2: Codex skill installed"
+
 # 8j-l: Gemini MCP + hooks + merge
 CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
@@ -1248,6 +1256,11 @@ if ! grep -q 'existing_section' "$FAKE_HOME/.codex/config.toml" 2>/dev/null; the
   exit 1
 fi
 echo "OK 9e-f: Codex TOML cleaned, existing preserved"
+if [ -d "$FAKE_HOME/.agents/skills/codebase-memory" ]; then
+  echo "FAIL 9f2: Codex skill not removed"
+  exit 1
+fi
+echo "OK 9f2: Codex skill removed"
 
 # 9g-i: Gemini MCP removed, existing preserved, hooks removed
 if cat "$FAKE_HOME/.gemini/settings.json" 2>/dev/null | python3 -c "
