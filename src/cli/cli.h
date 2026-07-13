@@ -175,6 +175,15 @@ int cbm_upsert_opencode_mcp(const char *binary_path, const char *config_path);
 /* Remove CMM MCP entry from opencode.json. Returns 0 on success. */
 int cbm_remove_opencode_mcp(const char *config_path);
 
+/* OpenCode: install TypeScript plugin to ~/.config/opencode/plugins/cbm-augment.ts.
+ * Wires tool.execute.after (grep/glob graph augment) and
+ * experimental.chat.system.transform (session reminder).
+ * Returns 0 on success. */
+int cbm_upsert_opencode_plugin(const char *home, const char *binary_path, bool dry_run);
+
+/* Remove the OpenCode plugin file. Returns 0 on success. */
+int cbm_remove_opencode_plugin(const char *home, bool dry_run);
+
 /* Antigravity: upsert MCP entry in ~/.gemini/antigravity/mcp_config.json.
  * Returns 0 on success. */
 int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path);
