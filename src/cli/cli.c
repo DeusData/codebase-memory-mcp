@@ -1388,15 +1388,76 @@ static void cbm_vibe_config_dir(const char *home_dir, char *out, size_t out_sz) 
     }
 }
 
+static bool cbm_hook_script_name_safe(const char *script_name) {
+    if (!script_name || !script_name[0]) {
+        return false;
+    }
+    for (const unsigned char *cursor = (const unsigned char *)script_name; *cursor; cursor++) {
+        bool safe = (*cursor >= 'a' && *cursor <= 'z') || (*cursor >= 'A' && *cursor <= 'Z') ||
+                    (*cursor >= '0' && *cursor <= '9') || *cursor == '-' || *cursor == '_' ||
+                    *cursor == '.';
+        if (!safe) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Build the hook command string written into Claude Code's settings.json.
- * Honors $CLAUDE_CONFIG_DIR. When CLAUDE_CONFIG_DIR is unset, preserves the
- * portable $HOME form. Values from CLAUDE_CONFIG_DIR are quoted as one literal
- * shell word so whitespace and metacharacters cannot alter the command. */
-static int cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
-    if (!script_name || !script_name[0] || !out || out_sz == 0U) {
+ * POSIX embeds a safely quoted absolute custom config path or a portable $HOME
+ * path. Windows explicitly invokes cmd.exe so the hook also works when Claude
+ * falls back from Git Bash to PowerShell. The Windows command defers expansion
+ * of custom paths to cmd.exe and disables delayed expansion, so user path bytes
+ * never become source text in either outer shell. */
+static int cbm_build_claude_hook_command(const char *script_name, const char *config_dir,
+                                         bool windows, char *out, size_t out_sz) {
+    if (!cbm_hook_script_name_safe(script_name) || !out || out_sz == 0U) {
         return CLI_ERR;
     }
     out[0] = '\0';
+    if (windows) {
+        const char *base =
+            config_dir && config_dir[0] ? "%CLAUDE_CONFIG_DIR%" : "%USERPROFILE%\\.claude";
+        int written = snprintf(out, out_sz, "cmd.exe /d /v:off /s /c '\"\"%s\\hooks\\%s\"\"'", base,
+                               script_name);
+        return written > 0 && (size_t)written < out_sz ? CLI_OK : CLI_ERR;
+    }
+    if (config_dir && config_dir[0]) {
+        char path[CLI_BUF_1K];
+        int written = snprintf(path, sizeof(path), "%s/hooks/%s", config_dir, script_name);
+        return written > 0 && (size_t)written < sizeof(path)
+                   ? cbm_shell_quote_word(path, out, out_sz)
+                   : CLI_ERR;
+    }
+    int written = snprintf(out, out_sz, "\"$HOME/.claude/hooks/%s\"", script_name);
+    return written > 0 && (size_t)written < out_sz ? CLI_OK : CLI_ERR;
+}
+
+static int cbm_resolve_hook_command(const char *script_name, char *out, size_t out_sz) {
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+#ifdef _WIN32
+    return cbm_build_claude_hook_command(script_name, env, true, out, out_sz);
+#else
+    return cbm_build_claude_hook_command(script_name, env, false, out, out_sz);
+#endif
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_resolve_claude_hook_command_for_testing(const char *script_name, bool windows,
+                                                char *command, size_t command_size) {
+    char env_buf[CLI_BUF_1K];
+    const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
+    return cbm_build_claude_hook_command(script_name, env, windows, command, command_size);
+}
+#endif
+
+/* Resolve the exact shell-quoted command form shipped immediately before the
+ * explicit Windows cmd.exe wrapper. It remains an ownership identity only. */
+static int cbm_resolve_previous_hook_command(const char *script_name, char *out, size_t out_sz) {
+    if (!cbm_hook_script_name_safe(script_name) || !out || out_sz == 0U) {
+        return CLI_ERR;
+    }
     char env_buf[CLI_BUF_1K];
     const char *env = cbm_safe_getenv("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), NULL);
     if (env && env[0]) {
@@ -3413,13 +3474,16 @@ static int cbm_remove_hermes_context_hook(const char *config_path, const char *b
 
 int cbm_upsert_claude_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
+    char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command)) != CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT, previous_command,
+                                          sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT, released_command,
                                           sizeof(released_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, NULL};
     int search_result = upsert_hooks_json((hooks_upsert_args_t){
         .settings_path = settings_path,
         .hook_event = "PreToolUse",
@@ -3444,13 +3508,16 @@ int cbm_upsert_claude_hooks(const char *settings_path) {
 
 int cbm_remove_claude_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
+    char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command)) != CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT, previous_command,
+                                          sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT, released_command,
                                           sizeof(released_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, NULL};
     int search_result = remove_hooks_json((hooks_remove_args_t){
         .settings_path = settings_path,
         .hook_event = "PreToolUse",
@@ -3961,13 +4028,16 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
 static int cbm_upsert_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
     char command[CLI_BUF_8K];
+    char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command)) != CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_SESSION_REMINDER_SCRIPT, previous_command,
+                                          sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SESSION_REMINDER_SCRIPT, released_command,
                                           sizeof(released_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, NULL};
     int rc = 0;
     for (int i = 0; i < NUM_DIRS; i++) {
         if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
@@ -3986,13 +4056,16 @@ static int cbm_upsert_session_hooks(const char *settings_path) {
 static int cbm_remove_session_hooks(const char *settings_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
     char command[CLI_BUF_8K];
+    char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command)) != CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_SESSION_REMINDER_SCRIPT, previous_command,
+                                          sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SESSION_REMINDER_SCRIPT, released_command,
                                           sizeof(released_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, NULL};
     int rc = 0;
     for (int i = 0; i < NUM_DIRS; i++) {
         if (remove_hooks_json((hooks_remove_args_t){.settings_path = settings_path,
@@ -4118,14 +4191,17 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
 
 int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
+    char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command)) !=
             CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, previous_command,
+                                          sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, released_command,
                                           sizeof(released_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, NULL};
     /* matcher "*" is the natural choice a user would also pick for their own
      * catch-all SubagentStart hook, so claim ownership by command too — never
      * clobber or remove a foreign "*" entry. */
@@ -4140,14 +4216,17 @@ int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
 
 int cbm_remove_claude_subagent_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
+    char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command)) !=
             CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, previous_command,
+                                          sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, released_command,
                                           sizeof(released_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, NULL};
     return remove_hooks_json((hooks_remove_args_t){.settings_path = settings_path,
                                                    .hook_event = "SubagentStart",
                                                    .matcher_str = "*",

@@ -8304,6 +8304,35 @@ TEST(cli_hook_scripts_platform_shape_issue929) {
     PASS();
 }
 
+/* Claude may execute shell-form hooks through PowerShell when Git Bash is not
+ * available. Windows registrations must therefore invoke the .cmd shim via an
+ * explicit command interpreter instead of evaluating a quoted path string. */
+TEST(cli_windows_claude_hook_command_is_shell_portable) {
+    char *saved_config = save_test_env("CLAUDE_CONFIG_DIR");
+    char command[1024];
+
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+    ASSERT_EQ(cbm_resolve_claude_hook_command_for_testing("cbm-session-reminder.cmd", true, command,
+                                                          sizeof(command)),
+              0);
+    ASSERT_STR_EQ(command, "cmd.exe /d /v:off /s /c '\"\"%USERPROFILE%\\.claude\\hooks\\"
+                           "cbm-session-reminder.cmd\"\"'");
+
+    cbm_setenv("CLAUDE_CONFIG_DIR", "C:\\Users\\A & B\\.claude!100%", 1);
+    ASSERT_EQ(cbm_resolve_claude_hook_command_for_testing("cbm-subagent-reminder.cmd", true,
+                                                          command, sizeof(command)),
+              0);
+    ASSERT_STR_EQ(command, "cmd.exe /d /v:off /s /c '\"\"%CLAUDE_CONFIG_DIR%\\hooks\\"
+                           "cbm-subagent-reminder.cmd\"\"'");
+    ASSERT(strstr(command, "A & B") == NULL);
+    ASSERT_EQ(cbm_resolve_claude_hook_command_for_testing("../foreign.cmd", true, command,
+                                                          sizeof(command)),
+              -1);
+
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
+    PASS();
+}
+
 /* issue #618: hook-augment was a structural no-op on Windows because its path
  * guards required POSIX-style '/'-prefixed absolute paths, so a drive-letter
  * cwd (C:/repo) was rejected before any search_graph query. The predicate must
@@ -9300,6 +9329,7 @@ SUITE(cli) {
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
     RUN_TEST(cli_hook_scripts_platform_shape_issue929);
+    RUN_TEST(cli_windows_claude_hook_command_is_shell_portable);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_upsert_claude_hook_fresh);

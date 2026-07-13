@@ -186,6 +186,8 @@ int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool window
                                             size_t command_size, char *shell, size_t shell_size);
 int cbm_build_qoder_hook_command_for_testing(const char *binary_path, bool windows, char *command,
                                              size_t command_size, char *shell, size_t shell_size);
+int cbm_resolve_claude_hook_command_for_testing(const char *script_name, bool windows,
+                                                char *command, size_t command_size);
 bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool windows);
 void cbm_hook_sanitize_metadata_for_testing(const char *input, char *output, size_t output_size);
 int cbm_upsert_qwen_lifecycle_hooks_for_testing(const char *settings_path, const char *binary_path,
