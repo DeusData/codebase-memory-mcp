@@ -1374,7 +1374,8 @@ unsigned tree_sitter_purescript_external_scanner_serialize(void *indents_v, char
   if (to_copy > TREE_SITTER_SERIALIZATION_BUFFER_SIZE) {
     return 0;
   }
-  memcpy(buffer, indents->data, to_copy);
+  if (to_copy > 0)
+    memcpy(buffer, indents->data, to_copy);
   return to_copy;
 }
 

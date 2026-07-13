@@ -75,6 +75,11 @@ const char *cbm_confidence_band(double score) {
 typedef CBM_DYN_ARRAY(char *) qn_array_t;
 
 struct cbm_registry {
+    /* Interned label strings (<=~30 distinct labels; owned here, freed in
+     * _free). The exact map's VALUES point into this pool instead of one
+     * strdup per registered definition (~8.5M strdups on the kernel). */
+    char *label_pool[64];
+    int label_pool_n;
     /* exact: qualifiedName → label string (heap-owned copies) */
     CBMHashTable *exact;
 
@@ -423,6 +428,33 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 
+/* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).
+ * A member call `x.foo()` reaches the weak textual cascade ONLY when the TS-LSP
+ * could not resolve the receiver type — type-resolved calls win via lsp_*
+ * strategies before the registry runs. Binding such a call to a project symbol
+ * by a weak short-name strategy fabricates a CALLS edge (`re.test()` ->
+ * SalesforceRestClient.test, `date.toISOString()` -> any project toISOString).
+ * Drop ONLY the weak strategies; keep import/same-module/qualified-tail matches
+ * and every lsp_* strategy. Uses an EXPLICIT drop-list (not keep-list +
+ * default-drop) because the parallel resolver runs lsp_* strategies through the
+ * same guard variable — a default-drop would silently kill lsp_ts_method. Pure
+ * + side-effect-free so the contract is unit-testable without a full pipeline. */
+bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy) {
+    if (!is_tsjs || !is_method || !strategy || !strategy[0]) {
+        return false;
+    }
+    /* Weak short-name strategies that actually reach the call-resolution guards:
+     * the registry's suffix_match / unique_name and the parallel field_type_hint.
+     * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
+     * is not wired into the sequential/parallel resolvers today, so it never
+     * reaches this helper, but naming it keeps a future wiring from silently
+     * reintroducing the noise. Everything else — same_module / import_map /
+     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
+     * lsp_* — is a receiver- or import-aware match and is KEPT. */
+    return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
+           strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {
@@ -437,17 +469,15 @@ cbm_registry_t *cbm_registry_new(void) {
 
 static void free_label(const char *key, void *value, void *ud) {
     (void)ud;
+    (void)value; /* interned in the registry's label_pool */
     free((void *)key);
-    free(value);
 }
 
 static void free_qn_array(const char *key, void *value, void *ud) {
     (void)ud;
     qn_array_t *arr = value;
     if (arr) {
-        for (int i = 0; i < arr->count; i++) {
-            free(arr->items[i]);
-        }
+        /* items borrow the exact map's keys — freed there, not here */
         cbm_da_free(arr);
         free(arr);
     }
@@ -458,10 +488,14 @@ void cbm_registry_free(cbm_registry_t *r) {
     if (!r) {
         return;
     }
-    cbm_ht_foreach(r->exact, free_label, NULL);
-    cbm_ht_free(r->exact);
+    /* by_name first: its items borrow exact's keys. */
     cbm_ht_foreach(r->by_name, free_qn_array, NULL);
     cbm_ht_free(r->by_name);
+    cbm_ht_foreach(r->exact, free_label, NULL);
+    cbm_ht_free(r->exact);
+    for (int i = 0; i < r->label_pool_n; i++) {
+        free(r->label_pool[i]);
+    }
     free(r);
 }
 
@@ -479,8 +513,28 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         return;
     }
 
-    /* Store in exact map: QN → label */
-    cbm_ht_set(r->exact, strdup(qualified_name), strdup(label));
+    /* Intern the label (bounded set; linear scan is fine at this size). */
+    const char *interned = NULL;
+    for (int i = 0; i < r->label_pool_n; i++) {
+        if (strcmp(r->label_pool[i], label) == 0) {
+            interned = r->label_pool[i];
+            break;
+        }
+    }
+    if (!interned && r->label_pool_n < (int)(sizeof(r->label_pool) / sizeof(r->label_pool[0]))) {
+        r->label_pool[r->label_pool_n] = strdup(label);
+        interned = r->label_pool[r->label_pool_n];
+        r->label_pool_n++;
+    }
+    if (!interned) {
+        return; /* pool exhausted (cannot happen with sane label sets) */
+    }
+
+    /* Store in exact map: QN → interned label. The key is the registry's ONE
+     * owned copy of the QN; by_name below borrows it (same lifetime) instead
+     * of a second strdup — this pair of copies was ~280 MB on the kernel. */
+    cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
+    const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
@@ -490,7 +544,7 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
         cbm_ht_set(r->by_name, strdup(simple), arr);
     }
-    cbm_da_push(arr, strdup(qualified_name));
+    cbm_da_push(arr, (char *)owned_qn);
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -564,6 +618,20 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * function name and suffix is NULL, so the target QN must be
      * resolved.requireAdmin — not just resolved, which would point at the
      * module node and miss the function entirely. */
+    /* Direct hit ONLY for suffix-less callees (an aliased direct-symbol
+     * import called bare: `from m import f as g; g()` — #875/#979). With a
+     * suffix present (`imported.method()`), returning the bare base here
+     * would swallow the suffix and bind the call to the imported symbol's
+     * own node (a Variable/Class/module) instead of base.method — exactly
+     * the mis-resolution the comment above warns about. That regressed
+     * django-scale graphs by ~11K CALLS/TESTS edges (Signal.send calls
+     * degraded to edges onto the signal variables themselves). #1000 */
+    if (!suffix || !suffix[0]) {
+        const char *direct = cbm_ht_get_key(r->exact, resolved);
+        if (direct) {
+            return (cbm_resolution_t){direct, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+        }
+    }
     char candidate[CBM_SZ_512];
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", resolved, suffix);

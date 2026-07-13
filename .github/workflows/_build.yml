@@ -8,9 +8,15 @@ on:
         description: 'Version string (e.g. v0.8.0)'
         type: string
         default: ''
+      attest:
+        description: 'Generate build provenance attestations for release artifacts'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 jobs:
   build-unix:
@@ -45,9 +51,9 @@ jobs:
     # release with no Intel macOS binary (a user-reported gap). macos-15-intel
     # is GitHub's supported Intel image through Aug 2027 (the last x86_64 macOS
     # runner); revisit the Intel leg before that retirement.
-    timeout-minutes: 25
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
@@ -83,6 +89,12 @@ jobs:
           tar -czf "codebase-memory-mcp-${GOOS}-${GOARCH}.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
 
+      - name: Attest standard binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+
       - name: Build UI binary
         env:
           VERSION: ${{ inputs.version }}
@@ -113,6 +125,12 @@ jobs:
           tar -czf "codebase-memory-mcp-ui-${GOOS}-${GOARCH}.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
 
+      - name: Attest UI binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-ui-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-${{ matrix.goos }}-${{ matrix.goarch }}
@@ -120,9 +138,9 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
@@ -158,6 +176,12 @@ jobs:
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
           zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
+      - name: Attest standard binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-windows-amd64.zip
+
       - name: Build UI binary
         shell: msys2 {0}
         env:
@@ -178,9 +202,96 @@ jobs:
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
           zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
+      - name: Attest UI binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-ui-windows-amd64.zip
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: binaries-windows-amd64
+          path: "*.zip"
+
+  build-windows-arm64:
+    # Native ARM64 Windows binary via the CLANGARM64 toolchain on the
+    # windows-11-arm runner (the same toolchain the test suite already
+    # exercises). Without it, ARM-Windows users fall back to the x86_64
+    # binary under emulation, and npm/pip on native-ARM Node/Python 404.
+    runs-on: windows-11-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANGARM64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-zlib
+            make
+            zip
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+
+      - name: Build standard binary
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh CC=clang CXX=clang++
+          fi
+
+      - name: Archive standard binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - name: Attest standard binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-windows-arm64.zip
+
+      - name: Build UI binary
+        shell: msys2 {0}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$VERSION" ]; then
+            scripts/build.sh --with-ui --version "$VERSION" CC=clang CXX=clang++
+          else
+            scripts/build.sh --with-ui CC=clang CXX=clang++
+          fi
+
+      - name: Archive UI binary
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          cp "$BIN" codebase-memory-mcp.exe
+          scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-ui-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+
+      - name: Attest UI binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-ui-windows-arm64.zip
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: binaries-windows-arm64
           path: "*.zip"
 
   build-linux-portable:
@@ -195,9 +306,9 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 25
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
@@ -230,6 +341,12 @@ jobs:
           tar -czf "codebase-memory-mcp-linux-${ARCH}-portable.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
 
+      - name: Attest standard binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-linux-${{ matrix.arch }}-portable.tar.gz
+
       - name: Build UI binary (static)
         env:
           VERSION: ${{ inputs.version }}
@@ -248,6 +365,12 @@ jobs:
           scripts/gen-third-party-notices.sh build/c/THIRD_PARTY_NOTICES.md
           tar -czf "codebase-memory-mcp-ui-linux-${ARCH}-portable.tar.gz" \
             -C build/c codebase-memory-mcp LICENSE install.sh THIRD_PARTY_NOTICES.md
+
+      - name: Attest UI binary provenance
+        if: ${{ inputs.attest }}
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: codebase-memory-mcp-ui-linux-${{ matrix.arch }}-portable.tar.gz
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

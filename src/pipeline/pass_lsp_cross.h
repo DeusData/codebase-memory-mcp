@@ -13,7 +13,8 @@
  * file LSP picks them up.
  *
  * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
- * TSX, PHP, C#. Anything else short-circuits via cbm_pxc_has_cross_lsp.
+ * TSX, PHP, C#, and JVM (Java/Kotlin via the shared filter helper).
+ * Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
  * (cbm_pipeline_pass_lsp_cross) that re-read every source file from
@@ -30,10 +31,11 @@
  * — type_rep.h covers the type-representation primitives while
  * go_lsp.h was where the project-wide def descriptor landed first. */
 #include "lsp/go_lsp.h"
-#include "lsp/py_lsp.h" /* cbm_py_build_cross_registry / cbm_run_py_lsp_cross_with_registry */
-#include "lsp/c_lsp.h"  /* cbm_c_build_cross_registry / cbm_run_c_lsp_cross_with_registry */
-#include "lsp/cs_lsp.h" /* cbm_cs_build_cross_registry / cbm_run_cs_lsp_cross_with_registry */
-#include "lsp/ts_lsp.h" /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
+#include "lsp/py_lsp.h"   /* cbm_py_build_cross_registry / cbm_run_py_lsp_cross_with_registry */
+#include "lsp/c_lsp.h"    /* cbm_c_build_cross_registry / cbm_run_c_lsp_cross_with_registry */
+#include "lsp/cs_lsp.h"   /* cbm_cs_build_cross_registry / cbm_run_cs_lsp_cross_with_registry */
+#include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
+#include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 
@@ -65,15 +67,13 @@ void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool
  * modules. gopls observed the same: it builds per-package summaries
  * and per-file only loads the summaries the file imports.
  *
- * cbm_pxc_build_module_def_index() builds an inverted index once
- * (O(D)) mapping def_module_qn → list of indices into all_defs[].
- * cbm_pxc_filter_defs_for_file() then returns a small CBMLSPDef[]
- * containing ONLY the defs from own_module + imp_qns — typically
- * 50-100× smaller than the global all_defs[].
- *
- * Net: per-file registry build drops from O(all_defs) to O(relevant_
- * defs). On a Go file importing 10 packages, relevant ≈ 1-2k vs
- * 110k → ~50× per-file speedup on the dominant cost. */
+ * cbm_pxc_build_module_def_index() builds inverted indexes once (O(D)):
+ * def_module_qn → defs and declared namespace/package → defs.
+ * cbm_pxc_filter_defs_for_file() then returns own_module + imp_qns for
+ * most languages. For Java/Kotlin callers it additionally returns
+ * same-namespace JVM defs so Gradle/Maven mixed source roots
+ * (`src/main/java/...` + `src/main/kotlin/...`) resolve same-package
+ * references without falling back to a full project registry per file. */
 typedef struct CBMModuleDefIndex CBMModuleDefIndex;
 
 CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_count);
@@ -81,12 +81,15 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
 void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx);
 
 /* Return a malloc'd CBMLSPDef[] containing all defs whose
- * def_module_qn matches own_module OR any of imp_qns. String fields
- * inside each entry are borrowed from the original all_defs[] arena
- * (caller keeps it alive). Caller frees the returned array with
- * free(). Writes the entry count to *out_count. Returns NULL if no
- * matches (with *out_count = 0). */
+ * def_module_qn matches own_module OR any of imp_qns. For Java/Kotlin
+ * callers, also include defs from the same declared package/namespace:
+ * JVM same-package references often cross `src/main/java` and
+ * `src/main/kotlin` roots without import statements. String fields inside
+ * each entry are borrowed from the original all_defs[] arena (caller keeps
+ * it alive). Caller frees the returned array with free(). Writes the entry
+ * count to *out_count. Returns NULL if no matches (with *out_count = 0). */
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
+                                        CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
                                         int imp_count, int *out_count);
 
@@ -105,6 +108,8 @@ typedef struct {
     CBMTypeRegistry *ts;     /* CBM_LANG_JAVASCRIPT, TYPESCRIPT, TSX */
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
+    /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
+     * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
 
 /* Return the appropriate pre-built registry for a language, or NULL
@@ -131,9 +136,15 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     case CBM_LANG_CSHARP:
         return r->cs;
     default:
-        return NULL;
+        return NULL; /* incl. CBM_LANG_RUST — its shared registry is built lazily */
     }
 }
+
+/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
+ * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
+ * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
+struct CBMCargoManifest;
+const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
@@ -149,5 +160,19 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                         CBMLSPDef *all_defs, int def_count, const char **imp_keys,
                         const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
+
+/* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the
+ * sequential driver (one path = one semantics): module-def-index filter →
+ * shared prebuilt registry (overlay pattern, no per-file registry build) →
+ * per-file fallback with FILTERED defs for languages without a shared
+ * variant. rust_shared_get (nullable) supplies the lazily-built shared Rust
+ * registry for NULL-filter rust files. */
+void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
+                           int source_len, const char *rel, const char *def_module,
+                           const CBMCrossLspRegistries *cross_registries,
+                           const CBMModuleDefIndex *module_def_index, CBMLSPDef *all_defs,
+                           int all_def_count, const char **imp_keys, const char **imp_vals,
+                           int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
+                           void *rust_shared_ctx);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

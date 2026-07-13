@@ -164,6 +164,7 @@ extern const TSLanguage *tree_sitter_apex(void);
 extern const TSLanguage *tree_sitter_soql(void);
 extern const TSLanguage *tree_sitter_sosl(void);
 extern const TSLanguage *tree_sitter_pine(void);
+extern const TSLanguage *tree_sitter_mojo(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -275,10 +276,14 @@ static const char *cfscript_import_types[] = {"import_statement", "import", NULL
 
 // ==================== CFML (tag dialect — .cfm templates) ====================
 // Tag-based grammar (HTML-derived). Embedded <cfscript> functions appear as
-// function_declaration/function_expression; tag <cffunction> nodes
-// (cf_function_tag) are handled separately in the definition walker because
-// their name lives in a cf_attribute rather than a `name` field.
-static const char *cfml_func_types[] = {"function_declaration", "function_expression", NULL};
+// function_declaration/function_expression. Tag <cffunction> nodes
+// (cf_function_tag) carry their name in a cf_attribute rather than a `name`
+// field, so the definition walker mints them via extract_cfml_function_tag and
+// compute_func_qn names them via compute_cfml_func_qn — but cf_function_tag is
+// listed here too so push_boundary_scopes pushes a SCOPE_FUNC and in-body calls
+// source to the enclosing cffunction rather than the Module.
+static const char *cfml_func_types[] = {"cf_function_tag", "function_declaration",
+                                        "function_expression", NULL};
 static const char *cfml_call_types[] = {"call_expression", NULL};
 static const char *cfml_branch_types[] = {
     "cf_if_tag",     "cf_elseif_tag",   "cf_else_tag",      "if_statement",
@@ -507,7 +512,7 @@ static const char *elixir_var_types[] = {"binary_operator", NULL};
 
 // ==================== HASKELL ====================
 /* "bind" = a nullary value binding (`foo = 1`); has a `name` field like `function`.
- * `signature` (type annotations) is suppressed in resolve_func_name so it never doubles. */
+ * `signature` (type annotations) is suppressed in cbm_resolve_func_name so it never doubles. */
 static const char *haskell_func_types[] = {"function", "signature", "bind", NULL};
 static const char *haskell_class_types[] = {"class", "data_type", "newtype", NULL};
 static const char *haskell_module_types[] = {"haskell", NULL};
@@ -636,7 +641,7 @@ static const char *css_import_types[] = {"import_statement", NULL};
 // ==================== SCSS ====================
 static const char *scss_func_types[] = {"mixin_statement", "function_statement", NULL};
 static const char *scss_module_types[] = {"stylesheet", NULL};
-static const char *scss_call_types[] = {"call_expression", NULL};
+static const char *scss_call_types[] = {"call_expression", "include_statement", NULL};
 static const char *scss_import_types[] = {"import_statement", "use_statement", "include_statement",
                                           NULL};
 static const char *scss_branch_types[] = {"if_statement", NULL};
@@ -694,6 +699,10 @@ static const char *r_env_funcs[] = {"Sys.getenv", NULL};
 static const char *perl_env_funcs[] = {"$ENV", NULL};
 
 // ==================== CLOJURE ====================
+/* Clojure def-forms (defn/def/...) are `list_lit` nodes; gating the actual
+ * def-vs-call distinction happens in cbm_resolve_func_name (returns NULL for a
+ * non-def list_lit such as a call), so non-def lists never push a SCOPE_FUNC. */
+static const char *clojure_func_types[] = {"list_lit", NULL};
 static const char *clojure_module_types[] = {"source", NULL};
 static const char *clojure_call_types[] = {"list_lit", NULL};
 
@@ -701,7 +710,7 @@ static const char *clojure_call_types[] = {"list_lit", NULL};
 /* Top-level `let f () = ...` parses to function_or_value_defn (module-level
  * value_declaration is aliased to declaration_expression, which wraps it). The
  * name lives on a function_declaration_left/value_declaration_left child — see
- * the CBM_LANG_FSHARP branch in resolve_func_name. */
+ * the CBM_LANG_FSHARP branch in cbm_resolve_func_name. */
 static const char *fsharp_func_types[] = {"function_declaration", "value_declaration",
                                           "function_or_value_defn", NULL};
 static const char *fsharp_class_types[] = {"type_definition", "exception_definition", NULL};
@@ -714,7 +723,11 @@ static const char *fsharp_branch_types[] = {"if_expression",    "for_expression"
 static const char *fsharp_var_types[] = {"value_declaration", NULL};
 
 // ==================== JULIA ====================
-static const char *julia_func_types[] = {"function_definition", "short_function_definition", NULL};
+/* `assignment` covers Julia short-form `f(x) = body` (the grammar parses it as an
+ * assignment with a call_expression LHS, not a short_function_definition). The
+ * resolver names it only when the LHS is a call, so plain `x = 5` is not a def. */
+static const char *julia_func_types[] = {"function_definition", "short_function_definition",
+                                         "assignment", NULL};
 static const char *julia_class_types[] = {"struct_definition", "abstract_definition",
                                           "primitive_definition", NULL};
 static const char *julia_module_types[] = {"source_file", NULL};
@@ -823,7 +836,7 @@ static const char *markdown_class_types[] = {"atx_heading", "setext_heading", NU
 // ==================== MAKEFILE ====================
 static const char *makefile_func_types[] = {"rule", "recipe", NULL};
 static const char *makefile_module_types[] = {"makefile", NULL};
-static const char *makefile_call_types[] = {"function_call", "call", NULL};
+static const char *makefile_call_types[] = {"function_call", "call", "shell_function", NULL};
 static const char *makefile_import_types[] = {"include_directive", "include", NULL};
 static const char *makefile_var_types[] = {"variable_assignment", NULL};
 
@@ -886,7 +899,7 @@ static const char *svelte_branch_types[] = {"if_statement", "each_statement", "a
 // ==================== MESON ====================
 static const char *meson_func_types[] = {"function_expression", NULL};
 static const char *meson_module_types[] = {"source_file", NULL};
-static const char *meson_call_types[] = {"function_expression", "command", NULL};
+static const char *meson_call_types[] = {"normal_command", NULL};
 static const char *meson_branch_types[] = {"if_statement", "foreach_statement", NULL};
 static const char *meson_var_types[] = {"assignment_statement", NULL};
 
@@ -970,7 +983,7 @@ static const char *d_throw_types[] = {"throw_expression", NULL};
 
 // ==================== LLVM IR ====================
 static const char *llvm_func_types[] = {"function_header", NULL};
-static const char *llvm_call_types[] = {"call", "invoke", NULL};
+static const char *llvm_call_types[] = {"call", "invoke", "instruction_call", NULL};
 static const char *llvm_branch_types[] = {"br", "switch", NULL};
 static const char *llvm_var_types[] = {"local_var", "global_var", NULL};
 
@@ -998,7 +1011,7 @@ static const char *solidity_assign_types[] = {"assignment_expression",
                                               "augmented_assignment_expression", NULL};
 static const char *solidity_throw_types[] = {"revert_statement", "emit_statement", NULL};
 static const char *solidity_module_types[] = {"source_file", NULL};
-static const char *typst_func_types[] = {"lambda", NULL};
+static const char *typst_func_types[] = {"lambda", "let", NULL};
 static const char *typst_call_types[] = {"call", NULL};
 static const char *typst_import_types[] = {"import", "include", NULL};
 static const char *typst_branch_types[] = {"if", "for", "while", NULL};
@@ -1056,6 +1069,9 @@ static const char *pascal_assign_types[] = {"assignment", NULL};
 static const char *pascal_throw_types[] = {"raise", NULL};
 static const char *pascal_module_types[] = {"source_file", NULL};
 static const char *d_module_types[] = {"source_file", NULL};
+/* Scheme def-forms (`(define (f ..) ..)`) are `list` nodes; the def-vs-call
+ * gate is in cbm_resolve_func_name (returns NULL for a non-def list). */
+static const char *scheme_func_types[] = {"list", NULL};
 static const char *scheme_call_types[] = {"list", NULL};
 static const char *scheme_var_types[] = {"symbol", NULL};
 static const char *scheme_module_types[] = {"program", NULL};
@@ -1071,7 +1087,11 @@ static const char *fish_branch_types[] = {"if_statement", "switch_statement", "w
                                           "for_statement", NULL};
 static const char *fish_var_types[] = {"variable", NULL};
 static const char *fish_module_types[] = {"program", NULL};
-static const char *awk_func_types[] = {"func_def", "rule", NULL};
+/* Only `func_def` (a named `function f(){}`) is a callable. A `rule` (`{...}` /
+ * `/re/{...}` / BEGIN/END) is ANONYMOUS top-level executable code — it cannot be
+ * called by name, so a call inside a rule is legitimately Module-sourced, and a
+ * rule must NOT be treated as a function boundary. */
+static const char *awk_func_types[] = {"func_def", NULL};
 static const char *awk_call_types[] = {"func_call", "command", NULL};
 static const char *awk_branch_types[] = {"if_statement",
                                          "for_statement",
@@ -1119,12 +1139,15 @@ static const char *ada_throw_types[] = {"raise_statement", NULL};
 static const char *ada_module_types[] = {"compilation", NULL};
 static const char *agda_func_types[] = {"function", NULL};
 static const char *agda_class_types[] = {"data", "record", NULL};
-static const char *agda_call_types[] = {"module_application", NULL};
+static const char *agda_call_types[] = {"module_application", "expr", NULL};
 static const char *agda_import_types[] = {"import", "open", "import_directive", "instance", NULL};
 static const char *agda_branch_types[] = {"lambda", "match", "do", NULL};
 static const char *agda_var_types[] = {"typed_binding", NULL};
 static const char *agda_module_types[] = {"source_file", NULL};
 static const char *racket_class_types[] = {"structure", NULL};
+/* Racket def-forms (`(define (f ..) ..)`) are `list` nodes; the def-vs-call
+ * gate is in cbm_resolve_func_name (returns NULL for a non-def list). */
+static const char *racket_func_types[] = {"list", NULL};
 static const char *racket_call_types[] = {"list", NULL};
 static const char *racket_var_types[] = {"symbol", NULL};
 static const char *racket_module_types[] = {"program", NULL};
@@ -1160,8 +1183,13 @@ static const char *purescript_import_types[] = {"import", "import_item", "instan
 static const char *purescript_branch_types[] = {"exp_if", "exp_case", "exp_do", NULL};
 static const char *purescript_var_types[] = {"signature", NULL};
 static const char *purescript_module_types[] = {"module", NULL};
-static const char *nickel_func_types[] = {"fun", NULL};
-static const char *nickel_call_types[] = {"infix_expr", NULL};
+/* The lambda node is `fun_expr` (the bare `fun` is only the keyword token, never
+ * a named node); its name lives on the enclosing let_binding's `pat` field, so
+ * cbm_resolve_func_name climbs to the parent for naming. A function application
+ * (`f x y`) is an `applicative` node — `infix_expr` is binary-operator
+ * application (`a + b`), not a call. */
+static const char *nickel_func_types[] = {"fun_expr", NULL};
+static const char *nickel_call_types[] = {"applicative", NULL};
 static const char *nickel_import_types[] = {"import", "include", NULL};
 static const char *nickel_branch_types[] = {"if", "match", NULL};
 static const char *nickel_var_types[] = {"let", NULL};
@@ -1238,7 +1266,7 @@ static const char *sway_assign_types[] = {"assignment_expression", NULL};
 static const char *sway_module_types[] = {"source_file", NULL};
 static const char *nasm_func_types[] = {"label", "preproc_def", "preproc_multiline_macro", NULL};
 static const char *nasm_class_types[] = {"struc_declaration", NULL};
-static const char *nasm_call_types[] = {"call_syntax_expression", NULL};
+static const char *nasm_call_types[] = {"call_syntax_expression", "actual_instruction", NULL};
 static const char *nasm_import_types[] = {"preproc_include", NULL};
 static const char *nasm_var_types[] = {"label", NULL};
 static const char *nasm_module_types[] = {"source_file", NULL};
@@ -1248,11 +1276,12 @@ static const char *assembly_module_types[] = {"program", NULL};
 static const char *astro_module_types[] = {"document", NULL};
 static const char *blade_module_types[] = {"document", NULL};
 static const char *just_func_types[] = {"recipe", NULL};
-static const char *just_call_types[] = {"function_call", NULL};
+static const char *just_call_types[] = {"function_call", "dependency", NULL};
 static const char *just_import_types[] = {"import", NULL};
 static const char *just_branch_types[] = {"if_expression", NULL};
 static const char *just_assign_types[] = {"assignment", NULL};
 static const char *just_module_types[] = {"source_file", NULL};
+static const char *gotemplate_func_types[] = {"define_action", NULL};
 static const char *gotemplate_call_types[] = {"function_call", "method_call", "template_action",
                                               NULL};
 static const char *gotemplate_module_types[] = {"template", NULL};
@@ -1292,7 +1321,7 @@ static const char *wgsl_assign_types[] = {"assignment_statement", NULL};
 static const char *wgsl_module_types[] = {"translation_unit", NULL};
 static const char *kdl_module_types[] = {"document", NULL};
 static const char *json5_module_types[] = {"document", NULL};
-static const char *jsonnet_func_types[] = {"anonymous_function", NULL};
+static const char *jsonnet_func_types[] = {"anonymous_function", "bind", NULL};
 static const char *jsonnet_call_types[] = {"functioncall", NULL};
 static const char *jsonnet_import_types[] = {"import", "importstr", NULL};
 static const char *jsonnet_branch_types[] = {"conditional", NULL};
@@ -1318,7 +1347,8 @@ static const char *capnp_import_types[] = {"import", "extends", "using_directive
 static const char *capnp_var_types[] = {"const", NULL};
 static const char *capnp_module_types[] = {"source", NULL};
 static const char *properties_var_types[] = {"property", NULL};
-static const char *properties_module_types[] = {"source_file", NULL};
+/* tree-sitter-properties roots the tree at `file`, not `source_file`. */
+static const char *properties_module_types[] = {"file", "source_file", NULL};
 static const char *sshconfig_module_types[] = {"source_file", NULL};
 static const char *bibtex_call_types[] = {"command", NULL};
 static const char *bibtex_module_types[] = {"document", NULL};
@@ -1360,7 +1390,8 @@ static const char *vhdl_class_types[] = {
     "interface_declaration",  "package_declaration",     "protected_type_declaration",
     "record_type_definition", "type_declaration",        NULL};
 static const char *vhdl_call_types[] = {"function_call", "procedure_call_statement",
-                                        "component_instantiation_statement", NULL};
+                                        "component_instantiation_statement", "parenthesis_group",
+                                        NULL};
 static const char *vhdl_import_types[] = {"library_clause", "use_clause", NULL};
 static const char *vhdl_branch_types[] = {"if_statement", "case_statement", "loop_statement", NULL};
 static const char *vhdl_var_types[] = {"variable_declaration", "signal_declaration",
@@ -1401,8 +1432,11 @@ static const char *kconfig_class_types[] = {"config", "menuconfig", "choice", "t
 static const char *kconfig_import_types[] = {"source", NULL};
 static const char *kconfig_branch_types[] = {"if", NULL};
 static const char *kconfig_module_types[] = {"source", NULL};
-static const char *bitbake_func_types[] = {"function_definition", "python_function_definition",
-                                           "recipe", NULL};
+/* `anonymous_python_function` is the tree-sitter-bitbake node for a
+ * `python do_foo() {...}` task; `function_definition` is a `do_foo() {...}`
+ * shell task. (`recipe` is the file root, not a function.) */
+static const char *bitbake_func_types[] = {"function_definition", "anonymous_python_function",
+                                           NULL};
 static const char *bitbake_var_types[] = {"variable_assignment", NULL};
 static const char *bitbake_call_types[] = {"call", NULL};
 static const char *bitbake_import_types[] = {
@@ -1462,7 +1496,7 @@ static const char *squirrel_assign_types[] = {"assignment_expression", NULL};
 static const char *squirrel_import_types[] = {"extends", NULL};
 static const char *squirrel_module_types[] = {"source_file", NULL};
 static const char *func_func_types[] = {"function_definition", NULL};
-static const char *func_call_types[] = {"method_call", NULL};
+static const char *func_call_types[] = {"method_call", "function_application", NULL};
 static const char *func_import_types[] = {"include_directive", NULL};
 static const char *func_module_types[] = {"source_file", NULL};
 static const char *regex_module_types[] = {"pattern", NULL};
@@ -1474,7 +1508,8 @@ static const char *mermaid_module_types[] = {"source_file", NULL};
 static const char *puppet_func_types[] = {"function_declaration", "lambda", NULL};
 static const char *puppet_class_types[] = {"class_definition", "node_definition",
                                            "resource_declaration", "type_declaration", NULL};
-static const char *puppet_call_types[] = {"function_call", "resource_declaration", NULL};
+static const char *puppet_call_types[] = {"function_call", "resource_declaration",
+                                          "include_statement", NULL};
 static const char *puppet_import_types[] = {"include_statement", "require_statement", "include",
                                             "require", NULL};
 static const char *puppet_branch_types[] = {"if_statement", "unless_statement", "case_statement",
@@ -1514,7 +1549,7 @@ static const char *wit_import_types[] = {
     "import_item", "toplevel_use_item", "export_item", "import", "include", "include_item", NULL};
 static const char *wit_module_types[] = {"source_file", NULL};
 static const char *tlaplus_func_types[] = {"operator_definition", "function_definition", NULL};
-static const char *tlaplus_call_types[] = {"function_evaluation", "call", NULL};
+static const char *tlaplus_call_types[] = {"function_evaluation", "call", "bound_op", NULL};
 static const char *tlaplus_import_types[] = {"extends", "instance", NULL};
 static const char *tlaplus_branch_types[] = {"if_then_else", "case", NULL};
 static const char *tlaplus_var_types[] = {"variable_declaration", NULL};
@@ -1562,6 +1597,21 @@ static const char *pine_var_types[] = {"variable_definition_statement",
 static const char *pine_branch_types[] = {"if_statement",     "switch_statement", "for_statement",
                                           "for_in_statement", "while_statement",  NULL};
 static const char *pine_assign_types[] = {"reassignment_statement", NULL};
+static const char *mojo_func_types[] = {"function_definition", NULL};
+static const char *mojo_class_types[] = {"class_definition", "trait_definition", NULL};
+static const char *mojo_module_types[] = {"module", NULL};
+static const char *mojo_call_types[] = {"call", NULL};
+static const char *mojo_import_types[] = {"import_statement", "import_from_statement",
+                                          "future_import_statement", NULL};
+static const char *mojo_branch_types[] = {"if_statement",
+                                          "match_statement",
+                                          "for_statement",
+                                          "while_statement",
+                                          "try_statement",
+                                          "with_statement",
+                                          NULL};
+static const char *mojo_var_types[] = {"assignment", NULL};
+static const char *mojo_assign_types[] = {"assignment", "augmented_assignment", NULL};
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -1789,7 +1839,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                              empty_types, NULL, NULL, tree_sitter_dockerfile, NULL},
 
     // CBM_LANG_CLOJURE
-    [CBM_LANG_CLOJURE] = {CBM_LANG_CLOJURE, empty_types, empty_types, empty_types,
+    [CBM_LANG_CLOJURE] = {CBM_LANG_CLOJURE, clojure_func_types, empty_types, empty_types,
                           clojure_module_types, clojure_call_types, empty_types, empty_types,
                           empty_types, empty_types, empty_types, empty_types, NULL, empty_types,
                           NULL, NULL, tree_sitter_clojure, NULL},
@@ -2032,7 +2082,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                         NULL},
 
     // CBM_LANG_SCHEME
-    [CBM_LANG_SCHEME] = {CBM_LANG_SCHEME, empty_types, empty_types, empty_types,
+    [CBM_LANG_SCHEME] = {CBM_LANG_SCHEME, scheme_func_types, empty_types, empty_types,
                          scheme_module_types, scheme_call_types, empty_types, empty_types,
                          empty_types, scheme_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_scheme, NULL},
@@ -2080,7 +2130,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        empty_types, NULL, NULL, tree_sitter_agda, NULL},
 
     // CBM_LANG_RACKET
-    [CBM_LANG_RACKET] = {CBM_LANG_RACKET, empty_types, racket_class_types, empty_types,
+    [CBM_LANG_RACKET] = {CBM_LANG_RACKET, racket_func_types, racket_class_types, empty_types,
                          racket_module_types, racket_call_types, empty_types, empty_types,
                          empty_types, racket_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_racket, NULL},
@@ -2185,7 +2235,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        tree_sitter_just, NULL},
 
     // CBM_LANG_GOTEMPLATE
-    [CBM_LANG_GOTEMPLATE] = {CBM_LANG_GOTEMPLATE, empty_types, empty_types, empty_types,
+    [CBM_LANG_GOTEMPLATE] = {CBM_LANG_GOTEMPLATE, gotemplate_func_types, empty_types, empty_types,
                              gotemplate_module_types, gotemplate_call_types, empty_types,
                              empty_types, empty_types, empty_types, empty_types, empty_types, NULL,
                              empty_types, NULL, NULL, tree_sitter_gotmpl, NULL},
@@ -2536,6 +2586,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        pine_module_types, pine_call_types, empty_types, empty_types,
                        pine_branch_types, pine_var_types, pine_assign_types, empty_types, NULL,
                        empty_types, NULL, NULL, tree_sitter_pine, NULL},
+
+    // CBM_LANG_MOJO
+    [CBM_LANG_MOJO] = {CBM_LANG_MOJO, mojo_func_types, mojo_class_types, empty_types,
+                       mojo_module_types, mojo_call_types, mojo_import_types, mojo_import_types,
+                       mojo_branch_types, mojo_var_types, mojo_assign_types, empty_types, NULL,
+                       empty_types, NULL, NULL, tree_sitter_mojo, NULL},
 
 };
 

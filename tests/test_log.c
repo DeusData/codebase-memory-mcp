@@ -22,8 +22,13 @@ static inline bool cbm_str_contains_raw(const char *s, const char *sub) {
 }
 
 static char log_buf[4096];
+static char sink_buf[4096];
 static int saved_stderr;
 static int pipe_fds[2];
+
+static void test_log_sink(const char *line) {
+    snprintf(sink_buf, sizeof(sink_buf), "%s", line ? line : "");
+}
 
 static void capture_start(void) {
     fflush(stderr);
@@ -112,6 +117,100 @@ TEST(log_int_helper) {
     PASS();
 }
 
+TEST(log_json_output) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_JSON);
+    capture_start();
+    cbm_log_info("test.msg", "key1", "val1", "key2", "line\nbreak");
+    const char *output = capture_end();
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(cbm_str_contains_raw(output, "\"level\":\"info\""));
+    ASSERT(cbm_str_contains_raw(output, "\"event\":\"test.msg\""));
+    ASSERT(cbm_str_contains_raw(output, "\"key1\":\"val1\""));
+    ASSERT(cbm_str_contains_raw(output, "\"key2\":\"line\\nbreak\""));
+    PASS();
+}
+
+TEST(log_text_sanitizes_control_chars) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    capture_start();
+    cbm_log_info("test\nmsg", "key", "line\r\nbreak\tvalue");
+    const char *output = capture_end();
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(cbm_str_contains_raw(output, "msg=test_msg"));
+    ASSERT(cbm_str_contains_raw(output, "key=line__break_value"));
+    ASSERT_EQ(output[strlen(output) - 1], '\n');
+    ASSERT_NULL(strchr(output, '\r'));
+    PASS();
+}
+
+TEST(log_sink_tee_keeps_stderr) {
+    sink_buf[0] = '\0';
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_set_sink_ex(test_log_sink, CBM_LOG_SINK_TEE);
+    capture_start();
+    cbm_log_info("tee.msg", "key", "val");
+    const char *output = capture_end();
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(cbm_str_contains_raw(output, "msg=tee.msg"));
+    ASSERT(cbm_str_contains_raw(sink_buf, "msg=tee.msg"));
+    PASS();
+}
+
+TEST(log_operational_helpers) {
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    capture_start();
+    cbm_log_mcp_request("tools/call", "search_graph", false, 1250);
+    cbm_log_http_request("graph_ui", "GET", "/api/layout", 200, 7, 0, 42);
+    const char *output = capture_end();
+    cbm_log_set_level(CBM_LOG_INFO);
+
+    ASSERT(cbm_str_contains_raw(output, "msg=mcp.request"));
+    ASSERT(cbm_str_contains_raw(output, "protocol=jsonrpc"));
+    ASSERT(cbm_str_contains_raw(output, "method=tools/call"));
+    ASSERT(cbm_str_contains_raw(output, "tool=search_graph"));
+    ASSERT(cbm_str_contains_raw(output, "msg=http.request"));
+    ASSERT(cbm_str_contains_raw(output, "method=GET"));
+    ASSERT(cbm_str_contains_raw(output, "path=/api/layout"));
+    ASSERT(cbm_str_contains_raw(output, "status=200"));
+    PASS();
+}
+
+TEST(log_format_from_env) {
+    cbm_setenv("CBM_LOG_FORMAT", "json", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_JSON);
+
+    cbm_setenv("CBM_LOG_FORMAT", "text", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_TEXT);
+
+    cbm_unsetenv("CBM_LOG_FORMAT");
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    PASS();
+}
+
+TEST(log_format_unset_keeps_current) {
+    cbm_unsetenv("CBM_LOG_FORMAT");
+    cbm_log_set_format(CBM_LOG_FORMAT_JSON);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_JSON);
+
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_format(), CBM_LOG_FORMAT_TEXT);
+
+    PASS();
+}
+
 /* CBM_LOG_LEVEL parsing — distilled from #414 (closes #413). */
 TEST(log_level_from_env_textual) {
     cbm_setenv("CBM_LOG_LEVEL", "error", 1);
@@ -191,6 +290,12 @@ SUITE(log) {
     RUN_TEST(log_filtered_by_level);
     RUN_TEST(log_error_output);
     RUN_TEST(log_int_helper);
+    RUN_TEST(log_json_output);
+    RUN_TEST(log_text_sanitizes_control_chars);
+    RUN_TEST(log_sink_tee_keeps_stderr);
+    RUN_TEST(log_operational_helpers);
+    RUN_TEST(log_format_from_env);
+    RUN_TEST(log_format_unset_keeps_current);
     RUN_TEST(log_level_from_env_textual);
     RUN_TEST(log_level_from_env_numeric);
     RUN_TEST(log_level_from_env_invalid_ignored);

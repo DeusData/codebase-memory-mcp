@@ -14,11 +14,15 @@
 #include "test_helpers.h"
 #include <cli/cli.h>
 #include <foundation/yaml.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
 #include <errno.h>
 #include <zlib.h>
 
@@ -695,6 +699,48 @@ TEST(cli_editor_mcp_uninstall) {
     PASS();
 }
 
+TEST(cli_junie_mcp_install_issue651) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.junie/mcp/mcp.json", tmpdir);
+
+    int rc = cbm_upsert_junie_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "mcpServers") != NULL);
+    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "/usr/local/bin/codebase-memory-mcp") != NULL);
+
+    rc = cbm_upsert_junie_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_EQ(rc, 0);
+
+    data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    int count = 0;
+    const char *p = data;
+    while ((p = strstr(p, "\"codebase-memory-mcp\"")) != NULL) {
+        count++;
+        p += 20;
+    }
+    ASSERT_EQ(count, 1);
+
+    rc = cbm_remove_junie_mcp(configpath);
+    ASSERT_EQ(rc, 0);
+
+    data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"codebase-memory-mcp\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_gemini_mcp_install) {
     /* Port of TestGeminiMCPInstall */
     char tmpdir[256];
@@ -713,6 +759,83 @@ TEST(cli_gemini_mcp_install) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "mcpServers") != NULL);
     ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_openclaw_mcp_install_uses_nested_servers) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-openclaw-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.openclaw/openclaw.json", tmpdir);
+
+    int rc = cbm_install_openclaw_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"mcp\"") != NULL);
+    ASSERT(strstr(data, "\"servers\"") != NULL);
+    ASSERT(strstr(data, "\"enabled\": true") != NULL);
+    ASSERT(strstr(data, "\"command\": \"/usr/local/bin/codebase-memory-mcp\"") != NULL);
+    ASSERT(strstr(data, "\"args\": []") != NULL);
+    ASSERT(strstr(data, "\"mcpServers\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_openclaw_mcp_preserves_existing_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-openclaw-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.openclaw", tmpdir);
+    test_mkdirp(dir);
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/openclaw.json", dir);
+    write_test_file(configpath,
+                    "{\"theme\":\"dark\",\"mcp\":{\"servers\":{\"other\":{\"command\":\"x\"}}}}");
+
+    int rc = cbm_install_openclaw_mcp("/usr/local/bin/codebase-memory-mcp", configpath);
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "theme") != NULL);
+    ASSERT(strstr(data, "other") != NULL);
+    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "\"mcpServers\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_openclaw_mcp_uninstall_uses_nested_servers) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-openclaw-mcp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/.openclaw/openclaw.json", tmpdir);
+
+    ASSERT_EQ(cbm_install_openclaw_mcp("/usr/local/bin/codebase-memory-mcp", configpath), 0);
+    ASSERT_EQ(cbm_remove_openclaw_mcp(configpath), 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"mcp\"") != NULL);
+    ASSERT(strstr(data, "\"servers\"") != NULL);
+    ASSERT(strstr(data, "\"codebase-memory-mcp\"") == NULL);
+    ASSERT(strstr(data, "\"mcpServers\"") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -1284,6 +1407,47 @@ TEST(cli_extract_binary_from_zip_invalid) {
     PASS();
 }
 
+TEST(cli_extract_binary_from_zip_rejects_truncated_deflate_size_over_int_max) {
+    const char *filename = "codebase-memory-mcp";
+    const unsigned char deflated[] = {0xAB, 0x00, 0x00}; /* raw DEFLATE for "x" */
+    size_t name_len = strlen(filename);
+    size_t zip_len = 30 + name_len + sizeof(deflated);
+    unsigned char *zip = calloc(1, zip_len);
+    ASSERT_NOT_NULL(zip);
+
+    uint32_t comp_size = 0xFFFF0000U;
+    uint32_t uncomp_size = 1U;
+    zip[0] = 0x50;
+    zip[1] = 0x4B;
+    zip[2] = 0x03;
+    zip[3] = 0x04;
+    zip[8] = 8;
+    zip[9] = 0;
+    zip[18] = (unsigned char)(comp_size & 0xFF);
+    zip[19] = (unsigned char)((comp_size >> 8) & 0xFF);
+    zip[20] = (unsigned char)((comp_size >> 16) & 0xFF);
+    zip[21] = (unsigned char)((comp_size >> 24) & 0xFF);
+    zip[22] = (unsigned char)(uncomp_size & 0xFF);
+    zip[23] = (unsigned char)((uncomp_size >> 8) & 0xFF);
+    zip[24] = (unsigned char)((uncomp_size >> 16) & 0xFF);
+    zip[25] = (unsigned char)((uncomp_size >> 24) & 0xFF);
+    zip[26] = (unsigned char)(name_len & 0xFF);
+    zip[27] = (unsigned char)((name_len >> 8) & 0xFF);
+    memcpy(zip + 30, filename, name_len);
+    memcpy(zip + 30 + name_len, deflated, sizeof(deflated));
+
+    int out_len = 0;
+    unsigned char *extracted = cbm_extract_binary_from_zip(zip, (int)zip_len, &out_len);
+    if (extracted) {
+        free(extracted);
+        free(zip);
+        FAIL("accepted a truncated deflated zip entry with a wrapped compressed size");
+    }
+    ASSERT_EQ(out_len, 0);
+    free(zip);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Skill dry-run tests
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1673,6 +1837,75 @@ TEST(cli_gemini_session_hook_parity) {
     PASS();
 }
 
+/* Claude SubagentStart reminder: subagents spawned via the Agent tool do not
+ * fire SessionStart, so this hook is their code-discovery channel. Verify the
+ * install shape, idempotent re-install, and clean removal. */
+TEST(cli_claude_subagent_hook) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-subhook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/settings.json", tmpdir);
+
+    ASSERT_EQ(cbm_upsert_claude_subagent_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT(strstr(d, "SubagentStart") != NULL);
+    ASSERT(strstr(d, "\"*\"") != NULL);                 /* match-all matcher */
+    ASSERT(strstr(d, "cbm-subagent-reminder") != NULL); /* points at the hook script */
+
+    /* Idempotent: a second upsert must not duplicate our entry. */
+    ASSERT_EQ(cbm_upsert_claude_subagent_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    int count = 0;
+    for (const char *p = d; (p = strstr(p, "cbm-subagent-reminder")) != NULL; p++)
+        count++;
+    ASSERT_EQ(count, 1);
+
+    ASSERT_EQ(cbm_remove_claude_subagent_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NULL(strstr(d, "SubagentStart"));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* A user's own catch-all ("*") SubagentStart hook must survive CMM install and
+ * uninstall: ownership is keyed on the command, not just the "*" matcher. */
+TEST(cli_claude_subagent_hook_preserves_user_entry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-subuser-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cfg[512];
+    snprintf(cfg, sizeof(cfg), "%s/settings.json", tmpdir);
+    /* Pre-existing user SubagentStart hook, also matcher "*", different command. */
+    write_test_file(
+        cfg, "{\"hooks\":{\"SubagentStart\":[{\"matcher\":\"*\","
+             "\"hooks\":[{\"type\":\"command\",\"command\":\"echo user-subagent-hook\"}]}]}}");
+
+    /* Install CMM's hook: the user's "*" entry must remain, ours added alongside. */
+    ASSERT_EQ(cbm_upsert_claude_subagent_hooks(cfg), 0);
+    const char *d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT(strstr(d, "echo user-subagent-hook") != NULL); /* user's hook untouched */
+    ASSERT(strstr(d, "cbm-subagent-reminder") != NULL);   /* ours added */
+
+    /* Remove CMM's hook: the user's entry must still be intact, ours gone. */
+    ASSERT_EQ(cbm_remove_claude_subagent_hooks(cfg), 0);
+    d = read_test_file(cfg);
+    ASSERT_NOT_NULL(d);
+    ASSERT(strstr(d, "echo user-subagent-hook") != NULL); /* user's hook preserved */
+    ASSERT_NULL(strstr(d, "cbm-subagent-reminder"));      /* only ours removed */
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_detect_agents_finds_gemini) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
@@ -1770,6 +2003,22 @@ TEST(cli_detect_agents_finds_kiro) {
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     ASSERT_TRUE(agents.kiro);
 
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* issue #651: Junie (~/.junie/) must be detected so install registers the
+ * MCP server in ~/.junie/mcp/mcp.json. */
+TEST(cli_detect_agents_finds_junie_issue651) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.junie", tmpdir);
+    test_mkdirp(dir);
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.junie);
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -2137,6 +2386,23 @@ TEST(cli_upsert_antigravity_mcp_replace) {
  *  Group C: Instructions File Upsert
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* #1032: Aider has no MCP support, but its installed CONVENTIONS.md told the
+ * model to call MCP tools it cannot invoke (search_graph(...) style). The
+ * Aider variant must teach the runnable CLI form instead. */
+TEST(cli_aider_instructions_are_cli_form_issue1032) {
+    const char *content = cbm_get_aider_instructions();
+    ASSERT_NOT_NULL(content);
+    /* Every discovery example is a runnable CLI command... */
+    ASSERT(strstr(content, "codebase-memory-mcp cli search_graph") != NULL);
+    ASSERT(strstr(content, "codebase-memory-mcp cli trace_path") != NULL);
+    ASSERT(strstr(content, "codebase-memory-mcp cli index_repository") != NULL);
+    /* ...and no bare MCP-call syntax remains to mislead the model. */
+    ASSERT_NULL(strstr(content, "search_graph(name_pattern"));
+    /* States the constraint explicitly. */
+    ASSERT(strstr(content, "no MCP support") != NULL);
+    PASS();
+}
+
 TEST(cli_upsert_instructions_fresh) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-instr-XXXXXX");
@@ -2302,11 +2568,10 @@ TEST(cli_upsert_claude_hook_fresh) {
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "PreToolUse") != NULL);
-    /* Matcher excludes Read per issue #362 (gating Read breaks the
-     * read-before-edit invariant). Assert exact matcher value AND that no
-     * Read-chained matcher slipped back in. */
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
-    ASSERT(strstr(data, "Glob|Read") == NULL);
+    /* Matcher includes Read for the coverage note (#963). Safe against the
+     * issue-#362 gate hazard: the augmenter is structurally non-blocking
+     * (always exit 0, additionalContext only). */
+    ASSERT(strstr(data, "\"Grep|Glob|Read\"") != NULL);
     ASSERT(strstr(data, "cbm-code-discovery-gate") != NULL);
 
     test_rmdir_r(tmpdir);
@@ -2325,7 +2590,12 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
     cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
 
     char script_path[512];
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/.claude/hooks/cbm-code-discovery-gate.cmd",
+             tmpdir);
+#else
     snprintf(script_path, sizeof(script_path), "%s/.claude/hooks/cbm-code-discovery-gate", tmpdir);
+#endif
     const char *data = read_test_file(script_path);
     ASSERT_NOT_NULL(data);
     /* No predictable temp/state file and no PPID-derived path. */
@@ -2336,6 +2606,154 @@ TEST(cli_hook_gate_script_no_predictable_tmp_issue384) {
 
     test_rmdir_r(tmpdir);
     PASS();
+}
+
+/* #929: on Windows, extensionless bash shims under .claude/hooks trigger the
+ * "How do you want to open this file?" dialog when editors (Cursor) scan the
+ * dir, and cannot execute without bash. Windows must install .cmd scripts
+ * (and remove the extensionless legacy twin on upgrade); POSIX keeps the
+ * extensionless bash form with no .cmd twin. */
+TEST(cli_hook_scripts_platform_shape_issue929) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook929-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+
+#ifdef _WIN32
+    /* Upgrade path: pre-create the pre-#929 extensionless file; the install
+     * must remove it so the Open-With trigger disappears. */
+    cbm_mkdir_p(hooks_dir, 0755);
+    char legacy_path[512];
+    snprintf(legacy_path, sizeof(legacy_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    write_test_file(legacy_path, "#!/bin/bash\nexit 0\n");
+#endif
+
+    cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+
+    char script_path[512];
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    const char *data = read_test_file(script_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strncmp(data, "@echo off", 9) == 0); /* cmd, not bash */
+    ASSERT(strstr(data, "hook-augment") != NULL);
+    /* Legacy extensionless twin removed on upgrade. */
+    FILE *lf = fopen(legacy_path, "r");
+    if (lf) {
+        fclose(lf);
+        FAIL("legacy extensionless hook file still present after install");
+    }
+#else
+    snprintf(script_path, sizeof(script_path), "%s/cbm-code-discovery-gate", hooks_dir);
+    const char *data = read_test_file(script_path);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strncmp(data, "#!/usr/bin/env bash", 19) == 0);
+    /* No .cmd twin on POSIX. */
+    char cmd_path[512];
+    snprintf(cmd_path, sizeof(cmd_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    FILE *cf = fopen(cmd_path, "r");
+    if (cf) {
+        fclose(cf);
+        FAIL(".cmd twin must not exist on POSIX");
+    }
+#endif
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+/* issue #618: hook-augment was a structural no-op on Windows because its path
+ * guards required POSIX-style '/'-prefixed absolute paths, so a drive-letter
+ * cwd (C:/repo) was rejected before any search_graph query. The predicate must
+ * accept POSIX and Windows drive roots alike (callers normalize '\\' to '/'). */
+TEST(cli_hook_augment_path_is_abs) {
+    /* POSIX absolute (unchanged behavior) */
+    ASSERT(cbm_hook_path_is_abs("/home/u/proj"));
+    /* Windows drive roots — the #618 regression */
+    ASSERT(cbm_hook_path_is_abs("C:/Users/me/proj"));
+    ASSERT(cbm_hook_path_is_abs("C:/"));
+    ASSERT(cbm_hook_path_is_abs("C:"));
+    ASSERT(cbm_hook_path_is_abs("d:/lowercase/drive"));
+    /* Not absolute → augmenter no-ops cleanly */
+    ASSERT(!cbm_hook_path_is_abs("relative/path"));
+    ASSERT(!cbm_hook_path_is_abs("proj"));
+    ASSERT(!cbm_hook_path_is_abs(""));
+    ASSERT(!cbm_hook_path_is_abs(NULL));
+    PASS();
+}
+
+/* #858: a fired hook-augment deadline used to be a SILENT _exit(0) —
+ * indistinguishable from "no matches" — and the 300ms default self-terminated
+ * on real cold starts, so augmentation never appeared in real sessions
+ * (0/24 observed). The deadline is now env-configurable
+ * (CBM_HOOK_DEADLINE_MS, generous default) and a fired deadline leaves an
+ * observable breadcrumb in a local log. Deterministic reproduction: stdin is
+ * a pipe with a live writer that never sends data, so ha_read_stdin blocks
+ * past a 60ms deadline and the timer must fire, breadcrumb, and _exit(0). */
+TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
+#ifdef _WIN32
+    SKIP_PLATFORM("in-process SIGALRM deadline is POSIX-only (settings.json timeout on Windows)");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hookdl-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char logpath[512];
+    snprintf(logpath, sizeof(logpath), "%s/timeouts.log", tmpdir);
+
+    int fds[2];
+    if (pipe(fds) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
+
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: hook-augment with a 60ms deadline and stdin that blocks
+         * forever (parent keeps the write end open, sends nothing). */
+        close(fds[1]);
+        dup2(fds[0], 0);
+        close(fds[0]);
+        setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
+        setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
+        alarm(10); /* backstop: never hang the suite */
+        _exit(cbm_cmd_hook_augment());
+    }
+    ASSERT_GT(pid, 0);
+    close(fds[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    close(fds[1]);
+
+    /* The deadline must have fired as a clean exit 0 (fail-open, no signal). */
+    ASSERT(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    /* RED before the fix: no breadcrumb existed — a fired deadline was
+     * indistinguishable from a no-match run. GREEN: the log names the
+     * deadline and the knob. */
+    FILE *f = fopen(logpath, "r");
+    if (!f) {
+        fprintf(stderr, "  [858] FAIL no timeout breadcrumb written to %s\n", logpath);
+    }
+    ASSERT_NOT_NULL(f);
+    char line[256] = "";
+    char *got = fgets(line, sizeof(line), f);
+    fclose(f);
+    ASSERT_NOT_NULL(got);
+    ASSERT(strstr(line, "deadline_exceeded") != NULL);
+    ASSERT(strstr(line, "CBM_HOOK_DEADLINE_MS") != NULL);
+
+    cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
+    cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
+    test_rmdir_r(tmpdir);
+    PASS();
+#endif
 }
 
 TEST(cli_upsert_claude_hook_existing) {
@@ -2356,9 +2774,8 @@ TEST(cli_upsert_claude_hook_existing) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    /* Our hook added with the non-blocking matcher (issue #362). */
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
-    ASSERT(strstr(data, "Glob|Read") == NULL);
+    /* Our hook added with the current matcher (Read included for #963). */
+    ASSERT(strstr(data, "\"Grep|Glob|Read\"") != NULL);
     /* Existing hook preserved */
     ASSERT(strstr(data, "Bash") != NULL);
     ASSERT(strstr(data, "firewall") != NULL);
@@ -2375,9 +2792,9 @@ TEST(cli_upsert_claude_hook_replace) {
 
     char settingspath[512];
     snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
-    /* Pre-existing CMM hook with old message */
+    /* Pre-existing CMM hook with an OLD matcher (pre-#963) + old message */
     write_test_file(settingspath,
-                    "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Grep|Glob|Read\","
+                    "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Grep|Glob\","
                     "\"hooks\":[{\"type\":\"command\",\"command\":\"echo old-cmm-message\"}]}]}}");
 
     int rc = cbm_upsert_claude_hooks(settingspath);
@@ -2778,10 +3195,164 @@ TEST(replace_binary_creates_new_file) {
 #endif /* _WIN32 */
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  CLI tool-argument flags / per-tool --help (#680)
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/* A plain `--flag value` pair maps to a string property by schema type. */
+TEST(cli_build_args_json_string_flag_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--repo-path", "/x"};
+    char *json = cbm_cli_build_args_json("index_repository", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"repo_path\":\"/x\"") != NULL);
+    free(json);
+    PASS();
+}
+
+/* An integer-typed property serializes as a JSON NUMBER, not a quoted string. */
+TEST(cli_build_args_json_integer_flag_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--limit", "100"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"limit\":100") != NULL);
+    ASSERT(strstr(json, "\"limit\":\"100\"") == NULL);
+    free(json);
+    PASS();
+}
+
+/* A bare boolean flag (no value) becomes true. */
+TEST(cli_build_args_json_bare_boolean_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--exclude-entry-points"};
+    char *json = cbm_cli_build_args_json("search_graph", 1, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"exclude_entry_points\":true") != NULL);
+    free(json);
+    PASS();
+}
+
+/* An unknown flag for a KNOWN tool must be rejected loudly, not silently
+ * typed as a string and dropped server-side (#997). GF1 eval: `trace_path
+ * --max-depth 1` was accepted, the real --depth stayed at default 3, and
+ * the trace silently returned hop-2/3 results — silent-wrong output. The
+ * error names the closest valid flag as a suggestion. */
+TEST(cli_build_args_json_unknown_flag_rejected) {
+    char *err = NULL;
+    char *argv[] = {"--max-depth", "1"};
+    char *json = cbm_cli_build_args_json("trace_path", 2, argv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    ASSERT(strstr(err, "unknown flag") != NULL);
+    ASSERT(strstr(err, "max-depth") != NULL);
+    ASSERT(strstr(err, "--depth") != NULL); /* nearest-flag suggestion */
+    free(err);
+    PASS();
+}
+
+/* A repeated array-typed flag accumulates into a JSON array. */
+TEST(cli_build_args_json_repeated_array_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "send", "--semantic-query", "publish"};
+    char *json = cbm_cli_build_args_json("search_graph", 4, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* kebab-case flag names map to snake_case JSON keys. */
+TEST(cli_build_args_json_kebab_to_snake_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--name-pattern", "Foo.*"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"name_pattern\":\"Foo.*\"") != NULL);
+    free(json);
+    PASS();
+}
+
+/* `--key=value` form splits on the FIRST `=`; value may contain spaces/dashes. */
+TEST(cli_build_args_json_key_equals_value_issue680) {
+    char *err = NULL;
+    char *argv[] = {"--repo-path=/a b"};
+    char *json = cbm_cli_build_args_json("index_repository", 1, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"repo_path\":\"/a b\"") != NULL);
+    free(json);
+    PASS();
+}
+
+/* A non-`--` positional is an error: returns NULL and sets *err_out. */
+TEST(cli_build_args_json_bad_positional_errors_issue680) {
+    char *err = NULL;
+    char *argv[] = {"foo"};
+    char *json = cbm_cli_build_args_json("search_graph", 1, argv, &err);
+    ASSERT_NULL(json);
+    ASSERT_NOT_NULL(err);
+    free(err);
+    PASS();
+}
+
+/* Per-tool --help returns 0 for a known tool, -1 for an unknown one. */
+TEST(cli_print_tool_help_issue680) {
+    ASSERT_EQ(cbm_cli_print_tool_help("index_repository"), 0);
+    ASSERT_EQ(cbm_cli_print_tool_help("nope_not_a_tool"), -1);
+    PASS();
+}
+
+/* The self-update path verifies a downloaded archive against a published
+ * checksum. That check is only meaningful if the digest is actually computed —
+ * a broken hash command (it once invoked `shasum -a CBM_SZ_256`, an invalid
+ * algorithm, from a bad macro rename inside the shell string) makes every
+ * digest fail, and the caller then falls through and installs unverified.
+ * Guard the digest itself against a known vector. */
+extern int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
+
+/* Hash `content` (len bytes) via a temp file and compare to expected hex.
+ * Returns 1 on match, 0 otherwise. */
+static int sha256_vector_ok(const void *content, size_t len, const char *expected) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/cbm_sha_XXXXXX", cbm_tmpdir());
+    int fd = cbm_mkstemp(path);
+    if (fd < 0) {
+        return 0;
+    }
+    FILE *fp = fdopen(fd, "wb");
+    if (!fp) {
+        return 0;
+    }
+    if (len > 0) {
+        fwrite(content, 1, len, fp);
+    }
+    fclose(fp);
+
+    char digest[128] = {0};
+    int rc = cbm_cli_sha256_file(path, digest, sizeof(digest));
+    remove(path);
+    return rc == 0 && strcmp(digest, expected) == 0;
+}
+
+/* NIST FIPS 180-4 SHA-256 test vectors: empty input, a single block ("abc"),
+ * and a 56-byte input that forces the length padding into a second block. */
+TEST(cli_sha256_file_matches_known_vector) {
+    ASSERT_TRUE(sha256_vector_ok(
+        "", 0, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
+    ASSERT_TRUE(sha256_vector_ok(
+        "abc", 3, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    ASSERT_TRUE(
+        sha256_vector_ok("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56,
+                         "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"));
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
 SUITE(cli) {
+    RUN_TEST(cli_sha256_file_matches_known_vector);
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);
@@ -2815,7 +3386,11 @@ SUITE(cli) {
     RUN_TEST(cli_editor_mcp_idempotent);
     RUN_TEST(cli_editor_mcp_preserves_others);
     RUN_TEST(cli_editor_mcp_uninstall);
+    RUN_TEST(cli_junie_mcp_install_issue651);
     RUN_TEST(cli_gemini_mcp_install);
+    RUN_TEST(cli_openclaw_mcp_install_uses_nested_servers);
+    RUN_TEST(cli_openclaw_mcp_preserves_existing_config);
+    RUN_TEST(cli_openclaw_mcp_uninstall_uses_nested_servers);
 
     /* VS Code MCP (2 tests — install_test.go) */
     RUN_TEST(cli_vscode_mcp_install);
@@ -2845,6 +3420,7 @@ SUITE(cli) {
     RUN_TEST(cli_extract_binary_from_zip_not_found);
     RUN_TEST(cli_extract_binary_from_zip_path_traversal);
     RUN_TEST(cli_extract_binary_from_zip_invalid);
+    RUN_TEST(cli_extract_binary_from_zip_rejects_truncated_deflate_size_over_int_max);
 
     /* Dry-run lifecycle (2 tests) */
     RUN_TEST(cli_install_dry_run);
@@ -2874,11 +3450,14 @@ SUITE(cli) {
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_gemini_session_hook_parity);
+    RUN_TEST(cli_claude_subagent_hook);
+    RUN_TEST(cli_claude_subagent_hook_preserves_user_entry);
     RUN_TEST(cli_detect_agents_finds_gemini);
     RUN_TEST(cli_detect_agents_finds_zed);
     RUN_TEST(cli_detect_agents_finds_antigravity);
     RUN_TEST(cli_detect_agents_finds_kilocode);
     RUN_TEST(cli_detect_agents_finds_kiro);
+    RUN_TEST(cli_detect_agents_finds_junie_issue651);
     RUN_TEST(cli_detect_agents_none_found);
 
     /* Codex MCP config upsert (3 tests — group B) */
@@ -2905,6 +3484,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_antigravity_mcp_replace);
 
     /* Instructions file upsert (6 tests — group C) */
+    RUN_TEST(cli_aider_instructions_are_cli_form_issue1032);
     RUN_TEST(cli_upsert_instructions_fresh);
     RUN_TEST(cli_upsert_instructions_existing);
     RUN_TEST(cli_upsert_instructions_replace);
@@ -2914,6 +3494,9 @@ SUITE(cli) {
 
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
+    RUN_TEST(cli_hook_scripts_platform_shape_issue929);
+    RUN_TEST(cli_hook_augment_path_is_abs);
+    RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_upsert_claude_hook_fresh);
     RUN_TEST(cli_upsert_claude_hook_existing);
     RUN_TEST(cli_upsert_claude_hook_replace);
@@ -2942,4 +3525,15 @@ SUITE(cli) {
     RUN_TEST(replace_binary_overwrites_readonly);
     RUN_TEST(replace_binary_creates_new_file);
 #endif
+
+    /* CLI tool-argument flags / per-tool --help (#680) */
+    RUN_TEST(cli_build_args_json_string_flag_issue680);
+    RUN_TEST(cli_build_args_json_integer_flag_issue680);
+    RUN_TEST(cli_build_args_json_bare_boolean_issue680);
+    RUN_TEST(cli_build_args_json_unknown_flag_rejected);
+    RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
+    RUN_TEST(cli_build_args_json_key_equals_value_issue680);
+    RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
+    RUN_TEST(cli_print_tool_help_issue680);
 }

@@ -123,6 +123,11 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
 // will replace this in v1.3.
 void cbm_ts_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
 
+// TEST HOOKS: count of full per-file cross-registry builds (the quadratic the
+// shared-registry dispatch eliminates; must stay 0 on the shared path).
+long cbm_ts_full_registry_builds(void);
+void cbm_ts_full_registry_builds_reset(void);
+
 // --- Batch cross-file LSP ---
 
 // Per-file input for batch TS LSP processing.

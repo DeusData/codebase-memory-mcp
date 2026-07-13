@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import type { ProcessInfo } from "../lib/types";
+import { useUiMessages } from "../lib/i18n";
 
 /* ── Gauge component ────────────────────────────────────── */
 
@@ -30,6 +31,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
   proc: ProcessInfo; selected: boolean;
   onSelect: () => void; onKill: () => void;
 }) {
+  const t = useUiMessages();
   return (
     <button
       onClick={onSelect}
@@ -46,7 +48,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
             PID {proc.pid}
           </span>
           {proc.is_self && (
-            <span className="text-[9px] px-1.5 py-0.5 rounded bg-primary/15 text-primary font-medium">THIS</span>
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-primary/15 text-primary font-medium">{t.control.thisProcess}</span>
           )}
         </div>
         {!proc.is_self && (
@@ -54,7 +56,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
             onClick={(e) => { e.stopPropagation(); onKill(); }}
             className="px-2 py-1 rounded-lg text-[10px] text-foreground/20 hover:text-destructive hover:bg-destructive/10 transition-all"
           >
-            Kill
+            {t.control.kill}
           </button>
         )}
       </div>
@@ -69,7 +71,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
           <p className="text-[13px] font-semibold tabular-nums text-foreground/70">{proc.rss_mb.toFixed(0)} MB</p>
         </div>
         <div>
-          <p className="text-[9px] text-foreground/20 uppercase">Uptime</p>
+          <p className="text-[9px] text-foreground/20 uppercase">{t.control.uptime}</p>
           <p className="text-[13px] font-semibold tabular-nums text-foreground/70">{proc.elapsed}</p>
         </div>
       </div>
@@ -82,6 +84,7 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
 /* ── Log viewer ─────────────────────────────────────────── */
 
 function LogViewer() {
+  const t = useUiMessages();
   const [lines, setLines] = useState<string[]>([]);
 
   useEffect(() => {
@@ -100,13 +103,13 @@ function LogViewer() {
   return (
     <div className="rounded-xl border border-border/30 bg-black/30 overflow-hidden">
       <div className="px-4 py-2 border-b border-border/20">
-        <span className="text-[11px] font-medium text-foreground/40">Process Logs</span>
+        <span className="text-[11px] font-medium text-foreground/40">{t.control.processLogs}</span>
         <span className="text-[10px] text-foreground/15 ml-2">{lines.length} lines</span>
       </div>
       <ScrollArea className="h-[400px]">
         <div className="p-3 font-mono text-[10px] leading-relaxed">
           {lines.length === 0 ? (
-            <p className="text-foreground/15 text-center py-8">No logs yet</p>
+            <p className="text-foreground/15 text-center py-8">{t.control.noLogs}</p>
           ) : (
             lines.map((line, i) => {
               const isErr = line.includes("level=error");
@@ -132,6 +135,7 @@ function LogViewer() {
 /* ── Main Control Tab ───────────────────────────────────── */
 
 export function ControlTab() {
+  const t = useUiMessages();
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
   const [selfMetrics, setSelfMetrics] = useState({ rss_mb: 0, user_cpu: 0, sys_cpu: 0 });
   const [selectedPid, setSelectedPid] = useState<number | null>(null);
@@ -156,7 +160,7 @@ export function ControlTab() {
   }, [fetchProcesses]);
 
   const killProcess = useCallback(async (pid: number) => {
-    if (!confirm(`Kill process ${pid}?`)) return;
+    if (!confirm(t.control.killConfirm(pid))) return;
     try {
       await fetch("/api/process-kill", {
         method: "POST",
@@ -165,7 +169,7 @@ export function ControlTab() {
       });
       setTimeout(fetchProcesses, 1000);
     } catch { /* ignore */ }
-  }, [fetchProcesses]);
+  }, [fetchProcesses, t.control]);
 
   /* Aggregates */
   const totalCpu = processes.reduce((s, p) => s + p.cpu, 0);
@@ -174,32 +178,32 @@ export function ControlTab() {
   return (
     <ScrollArea className="h-full">
       <div className="p-8 max-w-4xl mx-auto">
-        <h2 className="text-[15px] font-semibold text-foreground/80 mb-6">Control Panel</h2>
+        <h2 className="text-[15px] font-semibold text-foreground/80 mb-6">{t.control.panel}</h2>
 
         {/* Aggregate gauges */}
         <div className="flex gap-4 mb-8">
-          <Gauge label="Total CPU" value={totalCpu} max={100 * processes.length || 100} unit="%" color="text-foreground/80" />
-          <Gauge label="Total RAM" value={totalRam} max={4096} unit="MB" color="text-foreground/80" />
-          <Gauge label="Processes" value={processes.length} max={10} unit="" color="text-primary" />
-          <Gauge label="Self RAM" value={selfMetrics.rss_mb} max={2048} unit="MB" color="text-primary" />
+          <Gauge label={t.control.totalCpu} value={totalCpu} max={100 * processes.length || 100} unit="%" color="text-foreground/80" />
+          <Gauge label={t.control.totalRam} value={totalRam} max={4096} unit="MB" color="text-foreground/80" />
+          <Gauge label={t.control.processes} value={processes.length} max={10} unit="" color="text-primary" />
+          <Gauge label={t.control.selfRam} value={selfMetrics.rss_mb} max={2048} unit="MB" color="text-primary" />
         </div>
 
         {/* Process grid */}
         <div className="mb-8">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-[13px] font-medium text-foreground/50">
-              Active Processes
+              {t.control.activeProcesses}
             </h3>
             <button
               onClick={fetchProcesses}
               className="text-[11px] text-primary/60 hover:text-primary transition-colors"
             >
-              Refresh
+              {t.common.refresh}
             </button>
           </div>
 
           {processes.length === 0 ? (
-            <p className="text-foreground/20 text-[12px] text-center py-8">No processes found</p>
+            <p className="text-foreground/20 text-[12px] text-center py-8">{t.control.noProcesses}</p>
           ) : (
             <div className="grid grid-cols-2 gap-3">
               {processes.map((p) => (

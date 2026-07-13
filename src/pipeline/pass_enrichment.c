@@ -292,8 +292,11 @@ static void free_tagged_nodes(tagged_node_t *nodes, int count) {
 /* Phase 1: Collect decorated nodes and count word frequency. */
 static int collect_decorated_nodes(cbm_gbuf_t *gbuf, tagged_node_t **out_nodes,
                                    CBMHashTable *word_counts) {
-    static const char *labels[] = {"Function", "Method", "Class"};
-    static const int nlabels = 3;
+    /* "Struct" alongside "Class" so Go/Rust/Swift/D struct names keep
+     * contributing to / receiving auto-tags as they did when structs were
+     * labelled "Class". */
+    static const char *labels[] = {"Function", "Method", "Class", "Struct"};
+    static const int nlabels = 4;
     tagged_node_t *nodes = NULL;
     int node_count = 0;
     int node_cap = 0;

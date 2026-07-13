@@ -12,6 +12,7 @@
  *   - patterns with / are rooted (anchored to base)
  */
 #include "foundation/constants.h"
+#include "foundation/compat_fs.h"
 
 enum { GI_INIT_CAP = 16, GI_CHAR_IDX1 = 1, GI_CHAR_IDX2 = 2, GI_SKIP3 = 3 };
 #include "discover/discover.h"
@@ -287,7 +288,7 @@ cbm_gitignore_t *cbm_gitignore_load(const char *path) {
         return NULL;
     }
 
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         return NULL;
     }

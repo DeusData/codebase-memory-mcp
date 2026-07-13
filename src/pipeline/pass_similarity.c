@@ -89,7 +89,27 @@ typedef struct {
     cbm_minhash_t fp;
     const char *file_path;
     const char *ext;
+    const char *qn; /* canonical ordering + pair-ownership (determinism) */
 } fp_entry_t;
+
+/* Canonical entry order: by qualified name (unique). The label-index order
+ * from collect_fp_entries is gbuf insertion order = parallel-extraction merge
+ * order, which varies run to run; LSH bucket chains and the per-node edge-cap
+ * truncation both inherit it, flickering WHICH SIMILAR_TO edges are emitted. */
+static int cmp_fp_entry_by_qn(const void *pa, const void *pb) {
+    const fp_entry_t *a = pa;
+    const fp_entry_t *b = pb;
+    const char *qa = a->qn ? a->qn : "";
+    const char *qb = b->qn ? b->qn : "";
+    int r = strcmp(qa, qb);
+    if (r != 0) {
+        return r;
+    }
+    if (a->node_id != b->node_id) {
+        return a->node_id < b->node_id ? -1 : 1;
+    }
+    return 0;
+}
 
 /* Collect all Function/Method nodes with fingerprints from graph buffer. */
 static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
@@ -124,9 +144,12 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
                 .fp = fp,
                 .file_path = n->file_path,
                 .ext = file_ext(n->file_path),
+                .qn = n->qualified_name,
             };
         }
     }
+    /* Canonicalize (determinism) — see cmp_fp_entry_by_qn. */
+    qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
     *out_entries = entries;
     return count;
 }
@@ -203,7 +226,11 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             if (strcmp(src->ext, cand->file_ext) != 0) {
                 continue;
             }
-            if (src->node_id >= cand->node_id) {
+            /* Pair ownership by canonical QN order, not node id: ids are
+             * assigned in parallel-merge order and vary run to run, which
+             * flipped which side owned a pair and (with the per-source edge
+             * cap) flickered the emitted set (determinism). */
+            if (!src->qn || !cand->qualified_name || strcmp(src->qn, cand->qualified_name) >= 0) {
                 continue;
             }
 
@@ -283,6 +310,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .fingerprint = &entries[i].fp,
             .file_path = entries[i].file_path,
             .file_ext = entries[i].ext,
+            .qualified_name = entries[i].qn,
         };
         cbm_lsh_insert(lsh, &lsh_entries[i]);
     }

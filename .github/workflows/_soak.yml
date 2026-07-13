@@ -47,9 +47,14 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # BUG FIX: this was hard-coded to 30, but the caller (nightly-soak.yml)
+    # passes duration_minutes: 240. GitHub killed the job at 30 min, so the
+    # "4h nightly soak" was SILENTLY TRUNCATED to 30 min and never once ran
+    # multi-hour. Budget must always exceed the passed duration; 300 covers
+    # the 240-min nightly with headroom (build + analysis + idle phases).
+    timeout-minutes: 300
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
@@ -57,6 +62,13 @@ jobs:
         run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
       - name: Soak (${{ inputs.duration_minutes }} min)
         run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes }}
+      # #581 guard: read-only soak (never reindex/mutate) so any memory growth is
+      # a query-path leak, not WAL/indexing. Reuses the build above.
+      - name: Query-leak soak (#581, read-only)
+        env:
+          CBM_SOAK_MODE: query-leak
+          RESULTS_DIR: soak-results-query-leak
+        run: scripts/soak-test.sh build/c/codebase-memory-mcp ${{ inputs.duration_minutes }} --skip-crash-test
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -64,12 +76,22 @@ jobs:
           name: soak-quick-${{ matrix.goos }}-${{ matrix.goarch }}
           path: soak-results/
           retention-days: 14
+      - name: Upload query-leak metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-query-leak-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: soak-results-query-leak/
+          retention-days: 14
 
   soak-quick-windows:
     runs-on: windows-latest
-    timeout-minutes: 30
+    # BUG FIX (same 30→240 mismatch as soak-quick above): the caller passes
+    # duration_minutes: 240, so a 30-min cap truncated the nightly soak here
+    # too. 300 covers the 240-min nightly with headroom.
+    timeout-minutes: 300
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64
@@ -90,12 +112,81 @@ jobs:
           BIN=build/c/codebase-memory-mcp
           [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
           scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }}
+      # #581 guard on Windows — the platform the bug is reported on.
+      - name: Query-leak soak (#581, read-only)
+        shell: msys2 {0}
+        env:
+          CBM_SOAK_MODE: query-leak
+          RESULTS_DIR: soak-results-query-leak
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }} --skip-crash-test
       - name: Upload metrics
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: soak-quick-windows-amd64
           path: soak-results/
+          retention-days: 14
+      - name: Upload query-leak metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-query-leak-windows-amd64
+          path: soak-results-query-leak/
+          retention-days: 14
+
+  soak-quick-windows-arm64:
+    # Native ARM64 Windows soak (CLANGARM64, no sanitizer — ASan is unavailable
+    # on native ARM64 Windows). Builds from source like soak-quick-windows.
+    runs-on: windows-11-arm
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANGARM64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-aarch64-clang
+            mingw-w64-clang-aarch64-zlib
+            mingw-w64-clang-aarch64-python3
+            make
+            git
+            coreutils
+      - name: Build
+        shell: msys2 {0}
+        run: scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++
+      - name: Soak (${{ inputs.duration_minutes }} min)
+        shell: msys2 {0}
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }}
+      # #581 guard on Windows — the platform the bug is reported on.
+      - name: Query-leak soak (#581, read-only)
+        shell: msys2 {0}
+        env:
+          CBM_SOAK_MODE: query-leak
+          RESULTS_DIR: soak-results-query-leak
+        run: |
+          BIN=build/c/codebase-memory-mcp
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/soak-test.sh "$BIN" ${{ inputs.duration_minutes }} --skip-crash-test
+      - name: Upload metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-quick-windows-arm64
+          path: soak-results/
+          retention-days: 14
+      - name: Upload query-leak metrics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: soak-query-leak-windows-arm64
+          path: soak-results-query-leak/
           retention-days: 14
 
   soak-asan:
@@ -125,9 +216,14 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    # ASan soak runs a FIXED 15-min soak (hard-coded below, NOT driven by
+    # inputs.duration_minutes), but the ASan-instrumented build is slow and
+    # leak reporting adds teardown time. 60 keeps the budget comfortably above
+    # the 15-min run so it is never truncated. (Same class of bug as the
+    # soak-quick 30→240 mismatch above — keep the timeout above the run length.)
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 git
@@ -150,9 +246,12 @@ jobs:
   soak-asan-windows:
     if: ${{ inputs.run_asan }}
     runs-on: windows-latest
-    timeout-minutes: 45
+    # FIXED 15-min soak (hard-coded below). MSYS2/Wine + ASan build is the
+    # slowest path; 60 keeps the budget well above the run length so it is
+    # never truncated.
+    timeout-minutes: 240
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64

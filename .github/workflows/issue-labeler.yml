@@ -1,9 +1,15 @@
 name: Issue area labeler
 
 # Adds area labels to new/edited issues based on keyword regexes in
-# .github/issue-labeler.yml. Additive only (sync-labels off): it never
-# removes a label a maintainer set by hand. Base bug/enhancement labels
-# already come from the issue forms.
+# .github/issue-labeler.yml. Additive only (addLabels never removes): it
+# never touches a label a maintainer set by hand. Base bug/enhancement
+# labels already come from the issue forms.
+#
+# Implemented with first-party actions/github-script (not a third-party
+# labeler action) so every pattern is compiled as a JavaScript RegExp with
+# the `i` flag applied centrally — inline `(?i)` groups are PCRE-only and
+# threw `SyntaxError: Invalid group` on every issue (#764). A pattern that
+# fails to compile now fails the run loudly instead of silently no-oping.
 
 on:
   issues:
@@ -16,13 +22,38 @@ jobs:
   triage:
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       issues: write
     steps:
-      - uses: github/issue-labeler@c1b0f9f52a63158c4adc09425e858e87b32e9685 # v3.4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
-          configuration-path: .github/issue-labeler.yml
-          enable-versioned-regex: 0
-          include-title: 1
-          include-body: 1
-          sync-labels: 0
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const text = [context.payload.issue.title, context.payload.issue.body]
+              .filter(Boolean).join('\n');
+            const rules = [];
+            const bad = [];
+            // Config format: one rule per line — "label": 'regex' (see the
+            // header comment in .github/issue-labeler.yml).
+            for (const line of fs.readFileSync('.github/issue-labeler.yml', 'utf8').split('\n')) {
+              const m = line.match(/^"([^"]+)":\s*'(.*)'\s*$/);
+              if (!m) continue;
+              try { rules.push({ label: m[1], re: new RegExp(m[2], 'i') }); }
+              catch (e) { bad.push(`${m[1]}: ${e.message}`); }
+            }
+            if (rules.length === 0 && bad.length === 0) {
+              core.setFailed('no labeling rules parsed from .github/issue-labeler.yml');
+              return;
+            }
+            const labels = rules.filter(r => r.re.test(text)).map(r => r.label);
+            if (labels.length) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels,
+              });
+            }
+            core.info(`matched: ${labels.join(', ') || '(none)'}`);
+            if (bad.length) core.setFailed(`invalid label regex(es): ${bad.join('; ')}`);

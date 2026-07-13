@@ -17,6 +17,7 @@
 #include "semantic/semantic.h"
 #include "semantic/ast_profile.h"
 #include "simhash/minhash.h"
+#include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
 #define XXH_INLINE_ALL
@@ -67,6 +68,13 @@ typedef struct {
     int64_t target_id;
     float score;
     bool same_file;
+    /* Canonical admission keys (determinism): func index of the discovering
+     * side, its candidate rank, and the partner's func index. The sequential
+     * admission pass replays pairs in (i, c) order so which pairs win the
+     * per-node max_edges budget no longer depends on worker scheduling. */
+    int i;
+    int j;
+    int c;
 } deferred_edge_t;
 
 typedef struct {
@@ -82,7 +90,7 @@ static void deferred_buf_init(deferred_edge_buf_t *buf) {
 }
 
 static void deferred_buf_push(deferred_edge_buf_t *buf, int64_t src, int64_t tgt, float score,
-                              bool same_file) {
+                              bool same_file, int i, int j, int c) {
     if (buf->count >= buf->cap) {
         int nc = buf->cap < CBM_SZ_256 ? CBM_SZ_256 : buf->cap * GROW;
         deferred_edge_t *grown = realloc(buf->edges, (size_t)nc * sizeof(deferred_edge_t));
@@ -92,8 +100,13 @@ static void deferred_buf_push(deferred_edge_buf_t *buf, int64_t src, int64_t tgt
         buf->edges = grown;
         buf->cap = nc;
     }
-    buf->edges[buf->count++] = (deferred_edge_t){
-        .source_id = src, .target_id = tgt, .score = score, .same_file = same_file};
+    buf->edges[buf->count++] = (deferred_edge_t){.source_id = src,
+                                                 .target_id = tgt,
+                                                 .score = score,
+                                                 .same_file = same_file,
+                                                 .i = i,
+                                                 .j = j,
+                                                 .c = c};
 }
 
 static void deferred_buf_free(deferred_edge_buf_t *buf) {
@@ -393,25 +406,59 @@ static int tokenize_json_array_field(const char *json, const char *key, char **t
 /* Walk the CALLS edges rooted at n (either outbound or inbound depending on
  * `outbound`) and tokenize the names of the target/source nodes.  Caller-side
  * caps via max_tokens and MAX_CALLEES. */
+static int cmp_name_ptr(const void *pa, const void *pb) {
+    const char *a = *(const char *const *)pa;
+    const char *b = *(const char *const *)pb;
+    return strcmp(a, b);
+}
+
+/* Collect the CALLS-neighbor names of `node_id`, SORTED by name. The edge
+ * arrays are in insertion order — which under parallel extraction varies run
+ * to run — and both consumers truncate (MAX_CALLEES / max_tokens), so an
+ * unstable order changed WHICH neighbors contribute to the semantic vectors
+ * and flickered near-threshold SEMANTICALLY_RELATED edges (determinism).
+ * Returns a malloc'd array of borrowed name pointers; caller frees the array. */
+static const char **collect_sorted_call_neighbors(const cbm_gbuf_t *gbuf, int64_t node_id,
+                                                  bool outbound, int *out_n) {
+    *out_n = 0;
+    const cbm_gbuf_edge_t **edges = NULL;
+    int ec = 0;
+    int rc = outbound ? cbm_gbuf_find_edges_by_source_type(gbuf, node_id, "CALLS", &edges, &ec)
+                      : cbm_gbuf_find_edges_by_target_type(gbuf, node_id, "CALLS", &edges, &ec);
+    if (rc != 0 || ec <= 0) {
+        return NULL;
+    }
+    const char **names = malloc((size_t)ec * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    int n = 0;
+    for (int e = 0; e < ec; e++) {
+        int64_t id = outbound ? edges[e]->target_id : edges[e]->source_id;
+        const cbm_gbuf_node_t *neighbor = cbm_gbuf_find_by_id(gbuf, id);
+        if (neighbor && neighbor->name) {
+            names[n++] = neighbor->name;
+        }
+    }
+    qsort(names, (size_t)n, sizeof(char *), cmp_name_ptr);
+    *out_n = n;
+    return names;
+}
+
 static int tokenize_call_neighbors(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, bool outbound,
                                    char **tokens, int count, int max_tokens) {
     if (!gbuf || count >= max_tokens) {
         return count;
     }
-    const cbm_gbuf_edge_t **edges = NULL;
-    int ec = 0;
-    int rc = outbound ? cbm_gbuf_find_edges_by_source_type(gbuf, n->id, "CALLS", &edges, &ec)
-                      : cbm_gbuf_find_edges_by_target_type(gbuf, n->id, "CALLS", &edges, &ec);
-    if (rc != 0) {
+    int nn = 0;
+    const char **names = collect_sorted_call_neighbors(gbuf, n->id, outbound, &nn);
+    if (!names) {
         return count;
     }
-    for (int e = 0; e < ec && e < MAX_CALLEES && count < max_tokens; e++) {
-        int64_t id = outbound ? edges[e]->target_id : edges[e]->source_id;
-        const cbm_gbuf_node_t *neighbor = cbm_gbuf_find_by_id(gbuf, id);
-        if (neighbor && neighbor->name) {
-            count += cbm_sem_tokenize(neighbor->name, tokens + count, max_tokens - count);
-        }
+    for (int e = 0; e < nn && e < MAX_CALLEES && count < max_tokens; e++) {
+        count += cbm_sem_tokenize(names[e], tokens + count, max_tokens - count);
     }
+    free((void *)names);
     return count;
 }
 
@@ -452,21 +499,19 @@ static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, char 
 
 static void build_api_vec(const cbm_gbuf_t *gbuf, int64_t node_id, cbm_sem_vec_t *out) {
     memset(out, 0, sizeof(*out));
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    if (cbm_gbuf_find_edges_by_source_type(gbuf, node_id, "CALLS", &edges, &edge_count) != 0) {
+    /* Sorted neighbors: stable MAX_CALLEES subset + stable float-accumulation
+     * order (see collect_sorted_call_neighbors). */
+    int n = 0;
+    const char **names = collect_sorted_call_neighbors(gbuf, node_id, /*outbound=*/true, &n);
+    if (!names) {
         return;
     }
-    int added = 0;
-    for (int i = 0; i < edge_count && added < MAX_CALLEES; i++) {
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
-        if (target && target->name) {
-            cbm_sem_vec_t callee_ri;
-            cbm_sem_random_index(target->name, &callee_ri);
-            cbm_sem_vec_add_scaled(out, &callee_ri, PSE_UNIT_POS);
-            added++;
-        }
+    for (int i = 0; i < n && i < MAX_CALLEES; i++) {
+        cbm_sem_vec_t callee_ri;
+        cbm_sem_random_index(names[i], &callee_ri);
+        cbm_sem_vec_add_scaled(out, &callee_ri, PSE_UNIT_POS);
     }
+    free((void *)names);
     cbm_sem_normalize(out);
 }
 
@@ -556,10 +601,14 @@ typedef struct {
     int *token_counts;                 /* output: token count per function */
     int func_count;
     _Atomic int next_idx;
+    /* Per-worker token intern pools (key==value==the one owned strdup):
+     * identical tokens ("xfs", "error", ...) recur across hundreds of
+     * thousands of functions; per-func strdups made all_tokens hold every
+     * instance. Interned, it holds at most workers x unique tokens. */
+    CBMHashTable **pools;
 } tokenize_ctx_t;
 
 static void tokenize_worker(int worker_id, void *ctx_ptr) {
-    (void)worker_id;
     tokenize_ctx_t *tc = ctx_ptr;
     while (true) {
         int f = atomic_fetch_add_explicit(&tc->next_idx, SKIP_ONE, memory_order_relaxed);
@@ -575,6 +624,18 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
         char **dst = &tc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
         int count = tokenize_node(n, tc->gbuf, dst, CBM_SEM_MAX_TOKENS);
         count = inject_pattern_tokens(n, tc->gbuf, dst, count, CBM_SEM_MAX_TOKENS);
+        if (tc->pools && tc->pools[worker_id]) {
+            CBMHashTable *pool = tc->pools[worker_id];
+            for (int t = 0; t < count; t++) {
+                char *canon = cbm_ht_get(pool, dst[t]);
+                if (canon) {
+                    free(dst[t]);
+                    dst[t] = canon;
+                } else {
+                    cbm_ht_set(pool, dst[t], dst[t]); /* key borrows the value */
+                }
+            }
+        }
         tc->token_counts[f] = count;
     }
 }
@@ -619,21 +680,25 @@ static void vec_build_worker(int worker_id, void *ctx_ptr) {
         vc->funcs[f].tfidf_weights = weights;
         vc->funcs[f].tfidf_len = tfidf_len;
 
-        /* RI vector: sum of enriched token vectors weighted by IDF */
-        memset(&vc->funcs[f].ri_vec, 0, sizeof(cbm_sem_vec_t));
+        /* RI vector: sum of enriched token vectors weighted by IDF. Built in a
+         * LOCAL dense buffer; only the quantized code is retained per func
+         * (the resident dense floats were ~9.4 GB on the kernel). */
+        cbm_sem_vec_t ri_dense;
+        memset(&ri_dense, 0, sizeof(cbm_sem_vec_t));
         for (int t = 0; t < tc; t++) {
             const cbm_sem_vec_t *ri = cbm_sem_corpus_ri_vec(vc->corpus, tokens[t]);
             if (ri) {
                 float idf = cbm_sem_corpus_idf(vc->corpus, tokens[t]);
-                cbm_sem_vec_add_scaled(&vc->funcs[f].ri_vec, ri, idf);
+                cbm_sem_vec_add_scaled(&ri_dense, ri, idf);
             }
         }
-        cbm_sem_normalize(&vc->funcs[f].ri_vec);
+        cbm_sem_normalize(&ri_dense);
+        cbm_rsq_encode(ri_dense.v, &vc->funcs[f].ri_code);
 
         /* Int8 quantize into pre-allocated output array (parallel-safe) */
         uint8_t *qv = &vc->qvecs[(ptrdiff_t)f * CBM_SEM_DIM];
         for (int d = 0; d < CBM_SEM_DIM; d++) {
-            float v = vc->funcs[f].ri_vec.v[d];
+            float v = ri_dense.v[d];
             if (v > PSE_UNIT_POS) {
                 v = PSE_UNIT_POS;
             }
@@ -657,8 +722,11 @@ enum {
     SEM_MAX_CANDIDATES = 200,
 };
 
-/* Row of a hyperplane matrix: float[CBM_SEM_DIM]. */
-typedef float hyperplane_row_t[CBM_SEM_DIM];
+/* Row of a hyperplane matrix in the ROTATED (quantized) basis: LSH only
+ * needs signs of dots against random directions, and a random direction in
+ * the rotated basis is as random as one in the original — so signatures are
+ * computed from dequantized codes without keeping dense originals. */
+typedef float hyperplane_row_t[CBM_RSQ_DIM];
 
 typedef struct {
     cbm_sem_func_t *funcs;
@@ -677,11 +745,13 @@ static void sig_build_worker(int worker_id, void *ctx_ptr) {
             break;
         }
 
+        float dec[CBM_RSQ_DIM];
+        cbm_rsq_decode(&sc->funcs[f].ri_code, dec);
         uint64_t sig = 0;
         for (int h = 0; h < NUM_HYPERPLANES; h++) {
             float dot = 0.0F;
-            for (int d = 0; d < CBM_SEM_DIM; d++) {
-                dot += sc->funcs[f].ri_vec.v[d] * sc->hyperplanes[h][d];
+            for (int d = 0; d < CBM_RSQ_DIM; d++) {
+                dot += dec[d] * sc->hyperplanes[h][d];
             }
             if (dot > 0.0F) {
                 sig |= (PSE_ONE_ULL << h);
@@ -696,7 +766,7 @@ static void sig_build_worker(int worker_id, void *ctx_ptr) {
 typedef struct {
     cbm_sem_func_t *funcs;
     uint64_t *signatures;
-    int *edge_counts; /* shared, atomically updated */
+    int *edge_counts; /* budget applied sequentially in phase6b (determinism) */
     cbm_sem_config_t cfg;
     int func_count;
 
@@ -767,14 +837,15 @@ static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *cand
     return cand_count;
 }
 
-/* Score one candidate pair (i, j) and push a deferred edge if the score
- * passes the threshold and both endpoints still have edge budget. */
-static void score_try_emit(score_ctx_t *sc, int i, int j, deferred_edge_buf_t *my_buf) {
-    int ei = atomic_load_explicit((_Atomic int *)&sc->edge_counts[i], memory_order_relaxed);
-    int ej = atomic_load_explicit((_Atomic int *)&sc->edge_counts[j], memory_order_relaxed);
-    if (ei >= sc->cfg.max_edges || ej >= sc->cfg.max_edges) {
-        return;
-    }
+/* Score one candidate pair (i, j) and push a deferred candidate edge if the
+ * score passes the threshold. ADMISSION (the per-node max_edges budget) is
+ * deliberately NOT decided here: the old check-then-increment on shared
+ * atomic counts made the admitted edge SET depend on worker scheduling —
+ * multi-threaded runs lost edges vs single-threaded and differed run-to-run
+ * (repro_parallel_edge_determinism). Scoring is pure math and stays parallel;
+ * the budget is applied afterwards in one sequential pass over the pairs in
+ * canonical (i, candidate-rank) order. */
+static void score_try_emit(score_ctx_t *sc, int i, int j, int c, deferred_edge_buf_t *my_buf) {
     if (strcmp(sc->funcs[i].file_ext, sc->funcs[j].file_ext) != 0) {
         return;
     }
@@ -784,9 +855,8 @@ static void score_try_emit(score_ctx_t *sc, int i, int j, deferred_edge_buf_t *m
     }
     bool same_file = sc->funcs[i].file_path && sc->funcs[j].file_path &&
                      strcmp(sc->funcs[i].file_path, sc->funcs[j].file_path) == 0;
-    deferred_buf_push(my_buf, sc->funcs[i].node_id, sc->funcs[j].node_id, score, same_file);
-    atomic_fetch_add_explicit((_Atomic int *)&sc->edge_counts[i], SKIP_ONE, memory_order_relaxed);
-    atomic_fetch_add_explicit((_Atomic int *)&sc->edge_counts[j], SKIP_ONE, memory_order_relaxed);
+    deferred_buf_push(my_buf, sc->funcs[i].node_id, sc->funcs[j].node_id, score, same_file, i, j,
+                      c);
 }
 
 static void score_worker(int worker_id, void *ctx_ptr) {
@@ -798,11 +868,6 @@ static void score_worker(int worker_id, void *ctx_ptr) {
         if (i >= sc->func_count) {
             break;
         }
-        int my_edges =
-            atomic_load_explicit((_Atomic int *)&sc->edge_counts[i], memory_order_relaxed);
-        if (my_edges >= sc->cfg.max_edges) {
-            continue;
-        }
         int seen[SCORE_SEEN_CAP];
         for (int s = 0; s < SCORE_SEEN_CAP; s++) {
             seen[s] = SCORE_SEEN_EMPTY;
@@ -810,7 +875,7 @@ static void score_worker(int worker_id, void *ctx_ptr) {
         int candidates[SEM_MAX_CANDIDATES];
         int cand_count = score_collect_candidates(sc, i, seen, candidates, SEM_MAX_CANDIDATES);
         for (int c = 0; c < cand_count; c++) {
-            score_try_emit(sc, i, candidates[c], my_buf);
+            score_try_emit(sc, i, candidates[c], c, my_buf);
         }
     }
 }
@@ -841,9 +906,13 @@ static void collect_worker(int worker_id, void *ctx_ptr) {
             const cbm_gbuf_node_t *n = cc->node_ptrs[i];
             decode_minhash(n->properties_json, &cc->funcs[i]);
             decode_struct_profile(n->properties_json, cc->funcs[i].struct_profile);
-            build_api_vec(cc->gbuf, n->id, &cc->funcs[i].api_vec);
-            build_type_vec(n->properties_json, &cc->funcs[i].type_vec);
-            build_deco_vec(n->properties_json, &cc->funcs[i].deco_vec);
+            cbm_sem_vec_t tmp_vec;
+            build_api_vec(cc->gbuf, n->id, &tmp_vec);
+            cbm_rsq_encode(tmp_vec.v, &cc->funcs[i].api_code);
+            build_type_vec(n->properties_json, &tmp_vec);
+            cbm_rsq_encode(tmp_vec.v, &cc->funcs[i].type_code);
+            build_deco_vec(n->properties_json, &tmp_vec);
+            cbm_rsq_encode(tmp_vec.v, &cc->funcs[i].deco_code);
         }
     }
 }
@@ -855,6 +924,24 @@ typedef struct {
     int count;
     int cap;
 } sem_bucket_t;
+
+/* Canonical node order: by qualified name (unique per node), id tie-break
+ * for defensiveness. Gives the semantic pass a stable, content-derived input
+ * order regardless of how parallel extraction merged the graph buffer. */
+static int cmp_node_ptr_by_qn(const void *pa, const void *pb) {
+    const cbm_gbuf_node_t *a = *(const cbm_gbuf_node_t *const *)pa;
+    const cbm_gbuf_node_t *b = *(const cbm_gbuf_node_t *const *)pb;
+    const char *qa = a->qualified_name ? a->qualified_name : "";
+    const char *qb = b->qualified_name ? b->qualified_name : "";
+    int r = strcmp(qa, qb);
+    if (r != 0) {
+        return r;
+    }
+    if (a->id != b->id) {
+        return a->id < b->id ? -1 : 1;
+    }
+    return 0;
+}
 
 /* Phase 1a: seed the funcs[] / node_ptrs[] arrays from all Function and
  * Method nodes in the graph buffer.  Returns the number of functions collected
@@ -898,6 +985,20 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
             func_count++;
         }
     }
+    /* Canonicalize the func order (determinism): the label-index order above
+     * is gbuf insertion order = parallel-extraction merge order, which varies
+     * run to run. Everything downstream is order-sensitive — LSH bucket chain
+     * order, the SEM_MAX_CANDIDATES truncation, seen[] and the admission
+     * sequence — so an unstable order changes WHICH semantic edges are
+     * emitted. Sort the cheap pointer array by qualified name (unique) and
+     * re-derive the three fields set so far; the heavy per-func payloads are
+     * filled in later phases, so no 12.7 KB structs are moved. */
+    qsort(node_ptrs, (size_t)func_count, sizeof(node_ptrs[0]), cmp_node_ptr_by_qn);
+    for (int k = 0; k < func_count; k++) {
+        funcs[k].node_id = node_ptrs[k]->id;
+        funcs[k].file_path = node_ptrs[k]->file_path;
+        funcs[k].file_ext = file_ext(node_ptrs[k]->file_path);
+    }
     *out_funcs = funcs;
     *out_nodes = node_ptrs;
     return func_count;
@@ -932,20 +1033,66 @@ static void phase5c_build_lsh_buckets(const uint64_t *signatures, int func_count
 
 /* Phase 6b: serialize deferred edges from all worker buffers into the graph
  * buffer (sequential because gbuf isn't thread-safe). */
-static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_bufs,
-                               int worker_count) {
-    int total_edges = 0;
+/* Canonical order for candidate pairs: ascending discovering-func index,
+ * then ascending candidate rank — the order a sequential scoring loop over
+ * canonically-sorted funcs would have produced. */
+static int cmp_deferred_edge_canonical(const void *pa, const void *pb) {
+    const deferred_edge_t *a = pa;
+    const deferred_edge_t *b = pb;
+    if (a->i != b->i) {
+        return a->i < b->i ? -1 : 1;
+    }
+    if (a->c != b->c) {
+        return a->c < b->c ? -1 : 1;
+    }
+    return 0;
+}
+
+/* Sequential, deterministic admission + merge: gather every above-threshold
+ * pair from the worker buffers, replay them in canonical (i, rank) order,
+ * and apply the per-node max_edges budget HERE — single-threaded — so the
+ * admitted edge set is a pure function of the (canonically sorted) inputs,
+ * independent of worker count and scheduling. */
+static int phase6b_merge_edges(cbm_gbuf_t *gbuf, deferred_edge_buf_t *worker_bufs, int worker_count,
+                               int *edge_counts, int max_edges) {
+    int total_pairs = 0;
     for (int w = 0; w < worker_count; w++) {
-        for (int e = 0; e < worker_bufs[w].count; e++) {
-            deferred_edge_t *de = &worker_bufs[w].edges[e];
-            char props[PROPS_BUF];
-            snprintf(props, sizeof(props), "{\"score\":%.3f,\"same_file\":%s}", de->score,
-                     de->same_file ? "true" : "false");
-            cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SEMANTICALLY_RELATED", props);
-            total_edges++;
+        total_pairs += worker_bufs[w].count;
+    }
+    deferred_edge_t *pairs = NULL;
+    if (total_pairs > 0) {
+        pairs = malloc((size_t)total_pairs * sizeof(deferred_edge_t));
+    }
+    if (!pairs) {
+        for (int w = 0; w < worker_count; w++) {
+            deferred_buf_free(&worker_bufs[w]);
         }
+        return 0;
+    }
+    int n = 0;
+    for (int w = 0; w < worker_count; w++) {
+        memcpy(&pairs[n], worker_bufs[w].edges,
+               (size_t)worker_bufs[w].count * sizeof(deferred_edge_t));
+        n += worker_bufs[w].count;
         deferred_buf_free(&worker_bufs[w]);
     }
+    qsort(pairs, (size_t)n, sizeof(deferred_edge_t), cmp_deferred_edge_canonical);
+
+    int total_edges = 0;
+    for (int e = 0; e < n; e++) {
+        deferred_edge_t *de = &pairs[e];
+        if (edge_counts[de->i] >= max_edges || edge_counts[de->j] >= max_edges) {
+            continue;
+        }
+        char props[PROPS_BUF];
+        snprintf(props, sizeof(props), "{\"score\":%.3f,\"same_file\":%s}", de->score,
+                 de->same_file ? "true" : "false");
+        cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SEMANTICALLY_RELATED", props);
+        edge_counts[de->i]++;
+        edge_counts[de->j]++;
+        total_edges++;
+    }
+    free(pairs);
     return total_edges;
 }
 
@@ -984,8 +1131,8 @@ static hyperplane_row_t *phase5a_build_hyperplanes(void) {
         return NULL;
     }
     for (int h = 0; h < NUM_HYPERPLANES; h++) {
-        for (int d = 0; d < CBM_SEM_DIM; d++) {
-            uint64_t seed = XXH3_64bits_withSeed(&d, sizeof(d), (uint64_t)h * CBM_SEM_DIM);
+        for (int d = 0; d < CBM_RSQ_DIM; d++) {
+            uint64_t seed = XXH3_64bits_withSeed(&d, sizeof(d), (uint64_t)h * CBM_RSQ_DIM);
             hyperplanes[h][d] = ((float)(seed & UINT32_MAX) / (float)UINT32_MAX) - PSE_ROUND_BIAS;
         }
     }
@@ -1014,13 +1161,15 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
 /* Phase 2: tokenize each function's metadata in parallel, filling
  * all_tokens[] and token_counts[].  Caller allocates the arrays. */
 static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char **all_tokens,
-                            int *token_counts, int func_count, int worker_count) {
+                            int *token_counts, int func_count, int worker_count,
+                            CBMHashTable **pools) {
     tokenize_ctx_t tc = {
         .node_ptrs = node_ptrs,
         .gbuf = gbuf,
         .all_tokens = all_tokens,
         .token_counts = token_counts,
         .func_count = func_count,
+        .pools = pools,
     };
     atomic_init(&tc.next_idx, 0);
     cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
@@ -1168,7 +1317,7 @@ static int run_scoring_phase(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs, uint64_t *
     CBM_PROF_END_N("semantic_edges", "6a_score_parallel", t_phase6a, func_count);
 
     CBM_PROF_START(t_phase6b);
-    int total = phase6b_merge_edges(gbuf, worker_bufs, worker_count);
+    int total = phase6b_merge_edges(gbuf, worker_bufs, worker_count, edge_counts, cfg.max_edges);
     CBM_PROF_END_N("semantic_edges", "6b_edge_merge_seq", t_phase6b, total);
 
     free(worker_bufs);
@@ -1177,18 +1326,32 @@ static int run_scoring_phase(cbm_gbuf_t *gbuf, cbm_sem_func_t *funcs, uint64_t *
 }
 
 /* Free the per-function arrays malloc'd during phases 1b and 4a. */
+static void free_token_pool_entry(const char *key, void *value, void *ud) {
+    (void)key; /* key == value: one owned string per unique token */
+    (void)ud;
+    free(value);
+}
+
+/* all_tokens slots BORROW their strings from the per-worker intern pools;
+ * the pools own exactly one copy per unique token per worker. */
 static void free_funcs_and_tokens(cbm_sem_func_t *funcs, int func_count, char **all_tokens,
-                                  const int *token_counts) {
+                                  const int *token_counts, CBMHashTable **pools, int worker_count) {
+    (void)token_counts;
     for (int f = 0; f < func_count; f++) {
         free(funcs[f].tfidf_indices);
         free(funcs[f].tfidf_weights);
-        int tc = token_counts[f];
-        for (int t = 0; t < tc; t++) {
-            free(all_tokens[((ptrdiff_t)f * CBM_SEM_MAX_TOKENS) + t]);
-        }
     }
     free(all_tokens);
     free(funcs);
+    if (pools) {
+        for (int w = 0; w < worker_count; w++) {
+            if (pools[w]) {
+                cbm_ht_foreach(pools[w], free_token_pool_entry, NULL);
+                cbm_ht_free(pools[w]);
+            }
+        }
+        free(pools);
+    }
 }
 
 /* ── Pass entry point ────────────────────────────────────────────── */
@@ -1226,7 +1389,14 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     int *token_counts = calloc((size_t)func_count, sizeof(int));
 
     CBM_PROF_START(t_phase2);
-    phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count);
+    CBMHashTable **token_pools = calloc((size_t)worker_count, sizeof(CBMHashTable *));
+    if (token_pools) {
+        for (int w = 0; w < worker_count; w++) {
+            token_pools[w] = cbm_ht_create(CBM_SZ_1K);
+        }
+    }
+    phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count,
+                    token_pools);
     CBM_PROF_END_N("semantic_edges", "2_tokenize_parallel", t_phase2, func_count);
     free(node_ptrs);
 
@@ -1260,7 +1430,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
     free_lsh_buckets(band_buckets);
     free(signatures);
     cbm_log_info("pass.done", "pass", "semantic_edges", "edges", itoa_log(total_edges));
-    free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts);
+    free_funcs_and_tokens(funcs, func_count, all_tokens, token_counts, token_pools, worker_count);
     free(token_counts);
     cbm_sem_corpus_free(corpus);
     CBM_PROF_END("semantic_edges", "7_cleanup", t_phase7);

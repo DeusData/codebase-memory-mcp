@@ -556,6 +556,63 @@ TEST(pylsp_crossfile_method_dispatch) {
     PASS();
 }
 
+/* Graph-quality guard for the Python seal fix (per-file field overlay). In the
+ * FUSED path the shared Tier-2 registry is read_only, so `self.b = Bar()` can no
+ * longer be recorded by mutating the shared registry; it is recorded in the per-file
+ * overlay instead. This test proves the overlay preserves same-file attribute-chain
+ * resolution: self.b.work() must still resolve to Bar.work. It RED-fails under a
+ * plain read_only *gate* (option A: the field is dropped, self.b is untyped, the
+ * work() call goes unresolved) and GREENs with the overlay. It ALSO asserts the
+ * shared registry entry stays unmutated (Foo.field_names == NULL) — the seal half. */
+TEST(pylsp_fused_self_attr_chain_via_overlay) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    /* Sealed shared registry: class Bar with method work(), class Foo. */
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.mod.Bar";
+    defs[0].short_name = "Bar";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.mod.Bar.work";
+    defs[1].short_name = "work";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.Bar";
+    defs[1].def_module_qn = "test.mod";
+    defs[1].lang = CBM_LANG_PYTHON;
+    defs[2].qualified_name = "test.mod.Foo";
+    defs[2].short_name = "Foo";
+    defs[2].label = "Class";
+    defs[2].def_module_qn = "test.mod";
+    defs[2].lang = CBM_LANG_PYTHON;
+
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 3);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    /* Foo.__init__ records self.b = Bar(); Foo.run dispatches self.b.work(). */
+    const char *src = "class Foo:\n"
+                      "    def __init__(self):\n"
+                      "        self.b = Bar()\n"
+                      "    def run(self):\n"
+                      "        return self.b.work()\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL, 0,
+                                       NULL, &out);
+
+    /* Overlay preserves the attribute-chain edge. */
+    ASSERT_GTE(find_resolved_arr(&out, "run", "work"), 0);
+    /* Seal preserved: the shared registry entry was NOT mutated. */
+    const CBMRegisteredType *foo = cbm_registry_lookup_type(reg, "test.mod.Foo");
+    ASSERT_NOT_NULL(foo);
+    ASSERT_TRUE(foo->field_names == NULL);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Issue #228: a class/static method invoked directly on a CROSS-FILE imported
  * class name — ActionRecordX.build_from_text(...) — produced no CALLS edge, so
  * the method showed in/out degree 0 and was flagged as dead code. Distinct from
@@ -1243,6 +1300,122 @@ TEST(pylsp_round6_property_access_chains) {
     PASS();
 }
 
+/* ── Evaluator guards — memoization, depth cap, step budget ─────
+ * (issues #710 and #720; distilled from PRs #732 and #758) */
+
+TEST(pylsp_issue710_deep_call_chain_resolves) {
+    /* Regression for #710: py_eval_expr_type evaluated a call node's
+     * attribute receiver TWICE (container special-case + general
+     * attribute path), so an N-link chained builder expression cost
+     * O(2^N) evaluations — ~65-link real-world chains hung indexing for
+     * hours. With per-node memoization the chain is O(N). On unfixed
+     * code this 40-link chain is ~2^40 evaluations: the test cannot
+     * finish and the suite times out, rather than passing silently.
+     * We also require the FINAL link to actually resolve — the fix must
+     * preserve resolution quality, not just terminate. */
+    CBMFileResult *r = extract_py(
+        "from typing import Self\n"
+        "class G:\n"
+        "    def add(self, x) -> Self:\n"
+        "        return self\n"
+        "    def compile(self):\n"
+        "        return 1\n"
+        "def build():\n"
+        "    return (\n"
+        "        G()\n"
+        "        .add(1).add(2).add(3).add(4).add(5).add(6).add(7).add(8)\n"
+        "        .add(9).add(10).add(11).add(12).add(13).add(14).add(15)\n"
+        "        .add(16).add(17).add(18).add(19).add(20).add(21).add(22)\n"
+        "        .add(23).add(24).add(25).add(26).add(27).add(28).add(29)\n"
+        "        .add(30).add(31).add(32).add(33).add(34).add(35).add(36)\n"
+        "        .add(37).add(38).add(39).add(40)\n"
+        "        .compile()\n"
+        "    )\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "build", "G.add"), 0);
+    ASSERT_GTE(require_resolved(r, "build", "G.compile"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pylsp_issue710_heterogeneous_receiver_chain) {
+    /* Guard for the memo cache's KEY choice. Every leftmost descendant of
+     * `c.session().execute().fetch()` — the outer call, each receiver
+     * call, down to the identifier `c` — starts at the same byte, so a
+     * cache keyed by start byte (PR #732's approach) aliases all of them:
+     * after `c` -> Client is inserted, the receiver call `c.session()`
+     * reads Client back instead of Session and the rest of the chain
+     * resolves wrongly or not at all. Each link here returns a DIFFERENT
+     * class so any such aliasing changes an assertable QN. Keying by node
+     * identity (TSNode.id) keeps every link distinct. */
+    CBMFileResult *r = extract_py(
+        "class Result:\n"
+        "    def fetch(self):\n"
+        "        return 1\n"
+        "class Session:\n"
+        "    def execute(self) -> \"Result\":\n"
+        "        return Result()\n"
+        "class Client:\n"
+        "    def session(self) -> \"Session\":\n"
+        "        return Session()\n"
+        "def run():\n"
+        "    c = Client()\n"
+        "    return c.session().execute().fetch()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Client.session"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Session.execute"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Result.fetch"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pylsp_eval_steps_budget_degrades_gracefully) {
+    /* PY_EVAL_MAX_STEPS_PER_FILE guard: a file whose expressions demand
+     * more evaluator work than the per-file budget must still complete
+     * quickly and keep everything resolved BEFORE exhaustion — graceful
+     * partial degradation, not a hang, crash, or corrupted result. 90
+     * statements x 30-link chains re-evaluated across the bind + emit
+     * phases (the assignment bind flushes the memo generation in between)
+     * comfortably exceed the 10000-step budget. */
+    enum { BUDGET_STMTS = 90, BUDGET_LINKS = 30 };
+    size_t sz = 4096 + (size_t)BUDGET_STMTS * (32 + (size_t)BUDGET_LINKS * 8);
+    char *src = malloc(sz);
+    ASSERT_NOT_NULL(src);
+    char *p = src;
+    size_t left = sz;
+    int n = snprintf(p, left,
+                     "from typing import Self\n"
+                     "class G:\n"
+                     "    def add(self, x) -> Self:\n"
+                     "        return self\n"
+                     "    def compile(self):\n"
+                     "        return 1\n"
+                     "def run():\n");
+    p += n;
+    left -= (size_t)n;
+    for (int s = 0; s < BUDGET_STMTS; s++) {
+        n = snprintf(p, left, "    v%d = G()", s);
+        p += n;
+        left -= (size_t)n;
+        for (int l = 0; l < BUDGET_LINKS; l++) {
+            n = snprintf(p, left, ".add(%d)", l);
+            p += n;
+            left -= (size_t)n;
+        }
+        n = snprintf(p, left, ".compile()\n");
+        p += n;
+        left -= (size_t)n;
+    }
+    snprintf(p, left, "    return v0\n");
+    CBMFileResult *r = extract_py(src);
+    free(src);
+    ASSERT_NOT_NULL(r);
+    /* The first statements run with budget to spare — they must resolve. */
+    ASSERT_GTE(require_resolved(r, "run", "G.compile"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(py_lsp) {
@@ -1279,6 +1452,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_pep695_generic_class);
     /* Phase 9 — cross-file + batch */
     RUN_TEST(pylsp_crossfile_method_dispatch);
+    RUN_TEST(pylsp_fused_self_attr_chain_via_overlay);
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
     RUN_TEST(pylsp_batch_two_files);
@@ -1318,4 +1492,8 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_round6_generator_yields_iterable);
     RUN_TEST(pylsp_round6_dataclass_field_access);
     RUN_TEST(pylsp_round6_property_access_chains);
+    /* Evaluator guards — #710/#720 (distilled PRs #732 + #758) */
+    RUN_TEST(pylsp_issue710_deep_call_chain_resolves);
+    RUN_TEST(pylsp_issue710_heterogeneous_receiver_chain);
+    RUN_TEST(pylsp_eval_steps_budget_degrades_gracefully);
 }

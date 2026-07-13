@@ -50,12 +50,19 @@ jobs:
     uses: ./.github/workflows/_test.yml
     with:
       skip_perf: true
+      broad_platforms: true
 
   # ── Build all platforms ────────────────────────────────────────
   build:
     if: ${{ inputs.skip_builds != true && !cancelled() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
     needs: [test]
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/_build.yml
+    with:
+      attest: false
 
   # ── Smoke test every binary ────────────────────────────────────
   # Run unless builds were skipped or a build leg FAILED. Every build leg
@@ -65,6 +72,8 @@ jobs:
     if: ${{ inputs.skip_builds != true && !cancelled() && needs.build.result != 'failure' && needs.build.result != 'skipped' }}
     needs: [build]
     uses: ./.github/workflows/_smoke.yml
+    with:
+      broad_platforms: true
 
   # ── Soak tests (optional, parallel with smoke) ────────────────
   soak:

@@ -509,9 +509,13 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
  * resolve to the same-named Module node instead of the Class node. Only
  * callable / declared symbols belong in the registry. */
 static bool incr_label_is_registry_symbol(const char *label) {
+    /* Mirror pass_definitions.c / pass_parallel.c registry seeding EXACTLY:
+     * callables + every type-like container (Class/Struct/Interface/Enum/Type/
+     * Trait) + Variable/Field. Struct included so an incremental re-resolve seeds
+     * the same struct type nodes a full reindex would. */
     return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
-                     strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
-                     strcmp(label, "Variable") == 0 || strcmp(label, "Field") == 0);
+                     cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+                     strcmp(label, "Field") == 0);
 }
 
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing
@@ -627,7 +631,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                              cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path) {
+                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -646,6 +650,13 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+
+        /* Coverage rows (#963): re-write the merged set into the rebuilt DB
+         * (AFTER hashes, so the deleted-file prune sees the live file set). */
+        if (cov_count > 0 &&
+            cbm_store_coverage_replace(hash_store, project, cov, cov_count) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "persist_coverage", "project", project);
+        }
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
          * any triggers that could have kept nodes_fts synchronized, so we
@@ -725,6 +736,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 
     cbm_store_free_file_hashes(stored, stored_count);
 
+    /* Coverage rows (#963): the dump below rebuilds the DB file, wiping the
+     * separate index_coverage table — capture the previous rows now (store
+     * still open) so entries for files NOT re-extracted this run survive. */
+    cbm_coverage_row_t *old_cov = NULL;
+    int old_cov_count = 0;
+    (void)cbm_store_coverage_get(store, project, &old_cov, &old_cov_count);
+
     /* Build list of changed files */
     cbm_file_info_t *changed_files =
         (n_changed > 0) ? malloc((size_t)n_changed * sizeof(cbm_file_info_t)) : NULL;
@@ -758,6 +776,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_free_coverage(old_cov, old_cov_count);
         cbm_store_close(store);
         return CBM_NOT_FOUND;
     }
@@ -802,7 +821,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
 
-    cbm_path_alias_collection_t *path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    /* Discovery exclusions (gitignore + skip dirs) captured by the run that
+     * routed here. Borrowed from the pipeline so the auxiliary repo walks
+     * (pkgmap via merge_pkg_entries, path aliases) skip excluded subtrees on
+     * incremental runs too — same borrow as the full path (#792/#804). */
+    char **excluded_dirs = NULL;
+    int excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
+
+    cbm_path_alias_collection_t *path_aliases =
+        cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
 
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -810,8 +838,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
         .path_aliases = path_aliases,
+        .excluded_dirs = excluded_dirs,
+        .excluded_count = excluded_count,
     };
 
     for (int i = 0; i < ci; i++) {
@@ -826,6 +857,63 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     run_extract_resolve(&ctx, changed_files, ci);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
     run_postpasses(&ctx, changed_files, ci, project);
+
+    /* Coverage rows (#963): merge = previous FAILURE rows for files NOT
+     * re-extracted this run + this run's fresh entries (changed files replace
+     * their old rows — a file that parses cleanly now simply contributes
+     * nothing, so its stale flag dies here). By-design not_indexed_* rows are
+     * NOT carried over: discovery runs completely on every route, so this
+     * run's excluded dirs + ignored files are the fresh, authoritative set.
+     * Rows for deleted files are pruned against file_hashes inside the
+     * replace. Borrowed strings: old_cov and the pipeline own them past the
+     * dump_and_persist call below. */
+    cbm_file_error_t *run_errs = NULL;
+    int run_err_count = 0;
+    cbm_pipeline_get_file_errors(p, &run_errs, &run_err_count);
+    char **run_excluded = NULL;
+    int run_excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &run_excluded, &run_excluded_count);
+    cbm_ignored_file_t *run_ignored = NULL;
+    int run_ignored_count = 0;
+    cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, NULL);
+    cbm_coverage_row_t *cov = NULL;
+    int cov_n = 0;
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    if (cov_cap > 0) {
+        cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
+    }
+    if (cov) {
+        CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
+        for (int i = 0; i < ci; i++) {
+            cbm_ht_set(changed_set, changed_files[i].rel_path, &changed_files[i]);
+        }
+        for (int i = 0; i < old_cov_count; i++) {
+            bool by_design = old_cov[i].kind && strncmp(old_cov[i].kind, "not_indexed", 11) == 0;
+            if (!by_design && old_cov[i].rel_path &&
+                !cbm_ht_get(changed_set, old_cov[i].rel_path)) {
+                cov[cov_n++] = old_cov[i];
+            }
+        }
+        cbm_ht_free(changed_set);
+        for (int i = 0; i < run_err_count; i++) {
+            cov[cov_n].rel_path = run_errs[i].path;
+            cov[cov_n].kind = run_errs[i].phase;
+            cov[cov_n].detail = run_errs[i].reason;
+            cov_n++;
+        }
+        for (int i = 0; i < run_excluded_count; i++) {
+            cov[cov_n].rel_path = run_excluded[i];
+            cov[cov_n].kind = "not_indexed_dir";
+            cov[cov_n].detail = "excluded subtree";
+            cov_n++;
+        }
+        for (int i = 0; i < run_ignored_count; i++) {
+            cov[cov_n].rel_path = run_ignored[i].rel_path;
+            cov[cov_n].kind = "not_indexed_file";
+            cov[cov_n].detail = run_ignored[i].reason;
+            cov_n++;
+        }
+    }
 
     free(changed_files);
     cbm_registry_free(registry);
@@ -851,7 +939,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
     dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p));
+                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n);
+    free(cov);
+    cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 

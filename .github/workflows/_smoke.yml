@@ -2,34 +2,99 @@
 name: Smoke
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      broad_platforms:
+        description: 'Smoke the shipped binaries on the broad platform matrix (extra OS versions) instead of the core set'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
+  # Emit the platform matrices as JSON. The CORE set is the default (fast,
+  # unchanged); the BROAD set adds extra free runners (additional OS versions)
+  # that download the SAME shipped artifact for their goos/goarch and verify it
+  # runs on a wider range of OS versions. No new artifacts are built — broad
+  # legs reuse the exact binaries produced by _build.yml.
+  setup-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      unix: ${{ steps.set.outputs.unix }}
+      windows: ${{ steps.set.outputs.windows }}
+      portable: ${{ steps.set.outputs.portable }}
+    steps:
+      - name: Compute matrices
+        id: set
+        env:
+          BROAD: ${{ inputs.broad_platforms }}
+        run: |
+          CORE_UNIX='[
+            {"os":"ubuntu-latest","goos":"linux","goarch":"amd64"},
+            {"os":"ubuntu-24.04-arm","goos":"linux","goarch":"arm64"},
+            {"os":"macos-14","goos":"darwin","goarch":"arm64"},
+            {"os":"macos-15-intel","goos":"darwin","goarch":"amd64"}
+          ]'
+          # Broad legs reuse existing goos/goarch artifacts on additional OS
+          # versions to widen the run-anywhere signal without building new targets.
+          # Broad legs are REQUIRED gates (no optional / continue-on-error):
+          # every smoke leg must pass. No `optional` flags anywhere.
+          #
+          # NOTE: the *dynamic* linux binary links glibc 2.38+ and cannot run on
+          # older distros by design — older-glibc coverage is the -portable (static)
+          # binary's job, exercised green by the smoke-linux-portable broad legs
+          # (ubuntu-22.04 / 22.04-arm). So the dynamic broad legs stay on
+          # forward-compatible OSes only (macOS); running the dynamic binary on
+          # ubuntu-22.04 would fail Phase 1 (glibc too old), not a real regression.
+          BROAD_UNIX='[
+            {"os":"macos-15","goos":"darwin","goarch":"arm64"}
+          ]'
+          CORE_WIN='[{"os":"windows-latest","arch":"amd64"}]'
+          # windows-11-arm now runs the NATIVE arm64 binary (build-windows-arm64),
+          # not the x86_64 binary under emulation — we smoke the artifact we ship.
+          BROAD_WIN='[{"os":"windows-2025","arch":"amd64"},{"os":"windows-11-arm","arch":"arm64"}]'
+          CORE_PORTABLE='[
+            {"arch":"amd64","runner":"ubuntu-latest"},
+            {"arch":"arm64","runner":"ubuntu-24.04-arm"}
+          ]'
+          BROAD_PORTABLE='[
+            {"arch":"amd64","runner":"ubuntu-22.04"},
+            {"arch":"arm64","runner":"ubuntu-22.04-arm"}
+          ]'
+          if [ "$BROAD" = "true" ]; then
+            UNIX=$(jq -cn --argjson a "$CORE_UNIX" --argjson b "$BROAD_UNIX" '$a + $b')
+            WIN=$(jq -cn --argjson a "$CORE_WIN" --argjson b "$BROAD_WIN" '$a + $b')
+            PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" --argjson b "$BROAD_PORTABLE" '$a + $b')
+          else
+            UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
+            WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
+            PORTABLE=$(jq -cn --argjson a "$CORE_PORTABLE" '$a')
+          fi
+          # Expand each OS entry over both variants into a FLAT include list so
+          # every {os,variant} runs as its own job. A {variant:[...],include:$LIST}
+          # matrix collapses under GitHub's include-merge (later os entries
+          # overwrite the variant combos last-wins), which silently dropped every
+          # OS except the last — e.g. only windows-11-arm ran, never windows-latest.
+          # Building the cartesian explicitly avoids that.
+          VARIANTS='["standard","ui"]'
+          UNIX_M=$(jq -cn --argjson a "$UNIX" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          WIN_M=$(jq -cn --argjson a "$WIN" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          PORTABLE_M=$(jq -cn --argjson a "$PORTABLE" --argjson v "$VARIANTS" '{include:[$a[] as $o | $v[] as $t | ($o + {variant:$t})]}')
+          echo "unix=$UNIX_M" >> "$GITHUB_OUTPUT"
+          echo "windows=$WIN_M" >> "$GITHUB_OUTPUT"
+          echo "portable=$PORTABLE_M" >> "$GITHUB_OUTPUT"
+
   smoke-unix:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            goos: linux
-            goarch: amd64
-          - os: ubuntu-24.04-arm
-            goos: linux
-            goarch: arm64
-          - os: macos-14
-            goos: darwin
-            goarch: arm64
-          - os: macos-15-intel
-            goos: darwin
-            goarch: amd64
-        variant: [standard, ui]
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -52,6 +117,19 @@ jobs:
           if [ -n "$SUFFIX" ]; then
             cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
                "/tmp/smoke-server/codebase-memory-mcp-${OS}-${ARCH}.tar.gz"
+          fi
+          # The linux binary self-updates from the fully-static "-portable" asset
+          # (build_update_url in src/cli/cli.c appends -portable on linux; _build.yml's
+          # build-linux-portable job ships it), so the smoke server must serve that name
+          # too -- otherwise `update` 404s and Phase 14 fails. Mirror the tarball(s) under
+          # the -portable name on linux only.
+          if [ "$OS" = "linux" ]; then
+            cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}.tar.gz" \
+               "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz"
+            if [ -n "$SUFFIX" ]; then
+              cp "/tmp/smoke-server/codebase-memory-mcp${SUFFIX}-${OS}-${ARCH}-portable.tar.gz" \
+                 "/tmp/smoke-server/codebase-memory-mcp-${OS}-${ARCH}-portable.tar.gz"
+            fi
           fi
           cd /tmp/smoke-server
           sha256sum *.tar.gz > checksums.txt 2>/dev/null || shasum -a 256 *.tar.gz > checksums.txt
@@ -78,6 +156,10 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq clamav > /dev/null 2>&1
+          # apt auto-starts the clamav-freshclam daemon, which holds a lock on
+          # freshclam's log/db; stop it so the manual freshclam below can run
+          # (else: "Failed to lock the log file ... Resource temporarily unavailable").
+          sudo systemctl stop clamav-freshclam 2>/dev/null || true
           sudo sed -i 's/^Example/#Example/' /etc/clamav/freshclam.conf 2>/dev/null || true
           grep -q "DatabaseMirror" /etc/clamav/freshclam.conf 2>/dev/null || \
             echo "DatabaseMirror database.clamav.net" | sudo tee -a /etc/clamav/freshclam.conf > /dev/null
@@ -98,34 +180,36 @@ jobs:
           clamscan --no-summary ./codebase-memory-mcp
 
   smoke-windows:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        variant: [standard, ui]
-    runs-on: windows-latest
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
-          msystem: CLANG64
+          msystem: ${{ matrix.arch == 'arm64' && 'CLANGARM64' || 'CLANG64' }}
           path-type: inherit
           install: >-
-            mingw-w64-clang-x86_64-python3
+            mingw-w64-clang-${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}-python3
+            mingw-w64-clang-${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}-curl
             unzip
             zip
             coreutils
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: binaries-windows-amd64
+          name: binaries-windows-${{ matrix.arch }}
 
       - name: Extract binary
         shell: msys2 {0}
         run: |
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
-          unzip -o "codebase-memory-mcp${SUFFIX}-windows-amd64.zip"
+          ARCH=${{ matrix.arch }}
+          unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip"
           [ -n "$SUFFIX" ] && cp "codebase-memory-mcp${SUFFIX}.exe" codebase-memory-mcp.exe || true
 
       - name: Start artifact server
@@ -134,19 +218,24 @@ jobs:
           mkdir -p /tmp/smoke-server
           cp codebase-memory-mcp.exe /tmp/smoke-server/
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
+          ARCH=${{ matrix.arch }}
           cd /tmp/smoke-server
-          zip -q "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" codebase-memory-mcp.exe
+          zip -q "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" codebase-memory-mcp.exe
           if [ -n "$SUFFIX" ]; then
-            cp "codebase-memory-mcp${SUFFIX}-windows-amd64.zip" "codebase-memory-mcp-windows-amd64.zip"
+            cp "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" "codebase-memory-mcp-windows-${ARCH}.zip"
           fi
           sha256sum *.zip > checksums.txt
-          python3 -m http.server 18080 -d /tmp/smoke-server &
+          # Pin to explicit IPv4: on windows-11-arm, `localhost` resolves to ::1 (IPv6)
+          # for msys2 curl while python's http.server is IPv4-only -> instant connect
+          # failure in smoke Phase 12a. --bind 127.0.0.1 + a 127.0.0.1 URL pin both ends.
+          python3 -m http.server 18080 --bind 127.0.0.1 -d /tmp/smoke-server &
 
       - name: Smoke test
         shell: msys2 {0}
         run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
         env:
-          SMOKE_DOWNLOAD_URL: http://localhost:18080
+          SMOKE_DOWNLOAD_URL: http://127.0.0.1:18080
+          SMOKE_ARCH: ${{ matrix.arch }}
 
       - name: Security audits
         shell: msys2 {0}
@@ -159,24 +248,30 @@ jobs:
         run: |
           & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
           $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$PWD\codebase-memory-mcp.exe" -DisableRemediation
+          $code = $LASTEXITCODE
           Write-Host $result
-          if ($LASTEXITCODE -ne 0) { Write-Host "BLOCKED: Windows Defender flagged binary!"; exit 1 }
-          Write-Host "=== Windows Defender: clean ==="
+          # MpCmdRun -Scan exit codes: 0 = clean, 2 = threat found. Any OTHER non-zero
+          # means the scan engine could not run at all (e.g. hr=0x800106ba: the Defender
+          # antimalware service is unavailable on the runner) — that is NOT a detection.
+          # Fail soft on an engine failure so a transient runner-side AV outage can't
+          # false-fail a release; only a real detection (exit 2) hard-blocks.
+          if ($code -eq 2) {
+            Write-Host "BLOCKED: Windows Defender flagged binary!"; exit 1
+          } elseif ($code -ne 0) {
+            Write-Host "::warning::Windows Defender scan could not run (exit $code) - skipping AV gate on this runner"
+          } else {
+            Write-Host "=== Windows Defender: clean ==="
+          }
 
   smoke-linux-portable:
+    needs: setup-matrix
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            runner: ubuntu-latest
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-        variant: [standard, ui]
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.portable) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -219,7 +314,7 @@ jobs:
     timeout-minutes: 10
     continue-on-error: true
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Build Glama image and verify MCP introspection
         run: bash pkg/glama/verify.sh
       - name: Test homebrew installation

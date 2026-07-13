@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "discover/discover.h" /* cbm_ignored_file_t (#963) */
+
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
@@ -63,6 +65,9 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p);
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
 
+/* Override the derived project name with a sanitized user-provided label. */
+bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
+
 /* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST). */
 int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
 
@@ -75,6 +80,51 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
 /* Committed node/edge counts captured at dump time (-1 when dump did not run).
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
+
+/* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
+
+/* One source file that was skipped during indexing. All strings are owned by
+ * the pipeline (copied on record, freed in cbm_pipeline_free). A skip is the
+ * expected, handled outcome of a bad/oversized file — indexing continues and
+ * the run still reports status "indexed"; these are surfaced (not errors that
+ * fail the run) via MCP `skipped[]` / the CLI / a per-run logfile. */
+typedef struct {
+    char *path;   /* repo-relative path of the skipped file */
+    char *reason; /* human-readable cause (e.g. "oversized (712 MB > 512 MB)",
+                   * "parse timeout", "read failed"). For phase "parse_partial"
+                   * this carries the 1-based line-range list ("12-40,88-90")
+                   * of the unparseable regions. */
+    char *phase;  /* "read" | "extract" | "oversized" | "parse_partial".
+                   * "parse_partial" (#963) is NOT a skip: the file WAS indexed
+                   * but contains tree-sitter ERROR/MISSING regions whose
+                   * constructs are absent from the graph (best-effort signal —
+                   * absence of the flag is NOT a completeness guarantee). The
+                   * MCP layer reports it separately from skipped[]. "cross_lsp"
+                   * is a RESERVED phase string for Track C's crash-attribution
+                   * signal and is intentionally NOT emitted today (the
+                   * cross-LSP passes are best-effort/void with no genuine
+                   * per-file failure). */
+} cbm_file_error_t;
+
+/* Record a skipped file. path/reason/phase are copied. NULL-safe on p.
+ *
+ * NOT thread-safe: call it from the sequential extraction pass, or from the
+ * parallel merge step (never from inside a parallel worker — workers collect
+ * into per-worker lists and merge sequentially). */
+void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char *reason,
+                                 const char *phase);
+
+/* Borrowed accessor for the recorded skips (owned by the pipeline, valid until
+ * cbm_pipeline_free()). out and count are set to NULL and 0 when p is NULL or
+ * nothing was skipped. Do not free. */
+void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count);
+
+/* Borrowed accessor for the individually-ignored files captured during
+ * discovery (#963 "purposely not indexed" — by design, not failures). count
+ * is the stored (capped) length, total the uncapped number seen. Do not
+ * free. */
+void cbm_pipeline_get_ignored(const cbm_pipeline_t *p, cbm_ignored_file_t **out, int *count,
+                              int *total);
 
 /* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
 
@@ -99,6 +149,12 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 
 /* Module QN: project.dir.parts (no name). Caller must free(). */
 char *cbm_pipeline_fqn_module(const char *project, const char *rel_path);
+
+/* Language-aware module QN. When `module_is_dir` is true (Java/Go package
+ * semantics) the module is derived from the CONTAINING DIRECTORY (the filename
+ * stem is dropped), so it agrees with the extraction-side def QNs; when false
+ * it is exactly cbm_pipeline_fqn_module(). Caller must free(). */
+char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir);
 
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
@@ -183,6 +239,14 @@ bool cbm_perl_is_builtin(const char *name);
  * matches are kept. Pure; unit-tested in test_registry.c. */
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
+
+/* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
+ * drop (#592/#606): true only for TS/JS, only for a member call with a
+ * non-this/super receiver (is_method), and only when the match used a weak
+ * short-name strategy (suffix_match / unique_name / field_type_hint / fuzzy).
+ * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

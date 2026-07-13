@@ -44,6 +44,19 @@ typedef struct {
     const char *enclosing_func_qn;
     const char *enclosing_class_qn; // for implicit `this` resolution
     const char *module_qn;
+    size_t module_qn_len; // cached strlen(module_qn); for stack-buffer QN building
+
+    // Negative-lookup memo for c_lookup_member_depth (depth==0 misses only).
+    // Open-addressing uint64 hash SET; 0 is the empty-slot sentinel. Populated
+    // ONLY when the Tier-2 registry is shared+read-only (registry_shared), where
+    // the module-prefix/base-class/short-name cascades are pure, stable functions
+    // of (type_qn, registry) — so a recorded miss can never turn into a hit. Lets
+    // the hot resolve path skip the sprintf("%s.%s") strlen storm + the O(type_count)
+    // short-name scan on repeated misses of the same (type_qn, member). malloc-owned;
+    // freed at end of c_lsp_process_file.
+    uint64_t *neg_memo;
+    int neg_memo_cap;   // power-of-two; 0 until first insert
+    int neg_memo_count; // live entries (grow by rehash at 70% load)
 
     // Output
     CBMResolvedCallArray *resolved_calls;

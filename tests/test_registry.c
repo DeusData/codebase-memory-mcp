@@ -367,6 +367,25 @@ TEST(resolve_import_map_bare_function) {
     PASS();
 }
 
+/* Aliased bare import (`from m import f as g`, called as g()). The import-map
+ * value is the full symbol QN (IMPORTS edge targets the function node), and
+ * the callee at the site is the alias g — NOT f. Resolution must return the
+ * symbol directly instead of appending the alias (which yields m.f.g → miss).
+ * Regression for #875. */
+TEST(resolve_import_map_bare_alias) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "scan_bash", "proj.security_scan.scan_bash", "Function");
+    /* Import map: alias "_scan_bash" → FULL SYMBOL QN (not the module). */
+    const char *keys[] = {"_scan_bash"};
+    const char *vals[] = {"proj.security_scan.scan_bash"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "_scan_bash", "proj.hooks.pre_tool", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.security_scan.scan_bash");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_unique_name) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "UniqueFunc", "proj.deep.path.UniqueFunc", "Function");
@@ -742,7 +761,71 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+TEST(tsjs_suppress_drops_weak_method_matches) {
+    /* #592/#606: a TS/JS member call whose receiver the LSP could not type, that
+     * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
+     * The strategies that actually reach the guards are the registry's
+     * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
+     * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
+     * resolvers today) so a future wiring cannot silently reintroduce it. */
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "fuzzy"));
+    PASS();
+}
+
+TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
+    /* Keep every receiver-/import-aware strategy. Because the PARALLEL resolver
+     * runs lsp_* strategies through this same guard variable, an explicit
+     * drop-list must never touch them — asserting the lsp_* keeps here is the
+     * regression guard for the "kills lsp edges" failure mode. The keep set
+     * enumerates the resolver's non-weak strategies: registry
+     * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
+     * {callee_suffix, service_pattern}, and lsp_*. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "same_module"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_method"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_local"));
+    /* A bare call (is_method=false) is a free-function call → never suppressed. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "suffix_match"));
+    /* Non-TS/JS languages are never affected. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(false, true, "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, NULL));
+    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, ""));
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
+
+/* Method call THROUGH an imported symbol that is itself an indexed node
+ * (`from m import sig; sig.send()`). The import-map value is the symbol QN
+ * and the callee carries a suffix — resolution must return symbol.send, NOT
+ * the bare symbol node. The #979 direct-hit early return swallowed the
+ * suffix whenever the base symbol existed as an exact node, degrading
+ * django-scale graphs by ~11K CALLS/TESTS edges (e.g. every
+ * `user_logged_in.send(...)` bound to the signal VARIABLE instead of
+ * Signal.send). Regression guard for #1000. */
+TEST(resolve_import_map_alias_with_suffix_hits_method) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "user_logged_in", "proj.auth.signals.user_logged_in", "Variable");
+    cbm_registry_add(r, "send", "proj.auth.signals.user_logged_in.send", "Method");
+    const char *keys[] = {"user_logged_in"};
+    const char *vals[] = {"proj.auth.signals.user_logged_in"};
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "user_logged_in.send", "proj.auth.views", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.auth.signals.user_logged_in.send");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+    cbm_registry_free(r);
+    PASS();
+}
 
 SUITE(registry) {
     /* FQN */
@@ -776,6 +859,8 @@ SUITE(registry) {
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
+    RUN_TEST(resolve_import_map_bare_alias);
+    RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
@@ -808,4 +893,6 @@ SUITE(registry) {
     RUN_TEST(perl_builtin_set_rejects_project_subs);
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
+    RUN_TEST(tsjs_suppress_drops_weak_method_matches);
+    RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
 }

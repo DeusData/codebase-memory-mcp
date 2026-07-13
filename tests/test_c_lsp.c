@@ -20,6 +20,13 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "lsp/c_lsp.h"
+#include "lsp/py_lsp.h"
+#include "lsp/cs_lsp.h"
+#include "lsp/ts_lsp.h"
+#include "lsp/go_lsp.h"
+#include "lsp/type_registry.h"
+#include "arena.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -15182,9 +15189,328 @@ TEST(clsp_easy_win_sfinaeconditional_return) {
     PASS();
 }
 
+/* Reproduce-first guard for the Linux-kernel full-index O(n^2) hang.
+ *
+ * In `full` mode the pipeline builds ONE project-wide C cross-registry
+ * (cbm_c_build_cross_registry), FINALIZES it (O(1) hash lookups), then shares it
+ * READ-ONLY across the parallel resolve workers (ctx.registry_shared = true).
+ * cbm_run_c_lsp_cross_with_registry must therefore NOT mutate it.
+ *
+ * Bug: c_lsp.c:4323 (and 4628/4201/4426) ignore registry_shared and add_func into
+ * the shared, already-finalized registry. Each post-finalize add lands in a tail
+ * the hash index does not cover, so lookup_func_self/lookup_method_self linear-scan
+ * that ever-growing tail on every lookup (type_registry.c:280-286, 186-195). Across
+ * 89k kernel files doing millions of lookups => O(files * defs) (the >6-min hang),
+ * plus an 11-thread heap race (c_lsp.c:4146-4152 warns of the SIGSEGV).
+ *
+ * INVARIANT (green <=> fixed): resolve leaves the finalized shared registry's
+ * func_count/type_count unchanged. RED on the unguarded code; GREEN once every
+ * mutation site honors !registry_shared. */
+TEST(clsp_tier2_shared_registry_readonly_c) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    /* stdlib-only project registry, finalized inside the builder */
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int funcs_before = reg->func_count;
+    int types_before = reg->type_count;
+    /* A C translation unit defining functions absent from the shared registry; a
+     * correct read-only resolve must not register them into it. */
+    const char *src = "struct Node { int v; };\n"
+                      "struct Node *make_node(int v);\n"
+                      "int helper(int x) { return x + 1; }\n"
+                      "int caller(void) { return helper(make_node(7)->v); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/false, reg, /*include_paths=*/NULL,
+                                      /*include_ns_qns=*/NULL, /*include_count=*/0,
+                                      /*cached_tree=*/NULL, &out);
+    ASSERT_EQ(reg->func_count, funcs_before);
+    ASSERT_EQ(reg->type_count, types_before);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Direct guard for the finalize-time short-name / embedded-type indexes and their
+ * iterators (type_registry.c), which the Rust trait/free-func fast paths rely on.
+ * Verifies: embed index yields exactly the types whose embedded_types carry a
+ * matching BARE name, in ascending registry order, deduped when a type lists the
+ * same bare twice; free-func index yields only free funcs (receiver_type==NULL) with
+ * the given short_name, not methods. */
+TEST(registry_short_name_indexes) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, &arena);
+
+    /* type 0: Trait (no embeds). type 1: A impl "pkg.Trait". type 2: B impl bare
+     * "Trait" AND a second embed also bare "Trait" (dedup case). type 3: C impl
+     * "pkg.Other". */
+    const char *a_emb[] = {"pkg.Trait", NULL};
+    const char *b_emb[] = {"other.Trait", "misc.Trait", NULL}; /* two entries, bare "Trait" */
+    const char *c_emb[] = {"pkg.Other", NULL};
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.A";
+    t.short_name = "A";
+    t.embedded_types = a_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.B";
+    t.short_name = "B";
+    t.embedded_types = b_emb;
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.C";
+    t.short_name = "C";
+    t.embedded_types = c_emb;
+    cbm_registry_add_type(&reg, t);
+
+    /* free func "helper" (x2 — different QNs), method "M.helper", free func "other". */
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.helper";
+    f.short_name = "helper";
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.sub.helper";
+    f.short_name = "helper";
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.M.helper";
+    f.short_name = "helper";
+    f.receiver_type = "pkg.M"; /* method — must NOT appear in the free-func index */
+    cbm_registry_add_func(&reg, f);
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.other";
+    f.short_name = "other";
+    cbm_registry_add_func(&reg, f);
+
+    cbm_registry_finalize(&reg);
+
+    /* Embed index for bare "Trait": types 1 (A) then 2 (B), ascending, B once. */
+    CBMTypeEmbedIter it;
+    cbm_registry_types_by_embedded_bare(&reg, "Trait", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 1);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 2);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Bare "Other": only type 3 (C). */
+    cbm_registry_types_by_embedded_bare(&reg, "Other", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), 3);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Bare with no implementers: empty. */
+    cbm_registry_types_by_embedded_bare(&reg, "Nope", &it);
+    ASSERT_EQ(cbm_type_embed_iter_next(&it), -1);
+
+    /* Free-func index for "helper": func 0 then 1 (ascending), NOT the method (2). */
+    CBMFreeFuncIter fit;
+    cbm_registry_free_funcs_by_short_name(&reg, "helper", &fit);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 1);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    /* Free-func "other": only func 3. */
+    cbm_registry_free_funcs_by_short_name(&reg, "other", &fit);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), 3);
+    ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* C++ sibling guard: the same shared-registry read-only invariant for the
+ * C++-only mutation sites — method registration (c_lsp.c:4760), template
+ * type-param scan (4558), default-arg min_params scan (4333). RED while those
+ * sites ignore registry_shared; GREEN once guarded. (Latent O(n^2)+race for large
+ * C++ codebases like LLVM/bitcoin — not the kernel, which is C.) */
+TEST(clsp_tier2_shared_registry_readonly_cpp) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int funcs_before = reg->func_count;
+    int types_before = reg->type_count;
+    const char *src = "template <typename T> struct Holder { T get(); };\n"
+                      "struct Box { int unwrap(); };\n"
+                      "int Box::unwrap() { return 0; }\n"
+                      "int with_default(int a, int b = 2) { return a + b; }\n"
+                      "int caller(Box *b) { return b->unwrap() + with_default(1); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, reg, /*include_paths=*/NULL,
+                                      /*include_ns_qns=*/NULL, /*include_count=*/0,
+                                      /*cached_tree=*/NULL, &out);
+    ASSERT_EQ(reg->func_count, funcs_before);
+    ASSERT_EQ(reg->type_count, types_before);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Cross-language check of the same Tier-2 shared-registry read-only invariant for
+ * the other languages that build a shared cross-registry (py, c#, ts, go). The
+ * registry-level seal (type_registry.c: add_func/_type no-op when reg->read_only)
+ * guards all of them at one chokepoint. Each test: build+finalize the shared
+ * registry, resolve a source, assert func_count/type_count are unchanged. (TS
+ * deliberately mutates a per-file OVERLAY chained to the base — the base must
+ * still be untouched.) */
+TEST(seal_py_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "def helper(x):\n    return x + 1\n\ndef caller():\n    return helper(1)\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Sibling of seal_py_shared_registry_readonly at the FIELD-ARRAY granularity.
+ *
+ * The count-based seal tests only catch mutations routed through
+ * cbm_registry_add_func/_type (which the read_only seal no-ops). But
+ * py_register_instance_field (py_lsp.c:495), invoked from the `self.x = ...`
+ * assignment handler (py_lsp.c:1616), writes the registered type's
+ * field_names/field_types arrays DIRECTLY (py_lsp.c:517 in-place; :543-544 pointer
+ * reassign) with NO read_only guard — bypassing the seal. In the fused parallel
+ * resolve path pass_parallel.c:2726 hands EVERY worker the one shared, finalized,
+ * read_only registry (pipeline.c:901 → cbm_py_build_cross_registry), so this is a
+ * cross-thread data race AND a cross-file dangling pointer (the appended arrays are
+ * allocated in the per-file resolve arena, freed when that file completes) into a
+ * sealed registry. func_count/type_count stay put, which is exactly why the sibling
+ * test above stays green while the bug persists.
+ *
+ * INVARIANT (green <=> fixed): resolving a `self.x = ...` method body against the
+ * sealed shared registry leaves the class's field arrays byte-identical. RED today
+ * (new field "x" is appended → field_names pointer + count both change); GREEN once
+ * py_register_instance_field honors ctx->registry->read_only. */
+TEST(seal_py_shared_registry_readonly_fields) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+
+    /* One Python class Foo (+ method m) so the shared registry holds a type
+     * "test.mod.Foo" that resolve's self.x= handler will target. */
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.mod.Foo";
+    defs[0].short_name = "Foo";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "test.mod.Foo.m";
+    defs[1].short_name = "m";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.Foo";
+    defs[1].def_module_qn = "test.mod";
+    defs[1].lang = CBM_LANG_PYTHON;
+
+    CBMTypeRegistry *reg = cbm_py_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    /* Snapshot Foo's field arrays before resolve. The entry is stable across
+     * resolve: read_only blocks add_type, so reg->types is never reallocated. */
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, "test.mod.Foo");
+    ASSERT_NOT_NULL(rt);
+    const char **names_before = rt->field_names;
+    int count_before = 0;
+    if (rt->field_names)
+        while (rt->field_names[count_before])
+            count_before++;
+
+    /* A method assigning a NEW instance field on self → the buggy code appends
+     * "x" directly into the sealed registry entry. */
+    const char *src = "class Foo:\n"
+                      "    def m(self):\n"
+                      "        self.x = 1\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL, 0,
+                                       NULL, &out);
+
+    /* The sealed registry entry must be untouched by resolve. */
+    int count_after = 0;
+    if (rt->field_names)
+        while (rt->field_names[count_after])
+            count_after++;
+    ASSERT_EQ(count_after, count_before);
+    ASSERT_TRUE(rt->field_names == names_before);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(seal_cs_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_cs_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "namespace N { class Box { int Unwrap() { return 0; }\n"
+                      "  int Caller() { return Unwrap(); } } }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_cs_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, 0,
+                                       NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(seal_ts_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_ts_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "class Box { unwrap(): number { return 0; } }\n"
+                      "function caller(b: Box): number { return b.unwrap(); }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_ts_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", false, false,
+                                       false, reg, NULL, 0, NULL, NULL, 0, NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(seal_go_shared_registry_readonly) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *reg = cbm_go_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(reg);
+    int fb = reg->func_count, tb = reg->type_count;
+    const char *src = "package main\nfunc helper(x int) int { return x + 1 }\n"
+                      "func caller() int { return helper(1) }\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_go_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out);
+    ASSERT_EQ(reg->func_count, fb);
+    ASSERT_EQ(reg->type_count, tb);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 SUITE(c_lsp) {
+    RUN_TEST(clsp_tier2_shared_registry_readonly_c);
+    RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
+    RUN_TEST(seal_py_shared_registry_readonly);
+    RUN_TEST(seal_py_shared_registry_readonly_fields);
+    RUN_TEST(seal_cs_shared_registry_readonly);
+    RUN_TEST(seal_ts_shared_registry_readonly);
+    RUN_TEST(seal_go_shared_registry_readonly);
+    RUN_TEST(registry_short_name_indexes);
     RUN_TEST(clsp_simple_var_decl);
     RUN_TEST(clsp_pointer_arrow);
     RUN_TEST(clsp_dot_access);

@@ -143,7 +143,7 @@ static cbm_store_t *setup_arch_test_store(void) {
 TEST(arch_get_all) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, 0, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, NULL, 0, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.package_count > 0);
@@ -162,7 +162,7 @@ TEST(arch_entry_points_exclude_tests) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"entry_points"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     for (int i = 0; i < info.entry_point_count; i++) {
         ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
@@ -179,7 +179,7 @@ TEST(arch_hotspots_exclude_tests) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     for (int i = 0; i < info.hotspot_count; i++) {
         ASSERT_TRUE(strstr(info.hotspots[i].name, "Test") == NULL);
@@ -194,7 +194,7 @@ TEST(arch_specific_aspects) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     const char *aspects[] = {"languages", "hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 2, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 2, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.hotspot_count > 0);
@@ -208,6 +208,94 @@ TEST(arch_specific_aspects) {
     PASS();
 }
 
+TEST(arch_path_scoping) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "pscope", "/tmp/pscope"), CBM_STORE_OK);
+
+    cbm_node_t f1 = {.project = "pscope",
+                     .label = "File",
+                     .name = "a.go",
+                     .qualified_name = "pscope.apps.foo.a.go",
+                     .file_path = "apps/foo/a.go"};
+    cbm_node_t f2 = {.project = "pscope",
+                     .label = "File",
+                     .name = "b.go",
+                     .qualified_name = "pscope.other.b.go",
+                     .file_path = "other/b.go"};
+    cbm_store_upsert_node(s, &f1);
+    cbm_store_upsert_node(s, &f2);
+
+    cbm_node_t fn_foo = {.project = "pscope",
+                         .label = "Function",
+                         .name = "Foo",
+                         .qualified_name = "pscope.apps.foo.Foo",
+                         .file_path = "apps/foo/a.go"};
+    cbm_node_t fn_other = {.project = "pscope",
+                           .label = "Function",
+                           .name = "Bar",
+                           .qualified_name = "pscope.other.Bar",
+                           .file_path = "other/b.go"};
+    cbm_store_upsert_node(s, &fn_foo);
+    cbm_store_upsert_node(s, &fn_other);
+
+    const char *aspects[] = {"languages", "packages"};
+    cbm_architecture_info_t whole;
+    memset(&whole, 0, sizeof(whole));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", NULL, aspects, 2, &whole), CBM_STORE_OK);
+
+    cbm_architecture_info_t scoped;
+    memset(&scoped, 0, sizeof(scoped));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo", aspects, 2, &scoped),
+              CBM_STORE_OK);
+
+    int whole_go = 0;
+    int scoped_go = 0;
+    for (int i = 0; i < whole.language_count; i++) {
+        if (strcmp(whole.languages[i].language, "Go") == 0) {
+            whole_go = whole.languages[i].file_count;
+        }
+    }
+    for (int i = 0; i < scoped.language_count; i++) {
+        if (strcmp(scoped.languages[i].language, "Go") == 0) {
+            scoped_go = scoped.languages[i].file_count;
+        }
+    }
+    ASSERT_TRUE(whole_go > scoped_go);
+    ASSERT_EQ(scoped_go, 1);
+
+    int whole_pkg_nodes = 0;
+    for (int i = 0; i < whole.package_count; i++) {
+        whole_pkg_nodes += whole.packages[i].node_count;
+    }
+    int scoped_pkg_nodes = 0;
+    for (int i = 0; i < scoped.package_count; i++) {
+        scoped_pkg_nodes += scoped.packages[i].node_count;
+    }
+    ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
+    ASSERT_EQ(scoped_pkg_nodes, 1);
+
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+
+    cbm_architecture_info_t scoped_slash;
+    memset(&scoped_slash, 0, sizeof(scoped_slash));
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo/", aspects, 2, &scoped_slash),
+              CBM_STORE_OK);
+    int slash_go = 0;
+    for (int i = 0; i < scoped_slash.language_count; i++) {
+        if (strcmp(scoped_slash.languages[i].language, "Go") == 0) {
+            slash_go = scoped_slash.languages[i].file_count;
+        }
+    }
+    ASSERT_EQ(slash_go, scoped_go);
+
+    cbm_store_architecture_free(&scoped_slash);
+    cbm_store_architecture_free(&whole);
+    cbm_store_architecture_free(&scoped);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_empty_project) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -215,7 +303,7 @@ TEST(arch_empty_project) {
 
     cbm_architecture_info_t info;
     const char *aspects[] = {"all"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "empty", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "empty", NULL, aspects, 1, &info), CBM_STORE_OK);
     /* All should be empty but no errors */
 
     cbm_store_architecture_free(&info);
@@ -228,7 +316,7 @@ TEST(arch_languages) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"languages"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     /* Check Go=3, Python=1, JavaScript=1 */
     int go_count = 0, py_count = 0, js_count = 0;
@@ -254,7 +342,7 @@ TEST(arch_routes) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"routes"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_EQ(info.route_count, 1);
     ASSERT_STR_EQ(info.routes[0].method, "POST");
@@ -271,7 +359,7 @@ TEST(arch_hotspots) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.hotspot_count > 0);
     /* ProcessOrder should be a hotspot (called by HandleRequest) */
@@ -295,7 +383,7 @@ TEST(arch_boundaries) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.boundary_count > 0);
     /* server → handler and handler → service should be present */
@@ -361,7 +449,7 @@ static double timed_boundaries_ms(int n_nodes, int n_edges, int n_pkgs) {
     const char *aspects[] = {"boundaries"};
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = cbm_store_get_architecture(s, "perf", aspects, 1, &info);
+    int rc = cbm_store_get_architecture(s, "perf", NULL, aspects, 1, &info);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms =
         (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
@@ -409,7 +497,7 @@ TEST(arch_layers) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"layers"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.layer_count > 0);
     /* Handler package has routes, should be "api" */
@@ -429,7 +517,7 @@ TEST(arch_file_tree) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"file_tree"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     ASSERT_TRUE(info.file_tree_count > 0);
     /* Check that entries have valid types */
@@ -448,7 +536,7 @@ TEST(arch_clusters) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
 
     /* With 5 functions and 4 edges, Louvain should find at least 1 cluster */
     if (info.cluster_count == 0) {
@@ -1106,7 +1194,7 @@ TEST(arch_clusters_basic) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
     ASSERT_TRUE(info.cluster_count >= 2); /* two dense communities */
     for (int i = 0; i < info.cluster_count; i++) {
         ASSERT_TRUE(info.clusters[i].members >= 2);
@@ -1279,6 +1367,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_entry_points_exclude_tests);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
+    RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_routes);

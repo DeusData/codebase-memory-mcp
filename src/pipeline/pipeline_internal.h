@@ -16,6 +16,7 @@
 #include "cbm.h"
 #include "lsp/go_lsp.h" /* CBMLSPDef for cbm_parallel_resolve cross-LSP inputs */
 #include <stdatomic.h>
+#include <string.h>
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
@@ -32,6 +33,19 @@
  * canonicalize to "/u/{}"). The result never exceeds the input length, so
  * out_sz >= strlen(in) + 1 always suffices. Returns out. */
 const char *cbm_route_canon_path(const char *in, char *out, size_t out_sz);
+
+/* True when a graph node is a structural directory container (Folder/Project)
+ * rather than a code node. In a directory-based-module language (Java/Go, see
+ * cbm_lang_module_is_dir) a file's module QN equals its directory QN, so an
+ * enclosing-scope lookup for a CLASS-LEVEL usage/call (enclosing_func_qn ==
+ * module_qn) resolves to the ONE Folder/Project node shared by every file in
+ * that package. Sourcing an edge there conflates all same-package files into a
+ * single source node with an arbitrary file_path (#787). Source-node finders
+ * must treat such a hit as a miss and fall back to the per-file File node. */
+static inline bool cbm_pipeline_node_is_dir_container(const cbm_gbuf_node_t *node) {
+    return node && node->label &&
+           (strcmp(node->label, "Folder") == 0 || strcmp(node->label, "Project") == 0);
+}
 
 /* Time unit conversions */
 #define CBM_NS_PER_SEC 1000000000LL
@@ -65,6 +79,10 @@ typedef struct {
     cbm_gbuf_t *gbuf;         /* owned by pipeline */
     cbm_registry_t *registry; /* owned by pipeline */
     atomic_int *cancelled;    /* pointer to pipeline's cancelled flag */
+    cbm_pipeline_t *pipeline; /* back-pointer for recording per-file skips
+                               * (Stage 2 / Track B). May be NULL on paths that
+                               * don't record; cbm_pipeline_add_file_error is
+                               * NULL-safe. */
     int mode;                 /* cbm_index_mode_t (0=full, 1=moderate, 2=fast, 3=advanced) */
 
     /* Extraction result cache (sequential pipeline optimization).
@@ -77,7 +95,40 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+
+    /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
+    char **excluded_dirs;
+    int excluded_count;
+
+    /* Sequential cross-LSP registry arena. The lsp_cross pass builds its
+     * shared per-language registries here; resolved_calls entries may BORROW
+     * strings owned by these registries, and the later calls pass still
+     * reads them — so the arena is OWNED and destroyed by
+     * run_sequential_pipeline AFTER all passes, never by the lsp_cross pass
+     * itself (destroying at pass end was a use-after-free in pass_calls).
+     * Mirrors the parallel path, where cross_lsp_arena outlives the fused
+     * resolve. */
+    CBMArena seq_cross_arena;
+    bool seq_cross_arena_live;
 } cbm_pipeline_ctx_t;
+
+static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
+                                                   int excluded_count) {
+    if (!rel_path || rel_path[0] == '\0' || !excluded_dirs || excluded_count <= 0) {
+        return 0;
+    }
+    for (int i = 0; i < excluded_count; i++) {
+        const char *excluded = excluded_dirs[i];
+        if (!excluded || excluded[0] == '\0') {
+            continue;
+        }
+        size_t n = strlen(excluded);
+        if (strncmp(rel_path, excluded, n) == 0 && (rel_path[n] == '\0' || rel_path[n] == '/')) {
+            return SKIP_ONE;
+        }
+    }
+    return 0;
+}
 
 /* Get the current pipeline's package map (NULL if none). */
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
@@ -127,9 +178,11 @@ CBMHashTable *cbm_pkgmap_build(cbm_pkg_entries_t *worker_entries, int worker_cou
                                const char *project_name);
 
 /* Build pkgmap by reading manifest files from the files array (sequential path). */
-int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries);
+int cbm_pkgmap_scan_repo(const char *repo_path, cbm_pkg_entries_t *entries, char **excluded_dirs,
+                         int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_repo(const char *repo_path, const cbm_file_info_t *files,
-                                         int file_count, const char *project_name);
+                                         int file_count, const char *project_name,
+                                         char **excluded_dirs, int excluded_count);
 CBMHashTable *cbm_pkgmap_build_from_files(const cbm_file_info_t *files, int file_count,
                                           const char *project_name);
 
@@ -402,6 +455,21 @@ char *cbm_infra_qn(const char *project_name, const char *rel_path, const char *i
  * Each worker creates nodes in a per-worker gbuf, then merges into ctx->gbuf.
  * Caches CBMFileResult* in result_cache[file_idx] for reuse in Phase 3B/4.
  * shared_ids provides globally unique node/edge IDs across workers. */
+
+/* Source-retention tuning for cbm_parallel_extract_ex. Zero-valued byte caps
+ * mean "use the derived default" (RAM-fraction total, clamped to an absolute
+ * ceiling; modest per-file cap); CBM_RETAIN_TOTAL_MB / CBM_RETAIN_PER_FILE_MB
+ * override those. retain_sources_set=false keeps the default retain policy. */
+typedef struct {
+    bool retain_sources;
+    bool retain_sources_set; /* false keeps the default retain_sources policy */
+    size_t retain_total_budget_bytes;
+    size_t retain_per_file_max_bytes;
+} cbm_parallel_extract_opts_t;
+
+int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                            CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
+                            int worker_count, const cbm_parallel_extract_opts_t *opts);
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                          CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                          int worker_count);
@@ -526,8 +594,14 @@ typedef struct {
 /* Scan a project directory for environment variable assignments with URL values.
  * Walks the filesystem, scans Dockerfiles, shell scripts, .env, YAML, TOML,
  * Terraform, and .properties files. Filters out secrets.
- * Returns number of bindings written to out (up to max_out). */
+ * Returns number of bindings written to out (up to max_out).
+ * NOTE: this walker currently has no production callers — it is exercised
+ * only by tests. The _excluded variant honors discovery exclusions for
+ * consistency with the pkgmap/path-alias walks (#792); the plain variant
+ * scans unexcluded (NULL exclusion list). */
 int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out);
+int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
+                                       char **excluded_dirs, int excluded_count);
 
 /* ── Incremental pipeline (pipeline_incremental.c) ───────────────── */
 
@@ -550,5 +624,12 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges);
  * Exposed for testing. */
 bool extract_grpc_service_method(const char *callee, char *service, size_t srv_sz, char *method,
                                  size_t meth_sz);
+
+/* Extraction back-pressure observability (pass_parallel.c): nap-cycle counter
+ * for the over-budget collect+nap gate. Test hook — asserts the gate stops
+ * re-paying the nap tax once a full cycle failed to reclaim under budget
+ * (futile: the resident floor, not transients, holds the memory). */
+long cbm_pp_bp_nap_cycles(void);
+void cbm_pp_bp_nap_cycles_reset(void);
 
 #endif /* CBM_PIPELINE_INTERNAL_H */

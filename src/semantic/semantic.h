@@ -27,6 +27,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "semantic/rotsq.h"
+
 /* ── Configuration ───────────────────────────────────────────────── */
 
 /* Random Indexing dimension. 256 is sufficient for <500K functions. */
@@ -134,10 +136,15 @@ typedef struct {
     int tfidf_len;
 
     /* Dense vectors for RI, API, Type, Decorator. */
-    cbm_sem_vec_t ri_vec;
-    cbm_sem_vec_t api_vec;
-    cbm_sem_vec_t type_vec;
-    cbm_sem_vec_t deco_vec;
+    /* Quantized semantic vectors (rotated 4-bit scalar quantization — see
+     * rotsq.h). The dense 768-float versions exist only transiently in the
+     * build workers: 4 x 3 KB resident floats per function were ~9.4 GB on
+     * the linux kernel; the codes are ~0.5 KB each. Scoring uses the exact
+     * code-expansion inner-product estimator (deterministic). */
+    cbm_rsq_code_t ri_code;
+    cbm_rsq_code_t api_code;
+    cbm_rsq_code_t type_code;
+    cbm_rsq_code_t deco_code;
 
     /* AST profile as float vector (decoded from "sp" property). */
     float struct_profile[CBM_SEM_AST_PROFILE_DIMS];

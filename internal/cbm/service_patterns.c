@@ -782,6 +782,10 @@ void cbm_service_patterns_init(void) {
     /* No-op — tables are static const */
 }
 
+bool cbm_service_pattern_is_global_fetch(const char *callee_name) {
+    return callee_name != NULL && strcmp(callee_name, "fetch") == 0;
+}
+
 cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn) {
     if (!resolved_qn || !resolved_qn[0]) {
         return CBM_SVC_NONE;

@@ -146,6 +146,48 @@ static void process_kustomize_pair(CBMExtractCtx *ctx, TSNode pair) {
     emit_kustomize_sequence(ctx, val_node, key_text);
 }
 
+// Forward declaration: defined with the K8s-manifest helpers below.
+static TSNode unwrap_pair_value(TSNode pair);
+
+// Emit a "Class" def named after the document's `kind` scalar. A kustomization
+// file has no metadata.name, so the def name is the bare kind ("Kustomization").
+// Mirrors the K8s manifest kind-def so Kustomize resources are also discoverable.
+static void emit_kustomize_kind_def(CBMExtractCtx *ctx, TSNode mapping) {
+    CBMArena *a = ctx->arena;
+    uint32_t pair_n = ts_node_child_count(mapping);
+    for (uint32_t pi = 0; pi < pair_n; pi++) {
+        TSNode pair = ts_node_child(mapping, pi);
+        if (strcmp(ts_node_type(pair), "block_mapping_pair") != 0) {
+            continue;
+        }
+        TSNode key_node = ts_node_named_child(pair, 0);
+        if (ts_node_is_null(key_node)) {
+            continue;
+        }
+        const char *key = get_scalar_text(a, key_node, ctx->source);
+        if (!key || strcmp(key, "kind") != 0) {
+            continue;
+        }
+        TSNode val_node = unwrap_pair_value(pair);
+        if (ts_node_is_null(val_node)) {
+            continue;
+        }
+        const char *kind = get_scalar_text(a, val_node, ctx->source);
+        if (!kind || !kind[0]) {
+            continue;
+        }
+        CBMDefinition def = {0};
+        def.name = cbm_arena_strdup(a, kind);
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->module_qn, kind);
+        def.label = cbm_arena_strdup(a, "Resource");
+        def.file_path = ctx->rel_path;
+        def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;
+        def.end_line = ts_node_end_point(mapping).row + TS_LINE_OFFSET;
+        cbm_defs_push(&ctx->result->defs, a, def);
+        return;
+    }
+}
+
 static void extract_kustomize(CBMExtractCtx *ctx) {
     TSNode root = ctx->root;
     uint32_t root_n = ts_node_child_count(root);
@@ -158,6 +200,8 @@ static void extract_kustomize(CBMExtractCtx *ctx) {
         if (ts_node_is_null(mapping)) {
             continue;
         }
+
+        emit_kustomize_kind_def(ctx, mapping);
 
         uint32_t pair_n = ts_node_child_count(mapping);
         for (uint32_t pi = 0; pi < pair_n; pi++) {
@@ -290,6 +334,9 @@ static void extract_k8s_manifest(CBMExtractCtx *ctx) {
         CBMDefinition def = {0};
         def.name = cbm_arena_strdup(a, def_name);
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->module_qn, def_name);
+        // "Resource" is the canonical def label for a K8s resource kind. It is a
+        // valid graph label and is what the K8s pipeline pass (pass_k8s.c) filters
+        // on to upsert Resource nodes and emit INFRA_MAPS edges.
         def.label = cbm_arena_strdup(a, "Resource");
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(mapping).row + TS_LINE_OFFSET;

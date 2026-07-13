@@ -42,6 +42,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Minimal Kotlin universal builtins as real graph nodes (kt_builtins_inject_defs).
+ * Amalgamation-included (see lsp_all.c); mirror of py_builtins.c. */
+#include "kotlin_builtins.c"
+
 #define KT_EVAL_MAX_DEPTH 32
 #define KT_IMPORT_INITIAL_CAP 16
 
@@ -58,7 +62,22 @@
 
 /* ── forward declarations ─────────────────────────────────────────── */
 
-static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node);
+static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    kt_resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void kt_process_class_decl(KotlinLSPContext *ctx, TSNode node);
 static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_companion,
                                    const char *outer_class_qn);
@@ -1421,6 +1440,7 @@ static void kt_process_object_decl(KotlinLSPContext *ctx, TSNode node, bool is_c
         }
     }
 
+    rt.is_object = true; /* object / companion object → static-like member calls */
     cbm_registry_add_type((CBMTypeRegistry *)ctx->registry, rt);
 
     /* Recurse into body */
@@ -2245,8 +2265,12 @@ static const CBMType *kt_eval_constructor_or_func_call(KotlinLSPContext *ctx, TS
     if (cls_qn && ctx->registry) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cls_qn);
         if (rt) {
-            kt_emit_resolved(ctx, kt_join_dot(ctx->arena, cls_qn, "<init>"), "lsp_kt_constructor",
-                             KT_CONF_CONSTRUCTOR);
+            /* A constructor call `Foo()` resolves to the Foo CLASS node, which the
+             * textual extractor stored; there is no separate `Foo.<init>` graph
+             * node, and the textual call site's callee is the bare class name
+             * `Foo` (not `<init>`). Emitting cls_qn (not cls_qn.<init>) makes the
+             * pipeline join's callee bare-segment match AND resolves the target. */
+            kt_emit_resolved(ctx, cls_qn, "lsp_kt_constructor", KT_CONF_CONSTRUCTOR);
             return cbm_type_named(ctx->arena, cls_qn);
         }
     }
@@ -2423,7 +2447,32 @@ static const CBMType *kt_eval_navigation_expression_type(KotlinLSPContext *ctx, 
         /* Check object-singleton or companion lookup */
         const CBMRegisteredFunc *rf = kotlin_lookup_method(ctx, recv_qn, member_text);
         if (rf && rf->qualified_name) {
-            kt_emit_resolved(ctx, rf->qualified_name, "lsp_kt_method", KT_CONF_METHOD);
+            /* Distinguish an extension function from a member method: a member's
+             * QN nests under the receiver (`<recv_qn>.<member>`), while an
+             * extension `fun Recv.ext()` is a TOP-LEVEL fun whose QN does NOT
+             * nest under recv_qn (only its receiver_type points back).
+             * kotlin_lookup_method matches both, so pick the strategy by QN shape. */
+            size_t recv_len = strlen(recv_qn);
+            bool is_member = (strncmp(rf->qualified_name, recv_qn, recv_len) == 0 &&
+                              rf->qualified_name[recv_len] == '.');
+            const char *strat = "lsp_kt_extension";
+            if (is_member) {
+                /* A member call on an `object`/`companion object` singleton is a
+                 * static dispatch; on a regular class instance it is a method. */
+                const CBMRegisteredType *recv_rt =
+                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
+            }
+            /* A call through the lambda implicit parameter `it` (e.g. inside
+             * `x.let { it.m() }`) is lambda-scoped dispatch, not a plain method. */
+            if (kt_node_is(receiver_node, "identifier") ||
+                kt_node_is(receiver_node, "simple_identifier")) {
+                char *rtext = kt_node_text(ctx, receiver_node);
+                if (rtext && strcmp(rtext, "it") == 0) {
+                    strat = "lsp_kt_lambda_it";
+                }
+            }
+            kt_emit_resolved(ctx, rf->qualified_name, strat, KT_CONF_METHOD);
             if (rf->signature && rf->signature->kind == CBM_TYPE_FUNC &&
                 rf->signature->data.func.return_types && rf->signature->data.func.return_types[0]) {
                 return rf->signature->data.func.return_types[0];
@@ -3140,7 +3189,7 @@ static void kt_process_statement(KotlinLSPContext *ctx, TSNode stmt) {
 /* Generic walker that fires call resolution on every call_expression in
  * a subtree, *without* descending into nested function/class bodies (those
  * are processed separately with their own scope). */
-static void kt_resolve_calls_in_node(KotlinLSPContext *ctx, TSNode node) {
+static void kt_resolve_calls_in_node_inner(KotlinLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(node)) {
         return;
     }
@@ -4076,13 +4125,20 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
         project_name = module_qn;
     }
 
-    /* Initial package_qn is empty — overridden by kotlin_lsp_process_file
-     * when it sees the `package_header` AST node. */
+    /* Initial package_qn is the FS-path module_qn ("<project>.<rel.path>"),
+     * matching the textual extractor's QN prefix so the LSP's caller_qn equals
+     * the call site's enclosing_func_qn (the join keys on an exact caller_qn
+     * match). A source `package_header`, when present, overrides this in
+     * kotlin_lsp_process_file for cross-file import resolution. */
     KotlinLSPContext ctx;
-    kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, "", module_qn, project_name,
-                    /*rel_path=*/NULL, &result->resolved_calls);
+    kotlin_lsp_init(&ctx, arena, use_source, use_source_len, &registry, module_qn, module_qn,
+                    project_name, /*rel_path=*/NULL, &result->resolved_calls);
 
     kotlin_lsp_process_file(&ctx, use_root);
+
+    /* Inject kotlin.Any universal-method nodes (toString/equals/hashCode) so the
+     * lsp_kt_any fallback emitted above has a target node to form a CALLS edge. */
+    kt_builtins_inject_defs(result, arena);
 
     if (patched_tree) {
         ts_tree_delete(patched_tree);
@@ -4095,6 +4151,85 @@ void cbm_run_kotlin_lsp(CBMArena *arena, CBMFileResult *result, const char *sour
  * a call site in another file resolves to the right node. Types and functions
  * keep their full project-qualified QN; functions carry receiver_type so the
  * sole-definer fallback can tell a top-level fun from a method. */
+static const char *kt_cross_builtin_return_qn(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    if (strcmp(name, "String") == 0) {
+        return "kotlin.String";
+    }
+    if (strcmp(name, "Int") == 0 || strcmp(name, "Integer") == 0) {
+        return "kotlin.Int";
+    }
+    if (strcmp(name, "Long") == 0) {
+        return "kotlin.Long";
+    }
+    if (strcmp(name, "Float") == 0) {
+        return "kotlin.Float";
+    }
+    if (strcmp(name, "Double") == 0) {
+        return "kotlin.Double";
+    }
+    if (strcmp(name, "Boolean") == 0 || strcmp(name, "Bool") == 0) {
+        return "kotlin.Boolean";
+    }
+    if (strcmp(name, "Char") == 0 || strcmp(name, "Character") == 0) {
+        return "kotlin.Char";
+    }
+    if (strcmp(name, "Byte") == 0) {
+        return "kotlin.Byte";
+    }
+    if (strcmp(name, "Short") == 0) {
+        return "kotlin.Short";
+    }
+    if (strcmp(name, "Unit") == 0 || strcmp(name, "Void") == 0 || strcmp(name, "void") == 0) {
+        return "kotlin.Unit";
+    }
+    if (strcmp(name, "Any") == 0 || strcmp(name, "Object") == 0) {
+        return "kotlin.Any";
+    }
+    return NULL;
+}
+
+static const CBMType *kt_cross_return_type(CBMArena *arena, const CBMLSPDef *d) {
+    if (!arena || !d || !d->return_types || !d->return_types[0]) {
+        return NULL;
+    }
+    const char *text = d->return_types;
+    const char *bar = strchr(text, '|');
+    const char *first = bar ? cbm_arena_strndup(arena, text, (size_t)(bar - text)) : text;
+    if (!first || !first[0]) {
+        return NULL;
+    }
+    if (!strchr(first, '.')) {
+        const char *builtin = kt_cross_builtin_return_qn(first);
+        if (builtin) {
+            first = builtin;
+        } else if (d->namespace_name && d->namespace_name[0]) {
+            first = kt_join_dot(arena, d->namespace_name, first);
+        }
+    }
+    return cbm_type_named(arena, first);
+}
+
+static const CBMType *kt_cross_func_sig_with_return(CBMArena *arena, const CBMLSPDef *d) {
+    const CBMType *ret = kt_cross_return_type(arena, d);
+    if (!ret || cbm_type_is_unknown(ret)) {
+        return NULL;
+    }
+    const char **empty_pn = (const char **)cbm_arena_alloc(arena, sizeof(*empty_pn));
+    const CBMType **empty_pt = (const CBMType **)cbm_arena_alloc(arena, sizeof(*empty_pt));
+    const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(*rets));
+    if (!empty_pn || !empty_pt || !rets) {
+        return NULL;
+    }
+    empty_pn[0] = NULL;
+    empty_pt[0] = NULL;
+    rets[0] = ret;
+    rets[1] = NULL;
+    return cbm_type_func(arena, empty_pn, empty_pt, rets);
+}
+
 static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const CBMLSPDef *d) {
     if (!d->qualified_name || !d->short_name || !d->label) {
         return;
@@ -4144,6 +4279,7 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         /* receiver_type distinguishes a top-level fun (NULL) from a method
          * (set) — the sole-definer fallback only matches top-level funs. */
         rf.receiver_type = d->receiver_type;
+        rf.signature = kt_cross_func_sig_with_return(arena, d);
         cbm_registry_add_func(reg, rf);
     }
 }

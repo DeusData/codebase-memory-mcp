@@ -170,6 +170,7 @@ typedef enum {
     CBM_LANG_QML,       // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
     CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
     CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
+    CBM_LANG_MOJO,      // Mojo
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -236,7 +237,9 @@ typedef struct {
     int loop_depth;                     // enclosing loop nesting at the call site
     int branch_depth;                   // enclosing branch nesting at the call site
     int start_line;                     // 1-based source line of the call (for def range-match)
-    bool is_method;                     // Perl-only: arrow/method call ($obj->m). Default false.
+    bool is_method;                     // method/member call with a non-self receiver. Perl:
+                                        // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                        // x.foo() whose receiver is not this/super. Default false.
 } CBMCall;
 
 typedef struct {
@@ -445,6 +448,16 @@ typedef struct {
 
     bool has_error;
     const char *error_msg;
+    /* Best-effort parse-coverage signal (experimental). parse_incomplete is true
+     * when the parse tree contains tree-sitter ERROR/MISSING nodes — constructs
+     * in those regions are silently absent from the graph. error_ranges is a
+     * compact "start-end,start-end" list of 1-based line ranges (arena-owned) or
+     * NULL. This only marks what we can DETECT: the absence of a flag is NOT a
+     * completeness guarantee. Callers should treat a flagged file as "prefer
+     * grep here", never treat an unflagged file as provably complete. */
+    bool parse_incomplete;
+    const char *error_ranges;
+    int error_region_count;
     bool is_test_file;
     int imports_count;
     TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
@@ -503,11 +516,11 @@ typedef struct {
 
 // --- Public API ---
 
-// Bind third-party allocators (tree-sitter, sqlite3, libgit2) to mimalloc as
+// Bind third-party allocators (tree-sitter, sqlite3) to mimalloc as
 // defense-in-depth, so they never depend on the fragile MI_OVERRIDE symbol
 // override (#424). MUST be called as the very first statement of main(), before
 // any sqlite3_open*/sqlite3_initialize (SQLITE_CONFIG_MALLOC returns
-// SQLITE_MISUSE once sqlite has initialized) and before any git_libgit2_init.
+// SQLITE_MISUSE once sqlite has initialized).
 // Idempotent (static guard); intended for single-threaded startup. cbm_init()
 // also calls it so non-main entry points (pipeline passes) still get the binds.
 // In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
@@ -515,6 +528,29 @@ void cbm_alloc_init(void);
 
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
+
+// True when rel_path is in the crash-quarantine set — the newline-delimited list
+// of files (CBM_INDEX_QUARANTINE_FILE) the crash supervisor pinned as crashers
+// during its single-threaded recovery re-run. Loaded once, lazily; read-only
+// after load. cbm_extract_file short-circuits such files to an empty result so no
+// pass can crash on them; the pipeline extract loops call this to also REPORT the
+// skip as phase="crash". Always false (cheap no-op) when the env var is unset.
+bool cbm_index_is_quarantined(const char *rel_path);
+
+// Phase a quarantined file was pinned under: "crash" (a fault signal) or "hang"
+// (killed for making no progress). Returns NULL when rel_path is not quarantined.
+// Drives the same lazy once-load as cbm_index_is_quarantined. Used by the pipeline
+// extract loops to report the skip's phase in skipped[] (falls back to "crash").
+const char *cbm_index_quarantine_phase(const char *rel_path);
+
+// Crash-supervisor marker journal (parallel-safe): appends "S <rel_path>" /
+// "D <rel_path>" to CBM_INDEX_MARKER_FILE. Files with an S but no D form the
+// parent's crash/hang suspect set. No-ops when the env var is unset.
+// cbm_extract_file journals its own start/done; long-running per-file phases
+// (cross-LSP resolve) call these around their per-file work so a hang there
+// is attributed to the RIGHT file instead of a stale extraction marker.
+void cbm_index_mark_start(const char *rel_path);
+void cbm_index_mark_done(const char *rel_path);
 
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
@@ -597,5 +633,18 @@ void cbm_extract_unified(CBMExtractCtx *ctx);
 
 // K8s / Kustomize semantic extractor (called when language is CBM_LANG_K8S or CBM_LANG_KUSTOMIZE).
 void cbm_extract_k8s(CBMExtractCtx *ctx);
+
+// --- Label predicates ---
+
+// True when `label` names a TYPE-LIKE container definition — a node that can own
+// methods/fields, be a base/embedded type, satisfy/declare an interface, and be a
+// target of name→type resolution. The canonical set is:
+//   Class, Struct, Interface, Enum, Type, Trait.
+// Single source of truth for every type-resolution / registry-seeding /
+// INHERITS·IMPLEMENTS / LSP-type-registrar consumer, so adding a new type-like
+// label (e.g. "Struct" for Rust/Go/Swift/D structs) updates them all at once
+// instead of scattering `|| strcmp(label,"Struct")==0` across the tree.
+// `label` may be NULL (returns false). Defined in helpers.c.
+bool cbm_label_is_type_like(const char *label);
 
 #endif // CBM_H

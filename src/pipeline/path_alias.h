@@ -72,6 +72,9 @@ typedef struct {
  * are found (also NULL on out-of-memory). Caller frees with
  * cbm_path_alias_collection_free. */
 cbm_path_alias_collection_t *cbm_load_path_aliases(const char *repo_path);
+cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_path,
+                                                            char **excluded_dirs,
+                                                            int excluded_count);
 
 /* Free a collection produced by cbm_load_path_aliases. NULL-safe. */
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll);

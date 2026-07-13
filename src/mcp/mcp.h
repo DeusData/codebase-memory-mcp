@@ -54,8 +54,16 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
+/* Return true when notifications/cancelled params target the active request. */
+bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
+                                    const char *active_id_str);
+
 /* Format the tools/list response. Returns heap-allocated JSON. */
 char *cbm_mcp_tools_list(void);
+
+/* Return a tool's JSON input_schema string by name (static; do not free), or
+ * NULL if the tool is unknown. Backs the CLI flag parser + per-tool --help. */
+const char *cbm_mcp_tool_input_schema(const char *tool_name);
 
 /* Format the initialize response. params_json is the raw initialize params
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
@@ -107,6 +115,18 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);
 
 /* Handle a tools/call request. Returns MCP tool result JSON. */
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json);
+
+/* ── Supervised background index (RSS isolation, #832) ────────── */
+
+/* Run a full index of root_path in a supervised worker SUBPROCESS (the same
+ * crash/hang-isolating runner used by handle_index_repository), so the child
+ * returns 100% of its RSS to the OS on exit instead of ratcheting the long-lived
+ * parent. Builds {"repo_path": root_path} internally. Returns the worker's
+ * response string (caller frees) on success, or NULL to signal the caller must
+ * degrade to the in-process path (kill switch set, spawn failure, or the process
+ * is not a supervisor host). This is the shared entry the watcher re-index
+ * (main.c) and the session auto-index (mcp.c) route through. */
+char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 

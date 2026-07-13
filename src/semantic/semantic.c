@@ -1620,7 +1620,7 @@ float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
     float score = cfg->w_tfidf * sparse_tfidf_cosine(a, b);
 
     /* Signal 2: Random Indexing */
-    score += cfg->w_ri * cbm_sem_cosine(&a->ri_vec, &b->ri_vec);
+    score += cfg->w_ri * cbm_rsq_ip(&a->ri_code, &b->ri_code);
 
     /* Signal 3: MinHash Jaccard */
     if (a->has_minhash && b->has_minhash) {
@@ -1630,13 +1630,13 @@ float cbm_sem_combined_score(const cbm_sem_func_t *a, const cbm_sem_func_t *b,
     }
 
     /* Signal 4: API Signatures */
-    score += cfg->w_api * cbm_sem_cosine(&a->api_vec, &b->api_vec);
+    score += cfg->w_api * cbm_rsq_ip(&a->api_code, &b->api_code);
 
     /* Signal 5: Type Signatures */
-    score += cfg->w_type * cbm_sem_cosine(&a->type_vec, &b->type_vec);
+    score += cfg->w_type * cbm_rsq_ip(&a->type_code, &b->type_code);
 
     /* Signal 7: Decorator Pattern */
-    score += cfg->w_decorator * cbm_sem_cosine(&a->deco_vec, &b->deco_vec);
+    score += cfg->w_decorator * cbm_rsq_ip(&a->deco_code, &b->deco_code);
 
     /* Signal 8+9+11: Structural profile + data flow + Halstead */
     float sp_score = small_cosine(a->struct_profile, b->struct_profile, CBM_SEM_AST_PROFILE_DIMS);

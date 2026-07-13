@@ -87,21 +87,181 @@ static const char *compute_wolfram_func_qn(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
-// Resolve the name node for a function, handling arrow functions.
-static TSNode resolve_func_name_node(TSNode node) {
-    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "arrow_function") == 0) {
-        TSNode parent = ts_node_parent(node);
-        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
-            name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+/* True for a Lisp def-form head symbol (defn/define/...). Mirrors
+ * lisp_is_def_head() in extract_defs.c so the scope-stack walk pushes a
+ * SCOPE_FUNC only for actual definitions, never for a plain call list such as
+ * `(add x 1)` — otherwise every parenthesized form would shadow the enclosing
+ * def and the in-body call would mis-source. */
+static bool lisp_head_is_def(const char *t) {
+    if (!t) {
+        return false;
+    }
+    static const char *heads[] = {"defn",
+                                  "defn-",
+                                  "def",
+                                  "defmacro",
+                                  "defmulti",
+                                  "defmethod",
+                                  "defprotocol",
+                                  "defrecord",
+                                  "deftype",
+                                  "definterface",
+                                  "defonce",
+                                  "define",
+                                  "define-syntax",
+                                  "define-values",
+                                  "define-syntax-rule",
+                                  "define-struct",
+                                  "define-record-type",
+                                  "define/contract",
+                                  "struct",
+                                  NULL};
+    for (int i = 0; heads[i]; i++) {
+        if (strcmp(t, heads[i]) == 0) {
+            return true;
         }
     }
-    /* Grammars without a `name` field (e.g. newer tree-sitter-kotlin): the
-     * function name is a simple_identifier child of function_declaration. */
-    if (ts_node_is_null(name_node) && strcmp(ts_node_type(node), "function_declaration") == 0) {
-        name_node = cbm_find_child_by_kind(node, "simple_identifier");
+    return false;
+}
+
+/* Resolve a Lisp (Clojure/Scheme/Racket) def-form's QN for scope tracking.
+ * The def node is a list/list_lit whose head names the def kind and whose
+ * second element is the name (a bare symbol) or a (name args...) nested list.
+ * Returns NULL for any non-def list (calls, vectors of args, the +/- body
+ * forms, ...), so push_boundary_scopes pushes no scope for them. Mirrors
+ * extract_lisp_def() in extract_defs.c. */
+static const char *compute_lisp_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_named_child_count(node) < 2) {
+        return NULL;
     }
-    return name_node;
+    char *head = cbm_node_text(ctx->arena, ts_node_named_child(node, 0), ctx->source);
+    if (!lisp_head_is_def(head)) {
+        return NULL;
+    }
+    TSNode target = ts_node_named_child(node, 1);
+    const char *tk = ts_node_type(target);
+    TSNode name_node = target;
+    /* (define (foo args) ...) — the name is the head symbol of the nested list. */
+    if ((strcmp(tk, "list") == 0 || strcmp(tk, "list_lit") == 0) &&
+        ts_node_named_child_count(target) > 0) {
+        name_node = ts_node_named_child(target, 0);
+    }
+    if (ts_node_is_null(name_node)) {
+        return NULL;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+}
+
+/* Resolve an Elixir def/defp/defmacro's QN for scope tracking. The def is a
+ * `call` node whose target (first child) is the def macro and whose first
+ * argument is either the function head call `name(args)` or a bare identifier
+ * (zero-arg). Returns NULL for a non-def `call` (e.g. the in-body `add(x,1)`
+ * call, whose target is not a def macro) so only defs push a scope. Mirrors
+ * extract_elixir_func_def() in extract_defs.c. */
+static const char *compute_elixir_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_child_count(node) == 0) {
+        return NULL;
+    }
+    char *macro = cbm_node_text(ctx->arena, ts_node_child(node, 0), ctx->source);
+    if (!macro || (strcmp(macro, "def") != 0 && strcmp(macro, "defp") != 0 &&
+                   strcmp(macro, "defmacro") != 0)) {
+        return NULL;
+    }
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) && ts_node_child_count(node) > 1) {
+        args = ts_node_child(node, 1);
+    }
+    if (ts_node_is_null(args) || ts_node_child_count(args) == 0) {
+        return NULL;
+    }
+    TSNode first_arg = ts_node_child(args, 0);
+    if (ts_node_is_null(first_arg)) {
+        return NULL;
+    }
+    const char *fk = ts_node_type(first_arg);
+    char *name = NULL;
+    if (strcmp(fk, "call") == 0 && ts_node_child_count(first_arg) > 0) {
+        name = cbm_node_text(ctx->arena, ts_node_child(first_arg, 0), ctx->source);
+    } else if (strcmp(fk, "identifier") == 0) {
+        name = cbm_node_text(ctx->arena, first_arg, ctx->source);
+    }
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+}
+
+/* Resolve a CFML tag-function's QN for scope tracking. A <cffunction name="foo">
+ * is a `cf_function_tag`; the name lives in a `cf_attribute` child (name="foo"),
+ * not on a `name` field, so the shared resolver (which has no source pointer to
+ * read the attribute NAME and disambiguate) cannot name it. The def-extractor
+ * extract_cfml_function_tag() does the same attribute walk; this mirrors it so
+ * the in-body call sources to the cffunction Function rather than the Module. */
+static const char *compute_cfml_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "cf_function_tag") != 0) {
+        return NULL;
+    }
+    char *name = NULL;
+    uint32_t cc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < cc && !name; i++) {
+        TSNode ch = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(ch), "cf_attribute") != 0) {
+            continue;
+        }
+        TSNode an = cbm_find_child_by_kind(ch, "cf_attribute_name");
+        if (ts_node_is_null(an)) {
+            continue;
+        }
+        char *aname = cbm_node_text(ctx->arena, an, ctx->source);
+        if (!aname || strcasecmp(aname, "name") != 0) {
+            continue;
+        }
+        TSNode val = cbm_find_child_by_kind(ch, "quoted_cf_attribute_value");
+        if (ts_node_is_null(val)) {
+            val = cbm_find_child_by_kind(ch, "cf_attribute_value");
+        }
+        if (ts_node_is_null(val)) {
+            continue;
+        }
+        TSNode inner = cbm_find_child_by_kind(val, "attribute_value");
+        name = cbm_node_text(ctx->arena, ts_node_is_null(inner) ? val : inner, ctx->source);
+    }
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+}
+
+/* Resolve a Go-template named-template's QN for scope tracking. A
+ * {{ define "greeting" }} ... {{ end }} is a `define_action` whose name is a
+ * quoted `interpreted_string_literal` child, not a bare identifier on a `name`
+ * field. The shared resolver can't strip the quotes (no source pointer), so the
+ * gate lives here. Mirrors extract_gotemplate_define() so a {{ template }}/include
+ * call inside the define body sources to the define's Function, not the Module. */
+static const char *compute_gotemplate_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "define_action") != 0) {
+        return NULL;
+    }
+    TSNode s = cbm_find_child_by_kind(node, "interpreted_string_literal");
+    if (ts_node_is_null(s)) {
+        return NULL;
+    }
+    char *raw = cbm_node_text(ctx->arena, s, ctx->source);
+    if (!raw) {
+        return NULL;
+    }
+    size_t len = strlen(raw);
+    if (len >= 2 && (raw[0] == '"' || raw[0] == '`')) {
+        raw = cbm_arena_strndup(ctx->arena, raw + 1, len - 2); // strip surrounding quotes
+    }
+    if (!raw || !raw[0]) {
+        return NULL;
+    }
+    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, raw);
 }
 
 // Compute function QN for scope tracking (mirrors cbm_enclosing_func_qn logic).
@@ -112,28 +272,179 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return compute_wolfram_func_qn(ctx, node);
     }
 
-    TSNode name_node = resolve_func_name_node(node);
+    /* CFML tag dialect: <cffunction name="foo"> is a cf_function_tag whose name
+     * lives in a cf_attribute, not a `name` field — gate here where ctx->source
+     * is available to read the attribute. Other CFML func nodes (embedded
+     * CFScript function_declaration/_expression) fall through to the shared
+     * resolver below. */
+    if (ctx->language == CBM_LANG_CFML && strcmp(ts_node_type(node), "cf_function_tag") == 0) {
+        return compute_cfml_func_qn(ctx, node);
+    }
+
+    /* Go templates: {{ define "x" }} is a define_action whose name is a quoted
+     * string literal — strip the quotes here (the shared resolver has no source). */
+    if (ctx->language == CBM_LANG_GOTEMPLATE) {
+        return compute_gotemplate_func_qn(ctx, node);
+    }
+
+    /* Lisp family (Clojure/Scheme/Racket): the def node is a list/list_lit, a
+     * very general kind that also matches plain call forms. The shared resolver
+     * has no source pointer to read the head symbol, so the def-vs-call gate
+     * lives here (we have ctx->source). Non-def lists return NULL → no scope
+     * pushed → the in-body call sources to the enclosing def, not the Module. */
+    if (ctx->language == CBM_LANG_CLOJURE || ctx->language == CBM_LANG_SCHEME ||
+        ctx->language == CBM_LANG_RACKET) {
+        return compute_lisp_func_qn(ctx, node);
+    }
+
+    /* Elixir: def/defp/defmacro are `call` nodes (so is every in-body call).
+     * Gate on the def-macro target text so only definitions push a scope. */
+    if (ctx->language == CBM_LANG_ELIXIR) {
+        return compute_elixir_func_qn(ctx, node);
+    }
+
+    /* Objective-C: a method_definition's selector keyword is a plain `identifier`
+     * child. Resolve the call-scope QN HERE (not via the shared cbm_resolve_func_name)
+     * so an in-body call sources to the method — without making the shared resolver
+     * report the method as a top-level Function (the @implementation class-member
+     * pass already emits the Method node; a shared-resolver name would double it). */
+    if (ctx->language == CBM_LANG_OBJC && strcmp(ts_node_type(node), "method_definition") == 0) {
+        TSNode id = cbm_find_child_by_kind(node, "identifier");
+        if (!ts_node_is_null(id)) {
+            char *mname = cbm_node_text(ctx->arena, id, ctx->source);
+            if (mname && mname[0]) {
+                if (state->enclosing_class_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, mname);
+                }
+                return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, mname,
+                                                   ctx->language);
+            }
+        }
+    }
+
+    /* Dart: function_signature / method_signature have no `name` field; the name
+     * is an `identifier` child (method_signature wraps a function_signature). The
+     * shared resolver doesn't cover them, so resolve here for call-scope so an
+     * in-body call sources to the function, not the Module. */
+    if (ctx->language == CBM_LANG_DART && (strcmp(ts_node_type(node), "function_signature") == 0 ||
+                                           strcmp(ts_node_type(node), "method_signature") == 0)) {
+        TSNode sig = node;
+        if (strcmp(ts_node_type(node), "method_signature") == 0) {
+            TSNode fs = cbm_find_child_by_kind(node, "function_signature");
+            if (!ts_node_is_null(fs)) {
+                sig = fs;
+            }
+        }
+        TSNode id = cbm_find_child_by_kind(sig, "identifier");
+        if (!ts_node_is_null(id)) {
+            char *nm = cbm_node_text(ctx->arena, id, ctx->source);
+            if (nm && nm[0]) {
+                if (state->enclosing_class_qn) {
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, nm);
+                }
+                return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, nm,
+                                                   ctx->language);
+            }
+        }
+    }
+
+    /* Agda: a definition is two `function` nodes — the type signature
+     * (`compute : Nat -> Nat`, lhs has a `function_name` child that names the
+     * def) and the body clause (`compute x = add x 1`, lhs has no function_name).
+     * The shared resolver deliberately returns NULL for the body clause to avoid
+     * a duplicate def, so an in-body call would source to the Module. Resolve the
+     * body clause's name here (call-scope only) from the lhs head identifier so
+     * the call attributes to the function. */
+    if (ctx->language == CBM_LANG_AGDA && strcmp(ts_node_type(node), "function") == 0) {
+        TSNode lhs = cbm_find_child_by_kind(node, "lhs");
+        if (!ts_node_is_null(lhs)) {
+            TSNode nm = cbm_find_child_by_kind(lhs, "function_name");
+            if (ts_node_is_null(nm)) {
+                /* Body clause: descend to the first leaf of the lhs (`compute x`
+                 * -> the head `compute`). */
+                TSNode cur = lhs;
+                for (int hop = 0;
+                     hop < 8 && !ts_node_is_null(cur) && ts_node_named_child_count(cur) > 0;
+                     hop++) {
+                    cur = ts_node_named_child(cur, 0);
+                }
+                nm = cur;
+            }
+            if (!ts_node_is_null(nm)) {
+                char *name = cbm_node_text(ctx->arena, nm, ctx->source);
+                if (name && name[0]) {
+                    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
+                                                       name, ctx->language);
+                }
+            }
+        }
+    }
+
+    /* Resolve the function name via the single shared resolver (extract_defs) so
+     * call-scope attribution agrees with definition extraction across all ~130
+     * grammars. The old private 4-case copy returned NULL for Fortran subroutine,
+     * SCSS mixin, SQL create_function, Julia short-form, etc., so
+     * push_boundary_scopes never pushed a SCOPE_FUNC and the calls inside were
+     * mis-attributed to the enclosing Module (QUALITY_ANALYSIS gap #3). */
+    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
     if (ts_node_is_null(name_node)) {
         return NULL;
     }
 
-    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source);
     if (!name || !name[0]) {
         return NULL;
+    }
+
+    /* C++/CUDA out-of-line method `void Foo::bar() {...}`: the def extractor
+     * records this as Method "proj.file.Foo.bar". The call-scope QN must match
+     * (be class-qualified) so an in-body call sources to the method, not a bare
+     * "proj.file.bar" that no node carries (#554/#621). The out-of-line def is at
+     * file scope, so enclosing_class_qn is NULL — derive the class from the
+     * qualified declarator instead. */
+    if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
+        strcmp(ts_node_type(node), "function_definition") == 0) {
+        char *scope_name = cbm_cpp_out_of_line_parent_class(ctx->arena, node, ctx->source);
+        if (scope_name && scope_name[0]) {
+            const char *class_qn =
+                cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, scope_name);
+            return cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, name);
+        }
     }
 
     if (state->enclosing_class_qn) {
         return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
     }
-    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    /* Java/Go: directory-based module so this enclosing-func QN matches the def
+     * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
+                                       ctx->language);
 }
 
 // Compute class QN for scope tracking.
-static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node) {
+static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     /* Newer tree-sitter-kotlin: class/object name is a type_identifier child. */
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_KOTLIN) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
+    }
+    /* Objective-C: class_interface / class_implementation have no `name` field;
+     * the class name is a plain `identifier` child. Without this the walk pushes
+     * no class scope, so a method body's calls source to the Module and the
+     * method itself is mis-extracted as a top-level Function (not a Method). */
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
+        name_node = cbm_find_child_by_kind(node, "identifier");
+    }
+    /* Rust: impl_item has no `name` field; the implementing type is in the `type`
+     * field (`impl Calc {...}` / `impl Trait for Calc {...}` both -> Calc). The
+     * dedicated impl handler in push_boundary_scopes is dead code (impl_item is in
+     * rust_class_types, so the class branch runs first and lands here), so resolve
+     * the type here. Without a class scope, an impl method's QN drops the type
+     * (proj.file.method) and no longer matches the class-qualified def-side Method
+     * node, so in-body calls fall back to the Module. */
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(node), "impl_item") == 0) {
+        name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
     }
     if (ts_node_is_null(name_node)) {
         return NULL;
@@ -144,7 +455,16 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node) {
         return NULL;
     }
 
-    return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this
+     * scope QN matches the def-side class QN (extract_defs.c compute_class_qn /
+     * extract_class_def), which the lsp_resolve join requires for nested types. */
+    if (state && state->enclosing_class_qn) {
+        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+    }
+
+    /* Java/Go: directory-based module (see compute_func_qn). */
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
+                                       ctx->language);
 }
 
 /* Forward declaration */
@@ -790,12 +1110,29 @@ static bool is_export_of_declaration(TSNode node) {
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth) {
     if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
-        const char *fqn = compute_func_qn(ctx, node, spec, state);
-        if (fqn) {
-            push_scope(state, SCOPE_FUNC, depth, fqn);
+        /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
+         * but the def walk does not descend into function bodies, so it emits no
+         * node for it. Pushing a func scope here would attribute in-body calls to
+         * that nodeless local binding — the CALLS edge then sources to neither a
+         * Function nor the Module. Only the OUTERMOST value_definition pushes a
+         * scope (none already on the stack), matching what the def walk extracts. */
+        bool skip_nested = false;
+        if (ctx->language == CBM_LANG_OCAML) {
+            for (int i = 0; i < state->scope_top; i++) {
+                if (state->scopes[i].kind == SCOPE_FUNC) {
+                    skip_nested = true;
+                    break;
+                }
+            }
+        }
+        if (!skip_nested) {
+            const char *fqn = compute_func_qn(ctx, node, spec, state);
+            if (fqn) {
+                push_scope(state, SCOPE_FUNC, depth, fqn);
+            }
         }
     } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
-        const char *cqn = compute_class_qn(ctx, node);
+        const char *cqn = compute_class_qn(ctx, node, state);
         if (cqn) {
             push_scope(state, SCOPE_CLASS, depth, cqn);
         }
@@ -807,6 +1144,23 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 const char *tqn =
                     cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);
                 push_scope(state, SCOPE_CLASS, depth, tqn);
+            }
+        }
+    } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
+        /* Dart models a function as `function_signature` + `function_body` SIBLINGS
+         * (the signature node does not contain the body). A scope pushed at the
+         * signature never covers the body, so in-body calls source to the Module.
+         * Push the function scope at the BODY using the preceding signature
+         * sibling's QN, so the body's children attribute to the function. */
+        TSNode prev = ts_node_prev_sibling(node);
+        while (!ts_node_is_null(prev) && strcmp(ts_node_type(prev), "function_signature") != 0 &&
+               strcmp(ts_node_type(prev), "method_signature") != 0) {
+            prev = ts_node_prev_sibling(prev);
+        }
+        if (!ts_node_is_null(prev)) {
+            const char *fqn = compute_func_qn(ctx, prev, spec, state);
+            if (fqn) {
+                push_scope(state, SCOPE_FUNC, depth, fqn);
             }
         }
     }

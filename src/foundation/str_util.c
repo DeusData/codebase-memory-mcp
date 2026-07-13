@@ -6,6 +6,7 @@
 #include "foundation/constants.h"
 #include <string.h>
 #include <ctype.h>
+#include <stdio.h>
 
 enum {
     JSON_ESC_LEN = 2,       /* escaped char takes 2 bytes (backslash + char) */
@@ -328,8 +329,11 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
             buf[pos++] = '\\';
             buf[pos++] = 't';
         } else if (c < JSON_CTRL_LIMIT) {
-            /* Other control chars: skip */
-            continue;
+            /* Other control chars: escape as \u00XX */
+            if (pos + 6 > bufsize - JSON_NUL_RESERVE) {
+                break;
+            }
+            pos += snprintf(buf + pos, 7, "\\u%04x", c);
         } else {
             buf[pos++] = (char)c;
         }

@@ -31,16 +31,39 @@ foreach ($arg in $args) {
     if ($arg -like "--dir=*") { $InstallDir = $arg.Substring(6) }
 }
 
+# Detect the OS architecture. RuntimeInformation.OSArchitecture reports the real
+# OS arch (Arm64) even from an x64 process running under emulation on ARM64 --
+# unlike $env:PROCESSOR_ARCHITECTURE, which reports the emulated "AMD64", and
+# PROCESSOR_ARCHITEW6432, which is unset for 64-bit emulated processes. Fall back
+# to the env vars only if the .NET API is somehow unavailable.
+if ($env:CBM_ARCH) {
+    # Explicit override wins — used by CI/tests, and an escape hatch under x64
+    # emulation on ARM64 where no in-process detection is reliable.
+    $Arch = $env:CBM_ARCH
+} else {
+    try {
+        $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+        $Arch = if ($osArch -eq 'Arm64') { "arm64" } else { "amd64" }
+    } catch {
+        if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+            $Arch = "arm64"
+        } else {
+            $Arch = "amd64"
+        }
+    }
+}
+
 Write-Host "codebase-memory-mcp installer (Windows)"
 Write-Host "  variant: $Variant"
+Write-Host "  arch:    $Arch"
 Write-Host "  target:  $InstallDir\$BinName"
 Write-Host ""
 
 # Build download URL
 if ($Variant -eq "ui") {
-    $Archive = "codebase-memory-mcp-ui-windows-amd64.zip"
+    $Archive = "codebase-memory-mcp-ui-windows-$Arch.zip"
 } else {
-    $Archive = "codebase-memory-mcp-windows-amd64.zip"
+    $Archive = "codebase-memory-mcp-windows-$Arch.zip"
 }
 $Url = "$BaseUrl/$Archive"
 
@@ -131,11 +154,13 @@ if ($SkipConfig) {
 } else {
     Write-Host ""
     Write-Host "Configuring coding agents..."
-    try {
-        & $Dest install -y 2>&1 | Write-Host
-    } catch {
-        Write-Host "Agent configuration failed (non-fatal)."
-        Write-Host "Run manually: codebase-memory-mcp install"
+    & $Dest install -y 2>&1 | Write-Host
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host ""
+        Write-Host "error: agent configuration failed (exit code $LASTEXITCODE)" -ForegroundColor Red
+        Write-Host "The binary was installed, but no coding agents were configured."
+        Write-Host "Run manually to configure: `"$Dest`" install"
+        exit 1
     }
 }
 

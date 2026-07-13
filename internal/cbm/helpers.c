@@ -146,6 +146,26 @@ static const char *generic_keywords[] = {
     "def",      "fn",        "func",      "fun",    "proc",   "sub",       "method",  "async",
     "await",    "yield",     NULL};
 
+/* Puppet reserves control-flow words but NOT `include`/`require`/`contain`,
+ * which are ordinary built-in functions invoked as calls. Using the generic
+ * list would wrongly drop `include`/`require` call edges, so Puppet gets its
+ * own reserved-word set that omits them. */
+static const char *puppet_keywords[] = {"true",   "false",  "undef",    "if",      "elsif",  "else",
+                                        "unless", "case",   "and",      "or",      "in",     "node",
+                                        "class",  "define", "inherits", "default", "return", NULL};
+
+// True when `label` names a type-like container definition (see cbm.h). Single
+// source of truth for the type-resolution / registry / IMPLEMENTS / LSP-type
+// consumers — adding a label here updates them all.
+bool cbm_label_is_type_like(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+           strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
+           strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;
@@ -174,6 +194,9 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_KOTLIN:
         keywords = kotlin_keywords;
         break;
+    case CBM_LANG_PUPPET:
+        keywords = puppet_keywords;
+        break;
     default:
         keywords = generic_keywords;
         break;
@@ -181,6 +204,29 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
 
     for (const char **kw = keywords; *kw; kw++) {
         if (strcmp(name, *kw) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Builtins that appear in the keyword set above (so they are suppressed as bare
+// usages) but for which we mint a real graph node and an LSP resolution, so a
+// CALL to them must still be extracted. MUST stay in sync with kPyBuiltinNodes
+// in internal/cbm/lsp/py_builtins.c — every entry here has a "builtins.<name>"
+// node, so the resulting CALLS edge always has a target (never Module-sourced).
+static const char *python_resolvable_builtins[] = {"len",  "print", "str",   "int",
+                                                   "list", "dict",  "range", NULL};
+
+bool cbm_is_resolvable_builtin(const char *name, CBMLanguage lang) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    if (lang != CBM_LANG_PYTHON) {
+        return false;
+    }
+    for (const char **b = python_resolvable_builtins; *b; b++) {
+        if (strcmp(name, *b) == 0) {
             return true;
         }
     }
@@ -692,8 +738,23 @@ static const char **func_kinds_for_lang(CBMLanguage lang) {
         return func_kinds_magma;
     case CBM_LANG_WOLFRAM:
         return func_kinds_wolfram;
-    default:
+    default: {
+        /* Enclosing-function drift fix (QUALITY_ANALYSIS gap #3): languages
+         * without a curated func_kinds entry previously fell back to
+         * func_kinds_generic, which misses their real function node types
+         * (e.g. dart function_signature, perl subroutine_declaration_statement,
+         * scss mixin_statement, nix function_expression, fortran subroutine,
+         * cobol program_definition, verilog/vhdl, ...). The enclosing-function
+         * walk then never found the parent function and attributed every
+         * in-body call to the Module node. Use the language spec's
+         * function_node_types (the single source of truth that extraction
+         * already uses) when the curated switch has no entry. Curated languages
+         * above are unchanged. */
+        const CBMLangSpec *spec = cbm_lang_spec(lang);
+        if (spec && spec->function_node_types && spec->function_node_types[0])
+            return spec->function_node_types;
         return func_kinds_generic;
+    }
     }
 }
 
@@ -717,7 +778,74 @@ TSNode cbm_find_enclosing_func(TSNode node, CBMLanguage lang) {
     return null_node;
 }
 
-// Get the name of a function node (basic: try "name" field)
+// Check if a node type is a terminal C declarator name.
+static bool is_c_terminal_name(const char *dk) {
+    return strcmp(dk, "identifier") == 0 || strcmp(dk, "field_identifier") == 0 ||
+           strcmp(dk, "operator_name") == 0 || strcmp(dk, "operator_cast") == 0 ||
+           strcmp(dk, "destructor_name") == 0;
+}
+
+// Resolve name from a C++ qualified_identifier/scoped_identifier.
+static TSNode resolve_qualified_name(TSNode decl) {
+    static const char *name_kinds[] = {"operator_name", "operator_cast",    "destructor_name",
+                                       "identifier",    "field_identifier", NULL};
+    for (const char **k = name_kinds; *k; k++) {
+        TSNode found = cbm_find_child_by_kind(decl, *k);
+        if (!ts_node_is_null(found)) {
+            return found;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+// Resolve function name from C/C++/CUDA/GLSL declarator chain. Shared canonical
+// implementation — see the header for the full rationale (#438).
+TSNode cbm_resolve_c_declarator_name_node(TSNode func_node) {
+    TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    for (int depth = 0; depth < CBM_DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); depth++) {
+        const char *dk = ts_node_type(decl);
+        if (is_c_terminal_name(dk)) {
+            return decl;
+        }
+        if (strcmp(dk, "qualified_identifier") == 0 || strcmp(dk, "scoped_identifier") == 0) {
+            return resolve_qualified_name(decl);
+        }
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && ts_node_named_child_count(decl) > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        if (ts_node_is_null(inner)) {
+            break;
+        }
+        decl = inner;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+// Convert a resolved function/method name node to its name string. Most nodes
+// map directly to their text, but a C++ conversion-operator's `operator_cast`
+// node spans the full "operator bool() const" — this grammar folds the parameter
+// list and cv-qualifiers into the node. The method's name is only the
+// "operator <type>" prefix, so truncate at the first '(' and trim trailing
+// space. Without this the conversion operator is indexed as "operator bool()
+// const", and a member lookup for "operator bool" (the implicit call in
+// `if (obj)`) misses.
+char *cbm_func_name_node_text(CBMArena *a, TSNode name_node, const char *source) {
+    char *text = cbm_node_text(a, name_node, source);
+    if (text && strcmp(ts_node_type(name_node), "operator_cast") == 0) {
+        char *paren = strchr(text, '(');
+        if (paren) {
+            while (paren > text && (paren[-1] == ' ' || paren[-1] == '\t')) {
+                paren--;
+            }
+            *paren = '\0';
+        }
+    }
+    return text;
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
@@ -752,6 +880,13 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
             }
         }
     }
+    // C/C++/CUDA/GLSL: function_definition carries its name in the declarator chain.
+    if (strcmp(ts_node_type(func_node), "function_definition") == 0) {
+        TSNode dn = cbm_resolve_c_declarator_name_node(func_node);
+        if (!ts_node_is_null(dn)) {
+            return cbm_func_name_node_text(a, dn, source);
+        }
+    }
     return NULL;
 }
 
@@ -767,22 +902,37 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         return module_qn;
     }
 
-    // Check if the function is inside a class — compute classQN.funcName
+    // Check if the function is inside a class — compute classQN.funcName.
+    // For nested classes the class QN must carry the FULL nesting chain
+    // (Outer.Inner, not just Inner) so it matches the class/method node QN the
+    // def walk produces via compute_class_qn (extract_defs.c). Qualifying with
+    // only the innermost class under-qualified the enclosing QN, so a call
+    // inside a nested-class method sourced to the file node instead of its
+    // method node and failed to join the LSP-resolved call by caller QN.
     const CBMLangSpec *spec = cbm_lang_spec(lang);
     if (spec && spec->class_node_types) {
-        TSNode cur = ts_node_parent(func_node);
-        while (!ts_node_is_null(cur)) {
-            if (cbm_kind_in_set(cur, spec->class_node_types)) {
-                TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
-                if (!ts_node_is_null(class_name)) {
-                    char *cname = cbm_node_text(a, class_name, source);
-                    if (cname && cname[0]) {
-                        const char *class_qn = cbm_fqn_compute(a, project, rel_path, cname);
-                        return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
-                    }
-                }
+        // Build the dotted class chain from the outermost enclosing class down
+        // to the innermost. Walk parents collecting class names innermost-first,
+        // then prepend each as we ascend so the result reads Outer.Inner.
+        const char *class_chain = NULL;
+        for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
+             cur = ts_node_parent(cur)) {
+            if (!cbm_kind_in_set(cur, spec->class_node_types)) {
+                continue;
             }
-            cur = ts_node_parent(cur);
+            TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));
+            if (ts_node_is_null(class_name)) {
+                continue;
+            }
+            char *cname = cbm_node_text(a, class_name, source);
+            if (!cname || !cname[0]) {
+                continue;
+            }
+            class_chain = class_chain ? cbm_arena_sprintf(a, "%s.%s", cname, class_chain) : cname;
+        }
+        if (class_chain) {
+            const char *class_qn = cbm_fqn_compute(a, project, rel_path, class_chain);
+            return cbm_arena_sprintf(a, "%s.%s", class_qn, name);
         }
     }
 
@@ -850,6 +1000,8 @@ static const char *module_parents_commonlisp[] = {"source", NULL};
 static const char *module_parents_matlab[] = {"source_file", NULL};
 static const char *module_parents_form[] = {"source_file", NULL};
 static const char *module_parents_magma[] = {"source_file", NULL};
+/* tree-sitter-properties roots at `file`. */
+static const char *module_parents_properties[] = {"file", "source_file", NULL};
 
 // Check if parent node kind matches direct-or-grandparent for scripting languages.
 // Returns true if pk matches root_kind, or pk matches wrapper_kind and grandparent is root_kind.
@@ -922,6 +1074,7 @@ static const char **get_module_parents(CBMLanguage lang) {
         return module_parents_php;
     case CBM_LANG_PERL:
     case CBM_LANG_GROOVY:
+    case CBM_LANG_DOCKERFILE: // top-level instructions are children of source_file
         return module_parents_zig;
     case CBM_LANG_R:
         return module_parents_php;
@@ -937,6 +1090,10 @@ static const char **get_module_parents(CBMLanguage lang) {
         return module_parents_form;
     case CBM_LANG_MAGMA:
         return module_parents_magma;
+    case CBM_LANG_PROPERTIES:
+        return module_parents_properties;
+    case CBM_LANG_GOMOD: // require_directive lives at source_file top level
+        return module_parents_zig;
     default:
         return NULL;
     }
@@ -997,6 +1154,15 @@ bool cbm_is_module_level(TSNode node, CBMLanguage lang) {
 static size_t strip_ext_len(const char *s, size_t len) {
     for (size_t i = len; i > 0; i--) {
         if (s[i - SKIP_ONE] == '.') {
+            /* A dot at the very start of a filename segment (index 0, or right
+             * after a '/') is a DOTFILE marker (".env", ".gitignore"), NOT an
+             * extension separator. Stripping there leaves an empty stem whose
+             * module QN collides with the parent directory/project root. Keep
+             * the whole name as the stem; the leading dot is dropped later in
+             * append_path_segments. */
+            if (i - SKIP_ONE == 0 || s[i - SKIP_ONE - SKIP_ONE] == '/') {
+                return len;
+            }
             return i - SKIP_ONE;
         }
         if (s[i - SKIP_ONE] == '/') {
@@ -1032,9 +1198,22 @@ static char *append_path_segments(char *out, const char *rel_path, size_t plen, 
         if (part_len > 0) {
             bool is_last = (part_end == end_ptr);
             if (!should_skip_fqn_part(start, part_len, is_last, has_name)) {
-                *out++ = '.';
-                memcpy(out, start, part_len);
-                out += part_len;
+                /* Drop a leading '.' from a dotfile / hidden-dir segment
+                 * (".env" -> "env", ".github" -> "github"). Otherwise the QN
+                 * separator '.' plus the segment's own leading '.' produce a
+                 * malformed "proj..env" double-dot, and a root dotfile's empty
+                 * stem collides with the project QN. */
+                const char *seg = start;
+                size_t seg_len = part_len;
+                if (seg[0] == '.') {
+                    seg++;
+                    seg_len--;
+                }
+                if (seg_len > 0) {
+                    *out++ = '.';
+                    memcpy(out, seg, seg_len);
+                    out += seg_len;
+                }
             }
         }
         start = part_end + SKIP_ONE;
@@ -1075,6 +1254,57 @@ char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, co
 
 char *cbm_fqn_module(CBMArena *a, const char *project, const char *rel_path) {
     return cbm_fqn_compute(a, project, rel_path, NULL);
+}
+
+// True when a language derives its module from the CONTAINING DIRECTORY (Java
+// package, Go package) rather than baking the filename stem into the module QN.
+// For these languages a sibling file in the same dir shares the module, and the
+// type/method name is appended once — so a class `Outer` in `Outer.java` is
+// `proj.Outer`, not `proj.Outer.Outer`, and a method in `myapp/db/conn.go`
+// belongs to module `proj.myapp.db`, not `proj.myapp.db.conn`.
+static bool cbm_lang_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
+char *cbm_fqn_module_source_lang(CBMArena *a, const char *project, const char *rel_path,
+                                 CBMLanguage lang) {
+    if (!cbm_lang_module_is_dir(lang)) {
+        // All other languages keep the legacy filename-stem module QN.
+        return cbm_fqn_module(a, project, rel_path);
+    }
+    if (!rel_path) {
+        rel_path = "";
+    }
+    // Module is the CONTAINING DIRECTORY: strip the basename (last '/' segment).
+    const char *last_slash = strrchr(rel_path, '/');
+    if (!last_slash) {
+        // Root file: dir is empty → module is just the project.
+        return cbm_fqn_folder(a, project, "");
+    }
+    size_t dir_len = (size_t)(last_slash - rel_path);
+    char *dir = (char *)cbm_arena_alloc(a, dir_len + SKIP_ONE);
+    if (!dir) {
+        return NULL;
+    }
+    memcpy(dir, rel_path, dir_len);
+    dir[dir_len] = '\0';
+    return cbm_fqn_folder(a, project, dir);
+}
+
+char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *rel_path,
+                                  const char *name, CBMLanguage lang) {
+    if (!cbm_lang_module_is_dir(lang)) {
+        // All other languages keep the legacy filename-stem symbol QN.
+        return cbm_fqn_compute(a, project, rel_path, name);
+    }
+    char *module = cbm_fqn_module_source_lang(a, project, rel_path, lang);
+    if (!module) {
+        return NULL;
+    }
+    if (!name || !name[0]) {
+        return module;
+    }
+    return cbm_arena_sprintf(a, "%s.%s", module, name);
 }
 
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {

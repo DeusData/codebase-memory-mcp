@@ -13,6 +13,7 @@
 #include "cbm.h" /* CBMLanguage, CBM_LANG_* */
 #include "foundation/constants.h"
 #include "foundation/platform.h" /* cbm_safe_getenv */
+#include "foundation/compat_fs.h"
 
 enum { MAX_CONFIG_SIZE = 65536 };
 #include "foundation/log.h"
@@ -117,6 +118,7 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"glsl", CBM_LANG_GLSL},
     {"ini", CBM_LANG_INI},
     {"matlab", CBM_LANG_MATLAB},
+    {"mojo", CBM_LANG_MOJO},
     {"lean", CBM_LANG_LEAN},
     {"form", CBM_LANG_FORM},
     {"magma", CBM_LANG_MAGMA},
@@ -231,7 +233,7 @@ static int parse_extra_extensions(yyjson_val *root, cbm_userext_t **entries, int
  * Returns 0 on success (or absent file), -1 on alloc failure.
  */
 static int load_config_file(const char *path, cbm_userext_t **entries, int *count) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return 0; /* file absent — silently ignore */
     }

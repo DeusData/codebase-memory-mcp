@@ -25,6 +25,11 @@ typedef struct {
     const char *type;
     const char *properties; // JSON string
     const char *url_path;   // extracted from properties by Go (for idx_edges_url_path)
+    const char *local_name; // for IMPORTS edges: the UNESCAPED
+                            // json_extract(properties,'$.local_name') value; ""/NULL
+                            // otherwise. Feeds sqlite_autoindex_edges_1 — must match
+                            // what SQLite computes for the local_name_gen column or
+                            // integrity_check reports the row missing from the index.
 } CBMDumpEdge;
 
 typedef struct {

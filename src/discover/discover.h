@@ -130,10 +130,40 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out);
 
+/* One deliberately-not-indexed file (#963): an individual file dropped by an
+ * ignore mechanism during the walk (its parent directory was NOT excluded —
+ * whole subtrees are reported separately as excluded dirs). BY DESIGN, not a
+ * failure. */
+typedef struct {
+    char *rel_path; /* heap-allocated, relative to repo root */
+    char *reason;   /* heap-allocated: "gitignore" | "cbmignore" |
+                     * "skip-list" | "ignored-suffix" | "fast-pattern" |
+                     * "size-cap" */
+} cbm_ignored_file_t;
+
+/* Stored per-file ignore entries are capped (the walk still counts ALL of
+ * them in *ignored_total_out, so truncation is always explicit, never
+ * silent). Whole excluded subtrees stay exhaustive via excluded_out. */
+enum { CBM_DISCOVER_IGNORED_CAP = 2000 };
+
+/* Like cbm_discover_ex(), but additionally reports the individual files that
+ * ignore rules dropped (#963 "purposely not indexed"). *ignored_out receives
+ * a heap array (caller frees via cbm_discover_free_ignored),
+ * *ignored_count_out its stored length (<= CBM_DISCOVER_IGNORED_CAP), and
+ * *ignored_total_out the TOTAL number of ignored files seen. Pass NULL to
+ * skip the collection entirely. */
+int cbm_discover_ex2(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
+                     int *count, char ***excluded_out, int *excluded_count_out,
+                     cbm_ignored_file_t **ignored_out, int *ignored_count_out,
+                     int *ignored_total_out);
+
 /* Free an array of file info results. NULL-safe. */
 void cbm_discover_free(cbm_file_info_t *files, int count);
 
 /* Free the excluded-directory list returned by cbm_discover_ex(). NULL-safe. */
 void cbm_discover_free_excluded(char **excluded, int count);
+
+/* Free the ignored-file list returned by cbm_discover_ex2(). NULL-safe. */
+void cbm_discover_free_ignored(cbm_ignored_file_t *ignored, int count);
 
 #endif /* CBM_DISCOVER_H */

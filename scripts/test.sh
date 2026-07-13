@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # test.sh — Clean build + run all C tests with ASan + UBSan.
 #
 # Usage:
@@ -57,8 +57,8 @@ verify_compiler "$CC"
 # Step 1: Clean
 scripts/clean.sh
 
-# Step 2 + 3: Build and run tests (with arch prefix on macOS)
-$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
+make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
@@ -72,8 +72,14 @@ fi
 # Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-$ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
+make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
 bash "$ROOT/tests/test_parent_watchdog.sh"
+
+# Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
+# (`cli --index-worker …`) whose supervisor dies must self-exit instead of
+# indexing on as an orphan. Reuses the prod binary built in Step 5.
+echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
+bash "$ROOT/tests/test_worker_watchdog.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

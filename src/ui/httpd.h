@@ -42,13 +42,15 @@ typedef struct cbm_httpd cbm_httpd_t;         /* listener */
 typedef struct cbm_http_conn cbm_http_conn_t; /* accepted connection */
 
 /* A parsed request. `path` and `query` are raw (NOT percent-decoded).
- * `origin` is the Origin header value ("" when absent) — the only header
- * the routing layer consumes. `body` is heap-allocated, NUL-terminated. */
+ * `origin` and `accept_language` are the header values consumed by the
+ * routing layer ("" when absent). `body` is heap-allocated, NUL-terminated. */
 typedef struct {
     char method[16];
     char path[2048];
     char query[2048];
     char origin[256];
+    char host[256];
+    char accept_language[256];
     char *body;
     size_t body_len;
 } cbm_http_req_t;
@@ -95,6 +97,8 @@ void cbm_http_replyf(cbm_http_conn_t *c, int status, const char *extra_headers, 
 void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_headers, const void *data,
                         size_t len);
 
+int cbm_http_conn_status(const cbm_http_conn_t *c);
+size_t cbm_http_conn_response_bytes(const cbm_http_conn_t *c);
 void cbm_httpd_conn_close(cbm_http_conn_t *c);
 
 /* ── Pure helpers (unit-tested without sockets) ───────────────── */

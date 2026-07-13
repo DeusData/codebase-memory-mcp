@@ -22,6 +22,8 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "cbm.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
@@ -31,20 +33,45 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include <string.h>
 
 /* Read entire file into heap-allocated buffer. Returns NULL on error.
- * Caller must free(). Sets *out_len to byte count. */
-static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+ * Caller must free(). Sets *out_len to byte count. *out_size receives the
+ * on-disk size and *out_status the failure reason, so the caller can attribute
+ * a skip to the right phase/reason (read vs oversized) instead of a silent
+ * drop. Both out params may be NULL. */
+static char *read_file(const char *path, int *out_len, long *out_size,
+                       cbm_read_status_t *out_status) {
+    if (out_size) {
+        *out_size = 0;
+    }
+    if (out_status) {
+        *out_status = CBM_READ_OK;
+    }
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
+        if (out_status) {
+            *out_status = CBM_READ_OPEN_FAIL;
+        }
         return NULL;
     }
 
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
+    if (out_size) {
+        *out_size = size;
+    }
 
-    if (size <= 0 ||
-        size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) { /* CBM_PERCENT MB sanity limit */
+    if (size <= 0) {
         (void)fclose(f);
+        if (out_status) {
+            *out_status = CBM_READ_EMPTY;
+        }
+        return NULL;
+    }
+    if (size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
+        (void)fclose(f);
+        if (out_status) {
+            *out_status = CBM_READ_OVERSIZED;
+        }
         return NULL;
     }
 
@@ -56,6 +83,9 @@ static char *read_file(const char *path, int *out_len) {
     char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
     if (!buf) {
         (void)fclose(f);
+        if (out_status) {
+            *out_status = CBM_READ_OOM;
+        }
         return NULL;
     }
 
@@ -295,15 +325,18 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
-    /* Register callable symbols + Interface.  Interface must be in the registry
-     * so C#/Java `class Foo : IBar` / `class Foo implements IBar` can resolve
-     * `IBar` to an INHERITS edge target during the enrichment phase.
-     * Variable/Field defs are also registered so pass_usages.c can resolve
-     * READS/WRITES accesses (rw->var_name) to a Variable/Field node QN. */
+    /* Register callable symbols + every type-like container (Class/Struct/
+     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
+     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
+     * field resolution can reach them — Struct included so Rust/Go/Swift/D structs
+     * resolve as type targets just as a Class did. Variable/Field defs are also
+     * registered so pass_usages.c can resolve READS/WRITES accesses (rw->var_name)
+     * to a Variable/Field node QN.
+     * KEEP IN SYNC with pass_parallel.c and pipeline_incremental.c's seed sets. */
     if (node_id > 0 && def->label &&
         (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         strcmp(def->label, "Class") == 0 || strcmp(def->label, "Interface") == 0 ||
-         strcmp(def->label, "Variable") == 0 || strcmp(def->label, "Field") == 0)) {
+         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
+         strcmp(def->label, "Field") == 0)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -392,6 +425,12 @@ static int create_env_configures_for_file(cbm_pipeline_ctx_t *ctx, const CBMFile
         const cbm_gbuf_node_t *src = NULL;
         if (ea->enclosing_func_qn && ea->enclosing_func_qn[0]) {
             src = cbm_gbuf_find_by_qn(ctx->gbuf, ea->enclosing_func_qn);
+            /* A class-level env access in a directory-module language carries
+             * the DIRECTORY module QN, which hits the shared Folder/Project
+             * node — attribute to this file's File node instead (#787, #842). */
+            if (cbm_pipeline_node_is_dir_container(src)) {
+                src = NULL;
+            }
         }
         if (!src) {
             if (!file_qn) {
@@ -481,11 +520,49 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
 
+        /* Crash-quarantine skip (Stage 3c): the supervisor's single-threaded
+         * recovery re-run always lands on THIS sequential path (worker_count
+         * forced to 1). This first sequential pass REPORTS a crasher as a
+         * phase="crash" skip (surfacing it in skipped[]) and continues; later
+         * sequential passes (calls/usages/semantic) re-extract on a cache miss
+         * but hit the hard guard inside cbm_extract_file, so they no-op without
+         * re-crashing and without duplicating the skip. No-op unless
+         * CBM_INDEX_QUARANTINE_FILE is set. */
+        if (cbm_index_is_quarantined(rel)) {
+            const char *phase = cbm_index_quarantine_phase(rel);
+            if (!phase) {
+                phase = "crash";
+            }
+            const char *reason =
+                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
+            errors++;
+            continue;
+        }
+
         /* Read source file */
         int source_len = 0;
-        char *source = read_file(path, &source_len);
+        long file_size = 0;
+        cbm_read_status_t rst = CBM_READ_OK;
+        char *source = read_file(path, &source_len, &file_size, &rst);
         if (!source) {
             errors++;
+            if (rst == CBM_READ_OVERSIZED) {
+                /* Never a silent drop: record the oversized skip + WARN so the
+                 * file surfaces in the response/logfile with its sizes. */
+                long cap = cbm_max_file_bytes();
+                char reason[96];
+                snprintf(reason, sizeof(reason), "oversized (%lld MB > %lld MB)",
+                         (long long)(file_size / (CBM_SZ_1K * CBM_SZ_1K)),
+                         (long long)(cap / (CBM_SZ_1K * CBM_SZ_1K)));
+                cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, "oversized");
+                cbm_log_warn("index.file_oversized", "path", rel, "size_mb",
+                             itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
+                             itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
+            } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
+                cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
+            }
+            /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */
             continue;
         }
 
@@ -498,7 +575,24 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         if (!result) {
             errors++;
+            cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
             continue;
+        }
+        /* Consume the previously-ignored has_error flag: a parse timeout /
+         * parse failure / unsupported-grammar result carries no defs but must
+         * still be reported (phase "extract", reason = the extractor's message).
+         * The empty result flows through unchanged (the defs loop is a no-op). */
+        if (result->has_error) {
+            cbm_pipeline_add_file_error(ctx->pipeline, rel,
+                                        result->error_msg ? result->error_msg : "extract failed",
+                                        "extract");
+            errors++;
+        } else if (result->parse_incomplete) {
+            /* Best-effort parse-coverage signal (#963): indexed, but with
+             * ERROR/MISSING regions — see pass_parallel.c (keep in sync). */
+            cbm_pipeline_add_file_error(ctx->pipeline, rel,
+                                        result->error_ranges ? result->error_ranges : "unknown",
+                                        "parse_partial");
         }
 
         /* Create nodes for each definition */

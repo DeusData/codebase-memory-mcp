@@ -6,7 +6,22 @@
 #include <stdlib.h>
 
 // Forward declarations
-static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node);
+static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node);
+
+/* Depth-guarded entry for the AST call-resolution walk. The walk recurses once
+ * per nesting level; a deeply-nested or cyclic file can overflow the native
+ * stack (SIGSEGV) and take down the whole index. Past the cap the subtree is
+ * skipped — its calls stay unresolved, which is graceful degradation, not a
+ * crash. The cap is CBM_LSP_MAX_WALK_DEPTH, env-overridable via the same name.
+ * The walk_depth-- runs after the inner returns, so early returns in the body
+ * never leak the counter. */
+static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
+    if (ctx->walk_depth >= cbm_lsp_max_walk_depth())
+        return;
+    ctx->walk_depth++;
+    resolve_calls_in_node_inner(ctx, node);
+    ctx->walk_depth--;
+}
 static void emit_resolved_call(GoLSPContext* ctx, const char* callee_qn, const char* strategy, float confidence);
 static const CBMType* go_lookup_field(GoLSPContext* ctx, const char* type_qn, const char* field_name, int depth);
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
@@ -1108,7 +1123,7 @@ static void emit_unresolved_call(GoLSPContext* ctx, const char* expr_text, const
 
 // --- Walk call expressions and resolve them ---
 
-static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
+static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
     if (ts_node_is_null(node)) return;
     const char* kind = ts_node_type(node);
 
@@ -1222,8 +1237,13 @@ static void resolve_calls_in_node(GoLSPContext* ctx, TSNode node) {
                                         const CBMRegisteredFunc* concrete_method =
                                             cbm_registry_lookup_method(ctx->registry, sole_impl_qn, field_name);
                                         if (concrete_method) {
+                                            // Sole-implementer interface dispatch is an unambiguous
+                                            // resolution (exactly one concrete method); rank it at least
+                                            // as high as a direct type dispatch (0.95) so the concrete
+                                            // `Type.method` wins over the interface-method type_dispatch
+                                            // for the same call site.
                                             emit_resolved_call(ctx, concrete_method->qualified_name,
-                                                "lsp_interface_resolve", 0.90f);
+                                                "lsp_interface_resolve", 0.95f);
                                             goto recurse;
                                         }
                                     }
@@ -1481,7 +1501,42 @@ static void process_function(GoLSPContext* ctx, TSNode func_node) {
     char* func_name = lsp_node_text(ctx, name_node);
     if (!func_name || !func_name[0]) return;
 
-    ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, func_name);
+    // For methods, the enclosing-function QN must include the receiver type
+    // (package.Type.Method), matching how the textual extractor and the
+    // registry qualify the method. Building it as package.Method (no receiver)
+    // here made the LSP-resolved call's caller_qn disagree with the textual
+    // call's enclosing_func_qn, so cbm_pipeline_find_lsp_resolution never
+    // joined them — every call inside a method body silently lost its
+    // type-aware LSP strategy. Derive the bare receiver type name the same way
+    // the receiver binding below does.
+    char* recv_type_name = NULL;
+    {
+        TSNode recv0 = ts_node_child_by_field_name(func_node, "receiver", 8);
+        if (!ts_node_is_null(recv0)) {
+            uint32_t rnc0 = ts_node_child_count(recv0);
+            for (uint32_t i = 0; i < rnc0 && !recv_type_name; i++) {
+                TSNode rp = ts_node_child(recv0, i);
+                if (ts_node_is_null(rp) || !ts_node_is_named(rp)) continue;
+                if (strcmp(ts_node_type(rp), "parameter_declaration") != 0) continue;
+                TSNode rtype = ts_node_child_by_field_name(rp, "type", 4);
+                if (ts_node_is_null(rtype)) continue;
+                // Unwrap a pointer receiver (*Type) to the bare type identifier.
+                const char* rtk = ts_node_type(rtype);
+                if (strcmp(rtk, "pointer_type") == 0 && ts_node_named_child_count(rtype) > 0) {
+                    rtype = ts_node_named_child(rtype, 0);
+                }
+                char* tn = lsp_node_text(ctx, rtype);
+                if (tn && tn[0]) recv_type_name = tn;
+            }
+        }
+    }
+
+    if (recv_type_name) {
+        ctx->enclosing_func_qn =
+            cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->package_qn, recv_type_name, func_name);
+    } else {
+        ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, func_name);
+    }
 
     // Push function scope
     CBMScope* saved_scope = ctx->current_scope;
@@ -1678,9 +1733,10 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
         CBMDefinition* d = &result->defs.items[i];
         if (!d->qualified_name || !d->name) continue;
 
-        // Register Class/Type nodes
-        if (d->label && (strcmp(d->label, "Class") == 0 || strcmp(d->label, "Type") == 0 ||
-                         strcmp(d->label, "Interface") == 0)) {
+        // Register every type-like container (Class/Struct/Type/Interface/Enum/
+        // Trait). Struct included so a Go `type T struct {...}` (now labelled
+        // "Struct") is registered as a type and its methods/embedding resolve.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
@@ -2499,9 +2555,9 @@ void cbm_run_go_lsp_cross(
 
         const char* def_mod = d->def_module_qn ? d->def_module_qn : module_qn;
 
-        // Type/Interface/Class
-        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
-            strcmp(d->label, "Interface") == 0) {
+        // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
+        // Struct included so Go structs (now labelled "Struct") register as types.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;  // borrowed
@@ -2752,8 +2808,9 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
          * fall back to — this registry is project-wide, not per-file. */
         const char* def_mod = d->def_module_qn ? d->def_module_qn : "";
 
-        if (strcmp(d->label, "Type") == 0 || strcmp(d->label, "Class") == 0 ||
-            strcmp(d->label, "Interface") == 0) {
+        // Every type-like container (Type/Class/Struct/Interface/Enum/Trait).
+        // Struct included so Go structs (now labelled "Struct") register as types.
+        if (cbm_label_is_type_like(d->label)) {
             CBMRegisteredType rt;
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name; /* borrowed */
@@ -2793,6 +2850,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
     }
 
     cbm_registry_finalize(reg);
+    reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
 

@@ -807,6 +807,62 @@ TEST(store_file_hash_batch) {
     PASS();
 }
 
+/* Guard for the persist-tail switch (pipeline.c dump_and_persist_hashes) from a
+ * per-file cbm_store_upsert_file_hash loop to a single cbm_store_upsert_file_hash_batch:
+ * both paths must yield IDENTICAL file_hashes rows (same tuples, same upsert/replace
+ * semantics — only the transaction boundary differs). Uses sha256="" exactly as the
+ * persist path does. */
+TEST(store_file_hash_batch_equals_loop) {
+    cbm_file_hash_t rows[4] = {
+        {.project = "p", .rel_path = "a.c", .sha256 = "", .mtime_ns = 111, .size = 10},
+        {.project = "p", .rel_path = "b/c.c", .sha256 = "", .mtime_ns = 222, .size = 20},
+        {.project = "p", .rel_path = "d.rs", .sha256 = "", .mtime_ns = 333, .size = 30},
+        {.project = "p", .rel_path = "e.py", .sha256 = "", .mtime_ns = 444, .size = 40},
+    };
+
+    /* Store A: the original per-file loop. */
+    cbm_store_t *a = cbm_store_open_memory();
+    cbm_store_upsert_project(a, "p", "/tmp/p");
+    for (int i = 0; i < 4; i++) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(a, rows[i].project, rows[i].rel_path, rows[i].sha256,
+                                             rows[i].mtime_ns, rows[i].size),
+                  CBM_STORE_OK);
+    }
+
+    /* Store B: the batched path. */
+    cbm_store_t *b = cbm_store_open_memory();
+    cbm_store_upsert_project(b, "p", "/tmp/p");
+    ASSERT_EQ(cbm_store_upsert_file_hash_batch(b, rows, 4), CBM_STORE_OK);
+
+    cbm_file_hash_t *ha = NULL, *hb = NULL;
+    int ca = 0, cb = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(a, "p", &ha, &ca), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_file_hashes(b, "p", &hb, &cb), CBM_STORE_OK);
+    ASSERT_EQ(ca, 4);
+    ASSERT_EQ(cb, 4);
+
+    /* Compare as sets (get_file_hashes has no ORDER BY). */
+    for (int i = 0; i < ca; i++) {
+        int found = 0;
+        for (int j = 0; j < cb; j++) {
+            if (strcmp(ha[i].rel_path, hb[j].rel_path) == 0) {
+                ASSERT_STR_EQ(ha[i].sha256, hb[j].sha256);
+                ASSERT_EQ(ha[i].mtime_ns, hb[j].mtime_ns);
+                ASSERT_EQ(ha[i].size, hb[j].size);
+                found = 1;
+                break;
+            }
+        }
+        ASSERT_TRUE(found);
+    }
+
+    cbm_store_free_file_hashes(ha, ca);
+    cbm_store_free_file_hashes(hb, cb);
+    cbm_store_close(a);
+    cbm_store_close(b);
+    PASS();
+}
+
 /* ── Find edges by URL path ────────────────────────────────────── */
 
 TEST(store_find_edges_by_url_path) {
@@ -1537,7 +1593,83 @@ TEST(store_count_nodes_unknown_project) {
     PASS();
 }
 
+/* ── Index coverage (#963) ──────────────────────────────────────── */
+
+/* Round-trip + deleted-file prune + shadow miss-graph materialization +
+ * empty-replace wipe. The prune keys off file_hashes (the live-file set), so
+ * a row for a file with no hash row must not survive the replace. */
+TEST(store_coverage_roundtrip_prune_shadow) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_store_upsert_file_hash(s, "test", "src/a.py", "", 1, 10);
+
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "src/a.py", .kind = "parse_partial", .detail = "4-7"},
+        {.rel_path = "gone.py", .kind = "oversized", .detail = "too big"},
+        /* By-design rows (#963): neither has a file_hashes row, yet both must
+         * SURVIVE the deleted-file prune (deliberately-unindexed paths never
+         * have hashes) — and must stay OUT of the shadow miss graph. */
+        {.rel_path = "secret.py", .kind = "not_indexed_file", .detail = "gitignore"},
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, "test", rows, 4), CBM_STORE_OK);
+
+    cbm_coverage_row_t *got = NULL;
+    int n = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "test", &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 3); /* gone.py pruned — no file_hashes row; by-design rows kept */
+    int saw_partial = 0;
+    int saw_by_design = 0;
+    for (int i = 0; i < n; i++) {
+        if (strcmp(got[i].kind, "parse_partial") == 0) {
+            saw_partial++;
+        }
+        if (strncmp(got[i].kind, "not_indexed", 11) == 0) {
+            saw_by_design++;
+        }
+    }
+    ASSERT_EQ(saw_partial, 1);
+    ASSERT_EQ(saw_by_design, 2);
+    cbm_store_free_coverage(got, n);
+
+    /* Shadow miss-graph materialized under "test::missed": FAILURES only —
+     * Project → Folder(src) → File(a.py){kind,detail}; the by-design rows do
+     * not appear. */
+    cbm_node_t *nodes = NULL;
+    int nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test::missed", "File", &nodes, &nc), CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].file_path, "src/a.py");
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"kind\":\"parse_partial\""));
+    ASSERT_NOT_NULL(strstr(nodes[0].properties_json, "\"detail\":\"4-7\""));
+    cbm_store_free_nodes(nodes, nc);
+    nodes = NULL;
+    nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test::missed", "Folder", &nodes, &nc),
+              CBM_STORE_OK);
+    ASSERT_EQ(nc, 1);
+    ASSERT_STR_EQ(nodes[0].name, "src");
+    cbm_store_free_nodes(nodes, nc);
+
+    /* Empty replace clears the table AND wipes the shadow graph. */
+    ASSERT_EQ(cbm_store_coverage_replace(s, "test", NULL, 0), CBM_STORE_OK);
+    got = NULL;
+    n = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "test", &got, &n), CBM_STORE_OK);
+    ASSERT_EQ(n, 0);
+    free(got);
+    nodes = NULL;
+    nc = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, "test::missed", "File", &nodes, &nc), CBM_STORE_OK);
+    ASSERT_EQ(nc, 0);
+    cbm_store_free_nodes(nodes, nc);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
+    RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
@@ -1572,6 +1704,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_find_by_qn_suffix_dot_boundary);
     RUN_TEST(store_node_degree);
     RUN_TEST(store_file_hash_batch);
+    RUN_TEST(store_file_hash_batch_equals_loop);
     RUN_TEST(store_find_edges_by_url_path);
     RUN_TEST(store_restore_from);
     RUN_TEST(store_pragma_settings);

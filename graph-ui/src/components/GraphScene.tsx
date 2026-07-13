@@ -9,6 +9,14 @@ import { EdgeLines } from "./EdgeLines";
 import { NodeLabels } from "./NodeLabels";
 import { NodeTooltip } from "./NodeTooltip";
 import type { GraphData, GraphNode, LinkedProject } from "../lib/types";
+import {
+  DEFAULT_DISPLAY_SETTINGS,
+  bloomIntensityScale,
+  nodeBoostScale,
+  type DisplaySettings,
+} from "../lib/density";
+
+const BASE_BLOOM_INTENSITY = 1.45;
 
 /* ── Camera fly-to animation ────────────────────────────── */
 
@@ -17,7 +25,13 @@ interface CameraTarget {
   lookAt: THREE.Vector3;
 }
 
-function CameraAnimator({ target }: { target: CameraTarget | null }) {
+function CameraAnimator({
+  target,
+  controlsRef,
+}: {
+  target: CameraTarget | null;
+  controlsRef: React.RefObject<OrbitControlsImpl | null>;
+}) {
   const { camera } = useThree();
   const targetRef = useRef<CameraTarget | null>(null);
   const progress = useRef(1);
@@ -36,7 +50,17 @@ function CameraAnimator({ target }: { target: CameraTarget | null }) {
     const t = 1 - Math.pow(1 - progress.current, 3); /* ease-out cubic */
 
     camera.position.lerp(targetRef.current.position, t * 0.08);
-    camera.lookAt(targetRef.current.lookAt);
+
+    /* Move the OrbitControls pivot to the focus point as well. Otherwise the
+     * controls keep their target at the origin and re-center the view on the
+     * next frame, snapping the camera back to the middle after the fly-to. */
+    const controls = controlsRef.current;
+    if (controls) {
+      controls.target.lerp(targetRef.current.lookAt, t * 0.08);
+      controls.update();
+    } else {
+      camera.lookAt(targetRef.current.lookAt);
+    }
   });
 
   return null;
@@ -45,6 +69,8 @@ function CameraAnimator({ target }: { target: CameraTarget | null }) {
 /* ── Idle auto-rotation ──────────────────────────────────── */
 
 const IDLE_TIMEOUT_MS = 60_000;
+export const GRAPH_CANVAS_DPR: [number, number] = [1, 1.5];
+export const GRAPH_COMPOSER_MULTISAMPLING = 0;
 
 function IdleAutoRotate({
   controlsRef,
@@ -86,30 +112,55 @@ function IdleAutoRotate({
 
 interface GraphSceneProps {
   data: GraphData;
+  /* Missed skeleton (#963): pre-offset, pre-painted white nodes + edges of
+   * the not-fully-indexed files, rendered as a ghost cluster beside the
+   * galaxy. null hides it. */
+  missed?: { nodes: GraphNode[]; edges: GraphData["edges"] } | null;
   highlightedIds: Set<number> | null;
   cameraTarget: CameraTarget | null;
   showLabels: boolean;
+  display?: DisplaySettings;
   onNodeClick: (node: GraphNode) => void;
+  /* Fired when a click hits empty space (no node). Used to fly back to the
+   * overview after focusing the missed skeleton. */
+  onBackgroundClick?: () => void;
 }
 
 export type { CameraTarget };
 
 export function GraphScene({
   data,
+  missed = null,
   highlightedIds,
   cameraTarget,
   showLabels,
+  display = DEFAULT_DISPLAY_SETTINGS,
   onNodeClick,
+  onBackgroundClick,
 }: GraphSceneProps) {
   const [hovered, setHovered] = useState<GraphNode | null>(null);
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
+
+  /* Adaptive density defaults × user multipliers. The automatic scale keeps
+   * contrast roughly constant as the graph grows; the sliders nudge it.
+   * NodeCloud applies `nodeBoost` directly (no internal density scaling),
+   * whereas EdgeLines scales by edge density itself — so it receives only the
+   * user edge-brightness multiplier to avoid double-applying. */
+  const nodeBoost = nodeBoostScale(data.nodes.length) * display.nodeGlow;
+  const bloomIntensity =
+    BASE_BLOOM_INTENSITY * bloomIntensityScale(data.nodes.length) * display.bloom;
 
   return (
     <Canvas
       camera={{ position: [0, 0, 800], fov: 50, near: 0.1, far: 100000 }}
       style={{ background: "#06090f" }}
-      dpr={[1, 2]}
-      gl={{ antialias: true, alpha: false }}
+      dpr={GRAPH_CANVAS_DPR}
+      gl={{
+        antialias: false,
+        alpha: false,
+        powerPreference: "high-performance",
+      }}
+      onPointerMissed={onBackgroundClick}
     >
       <color attach="background" args={["#06090f"]} />
       <ambientLight intensity={0.5} />
@@ -124,14 +175,40 @@ export function GraphScene({
         nodes={data.nodes}
         edges={data.edges}
         highlightedIds={highlightedIds}
+        brightness={display.edgeBrightness}
       />
       <NodeCloud
         nodes={data.nodes}
         highlightedIds={highlightedIds}
         onHover={setHovered}
         onClick={onNodeClick}
+        boost={nodeBoost}
       />
       {showLabels && <NodeLabels nodes={data.nodes} highlightedIds={highlightedIds} />}
+
+      {/* Missed skeleton (#963): white ghost of the not-fully-indexed files.
+       * Clicks route through the same handler — GraphTab re-centers the
+       * camera on the whole skeleton cluster. */}
+      {missed && missed.nodes.length > 0 && (
+        <group>
+          <EdgeLines
+            nodes={missed.nodes}
+            edges={missed.edges}
+            highlightedIds={null}
+            opacity={0.28}
+            brightness={display.edgeBrightness}
+          />
+          <NodeCloud
+            nodes={missed.nodes}
+            highlightedIds={null}
+            onHover={setHovered}
+            onClick={onNodeClick}
+            opacity={0.6}
+            boost={nodeBoost * 0.75}
+          />
+          {showLabels && <NodeLabels nodes={missed.nodes} highlightedIds={null} />}
+        </group>
+      )}
 
       {/* Satellite galaxies for cross-repo linked projects */}
       {data.linked_projects?.map((lp: LinkedProject) => {
@@ -148,6 +225,7 @@ export function GraphScene({
               edges={lp.edges}
               highlightedIds={null}
               opacity={0.3}
+              brightness={display.edgeBrightness}
             />
             <NodeCloud
               nodes={offsetNodes}
@@ -155,6 +233,7 @@ export function GraphScene({
               onHover={setHovered}
               onClick={onNodeClick}
               opacity={0.5}
+              boost={nodeBoost}
             />
             {/* Inter-galaxy CROSS_* edges: source is in primary, target in
              * this linked project's offset nodes. */}
@@ -165,6 +244,7 @@ export function GraphScene({
                 edges={lp.cross_edges}
                 highlightedIds={highlightedIds}
                 opacity={0.85}
+                brightness={display.edgeBrightness}
               />
             )}
           </group>
@@ -173,14 +253,14 @@ export function GraphScene({
 
       {hovered && <NodeTooltip node={hovered} />}
 
-      <CameraAnimator target={cameraTarget} />
+      <CameraAnimator target={cameraTarget} controlsRef={controlsRef} />
       <IdleAutoRotate controlsRef={controlsRef} />
 
-      <EffectComposer>
+      <EffectComposer multisampling={GRAPH_COMPOSER_MULTISAMPLING}>
         <Bloom
           luminanceThreshold={0.3}
           luminanceSmoothing={0.7}
-          intensity={1.2}
+          intensity={bloomIntensity}
           mipmapBlur
           radius={0.6}
         />

@@ -27,9 +27,48 @@
  */
 
 #include "ts_lsp.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* TEST HOOK: full per-file cross-registry builds (stdlib + every cross-file
+ * def registered + finalized, per file). This is the sequential-mode quadratic
+ * that ground an 81k-file TS corpus for hours — the shared-registry dispatch
+ * must keep it at ZERO; any nonzero count means a resolve path regressed to
+ * the per-file build. */
+static _Atomic long g_ts_full_reg_builds;
+long cbm_ts_full_registry_builds(void) {
+    return atomic_load(&g_ts_full_reg_builds);
+}
+void cbm_ts_full_registry_builds_reset(void) {
+    atomic_store(&g_ts_full_reg_builds, 0);
+}
+
+/* Dynamic work budget for parse_ts_type_text (thread-local, reset at every
+ * per-file/per-build entry point). The type-text parser is self-recursive
+ * over string SLICES and re-derives lengths per call, so an adversarial or
+ * generated type text can cost far more than its bytes suggest. Instead of
+ * a fixed depth cap, the total work SCALES WITH THE INPUT: budget =
+ * 1M + 64 x source_len units, each call charging 1 + slice_len/16 — i.e.
+ * total scanned bytes are bounded at ~1024x the source size, generous
+ * enough that no real-world file ever hits it. CBM_TS_TYPE_BUDGET (absolute
+ * units) overrides. On exhaustion: WARN once per window, then return
+ * UNKNOWN — the same graceful degradation the parser already uses for
+ * constructs it does not model. -1 = unlimited (no entry point armed it). */
+static _Thread_local long g_ts_type_budget = -1;
+static _Thread_local bool g_ts_type_budget_warned;
+
+static void ts_type_budget_reset(size_t source_len) {
+    const char *e = getenv("CBM_TS_TYPE_BUDGET");
+    if (e && e[0]) {
+        long v = atol(e);
+        g_ts_type_budget = (v > 0) ? v : -1;
+    } else {
+        g_ts_type_budget = 1000000 + (long)source_len * 64;
+    }
+    g_ts_type_budget_warned = false;
+}
 
 #define TS_LSP_MAX_EVAL_DEPTH 64
 #define TS_LSP_FIELD_LEN(s) ((uint32_t)(sizeof(s) - 1))
@@ -155,6 +194,22 @@ static const CBMType *parse_ts_type_text(CBMArena *arena, const char *text, cons
         len--;
     if (len == 0)
         return cbm_type_unknown();
+
+    /* Dynamic budget (see g_ts_type_budget): charge proportional to this
+     * slice; on exhaustion degrade to UNKNOWN instead of grinding. */
+    if (g_ts_type_budget >= 0) {
+        g_ts_type_budget -= 1 + (long)(len / 16);
+        if (g_ts_type_budget < 0) {
+            if (!g_ts_type_budget_warned) {
+                g_ts_type_budget_warned = true;
+                fprintf(stderr,
+                        "  [tslsp] type-text parse budget exhausted (module %s); "
+                        "returning unknown\n",
+                        module_qn ? module_qn : "?");
+            }
+            return cbm_type_unknown();
+        }
+    }
 
     // Function type `(params) => returnType` (TS function type literal).
     if (text[0] == '(') {
@@ -2653,6 +2708,16 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
         const char *lname = ctx->import_local_names ? ctx->import_local_names[i] : NULL;
         const char *mqn = ctx->import_module_qns ? ctx->import_module_qns[i] : NULL;
         if (lname && mqn && strcmp(lname, tag_name) == 0) {
+            /* A relative module path ("./widget") is unresolved at the per-file
+             * stage — it is the raw specifier, not a module QN, so "./widget.Widget"
+             * matches no node and (winning the join on equal confidence) would drop
+             * the edge. The cross-file pass re-runs with the path resolved to the
+             * real module QN and emits the correct resolution, so skip the per-file
+             * emission for relative specifiers and let that one stand. */
+            if (mqn[0] == '.') {
+                ts_emit_unresolved_call(ctx, tag_name, "jsx_import_unresolved_path");
+                return;
+            }
             const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", mqn, tag_name);
             ts_emit_resolved_call(ctx, qn, "lsp_ts_jsx_import", 0.85f);
             return;
@@ -4774,6 +4839,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
                     TSNode root, bool js_mode, bool jsx_mode, bool dts_mode) {
     if (!arena || !result || !source || ts_node_is_null(root))
         return;
+    ts_type_budget_reset((size_t)source_len);
 
     // Diagnostic / benchmarking knob: setting `CBM_LSP_DISABLED=1` skips the resolver.
     // This is used by the baseline-vs-LSP comparison tests to measure how many calls
@@ -4967,6 +5033,8 @@ CBMTypeRegistry *cbm_ts_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
         return NULL;
     cbm_registry_init(reg, arena);
     cbm_ts_stdlib_register(reg, arena);
+    /* Budget scales with the def volume this build parses type texts for. */
+    ts_type_budget_reset((size_t)(def_count > 0 ? def_count : 1) * 1024);
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef *d = &defs[i];
         if (d->lang != CBM_LANG_JAVASCRIPT && d->lang != CBM_LANG_TYPESCRIPT &&
@@ -4976,6 +5044,7 @@ CBMTypeRegistry *cbm_ts_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
         ts_register_lsp_defs(arena, reg, d, 1);
     }
     cbm_registry_finalize(reg);
+    reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
 
@@ -4994,6 +5063,8 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         TSTree *cached_tree, CBMResolvedCallArray *out) {
     if (!arena || !out || !reg)
         return;
+
+    ts_type_budget_reset((size_t)source_len);
 
     /* Per-file overlay: register only the file's own-module defs so the
      * AST passes can refine them. Imports/stdlib resolve via fallback. */
@@ -5064,6 +5135,8 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
     if (!arena || !out)
         return;
 
+    atomic_fetch_add(&g_ts_full_reg_builds, 1);
+    ts_type_budget_reset((size_t)source_len);
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_ts_stdlib_register(&reg, arena);
