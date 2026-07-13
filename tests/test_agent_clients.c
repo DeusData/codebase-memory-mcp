@@ -358,6 +358,9 @@ TEST(agent_clients_resolve_rovo_override_and_conditional_paths) {
     agent_probe_t probe = {.paths = {config}, .path_count = 1U};
     cbm_agent_client_resolve_options_t options = agent_options(&probe);
     options.home_dir = dir;
+#ifdef _WIN32
+    options.is_windows = true;
+#endif
     char path[1024];
     ASSERT_EQ(
         cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_ROVO_DEV, &options, path, sizeof(path)), 0);
@@ -395,6 +398,9 @@ TEST(agent_clients_rovo_override_rejects_relative_and_traversal_paths) {
     agent_probe_t probe = {.paths = {config}, .path_count = 1U};
     cbm_agent_client_resolve_options_t options = agent_options(&probe);
     options.home_dir = dir;
+#ifdef _WIN32
+    options.is_windows = true;
+#endif
 
     for (size_t i = 0U; i < sizeof(invalid_paths) / sizeof(invalid_paths[0]); i++) {
         ASSERT_EQ(agent_write_rovo_override(config, invalid_paths[i]), 0);
@@ -425,6 +431,9 @@ TEST(agent_clients_rovo_override_rejects_absolute_paths_outside_user_root) {
     agent_probe_t probe = {.paths = {config}, .path_count = 1U};
     cbm_agent_client_resolve_options_t options = agent_options(&probe);
     options.home_dir = dir;
+#ifdef _WIN32
+    options.is_windows = true;
+#endif
 
     for (size_t i = 0U; i < sizeof(invalid_paths) / sizeof(invalid_paths[0]); i++) {
         ASSERT_EQ(agent_write_rovo_override(config, invalid_paths[i]), 0);

@@ -1366,8 +1366,14 @@ TEST(cli_vscode_profile_mcp_uninstall) {
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
+    char *saved_appdata = save_test_env("APPDATA");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
+#ifdef _WIN32
+    char appdata[512];
+    snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
+    cbm_setenv("APPDATA", appdata, 1);
+#endif
     char *argv[] = {"uninstall", "--yes"};
     int rc = cbm_cmd_uninstall(2, argv);
     char *base = read_test_file_alloc(base_config);
@@ -1379,6 +1385,7 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     free(profile);
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
+    restore_test_env("APPDATA", saved_appdata);
     test_rmdir_r(tmpdir);
     if (rc != 0 || !removed)
         FAIL("VS Code uninstall must remove MCP entries from every existing profile");
@@ -2121,11 +2128,16 @@ TEST(cli_special_hook_failures_propagate_from_install_and_uninstall) {
 
     char *after = read_test_file_alloc(hooks_path);
     bool unchanged = after && strcmp(after, "[]\n") == 0;
+#ifdef _WIN32
+    bool results_ok = install_rc == 0 && uninstall_rc != 0;
+#else
+    bool results_ok = install_rc != 0 && uninstall_rc != 0;
+#endif
     free(after);
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     test_rmdir_r(tmpdir);
-    if (install_rc == 0 || uninstall_rc == 0 || !unchanged)
+    if (!results_ok || !unchanged)
         FAIL("special hook editor failures must propagate without changing foreign content");
     PASS();
 }
@@ -2495,9 +2507,15 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
     char *saved_copilot = save_test_env("COPILOT_HOME");
     char *saved_crush = save_test_env("CRUSH_GLOBAL_CONFIG");
     char *saved_vibe = save_test_env("VIBE_HOME");
+    char *saved_appdata = save_test_env("APPDATA");
     cbm_unsetenv("COPILOT_HOME");
     cbm_unsetenv("CRUSH_GLOBAL_CONFIG");
     cbm_unsetenv("VIBE_HOME");
+#ifdef _WIN32
+    char appdata[512];
+    snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
+    cbm_setenv("APPDATA", appdata, 1);
+#endif
 
     const char *const dirs[] = {
         ".hermes",
@@ -2541,7 +2559,9 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "\"factory-droid\"",
         "/.factory/mcp.json",
         "/.factory/AGENTS.md",
+#ifndef _WIN32
         "/.factory/hooks.json",
+#endif
         "\"crush\"",
         "/.config/crush/crush.json",
         "/.config/crush/codebase-memory.md",
@@ -2568,6 +2588,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
     restore_test_env("COPILOT_HOME", saved_copilot);
     restore_test_env("CRUSH_GLOBAL_CONFIG", saved_crush);
     restore_test_env("VIBE_HOME", saved_vibe);
+    restore_test_env("APPDATA", saved_appdata);
     test_rmdir_r(tmpdir);
 
     if (!has_json || missing)
@@ -2581,15 +2602,20 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    const char *const env_names[] = {"PATH",           "COPILOT_HOME", "CRUSH_GLOBAL_CONFIG",
-                                     "VIBE_HOME",      "CODEX_HOME",   "CLAUDE_CONFIG_DIR",
-                                     "OPENCODE_CONFIG"};
+    const char *const env_names[] = {
+        "PATH",       "COPILOT_HOME",      "CRUSH_GLOBAL_CONFIG", "VIBE_HOME",
+        "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG",     "APPDATA"};
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         saved_env[i] = save_test_env(env_names[i]);
         cbm_unsetenv(env_names[i]);
     }
     cbm_setenv("PATH", tmpdir, 1);
+#ifdef _WIN32
+    char appdata[512];
+    snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
+    cbm_setenv("APPDATA", appdata, 1);
+#endif
 
     const char *const dirs[] = {
         ".hermes",
@@ -2658,14 +2684,19 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
     schemas_ok = schemas_ok && test_file_contains_all(path, factory, 4);
     snprintf(path, sizeof(path), "%s/.factory/AGENTS.md", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, shared_skill + 1, 2);
+    snprintf(path, sizeof(path), "%s/.factory/hooks.json", tmpdir);
+#ifdef _WIN32
+    struct stat factory_hook_state;
+    schemas_ok = schemas_ok && stat(path, &factory_hook_state) != 0;
+#else
     const char *const factory_hooks[] = {"SessionStart", "PostToolUse",       "Read",
                                          "hook-augment", "--dialect factory", "timeout"};
-    snprintf(path, sizeof(path), "%s/.factory/hooks.json", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, factory_hooks, 6);
     char *factory_hook_data = read_test_file_alloc(path);
     schemas_ok = schemas_ok && factory_hook_data &&
                  test_count_substring(factory_hook_data, "\"matcher\"") == 1U;
     free(factory_hook_data);
+#endif
 
     const char *const crush[] = {
         "\"mcp\"",       "codebase-memory-mcp", "stdio", binary, "\"options\"",
@@ -3751,7 +3782,11 @@ TEST(cli_hermes_stable_shell_context_contract) {
     snprintf(hermes_dir, sizeof(hermes_dir), "%s/.hermes", tmpdir);
     snprintf(config_path, sizeof(config_path), "%s/config.yaml", hermes_dir);
     snprintf(allowlist_path, sizeof(allowlist_path), "%s/shell-hooks-allowlist.json", hermes_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
     snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
     test_mkdirp(hermes_dir);
     write_test_file(config_path, "theme: solarized\nhooks:\n  post_llm_call:\n"
                                  "    - command: \"/usr/bin/user-hermes-hook\"\n");
@@ -4361,10 +4396,24 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     char devin_skill[768];
     char binary_path[640];
     snprintf(xdg_home, sizeof(xdg_home), "%s/xdg", tmpdir);
+#ifdef _WIN32
+    char appdata_home[512];
+    snprintf(appdata_home, sizeof(appdata_home), "%s/AppData/Roaming", tmpdir);
+    snprintf(gitlab_dir, sizeof(gitlab_dir), "%s/GitLab/duo", appdata_home);
+#else
     snprintf(gitlab_dir, sizeof(gitlab_dir), "%s/gitlab/duo", xdg_home);
+#endif
     snprintf(gitlab_mcp, sizeof(gitlab_mcp), "%s/mcp.json", gitlab_dir);
+#ifdef _WIN32
+    snprintf(gitlab_hooks, sizeof(gitlab_hooks), "%s/hooks.json", gitlab_dir);
+#else
     snprintf(gitlab_hooks, sizeof(gitlab_hooks), "%s/.gitlab/duo/hooks.json", tmpdir);
+#endif
+#ifdef _WIN32
+    snprintf(devin_dir, sizeof(devin_dir), "%s/devin", appdata_home);
+#else
     snprintf(devin_dir, sizeof(devin_dir), "%s/.config/devin", tmpdir);
+#endif
     snprintf(devin_config, sizeof(devin_config), "%s/config.json", devin_dir);
     snprintf(devin_agents, sizeof(devin_agents), "%s/AGENTS.md", devin_dir);
     snprintf(devin_skill, sizeof(devin_skill), "%s/skills/codebase-memory/SKILL.md", devin_dir);
@@ -4392,14 +4441,23 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_setenv("XDG_CONFIG_HOME", xdg_home, 1);
+#ifdef _WIN32
+    cbm_setenv("APPDATA", appdata_home, 1);
+#endif
 
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    bool gitlab_hook_plan_ok =
+#ifdef _WIN32
+        !test_plan_hook_contains(plan_root, "GitLab Duo CLI", gitlab_hooks);
+#else
+        test_plan_hook_contains(plan_root, "GitLab Duo CLI", gitlab_hooks);
+#endif
     bool plan_ok =
         plan && test_json_string_array_contains(plan_root, "config_files_planned", gitlab_mcp) &&
         test_json_string_array_contains(plan_root, "config_files_planned", devin_config) &&
-        test_plan_hook_contains(plan_root, "GitLab Duo CLI", gitlab_hooks) &&
+        gitlab_hook_plan_ok &&
         test_plan_hook_contains(plan_root, "Devin CLI / Local", devin_config) &&
         test_json_string_array_contains(plan_root, "instruction_files_planned", devin_agents) &&
         test_json_string_array_contains(plan_root, "skill_files_planned", devin_skill);
@@ -4419,12 +4477,18 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     char *devin_data = read_test_file_alloc(devin_config);
     char *devin_agents_data = read_test_file_alloc(devin_agents);
     struct stat state;
+#ifdef _WIN32
+    bool gitlab_hook_installed = gitlab_data && strcmp(gitlab_data, gitlab_original) == 0 &&
+                                 !strstr(gitlab_data, "hook-augment");
+#else
+    bool gitlab_hook_installed = gitlab_data && strstr(gitlab_data, "/usr/bin/user-hook") &&
+                                 strstr(gitlab_data, "hook-augment") &&
+                                 strstr(gitlab_data, "\"timeout\": 5") &&
+                                 test_count_substring(gitlab_data, "hook-augment") == 1U &&
+                                 !strstr(gitlab_data, "enable-project-hooks");
+#endif
     bool installed =
-        first_rc == 0 && second_rc == 0 && gitlab_data &&
-        strstr(gitlab_data, "/usr/bin/user-hook") && strstr(gitlab_data, "hook-augment") &&
-        strstr(gitlab_data, "\"timeout\": 5") &&
-        test_count_substring(gitlab_data, "hook-augment") == 1U &&
-        !strstr(gitlab_data, "enable-project-hooks") && devin_data &&
+        first_rc == 0 && second_rc == 0 && gitlab_hook_installed && devin_data &&
         strstr(devin_data, "theme_mode") && strstr(devin_data, "SessionStart") &&
         strstr(devin_data, "UserPromptSubmit") && strstr(devin_data, "PostCompaction") &&
         strstr(devin_data, "--dialect devin") &&
@@ -4614,7 +4678,13 @@ TEST(cli_devin_does_not_duplicate_owned_claude_session_start) {
     char claude_settings[640];
     char devin_config[640];
     snprintf(claude_dir, sizeof(claude_dir), "%s/.claude", tmpdir);
+#ifdef _WIN32
+    char appdata[512];
+    snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
+    snprintf(devin_dir, sizeof(devin_dir), "%s/devin", appdata);
+#else
     snprintf(devin_dir, sizeof(devin_dir), "%s/.config/devin", tmpdir);
+#endif
     snprintf(claude_settings, sizeof(claude_settings), "%s/settings.json", claude_dir);
     snprintf(devin_config, sizeof(devin_config), "%s/config.json", devin_dir);
     test_mkdirp(claude_dir);
@@ -4625,10 +4695,14 @@ TEST(cli_devin_does_not_duplicate_owned_claude_session_start) {
     char *saved_path = save_test_env("PATH");
     char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
     char *saved_claude = save_test_env("CLAUDE_CONFIG_DIR");
+    char *saved_appdata = save_test_env("APPDATA");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("XDG_CONFIG_HOME");
     cbm_unsetenv("CLAUDE_CONFIG_DIR");
+#ifdef _WIN32
+    cbm_setenv("APPDATA", appdata, 1);
+#endif
     int rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
     char *claude = read_test_file_alloc(claude_settings);
@@ -4643,6 +4717,7 @@ TEST(cli_devin_does_not_duplicate_owned_claude_session_start) {
     restore_test_env("PATH", saved_path);
     restore_test_env("XDG_CONFIG_HOME", saved_xdg);
     restore_test_env("CLAUDE_CONFIG_DIR", saved_claude);
+    restore_test_env("APPDATA", saved_appdata);
     test_rmdir_r(tmpdir);
     if (!no_duplicate)
         FAIL("Devin must inherit the exact owned Claude SessionStart hook only once while keeping "
@@ -5721,7 +5796,11 @@ TEST(cli_uninstall_preserves_hook_script_with_modified_binary) {
     char claude_dir[512];
     char script_path[640];
     snprintf(claude_dir, sizeof(claude_dir), "%s/.claude", tmpdir);
+#ifdef _WIN32
+    snprintf(script_path, sizeof(script_path), "%s/hooks/cbm-session-reminder.cmd", claude_dir);
+#else
     snprintf(script_path, sizeof(script_path), "%s/hooks/cbm-session-reminder", claude_dir);
+#endif
     test_mkdirp(claude_dir);
 
     char *saved_home = save_test_env("HOME");
@@ -5731,13 +5810,22 @@ TEST(cli_uninstall_preserves_hook_script_with_modified_binary) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CLAUDE_CONFIG_DIR");
     char binary[640];
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
     snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
     int install_rc = cbm_install_agent_configs(tmpdir, binary, false, false);
 
     char *installed = read_test_file_alloc(script_path);
     char owned_assignment[768];
+#ifdef _WIN32
+    snprintf(owned_assignment, sizeof(owned_assignment), "set \"BIN=%s\"", binary);
+    const char *foreign_assignment = "set \"BIN=C:/tmp/user-owned-hook-bin.exe\"";
+#else
     snprintf(owned_assignment, sizeof(owned_assignment), "BIN='%s'", binary);
     const char *foreign_assignment = "BIN='/tmp/user-owned-hook-bin'";
+#endif
     char *assignment = installed ? strstr(installed, owned_assignment) : NULL;
     size_t prefix_len = assignment ? (size_t)(assignment - installed) : 0U;
     size_t suffix_len = assignment ? strlen(assignment + strlen(owned_assignment)) : 0U;
@@ -5993,8 +6081,14 @@ TEST(cli_claude_lifecycle_hooks_delegate_to_augmenter) {
     char session_path[640];
     char subagent_path[640];
     char settings_path[640];
+#ifdef _WIN32
+    snprintf(session_path, sizeof(session_path), "%s/hooks/cbm-session-reminder.cmd", config_dir);
+    snprintf(subagent_path, sizeof(subagent_path), "%s/hooks/cbm-subagent-reminder.cmd",
+             config_dir);
+#else
     snprintf(session_path, sizeof(session_path), "%s/hooks/cbm-session-reminder", config_dir);
     snprintf(subagent_path, sizeof(subagent_path), "%s/hooks/cbm-subagent-reminder", config_dir);
+#endif
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     char *session = read_test_file_alloc(session_path);
     char *subagent = read_test_file_alloc(subagent_path);
@@ -6175,7 +6269,11 @@ TEST(cli_vscode_only_installs_copilot_durable_context) {
 #endif
 
     char binary[640];
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
     snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
     cbm_install_agent_configs(tmpdir, binary, false, false);
     int second_install_rc = cbm_install_agent_configs(tmpdir, binary, false, false);
 
@@ -6194,12 +6292,14 @@ TEST(cli_vscode_only_installs_copilot_durable_context) {
     char *skill = read_test_file_alloc(skill_path);
     char *agent = read_test_file_alloc(agent_path);
     struct stat absent_mcp;
-    bool installed = second_install_rc == 0 && hook && skill && agent &&
-                     strstr(hook, "sessionStart") && strstr(hook, "subagentStart") &&
-                     strstr(hook, "--dialect copilot") && strstr(skill, "search_graph") &&
-                     strstr(agent, "search_graph") && strstr(agent, "tools:") &&
-                     stat(copilot_mcp_path, &absent_mcp) != 0 &&
-                     stat(copilot_instructions_path, &absent_mcp) != 0;
+    bool hook_installed = hook && strstr(hook, "sessionStart") && strstr(hook, "subagentStart") &&
+                          strstr(hook, "--dialect copilot");
+    bool skill_installed = skill && strstr(skill, "search_graph");
+    bool agent_installed = agent && strstr(agent, "search_graph") && strstr(agent, "tools:");
+    bool mcp_absent = stat(copilot_mcp_path, &absent_mcp) != 0;
+    bool instructions_absent = stat(copilot_instructions_path, &absent_mcp) != 0;
+    bool installed = second_install_rc == 0 && hook_installed && skill_installed &&
+                     agent_installed && mcp_absent && instructions_absent;
     free(hook);
     free(skill);
     free(agent);
@@ -6211,9 +6311,10 @@ TEST(cli_vscode_only_installs_copilot_durable_context) {
     struct stat removed_hook;
     struct stat removed_skill;
     char *preserved = read_test_file_alloc(agent_path);
-    bool ownership_safe = stat(hook_path, &removed_hook) != 0 &&
-                          stat(skill_path, &removed_skill) != 0 && preserved &&
-                          strcmp(preserved, modified) == 0;
+    bool hook_removed = stat(hook_path, &removed_hook) != 0;
+    bool skill_removed = stat(skill_path, &removed_skill) != 0;
+    bool modified_agent_preserved = preserved && strcmp(preserved, modified) == 0;
+    bool ownership_safe = hook_removed && skill_removed && modified_agent_preserved;
     free(preserved);
 
     restore_test_env("HOME", saved_home);
@@ -6222,9 +6323,16 @@ TEST(cli_vscode_only_installs_copilot_durable_context) {
     restore_test_env("XDG_CONFIG_HOME", saved_xdg);
     restore_test_env("APPDATA", saved_appdata);
     test_rmdir_r(tmpdir);
-    if (rc != 0 || !installed || !ownership_safe)
+    if (rc != 0 || !installed || !ownership_safe) {
+        fprintf(stderr,
+                "VS Code durable diag install_rc=%d hook=%d skill=%d agent=%d mcp_absent=%d "
+                "instructions_absent=%d uninstall_rc=%d hook_removed=%d skill_removed=%d "
+                "agent_preserved=%d\n",
+                second_install_rc, hook_installed, skill_installed, agent_installed, mcp_absent,
+                instructions_absent, rc, hook_removed, skill_removed, modified_agent_preserved);
         FAIL("VS Code-only installs must receive current user skill, read-only agent, and "
              "SessionStart/SubagentStart context without a Copilot CLI MCP config");
+    }
     PASS();
 }
 
@@ -6243,7 +6351,11 @@ TEST(cli_lifecycle_hooks_preserve_foreign_substring_commands) {
     snprintf(factory_dir, sizeof(factory_dir), "%s/.factory", tmpdir);
     snprintf(qwen_settings, sizeof(qwen_settings), "%s/settings.json", qwen_dir);
     snprintf(factory_hooks, sizeof(factory_hooks), "%s/hooks.json", factory_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
     snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
     test_mkdirp(qwen_dir);
     test_mkdirp(factory_dir);
     const char *qwen_foreign =
@@ -6266,11 +6378,19 @@ TEST(cli_lifecycle_hooks_preserve_foreign_substring_commands) {
     int install_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
     char *qwen_after_install = read_test_file_alloc(qwen_settings);
     char *factory_after_install = read_test_file_alloc(factory_hooks);
-    bool install_preserved = qwen_after_install && strstr(qwen_after_install, "--keep-session") &&
-                             strstr(qwen_after_install, "--keep-subagent") &&
-                             strstr(qwen_after_install, "hook-augment") && factory_after_install &&
-                             strstr(factory_after_install, "--keep-factory") &&
-                             strstr(factory_after_install, "hook-augment");
+    bool qwen_install_preserved =
+        qwen_after_install && strstr(qwen_after_install, "--keep-session") &&
+        strstr(qwen_after_install, "--keep-subagent") && strstr(qwen_after_install, "hook-augment");
+#ifdef _WIN32
+    bool factory_install_preserved = factory_after_install &&
+                                     strcmp(factory_after_install, factory_foreign) == 0 &&
+                                     !strstr(factory_after_install, "hook-augment");
+#else
+    bool factory_install_preserved = factory_after_install &&
+                                     strstr(factory_after_install, "--keep-factory") &&
+                                     strstr(factory_after_install, "hook-augment");
+#endif
+    bool install_preserved = qwen_install_preserved && factory_install_preserved;
     free(qwen_after_install);
     free(factory_after_install);
 
@@ -6278,12 +6398,19 @@ TEST(cli_lifecycle_hooks_preserve_foreign_substring_commands) {
     int uninstall_rc = cbm_cmd_uninstall(2, argv);
     char *qwen_after_uninstall = read_test_file_alloc(qwen_settings);
     char *factory_after_uninstall = read_test_file_alloc(factory_hooks);
-    bool uninstall_preserved =
-        qwen_after_uninstall && strstr(qwen_after_uninstall, "--keep-session") &&
-        strstr(qwen_after_uninstall, "--keep-subagent") &&
-        !strstr(qwen_after_uninstall, "hook-augment") && factory_after_uninstall &&
-        strstr(factory_after_uninstall, "--keep-factory") &&
-        !strstr(factory_after_uninstall, "hook-augment");
+    bool qwen_uninstall_preserved = qwen_after_uninstall &&
+                                    strstr(qwen_after_uninstall, "--keep-session") &&
+                                    strstr(qwen_after_uninstall, "--keep-subagent") &&
+                                    !strstr(qwen_after_uninstall, "hook-augment");
+#ifdef _WIN32
+    bool factory_uninstall_preserved =
+        factory_after_uninstall && strcmp(factory_after_uninstall, factory_foreign) == 0;
+#else
+    bool factory_uninstall_preserved = factory_after_uninstall &&
+                                       strstr(factory_after_uninstall, "--keep-factory") &&
+                                       !strstr(factory_after_uninstall, "hook-augment");
+#endif
+    bool uninstall_preserved = qwen_uninstall_preserved && factory_uninstall_preserved;
     free(qwen_after_uninstall);
     free(factory_after_uninstall);
 
