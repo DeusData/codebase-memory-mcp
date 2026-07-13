@@ -8,7 +8,9 @@
 #include <ctype.h>
 
 enum {
-    JSON_ESC_LEN = 2,       /* escaped char takes 2 bytes (backslash + char) */
+    JSON_ESC_LEN = 2, /* escaped char takes 2 bytes (backslash + char) */
+    JSON_UNICODE_ESC_LEN = 6,
+    JSON_HEX_MASK = 0x0f,
     JSON_NUL_RESERVE = 1,   /* reserve 1 byte for NUL terminator */
     JSON_CTRL_LIMIT = 0x20, /* ASCII control character upper bound */
 };
@@ -370,8 +372,16 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
             buf[pos++] = '\\';
             buf[pos++] = 't';
         } else if (c < JSON_CTRL_LIMIT) {
-            /* Other control chars: skip */
-            continue;
+            static const char hex[] = "0123456789abcdef";
+            if (pos + JSON_UNICODE_ESC_LEN > bufsize - JSON_NUL_RESERVE) {
+                break;
+            }
+            buf[pos++] = '\\';
+            buf[pos++] = 'u';
+            buf[pos++] = '0';
+            buf[pos++] = '0';
+            buf[pos++] = hex[c >> 4];
+            buf[pos++] = hex[c & JSON_HEX_MASK];
         } else {
             buf[pos++] = (char)c;
         }
