@@ -1732,6 +1732,11 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p->flush_store) {
         rc = try_incremental_or_reindex(p, files, file_count, &replace_project_in_existing_store);
         if (rc >= 0) {
+            /* Incremental parallel extraction may publish a process-global
+             * package map. The full path releases it in cleanup below, but
+             * this successful early return bypasses that block. */
+            cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
+            cbm_pipeline_set_pkgmap(NULL);
             CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
             cbm_discover_free(files, file_count);
             return rc;
