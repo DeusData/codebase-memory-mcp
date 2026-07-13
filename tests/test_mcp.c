@@ -4430,6 +4430,13 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     ASSERT_NULL(strstr(resp, "isError"));
     free(resp);
 
+    /* ADR presence metadata must read the same canonical SQLite backend. */
+    resp = cbm_mcp_handle_tool(srv, "get_graph_schema", "{\"project\":\"adr-unify\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"adr_present\\\":true"));
+    ASSERT_NULL(strstr(resp, "adr_hint"));
+    free(resp);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
