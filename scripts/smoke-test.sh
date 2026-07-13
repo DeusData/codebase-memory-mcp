@@ -1017,6 +1017,82 @@ path_match() {
   return 1
 }
 
+# Validate the common Scout/Verify/Auditor contract once for every documented
+# profile dialect. Dialect-specific schema checks remain below where useful.
+assert_tier_profile_set() {
+  local label="$1"
+  local directory="$2"
+  local suffix="$3"
+  local access="$4"
+  local spec slug tier file
+  for spec in \
+    "codebase-memory-scout|Tier 1" \
+    "codebase-memory|Tier 2" \
+    "codebase-memory-auditor|Tier 3"; do
+    slug=${spec%%|*}
+    tier=${spec##*|}
+    file="$directory/$slug$suffix"
+    if [ ! -f "$file" ]; then
+      echo "FAIL 8aw: $label $tier profile missing: $file"
+      exit 1
+    fi
+    if { ! grep -Fq "$tier" "$file" 2>/dev/null && ! grep -Fq "$slug" "$file" 2>/dev/null; } ||
+       ! grep -q 'check_index_coverage' "$file" 2>/dev/null ||
+       grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$file" 2>/dev/null; then
+      echo "FAIL 8aw: $label $tier profile identity, coverage, or mutator contract is wrong"
+      exit 1
+    fi
+    if [ "$access" = "direct" ]; then
+      if ! grep -Fq 'source read/grep fallback' "$file" 2>/dev/null; then
+        echo "FAIL 8aw: $label $tier direct profile lacks source fallback"
+        exit 1
+      fi
+    elif ! grep -q 'parent agent must supply' "$file" 2>/dev/null ||
+         ! grep -q 'must not call or claim access to MCP' "$file" 2>/dev/null ||
+         grep -qE '(mcpServers|mcp__codebase-memory-mcp__|mcp_codebase-memory-mcp_|@codebase-memory-mcp/|codebase-memory-mcp/)' "$file" 2>/dev/null; then
+      echo "FAIL 8aw: $label $tier handoff profile exposes child MCP or lacks parent evidence"
+      exit 1
+    fi
+  done
+}
+
+assert_tier_profile_set_removed() {
+  local label="$1"
+  local directory="$2"
+  local suffix="$3"
+  local slug file
+  for slug in codebase-memory-scout codebase-memory codebase-memory-auditor; do
+    file="$directory/$slug$suffix"
+    if [ -e "$file" ]; then
+      echo "FAIL 9n-i: owned $label tier profile remains: $file"
+      exit 1
+    fi
+  done
+}
+
+assert_tier_prompt_set() {
+  local label="$1"
+  local directory="$2"
+  local suffix="$3"
+  local spec slug tier file
+  for spec in \
+    "codebase-memory-scout|Tier 1" \
+    "codebase-memory|Tier 2" \
+    "codebase-memory-auditor|Tier 3"; do
+    slug=${spec%%|*}
+    tier=${spec##*|}
+    file="$directory/$slug$suffix"
+    if [ ! -f "$file" ] ||
+       ! grep -Fq "$tier" "$file" 2>/dev/null ||
+       ! grep -q 'check_index_coverage' "$file" 2>/dev/null ||
+       ! grep -Fq 'source read/grep fallback' "$file" 2>/dev/null ||
+       grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$file" 2>/dev/null; then
+      echo "FAIL 8aw: $label $tier prompt contract is wrong"
+      exit 1
+    fi
+  done
+}
+
 # 8a: Claude Code MCP (new path) — correct command
 CMD=$(json_get "$FAKE_HOME/.claude.json" "d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command','')")
 if [ -z "$CMD" ] || ! path_match "$CMD" "$SELF_PATH"; then
@@ -1051,31 +1127,32 @@ echo "OK 8c: undocumented nested Claude MCP path absent"
 CLAUDE_AGENT="$FAKE_HOME/.claude/agents/codebase-memory.md"
 if ! grep -q '^mcpServers: \[codebase-memory-mcp\]$' "$CLAUDE_AGENT" 2>/dev/null ||
    ! grep -q 'mcp__codebase-memory-mcp__search_graph' "$CLAUDE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CLAUDE_AGENT" 2>/dev/null ||
    ! grep -q '^permissionMode: plan$' "$CLAUDE_AGENT" 2>/dev/null ||
-   grep -q 'mcp__codebase-memory-mcp__delete_project' "$CLAUDE_AGENT" 2>/dev/null; then
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$CLAUDE_AGENT" 2>/dev/null; then
   echo "FAIL 8c-i: Claude exact-tool graph subagent missing or over-privileged"
   exit 1
 fi
 echo "OK 8c-i: Claude exact-tool graph subagent"
 
-# 8d: Claude Code hooks — matcher must be exactly "Grep|Glob|Read" (no Search).
-# Read is matched for the indexing-coverage note (#963); safe against the old
-# issue-#362 gate hazard because the augmenter is structurally non-blocking
-# (always exit 0, additionalContext only). This assertion locks in the exact
-# matcher to prevent both regressions (Read dropped again) and creep (Search
-# or catch-all matchers sneaking back).
+# 8d: Claude Code hooks keep search augmentation and read-coverage reporting
+# separate: PreToolUse matches exactly Grep|Glob, while PostToolUse matches
+# exactly Read. Neither hook may grow a Search or catch-all matcher.
 if ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-hooks = d.get('hooks', {}).get('PreToolUse', [])
-ok = any(h.get('matcher') == 'Grep|Glob|Read' for h in hooks)
-bad = any('Search' in str(h.get('matcher', '')) for h in hooks)
+all_hooks = d.get('hooks', {})
+pre = all_hooks.get('PreToolUse', [])
+post = all_hooks.get('PostToolUse', [])
+ok = (any(h.get('matcher') == 'Grep|Glob' for h in pre) and
+      any(h.get('matcher') == 'Read' for h in post))
+bad = any('Search' in str(h.get('matcher', '')) for h in pre + post)
 sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
-  echo "FAIL 8d: PreToolUse hook matcher is not exactly 'Grep|Glob|Read'"
+  echo "FAIL 8d: Claude search/read hook matchers are not exact"
   exit 1
 fi
-echo "OK 8d: Claude Code PreToolUse hook (matcher=Grep|Glob|Read)"
+echo "OK 8d: Claude Code PreToolUse Grep|Glob + PostToolUse Read"
 
 # 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
 # #929: Windows installs a .cmd script (extensionless bash shims triggered the
@@ -1175,7 +1252,8 @@ if ! grep -q '^name: codebase-memory$' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q 'graph project' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q '^tools:' "$GEMINI_AGENT" 2>/dev/null ||
    ! grep -q 'mcp_codebase-memory-mcp_search_graph' "$GEMINI_AGENT" 2>/dev/null ||
-   grep -q 'mcp_codebase-memory-mcp_delete_project' "$GEMINI_AGENT" 2>/dev/null; then
+   ! grep -q 'mcp_codebase-memory-mcp_check_index_coverage' "$GEMINI_AGENT" 2>/dev/null ||
+   grep -qE 'mcp_codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$GEMINI_AGENT" 2>/dev/null; then
   echo "FAIL 8m-i: Gemini dedicated graph subagent is incomplete"
   exit 1
 fi
@@ -1282,10 +1360,11 @@ fi
 KILO_AGENT="$FAKE_HOME/.config/kilo/agents/codebase-memory.md"
 if ! grep -q '^mode: subagent$' "$KILO_AGENT" 2>/dev/null ||
    ! grep -Fq '"*": deny' "$KILO_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_search_graph": ask' "$KILO_AGENT" 2>/dev/null ||
-   ! grep -Fq '"codebase-memory-mcp_get_code_snippet": ask' "$KILO_AGENT" 2>/dev/null ||
-   grep -Fq '"codebase-memory-mcp_*": ask' "$KILO_AGENT" 2>/dev/null ||
-   grep -qE 'codebase-memory-mcp_(delete_project|manage_adr|ingest_traces)' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_search_graph": allow' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_get_code_snippet": allow' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_check_index_coverage": allow' "$KILO_AGENT" 2>/dev/null ||
+   grep -Fq '"codebase-memory-mcp_*": allow' "$KILO_AGENT" 2>/dev/null ||
+   grep -qE 'codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$KILO_AGENT" 2>/dev/null ||
    grep -qE '^  (edit|bash|shell): allow$' "$KILO_AGENT" 2>/dev/null; then
   echo "FAIL 8u: KiloCode global read-only subagent is missing or over-permissive"
   exit 1
@@ -1352,11 +1431,15 @@ if ! path_match "$CMD" "$SELF_PATH" ||
 import json, sys
 d = json.load(sys.stdin)
 tools = d.get('tools', [])
+server = d.get('mcpServers', {}).get('codebase-memory-mcp', {})
 ok = (d.get('name') == 'codebase-memory' and tools[:3] == ['read', 'grep', 'glob'] and
       '@codebase-memory-mcp/search_graph' in tools and
-      '@codebase-memory-mcp/delete_project' not in tools and
+      '@codebase-memory-mcp/check_index_coverage' in tools and
+      all('@codebase-memory-mcp/' + name not in tools for name in
+          ('index_repository', 'delete_project', 'manage_adr', 'ingest_traces')) and
       '@codebase-memory-mcp' not in tools and d.get('includeMcpJson') is False and
       set(d.get('mcpServers', {})) == {'codebase-memory-mcp'} and
+      server.get('args') == ['--tool-profile', 'analysis'] and
       'search_graph' in d.get('prompt', ''))
 sys.exit(0 if ok else 1)
 " 2>/dev/null; then
@@ -1493,6 +1576,7 @@ if ! grep -q 'search_graph' "$FAKE_HOME/.factory/AGENTS.md" 2>/dev/null; then
   echo "FAIL 8ac-i: Factory durable instructions missing"
   exit 1
 fi
+FACTORY_MATCHER_COUNT=$(grep -c '"matcher"' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null || true)
 if [[ "$BINARY" == *.exe ]]; then
   if grep -q 'hook-augment' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null; then
     echo "FAIL 8ac-i: Factory hook installed on Windows without a documented shell contract"
@@ -1500,22 +1584,26 @@ if [[ "$BINARY" == *.exe ]]; then
   fi
   echo "OK 8ac-i: Factory durable instructions; Windows hook withheld"
 elif ! grep -q 'SessionStart' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     ! grep -q 'PostToolUse' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     ! grep -q 'Read' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
      ! grep -q 'hook-augment' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
      ! grep -q 'timeout' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
-     grep -q '"matcher"' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null; then
-  echo "FAIL 8ac-i: Factory SessionStart hook missing or malformed"
+     [ "$FACTORY_MATCHER_COUNT" != "1" ]; then
+  echo "FAIL 8ac-i: Factory SessionStart/PostToolUse Read hooks missing or malformed"
   exit 1
 else
-  echo "OK 8ac-i: Factory durable instructions + SessionStart"
+  echo "OK 8ac-i: Factory durable instructions + SessionStart/PostToolUse Read"
 fi
 FACTORY_AGENT="$FAKE_HOME/.factory/droids/codebase-memory.md"
-if ! grep -q '^tools: read-only$' "$FACTORY_AGENT" 2>/dev/null ||
-   ! grep -q '^mcpServers: \[codebase-memory-mcp\]$' "$FACTORY_AGENT" 2>/dev/null ||
-   ! grep -q 'search_graph' "$FACTORY_AGENT" 2>/dev/null; then
-  echo "FAIL 8ac-ii: Factory exact-server read-only droid missing"
+if ! grep -q '^tools: \["Read", "LS", "Grep", "Glob",' "$FACTORY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__search_graph' "$FACTORY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$FACTORY_AGENT" 2>/dev/null ||
+   grep -q '^mcpServers:' "$FACTORY_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$FACTORY_AGENT" 2>/dev/null; then
+  echo "FAIL 8ac-ii: Factory exact-tool Verify droid missing or over-privileged"
   exit 1
 fi
-echo "OK 8ac-ii: Factory exact-server read-only droid"
+echo "OK 8ac-ii: Factory exact-tool Verify droid"
 
 # 8ad: Crush stdio MCP schema + instructions
 CMD=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp']['command']")
@@ -1565,13 +1653,14 @@ fi
 VIBE_AGENT="$FAKE_HOME/.vibe/agents/codebase-memory.toml"
 VIBE_PROMPT="$FAKE_HOME/.vibe/prompts/codebase-memory.md"
 if ! grep -q '^agent_type = "subagent"$' "$VIBE_AGENT" 2>/dev/null ||
-   ! grep -Fq 'enabled_tools = ["codebase-memory-mcp_search_graph"' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq 'enabled_tools = ["read_file", "grep_search", "codebase-memory-mcp_search_graph"' "$VIBE_AGENT" 2>/dev/null ||
    ! grep -Fq '"codebase-memory-mcp_get_code_snippet"' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_check_index_coverage"' "$VIBE_AGENT" 2>/dev/null ||
    grep -Fq '"codebase-memory-mcp_*"' "$VIBE_AGENT" 2>/dev/null ||
-   grep -qE 'codebase-memory-mcp_(delete_project|manage_adr|ingest_traces)' "$VIBE_AGENT" 2>/dev/null ||
+   grep -qE 'codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$VIBE_AGENT" 2>/dev/null ||
    ! grep -q '^system_prompt_id = "codebase-memory"$' "$VIBE_AGENT" 2>/dev/null ||
    ! grep -q 'search_graph' "$VIBE_PROMPT" 2>/dev/null ||
-   ! grep -q 'Never perform state-changing actions' "$VIBE_PROMPT" 2>/dev/null; then
+   ! grep -q 'Never edit files or perform state-changing actions' "$VIBE_PROMPT" 2>/dev/null; then
   echo "FAIL 8af-i: Vibe global subagent or prompt missing"
   exit 1
 fi
@@ -1637,43 +1726,54 @@ if [ ! -s "$SKILL_FILE" ]; then
 fi
 echo "OK 8ai: skill installed"
 
-# 8aj: Qoder MCP, skill, and directly attached read-only graph agent. Its
-# UserPromptSubmit hook is installed only where the documented shell contract is
-# unambiguous.
+# 8aj: Qoder MCP, skill, directly attached read-only graph agent, and current
+# lifecycle/read hooks. Legacy UserPromptSubmit is removed during migration.
 QODER_SETTINGS="$FAKE_HOME/.qoder/settings.json"
 QODER_SKILL="$FAKE_HOME/.qoder/skills/codebase-memory/SKILL.md"
 QODER_AGENT="$FAKE_HOME/.qoder/agents/codebase-memory.md"
 CMD=$(json_get "$QODER_SETTINGS" "d['mcpServers']['codebase-memory-mcp']['command']")
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q 'search_graph' "$QODER_SKILL" 2>/dev/null ||
-   ! grep -q '^tools: Read,Grep,Glob$' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$QODER_AGENT" 2>/dev/null ||
    ! grep -q '^mcpServers:$' "$QODER_AGENT" 2>/dev/null ||
    ! grep -q '^  - codebase-memory-mcp$' "$QODER_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$QODER_AGENT" 2>/dev/null ||
    grep -q 'parent agent' "$QODER_AGENT" 2>/dev/null; then
-  echo "FAIL 8aj: Qoder MCP, skill, or direct-MCP read-only agent missing"
+  echo "FAIL 8aj: Qoder MCP, skill, or exact-tool Verify agent missing"
   exit 1
 fi
 if [[ "$BINARY" == *.exe ]]; then
-  if grep -q -- '--dialect qoder' "$QODER_SETTINGS" 2>/dev/null; then
-    echo "FAIL 8aj: Qoder hook installed on Windows without a documented shell contract"
-    exit 1
-  fi
-  echo "OK 8aj: Qoder MCP + direct graph agent; Windows hook withheld"
-elif ! cat "$QODER_SETTINGS" 2>/dev/null | python3 -c "
+  QODER_EXPECTED_SHELL="powershell"
+else
+  QODER_EXPECTED_SHELL=""
+fi
+if ! cat "$QODER_SETTINGS" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 all_hooks = d.get('hooks', {})
-hooks = all_hooks.get('UserPromptSubmit', [])
-ok = (d.get('theme') == 'dark' and len(hooks) == 1 and
-      '--dialect qoder' in str(hooks[0]) and
-      'SessionStart' not in all_hooks and 'SubagentStart' not in all_hooks)
+expected = {
+    'SessionStart': 'startup|resume|clear|compact|new',
+    'SubagentStart': '*',
+    'PostToolUse': 'Read',
+}
+ok = d.get('theme') == 'dark' and 'UserPromptSubmit' not in all_hooks
+for event, matcher in expected.items():
+    entries = all_hooks.get(event, [])
+    ok = ok and len(entries) == 1 and entries[0].get('matcher') == matcher
+    hooks = entries[0].get('hooks', []) if entries else []
+    ok = ok and len(hooks) == 1
+    if hooks:
+        hook = hooks[0]
+        ok = (ok and '--dialect qoder' in hook.get('command', '') and
+              hook.get('timeout') == 5 and
+              hook.get('shell', '') == '$QODER_EXPECTED_SHELL')
 sys.exit(0 if ok else 1)
 " 2>/dev/null; then
-  echo "FAIL 8aj: Qoder UserPromptSubmit hook missing or malformed"
+  echo "FAIL 8aj: Qoder lifecycle/read hooks missing or malformed"
   exit 1
-else
-  echo "OK 8aj: Qoder MCP + direct graph agent + UserPromptSubmit"
 fi
+echo "OK 8aj: Qoder MCP + direct graph agent + lifecycle/read hooks"
 
 # 8ak: Kimi honors KIMI_CODE_HOME for MCP and durable parent/subagent context.
 KIMI_MCP="$CUSTOM_KIMI_HOME/mcp.json"
@@ -1718,24 +1818,35 @@ if ! grep -q 'Sessions and Subagents' "$WARP_SKILL" 2>/dev/null ||
 fi
 echo "OK 8am: Warp shared skill only (MCP remains manual)"
 
-# 8an: Junie receives its MCP config, skill, and exact-server graph agent.
+# 8an: Junie receives its MCP config, skill, and dedicated restricted-server
+# graph agent.
 # SessionStart augmentation remains withheld because current EAP docs say its
 # additionalContext output is ignored.
 JUNIE_MCP="$FAKE_HOME/.junie/mcp/mcp.json"
 JUNIE_SKILL="$FAKE_HOME/.junie/skills/codebase-memory/SKILL.md"
 JUNIE_AGENT="$FAKE_HOME/.junie/agents/codebase-memory.md"
 CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+JUNIE_SCOUT_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-scout']['command']")
+JUNIE_ANALYSIS_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-analysis']['command']")
+JUNIE_SCOUT_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-scout']['args']")
+JUNIE_ANALYSIS_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-analysis']['args']")
 if ! path_match "$CMD" "$SELF_PATH" ||
+   ! path_match "$JUNIE_SCOUT_CMD" "$SELF_PATH" ||
+   ! path_match "$JUNIE_ANALYSIS_CMD" "$SELF_PATH" ||
+   [ "$JUNIE_SCOUT_ARGS" != "['--tool-profile=scout']" ] ||
+   [ "$JUNIE_ANALYSIS_ARGS" != "['--tool-profile=analysis']" ] ||
    ! grep -q 'Sessions and Subagents' "$JUNIE_SKILL" 2>/dev/null ||
-   ! grep -q 'description: "Read-only' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'description: "Default task-directed graph verification' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'tools: \["Read", "Grep", "Glob"\]' "$JUNIE_AGENT" 2>/dev/null ||
-   ! grep -q 'mcpServers: \["codebase-memory-mcp"\]' "$JUNIE_AGENT" 2>/dev/null ||
-   ! grep -q 'Use codebase-memory-mcp' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcpServers: \["codebase-memory-analysis"\]' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'hard-enforces the analysis tool profile' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'check_index_coverage' "$JUNIE_AGENT" 2>/dev/null ||
+   grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$JUNIE_AGENT" 2>/dev/null ||
    grep -q '"Bash"' "$JUNIE_AGENT" 2>/dev/null; then
-  echo "FAIL 8an: Junie MCP, skill, or exact-server graph agent missing"
+  echo "FAIL 8an: Junie MCP, skill, or restricted-server Verify agent missing"
   exit 1
 fi
-echo "OK 8an: Junie MCP + skill + exact-server graph agent"
+echo "OK 8an: Junie MCP + skill + restricted-server Verify agent"
 
 # 8ao: Conditional registry clients install only when an explicit config exists.
 CMD=$(json_get "$ROO_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
@@ -1838,7 +1949,9 @@ if ! path_match "$CMD" "$SELF_PATH" || [ "$CODEBUDDY_KEEP" != "codebuddy" ] ||
    ! grep -q 'search_graph' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'Sessions and Subagents' "$CODEBUDDY_SKILL" 2>/dev/null ||
    ! grep -q '^permissionMode: plan$' "$CODEBUDDY_AGENT" 2>/dev/null ||
-   ! grep -q '^tools: mcp__codebase-memory-mcp__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$CODEBUDDY_AGENT" 2>/dev/null ||
    grep -q '^tools:$' "$CODEBUDDY_AGENT" 2>/dev/null ||
    grep -q 'mcp__codebase-memory__search_graph' "$CODEBUDDY_AGENT" 2>/dev/null ||
    ! grep -q '^skills: codebase-memory$' "$CODEBUDDY_AGENT" 2>/dev/null ||
@@ -1911,6 +2024,36 @@ if ! path_match "$AMAZON_Q_CMD" "$SELF_PATH" ||
   exit 1
 fi
 echo "OK 8av: Amazon Q IDE canonical default.json"
+
+# 8aw: Every supported profile dialect installs the complete tier matrix. This
+# complements the detailed Verify checks above without duplicating each schema.
+assert_tier_profile_set "Claude" "$FAKE_HOME/.claude/agents" ".md" "direct"
+assert_tier_profile_set "Codex" "$FAKE_HOME/.codex/agents" ".toml" "direct"
+assert_tier_profile_set "Gemini" "$FAKE_HOME/.gemini/agents" ".md" "direct"
+if [ -f "$FAKE_HOME/.config/opencode/opencode.json" ]; then
+  assert_tier_profile_set "OpenCode" "$FAKE_HOME/.config/opencode/agents" ".md" "direct"
+fi
+assert_tier_profile_set "Kilo" "$FAKE_HOME/.config/kilo/agents" ".md" "direct"
+assert_tier_profile_set "Cursor" "$FAKE_HOME/.cursor/agents" ".md" "handoff"
+assert_tier_profile_set "Kiro" "$FAKE_HOME/.kiro/agents" ".json" "direct"
+assert_tier_profile_set "Junie" "$FAKE_HOME/.junie/agents" ".md" "direct"
+assert_tier_profile_set "Augment" "$FAKE_HOME/.augment/agents" ".md" "handoff"
+assert_tier_profile_set "Qwen" "$FAKE_HOME/.qwen/agents" ".md" "direct"
+assert_tier_profile_set "Factory" "$FAKE_HOME/.factory/droids" ".md" "direct"
+assert_tier_profile_set "Vibe" "$FAKE_HOME/.vibe/agents" ".toml" "direct"
+assert_tier_prompt_set "Vibe" "$FAKE_HOME/.vibe/prompts" ".md"
+for VIBE_SLUG in codebase-memory-scout codebase-memory codebase-memory-auditor; do
+  if ! grep -Fq "system_prompt_id = \"$VIBE_SLUG\"" "$FAKE_HOME/.vibe/agents/$VIBE_SLUG.toml" 2>/dev/null; then
+    echo "FAIL 8aw: Vibe agent/prompt identifier mismatch for $VIBE_SLUG"
+    exit 1
+  fi
+done
+assert_tier_profile_set "Copilot" "$FAKE_HOME/.copilot/agents" ".agent.md" "direct"
+assert_tier_profile_set "Qoder" "$FAKE_HOME/.qoder/agents" ".md" "direct"
+assert_tier_profile_set "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md" "direct"
+assert_tier_profile_set "Pochi" "$FAKE_HOME/.pochi/agents" ".md" "handoff"
+assert_tier_profile_set "Rovo" "$FAKE_HOME/.rovodev/subagents" ".md" "handoff"
+echo "OK 8aw: all supported Scout/Verify/Auditor profile sets"
 
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
@@ -2073,6 +2216,16 @@ sys.exit(1 if 'codebase-memory-mcp' in d.get('$ROOT', {}) else 0)
     exit 1
   fi
 done
+if ! cat "$JUNIE_MCP" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+servers = d.get('mcpServers', {})
+names = {'codebase-memory-mcp', 'codebase-memory-scout', 'codebase-memory-analysis'}
+sys.exit(1 if names.intersection(servers) else 0)
+" 2>/dev/null; then
+  echo "FAIL 9l: Junie default or restricted MCP alias remains"
+  exit 1
+fi
 POCHI_MCP_AFTER=$(sed '/^[[:space:]]*\/\//d' "$POCHI_MCP" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -2232,6 +2385,28 @@ if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ] ||
   exit 1
 fi
 echo "OK 9n: skills removed"
+
+# 9n-i: Uninstall removes every owned tier sibling, not only the historical
+# Verify filename checked by the legacy variables above.
+assert_tier_profile_set_removed "Claude" "$FAKE_HOME/.claude/agents" ".md"
+assert_tier_profile_set_removed "Codex" "$FAKE_HOME/.codex/agents" ".toml"
+assert_tier_profile_set_removed "Gemini" "$FAKE_HOME/.gemini/agents" ".md"
+assert_tier_profile_set_removed "OpenCode" "$FAKE_HOME/.config/opencode/agents" ".md"
+assert_tier_profile_set_removed "Kilo" "$FAKE_HOME/.config/kilo/agents" ".md"
+assert_tier_profile_set_removed "Cursor" "$FAKE_HOME/.cursor/agents" ".md"
+assert_tier_profile_set_removed "Kiro" "$FAKE_HOME/.kiro/agents" ".json"
+assert_tier_profile_set_removed "Junie" "$FAKE_HOME/.junie/agents" ".md"
+assert_tier_profile_set_removed "Augment" "$FAKE_HOME/.augment/agents" ".md"
+assert_tier_profile_set_removed "Qwen" "$FAKE_HOME/.qwen/agents" ".md"
+assert_tier_profile_set_removed "Factory" "$FAKE_HOME/.factory/droids" ".md"
+assert_tier_profile_set_removed "Vibe" "$FAKE_HOME/.vibe/agents" ".toml"
+assert_tier_profile_set_removed "Vibe prompt" "$FAKE_HOME/.vibe/prompts" ".md"
+assert_tier_profile_set_removed "Copilot" "$FAKE_HOME/.copilot/agents" ".agent.md"
+assert_tier_profile_set_removed "Qoder" "$FAKE_HOME/.qoder/agents" ".md"
+assert_tier_profile_set_removed "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md"
+assert_tier_profile_set_removed "Pochi" "$FAKE_HOME/.pochi/agents" ".md"
+assert_tier_profile_set_removed "Rovo" "$FAKE_HOME/.rovodev/subagents" ".md"
+echo "OK 9n-i: all owned Scout/Verify/Auditor profile sets removed"
 
 echo ""
 echo "--- Phase 9b: adversarial install/uninstall tests ---"
