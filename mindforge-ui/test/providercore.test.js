@@ -54,18 +54,18 @@ describe("apiChatRequest", () => {
       const result = await apiChatRequest({ provider: "slow", model: "m", prompt: "p",
         base: "https://api.example.test", timeoutMs: 10, fetchImpl });
       assert.equal(result.ok, false);
-      assert.match(result.out, /время ожидания/);
+      assert.match(result.out, /timed out/);
     } finally { clearTimeout(keepAlive); }
   });
 
   test("rejects malformed and oversized responses", async () => {
     const malformed = await apiChatRequest({ provider: "bad", model: "m", prompt: "p",
       base: "https://api.example.test", fetchImpl: async () => new Response("not-json") });
-    assert.match(malformed.out, /некорректный JSON/);
+    assert.match(malformed.out, /invalid JSON/);
 
     const oversized = await apiChatRequest({ provider: "large", model: "m", prompt: "p",
       base: "https://api.example.test", maxResponseBytes: 100,
       fetchImpl: async () => new Response("{}", { headers: { "Content-Length": "1000" } }) });
-    assert.match(oversized.out, /слишком большой/);
+    assert.match(oversized.out, /response too large/);
   });
 });

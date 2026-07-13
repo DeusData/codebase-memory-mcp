@@ -6,6 +6,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execFile } = require("child_process");
+const t = require("./i18n").t;
 
 // Folder name: letters (incl. Cyrillic), digits, _ . -, inner spaces. Never a
 // path: separators are rejected outright, no leading/trailing space or dot-dot.
@@ -30,12 +31,12 @@ async function createProjectAt(installDir, parentDir, name, env, seedDir) {
   const steps = [];
   const step = (n, ok, out) => { steps.push({ name: n, ok, out: String(out || "").trim().slice(-800) }); return ok; };
   if (!okProjectName(name))
-    return { ok: false, steps: [{ name: "имя", ok: false, out: "недопустимое имя проекта" }] };
+    return { ok: false, steps: [{ name: t("proj.stepName"), ok: false, out: t("proj.badName") }] };
   if (!parentDir || !fs.existsSync(parentDir))
-    return { ok: false, steps: [{ name: "родительская папка", ok: false, out: "папка не существует" }] };
+    return { ok: false, steps: [{ name: t("proj.stepParent"), ok: false, out: t("proj.parentMissing") }] };
   const target = path.join(parentDir, name);
   if (fs.existsSync(target))
-    return { ok: false, target, steps: [{ name: "mkdir", ok: false, out: "такая папка уже существует" }] };
+    return { ok: false, target, steps: [{ name: "mkdir", ok: false, out: t("proj.alreadyExists") }] };
   try { fs.mkdirSync(target, { recursive: true }); step("mkdir", true, target); }
   catch (e) { return { ok: false, target, steps: [{ name: "mkdir", ok: false, out: e.message }] }; }
 
@@ -51,26 +52,24 @@ async function createProjectAt(installDir, parentDir, name, env, seedDir) {
   const installer = path.join(installDir, "fablize", "install.sh");
   if (fs.existsSync(installer)) {
     const r = await runIn(installDir, "bash", [installer, target], env);
-    step("дисциплины fablize", r.ok, r.out + r.err);
-    if (!r.ok) warning = "проект создан, но дисциплины fablize не применились — " +
-      `выполните вручную: bash ${installer} "${target}"`;
+    step(t("proj.stepDisciplines"), r.ok, r.out + r.err);
+    if (!r.ok) warning = t("proj.disciplinesFailed", { installer, target });
   } else {
-    step("дисциплины fablize", false, "installer не найден: " + installer);
-    warning = "проект создан без дисциплин fablize (installer не найден в " + installDir + ")";
+    step(t("proj.stepDisciplines"), false, t("proj.installerMissing", { installer }));
+    warning = t("proj.noDisciplines", { dir: installDir });
   }
 
   // Первый коммит обязателен: запуск историй делает `git worktree add … HEAD`,
   // а HEAD в репозитории без коммитов не резолвится — история падала бы сразу.
   await runIn(target, "git", ["add", "-A"], env);
   let c = await runIn(target, "git",
-    ["commit", "--allow-empty", "-m", "MindForge: инициализация проекта"], env);
+    ["commit", "--allow-empty", "-m", t("proj.initCommit")], env);
   if (!c.ok) // машина без настроенной git-идентичности
     c = await runIn(target, "git",
       ["-c", "user.name=MindForge", "-c", "user.email=mindforge@local",
-       "commit", "--allow-empty", "-m", "MindForge: инициализация проекта"], env);
-  if (!step("первый коммит", c.ok, c.out + c.err) && !warning)
-    warning = "проект создан, но первый коммит не удался — истории не запустятся, " +
-      "выполните вручную: git -C \"" + target + "\" commit --allow-empty -m init";
+       "commit", "--allow-empty", "-m", t("proj.initCommit")], env);
+  if (!step(t("proj.stepFirstCommit"), c.ok, c.out + c.err) && !warning)
+    warning = t("proj.firstCommitFailed", { target });
   return { ok: true, target, steps, warning };
 }
 

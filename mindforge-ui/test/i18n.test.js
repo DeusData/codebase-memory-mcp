@@ -51,14 +51,42 @@ function cyrillicInRuntimeStrings(source) {
   return [...new Set(hits)];
 }
 
+const RUNTIME_FILES = () => {
+  const root = path.join(__dirname, "..");
+  return ["main.js", "renderer.js", "preload.js",
+    "projectcore.js", "providercore.js", "graphcore.js",
+    "filecore.js", "pollcore.js", "backgroundcore.js",
+    ...fs.readdirSync(path.join(root, "views"))
+      .filter((name) => name.endsWith(".js")).map((name) => `views/${name}`)];
+};
+
 test("runtime JavaScript keeps localized text in i18n.js", () => {
   const root = path.join(__dirname, "..");
-  const files = ["main.js", "renderer.js", "preload.js", ...fs.readdirSync(path.join(root, "views"))
-    .filter((name) => name.endsWith(".js")).map((name) => `views/${name}`)];
+  const files = RUNTIME_FILES();
   const failures = [];
   for (const file of files) {
     const lines = cyrillicInRuntimeStrings(fs.readFileSync(path.join(root, file), "utf8"));
     if (lines.length) failures.push(`${file}:${lines.join(",")}`);
   }
   assert.deepEqual(failures, [], `hard-coded Cyrillic runtime strings: ${failures.join("; ")}`);
+});
+
+test("every i18n key referenced in runtime JS and index.html exists in the dictionary", () => {
+  const root = path.join(__dirname, "..");
+  const known = new Set(Object.keys(I18N.dict.en));
+  const missing = [];
+  const scan = (file, source) => {
+    const patterns = [
+      /\bt\(\s*["']([A-Za-z0-9_.-]+)["']/g,          // t("key") / I18N.t("key")
+      /data-i18n(?:-ph|-empty)?=["']([A-Za-z0-9_.-]+)["']/g, // markup attributes
+    ];
+    for (const re of patterns) {
+      let m;
+      while ((m = re.exec(source))) if (!known.has(m[1])) missing.push(`${file}: ${m[1]}`);
+    }
+  };
+  for (const file of RUNTIME_FILES())
+    scan(file, fs.readFileSync(path.join(root, file), "utf8"));
+  scan("index.html", fs.readFileSync(path.join(root, "index.html"), "utf8"));
+  assert.deepEqual(missing, [], `keys used but not defined: ${missing.join("; ")}`);
 });

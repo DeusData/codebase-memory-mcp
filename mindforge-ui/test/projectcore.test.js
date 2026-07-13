@@ -77,7 +77,7 @@ describe("createProjectAt", () => {
   test("creates a usable git project even without the fablize installer", async () => {
     const result = await createProjectAt(root, projects, "plain-app");
     assert.equal(result.ok, true);
-    assert.match(result.warning, /installer не найден/);
+    assert.match(result.warning, /installer not found/);
     assert.equal(fs.existsSync(path.join(result.target, ".git")), true);
     assert.doesNotThrow(() => execFileSync("git", ["-C", result.target, "rev-parse", "--verify", "HEAD"]));
   });

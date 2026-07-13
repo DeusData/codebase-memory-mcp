@@ -38,7 +38,9 @@ check_handler() {
     local args="$2"
     echo "[smoke_guard] Invoking $handler with project='$FAKE_PROJECT'..."
     local response
-    response="$("$BINARY" cli "$handler" "$args" 2>/dev/null)"
+    # The binary reports guard errors on stderr and exits non-zero (correct CLI
+    # behavior): capture both streams, and `|| true` keeps set -e from aborting.
+    response="$("$BINARY" cli "$handler" "$args" 2>&1 || true)"
     echo "[smoke_guard] Response: $response"
 
     # For a missing .db file, cbm_store_open_path_query returns NULL so

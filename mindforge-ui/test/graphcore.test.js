@@ -40,7 +40,7 @@ describe("graph supervisor", () => {
       openExternal: async () => {}, probeImpl: async () => false, existsImpl: () => false });
     const result = await supervisor.open();
     assert.equal(result.ok, false);
-    assert.match(result.error, /не собран/);
+    assert.match(result.error, /is not built/);
   });
 
   test("starts, probes and opens the bundled server", async () => {

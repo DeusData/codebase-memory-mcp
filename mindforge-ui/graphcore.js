@@ -1,6 +1,7 @@
 "use strict";
 
 const fs = require("fs");
+const t = require("./i18n").t;
 const { spawn } = require("child_process");
 
 const DEFAULT_GRAPH_URL = "http://127.0.0.1:9749";
@@ -34,7 +35,7 @@ function createGraphSupervisor({ binPath, cwd, openExternal,
       return { ok: true, reused: true };
     }
     if (!existsImpl(binPath))
-      return { ok: false, error: "движок памяти не собран — подготовьте сборку в предупреждении сверху" };
+      return { ok: false, error: t("graphcore.engineMissing") };
 
     let exited = false;
     let stderr = "";
@@ -47,7 +48,7 @@ function createGraphSupervisor({ binPath, cwd, openExternal,
       child.stderr?.on?.("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-2000); });
     } catch (error) {
       child = null;
-      return { ok: false, error: `не удалось запустить 3D-граф: ${error.message}` };
+      return { ok: false, error: t("graphcore.startFailed", { msg: error.message }) };
     }
 
     for (let i = 0; i < attempts && !exited; i++) {
@@ -59,10 +60,10 @@ function createGraphSupervisor({ binPath, cwd, openExternal,
     }
     stop();
     if (/without the embedded UI|no frontend embedded/i.test(stderr))
-      return { ok: false, error: "движок собран без 3D UI — пересоберите через scripts/build.sh --with-ui" };
+      return { ok: false, error: t("graphcore.noUi") };
     return { ok: false, error: exited
-      ? "процесс 3D-графа завершился при запуске"
-      : "3D-граф не ответил за 6 секунд" };
+      ? t("graphcore.exitedOnStart")
+      : t("graphcore.noResponse") };
   }
 
   async function open() {
