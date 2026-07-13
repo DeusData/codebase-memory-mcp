@@ -445,6 +445,17 @@ TEST(validate_shell_arg_spaces) {
     PASS();
 }
 
+TEST(json_escape_control_chars) {
+    char buf[64];
+    const char input[] = {'A', 0x01, 'B', '\n', 0x1f, '\0'};
+
+    int len = cbm_json_escape(buf, sizeof(buf), input);
+
+    ASSERT_STR_EQ(buf, "A\\u0001B\\n\\u001f");
+    ASSERT_EQ(len, 16);
+    PASS();
+}
+
 /* ── SNPRINTF_APPEND tests ────────────────────────────────────── */
 
 TEST(snprintf_append_basic) {
@@ -556,6 +567,7 @@ SUITE(str_util) {
     RUN_TEST(validate_shell_arg_backslash);
     RUN_TEST(validate_shell_arg_empty);
     RUN_TEST(validate_shell_arg_spaces);
+    RUN_TEST(json_escape_control_chars);
     /* SNPRINTF_APPEND */
     RUN_TEST(snprintf_append_basic);
     RUN_TEST(snprintf_append_fills_exactly);
