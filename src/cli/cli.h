@@ -190,10 +190,8 @@ bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool window
 void cbm_hook_sanitize_metadata_for_testing(const char *input, char *output, size_t output_size);
 int cbm_upsert_qwen_lifecycle_hooks_for_testing(const char *settings_path, const char *binary_path,
                                                 bool windows);
-int cbm_upsert_qoder_context_hooks_for_testing(const char *settings_path,
-                                               const char *binary_path);
-int cbm_remove_qoder_context_hooks_for_testing(const char *settings_path,
-                                               const char *binary_path);
+int cbm_upsert_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
+int cbm_remove_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
 /* Explicit lifecycle adapter seam for hook protocols whose output envelope is
  * not Claude/Gemini-compatible. Returns allocated JSON or NULL to fail open. */
 char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char *forced_event,

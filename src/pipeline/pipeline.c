@@ -1160,8 +1160,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                 struct stat fst;
                 if (stat(files[i].path, &fst) == 0) {
                     if (cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path,
-                                                   "", stat_mtime_ns(&fst), fst.st_size) !=
-                        CBM_STORE_OK) {
+                                                   "", stat_mtime_ns(&fst),
+                                                   fst.st_size) != CBM_STORE_OK) {
                         hash_records_complete = false;
                     }
                 } else {
@@ -1225,8 +1225,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         };
         if (cbm_store_coverage_replace_ex(hash_store, p->project_name, cov, cn, &coverage_meta) !=
             CBM_STORE_OK) {
-            cbm_log_error("pipeline.err", "phase", "persist_coverage", "project",
-                          p->project_name);
+            cbm_log_error("pipeline.err", "phase", "persist_coverage", "project", p->project_name);
         }
         free(cov);
         if (have_project_info) {

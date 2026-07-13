@@ -69,10 +69,10 @@ TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed) {
     char *script = security_read_file("scripts/security-vendored.sh");
     ASSERT_NOT_NULL(script);
     ASSERT_NOT_NULL(strstr(script, "MISSING=$((MISSING + 1))\n        CONTENT_DRIFT=1"));
-    ASSERT_NOT_NULL(strstr(
-        script,
-        "if [[ $CHECKED -eq 0 ]]; then\n    echo \"BLOCKED: checksum manifest verified zero "
-        "files\"\n    STRUCTURAL_FAIL=1"));
+    ASSERT_NOT_NULL(
+        strstr(script,
+               "if [[ $CHECKED -eq 0 ]]; then\n    echo \"BLOCKED: checksum manifest verified zero "
+               "files\"\n    STRUCTURAL_FAIL=1"));
     free(script);
     PASS();
 }
@@ -120,8 +120,7 @@ static int security_make_vendored_fixture(char *root, size_t root_size,
 
 TEST(vendored_integrity_rejects_unmanifested_source) {
     char root[1024];
-    ASSERT_EQ(security_make_vendored_fixture(root, sizeof(root),
-                                             "vendored/yyjson/unmanifested.h",
+    ASSERT_EQ(security_make_vendored_fixture(root, sizeof(root), "vendored/yyjson/unmanifested.h",
                                              "#define CBM_SAFE_EXTRA 1\n"),
               0);
 
@@ -137,9 +136,8 @@ TEST(vendored_integrity_rejects_unmanifested_source) {
 
 TEST(vendored_integrity_update_refuses_dangerous_source_without_manifest_mutation) {
     char root[1024];
-    ASSERT_EQ(security_make_vendored_fixture(
-                  root, sizeof(root), "vendored/yyjson/danger.c",
-                  "int danger(void) { return system(\"true\"); }\n"),
+    ASSERT_EQ(security_make_vendored_fixture(root, sizeof(root), "vendored/yyjson/danger.c",
+                                             "int danger(void) { return system(\"true\"); }\n"),
               0);
 
     char script_path[1200];

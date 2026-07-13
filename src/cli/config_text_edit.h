@@ -30,15 +30,13 @@ int cbm_text_ensure_owned_document(const char *file_path, const char *owned_cont
  * upgrade only an exact byte-for-byte previously released document. Returns
  * 1 for user-modified/unowned content. */
 int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
-                                    const char *const *released_contents,
-                                    size_t released_count);
+                                    const char *const *released_contents, size_t released_count);
 /* Returns 0 when removed/missing, 1 when a regular document exists but is not
  * byte-for-byte owned by the caller, and -1 for unsafe state or I/O failure. */
 int cbm_text_remove_owned_document(const char *file_path, const char *expected_owned_content);
 /* Remove current or any exact released document; preserve all other bytes. */
 int cbm_text_remove_owned_document_any(const char *file_path, const char *current_content,
-                                       const char *const *released_contents,
-                                       size_t released_count);
+                                       const char *const *released_contents, size_t released_count);
 
 #ifdef CBM_TEXT_EDIT_ENABLE_TEST_API
 typedef void (*cbm_text_precommit_test_hook_t)(const char *file_path, void *context);

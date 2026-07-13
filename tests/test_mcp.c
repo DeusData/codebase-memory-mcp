@@ -2226,8 +2226,8 @@ TEST(tool_project_arg_resolves_unique_tail_issue1025) {
     ASSERT_NOT_NULL(srv);
 
     char args[CBM_SZ_1K];
-    snprintf(args, sizeof(args),
-             "{\"repo_path\":\"%s\",\"name\":\"E-project-graph-suffix1025\"}", repo_a);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"E-project-graph-suffix1025\"}",
+             repo_a);
     char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
     ASSERT_NOT_NULL(r);
     free(r);

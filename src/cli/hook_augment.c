@@ -732,8 +732,7 @@ static bool ha_canonical_path(const char *input, char *output, size_t output_siz
     return cbm_hook_path_is_abs(output);
 }
 
-static bool ha_path_contains_mode(const char *root, const char *candidate,
-                                  bool case_insensitive) {
+static bool ha_path_contains_mode(const char *root, const char *candidate, bool case_insensitive) {
     if (!root || !candidate) {
         return false;
     }
@@ -1004,17 +1003,16 @@ static bool ha_tool_event_supported(ha_lifecycle_dialect_t dialect, const char *
         }
         return false;
     }
-    bool matches =
-        (dialect == HA_DIALECT_GEMINI && strcmp(event, "AfterTool") == 0 &&
-         strcmp(tool, "read_file") == 0) ||
-        (dialect == HA_DIALECT_QWEN && strcmp(event, "PostToolUse") == 0 &&
-         strcmp(tool, "ReadFile") == 0) ||
-        (dialect == HA_DIALECT_QODER && strcmp(event, "PostToolUse") == 0 &&
-         strcmp(tool, "Read") == 0) ||
-        (dialect == HA_DIALECT_FACTORY && strcmp(event, "PostToolUse") == 0 &&
-         strcmp(tool, "Read") == 0) ||
-        (dialect == HA_DIALECT_AUGMENT && strcmp(event, "PostToolUse") == 0 &&
-         strcmp(tool, "view") == 0);
+    bool matches = (dialect == HA_DIALECT_GEMINI && strcmp(event, "AfterTool") == 0 &&
+                    strcmp(tool, "read_file") == 0) ||
+                   (dialect == HA_DIALECT_QWEN && strcmp(event, "PostToolUse") == 0 &&
+                    strcmp(tool, "ReadFile") == 0) ||
+                   (dialect == HA_DIALECT_QODER && strcmp(event, "PostToolUse") == 0 &&
+                    strcmp(tool, "Read") == 0) ||
+                   (dialect == HA_DIALECT_FACTORY && strcmp(event, "PostToolUse") == 0 &&
+                    strcmp(tool, "Read") == 0) ||
+                   (dialect == HA_DIALECT_AUGMENT && strcmp(event, "PostToolUse") == 0 &&
+                    strcmp(tool, "view") == 0);
     if (matches && coverage) {
         *coverage = true;
     }

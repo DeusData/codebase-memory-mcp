@@ -2327,8 +2327,7 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
         }
     } else {
         sqlite3_stmt *del_meta = NULL;
-        if (sqlite3_prepare_v2(s->db,
-                               "DELETE FROM index_coverage_meta WHERE project = ?1;",
+        if (sqlite3_prepare_v2(s->db, "DELETE FROM index_coverage_meta WHERE project = ?1;",
                                CBM_NOT_FOUND, &del_meta, NULL) != SQLITE_OK) {
             store_set_error_sqlite(s, "coverage meta delete prepare");
             (void)exec_sql(s, "ROLLBACK;");
@@ -2414,28 +2413,26 @@ static int coverage_query_rows(cbm_store_t *s, const char *project, const char *
 
 int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char *rel_path,
                                 cbm_coverage_row_t **out, int *count) {
-    static const char sql[] =
-        "SELECT rel_path, kind, detail FROM index_coverage "
-        "WHERE project = ?1 AND (rel_path = ?2 OR "
-        " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2) "
-        "  AND substr(?2, 1, length(rel_path)) = rel_path "
-        "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
-        "ORDER BY length(rel_path) DESC, rel_path, kind;";
+    static const char sql[] = "SELECT rel_path, kind, detail FROM index_coverage "
+                              "WHERE project = ?1 AND (rel_path = ?2 OR "
+                              " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2) "
+                              "  AND substr(?2, 1, length(rel_path)) = rel_path "
+                              "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
+                              "ORDER BY length(rel_path) DESC, rel_path, kind;";
     return coverage_query_rows(s, project, rel_path, sql, out, count);
 }
 
 int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
                                  cbm_coverage_row_t **out, int *count) {
-    static const char sql[] =
-        "SELECT rel_path, kind, detail FROM index_coverage "
-        "WHERE project = ?1 AND (length(?2) = 0 OR rel_path = ?2 OR "
-        " (length(rel_path) > length(?2) "
-        "  AND substr(rel_path, 1, length(?2)) = ?2 "
-        "  AND substr(rel_path, length(?2) + 1, 1) = '/') OR "
-        " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2) "
-        "  AND substr(?2, 1, length(rel_path)) = rel_path "
-        "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
-        "ORDER BY rel_path, kind;";
+    static const char sql[] = "SELECT rel_path, kind, detail FROM index_coverage "
+                              "WHERE project = ?1 AND (length(?2) = 0 OR rel_path = ?2 OR "
+                              " (length(rel_path) > length(?2) "
+                              "  AND substr(rel_path, 1, length(?2)) = ?2 "
+                              "  AND substr(rel_path, length(?2) + 1, 1) = '/') OR "
+                              " (kind = 'not_indexed_dir' AND length(rel_path) < length(?2) "
+                              "  AND substr(?2, 1, length(rel_path)) = rel_path "
+                              "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
+                              "ORDER BY rel_path, kind;";
     return coverage_query_rows(s, project, scope, sql, out, count);
 }
 
@@ -2460,12 +2457,11 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(
-            s->db,
-            "SELECT project, generation, index_mode, recorded_at, recording_status, "
-            "ignored_files_stored, ignored_files_total, coverage_version, "
-            "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
-            CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT project, generation, index_mode, recorded_at, recording_status, "
+                           "ignored_files_stored, ignored_files_total, coverage_version, "
+                           "hash_records_complete FROM index_coverage_meta WHERE project = ?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage meta get prepare");
         return CBM_STORE_ERR;
     }

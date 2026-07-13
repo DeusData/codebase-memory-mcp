@@ -5704,8 +5704,9 @@ TEST(incremental_aborts_when_previous_coverage_is_unreadable) {
     ASSERT_GT(nodes_before, 0);
     /* Simulate an unreadable prior coverage generation while leaving the
      * graph and file hashes healthy enough to otherwise run incrementally. */
-    ASSERT_EQ(cbm_store_exec(s, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
-              CBM_STORE_OK);
+    ASSERT_EQ(
+        cbm_store_exec(s, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
+        CBM_STORE_OK);
     cbm_store_close(s);
 
     char path[512];

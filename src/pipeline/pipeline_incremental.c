@@ -665,8 +665,8 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
-        bool hash_records_complete =
-            persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+        bool hash_records_complete = persist_hashes(hash_store, project, files, file_count,
+                                                    mode_skipped, mode_skipped_count);
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */

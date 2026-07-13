@@ -1138,14 +1138,13 @@ static int text_matches_candidate(const char *data, size_t data_len, const char 
         text_validate_bytes(candidate, candidate_len, 1) != TEXT_OK) {
         return TEXT_ERROR;
     }
-    *matches = data_len == candidate_len &&
-               (data_len == 0U || memcmp(data, candidate, data_len) == 0);
+    *matches =
+        data_len == candidate_len && (data_len == 0U || memcmp(data, candidate, data_len) == 0);
     return TEXT_OK;
 }
 
 int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
-                                    const char *const *released_contents,
-                                    size_t released_count) {
+                                    const char *const *released_contents, size_t released_count) {
     size_t current_len = 0U;
     if (!text_valid_path(file_path) ||
         text_bounded_strlen(current_content, TEXT_MAX_BYTES, &current_len) != TEXT_OK ||

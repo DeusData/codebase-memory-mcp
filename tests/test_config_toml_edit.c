@@ -804,21 +804,21 @@ TEST(config_toml_vibe_owned_table_installs_idempotently_and_removes_exact_state)
                             "args = []\n";
     ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
 
-    ASSERT_EQ(cbm_toml_upsert_owned_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY,
-                                                      canonical),
-              0);
+    ASSERT_EQ(
+        cbm_toml_upsert_owned_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY, canonical),
+        0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, installed);
 
-    ASSERT_EQ(cbm_toml_upsert_owned_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY,
-                                                      canonical),
-              0);
+    ASSERT_EQ(
+        cbm_toml_upsert_owned_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY, canonical),
+        0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, installed);
 
-    ASSERT_EQ(cbm_toml_remove_owned_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY,
-                                                      canonical),
-              0);
+    ASSERT_EQ(
+        cbm_toml_remove_owned_named_array_table(path, CTE_TABLE, CTE_KEY, CTE_IDENTITY, canonical),
+        0);
     ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
     ASSERT_STR_EQ(actual, "");
     th_cleanup(dir);
