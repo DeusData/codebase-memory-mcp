@@ -3476,14 +3476,21 @@ int cbm_upsert_claude_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
+    char previous_legacy_command[CLI_BUF_8K];
+    char released_legacy_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command)) != CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT, released_command,
-                                          sizeof(released_command)) != CLI_OK) {
+                                          sizeof(released_command)) != CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT_LEGACY, previous_legacy_command,
+                                          sizeof(previous_legacy_command)) != CLI_OK ||
+        cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT_LEGACY, released_legacy_command,
+                                          sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+                                        previous_legacy_command, NULL};
     int search_result = upsert_hooks_json((hooks_upsert_args_t){
         .settings_path = settings_path,
         .hook_event = "PreToolUse",
@@ -3510,14 +3517,21 @@ int cbm_remove_claude_hooks(const char *settings_path) {
     char command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
+    char previous_legacy_command[CLI_BUF_8K];
+    char released_legacy_command[CLI_BUF_8K];
     if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command)) != CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT, released_command,
-                                          sizeof(released_command)) != CLI_OK) {
+                                          sizeof(released_command)) != CLI_OK ||
+        cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT_LEGACY, previous_legacy_command,
+                                          sizeof(previous_legacy_command)) != CLI_OK ||
+        cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT_LEGACY, released_legacy_command,
+                                          sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, NULL};
+    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+                                        previous_legacy_command, NULL};
     int search_result = remove_hooks_json((hooks_remove_args_t){
         .settings_path = settings_path,
         .hook_event = "PreToolUse",
