@@ -2885,6 +2885,38 @@ static bool cmm_hook_outer_is_canonical(yyjson_mut_val *entry, bool has_matcher)
            (!has_matcher || (matcher && yyjson_mut_is_str(matcher)));
 }
 
+static size_t remove_all_owned_hooks_from_event(yyjson_mut_val *event_arr, const char *matcher_str,
+                                                const char *const *old_matchers,
+                                                const char *match_command_exact,
+                                                const char *const *old_commands) {
+    if (!event_arr || !yyjson_mut_is_arr(event_arr) || !match_command_exact) {
+        return 0U;
+    }
+    size_t removed = 0U;
+    size_t entry_index = 0U;
+    while (entry_index < yyjson_mut_arr_size(event_arr)) {
+        yyjson_mut_val *entry = yyjson_mut_arr_get(event_arr, entry_index);
+        bool entry_removed = false;
+        size_t hook_index = 0U;
+        while (find_cmm_hook_in_entry(entry, matcher_str, old_matchers, match_command_exact,
+                                      old_commands, &hook_index)) {
+            yyjson_mut_val *entry_hooks = yyjson_mut_obj_get(entry, "hooks");
+            yyjson_mut_arr_remove(entry_hooks, hook_index);
+            removed++;
+            if (yyjson_mut_arr_size(entry_hooks) == 0U &&
+                cmm_hook_outer_is_canonical(entry, matcher_str != NULL)) {
+                yyjson_mut_arr_remove(event_arr, entry_index);
+                entry_removed = true;
+                break;
+            }
+        }
+        if (!entry_removed) {
+            entry_index++;
+        }
+    }
+    return removed;
+}
+
 /* Generic hook upsert for both Claude Code and Gemini CLI */
 
 typedef struct {
@@ -3004,25 +3036,11 @@ static int upsert_hooks_json(hooks_upsert_args_t args) {
         }
     }
 
-    /* Remove existing CMM entry if present */
-    size_t idx;
-    size_t max;
-    yyjson_mut_val *item;
-    yyjson_mut_arr_foreach(event_arr, idx, max, item) {
-        size_t hook_index = 0U;
-        const char *effective_exact =
-            args.match_command_exact ? args.match_command_exact : command_str;
-        if (find_cmm_hook_in_entry(item, matcher_str, old_matchers, effective_exact,
-                                   args.old_commands, &hook_index)) {
-            yyjson_mut_val *entry_hooks = yyjson_mut_obj_get(item, "hooks");
-            yyjson_mut_arr_remove(entry_hooks, hook_index);
-            if (yyjson_mut_arr_size(entry_hooks) == 0U &&
-                cmm_hook_outer_is_canonical(item, matcher_str != NULL)) {
-                yyjson_mut_arr_remove(event_arr, idx);
-            }
-            break;
-        }
-    }
+    /* Collapse every exact-owned historical/current entry before appending the
+     * one canonical entry. Foreign commands remain untouched. */
+    const char *effective_exact = args.match_command_exact ? args.match_command_exact : command_str;
+    (void)remove_all_owned_hooks_from_event(event_arr, matcher_str, old_matchers, effective_exact,
+                                            args.old_commands);
 
     /* Build our hook entry */
     yyjson_mut_val *entry = yyjson_mut_obj(mdoc);
@@ -3135,21 +3153,13 @@ static int remove_hooks_json(hooks_remove_args_t args) {
         return CLI_ERR;
     }
 
-    size_t idx;
-    size_t max;
-    yyjson_mut_val *item;
-    yyjson_mut_arr_foreach(event_arr, idx, max, item) {
-        size_t hook_index = 0U;
-        if (find_cmm_hook_in_entry(item, matcher_str, old_matchers, args.match_command_exact,
-                                   args.old_commands, &hook_index)) {
-            yyjson_mut_val *entry_hooks = yyjson_mut_obj_get(item, "hooks");
-            yyjson_mut_arr_remove(entry_hooks, hook_index);
-            if (yyjson_mut_arr_size(entry_hooks) == 0U &&
-                cmm_hook_outer_is_canonical(item, matcher_str != NULL)) {
-                yyjson_mut_arr_remove(event_arr, idx);
-            }
-            break;
-        }
+    size_t removed = remove_all_owned_hooks_from_event(event_arr, matcher_str, old_matchers,
+                                                       args.match_command_exact, args.old_commands);
+
+    if (removed == 0U) {
+        yyjson_mut_doc_free(mdoc);
+        free(expected_content);
+        return CLI_OK;
     }
 
     rc = write_hook_event_array(settings_path, hook_event, mdoc, event_arr, expected_content,
