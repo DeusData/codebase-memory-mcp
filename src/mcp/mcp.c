@@ -3256,6 +3256,18 @@ static char *verify_project_indexed(cbm_store_t *store, const char *project) {
     return NULL;
 }
 
+static bool store_has_adr(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) {
+        return false;
+    }
+    cbm_adr_t adr = {0};
+    if (cbm_store_adr_get(store, project, &adr) != CBM_STORE_OK) {
+        return false;
+    }
+    cbm_store_adr_free(&adr);
+    return true;
+}
+
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     char *raw_project = cbm_mcp_get_string_arg(args, "project");
     project_expand_t pe = {0};
@@ -3310,22 +3322,24 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);
 
-    /* Check ADR presence */
+    /* SQLite is the canonical ADR backend shared by MCP and UI. Retain the
+     * legacy file check so pre-migration installations still report truthfully. */
+    bool adr_exists = store_has_adr(store, project);
     cbm_project_t proj_info = {0};
-    if (cbm_store_get_project(store, project, &proj_info) == 0 && proj_info.root_path) {
+    if (!adr_exists && cbm_store_get_project(store, project, &proj_info) == 0 &&
+        proj_info.root_path) {
         char adr_path[CBM_SZ_4K];
         int adr_len = snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md",
                                proj_info.root_path);
-        bool adr_exists = adr_len > 0 && (size_t)adr_len < sizeof(adr_path) &&
-                          cbm_file_exists(adr_path);
-        yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
-        if (!adr_exists) {
-            yyjson_mut_obj_add_str(
-                doc, root, "adr_hint",
-                "No ADR found. Use manage_adr(mode='update') to persist architectural "
-                "decisions across MCP server runs. Run get_architecture(aspects=['all']) first.");
-        }
-        cbm_project_free_fields(&proj_info);
+        adr_exists = adr_len > 0 && (size_t)adr_len < sizeof(adr_path) && cbm_file_exists(adr_path);
+    }
+    cbm_project_free_fields(&proj_info);
+    yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
+    if (!adr_exists) {
+        yyjson_mut_obj_add_str(
+            doc, root, "adr_hint",
+            "No ADR found. Use manage_adr(mode='update') to persist architectural "
+            "decisions across MCP server runs. Run get_architecture(aspects=['all']) first.");
     }
 
     bool overlay_limitation_reported = false;
@@ -6511,15 +6525,15 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             if (eco != CBM_PKG_COUNT)
                 yyjson_mut_obj_add_str(doc, root, "detected_ecosystem",
                                        cbm_pkg_manager_str(eco));
-
-
-            /* Check ADR presence and suggest creation if missing */
+            /* Check the canonical SQLite ADR backend first, with legacy-file
+             * fallback for installations that have not migrated yet. */
             CBM_PROF_START(prof_index_adr);
             char adr_path[CBM_SZ_4K];
             int adr_len = snprintf(adr_path, sizeof(adr_path), "%s/.codebase-memory/adr.md",
                                    repo_path);
-            bool adr_exists = adr_len > 0 && (size_t)adr_len < sizeof(adr_path) &&
-                              cbm_file_exists(adr_path);
+            bool adr_exists =
+                store_has_adr(store, project_name) ||
+                (adr_len > 0 && (size_t)adr_len < sizeof(adr_path) && cbm_file_exists(adr_path));
             yyjson_mut_obj_add_bool(doc, root, "adr_present", adr_exists);
             if (!adr_exists) {
                 yyjson_mut_obj_add_str(

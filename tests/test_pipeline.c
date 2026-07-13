@@ -333,6 +333,56 @@ TEST(pipeline_structure_nodes) {
     PASS();
 }
 
+TEST(pipeline_full_reindex_preserves_adr_and_sibling_project) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/full_replace.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char project[CBM_SZ_256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    static const char adr_text[] = "# Decision\nPreserve user-authored context.";
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_adr_store(store, project, adr_text), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(store, "sibling", "/tmp/sibling"), CBM_STORE_OK);
+    cbm_node_t sibling = {.project = "sibling",
+                          .label = "Function",
+                          .name = "keep",
+                          .qualified_name = "sibling.keep",
+                          .file_path = "keep.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &sibling), 0);
+    cbm_store_close(store);
+
+    /* The default policy disables incremental indexing. A second run must
+     * still replace only this project's derived graph, not rewrite the DB. */
+    p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(store, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    ASSERT_EQ(cbm_store_count_nodes(store, "sibling"), 1);
+    cbm_node_t kept = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "sibling", "sibling.keep", &kept), CBM_STORE_OK);
+    cbm_node_free_fields(&kept);
+    cbm_store_close(store);
+
+    teardown_test_repo();
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -15642,6 +15692,7 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_full_reindex_preserves_adr_and_sibling_project);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_rejects_overlong_db_path_without_truncated_write);
     RUN_TEST(pipeline_structure_edges);

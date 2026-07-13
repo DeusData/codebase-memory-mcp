@@ -1431,18 +1431,30 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
         free(db_path);
         return CBM_NOT_FOUND;
     }
-    if (p->incremental_reindex == CBM_INCREMENTAL_REINDEX_OFF ||
-        (p->incremental_reindex == CBM_INCREMENTAL_REINDEX_FAST &&
-         p->mode != CBM_MODE_FAST)) {
-        cbm_log_info("pipeline.route", "path", "full", "reason",
-                     p->incremental_reindex == CBM_INCREMENTAL_REINDEX_OFF
-                         ? "incremental_reindex=off"
-                         : "incremental_reindex=fast_requires_fast_mode");
-        free(db_path);
-        return CBM_NOT_FOUND;
-    }
+    bool allow_incremental =
+        p->incremental_reindex != CBM_INCREMENTAL_REINDEX_OFF &&
+        (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_FAST || p->mode == CBM_MODE_FAST);
     cbm_store_t *check_store = cbm_store_open_path(db_path);
-    if (check_store && cbm_store_check_integrity(check_store)) {
+    bool path_only_failure = false;
+    bool store_reusable =
+        check_store &&
+        (cbm_store_check_integrity_full(check_store, &path_only_failure) || path_only_failure);
+    if (store_reusable) {
+        /* A valid existing store can replace just this project's graph in one
+         * transaction. This preserves sibling projects and user-authored
+         * project_summaries even when incremental indexing is disabled. */
+        if (out_replace_project) {
+            *out_replace_project = true;
+        }
+        if (!allow_incremental) {
+            cbm_store_close(check_store);
+            cbm_log_info("pipeline.route", "path", "full", "reason",
+                         p->incremental_reindex == CBM_INCREMENTAL_REINDEX_OFF
+                             ? "incremental_reindex=off"
+                             : "incremental_reindex=fast_requires_fast_mode");
+            free(db_path);
+            return CBM_NOT_FOUND;
+        }
         cbm_file_hash_t *hashes = NULL;
         int hash_count = 0;
         cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
@@ -1464,17 +1476,13 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
         if (hash_count > 0) {
             cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
                          itoa_buf(hash_count), "discovered", itoa_buf(file_count));
-            if (out_replace_project) {
-                *out_replace_project = true;
-            }
         }
     } else if (check_store) {
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "atomic_rewrite");
-    if (out_replace_project) {
-        *out_replace_project = true;
-    }
+    cbm_log_info("pipeline.route", "path", "reindex", "action",
+                 out_replace_project && *out_replace_project ? "replace_project"
+                                                             : "atomic_rewrite");
     free(db_path);
     return CBM_NOT_FOUND;
 }
