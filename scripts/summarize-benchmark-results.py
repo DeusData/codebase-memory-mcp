@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -221,6 +223,20 @@ def display(value: Any, digits: int = 1) -> str:
     return str(value).replace("|", "\\|")
 
 
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
 def render_markdown(rows: list[dict[str, Any]]) -> str:
     mark_pareto_frontier(rows)
     lines = [
@@ -309,8 +325,7 @@ def main() -> int:
     markdown = render_markdown([summarize_group(label, reports) for label, reports in grouped.items()])
     if args.out:
         output = Path(args.out).expanduser()
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(markdown, encoding="utf-8")
+        atomic_write_text(output, markdown)
     print(markdown, end="")
     return 0
 

@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -124,6 +125,14 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         SUMMARY.mark_pareto_frontier([row])
         self.assertEqual(row["decision"], "REJECT: quality/correctness")
         self.assertEqual(row["pareto"], "ineligible")
+
+    def test_atomic_report_write_replaces_content_without_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "summary.md"
+            SUMMARY.atomic_write_text(output, "first\n")
+            SUMMARY.atomic_write_text(output, "second\n")
+            self.assertEqual(output.read_text(), "second\n")
+            self.assertEqual(list(output.parent.glob(".summary.md.*.tmp")), [])
 
 
 if __name__ == "__main__":
