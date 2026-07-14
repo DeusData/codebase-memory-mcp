@@ -21,6 +21,7 @@ REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 VARIANT="standard"
 SKIP_CONFIG=false
+ENABLE_GLOBALCHECK=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
 
 # Security: reject non-HTTPS download URLs (defense-in-depth)
@@ -35,12 +36,14 @@ for arg in "$@"; do
         --standard)     VARIANT="standard" ;;
         --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
         --skip-config)  SKIP_CONFIG=true ;;
+        --enable-globalcheck) ENABLE_GLOBALCHECK=true ;;
         --help|-h)
-            echo "Usage: install.sh [--ui] [--dir=<path>] [--skip-config]"
+            echo "Usage: install.sh [--ui] [--dir=<path>] [--skip-config] [--enable-globalcheck]"
             echo "  --ui           Install the UI variant (with graph visualization)"
             echo "  --standard     Install the standard variant (default)"
             echo "  --dir PATH     Install directory (default: ~/.local/bin)"
             echo "  --skip-config  Skip automatic agent configuration"
+            echo "  --enable-globalcheck Enable GlobalCheck compliance for configured agents"
             exit 0
             ;;
     esac
@@ -196,7 +199,12 @@ if [ "$SKIP_CONFIG" = true ]; then
 else
     echo ""
     echo "Configuring coding agents..."
-    "$DEST" install -y 2>&1 || {
+    INSTALL_ARGS="-y"
+    if [ "$ENABLE_GLOBALCHECK" = true ]; then
+        INSTALL_ARGS+=" --enable-globalcheck"
+        echo "  (GlobalCheck compliance enabled)"
+    fi
+    "$DEST" install $INSTALL_ARGS 2>&1 || {
         echo ""
         echo "Agent configuration failed (non-fatal)."
         echo "Run manually: codebase-memory-mcp install"
