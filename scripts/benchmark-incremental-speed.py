@@ -507,6 +507,17 @@ def parse_log_max_int_field(stderr: str, marker: str, field: str) -> int | None:
     return maximum
 
 
+def parse_log_text_field(stderr: str, marker: str, field: str) -> str | None:
+    prefix = f"{field}="
+    for line in reversed(stderr.splitlines()):
+        if marker not in line:
+            continue
+        for item in line.split():
+            if item.startswith(prefix):
+                return item[len(prefix) :]
+    return None
+
+
 def parse_exact_reason(stderr: str) -> str | None:
     detail = parse_exact_route_detail(stderr)
     reason = detail.get("reason")
@@ -621,8 +632,14 @@ def build_index_result(
     include_logs: bool,
 ) -> dict[str, Any]:
     measurement_log_markers: list[str] = []
-    logfile = data.get("logfile")
-    if isinstance(logfile, str) and logfile:
+    logfiles: list[str] = []
+    supervisor_log = parse_log_text_field(stderr, "index.supervisor.profile_log", "log")
+    if supervisor_log:
+        logfiles.append(supervisor_log)
+    response_log = data.get("logfile")
+    if isinstance(response_log, str) and response_log and response_log not in logfiles:
+        logfiles.append(response_log)
+    for logfile in logfiles:
         try:
             with Path(logfile).open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
@@ -638,7 +655,9 @@ def build_index_result(
                         if len(measurement_log_markers) >= 512:
                             break
         except OSError:
-            pass
+            continue
+        if measurement_log_markers:
+            break
     measurement_text = "\n".join((stderr, *measurement_log_markers))
     elapsed_ms_int = int(elapsed_ms)
     publish_kind = response_publish_kind(data)

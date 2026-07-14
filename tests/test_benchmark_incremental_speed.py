@@ -152,8 +152,11 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 encoding="utf-8",
             )
             result = BENCHMARK.build_index_result(
-                {"publish_kind": "full", "logfile": str(logfile)},
-                "level=info msg=index.supervisor.reap outcome=clean",
+                {"publish_kind": "full", "logfile": "/missing/response.log"},
+                (
+                    "level=info msg=index.supervisor.reap outcome=clean\n"
+                    f"level=info msg=index.supervisor.profile_log log={logfile}"
+                ),
                 stdout_bytes=10,
                 elapsed_ms=100.0,
                 include_logs=False,
