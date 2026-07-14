@@ -137,6 +137,43 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         )
         self.assertEqual(result["peak_rss_mb"], 256)
 
+    def test_build_index_result_reads_bounded_worker_log_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logfile = Path(tmpdir) / "index.log"
+            logfile.write_text(
+                "ignored detail\n"
+                "level=info msg=mem.phase phase=parallel_resolve rss_mb=192 peak_mb=320\n"
+                "level=info msg=pipeline.done elapsed_ms=81\n",
+                encoding="utf-8",
+            )
+            result = BENCHMARK.build_index_result(
+                {"publish_kind": "full", "logfile": str(logfile)},
+                "level=info msg=index.supervisor.reap outcome=clean",
+                stdout_bytes=10,
+                elapsed_ms=100.0,
+                include_logs=False,
+            )
+
+        self.assertEqual(result["peak_rss_mb"], 320)
+        self.assertEqual(result["logged_elapsed_ms"]["pipeline_done"], 81)
+        self.assertEqual(len(result["measurement_log_markers"]), 2)
+        self.assertNotIn("ignored detail", "\n".join(result["measurement_log_markers"]))
+
+    def test_route_handler_mutation_adds_executable_route_registration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            source = repo / "src" / "ui" / "http_server.c"
+            source.parent.mkdir(parents=True)
+            source.write_text("/* fixture */\n", encoding="utf-8")
+
+            mutation = BENCHMARK.mutate_self_dogfood_scenario("route_handler", repo)
+            mutated = source.read_text(encoding="utf-8")
+
+        self.assertEqual(mutation["changed_paths"], ["src/ui/http_server.c"])
+        self.assertIn("cbm_pan4_oracle_route_handler", mutated)
+        self.assertIn('cbm_http_path_match(path, "/api/pan4-oracle")', mutated)
+        self.assertNotIn("route oracle literal", mutated)
+
     def test_build_index_result_uses_none_without_memory_markers(self) -> None:
         result = BENCHMARK.build_index_result(
             {"publish_kind": "full"}, "level=info msg=pipeline.done elapsed_ms=80", 10,

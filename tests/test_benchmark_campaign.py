@@ -81,6 +81,38 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertIn("bad", (attempts[0] / "stdout.log").read_text())
             self.assertTrue((attempts[0] / "attempt.json").is_file())
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX signal-group assertion")
+    def test_timeout_stops_descendant_and_retains_failed_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            marker = root / "descendant-terminated"
+            child = (
+                "import pathlib,signal,sys,time; "
+                "signal.signal(signal.SIGTERM, lambda *_: "
+                "(pathlib.Path(sys.argv[1]).write_text('terminated'), sys.exit(0))); "
+                "time.sleep(60)"
+            )
+            parent = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[1]]); "
+                "time.sleep(60)"
+            )
+            planned = cell(
+                [sys.executable, "-c", parent, str(marker)], timeout_seconds=0.5
+            )
+
+            outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            attempt = next((cell_root / "attempts").iterdir())
+            record = json.loads((attempt / "attempt.json").read_text())
+
+            self.assertEqual(outcome["status"], "failed")
+            self.assertEqual(record["status"], "failed")
+            self.assertIn("timed out", record["error"])
+            self.assertTrue(marker.is_file())
+            self.assertFalse((cell_root / "running.lock").exists())
+            self.assertFalse((cell_root / "complete.json").exists())
+
     def test_setup_error_releases_cell_lock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

@@ -620,11 +620,31 @@ def build_index_result(
     elapsed_ms: float,
     include_logs: bool,
 ) -> dict[str, Any]:
+    measurement_log_markers: list[str] = []
+    logfile = data.get("logfile")
+    if isinstance(logfile, str) and logfile:
+        try:
+            with Path(logfile).open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    if any(
+                        marker in line
+                        for marker in (
+                            "msg=mem.phase",
+                            "msg=pipeline.done",
+                            "msg=incremental.done",
+                        )
+                    ):
+                        measurement_log_markers.append(line.rstrip("\n"))
+                        if len(measurement_log_markers) >= 512:
+                            break
+        except OSError:
+            pass
+    measurement_text = "\n".join((stderr, *measurement_log_markers))
     elapsed_ms_int = int(elapsed_ms)
     publish_kind = response_publish_kind(data)
     logged_elapsed_ms = {
-        "pipeline_done": parse_logged_elapsed_ms(stderr, LOG_MARKER_PIPELINE_DONE),
-        "incremental_done": parse_logged_elapsed_ms(stderr, LOG_MARKER_INCREMENTAL_DONE),
+        "pipeline_done": parse_logged_elapsed_ms(measurement_text, LOG_MARKER_PIPELINE_DONE),
+        "incremental_done": parse_logged_elapsed_ms(measurement_text, LOG_MARKER_INCREMENTAL_DONE),
     }
     indexed_ms = indexed_work_elapsed_ms(logged_elapsed_ms)
     publish_reason = response_publish_reason(data)
@@ -635,7 +655,8 @@ def build_index_result(
     freshness_state = response_freshness_state(data)
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
-        "peak_rss_mb": parse_log_max_int_field(stderr, "mem.phase", "peak_mb"),
+        "peak_rss_mb": parse_log_max_int_field(measurement_text, "mem.phase", "peak_mb"),
+        "measurement_log_markers": measurement_log_markers,
         "indexed_work_elapsed_ms": indexed_ms,
         "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
         "response": data,
@@ -1476,11 +1497,16 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
         )
         return {"marker": marker, "changed_paths": changed, "description": "single C header edit"}
     if name == "route_handler":
-        changed.append(append_c_marker_function(repo_dir, "src/ui/http_server.c", marker, 4102))
         append_text(
             repo_dir / "src/ui/http_server.c",
-            "\n/* P.A.N4 route oracle literal: /api/pan4-oracle */\n",
+            (
+                "\n"
+                f"static int {marker}(const char *path) {{\n"
+                '    return cbm_http_path_match(path, "/api/pan4-oracle");\n'
+                "}\n"
+            ),
         )
+        changed.append("src/ui/http_server.c")
         return {
             "marker": marker,
             "changed_paths": changed,
@@ -1661,19 +1687,22 @@ def run_self_dogfood_oracles(
             first_changed,
             "changed file path appears in scoped architecture",
         )
+    route_expected = "/api/pan4-oracle" if mutation.get("description", "").startswith(
+        "HTTP UI handler"
+    ) else None
+    route_arguments: dict[str, Any] = {"project": project, "label": "Route", "limit": 5}
+    if route_expected:
+        route_arguments["name_pattern"] = "pan4-oracle"
     oracles["route_freshness_probe"] = run_tool_call_for_transport(
         transport,
         binary,
         env,
         "search_graph",
-        {"project": project, "label": "Route", "limit": 3},
+        route_arguments,
         args.timeout,
         args.include_logs,
         client,
     )
-    route_expected = "/api/pan4-oracle" if mutation.get("description", "").startswith(
-        "HTTP UI handler"
-    ) else None
     expectations["route_freshness_probe"] = (
         route_expected,
         "new route literal appears in route search" if route_expected else "route mutation not applicable",
