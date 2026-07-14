@@ -8,6 +8,7 @@ indexing only for that cache, and removes only paths it created.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -456,6 +457,23 @@ def parse_log_int_field(stderr: str, marker: str, field: str) -> int | None:
     return None
 
 
+def parse_log_max_int_field(stderr: str, marker: str, field: str) -> int | None:
+    prefix = f"{field}="
+    maximum: int | None = None
+    for line in stderr.splitlines():
+        if marker not in line:
+            continue
+        for item in line.split():
+            if not item.startswith(prefix):
+                continue
+            try:
+                value = int(item.split("=", 1)[1])
+            except ValueError:
+                continue
+            maximum = value if maximum is None else max(maximum, value)
+    return maximum
+
+
 def parse_exact_reason(stderr: str) -> str | None:
     detail = parse_exact_route_detail(stderr)
     reason = detail.get("reason")
@@ -584,6 +602,7 @@ def build_index_result(
     freshness_state = response_freshness_state(data)
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
+        "peak_rss_mb": parse_log_max_int_field(stderr, "mem.phase", "peak_mb"),
         "indexed_work_elapsed_ms": indexed_ms,
         "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
         "response": data,
@@ -1252,6 +1271,19 @@ def git_metadata(repo_root: Path, timeout: int) -> dict[str, Any]:
     }
 
 
+def binary_metadata(binary: Path) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    with binary.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    stat = binary.stat()
+    return {
+        "path": str(binary.resolve()),
+        "size_bytes": stat.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def clone_real_repo(url: str, target: Path, timeout: int) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     proc, _ = command_result(
@@ -1618,6 +1650,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
+        "binary_metadata": binary_metadata(binary),
         "work_root": str(work_root),
         "mode": "matrix",
         "parameters": {
@@ -1776,6 +1809,7 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
+        "binary_metadata": binary_metadata(binary),
         "work_root": str(work_root),
         "source_repo": str(source_repo),
         "source_git": git_metadata(source_repo, args.timeout),
@@ -1940,6 +1974,7 @@ def main() -> int:
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
+        "binary_metadata": binary_metadata(binary),
         "work_root": str(work_root),
         "parameters": {
             "files": args.files,
