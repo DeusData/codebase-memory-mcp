@@ -55,7 +55,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 (
                     "import json,sys; "
                     "json.dump({'binary_metadata':{'sha256':'" + "b" * 64 +
-                    "'},'derived':{'passed':True}},open(sys.argv[1],'w'))"
+                    "'},'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
                 ),
                 "{result_path}",
             ]
@@ -126,7 +126,14 @@ class BenchmarkCampaignTest(unittest.TestCase):
             result = root / "runs" / identity / "attempts" / "one" / "result.json"
             result.parent.mkdir(parents=True)
             result.write_text(
-                json.dumps({"binary_metadata": {"sha256": "b" * 64}}), encoding="utf-8"
+                json.dumps(
+                    {
+                        "binary_metadata": {"sha256": "b" * 64},
+                        "derived": {"passed": True},
+                        "cases": [{"passed": True}],
+                    }
+                ),
+                encoding="utf-8",
             )
             CAMPAIGN.atomic_write_json(
                 root / "runs" / identity / "complete.json",
@@ -142,6 +149,29 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(report["input_count"], 1)
             self.assertTrue((root / "reports" / "summary.md").is_file())
             self.assertIn("latest-rank-off-r1", (root / "reports" / "summary.md").read_text())
+
+    def test_harness_error_report_is_not_marked_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload = {
+                "binary_metadata": {"sha256": "b" * 64},
+                "derived": {"passed": False},
+                "cases": [],
+                "error": "RuntimeError: index failed",
+            }
+            command = [
+                sys.executable,
+                "-c",
+                "import json,sys; json.dump(json.loads(sys.argv[2]),open(sys.argv[1],'w'))",
+                "{result_path}",
+                json.dumps(payload),
+            ]
+            planned = cell(command, accepted_exit_codes=[0, 1])
+            outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            self.assertEqual(outcome["status"], "failed")
+            self.assertIn("contains an error", outcome["error"])
+            self.assertFalse((cell_root / "complete.json").exists())
 
 
 if __name__ == "__main__":
