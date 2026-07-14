@@ -92,7 +92,7 @@ bool cbm_index_supervisor_should_wrap(void) {
  * repo that keeps making progress is never falsely killed. Default: 15 min (a
  * genuinely stuck file emits nothing, so this fires only on a real hang). The
  * CBM_INDEX_WORKER_TIMEOUT_S override (seconds → ms) tightens it for tests. */
-static int worker_quiet_timeout_ms(void) {
+int cbm_index_worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
     const char *e = getenv("CBM_INDEX_WORKER_TIMEOUT_S");
     if (e && e[0]) {
@@ -205,7 +205,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     opts.bin = self;
     opts.argv = argv;
     opts.log_file = log_path;
-    opts.quiet_timeout_ms = worker_quiet_timeout_ms();
+    opts.quiet_timeout_ms = cbm_index_worker_quiet_timeout_ms();
     /* We manage log deletion ourselves after reaping (below): keep it on failure
      * for post-mortem, delete it only on a clean run. See the observability
      * note at the reap site. */

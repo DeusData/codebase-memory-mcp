@@ -146,6 +146,11 @@ bool cbm_mcp_server_overlay_compaction_active(cbm_mcp_server_t *srv);
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
 
+/* Ask a running cbm_mcp_server_run loop to exit at its next poll tick. A single
+ * atomic store — async-signal-safe, so signal handlers and watchdog threads can
+ * call it instead of closing stdio streams out from under a blocked getline. */
+void cbm_mcp_server_request_stop(cbm_mcp_server_t *srv);
+
 /* Process a single JSON-RPC request line and return the response.
  * Returns heap-allocated JSON response string, or NULL for notifications. */
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line);

@@ -20,6 +20,7 @@
 #ifndef CBM_SUBPROCESS_H
 #define CBM_SUBPROCESS_H
 
+#include <stdatomic.h> /* _Atomic long child_pid_out publication */
 #include <stdbool.h>
 #include <stddef.h> /* size_t (cbm_build_win_cmdline) */
 
@@ -54,6 +55,12 @@ typedef struct {
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
                                   * ms with no new completed log line */
     bool delete_log_on_exit;     /* unlink log_file after reaping */
+    _Atomic long *child_pid_out; /* optional: the live child's pid is published here
+                                  * right after a successful fork/CreateProcess and
+                                  * reset to 0 once the child is reaped, so another
+                                  * thread (e.g. a kill endpoint) can validate a pid
+                                  * against a child that is actually still alive.
+                                  * 0 = no live child. NULL => not published. */
 } cbm_proc_opts_t;
 
 /* Spawn opts->bin, supervise (tail + optional quiet-timeout), block until it ends,

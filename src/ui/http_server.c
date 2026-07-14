@@ -34,8 +34,8 @@
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
-#include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
-#include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
+#include "foundation/subprocess.h"  /* cbm_subprocess_run — supervised index spawn */
+#include "mcp/index_supervisor.h"   /* cbm_index_worker_quiet_timeout_ms — shared knob */
 
 #include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
@@ -157,9 +157,12 @@ typedef struct {
     char project_name[256];
     atomic_int status; /* 0=idle, 1=running, 2=done, 3=error */
     char error_msg[256];
-#ifndef _WIN32
-    pid_t child_pid; /* tracked for process-kill validation */
-#endif
+    /* Live child pid for process-kill validation, on every platform. Published
+     * atomically by cbm_subprocess_run (set after spawn, reset to 0 at reap) and
+     * read by the HTTP thread's /api/process-kill handler, so a recycled slot, a
+     * job that has not spawned yet, or an already-reaped (possibly OS-recycled)
+     * pid can never validate as killable. 0 = no live child. */
+    _Atomic long child_pid;
 } index_job_t;
 
 static index_job_t g_index_jobs[MAX_INDEX_JOBS];
@@ -626,13 +629,25 @@ static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-#ifndef _WIN32
-    /* Only allow killing PIDs that were spawned by this server (indexing jobs) */
+    /* pid 0 / negatives address the caller's whole process group (POSIX
+     * kill(0,…) would signal this server and everything it spawned) and can
+     * never be a spawned child; reject before the ownership scan. */
+    if (target_pid <= 0) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid pid\"}");
+        return;
+    }
+
+    /* Only allow killing PIDs that were spawned by this server (indexing jobs),
+     * on every platform (the Windows path previously skipped this check and
+     * would TerminateProcess an arbitrary pid). child_pid is nonzero only while
+     * that job's child is alive — published after spawn and cleared at reap by
+     * cbm_subprocess_run — so a not-yet-spawned slot or a reaped, OS-recycled
+     * pid can never validate. */
     {
         bool pid_is_ours = false;
         for (int i = 0; i < MAX_INDEX_JOBS; i++) {
             if (atomic_load(&g_index_jobs[i].status) == 1 &&
-                g_index_jobs[i].child_pid == target_pid) {
+                atomic_load(&g_index_jobs[i].child_pid) == (long)target_pid) {
                 pid_is_ours = true;
                 break;
             }
@@ -643,7 +658,6 @@ static void handle_process_kill(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             return;
         }
     }
-#endif
 
 #ifdef _WIN32
     HANDLE hproc = OpenProcess(PROCESS_TERMINATE, FALSE, (DWORD)target_pid);
@@ -994,7 +1008,22 @@ void cbm_http_server_set_binary_path(const char *path) {
     }
 }
 
-/* Index via subprocess — isolates crashes from the main process. */
+/* Stream a supervised index worker's completed log lines into the UI log ring. */
+static void ui_index_log_line(const char *line, void *ud) {
+    (void)ud;
+    if (line[0]) {
+        cbm_ui_log_append(line);
+    }
+}
+
+/* Index via subprocess — isolates crashes from the main process. Runs through
+ * cbm_subprocess_run, the primitive that was generalized FROM this spawn site
+ * (subprocess.h) but never adopted back here: the shared path gives an
+ * async-signal-safe child body (open+dup2, no freopen-after-fork malloc in a
+ * multithreaded parent), an EINTR-safe reap that keeps the REAL exit status
+ * (the old post-loop waitpid re-reaped an already-reaped pid, so every failed
+ * job reported exit code 0 / "done"), the shared no-progress kill timeout, and
+ * the CreateProcessW wide-cmdline quoting (#423/#20) in one tested place. */
 static void *index_thread_fn(void *arg) {
     index_job_t *job = arg;
     cbm_log_info("ui.index.start", "path", job->root_path);
@@ -1006,8 +1035,6 @@ static void *index_thread_fn(void *arg) {
         cbm_http_server_resolve_binary_path(NULL, self_path, sizeof(self_path));
         bin = self_path[0] ? self_path : "codebase-memory-mcp";
     }
-
-    char log_file[256];
 
     /* JSON-escape root_path and optional project name. */
     char escaped_path[2048];
@@ -1022,151 +1049,61 @@ static void *index_thread_fn(void *arg) {
         snprintf(json_arg, sizeof(json_arg), "{\"repo_path\":\"%s\"}", escaped_path);
     }
 
+    /* Per-slot log name: all MAX_INDEX_JOBS slots may run concurrently, and the
+     * previous <pid>-only name made concurrent jobs interleave one log and let
+     * the first finisher delete the other's live log. */
+    int slot = (int)(job - g_index_jobs);
+    char log_file[256];
 #ifdef _WIN32
-    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d.log",
-             getenv("TEMP") ? getenv("TEMP") : ".", (int)_getpid());
+    char temp_dir[CBM_SZ_1K];
+    const char *temp = cbm_safe_getenv("TEMP", temp_dir, sizeof(temp_dir), ".");
+    snprintf(log_file, sizeof(log_file), "%s\\cbm_index_%d_%d.log",
+             temp, (int)_getpid(), slot);
+#else
+    snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d_%d.log", (int)getpid(), slot);
+#endif
 
-    /* Build command line for CreateProcess through the shared MS-CRT quoter so the
-     * JSON arg's embedded quotes survive the child's argv re-parse — a naive
-     * `"%s"` wrap dropped them, corrupting {"repo_path":"…"} into {repo_path:…}.
-     * --index-worker: this http_server spawn is already the crash-isolation layer,
-     * so the child runs indexing in-process rather than spawning its own supervisor
+    /* --index-worker: this spawn is already the crash-isolation layer, so the
+     * child runs indexing in-process rather than spawning its own supervisor
      * (avoids redundant process nesting). */
-    char cmdline[2048];
     const char *const idx_argv[] = {bin,      "cli", "--index-worker", "index_repository",
                                     json_arg, NULL};
-    if (!cbm_build_win_cmdline(cmdline, sizeof(cmdline), idx_argv)) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "index command line too long");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-    /* Wide command line: CreateProcessA would re-mangle the UTF-8 repo path through the
-     * ANSI code page at the spawn boundary, so a non-ASCII repo path never reaches the
-     * worker intact (#423/#20). Convert and spawn via CreateProcessW. */
-    wchar_t *wcmd = cbm_utf8_to_wide(cmdline);
-    if (!wcmd) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "index command line conversion failed");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
 
     cbm_log_info("ui.index.spawn", "bin", bin, "log", log_file);
 
-    HANDLE hlog = CreateFileA(log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, NULL);
-    STARTUPINFOW si_proc = {.cb = sizeof(si_proc)};
-    if (hlog != INVALID_HANDLE_VALUE) {
-        si_proc.dwFlags = STARTF_USESTDHANDLES;
-        si_proc.hStdError = hlog;
-        si_proc.hStdOutput = hlog;
-    }
-    PROCESS_INFORMATION pi = {0};
-    BOOL spawned = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si_proc, &pi);
-    free(wcmd);
-    if (!spawned) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "CreateProcess failed");
+    cbm_proc_opts_t opts = {0};
+    opts.bin = bin;
+    opts.argv = idx_argv;
+    opts.log_file = log_file;
+    opts.on_log_line = ui_index_log_line;
+    opts.quiet_timeout_ms = cbm_index_worker_quiet_timeout_ms();
+    opts.delete_log_on_exit = true;
+    opts.child_pid_out = &job->child_pid;
+
+    cbm_proc_result_t res;
+    if (cbm_subprocess_run(&opts, &res) != 0) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "index worker spawn failed");
         atomic_store(&job->status, 3);
-        if (hlog != INVALID_HANDLE_VALUE)
-            CloseHandle(hlog);
+        cbm_log_info("ui.index.done", "path", job->root_path, "rc", "err");
         return NULL;
     }
-    if (hlog != INVALID_HANDLE_VALUE)
-        CloseHandle(hlog);
 
-    /* Poll log file while child runs */
-    long tail_pos = 0;
-    for (;;) {
-        DWORD wait = WaitForSingleObject(pi.hProcess, 500);
-        FILE *lf = fopen(log_file, "r");
-        if (lf) {
-            fseek(lf, tail_pos, SEEK_SET);
-            char line[512];
-            while (fgets(line, sizeof(line), lf)) {
-                size_t l = strlen(line);
-                if (l > 0 && line[l - 1] == '\n')
-                    line[l - 1] = '\0';
-                if (line[0])
-                    cbm_ui_log_append(line);
-            }
-            tail_pos = ftell(lf);
-            fclose(lf);
-        }
-        if (wait == WAIT_OBJECT_0)
-            break;
-    }
-
-    DWORD win_exit = 1;
-    GetExitCodeProcess(pi.hProcess, &win_exit);
-    int exit_code = (int)win_exit;
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    (void)DeleteFileA(log_file);
-#else
-    snprintf(log_file, sizeof(log_file), "/tmp/cbm_index_%d.log", (int)getpid());
-
-    cbm_log_info("ui.index.fork", "bin", bin, "log", log_file);
-
-    pid_t child_pid = fork();
-    if (child_pid < 0) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "fork failed");
-        atomic_store(&job->status, 3);
-        return NULL;
-    }
-    job->child_pid = child_pid;
-
-    if (child_pid == 0) {
-        FILE *lf = freopen(log_file, "w", stderr);
-        (void)lf;
-        freopen("/dev/null", "w", stdout);
-        execl(bin, bin, "cli", "--index-worker", "index_repository", json_arg, (char *)NULL);
-        _exit(127);
-    }
-
-    long tail_pos = 0;
-    for (;;) {
-        int wstatus = 0;
-        pid_t wr = waitpid(child_pid, &wstatus, WNOHANG);
-        bool child_done = (wr == child_pid);
-
-        FILE *lf = fopen(log_file, "r");
-        if (lf) {
-            fseek(lf, tail_pos, SEEK_SET);
-            char line[512];
-            while (fgets(line, sizeof(line), lf)) {
-                size_t l = strlen(line);
-                if (l > 0 && line[l - 1] == '\n')
-                    line[l - 1] = '\0';
-                if (line[0])
-                    cbm_ui_log_append(line);
-            }
-            tail_pos = ftell(lf);
-            fclose(lf);
-        }
-
-        if (child_done)
-            break;
-
-        struct timespec ts = {0, UI_INDEX_LOG_POLL_NS};
-        cbm_nanosleep(&ts, NULL);
-    }
-
-    int wstatus = 0;
-    waitpid(child_pid, &wstatus, 0);
-    int exit_code = WIFEXITED(wstatus) ? WEXITSTATUS(wstatus) : -1;
-
-    (void)cbm_unlink(log_file);
-#endif
-
-    if (exit_code != 0) {
-        snprintf(job->error_msg, sizeof(job->error_msg), "indexing failed (exit code %d)",
-                 exit_code);
+    if (res.outcome == CBM_PROC_CLEAN) {
+        atomic_store(&job->status, 2);
+    } else if (res.term_signal != 0) {
+        snprintf(job->error_msg, sizeof(job->error_msg), "indexing %s (signal %d)",
+                 cbm_proc_outcome_str(res.outcome), res.term_signal);
         atomic_store(&job->status, 3);
     } else {
-        atomic_store(&job->status, 2);
+        snprintf(job->error_msg, sizeof(job->error_msg), "indexing %s (exit code %d)",
+                 cbm_proc_outcome_str(res.outcome), res.exit_code);
+        atomic_store(&job->status, 3);
     }
-    cbm_log_info("ui.index.done", "path", job->root_path, "rc", exit_code == 0 ? "ok" : "err");
+    cbm_log_info("ui.index.done", "path", job->root_path, "rc",
+                 res.outcome == CBM_PROC_CLEAN ? "ok" : "err");
     return NULL;
 }
+
 
 /* POST /api/index — body: {"root_path": "/abs/path", "project_name": "..."} */
 static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
@@ -1217,6 +1154,11 @@ static void handle_index_start(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     snprintf(job->root_path, sizeof(job->root_path), "%s", rpath);
     snprintf(job->project_name, sizeof(job->project_name), "%s", project_name);
     job->error_msg[0] = '\0';
+    /* Clear the recycled slot's previous child pid BEFORE publishing status=1:
+     * /api/process-kill validates (status==1 && child_pid==target), and the gap
+     * between this store and the worker thread's fork must never validate the
+     * prior occupant's (possibly OS-recycled) pid. */
+    atomic_store(&job->child_pid, 0);
     atomic_store(&job->status, 1);
     yyjson_doc_free(doc);
 

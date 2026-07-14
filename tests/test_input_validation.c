@@ -349,7 +349,7 @@ TEST(trace_case_mismatch_finds_via_fallback) {
      * No project passed: resolve_store returns in-memory store, fallback search
      * has no project filter, finds "foo", re-queries with result's project. */
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
-        "{\"function_name\":\"Foo\"}");
+        "{\"function_name\":\"Foo\",\"format\":\"json\"}");
     char *resp = extract_text(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -482,9 +482,10 @@ TEST(g1_summary_mode_has_results_key) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* Pass project explicitly to ensure store is found */
+    /* Pass project explicitly to ensure store is found.
+     * format:"json" opts into the legacy JSON summary shape (G1 contract). */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-        "{\"mode\":\"summary\",\"limit\":100}");
+        "{\"mode\":\"summary\",\"limit\":100,\"format\":\"json\"}");
     char *resp = extract_text(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -509,9 +510,11 @@ TEST(cq3_cypher_with_label_warns) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
+    /* format:"json" — the ignored-filters warning is part of the legacy JSON
+     * response shape (the TOON default only carries Cypher-engine warnings). */
     char *raw = cbm_mcp_handle_tool(srv, "query_graph",
         "{\"cypher\":\"MATCH (n:Function) RETURN n.name LIMIT 5\","
-        "\"label\":\"Class\"}");
+        "\"label\":\"Class\",\"format\":\"json\"}");
     char *resp = extract_text(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -556,7 +559,7 @@ TEST(pattern_or_search_graph) {
     ASSERT_NOT_NULL(srv);
     /* pattern="foo" should match node named "foo" (OR across name and qualified_name) */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"pattern\":\"foo\",\"limit\":5}");
+                                    "{\"pattern\":\"foo\",\"limit\":5,\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -587,7 +590,7 @@ TEST(source_search_via_search_in_param) {
     snprintf(args, sizeof(args),
         "{\"pattern\":\"cbm_unique_grep_token\","
         "\"search_in\":\"source\","
-        "\"project\":\"validation-test\"}");
+        "\"project\":\"validation-test\",\"format\":\"json\"}");
     char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -626,7 +629,7 @@ TEST(source_search_path_project_normalizes_to_slug) {
     snprintf(args, sizeof(args),
         "{\"pattern\":\"path_slug_normalize_token\","
         "\"search_in\":\"source\","
-        "\"project\":\"validation-test\"}");
+        "\"project\":\"validation-test\",\"format\":\"json\"}");
     char *raw = cbm_mcp_handle_tool(srv, "search_code", args);
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
@@ -648,7 +651,7 @@ TEST(source_search_default_is_graph) {
     ASSERT_NOT_NULL(srv);
     /* No search_in → defaults to graph search → returns results array */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"pattern\":\"foo\",\"limit\":5}");
+                                    "{\"pattern\":\"foo\",\"limit\":5,\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -668,7 +671,7 @@ TEST(summary_bool_alias) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"summary\":true}");
+                                    "{\"summary\":true,\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -690,7 +693,8 @@ TEST(case_sensitive_graph_search) {
     ASSERT_NOT_NULL(srv);
     /* case_sensitive=true: "FOO" should NOT match node named "foo" */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"name_pattern\":\"FOO\",\"case_sensitive\":true,\"limit\":5}");
+                                    "{\"name_pattern\":\"FOO\",\"case_sensitive\":true,"
+                                    "\"limit\":5,\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -781,7 +785,7 @@ TEST(pattern_glob_wildcards_auto_convert) {
     ASSERT_NOT_NULL(srv);
     /* "*foo*" is not valid regex but valid glob — should auto-convert and find "foo" node */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"pattern\":\"*foo*\",\"limit\":5}");
+                                    "{\"pattern\":\"*foo*\",\"limit\":5,\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
@@ -1022,7 +1026,8 @@ TEST(source_search_no_project_falls_back_to_session) {
 
     /* No project= arg — get_project_root falls back to session_project */
     char *raw = cbm_mcp_handle_tool(srv, "search_code",
-        "{\"pattern\":\"session_fallback_token\",\"search_in\":\"source\"}");
+        "{\"pattern\":\"session_fallback_token\",\"search_in\":\"source\","
+        "\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));

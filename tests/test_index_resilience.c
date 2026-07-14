@@ -97,12 +97,15 @@ static cbm_store_t *ri_index_capture(RProj *lp, char **out_resp) {
     if (!lp->project) {
         return NULL;
     }
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
+    /* Resolve the cache dir the same way the pipeline does (honors the
+     * CBM_CACHE_DIR isolation dir test_main.c sets for every run). A
+     * hardcoded ~/.cache here reads a DIFFERENT store than the one the
+     * pipeline writes — the "815 empty-store failures" mismatch documented
+     * at the isolation setup in test_main.c. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return NULL;
     }
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp->dbpath, sizeof(lp->dbpath), "%s/%s.db", cache_dir, lp->project);
     unlink(lp->dbpath);
@@ -694,12 +697,11 @@ TEST(index_relative_repo_path_canonicalized) {
         FAIL("project name derivation failed");
     }
 
-    const char *home = getenv("HOME");
-    if (!home) {
-        home = "/tmp";
+    /* Same CBM_CACHE_DIR-honoring resolution as ri_index_capture above. */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        FAIL("cache dir resolution failed");
     }
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/codebase-memory-mcp", home);
     cbm_mkdir(cache_dir);
     snprintf(lp.dbpath, sizeof(lp.dbpath), "%s/%s.db", cache_dir, lp.project);
     unlink(lp.dbpath);

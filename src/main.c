@@ -57,7 +57,9 @@ enum {
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <io.h> /* _close — async-signal-safe stdin fd close in request_shutdown */
+#else
 #include <unistd.h>
 #endif
 
@@ -73,10 +75,13 @@ static cbm_http_server_t *g_http_server = NULL;
 static atomic_int g_shutdown = 0;
 
 /* Idempotent shutdown: cancels the active pipeline, stops background servers,
- * and closes stdin to unblock the MCP read loop. Invoked from the signal
- * handler and from the parent-death watchdog, hence the atomic_exchange guard
- * so the body runs at most once. Body is async-signal-safe (only atomic stores
- * and stop calls that themselves only set atomics). */
+ * and asks the MCP read loop to exit. Invoked from the signal handler and from
+ * the parent-death watchdog, hence the atomic_exchange guard so the body runs
+ * at most once. Body is async-signal-safe (only atomic stores, stop calls that
+ * themselves only set atomics, and close(2) — fclose(stdin) is NOT on the
+ * async-signal-safe list: it takes the FILE lock and frees, so calling it here
+ * while the main thread is blocked inside getline(stdin) was undefined
+ * behavior / a self-deadlock on the same non-recursive stdio lock). */
 static void request_shutdown(void) {
     if (atomic_exchange(&g_shutdown, 1)) {
         return; /* already shutting down */
@@ -98,8 +103,18 @@ static void request_shutdown(void) {
     if (g_http_server) {
         cbm_http_server_stop(g_http_server);
     }
-    /* Close stdin to unblock getline in the MCP server loop */
-    (void)fclose(stdin);
+    /* End the MCP read loop: set its stop flag (checked every poll tick), then
+     * close the raw stdin fd so a blocked poll/read fails over immediately.
+     * close(2) is async-signal-safe; the FILE* itself is left for exit-time
+     * cleanup on the main thread. */
+    if (g_server) {
+        cbm_mcp_server_request_stop(g_server);
+    }
+#ifdef _WIN32
+    (void)_close(0);
+#else
+    (void)close(STDIN_FILENO);
+#endif
 }
 
 static void signal_handler(int sig) {

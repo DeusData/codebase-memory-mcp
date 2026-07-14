@@ -319,11 +319,14 @@ TEST(search_graph_include_deps_marks_source) {
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* With include_dependencies=true, results should have source field */
+    /* With include_dependencies=true, results should have source field.
+     * format:"json" opts into the legacy JSON shape carrying per-result
+     * source tags (the TOON default has no source column). */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"dep-query-test\","
                                     "\"label\":\"Function\","
-                                    "\"include_dependencies\":true}");
+                                    "\"include_dependencies\":true,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_di(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -805,7 +808,14 @@ TEST(test_auto_index_deps_refreshes_nodes_fts) {
     fclose(fp);
 
     ASSERT_EQ(cbm_dep_auto_index(project, proj_dir, store, 1, NULL), 1);
-    ASSERT_EQ(count_fts_matches(store, "dep-fts-test.dep.requests", "get"), 0);
+    /* Removed defs must leave the FTS index after the refresh. "post" is gone
+     * and is not a Python builtin, so it must have zero matches. "get" is no
+     * longer a def either, but every Python file mints the synthetic builtin
+     * nodes from internal/cbm/lsp/py_builtins.c — including builtins.dict.get
+     * (name "get", file "<python-builtins>") — so exactly ONE live "get" row
+     * remains: the builtin, not the deleted requests.get definition. */
+    ASSERT_EQ(count_fts_matches(store, "dep-fts-test.dep.requests", "post"), 0);
+    ASSERT_EQ(count_fts_matches(store, "dep-fts-test.dep.requests", "get"), 1);
     ASSERT_GT(count_fts_matches(store, "dep-fts-test.dep.requests", "put"), 0);
 
     cbm_store_close(store);
@@ -823,10 +833,11 @@ TEST(test_search_results_have_source_field) {
     cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* Search with no project filter — should return both project + dep nodes */
+    /* Search with no project filter — should return both project + dep nodes.
+     * format:"json" opts into the legacy JSON shape with source tags. */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"testproj\","
-                                    "\"label\":\"Function\"}");
+                                    "\"label\":\"Function\",\"format\":\"json\"}");
     char *resp = extract_text_content_di(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -846,10 +857,10 @@ TEST(test_search_dep_results_tagged_dependency) {
     cbm_mcp_server_t *srv = setup_proj_with_deps(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* Search dep nodes via project_pattern */
+    /* Search dep nodes via project_pattern (format:"json" for source tags) */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"testproj\","
-                                    "\"label\":\"Class\"}");
+                                    "\"label\":\"Class\",\"format\":\"json\"}");
     char *resp = extract_text_content_di(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -875,7 +886,7 @@ TEST(test_search_response_has_session_project) {
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"testproj\","
-                                    "\"label\":\"Function\"}");
+                                    "\"label\":\"Function\",\"format\":\"json\"}");
     char *resp = extract_text_content_di(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);

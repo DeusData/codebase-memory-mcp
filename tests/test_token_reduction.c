@@ -163,9 +163,11 @@ TEST(search_graph_default_limit_is_50) {
     cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* search_graph with no limit parameter — should default to 50 */
+    /* search_graph with no limit parameter — should default to 50.
+     * format:"json" opts into the legacy JSON shape this test parses. */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"project\":\"limit-test\",\"label\":\"Function\"}");
+                                    "{\"project\":\"limit-test\",\"label\":\"Function\","
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -200,7 +202,7 @@ TEST(search_graph_explicit_limit_honored) {
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"limit-test\",\"label\":\"Function\","
-                                    "\"limit\":5}");
+                                    "\"limit\":5,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -226,7 +228,7 @@ TEST(search_graph_explicit_high_limit_still_works) {
     /* Explicit limit=1000 should override default and return all 80+ */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"limit-test\",\"label\":\"Function\","
-                                    "\"limit\":1000}");
+                                    "\"limit\":1000,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -278,17 +280,17 @@ TEST(search_graph_pagination_stable_ordering) {
     cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* Page 1: offset=0, limit=10 */
+    /* Page 1: offset=0, limit=10 (format:"json" — this test parses JSON) */
     char *raw1 = cbm_mcp_handle_tool(srv, "search_graph",
                                      "{\"project\":\"limit-test\",\"label\":\"Function\","
-                                     "\"limit\":10,\"offset\":0}");
+                                     "\"limit\":10,\"offset\":0,\"format\":\"json\"}");
     char *resp1 = extract_text_content_tr(raw1);
     free(raw1);
 
     /* Page 2: offset=10, limit=10 */
     char *raw2 = cbm_mcp_handle_tool(srv, "search_graph",
                                      "{\"project\":\"limit-test\",\"label\":\"Function\","
-                                     "\"limit\":10,\"offset\":10}");
+                                     "\"limit\":10,\"offset\":10,\"format\":\"json\"}");
     char *resp2 = extract_text_content_tr(raw2);
     free(raw2);
 
@@ -500,7 +502,7 @@ TEST(search_graph_compact_omits_redundant_name) {
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"limit-test\",\"label\":\"Function\","
-                                    "\"limit\":5,\"compact\":true}");
+                                    "\"limit\":5,\"compact\":true,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -535,7 +537,8 @@ TEST(trace_compact_omits_redundant_name) {
 
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
-                                    "\"project\":\"limit-test\",\"compact\":true}");
+                                    "\"project\":\"limit-test\",\"compact\":true,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -563,24 +566,28 @@ TEST(trace_compact_omits_redundant_name) {
 TEST(search_graph_compact_defaults_to_true) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
-    /* No compact param -> default is true -> name omitted when name == last qn segment.
-     * All sp-test nodes satisfy this (e.g. name="main", qn="sp-test.main.main"). */
+    /* No compact/format params -> the default output is the compact TOON
+     * encoding (upstream 4843a340): scalar lines plus a
+     * results[N]{qn,label,file,lines,in,out} table whose rows are keyed by
+     * qualified name only — no redundant per-row "name" field exists at all. */
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"include_dependencies\":false}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
-    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
-    ASSERT_NOT_NULL(doc);
-    yyjson_val *results = yyjson_obj_get(yyjson_doc_get_root(doc), "results");
-    ASSERT_NOT_NULL(results);
-    ASSERT_GT((int)yyjson_arr_size(results), 0);
-    yyjson_val *first = yyjson_arr_get(results, 0);
-    /* compact=true default: name == last qn segment -> name field OMITTED */
-    ASSERT_NULL(yyjson_obj_get(first, "name"));
-    ASSERT_NOT_NULL(yyjson_obj_get(first, "qualified_name"));
-    yyjson_doc_free(doc);
+    /* TOON contract: leading `key: value` scalar, table header, known row. */
+    ASSERT_EQ(strncmp(resp, "total: ", 7), 0);
+    const char *hdr = strstr(resp, "results[3]{qn,label,file,lines,in,out}:\n");
+    ASSERT_NOT_NULL(hdr);
+    ASSERT_NOT_NULL(strstr(resp, "\n  sp-test.main.main,Function,main.py,1-5,"));
+    /* Header count matches the actual number of indented rows. */
+    int rows = 0;
+    for (const char *p = hdr; (p = strstr(p, "\n  ")) != NULL; p += 3)
+        rows++;
+    ASSERT_EQ(rows, 3);
+    /* Compact default: no verbose JSON "name" field anywhere. */
+    ASSERT_NULL(strstr(resp, "\"name\""));
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -592,7 +599,7 @@ TEST(search_graph_compact_false_includes_name) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"include_dependencies\":false,"
-                                    "\"compact\":false}");
+                                    "\"compact\":false,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -621,7 +628,7 @@ TEST(search_graph_summary_mode) {
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"limit-test\","
-                                    "\"mode\":\"summary\"}");
+                                    "\"mode\":\"summary\",\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -642,7 +649,7 @@ TEST(search_graph_summary_mode) {
  *  1.5 TRACE EDGE CASES
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(trace_ambiguous_function_returns_candidates) {
+TEST(trace_ambiguous_function_returns_suggestions) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_limit_test_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -666,9 +673,13 @@ TEST(trace_ambiguous_function_returns_candidates) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* Should include candidates array when name is ambiguous */
-    ASSERT_NOT_NULL(strstr(resp, "\"candidates\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"resolved\""));
+    /* Upstream 7d6d52b9: two *real* same-named callable definitions are
+     * genuinely ambiguous — trace_path must return status:ambiguous with a
+     * suggestions list (both QNs) instead of silently picking/unioning one. */
+    ASSERT_NOT_NULL(strstr(resp, "ambiguous"));
+    ASSERT_NOT_NULL(strstr(resp, "\"suggestions\""));
+    ASSERT_NOT_NULL(strstr(resp, "limit-test.many.func_000"));
+    ASSERT_NOT_NULL(strstr(resp, "limit-test.other.func_000"));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -686,7 +697,8 @@ TEST(trace_bfs_deduplicates_cycles) {
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
                                     "\"project\":\"limit-test\","
-                                    "\"direction\":\"outbound\",\"depth\":5}");
+                                    "\"direction\":\"outbound\",\"depth\":5,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -717,7 +729,7 @@ TEST(trace_max_results_parameter) {
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"func_000\","
                                     "\"project\":\"limit-test\","
-                                    "\"max_results\":1}");
+                                    "\"max_results\":1,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -860,7 +872,8 @@ TEST(search_graph_omits_empty_label_and_file_path) {
     cbm_store_upsert_node(st, &n);
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"project\":\"empty-test\",\"compact\":false}");
+                                    "{\"project\":\"empty-test\",\"compact\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -896,7 +909,8 @@ TEST(search_graph_includes_nonempty_label_and_file_path) {
     cbm_store_upsert_node(st, &n);
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"project\":\"nonempty-test\",\"compact\":false}");
+                                    "{\"project\":\"nonempty-test\",\"compact\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -937,7 +951,8 @@ TEST(search_graph_omits_zero_degrees) {
     cbm_store_upsert_node(st, &n);
 
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"project\":\"degree-test\",\"compact\":false}");
+                                    "{\"project\":\"degree-test\",\"compact\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -965,7 +980,7 @@ TEST(search_graph_includes_nonzero_degrees) {
                                     "{\"project\":\"sp-test\","
                                     "\"qn_pattern\":\".*process_request.*\","
                                     "\"include_dependencies\":false,"
-                                    "\"compact\":false}");
+                                    "\"compact\":false,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1119,7 +1134,8 @@ TEST(search_graph_qn_pattern_filters_results) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"qn_pattern\":\".*handlers.*\","
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1143,7 +1159,8 @@ TEST(search_graph_qn_pattern_no_match_returns_empty) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"qn_pattern\":\".*nonexistent_module.*\","
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1166,7 +1183,8 @@ TEST(search_graph_relationship_filters_to_matching_edge_type) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"relationship\":\"HTTP_CALLS\","
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1190,7 +1208,8 @@ TEST(search_graph_relationship_nonexistent_type_returns_empty) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"relationship\":\"WRITES\","
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1213,7 +1232,8 @@ TEST(search_graph_exclude_entry_points_removes_zero_inbound) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"exclude_entry_points\":true,"
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1240,7 +1260,8 @@ TEST(search_graph_exclude_entry_points_false_keeps_all) {
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
                                     "\"exclude_entry_points\":false,"
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1277,7 +1298,8 @@ TEST(search_graph_include_dependencies_false_excludes_dep_nodes) {
     ASSERT_NOT_NULL(srv);
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
                                     "{\"project\":\"sp-test\","
-                                    "\"include_dependencies\":false}");
+                                    "\"include_dependencies\":false,"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1299,7 +1321,11 @@ TEST(search_graph_include_dependencies_false_excludes_dep_nodes) {
 TEST(trace_path_compact_defaults_to_true) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
-    /* No compact param -> defaults to true -> name omitted when it matches qn suffix */
+    /* No compact/format params -> compact stays the default, which now means
+     * the TOON trace encoding: `function:`/`direction:` scalars plus a
+     * callees[N]{qn,hop} table keyed by qualified name only (no redundant
+     * per-hop "name" field). compact:false still opts into verbose JSON
+     * (see trace_path_compact_false_includes_name below). */
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
@@ -1307,19 +1333,13 @@ TEST(trace_path_compact_defaults_to_true) {
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
-    /* Parse and check: callees[0] should NOT have "name" key (compact=true default).
-     * main -> process_request. qn "sp-test.handlers.process_request",
-     * name "process_request". ends_with_segment(qn, name) is TRUE => name omitted. */
-    yyjson_doc *doc = yyjson_read(resp, strlen(resp), 0);
-    ASSERT_NOT_NULL(doc);
-    yyjson_val *root = yyjson_doc_get_root(doc);
-    yyjson_val *callees = yyjson_obj_get(root, "callees");
-    ASSERT_NOT_NULL(callees);
-    ASSERT_GT((int)yyjson_arr_size(callees), 0);
-    yyjson_val *first_callee = yyjson_arr_get(callees, 0);
-    /* compact=true default: name matches last segment of qn -> name field OMITTED */
-    ASSERT_NULL(yyjson_obj_get(first_callee, "name"));
-    yyjson_doc_free(doc);
+    /* main -> process_request: exactly one hop-1 row, keyed by qn. */
+    ASSERT_EQ(strncmp(resp, "function: main\n", 15), 0);
+    ASSERT_NOT_NULL(strstr(resp, "direction: outbound\n"));
+    ASSERT_NOT_NULL(strstr(resp, "callees[1]{qn,hop}:\n"));
+    ASSERT_NOT_NULL(strstr(resp, "\n  sp-test.handlers.process_request,1"));
+    /* Compact default: no verbose JSON "name" field anywhere. */
+    ASSERT_NULL(strstr(resp, "\"name\""));
     free(resp);
     cbm_mcp_server_free(srv);
     PASS();
@@ -1363,7 +1383,8 @@ TEST(trace_path_edge_types_http_calls_traverses_http_edges) {
                                     "{\"function_name\":\"fetch_data\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"outbound\","
-                                    "\"edge_types\":[\"HTTP_CALLS\"]}");
+                                    "\"edge_types\":[\"HTTP_CALLS\"],"
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1387,7 +1408,8 @@ TEST(trace_path_default_edge_types_calls_only) {
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
-                                    "\"direction\":\"outbound\"}");
+                                    "\"direction\":\"outbound\","
+                                    "\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1445,7 +1467,7 @@ TEST(trace_path_risk_labels) {
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
                                     "\"direction\":\"outbound\","
-                                    "\"risk_labels\":true}");
+                                    "\"risk_labels\":true,\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1478,13 +1500,15 @@ TEST(trace_path_exclude_filters_file_paths) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  2.0 JSON OUTPUT MINIFICATION
- *  All tool responses must be single-line minified JSON.
- *  yy_doc_to_str uses YYJSON_WRITE_ALLOW_INVALID_UNICODE (no PRETTY).
- *  Tests verify this contract holds across the full API surface.
+ *  2.0 DEFAULT OUTPUT ENCODING
+ *  Upstream 4843a340: the default tool output is TOON, a compact
+ *  multi-line text format — `key: value` scalars and
+ *  `name[N]{cols}:` tables (src/mcp/compact_out.h). format:"json"
+ *  restores the legacy minified JSON. This test pins the TOON
+ *  default across the read-tool surface.
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(all_mcp_responses_are_minified_json) {
+TEST(all_mcp_responses_default_to_toon) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
 
@@ -1495,13 +1519,29 @@ TEST(all_mcp_responses_are_minified_json) {
         "{\"project\":\"sp-test\"}",
         "{\"query\":\"MATCH (n) RETURN n.name LIMIT 3\",\"project\":\"sp-test\"}"
     };
+    /* Each default response opens with a TOON scalar or table header... */
+    const char *expected_prefix[] = {
+        "total: ",          /* search_graph  */
+        "function: main\n", /* trace_path    */
+        "project: sp-test\n", /* get_architecture */
+        "rows["             /* query_graph   */
+    };
+    /* ...and carries the expected data for the sp-test fixture. */
+    const char *expected_content[] = {
+        "results[",          /* search_graph table header */
+        "callees[",          /* trace_path table header */
+        "total_nodes: ",     /* get_architecture scalar */
+        "total: "            /* query_graph row-count scalar */
+    };
     for (int t = 0; t < 4; t++) {
         char *raw  = cbm_mcp_handle_tool(srv, tools[t], args[t]);
         char *text = extract_text_content_tr(raw);
         free(raw);
         ASSERT_NOT_NULL(text);
-        /* Pretty-printed JSON always contains newlines — must be absent */
-        ASSERT_NULL(strstr(text, "\n"));
+        /* Default output is TOON text, not a JSON object. */
+        ASSERT_TRUE(text[0] != '{');
+        ASSERT_EQ(strncmp(text, expected_prefix[t], strlen(expected_prefix[t])), 0);
+        ASSERT_NOT_NULL(strstr(text, expected_content[t]));
         free(text);
     }
 
@@ -1607,7 +1647,7 @@ TEST(trace_path_candidates_includes_nonempty_file_path) {
  *  Tests verify the contract and that output remains minified.
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(get_architecture_output_is_minified_and_no_empty_fields) {
+TEST(get_architecture_output_is_toon_and_no_empty_fields) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     cbm_store_t *st = cbm_mcp_server_store(srv);
@@ -1629,14 +1669,16 @@ TEST(get_architecture_output_is_minified_and_no_empty_fields) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* Must be minified */
-    ASSERT_NULL(strstr(resp, "\n"));
+    /* Default output is the TOON summary: scalar header plus tables with the
+     * single indexed Function accounted for. */
+    ASSERT_EQ(strncmp(resp, "project: arch-test\n", 19), 0);
+    ASSERT_NOT_NULL(strstr(resp, "total_nodes: 1"));
+    ASSERT_NOT_NULL(strstr(resp, "node_labels[1]{label,count}:\n"));
+    ASSERT_NOT_NULL(strstr(resp, "\n  Function,1"));
 
-    /* key_functions block must never emit empty-string values */
-    ASSERT_NULL(strstr(resp, "\"name\":\"\""));
-    ASSERT_NULL(strstr(resp, "\"label\":\"\""));
-    ASSERT_NULL(strstr(resp, "\"file_path\":\"\""));
-    ASSERT_NULL(strstr(resp, "\"qualified_name\":\"\""));
+    /* No empty fields: TOON renders an empty cell/scalar as "" — none may
+     * appear (the fixture has no empty name/label/file_path/qn values). */
+    ASSERT_NULL(strstr(resp, "\"\""));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -1656,7 +1698,7 @@ TEST(trace_path_response_includes_callers_total) {
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"main\","
                                     "\"project\":\"sp-test\","
-                                    "\"direction\":\"both\"}");
+                                    "\"direction\":\"both\",\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1716,7 +1758,7 @@ TEST(get_architecture_compact_omits_redundant_name_in_key_functions) {
     cbm_mcp_server_t *srv = setup_sp_server();
     ASSERT_NOT_NULL(srv);
     char *raw = cbm_mcp_handle_tool(srv, "get_architecture",
-                                    "{\"project\":\"sp-test\"}");
+                                    "{\"project\":\"sp-test\",\"format\":\"json\"}");
     char *resp = extract_text_content_tr(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1787,7 +1829,7 @@ SUITE(token_reduction) {
     RUN_TEST(search_graph_summary_mode);
 
     /* 1.5 Trace Edge Cases */
-    RUN_TEST(trace_ambiguous_function_returns_candidates);
+    RUN_TEST(trace_ambiguous_function_returns_suggestions);
     RUN_TEST(trace_bfs_deduplicates_cycles);
     RUN_TEST(trace_max_results_parameter);
 
@@ -1806,14 +1848,14 @@ SUITE(token_reduction) {
     RUN_TEST(search_graph_includes_nonzero_degrees);
 
     /* 2.0 JSON Output Minification */
-    RUN_TEST(all_mcp_responses_are_minified_json);
+    RUN_TEST(all_mcp_responses_default_to_toon);
 
     /* 2.1 trace_path Field Omission */
     RUN_TEST(trace_path_candidates_omits_empty_file_path);
     RUN_TEST(trace_path_candidates_includes_nonempty_file_path);
 
     /* 2.2 get_architecture Compact Coverage */
-    RUN_TEST(get_architecture_output_is_minified_and_no_empty_fields);
+    RUN_TEST(get_architecture_output_is_toon_and_no_empty_fields);
 
     /* Search Parameterization Accuracy */
     RUN_TEST(search_graph_qn_pattern_filters_results);
