@@ -642,26 +642,22 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
         }
     }
 
-    /* Default imports */
-    const char *via_default = kt_resolve_in_default_imports(ctx, name, CBM_KT_USE_FUNCTION);
-    if (via_default) {
-        return via_default;
-    }
-
-    /* Cross-file sole-definer fallback. In the default package (no `package`
+    /* Cross-file sole-definer fallback. Kotlin declarations in the current
+     * project/package shadow default imports, so this lookup must run before
+     * kotlin.*, java.*, and other implicit-import packages. In the default
+     * package (no `package`
      * declaration) a top-level `double()` in Util.kt is callable bare from
      * Main.kt, but its registered QN embeds the defining file's path
      * ("<project>.Util.double") which the caller can't reconstruct.  When the
-     * project-wide registry holds EXACTLY ONE top-level function (receiver_type
-     * == NULL) whose short name matches, resolve to it.  Bounded to a single
-     * candidate so an ambiguous name (>1 definer) is left unresolved — sound,
-     * mirroring the registry's "unique_name" strategy.  Runs only after the
-     * package/import/bare/default-import lookups miss, so it never overrides a
-     * more specific match; in the per-file pass the registry holds just this
-     * file's defs, so the candidate is the file's own sole top-level fun. */
+     * project-wide registry holds EXACTLY ONE project top-level function
+     * (receiver_type == NULL) whose short name matches, resolve to it. Bounded
+     * to a single candidate so an ambiguous name (>1 definer) is unresolved.
+     * Filtering on project_name prevents a same-named stdlib function such as
+     * kotlin.comparisons.maxOf from making the project declaration ambiguous. */
     if (ctx->registry && ctx->registry->funcs) {
         const char *only_qn = NULL;
         int matches = 0;
+        size_t project_len = ctx->project_name ? strlen(ctx->project_name) : 0;
         for (int i = 0; i < ctx->registry->func_count && matches < 2; i++) {
             const CBMRegisteredFunc *f = &ctx->registry->funcs[i];
             if (!f->qualified_name || !f->short_name) {
@@ -670,7 +666,10 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
             if (f->receiver_type) { /* method / extension — not a bare top-level fun */
                 continue;
             }
-            if (strcmp(f->short_name, name) == 0) {
+            bool project_def = project_len > 0 &&
+                               strncmp(f->qualified_name, ctx->project_name, project_len) == 0 &&
+                               f->qualified_name[project_len] == '.';
+            if (project_def && strcmp(f->short_name, name) == 0) {
                 only_qn = f->qualified_name;
                 matches++;
             }
@@ -680,7 +679,9 @@ const char *kotlin_resolve_function_name(KotlinLSPContext *ctx, const char *name
         }
     }
 
-    return NULL;
+    /* Default imports are the final function-name fallback after explicit,
+     * same-package, wildcard, and unique project declarations. */
+    return kt_resolve_in_default_imports(ctx, name, CBM_KT_USE_FUNCTION);
 }
 
 static const char *kt_resolve_in_default_imports(KotlinLSPContext *ctx, const char *name,
@@ -4346,8 +4347,12 @@ void cbm_run_kotlin_lsp_cross(CBMArena *arena, const char *source, int source_le
     }
 
     KotlinLSPContext ctx;
-    kotlin_lsp_init(&ctx, arena, source, source_len, &reg, "", module_qn ? module_qn : "",
-                    project_name, /*rel_path=*/NULL, out);
+    /* Start from the file module QN just like cbm_run_kotlin_lsp(). A source
+     * package_header replaces this during kotlin_lsp_process_file(); default-
+     * package files retain it so emitted caller_qn values still match the
+     * textual extractor's <project>.<File>.<function> identity. */
+    kotlin_lsp_init(&ctx, arena, source, source_len, &reg, module_qn ? module_qn : "",
+                    module_qn ? module_qn : "", project_name, /*rel_path=*/NULL, out);
 
     /* Apply caller-supplied imports (resolved IMPORTS edges). */
     for (int i = 0; i < import_count; i++) {
