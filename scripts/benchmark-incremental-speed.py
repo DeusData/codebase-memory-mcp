@@ -269,6 +269,20 @@ def unwrap_mcp_result(response: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def cli_result_text(stdout: str) -> str:
+    outer = json.loads(stdout)
+    if "content" in outer:
+        return str(outer["content"][0]["text"])
+    return json.dumps(outer, separators=(",", ":"), sort_keys=True)
+
+
+def mcp_result_text(response: dict[str, Any]) -> str:
+    result = response.get("result", {})
+    if "content" in result:
+        return str(result["content"][0]["text"])
+    return json.dumps(result, separators=(",", ":"), sort_keys=True)
+
+
 TOKEN_ESTIMATOR = "utf8_bytes_div_4_ceil"
 
 
@@ -398,13 +412,19 @@ class McpClient:
     def call_tool(
         self, name: str, arguments: dict[str, Any]
     ) -> tuple[dict[str, Any], str, int, float]:
+        text, stderr, stdout_bytes, elapsed_ms = self.call_tool_text(name, arguments)
+        return json.loads(text), stderr, stdout_bytes, elapsed_ms
+
+    def call_tool_text(
+        self, name: str, arguments: dict[str, Any]
+    ) -> tuple[str, str, int, float]:
         mark = self._stderr_mark()
         start = now_ms()
         response = self._request("tools/call", {"name": name, "arguments": arguments})
         elapsed_ms = now_ms() - start
         stderr = self._stderr_since(mark)
         stdout_bytes = len(json.dumps(response, separators=(",", ":")).encode("utf-8"))
-        return unwrap_mcp_result(response), stderr, stdout_bytes, elapsed_ms
+        return mcp_result_text(response), stderr, stdout_bytes, elapsed_ms
 
 
 def log_tail(stderr: str) -> list[str]:
@@ -725,8 +745,10 @@ def build_tool_call_result(
     stdout_bytes: int,
     elapsed_ms: float,
     include_logs: bool,
+    response_payload: bytes | None = None,
 ) -> dict[str, Any]:
-    payload = canonical_response_bytes(data)
+    quality_payload = canonical_response_bytes(data)
+    payload = response_payload if response_payload is not None else quality_payload
     result: dict[str, Any] = {
         "elapsed_ms": round(elapsed_ms, 3),
         # Preserve the historical field while separating transport framing from
@@ -736,6 +758,8 @@ def build_tool_call_result(
         "response_bytes": len(payload),
         "response_token_estimate": estimate_response_tokens(payload),
         "token_estimator": TOKEN_ESTIMATOR,
+        "response_encoding": "tool_default" if response_payload is not None else "canonical_json",
+        "quality_response_bytes": len(quality_payload),
         "response": data,
         "freshness_state": response_freshness_state(data) or None,
         "freshness": response_freshness(data),
@@ -754,14 +778,29 @@ def run_cli_tool_call(
     timeout: int,
     include_logs: bool,
 ) -> dict[str, Any]:
-    cmd = [str(binary), "cli", "--json", tool_name, json.dumps(arguments, separators=(",", ":"))]
+    encoded = json.dumps(arguments, separators=(",", ":"))
+    cmd = [str(binary), "cli", "--json", tool_name, encoded]
     proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
         raise command_failure(f"{tool_name}_call", cmd, env, proc, elapsed_ms)
-    data = unwrap_cli_json(proc.stdout)
-    return build_tool_call_result(
-        data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs
+    raw_payload = cli_result_text(proc.stdout).encode("utf-8")
+    quality_arguments = dict(arguments)
+    quality_arguments["format"] = "json"
+    quality_cmd = [
+        str(binary), "cli", "--json", tool_name,
+        json.dumps(quality_arguments, separators=(",", ":")),
+    ]
+    quality_proc, quality_elapsed_ms = command_result(quality_cmd, env, timeout)
+    if quality_proc.returncode != 0:
+        raise command_failure(
+            f"{tool_name}_quality_call", quality_cmd, env, quality_proc, quality_elapsed_ms
+        )
+    data = unwrap_cli_json(quality_proc.stdout)
+    result = build_tool_call_result(
+        data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs, raw_payload
     )
+    result["quality_probe_elapsed_ms"] = round(quality_elapsed_ms, 3)
+    return result
 
 
 def run_mcp_tool_call(
@@ -770,8 +809,15 @@ def run_mcp_tool_call(
     arguments: dict[str, Any],
     include_logs: bool,
 ) -> dict[str, Any]:
-    data, stderr, stdout_bytes, elapsed_ms = client.call_tool(tool_name, arguments)
-    return build_tool_call_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
+    raw_text, stderr, stdout_bytes, elapsed_ms = client.call_tool_text(tool_name, arguments)
+    quality_arguments = dict(arguments)
+    quality_arguments["format"] = "json"
+    data, _, _, quality_elapsed_ms = client.call_tool(tool_name, quality_arguments)
+    result = build_tool_call_result(
+        data, stderr, stdout_bytes, elapsed_ms, include_logs, raw_text.encode("utf-8")
+    )
+    result["quality_probe_elapsed_ms"] = round(quality_elapsed_ms, 3)
+    return result
 
 
 def run_tool_call_for_transport(

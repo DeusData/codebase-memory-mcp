@@ -12,17 +12,56 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
-    def test_tool_result_measures_canonical_payload_not_transport_envelope(self) -> None:
+    def test_tool_result_separates_default_payload_quality_json_and_transport(self) -> None:
+        default_payload = b"total: 1\nresults[1]{name}:\n  alpha\n"
         result = BENCHMARK.build_tool_call_result(
-            {"name": "alpha", "items": [1, 2]}, "", 999, 12.5, False
+            {"name": "alpha", "items": [1, 2]}, "", 999, 12.5, False,
+            default_payload,
         )
         canonical = b'{"items":[1,2],"name":"alpha"}'
         self.assertEqual(result["transport_response_bytes"], 999)
-        self.assertEqual(result["response_bytes"], len(canonical))
+        self.assertEqual(result["response_bytes"], len(default_payload))
+        self.assertEqual(result["quality_response_bytes"], len(canonical))
         self.assertEqual(
-            result["response_token_estimate"], BENCHMARK.estimate_response_tokens(canonical)
+            result["response_token_estimate"], BENCHMARK.estimate_response_tokens(default_payload)
         )
         self.assertEqual(result["token_estimator"], "utf8_bytes_div_4_ceil")
+        self.assertEqual(result["response_encoding"], "tool_default")
+
+    def test_result_text_extractors_preserve_default_toon(self) -> None:
+        toon = "total: 1\nresults[1]{name}:\n  alpha\n"
+        cli_stdout = '{"content":[{"type":"text","text":"total: 1\\nresults[1]{name}:\\n  alpha\\n"}]}'
+        mcp_response = {"result": {"content": [{"type": "text", "text": toon}]}}
+        self.assertEqual(BENCHMARK.cli_result_text(cli_stdout), toon)
+        self.assertEqual(BENCHMARK.mcp_result_text(mcp_response), toon)
+
+    def test_mcp_tool_call_measures_default_payload_and_uses_json_for_quality(self) -> None:
+        class FakeClient:
+            def call_tool_text(self, name, arguments):
+                self.default_call = (name, arguments)
+                return "total: 1\nresults[1]{name}:\n  alpha\n", "default log", 321, 7.25
+
+            def call_tool(self, name, arguments):
+                self.quality_call = (name, arguments)
+                return {"results": [{"name": "alpha"}]}, "quality log", 654, 2.5
+
+        client = FakeClient()
+        result = BENCHMARK.run_mcp_tool_call(
+            client, "search_graph", {"name_pattern": "alpha"}, False
+        )
+
+        self.assertEqual(
+            client.default_call, ("search_graph", {"name_pattern": "alpha"})
+        )
+        self.assertEqual(
+            client.quality_call,
+            ("search_graph", {"name_pattern": "alpha", "format": "json"}),
+        )
+        self.assertEqual(result["elapsed_ms"], 7.25)
+        self.assertEqual(result["quality_probe_elapsed_ms"], 2.5)
+        self.assertEqual(result["transport_response_bytes"], 321)
+        self.assertEqual(result["response_encoding"], "tool_default")
+        self.assertEqual(result["response"]["results"][0]["name"], "alpha")
 
     def test_quality_summary_requires_every_applicable_oracle(self) -> None:
         oracles = {
