@@ -340,6 +340,36 @@ TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps) {
     PASS();
 }
 
+TEST(pagerank_disabled_config_clears_rank_views) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "rank_disabled", "/tmp/rank_disabled");
+    int64_t a = add_node(s, "rank_disabled", "a");
+    int64_t b = add_node(s, "rank_disabled", "b");
+    add_edge(s, "rank_disabled", a, b, "CALLS");
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "rank_disabled"), 2);
+    ASSERT_TRUE(count_table_rows(s, "pagerank") > 0);
+    ASSERT_TRUE(count_table_rows(s, "linkrank") > 0);
+    ASSERT_TRUE(count_table_rows(s, "node_degree") > 0);
+
+    char tmpdir[CBM_PATH_MAX];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/pr-disabled-XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_pagerank_refresh_if_needed(s, "rank_disabled", cfg, true, 0, false), 0);
+    ASSERT_EQ(count_table_rows(s, "pagerank"), 0);
+    ASSERT_EQ(count_table_rows(s, "linkrank"), 0);
+    ASSERT_EQ(count_table_rows(s, "node_degree"), 0);
+    ASSERT_FALSE(cbm_pagerank_views_complete(s, "rank_disabled"));
+
+    cbm_config_close(cfg);
+    th_rmtree(tmpdir);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_policy", "/tmp/refresh_policy");
@@ -1374,6 +1404,7 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_refresh_if_needed_skips_complete_unchanged_graph);
     RUN_TEST(pagerank_refresh_if_needed_recomputes_changed_graph);
     RUN_TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps);
+    RUN_TEST(pagerank_disabled_config_clears_rank_views);
     RUN_TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views);
     RUN_TEST(pagerank_refresh_stale_on_exact_does_not_defer_containment);
     RUN_TEST(pagerank_refresh_stale_on_incremental_defers_containment);

@@ -3273,6 +3273,12 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "false (default) ranks project symbols before dependency symbols when include_dependencies=true. "
      "true uses pure relevance order across project and dependency symbols."},
     /* ── PageRank ── */
+    {CBM_CONFIG_RANK_ENABLED, "true", NULL, "PageRank",
+     "Compute PageRank, LinkRank, and precomputed node-degree views after indexing",
+     "true|false",
+     "true preserves existing ranking behavior. false skips all three coupled rank views and removes "
+     "their stored rows so queries cannot consume stale scores; structural degree remains available. "
+     "Disable for a lower-cost baseline: codebase-memory-mcp config set rank_enabled false"},
     {"pagerank_max_iter", "20", NULL, "PageRank",
      "Max iterations for PageRank algorithm before stopping (more = more accurate convergence)",
      "1-10000",
@@ -3433,6 +3439,26 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "clusters; lower (0.3-0.5) merges related clusters into coarse subsystems. Non-positive and "
      "NaN values are clamped to 1.0. Drives the 'clusters' section of get_architecture."},
     /* ── Similarity ── */
+    {CBM_CONFIG_SIMILARITY_ENABLED, "true", NULL, "Similarity",
+     "Create MinHash SIMILAR edges during full and moderate indexing",
+     "true|false",
+     "false skips the global MinHash comparison pass while leaving semantic edges independent. "
+     "Use for an ablation or lower indexing cost: codebase-memory-mcp config set similarity_enabled false"},
+    {CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true", NULL, "Similarity",
+     "Create SEMANTICALLY_RELATED edges during full and moderate indexing",
+     "true|false",
+     "false skips the global semantic-edge pass while leaving MinHash similarity independent. "
+     "Use for an ablation or lower indexing cost: codebase-memory-mcp config set semantic_edges_enabled false"},
+    {CBM_CONFIG_GITHISTORY_ENABLED, "true", NULL, "Similarity",
+     "Scan Git history and create FILE_CHANGES_WITH coupling edges",
+     "true|false",
+     "false avoids Git-history scanning and its worker without changing source extraction. "
+     "Disable for repositories without useful history: codebase-memory-mcp config set githistory_enabled false"},
+    {CBM_CONFIG_HTTPLINKS_ENABLED, "true", NULL, "Similarity",
+     "Create route-to-client HTTP_CALLS edges with the HTTP linker",
+     "true|false",
+     "false skips fork-specific HTTP linking while retaining route discovery and other call edges. "
+     "Use for upstream-compatible comparisons: codebase-memory-mcp config set httplinks_enabled false"},
     {"similarity_threshold", "0.0", NULL, "Similarity",
      "MinHash Jaccard threshold for semantic SIMILAR edges (0.0 = use the built-in 0.95 default)",
      "0.0-1.0",

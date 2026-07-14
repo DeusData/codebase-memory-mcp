@@ -96,12 +96,16 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p);
  * Must be called before cbm_pipeline_run(). Pipeline does NOT own the store. */
 void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 
-/* Config keys consumed by cbm_pipeline_apply_config(). A value <=0 leaves the
- * corresponding pass on its compiled-in default. */
+/* Config keys consumed by cbm_pipeline_apply_config(). Boolean capabilities
+ * default enabled; threshold values <=0 retain their compiled-in defaults. */
 #define CBM_CONFIG_SIMILARITY_THRESHOLD "similarity_threshold"
+#define CBM_CONFIG_SIMILARITY_ENABLED "similarity_enabled"
 #define CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE "httplink_min_confidence"
+#define CBM_CONFIG_HTTPLINKS_ENABLED "httplinks_enabled"
 #define CBM_CONFIG_SEMANTIC_THRESHOLD "semantic_threshold"
+#define CBM_CONFIG_SEMANTIC_EDGES_ENABLED "semantic_edges_enabled"
 #define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
+#define CBM_CONFIG_GITHISTORY_ENABLED "githistory_enabled"
 #define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
 #define CBM_CONFIG_EXTRACT_TIMEOUT_MS "extract_timeout_ms"
 #define CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS 5000
@@ -135,18 +139,26 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 /* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
  * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
 void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_similarity_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_httplinks_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_semantic_edges_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_githistory_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_exact_delta_limits(cbm_pipeline_t *p, int max_changed_paths,
                                          int max_affected_paths);
 /* Apply config-backed thresholds. NULL cfg is allowed and leaves defaults. */
 void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg);
 double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p);
+bool cbm_pipeline_similarity_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p);
+bool cbm_pipeline_httplinks_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p);
+bool cbm_pipeline_semantic_edges_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p);
+bool cbm_pipeline_githistory_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p);
 int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p);
 int cbm_pipeline_exact_max_affected_paths(const cbm_pipeline_t *p);
