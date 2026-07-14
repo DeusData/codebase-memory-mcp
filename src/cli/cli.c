@@ -3959,11 +3959,11 @@ static int cbm_remove_owned_hook_script(const char *path, const char *expected_c
  * match a current or released installer-owned script. Modified/foreign files
  * at the reserved path are preserved. POSIX keeps the extensionless name,
  * where legacy == current, so no separate cleanup is needed there. */
+#ifdef _WIN32
 static int cbm_remove_owned_legacy_hook_script(const char *hooks_dir, const char *legacy_name,
                                                const char *current_script,
                                                const char *const *released_scripts,
                                                size_t released_script_count) {
-#ifdef _WIN32
     if (!hooks_dir || !legacy_name || !current_script) {
         return CLI_ERR;
     }
@@ -3975,15 +3975,8 @@ static int cbm_remove_owned_legacy_hook_script(const char *hooks_dir, const char
     int result = cbm_text_remove_owned_document_any(legacy_path, current_script, released_scripts,
                                                     released_script_count);
     return result < CLI_OK ? CLI_ERR : CLI_OK;
-#else
-    (void)hooks_dir;
-    (void)legacy_name;
-    (void)current_script;
-    (void)released_scripts;
-    (void)released_script_count;
-    return CLI_OK;
-#endif
 }
+#endif
 
 bool cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     if (!home || !binary_path) {
@@ -4021,10 +4014,12 @@ bool cbm_install_hook_gate_script(const char *home, const char *binary_path) {
                                                          sizeof(released_script)) == CLI_OK
                               ? 1U
                               : 0U;
+#ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_HOOK_GATE_SCRIPT_LEGACY, script, legacy,
                                             legacy_count) != CLI_OK) {
         return false;
     }
+#endif
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, legacy_count);
 }
 
@@ -4067,10 +4062,12 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
         return false;
     }
     const char *const legacy[] = {cmm_released_session_script};
+#ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_SESSION_REMINDER_SCRIPT_LEGACY, script,
                                             legacy, 1U) != CLI_OK) {
         return false;
     }
+#endif
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
@@ -4259,10 +4256,12 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
         return false;
     }
     const char *const legacy[] = {cmm_released_subagent_script};
+#ifdef _WIN32
     if (cbm_remove_owned_legacy_hook_script(hooks_dir, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY, script,
                                             legacy, 1U) != CLI_OK) {
         return false;
     }
+#endif
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
@@ -7839,6 +7838,7 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
                 record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
                                           script_path_valid ? script_path : owned_scripts[i].name);
             }
+#ifdef _WIN32
             if (!hooks_dir_valid ||
                 cbm_remove_owned_legacy_hook_script(
                     hooks_dir, owned_scripts[i].legacy_name, owned_scripts[i].current,
@@ -7852,6 +7852,7 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
                                               ? legacy_path
                                               : owned_scripts[i].legacy_name);
             }
+#endif
         }
     }
     printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
