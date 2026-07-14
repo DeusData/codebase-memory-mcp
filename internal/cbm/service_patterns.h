@@ -34,6 +34,16 @@ void cbm_service_patterns_init(void);
  * "project.venv.requests.api.get"). Import-alias transparent. */
 cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn);
 
+/* True for a bare, unqualified call to the native `fetch()` API. Deliberately
+ * NOT part of the substring tables above: those are matched unconditionally
+ * against the raw callee name before/regardless of registry resolution
+ * (the #523 external-library bypass), and "fetch" — unlike "axios" or
+ * "requests" — collides with a plausible local identifier. Callers must
+ * only consult this after registry resolution has come back empty, so a
+ * locally resolvable `function fetch(){}` / `const fetch = () => {}` is
+ * classified via its real resolved QN instead and never reaches this check. */
+bool cbm_service_pattern_is_global_fetch(const char *callee_name);
+
 /* Per-worker TLS cache for cbm_service_pattern_match results. The
  * pattern matcher runs once per resolved CALL edge in emit_service_
  * edge — that's 6 pattern lists × ~30 patterns × strstr per call ≈
@@ -57,6 +67,11 @@ const char *cbm_service_pattern_route_method(const char *callee_name);
  * handler argument in suffix-only fallback. Generic HTTP verbs like .get/.Get
  * return false so HTTP client wrappers get normal resolution first. */
 bool cbm_service_pattern_route_suffix_allows_no_handler(const char *callee_name);
+/* True only for the literal PHP Route facade form qualified by extraction
+ * (for example, Route::get). Its handler syntax is not always reducible to a
+ * simple symbol, but the callee remains an unambiguous registration (#952). */
+bool cbm_service_pattern_is_php_route_facade(const char *callee_name);
+bool cbm_service_pattern_is_handlerless_http_client(const char *callee_name);
 
 /* Classify a string literal as a genuine HTTP route path. Returns true for
  * real routes ("/api/orders", "/users/:id", "https://..."); false for file

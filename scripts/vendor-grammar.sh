@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # vendor-grammar.sh: Vendor a single tree-sitter grammar into internal/cbm/vendored/grammars/<name>/
 # Usage: ./scripts/vendor-grammar.sh <repo_url> <name> [subdir]
 #   repo_url: GitHub repository URL (e.g., https://github.com/tree-sitter/tree-sitter-json)

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # embed-frontend.sh — Convert built frontend assets into linkable object files.
 #
 # Usage: scripts/embed-frontend.sh <dist_dir> <output_dir>

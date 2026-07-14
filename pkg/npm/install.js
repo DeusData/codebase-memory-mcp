@@ -109,10 +109,14 @@ async function main() {
   // dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
   // have no such variant. Keep in sync with install.sh / pypi _cli.py / cli.c.
   const variant = platform === 'linux' ? '-portable' : '';
-  const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
+  // Opt into the UI build (embedded graph visualization) with CBM_VARIANT=ui.
+  // Default is the standard (headless) build. Mirrors install.sh --ui.
+  const ui = (process.env.CBM_VARIANT || '').toLowerCase() === 'ui' ? 'ui-' : '';
+  const archive = `codebase-memory-mcp-${ui}${platform}-${arch}${variant}.${ext}`;
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
 
-  process.stdout.write(`codebase-memory-mcp: downloading v${VERSION} for ${platform}/${arch}...\n`);
+  const uiLabel = ui ? '(ui) ' : '';
+  process.stdout.write(`codebase-memory-mcp: downloading v${VERSION} ${uiLabel}for ${platform}/${arch}...\n`);
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cbm-install-'));
   const tmpArchive = path.join(tmpDir, `cbm.${ext}`);

@@ -1127,10 +1127,20 @@ The evaluation's most serious flaw is not operational — it is that the bespoke
 
 # Appendix A — Per-language chapters (159)
 
-> Each chapter is a *draft specification* (per §12): repo + 5 dimension-tagged questions
-> (symmetric-authoring split), the per-type graph-stats block (all 32 edge types, zeros
-> kept), and — for the 9 LSP languages — the cross-repo + semantic/similarity deep-dive.
-> Final question symbols are confirmed grep-first against the pinned commit at execution.
+> **⚠️ STATUS — these are DRAFT specifications, not the final question bank.** The chapters below
+> were **LLM-drafted from model knowledge of each repo** to establish the format, dimension mapping,
+> and deep-dive shape. Symbols that could not be confirmed carry a `[verify]` tag. They are **not yet
+> ground-truth-derived** and **must be regenerated at execution time** per §3.1 / §12:
+>
+> - **Question *types* are already grounded** in the Sillito et al. taxonomy (§3.1) — that part is final.
+> - **Question *targets* (the specific symbols/files) are NOT yet from ground truth.** At execution they
+>   are replaced by: **SWE-QA** items for the major languages, and for the rest, targets **seeded from
+>   independent LSP symbol/reference data + git history — never from the model**, then confirmed
+>   grep-first against the pinned commit (symmetric-authoring split, [CR-1]).
+>
+> In short: each chapter shows *what kind* of question each dimension asks and *how* it is evaluated
+> (output, stats block with all 32 edge types, aggregation, LSP deep-dive). It does **not** yet contain
+> the final, ground-truth-sourced question set — do not read the drafted symbol names as validated.
 
 ---
 

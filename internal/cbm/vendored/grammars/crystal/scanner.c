@@ -3131,7 +3131,8 @@ unsigned tree_sitter_crystal_external_scanner_serialize(void *payload, char *buf
 
     // The literals array can be serialized in one chunk.
     size_t literal_content_size = state->literals.size * array_elem_size(&state->literals);
-    memcpy(&buffer[offset], state->literals.contents, literal_content_size);
+    if (literal_content_size > 0)
+        memcpy(&buffer[offset], state->literals.contents, literal_content_size);
     offset += literal_content_size;
 
     // It's safe to cast the heredoc count into a char since it will always be

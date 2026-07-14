@@ -115,12 +115,185 @@ static void build_method_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     reg->method_entry_count = idx;
 }
 
+/* Index: bare(embedded_type) -> chain of TYPE indices declaring it. One entry per
+ * (type, embedded_type). Types are iterated DESCENDING and prepended so each bucket
+ * chain ends up in ASCENDING type-index order (preserves the Rust loops' first-match
+ * tie-break); a type's multiple entries land adjacent so the iterator can dedup them. */
+static void build_type_embed_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
+    int ecount = 0;
+    for (int i = 0; i < reg->type_count; i++) {
+        const char **e = reg->types[i].embedded_types;
+        if (!e)
+            continue;
+        for (int j = 0; e[j]; j++)
+            ecount++;
+    }
+    if (ecount == 0)
+        return;
+    int bucket_count = next_pow2(ecount * 2);
+    if (bucket_count < 16)
+        bucket_count = 16;
+    int *buckets = (int *)cbm_arena_alloc(idx_arena, (size_t)bucket_count * sizeof(int));
+    CBMRegistryHashEntry *entries = (CBMRegistryHashEntry *)cbm_arena_alloc(
+        idx_arena, (size_t)ecount * sizeof(CBMRegistryHashEntry));
+    if (!buckets || !entries)
+        return;
+    for (int i = 0; i < bucket_count; i++)
+        buckets[i] = -1;
+    int idx = 0;
+    for (int i = reg->type_count - 1; i >= 0; i--) {
+        const char **e = reg->types[i].embedded_types;
+        if (!e)
+            continue;
+        for (int j = 0; e[j]; j++) {
+            const char *s = e[j];
+            if (!s)
+                continue;
+            const char *dot = strrchr(s, '.');
+            const char *bare = dot ? dot + 1 : s;
+            uint64_t h = fnv1a(bare);
+            int slot = (int)(h & (uint64_t)(bucket_count - 1));
+            entries[idx].hash = h;
+            entries[idx].payload_index = i;
+            entries[idx].next_index = buckets[slot];
+            entries[idx].slot = slot;
+            buckets[slot] = idx;
+            idx++;
+        }
+    }
+    reg->type_embed_buckets = buckets;
+    reg->type_embed_entries = entries;
+    reg->type_embed_bucket_count = bucket_count;
+    reg->type_embed_entry_count = idx;
+}
+
+/* Index: short_name -> chain of FREE-function (receiver_type==NULL) indices.
+ * Descending-iterate + prepend for ascending chain order (as above). */
+static void build_ffunc_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
+    int fcount = 0;
+    for (int i = 0; i < reg->func_count; i++) {
+        const CBMRegisteredFunc *f = &reg->funcs[i];
+        if (!f->receiver_type && f->short_name)
+            fcount++;
+    }
+    if (fcount == 0)
+        return;
+    int bucket_count = next_pow2(fcount * 2);
+    if (bucket_count < 16)
+        bucket_count = 16;
+    int *buckets = (int *)cbm_arena_alloc(idx_arena, (size_t)bucket_count * sizeof(int));
+    CBMRegistryHashEntry *entries = (CBMRegistryHashEntry *)cbm_arena_alloc(
+        idx_arena, (size_t)fcount * sizeof(CBMRegistryHashEntry));
+    if (!buckets || !entries)
+        return;
+    for (int i = 0; i < bucket_count; i++)
+        buckets[i] = -1;
+    int idx = 0;
+    for (int i = reg->func_count - 1; i >= 0; i--) {
+        const CBMRegisteredFunc *f = &reg->funcs[i];
+        if (f->receiver_type || !f->short_name)
+            continue;
+        uint64_t h = fnv1a(f->short_name);
+        int slot = (int)(h & (uint64_t)(bucket_count - 1));
+        entries[idx].hash = h;
+        entries[idx].payload_index = i;
+        entries[idx].next_index = buckets[slot];
+        entries[idx].slot = slot;
+        buckets[slot] = idx;
+        idx++;
+    }
+    reg->ffunc_short_buckets = buckets;
+    reg->ffunc_short_entries = entries;
+    reg->ffunc_short_bucket_count = bucket_count;
+    reg->ffunc_short_entry_count = idx;
+}
+
+void cbm_registry_types_by_embedded_bare(const CBMTypeRegistry *reg, const char *bare,
+                                         CBMTypeEmbedIter *out) {
+    out->reg = reg;
+    out->hash = fnv1a(bare);
+    out->prev_type = -1;
+    if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
+        /* finalized: walk the embed chain (if built) then the post-finalize tail */
+        if (reg->type_embed_buckets && reg->type_embed_bucket_count > 0) {
+            int slot = (int)(out->hash & (uint64_t)(reg->type_embed_bucket_count - 1));
+            out->chain_idx = reg->type_embed_buckets[slot];
+        } else {
+            out->chain_idx = -1;
+        }
+        out->tail_i = reg->type_qn_entry_count;
+        out->tail_end = reg->type_count;
+    } else {
+        /* unfinalized: full linear scan over all types (identical candidate set) */
+        out->chain_idx = -1;
+        out->tail_i = 0;
+        out->tail_end = reg->type_count;
+    }
+}
+
+int cbm_type_embed_iter_next(CBMTypeEmbedIter *it) {
+    const CBMTypeRegistry *reg = it->reg;
+    while (it->chain_idx >= 0) {
+        const CBMRegistryHashEntry *e = &reg->type_embed_entries[it->chain_idx];
+        int p = e->payload_index;
+        uint64_t h = e->hash;
+        it->chain_idx = e->next_index;
+        if (h != it->hash)
+            continue; /* hash collision */
+        if (p == it->prev_type)
+            continue; /* same type, multiple matching embeds — yield once */
+        it->prev_type = p;
+        return p;
+    }
+    if (it->tail_i < it->tail_end)
+        return it->tail_i++;
+    return -1;
+}
+
+void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
+                                           CBMFreeFuncIter *out) {
+    out->reg = reg;
+    out->hash = fnv1a(short_name);
+    if (reg->func_qn_buckets && reg->func_qn_bucket_count > 0) {
+        if (reg->ffunc_short_buckets && reg->ffunc_short_bucket_count > 0) {
+            int slot = (int)(out->hash & (uint64_t)(reg->ffunc_short_bucket_count - 1));
+            out->chain_idx = reg->ffunc_short_buckets[slot];
+        } else {
+            out->chain_idx = -1;
+        }
+        out->tail_i = reg->func_qn_entry_count;
+        out->tail_end = reg->func_count;
+    } else {
+        out->chain_idx = -1;
+        out->tail_i = 0;
+        out->tail_end = reg->func_count;
+    }
+}
+
+int cbm_free_func_iter_next(CBMFreeFuncIter *it) {
+    const CBMTypeRegistry *reg = it->reg;
+    while (it->chain_idx >= 0) {
+        const CBMRegistryHashEntry *e = &reg->ffunc_short_entries[it->chain_idx];
+        int p = e->payload_index;
+        uint64_t h = e->hash;
+        it->chain_idx = e->next_index;
+        if (h != it->hash)
+            continue;
+        return p; /* each free func has one short_name → no dedup needed */
+    }
+    if (it->tail_i < it->tail_end)
+        return it->tail_i++;
+    return -1;
+}
+
 void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena) {
     if (!reg || !idx_arena)
         return;
     build_qn_index(reg, idx_arena, /*for_funcs=*/true);
     build_qn_index(reg, idx_arena, /*for_funcs=*/false);
     build_method_index(reg, idx_arena);
+    build_type_embed_index(reg, idx_arena);
+    build_ffunc_short_index(reg, idx_arena);
 }
 
 void cbm_registry_finalize(CBMTypeRegistry *reg) {
@@ -135,6 +308,10 @@ void cbm_registry_init(CBMTypeRegistry *reg, CBMArena *arena) {
 }
 
 void cbm_registry_add_func(CBMTypeRegistry *reg, CBMRegisteredFunc func) {
+    if (reg->read_only) {
+        return; /* sealed Tier-2 shared registry: refuse post-finalize mutation (O(n^2)+race guard)
+                 */
+    }
     if (reg->func_count >= reg->func_cap) {
         int new_cap = reg->func_cap == 0 ? 64 : reg->func_cap * 2;
         CBMRegisteredFunc *new_items = (CBMRegisteredFunc *)cbm_arena_alloc(
@@ -151,6 +328,10 @@ void cbm_registry_add_func(CBMTypeRegistry *reg, CBMRegisteredFunc func) {
 }
 
 void cbm_registry_add_type(CBMTypeRegistry *reg, CBMRegisteredType type) {
+    if (reg->read_only) {
+        return; /* sealed Tier-2 shared registry: refuse post-finalize mutation (O(n^2)+race guard)
+                 */
+    }
     if (reg->type_count >= reg->type_cap) {
         int new_cap = reg->type_cap == 0 ? 64 : reg->type_cap * 2;
         CBMRegisteredType *new_items = (CBMRegisteredType *)cbm_arena_alloc(

@@ -17,6 +17,7 @@
 #include <string.h>
 #ifndef _WIN32
 #include <unistd.h>
+#include <sys/wait.h>
 #endif
 
 /* ── Config tests ─────────────────────────────────────────────── */
@@ -317,6 +318,88 @@ TEST(layout_respects_max_nodes) {
     PASS();
 }
 
+TEST(layout_clamps_render_cap_from_env) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    const char *old_raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    char *old_cap = old_raw ? strdup(old_raw) : NULL;
+    cbm_setenv("CBM_UI_MAX_RENDER_NODES", "25", 1);
+
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    for (int i = 0; i < 40; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test::fn%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "a.c",
+                        .start_line = i,
+                        .end_line = i + 1};
+        cbm_store_upsert_node(store, &n);
+    }
+
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 50000);
+    ASSERT_NOT_NULL(r);
+    ASSERT_LTE(r->node_count, 25);
+    ASSERT_EQ(r->total_nodes, 40);
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    if (old_cap) {
+        cbm_setenv("CBM_UI_MAX_RENDER_NODES", old_cap, 1);
+        free(old_cap);
+    } else {
+        cbm_unsetenv("CBM_UI_MAX_RENDER_NODES");
+    }
+    PASS();
+}
+
+/* A caller-requested budget above the default must be honored (up to the hard
+ * ceiling) when no env cap is set — the default is a default, not a ceiling. */
+TEST(layout_honors_budget_above_default) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+
+    const char *old_raw = getenv("CBM_UI_MAX_RENDER_NODES");
+    char *old_cap = old_raw ? strdup(old_raw) : NULL;
+    cbm_unsetenv("CBM_UI_MAX_RENDER_NODES");
+
+    cbm_store_upsert_project(store, "test", "/tmp/test");
+
+    enum { BUDGET_NODES = 5100 };
+    for (int i = 0; i < BUDGET_NODES; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test::fn%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "a.c",
+                        .start_line = i,
+                        .end_line = i + 1};
+        cbm_store_upsert_node(store, &n);
+    }
+
+    cbm_layout_result_t *r =
+        cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, BUDGET_NODES);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->node_count, BUDGET_NODES);
+    ASSERT_EQ(r->total_nodes, BUDGET_NODES);
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    if (old_cap) {
+        cbm_setenv("CBM_UI_MAX_RENDER_NODES", old_cap, 1);
+        free(old_cap);
+    }
+    PASS();
+}
+
 TEST(layout_deterministic) {
     cbm_store_t *store = cbm_store_open_memory();
     ASSERT_NOT_NULL(store);
@@ -414,6 +497,290 @@ TEST(layout_null_inputs) {
     PASS();
 }
 
+/* ── Dead-code classification (distilled from PR #789) ────────── */
+
+static const cbm_layout_node_t *find_layout_node(const cbm_layout_result_t *r, const char *name) {
+    for (int i = 0; i < r->node_count; i++) {
+        if (r->nodes[i].name && strcmp(r->nodes[i].name, name) == 0) {
+            return &r->nodes[i];
+        }
+    }
+    return NULL;
+}
+
+/* A function with zero callers/usages and no entry/test/exported flag is
+ * "dead"; entry-point, test, and exported functions are NOT dead even at zero
+ * callers; a called function reports its true full-graph incoming CALLS degree
+ * ("single" at 1, "normal" at >=2). Non-Function labels are "structural". */
+TEST(layout_dead_code_classification) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "dc", "/tmp/dc"), CBM_STORE_OK);
+
+    /* Candidates (Function, non-test path unless noted). */
+    cbm_node_t dead = {.project = "dc",
+                       .label = "Function",
+                       .name = "deadfn",
+                       .qualified_name = "dc::deadfn",
+                       .file_path = "src/a.c",
+                       .properties_json = "{\"is_entry_point\":false,\"is_test\":false,"
+                                          "\"is_exported\":false}"};
+    cbm_node_t entry = {.project = "dc",
+                        .label = "Function",
+                        .name = "entryfn",
+                        .qualified_name = "dc::entryfn",
+                        .file_path = "src/b.c",
+                        .properties_json = "{\"is_entry_point\":true}"};
+    cbm_node_t tst = {.project = "dc",
+                      .label = "Function",
+                      .name = "testfn",
+                      .qualified_name = "dc::testfn",
+                      .file_path = "src/c.c",
+                      .properties_json = "{\"is_test\":true}"};
+    cbm_node_t tstpath = {.project = "dc",
+                          .label = "Function",
+                          .name = "bypathfn",
+                          .qualified_name = "dc::bypathfn",
+                          .file_path = "tests/mod_helpers.c",
+                          .properties_json = "{}"};
+    cbm_node_t exp = {.project = "dc",
+                      .label = "Function",
+                      .name = "exportedfn",
+                      .qualified_name = "dc::exportedfn",
+                      .file_path = "src/d.c",
+                      .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t single = {.project = "dc",
+                         .label = "Function",
+                         .name = "calledonce",
+                         .qualified_name = "dc::calledonce",
+                         .file_path = "src/e.c",
+                         .properties_json = "{}"};
+    cbm_node_t norm = {.project = "dc",
+                       .label = "Function",
+                       .name = "callednormal",
+                       .qualified_name = "dc::callednormal",
+                       .file_path = "src/f.c",
+                       .properties_json = "{}"};
+    cbm_node_t caller = {.project = "dc",
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "dc::caller",
+                         .file_path = "src/g.c",
+                         .properties_json = "{}"};
+    /* A structural (non-Function) node is never a dead-code candidate. */
+    cbm_node_t cls = {.project = "dc",
+                      .label = "Class",
+                      .name = "SomeClass",
+                      .qualified_name = "dc::SomeClass",
+                      .file_path = "src/h.c",
+                      .properties_json = "{}"};
+
+    int64_t id_dead = cbm_store_upsert_node(store, &dead);
+    cbm_store_upsert_node(store, &entry);
+    cbm_store_upsert_node(store, &tst);
+    cbm_store_upsert_node(store, &tstpath);
+    cbm_store_upsert_node(store, &exp);
+    int64_t id_single = cbm_store_upsert_node(store, &single);
+    int64_t id_norm = cbm_store_upsert_node(store, &norm);
+    int64_t id_caller = cbm_store_upsert_node(store, &caller);
+    cbm_store_upsert_node(store, &cls);
+    ASSERT_GT(id_dead, 0);
+
+    /* calledonce ← 1 CALLS; callednormal ← 2 CALLS (full-graph inbound). */
+    cbm_edge_t e1 = {
+        .project = "dc", .source_id = id_caller, .target_id = id_single, .type = "CALLS"};
+    cbm_edge_t e2 = {
+        .project = "dc", .source_id = id_caller, .target_id = id_norm, .type = "CALLS"};
+    cbm_edge_t e3 = {.project = "dc", .source_id = id_dead, .target_id = id_norm, .type = "CALLS"};
+    cbm_store_insert_edge(store, &e1);
+    cbm_store_insert_edge(store, &e2);
+    cbm_store_insert_edge(store, &e3);
+
+    cbm_layout_result_t *r = cbm_layout_compute(store, "dc", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    ASSERT_NOT_NULL(r);
+
+    const cbm_layout_node_t *ln;
+
+    ln = find_layout_node(r, "deadfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "dead");
+    ASSERT_EQ(ln->in_calls, 0);
+
+    ln = find_layout_node(r, "entryfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "entry");
+
+    ln = find_layout_node(r, "testfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "test");
+
+    ln = find_layout_node(r, "bypathfn"); /* test detected via file path */
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "test");
+
+    ln = find_layout_node(r, "exportedfn");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "exported");
+
+    ln = find_layout_node(r, "calledonce");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "single");
+    ASSERT_EQ(ln->in_calls, 1);
+
+    ln = find_layout_node(r, "callednormal");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "normal");
+    ASSERT_EQ(ln->in_calls, 2);
+
+    ln = find_layout_node(r, "SomeClass");
+    ASSERT_NOT_NULL(ln);
+    ASSERT_STR_EQ(ln->status, "structural");
+
+    /* The classification must survive JSON serialization. */
+    char *json = cbm_layout_to_json(r);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"status\":\"dead\"") != NULL);
+    ASSERT(strstr(json, "\"in_calls\":2") != NULL);
+    free(json);
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    PASS();
+}
+
+/* ── Octree recursion guard (distilled from PR #821; refs #498/#726/#402) ── */
+
+/* Bodies that share a position made octree_insert subdivide forever — the
+ * cell around them shrinks but never separates them, so one octree cell is
+ * calloc'd per level until the process dies (stack overflow) or freezes the
+ * machine allocating (the 34GB-swap reports). Fixed by the depth/half-size
+ * floor in src/ui/layout3d.c (OCTREE_MAX_DEPTH / OCTREE_MIN_HALF).
+ *
+ * Coincident positions are reachable through the public layout API: layout3d
+ * anchors each node by fnv1a(file cluster key) and jitters it with a PRNG
+ * seeded by fnv1a(qualified_name). The three QNs below are distinct strings
+ * with IDENTICAL 32-bit FNV-1a hashes (0x06bb012e, found by offline brute
+ * force), so in the same file they get bit-identical positions on every
+ * platform (integer hashing only — no libm in the coincidence path).
+ *
+ * A literal sub-ULP-separated pair cannot be constructed through the public
+ * API: same-anchor positions are quantized to exact multiples of the jitter
+ * quantum (5/4096 — exactly 20 ULP at anchor magnitude ~600), and
+ * cross-anchor separations depend on the platform's cosf/sinf bits. Exact
+ * coincidence is the API-reachable degenerate input, and it necessarily
+ * drives the recursion through the sub-ULP regime: half_size falls below
+ * ULP(center) with the bodies still unseparated, freezing child centers
+ * while cells keep being allocated.
+ */
+#if !defined(_WIN32)
+/* Child body: builds the store and runs the layout so a crash or hang cannot
+ * take down the runner (alarm bounds a hang, fork isolates a SIGSEGV).
+ * Deliberately NO memory rlimit: under a rlimit a failing calloc makes
+ * octree_insert silently truncate and the UNFIXED code would complete —
+ * turning this guard vacuously green. The alarm alone bounds the runaway.
+ * Exit codes: 0 ok, 2 store setup, 3 layout NULL, 4 node count/lookup,
+ * 5 fixture no longer coincident, 6 non-finite coordinate. Never returns. */
+static void layout_octree_guard_child(void) {
+    alarm(5); /* post-fix the whole child runs in milliseconds */
+    cbm_store_t *store = cbm_store_open_memory();
+    if (!store)
+        _exit(2);
+    if (cbm_store_upsert_project(store, "test", "/tmp/test") != CBM_STORE_OK)
+        _exit(2);
+
+    /* Distinct QNs, one fnv1a hash — coincident after anchor + jitter. */
+    static const char *cqn[3] = {"test::octree_c5988474", "test::octree_c11394919",
+                                 "test::octree_c33141700"};
+    for (int i = 0; i < 3; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), "co%d", i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = cqn[i],
+                        .file_path = "pkg/sub/mod/a.c",
+                        .start_line = i + 1,
+                        .end_line = i + 2};
+        if (cbm_store_upsert_node(store, &n) <= 0)
+            _exit(2);
+    }
+    /* A few normally-spread nodes so the octree root box has realistic
+     * (non-degenerate) extent, as in the reported repositories. */
+    for (int i = 0; i < 3; i++) {
+        char name[32], qn[64], fp[32];
+        snprintf(name, sizeof(name), "fn%d", i);
+        snprintf(qn, sizeof(qn), "test::spread_fn%d", i);
+        snprintf(fp, sizeof(fp), "dir%d/f%d.c", i, i);
+        cbm_node_t n = {.project = "test",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = fp,
+                        .start_line = 1,
+                        .end_line = 2};
+        if (cbm_store_upsert_node(store, &n) <= 0)
+            _exit(2);
+    }
+
+    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
+    if (!r)
+        _exit(3);
+    if (r->node_count != 6)
+        _exit(4);
+
+    /* The colliding QNs must actually be coincident — identical output
+     * coordinates (identical seeds → identical positions, and coincident
+     * bodies receive identical forces every iteration, so they stay
+     * together). If a seeding change ever breaks this, the fixture no longer
+     * reproduces the bug: fail loudly instead of going vacuously green. */
+    int ci[3], nc = 0;
+    for (int i = 0; i < r->node_count && nc < 3; i++) {
+        if (r->nodes[i].qualified_name &&
+            strncmp(r->nodes[i].qualified_name, "test::octree_c", 14) == 0)
+            ci[nc++] = i;
+    }
+    if (nc != 3)
+        _exit(4);
+    for (int k = 1; k < 3; k++) {
+        if (r->nodes[ci[k]].x != r->nodes[ci[0]].x || r->nodes[ci[k]].y != r->nodes[ci[0]].y ||
+            r->nodes[ci[k]].z != r->nodes[ci[0]].z)
+            _exit(5);
+    }
+    for (int i = 0; i < r->node_count; i++) {
+        if (!isfinite(r->nodes[i].x) || !isfinite(r->nodes[i].y) || !isfinite(r->nodes[i].z))
+            _exit(6);
+    }
+
+    cbm_layout_free(r);
+    cbm_store_close(store);
+    _exit(0);
+}
+#endif
+
+TEST(layout_coincident_nodes_bounded) {
+#if defined(_WIN32)
+    SKIP_PLATFORM("fork/alarm not available; POSIX-only bounded-hang reproduction");
+#else
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0)
+        FAIL("fork() failed");
+    if (pid == 0)
+        layout_octree_guard_child(); /* never returns */
+
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+
+    /* Unfixed code dies here: SIGSEGV (unbounded recursion overflowing the
+     * stack) or SIGALRM (tail-call-optimized allocation runaway cut off by
+     * the child's alarm). Fixed code exits 0 well within the budget. */
+    ASSERT_FALSE(WIFSIGNALED(status));
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(ui) {
@@ -433,7 +800,11 @@ SUITE(ui) {
     RUN_TEST(layout_single_node);
     RUN_TEST(layout_two_connected);
     RUN_TEST(layout_respects_max_nodes);
+    RUN_TEST(layout_clamps_render_cap_from_env);
+    RUN_TEST(layout_honors_budget_above_default);
     RUN_TEST(layout_deterministic);
     RUN_TEST(layout_to_json);
     RUN_TEST(layout_null_inputs);
+    RUN_TEST(layout_dead_code_classification);
+    RUN_TEST(layout_coincident_nodes_bounded);
 }

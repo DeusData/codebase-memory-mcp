@@ -105,116 +105,7 @@ static void commit_free(commit_t *c) {
     free(c->files);
 }
 
-/* ── libgit2-based git log parsing (preferred) ────────────────────── */
-
-#ifdef HAVE_LIBGIT2
-#include <git2.h>
-#include <time.h>
-
-static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) {
-    *out = NULL;
-    *out_count = 0;
-
-    git_libgit2_init();
-
-    git_repository *repo = NULL;
-    if (git_repository_open(&repo, repo_path) != 0) {
-        git_libgit2_shutdown();
-        return CBM_NOT_FOUND;
-    }
-
-    /* Walk from HEAD, sorted chronologically */
-    git_revwalk *walker = NULL;
-    if (git_revwalk_new(&walker, repo) != 0) {
-        git_repository_free(repo);
-        git_libgit2_shutdown();
-        return CBM_NOT_FOUND;
-    }
-    git_revwalk_sorting(walker, GIT_SORT_TIME);
-    git_revwalk_push_head(walker);
-
-    /* 1 year cutoff, max 10k commits */
-    time_t cutoff = time(NULL) - (365L * 24 * 3600);
-    int max_commits = 10000;
-
-    int cap = CBM_SZ_64;
-    commit_t *commits = malloc(cap * sizeof(commit_t));
-    int count = 0;
-
-    git_oid oid;
-    while (git_revwalk_next(&oid, walker) == 0 && count < max_commits) {
-        git_commit *commit = NULL;
-        if (git_commit_lookup(&commit, repo, &oid) != 0) {
-            continue;
-        }
-
-        /* Check if commit is within the 6-month window */
-        git_time_t ct = git_commit_time(commit);
-        if ((time_t)ct < cutoff) {
-            git_commit_free(commit);
-            break; /* sorted by time — all subsequent commits are older */
-        }
-
-        /* Get commit tree and parent tree for diff */
-        git_tree *tree = NULL;
-        git_tree *parent_tree = NULL;
-        git_commit_tree(&tree, commit);
-
-        unsigned int nparents = git_commit_parentcount(commit);
-        if (nparents > 0) {
-            git_commit *parent = NULL;
-            if (git_commit_parent(&parent, commit, 0) == 0) {
-                git_commit_tree(&parent_tree, parent);
-                git_commit_free(parent);
-            }
-        }
-
-        /* Diff parent_tree → tree to find changed files */
-        git_diff *diff = NULL;
-        git_diff_options diff_opts;
-        git_diff_options_init(&diff_opts, GIT_DIFF_OPTIONS_VERSION);
-        if (git_diff_tree_to_tree(&diff, repo, parent_tree, tree, &diff_opts) == 0) {
-            commit_t current = {0};
-
-            size_t ndeltas = git_diff_num_deltas(diff);
-            for (size_t d = 0; d < ndeltas; d++) {
-                const git_diff_delta *delta = git_diff_get_delta(diff, d);
-                const char *path = delta->new_file.path;
-                if (path && cbm_is_trackable_file(path)) {
-                    commit_add_file(&current, path);
-                }
-            }
-
-            if (current.count > 0) {
-                if (count >= cap) {
-                    cap *= PAIR_LEN;
-                    commits = safe_realloc(commits, cap * sizeof(commit_t));
-                }
-                current.timestamp = (long long)ct;
-                commits[count++] = current;
-            } else {
-                commit_free(&current);
-            }
-            git_diff_free(diff);
-        }
-
-        if (parent_tree) {
-            git_tree_free(parent_tree);
-        }
-        git_tree_free(tree);
-        git_commit_free(commit);
-    }
-
-    git_revwalk_free(walker);
-    git_repository_free(repo);
-    git_libgit2_shutdown();
-
-    *out = commits;
-    *out_count = count;
-    return 0;
-}
-
-#else /* !HAVE_LIBGIT2 — popen fallback */
+/* ── git log parsing (popen "git log") ────────────────────────────── */
 
 static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) {
     *out = NULL;
@@ -296,8 +187,6 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
     *out_count = count;
     return 0;
 }
-
-#endif /* HAVE_LIBGIT2 */
 
 /* Callback to free hash table entries. */
 static void free_counter(const char *key, void *val, void *ud) {

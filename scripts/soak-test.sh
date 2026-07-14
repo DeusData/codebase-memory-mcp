@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # soak-test.sh — Endurance test for codebase-memory-mcp.
 #
 # Runs compressed workload cycles: queries, file mutations, reindexes, idle periods.
@@ -24,6 +24,9 @@ BINARY=$(cd "$(dirname "$BINARY")" && pwd)/$(basename "$BINARY")
 #   default     = mixed queries, mutations, periodic reindex, and crash recovery.
 #   query-leak  = read-only query pressure without reindex/memory collection, so
 #                 query-only leaks cannot be hidden by an indexing cleanup pass.
+#                 It exercises search_graph, query_graph, trace_path,
+#                 get_code_snippet, and search_code without invoking the
+#                 mimalloc collection path in index_repository.
 CBM_SOAK_MODE="${CBM_SOAK_MODE:-default}"
 case "$CBM_SOAK_MODE" in
     default|query-leak) ;;
@@ -74,8 +77,49 @@ DIAGNOSTICS_REFRESH_ATTEMPTS=20
 DIAGNOSTICS_REFRESH_POLL_SECONDS=0.5
 MILLISECONDS_PER_SECOND=1000
 CPU_PERCENT_SCALE=100
+WORKLOAD_MUTATION_INTERVAL_SECONDS="${CBM_SOAK_MUTATION_INTERVAL_SECONDS:-120}"
+WORKLOAD_REINDEX_INTERVAL_SECONDS="${CBM_SOAK_REINDEX_INTERVAL_SECONDS:-120}"
+DIAGNOSTICS_SAMPLE_CYCLE_INTERVAL="${CBM_SOAK_DIAGNOSTICS_SAMPLE_CYCLES:-5}"
+WORKLOAD_CYCLE_SLEEP_SECONDS="${CBM_SOAK_WORKLOAD_CYCLE_SLEEP_SECONDS:-2}"
+MEMORY_GROWTH_RATIO_MAX="${CBM_SOAK_MEMORY_GROWTH_RATIO_MAX:-3.0}"
+RSS_SLOPE_ENFORCEMENT_MINUTES="${CBM_SOAK_RSS_SLOPE_ENFORCEMENT_MINUTES:-30}"
+RSS_SLOPE_MAX_KB_PER_HOUR="${CBM_SOAK_RSS_SLOPE_MAX_KB_PER_HOUR:-500}"
+FD_DRIFT_MAX="${CBM_SOAK_FD_DRIFT_MAX:-20}"
+QUERY_LATENCY_MAX_MS="${CBM_SOAK_QUERY_LATENCY_MAX_MS:-60000}"
 
-RESULTS_DIR="${CBM_SOAK_RESULTS_DIR:-soak-results}"
+for positive_integer_setting in \
+    "$WORKLOAD_MUTATION_INTERVAL_SECONDS" \
+    "$WORKLOAD_REINDEX_INTERVAL_SECONDS" \
+    "$DIAGNOSTICS_SAMPLE_CYCLE_INTERVAL" \
+    "$WORKLOAD_CYCLE_SLEEP_SECONDS" \
+    "$QUERY_LATENCY_MAX_MS"; do
+    case "$positive_integer_setting" in
+        ''|*[!0-9]*|0)
+            echo "CBM_SOAK_* interval and limit settings must be positive integers" >&2
+            exit 2
+            ;;
+    esac
+done
+for nonnegative_integer_setting in \
+    "$RSS_SLOPE_ENFORCEMENT_MINUTES" \
+    "$RSS_SLOPE_MAX_KB_PER_HOUR" \
+    "$FD_DRIFT_MAX"; do
+    case "$nonnegative_integer_setting" in
+        ''|*[!0-9]*)
+            echo "CBM_SOAK_* resource limit settings must be non-negative integers" >&2
+            exit 2
+            ;;
+    esac
+done
+if ! awk -v ratio="$MEMORY_GROWTH_RATIO_MAX" \
+    'BEGIN { exit !(ratio ~ /^[0-9]+([.][0-9]+)?$/ && ratio > 0) }'; then
+    echo "CBM_SOAK_MEMORY_GROWTH_RATIO_MAX must be a positive number" >&2
+    exit 2
+fi
+
+# CBM_SOAK_RESULTS_DIR is the canonical namespaced setting. Retain RESULTS_DIR
+# as a compatibility fallback for existing CI and direct harness callers.
+RESULTS_DIR="${CBM_SOAK_RESULTS_DIR:-${RESULTS_DIR:-soak-results}}"
 mkdir -p "$RESULTS_DIR"
 
 METRICS_CSV="$RESULTS_DIR/metrics.csv"
@@ -162,7 +206,6 @@ trap 'exit 143' TERM
 # protocol write is checked below so a dead server is reported without the
 # harness itself being terminated by SIGPIPE.
 trap '' PIPE
-
 echo "=== soak-test: binary=$BINARY duration=${DURATION_MIN}m mode=${CBM_SOAK_MODE} ==="
 
 # ── Helper: generate realistic test project (~200 files) ─────────
@@ -358,7 +401,7 @@ mcp_call() {
     local dur=$((t1 - t0))
     echo "$(date +%s),$tool,$dur,$status" >> "$LATENCY_CSV"
     if [ "$status" -ne 0 ]; then
-        echo "FAIL: $tool returned no successful MCP response" >&2
+        echo "FAIL: $tool returned no successful MCP response: $(printf '%s' "$resp" | cut -c1-300)" >&2
         return 1
     fi
     return 0
@@ -537,11 +580,14 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
         run_mcp_call get_code_snippet "{\"project\":\"$PROJ_NAME\",\"qualified_name\":\"handle_1\"}"
         run_mcp_call search_code "{\"project\":\"$PROJ_NAME\",\"pattern\":\"def \"}"
     else
-        run_mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*compute.*\"}"
-        run_mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"compute\",\"direction\":\"both\"}"
+        # Trace a symbol generated above. The former "compute" fixture did not
+        # exist, so trace_path correctly returned an MCP error and made every
+        # soak cycle fail without exercising traversal or its resource lifecycle.
+        run_mcp_call search_graph "{\"project\":\"$PROJ_NAME\",\"name_pattern\":\".*handle_1.*\"}"
+        run_mcp_call trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"handle_1\",\"direction\":\"both\"}"
 
         # File mutation every 2 minutes.
-        if [ $((NOW - LAST_MUTATE)) -ge 120 ]; then
+        if [ $((NOW - LAST_MUTATE)) -ge "$WORKLOAD_MUTATION_INTERVAL_SECONDS" ]; then
             echo "# mutation at cycle $CYCLE $(date)" >> "$SOAK_PROJECT/src/main.py"
             git -C "$SOAK_PROJECT" add -A 2>/dev/null
             git -C "$SOAK_PROJECT" -c user.email=test@test -c user.name=test \
@@ -550,21 +596,21 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
         fi
 
         # Full reindex every 2 minutes (compressed — simulates 15min real interval).
-        if [ $((NOW - LAST_REINDEX)) -ge 120 ]; then
+        if [ $((NOW - LAST_REINDEX)) -ge "$WORKLOAD_REINDEX_INTERVAL_SECONDS" ]; then
             run_mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"
             LAST_REINDEX=$NOW
         fi
     fi
 
     # Collect diagnostics every 10 seconds (5 cycles)
-    if [ $((CYCLE % 5)) -eq 0 ]; then
+    if [ $((CYCLE % DIAGNOSTICS_SAMPLE_CYCLE_INTERVAL)) -eq 0 ]; then
         if ! collect_snapshot; then
             echo "FAIL: diagnostics snapshot was unavailable" >&2
             PASS=false
         fi
     fi
 
-    sleep 2
+    sleep "$WORKLOAD_CYCLE_SLEEP_SECONDS"
 done
 
 # ── Phase 4: Idle period + final snapshot ────────────────────────
@@ -625,8 +671,9 @@ fi
 echo "OK: idle CPU=${IDLE_CPU}% over ${IDLE_OBSERVED_SECONDS}s"
 
 # ── Phase 5: Crash recovery test ────────────────────────────────
-# Skipped in query-leak mode: reindexing invokes memory collection and would
-# invalidate the purpose of that read-only leak detector.
+# Skipped in query-leak mode: crash recovery re-indexes (Phase 5 calls
+# index_repository), which triggers cbm_mem_collect and would mask the #581
+# query-only leak the whole run is trying to surface.
 
 if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak" ]; then
     echo "--- Phase 5: crash recovery ---"
@@ -706,8 +753,9 @@ END {
     printf "%.0f", slope * 3600 / 1024
 }' "$METRICS_CSV")
 echo "RSS slope (post-warmup): ${RSS_SLOPE} KB/hr" | tee -a "$SUMMARY"
-if [ "$DURATION_MIN" -ge 30 ] && [ "${RSS_SLOPE:-0}" -gt 500 ] 2>/dev/null; then
-    echo "FAIL: RSS slope ${RSS_SLOPE} KB/hr > 500 KB/hr" | tee -a "$SUMMARY"
+if [ "$DURATION_MIN" -ge "$RSS_SLOPE_ENFORCEMENT_MINUTES" ] && \
+    [ "${RSS_SLOPE:-0}" -gt "$RSS_SLOPE_MAX_KB_PER_HOUR" ] 2>/dev/null; then
+    echo "FAIL: RSS slope ${RSS_SLOPE} KB/hr > ${RSS_SLOPE_MAX_KB_PER_HOUR} KB/hr" | tee -a "$SUMMARY"
     PASS=false
 fi
 
@@ -717,11 +765,13 @@ if [ "${FIRST_RSS:-0}" -gt 0 ] 2>/dev/null; then
     MAX_RSS_RATIO=$(awk "BEGIN { printf \"%.1f\", ${MAX_RSS} / ${FIRST_RSS} }")
     echo "RSS ratio: last/first=${RSS_RATIO}x max/first=${MAX_RSS_RATIO}x" \
         | tee -a "$SUMMARY"
-    if awk "BEGIN { exit (${LAST_RSS} / ${FIRST_RSS} > 3.0) ? 0 : 1 }" 2>/dev/null; then
+    if awk -v ceiling="$MEMORY_GROWTH_RATIO_MAX" \
+        "BEGIN { exit (${LAST_RSS} / ${FIRST_RSS} > ceiling) ? 0 : 1 }" 2>/dev/null; then
         echo "FAIL: RSS grew ${RSS_RATIO}x (last=${LAST_RSS}MB vs first=${FIRST_RSS}MB)" | tee -a "$SUMMARY"
         PASS=false
     fi
-    if awk "BEGIN { exit (${MAX_RSS} / ${FIRST_RSS} > 3.0) ? 0 : 1 }" 2>/dev/null; then
+    if awk -v ceiling="$MEMORY_GROWTH_RATIO_MAX" \
+        "BEGIN { exit (${MAX_RSS} / ${FIRST_RSS} > ceiling) ? 0 : 1 }" 2>/dev/null; then
         echo "FAIL: peak RSS grew ${MAX_RSS_RATIO}x above post-index baseline" | tee -a "$SUMMARY"
         PASS=false
     fi
@@ -739,7 +789,8 @@ echo "Storage: cache first=${FIRST_CACHE_BYTES}B last=${LAST_CACHE_BYTES}B max=$
 if [ "${FIRST_CACHE_BYTES:-0}" -gt 0 ] 2>/dev/null; then
     CACHE_RATIO=$(awk "BEGIN { printf \"%.2f\", ${LAST_CACHE_BYTES} / ${FIRST_CACHE_BYTES} }")
     echo "Cache ratio (last/first): ${CACHE_RATIO}x" | tee -a "$SUMMARY"
-    if awk "BEGIN { exit (${LAST_CACHE_BYTES} / ${FIRST_CACHE_BYTES} > 3.0) ? 0 : 1 }" \
+    if awk -v ceiling="$MEMORY_GROWTH_RATIO_MAX" \
+        "BEGIN { exit (${LAST_CACHE_BYTES} / ${FIRST_CACHE_BYTES} > ceiling) ? 0 : 1 }" \
         2>/dev/null; then
         echo "FAIL: cache grew ${CACHE_RATIO}x after initial index" | tee -a "$SUMMARY"
         PASS=false
@@ -762,8 +813,8 @@ echo "Cache slope (post-warmup): ${CACHE_SLOPE} KB/hr" | tee -a "$SUMMARY"
 # Check 3: FD drift
 FD_DRIFT=$(awk -F, 'NR>1 && $5>0 { if (!first) first=$5; last=$5 } END { print last-first }' "$METRICS_CSV")
 echo "FD drift: ${FD_DRIFT:-0}" | tee -a "$SUMMARY"
-if [ "${FD_DRIFT:-0}" -gt 20 ] 2>/dev/null; then
-    echo "FAIL: FD drift ${FD_DRIFT} > 20" | tee -a "$SUMMARY"
+if [ "${FD_DRIFT:-0}" -gt "$FD_DRIFT_MAX" ] 2>/dev/null; then
+    echo "FAIL: FD drift ${FD_DRIFT} > ${FD_DRIFT_MAX}" | tee -a "$SUMMARY"
     PASS=false
 fi
 
@@ -781,8 +832,8 @@ MAX_LATENCY=$(awk -F, 'NR>1 && $2!="index_repository" { if ($3>max) max=$3 } END
 MAX_INDEX=$(awk -F, 'NR>1 && $2=="index_repository" { if ($3>max) max=$3 } END { print max+0 }' "$LATENCY_CSV")
 echo "Max query latency: ${MAX_LATENCY}ms (index: ${MAX_INDEX}ms)" | tee -a "$SUMMARY"
 # 60s threshold — MSYS2/Wine adds significant overhead to all operations
-if [ "${MAX_LATENCY:-0}" -gt 60000 ] 2>/dev/null; then
-    echo "FAIL: max query latency ${MAX_LATENCY}ms > 60s" | tee -a "$SUMMARY"
+if [ "${MAX_LATENCY:-0}" -gt "$QUERY_LATENCY_MAX_MS" ] 2>/dev/null; then
+    echo "FAIL: max query latency ${MAX_LATENCY}ms > ${QUERY_LATENCY_MAX_MS}ms" | tee -a "$SUMMARY"
     PASS=false
 fi
 

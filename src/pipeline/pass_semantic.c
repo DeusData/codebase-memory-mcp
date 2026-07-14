@@ -19,21 +19,31 @@
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "cbm.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/* True for languages whose module QN derives from the CONTAINING DIRECTORY
+ * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
+ * so base-class / same-module resolution keys against the directory-based
+ * def-node QNs. */
+static bool ps_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
 static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
     (void)fseek(f, 0, SEEK_END);
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
         (void)fclose(f);
         return NULL;
     }
@@ -74,11 +84,11 @@ static const char *resolve_as_class(const cbm_registry_t *reg, const char *name,
         return NULL;
     }
 
-    /* Verify it is a user-defined type target. */
+    /* Verify it's a type-like container (Class/Struct/Interface/Enum/Type/Trait):
+     * a base/embedded type, impl receiver, or inheritance target must resolve to
+     * one of these. Struct included so Rust/Go/Swift/D `impl Trait for S` and Go
+     * struct embedding resolve. */
     const char *label = cbm_registry_label_of(reg, res.qualified_name);
-    if (!label) {
-        return NULL;
-    }
     if (!cbm_label_is_type_like(label)) {
         return NULL;
     }
@@ -207,15 +217,16 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
         return 0;
     }
 
-    /* Find all Go struct nodes; older fixtures may still use Class. */
-    const cbm_gbuf_node_t **structs = NULL;
-    int struct_count = 0;
-    cbm_gbuf_find_by_label(ctx->gbuf, "Struct", &structs, &struct_count);
-
+    /* Find candidate concrete types. In Go the type that satisfies an interface
+     * is a struct (now labelled "Struct") or a named type (labelled "Class"); both
+     * sets are checked. Each call returns a borrowed internal array (no free). */
     const cbm_gbuf_node_t **classes = NULL;
     int class_count = 0;
     cbm_gbuf_find_by_label(ctx->gbuf, "Class", &classes, &class_count);
-    if (struct_count == 0 && class_count == 0) {
+    const cbm_gbuf_node_t **structs = NULL;
+    int struct_count = 0;
+    cbm_gbuf_find_by_label(ctx->gbuf, "Struct", &structs, &struct_count);
+    if (class_count == 0 && struct_count == 0) {
         return 0;
     }
 
@@ -452,7 +463,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
         cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
                                                  &imp_vals, &imp_count);
 
-        char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
+        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
+                                                      ps_module_is_dir(files[i].language));
 
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {

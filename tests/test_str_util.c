@@ -567,6 +567,7 @@ SUITE(str_util) {
     RUN_TEST(validate_shell_arg_backslash);
     RUN_TEST(validate_shell_arg_empty);
     RUN_TEST(validate_shell_arg_spaces);
+    /* JSON Escaping */
     RUN_TEST(json_escape_control_chars);
     /* SNPRINTF_APPEND */
     RUN_TEST(snprintf_append_basic);

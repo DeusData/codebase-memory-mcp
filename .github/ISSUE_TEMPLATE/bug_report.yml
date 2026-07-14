@@ -103,6 +103,21 @@ body:
         Please check for private paths/strings before pasting.
       render: text
 
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics trajectory (memory / performance / leak issues)
+      description: |
+        We collect **no telemetry**, so for a memory or performance problem we
+        need the diagnostics trajectory from your machine. Set
+        `CBM_DIAGNOSTICS=1`, reproduce the issue, then attach (or paste) the file
+        `cbm-diagnostics-<pid>.ndjson` from your temp dir (`$TMPDIR` / `/tmp`, or
+        `%TEMP%` on Windows). It records only resource counters (rss, committed,
+        fds, query counts) over time — no code or queries. See the README
+        "Troubleshooting & Diagnostics" section. Pasting an agent's summary of
+        the trajectory is also fine.
+      render: text
+
   - type: input
     id: scale
     attributes:

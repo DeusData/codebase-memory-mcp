@@ -1,12 +1,16 @@
 import { useMemo } from "react";
 import * as THREE from "three";
 import type { GraphNode, GraphEdge } from "../lib/types";
+import { edgeIntensityScale } from "../lib/density";
 
 interface EdgeLinesProps {
   nodes: GraphNode[];
   edges: GraphEdge[];
   highlightedIds: Set<number> | null;
   opacity?: number;
+  /* User edge-brightness multiplier (see DisplaySettings). Layered on top of
+   * the automatic density scale. */
+  brightness?: number;
   /* When set, edge.target is looked up in this array instead of `nodes`.
    * Used for cross-galaxy edges where source lives in the primary graph
    * and target lives in a linked project's offset-adjusted nodes. */
@@ -52,9 +56,13 @@ export function EdgeLines({
   edges,
   highlightedIds,
   opacity = 1.0,
+  brightness = 1.0,
   targetNodes,
 }: EdgeLinesProps) {
   const geometry = useMemo(() => {
+    /* Shrink per-edge glow as the edge count grows so the additively-blended
+     * center doesn't saturate to white; the user multiplier rides on top. */
+    const densityScale = edgeIntensityScale(edges.length) * brightness;
     const srcMap = new Map<number, number>();
     for (let i = 0; i < nodes.length; i++) {
       srcMap.set(nodes[i].id, i);
@@ -91,7 +99,11 @@ export function EdgeLines({
        * With additive blending + dark background, these glow nicely. */
       let intensity = sameCluster ? 0.25 : 0.06;
       if (hasHighlight) {
-        intensity = sHL && tHL ? 0.5 : 0.04;
+        /* A selection stays at full strength (never density-scaled) so it
+         * pops against the dimmed rest; only the un-selected bulk is scaled. */
+        intensity = sHL && tHL ? 0.5 : 0.04 * densityScale;
+      } else {
+        intensity *= densityScale;
       }
 
       const off = validCount * 6;
@@ -125,7 +137,7 @@ export function EdgeLines({
       new THREE.BufferAttribute(colors.slice(0, validCount * 6), 3),
     );
     return geo;
-  }, [nodes, edges, highlightedIds, targetNodes]);
+  }, [nodes, edges, highlightedIds, targetNodes, brightness]);
 
   return (
     <lineSegments geometry={geometry}>

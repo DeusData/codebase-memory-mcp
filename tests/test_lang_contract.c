@@ -1210,6 +1210,112 @@ TEST(contract_edge_workspaces_imports_issue408) {
     PASS();
 }
 
+/* #767: a wildcard tsconfig alias for the "@lib" prefix (mapped to ./src/lib)
+ * shares that prefix with an unrelated scoped npm package ("@lib/external-pkg",
+ * meant to resolve normally from node_modules). The engine has no such file
+ * and must NOT invent an edge to the "src/lib" Folder node via a later
+ * fallback strategy that re-tries the truncated "@lib" prefix against the
+ * tsconfig's other, bare alias entry. Zero IMPORTS edges in the whole project
+ * is the correct outcome: the same as any other unresolved external import. */
+TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"tsconfig.json", "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                          "      \"@lib\": [\"./src/lib\"],\n"
+                          "      \"@lib/*\": [\"./src/lib/*\"]\n    }\n  }\n}\n"},
+        {"src/lib/thing.ts", "export const Thing = {};\n"},
+        {"src/consumer.ts",
+         "import { ClientC } from '@lib/external-pkg';\n\n"
+         "export function useClient() {\n  return new ClientC();\n}\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 3);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, "IMPORTS") : -1;
+    if (got != 0) {
+        fprintf(stderr, "  [EDGE] FAIL IMPORTS count=%d expected=0 (phantom Folder edge)\n", got);
+    }
+    ASSERT_EQ(got, 0);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
+/* #767 regression guard: a wildcard tsconfig alias resolving to a REAL,
+ * indexed file must still produce its IMPORTS edge — the import-targetable
+ * label filter must reject Folder/Project/etc. matches without rejecting
+ * legitimate File/Module matches. */
+TEST(contract_edge_imports_alias_resolves_real_file_issue767) {
+    static const LangFile f[] = {
+        {"tsconfig.json", "{\n  \"compilerOptions\": {\n    \"paths\": {\n"
+                          "      \"@lib\": [\"./src/lib\"],\n"
+                          "      \"@lib/*\": [\"./src/lib/*\"]\n    }\n  }\n}\n"},
+        {"src/lib/thing.ts", "export const Thing = {};\n"},
+        {"src/consumer.ts",
+         "import { Thing } from '@lib/thing';\n\n"
+         "export function useThing() {\n  return Thing;\n}\n"}};
+    ASSERT_TRUE(edge_present(f, 3, "IMPORTS", 1));
+    PASS();
+}
+
+/* True if some CALLS edge's TARGET node carries `label` and a QN ending with
+ * `qn_suffix` — i.e. the call resolved to that specific definition. */
+static int calls_edge_targets(cbm_store_t *store, const char *project, const char *label,
+                              const char *qn_suffix) {
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK)
+        return 0;
+    int found = 0;
+    size_t sl = strlen(qn_suffix);
+    for (int i = 0; i < n && !found; i++) {
+        cbm_node_t tgt;
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) != CBM_STORE_OK)
+            continue;
+        const char *qn = tgt.qualified_name;
+        if (qn && tgt.label && strcmp(tgt.label, label) == 0) {
+            size_t ql = strlen(qn);
+            if (ql >= sl && strcmp(qn + ql - sl, qn_suffix) == 0)
+                found = 1;
+        }
+        cbm_node_free_fields(&tgt);
+    }
+    cbm_store_free_edges(edges, n);
+    return found;
+}
+
+/* #871: a CommonJS require() binding shadowed call resolution. `const doThing
+ * = require("../bs/doThing")` emitted a Variable def for `doThing` in the
+ * importing module, so the call `doThing(...)` resolved to that same-module
+ * Variable (an import ALIAS, not a definition) instead of following the
+ * recorded import to the exported function — which stayed at zero inbound
+ * CALLS (the reporter's disconnected-node symptom). ESM `import` bindings
+ * never materialize as Variables; the identifier-bound require form must
+ * behave identically: no shadowing Variable, CALLS edge lands on the real
+ * Function. Fixture = the reporter's exact two-file repro. */
+TEST(contract_edge_commonjs_require_call_resolves_issue871) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"src/bs/doThing.js",
+         "module.exports = async function doThing({ id }) {\n  return id;\n};\n"},
+        {"src/mutations/doThing.js",
+         "const doThing = require(\"../bs/doThing\");\n\n"
+         "module.exports = async (parent, args) => {\n  return doThing({ id: args.id });\n};\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    /* The call resolves THROUGH the require to the exported function. */
+    int resolved = calls_edge_targets(store, lp.project, "Function", ".bs.doThing.doThing");
+    /* The alias must not swallow the call: no CALLS edge may terminate on a
+     * Variable in the importing module (ESM parity: the binding is an import,
+     * not a definition). */
+    int shadowed = calls_edge_targets(store, lp.project, "Variable", ".mutations.doThing.doThing");
+    if (!resolved || shadowed) {
+        fprintf(stderr, "  [871] FAIL resolved=%d shadowed=%d (require binding must resolve to "
+                        "the exported Function, not the local alias Variable)\n",
+                resolved, shadowed);
+    }
+    ASSERT_TRUE(resolved);
+    ASSERT_TRUE(!shadowed);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* DEPENDS_ON — Helm Chart.yaml `dependencies:` -> per-dependency Chart node.
  * Basename must be exactly "Chart.yaml"; pass_k8s runs in both pipeline paths. */
 TEST(contract_edge_depends_on) {
@@ -1418,6 +1524,9 @@ SUITE(lang_contract) {
      * FILE_CHANGES_WITH (git co-change). Completes 25-edge-type coverage. */
     RUN_TEST(contract_edge_tests);
     RUN_TEST(contract_edge_workspaces_imports_issue408);
+    RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
+    RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
+    RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);

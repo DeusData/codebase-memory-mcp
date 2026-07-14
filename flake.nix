@@ -44,10 +44,6 @@
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
           inputsFrom = [ self.packages.${pkgs.system}.default ];
-          # libgit2 is an optional dependency auto-detected via pkg-config at
-          # build time. When present it accelerates git history parsing;
-          # otherwise the build falls back to shelling out to `git log`.
-          packages = [ pkgs.pkg-config pkgs.libgit2 ];
         };
       });
     };

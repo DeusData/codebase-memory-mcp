@@ -1,0 +1,61 @@
+# Binding ownership policy for codebase-memory-mcp.
+#
+# This repository is user-owned, so ownership is expressed with individual
+# GitHub handles rather than organization teams.
+#
+# CODEOWNERS is the binding merge gate, not the reviewer directory.
+# Advisory area reviewers are recorded in MAINTAINERS.md. A handle appears in
+# this file only when that person is authorized to satisfy binding code-owner
+# approval for the matching path.
+
+# Default owner gate: every pull request crosses the project owner's desk.
+* @DeusData
+
+# Security-sensitive and authority-sensitive surfaces.
+/.github/ @DeusData
+/scripts/ @DeusData
+/Makefile.cbm @DeusData
+/SECURITY.md @DeusData
+/docs/SECURITY-DISCLOSURE.md @DeusData
+/CONTRIBUTING.md @DeusData
+/CODE_OF_CONDUCT.md @DeusData
+/DCO @DeusData
+/LICENSE @DeusData
+/MAINTAINERS.md @DeusData
+
+# Release and distribution surfaces.
+/pkg/ @DeusData
+/install.sh @DeusData
+/install.ps1 @DeusData
+/server.json @DeusData
+/glama.json @DeusData
+/flake.nix @DeusData
+/flake.lock @DeusData
+/THIRD_PARTY.md @DeusData
+/vendored/ @DeusData
+/internal/cbm/vendored/ @DeusData
+
+# Core product surfaces.
+/src/foundation/ @DeusData
+/src/store/ @DeusData
+/src/cypher/ @DeusData
+/src/graph_buffer/ @DeusData
+/src/mcp/ @DeusData
+/src/cli/ @DeusData
+/src/discover/ @DeusData
+/src/watcher/ @DeusData
+/src/pipeline/ @DeusData
+/src/git/ @DeusData
+/src/semantic/ @DeusData
+/src/simhash/ @DeusData
+/src/traces/ @DeusData
+/src/ui/ @DeusData
+
+# Extraction, language support, and graph UI.
+/internal/cbm/ @DeusData
+/tools/ @DeusData
+/graph-ui/ @DeusData
+
+# Test and reproduction infrastructure.
+/tests/ @DeusData
+/test-infrastructure/ @DeusData

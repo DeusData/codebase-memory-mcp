@@ -21,6 +21,9 @@ enum {
      * a fresh full index. */
     PC_CALL_PROPS_CAP = CBM_SZ_2K,
 };
+/* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
+ * resolution is empty (external, unindexed client library) — see #523. */
+static const double PC_SVC_PATTERN_CONFIDENCE = 0.5;
 #include "pipeline/pipeline.h"
 #include <stdint.h>
 #include "pipeline/pipeline_internal.h"
@@ -28,6 +31,8 @@ enum {
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
 #include "service_patterns.h"
@@ -39,9 +44,17 @@ enum {
 #include <stdlib.h>
 #include <string.h>
 
+/* True for languages whose module QN derives from the CONTAINING DIRECTORY
+ * (Java/Go package). MUST match cbm_lang_module_is_dir() (internal/cbm/helpers.c)
+ * so same-module callee resolution keys against the directory-based def-node
+ * QNs in the registry. */
+static bool pc_module_is_dir(CBMLanguage lang) {
+    return lang == CBM_LANG_JAVA || lang == CBM_LANG_GO;
+}
+
 /* Read entire file into heap-allocated buffer. Caller must free(). */
 static char *read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
@@ -50,7 +63,7 @@ static char *read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
         (void)fclose(f);
         return NULL;
     }
@@ -132,10 +145,11 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
     }
 }
 
-/* Insert a call-site edge through the shared finalizer so sequential and
- * parallel indexing serialize call args identically. Only plain CALLS carries
- * line metadata; service/config edges use args for derived route/data-flow
- * passes but keep their existing edge-specific fields as the stable contract. */
+/* Insert a call-site edge through the sole shared finalizer so sequential and
+ * parallel indexing serialize call args identically. This preserves #514 for
+ * small sequential repositories without duplicating the args property. Only
+ * plain CALLS carries line metadata; service/config edges use args for derived
+ * route/data-flow passes but retain their stable edge-specific fields. */
 static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const char *type,
                             char *props, size_t cap, const CBMCall *call) {
     if (call) {
@@ -148,9 +162,10 @@ static void calls_emit_edge(cbm_gbuf_t *gbuf, int64_t src, int64_t tgt, const ch
     cbm_gbuf_insert_edge(gbuf, src, tgt, type, props);
 }
 
-static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+static bool emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
-                                 const cbm_resolution_t *res, cbm_svc_kind_t svc) {
+                                 const cbm_resolution_t *res, cbm_svc_kind_t svc,
+                                 bool suppress_plain_calls) {
     const char *url_or_topic = call->first_string_arg;
     bool is_url = (url_or_topic && url_or_topic[0] != '\0' &&
                    (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL));
@@ -167,6 +182,19 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         is_url = false;
     }
     if (!is_url && !is_topic) {
+        /* No URL/topic → this is not a real service call; the svc kind was a
+         * substring coincidence in the resolved QN (e.g. "SalesforceRestClient"
+         * matches the "RestClient" HTTP lib). Emit a plain CALLS edge — unless a
+         * weak TS/JS member-call match should be suppressed (#592/#606). */
+        if (suppress_plain_calls) {
+            return false;
+        }
+        /* External service-pattern fallbacks have no project target. If their
+         * apparent URL was rejected as a non-route literal, there is no valid
+         * plain CALLS edge to emit and dereferencing target would crash. */
+        if (!target) {
+            return false;
+        }
         char esc_callee[CBM_SZ_256];
         cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
         char props[PC_CALL_PROPS_CAP];
@@ -175,7 +203,7 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                  esc_callee, res->confidence, res->strategy ? res->strategy : "unknown",
                  res->candidate_count);
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CALLS", props, sizeof(props), call);
-        return;
+        return true;
     }
     const char *edge_type = (svc == CBM_SVC_HTTP) ? "HTTP_CALLS" : "ASYNC_CALLS";
     const char *method =
@@ -185,30 +213,45 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     int64_t route_id = cbm_pipeline_upsert_service_route(ctx->gbuf, url_or_topic, svc, method,
                                                          broker, NULL, NULL);
     if (route_id == 0) {
-        return;
+        return false;
     }
     char esc_callee[CBM_SZ_256];
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
+    /* Incremental build mirroring the parallel path's
+     * emit_http_async_service_edge: the old single format string closed the
+     * method value's quote but not the broker's, emitting
+     * "broker":"bullmq} on EVERY brokered ASYNC_CALLS edge — and its fixup
+     * only handled truncation, which never fires in the normal case (#898). */
     char props[PC_CALL_PROPS_CAP];
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
-             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
-             broker ? ",\"broker\":\"" : "", broker ? broker : "");
-    if (broker) {
-        size_t plen = strlen(props);
-        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
-        }
+    int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_callee,
+                     esc_url);
+    if (method && n > 0 && (size_t)n < sizeof(props)) {
+        n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"method\":\"%s\"", method);
+    }
+    if (broker && n > 0 && (size_t)n < sizeof(props)) {
+        n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"broker\":\"%s\"", broker);
+    }
+    if (n > 0 && (size_t)n < sizeof(props) - 1) {
+        props[n] = '}';
+        props[n + 1] = '\0';
     }
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
+    return true;
 }
 
-/* Classify a resolved call and emit the appropriate edge. */
+/* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
+ * match, #592/#606), the route/HTTP/ASYNC/CONFIG service classifications below
+ * still run — only the plain CALLS fall-through is skipped, so a fabricated
+ * project edge is dropped while every service edge stays main-identical. */
+/* Classify a resolved call and emit the appropriate edge. Returns whether an
+ * edge was emitted, allowing the caller to run derived URL-argument routing. */
 static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  const cbm_gbuf_node_t *source, const cbm_gbuf_node_t *target,
                                  const cbm_resolution_t *res, const char *module_qn,
-                                 const char **imp_keys, const char **imp_vals, int imp_count) {
+                                 const char **imp_keys, const char **imp_vals, int imp_count,
+                                 bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
@@ -220,8 +263,7 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         }
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
-        emit_http_async_edge(ctx, call, source, target, res, svc);
-        return true;
+        return emit_http_async_edge(ctx, call, source, target, res, svc, suppress_plain_calls);
     }
     if (svc == CBM_SVC_CONFIG) {
         char esc_c[CBM_SZ_256];
@@ -234,6 +276,9 @@ static bool emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         calls_emit_edge(ctx->gbuf, source->id, target->id, "CONFIGURES", props, sizeof(props),
                         call);
         return true;
+    }
+    if (suppress_plain_calls) {
+        return false; /* weak TS/JS member-call match with an unresolved receiver (#606) */
     }
     char esc_c2[CBM_SZ_256];
     cbm_json_escape(esc_c2, sizeof(esc_c2), call->callee_name);
@@ -252,6 +297,12 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
     const cbm_gbuf_node_t *src = NULL;
     if (enclosing_qn) {
         src = cbm_gbuf_find_by_qn(ctx->gbuf, enclosing_qn);
+        /* A class-level call in a directory-module language carries the
+         * DIRECTORY module QN, which hits the shared Folder/Project node —
+         * attribute to this file's File node instead (#787). */
+        if (cbm_pipeline_node_is_dir_container(src)) {
+            src = NULL;
+        }
     }
     if (!src) {
         char *fqn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -262,21 +313,31 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
 }
 
 static const cbm_gbuf_node_t *calls_lsp_target_node(cbm_pipeline_ctx_t *ctx,
-                                                    const char *callee_qn) {
+                                                    const char *callee_qn,
+                                                    bool allow_tail_match) {
     const cbm_gbuf_node_t *direct = cbm_pipeline_find_node_by_qn(ctx, callee_qn);
     if (direct || !ctx || !ctx->project_name || !callee_qn) {
         return direct;
     }
     size_t proj_len = strlen(ctx->project_name);
     if (strncmp(callee_qn, ctx->project_name, proj_len) == 0 && callee_qn[proj_len] == '.') {
-        return NULL;
+        return allow_tail_match
+                   ? cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, callee_qn, true)
+                   : NULL;
     }
     char buf[CBM_SZ_1K];
     int written = snprintf(buf, sizeof(buf), "%s.%s", ctx->project_name, callee_qn);
     if (written < 0 || (size_t)written >= sizeof(buf)) {
         return NULL;
     }
-    return cbm_pipeline_find_node_by_qn(ctx, buf);
+    direct = cbm_pipeline_find_node_by_qn(ctx, buf);
+    if (direct || !allow_tail_match) {
+        return direct;
+    }
+    /* Add the ambiguity-safe Class.method fallback only for languages whose
+     * caller explicitly enables it. Exact store-backed lookup remains first. */
+    return cbm_pipeline_lsp_target_node(ctx->gbuf, ctx->project_name, callee_qn,
+                                        allow_tail_match);
 }
 
 static bool calls_suppress_python_file_weak_dotted_match(const cbm_gbuf_node_t *source,
@@ -302,12 +363,17 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* LSP-resolved calls take precedence over registry-textual matching. */
+    /* LSP-resolved calls take precedence over registry-textual matching.
+     * Unique-tail fallbacks are JVM-only. Retain the O(1) exact index and the
+     * configured confidence floor; only an allowed indexed miss scans tails. */
+    bool allow_tail_match = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp =
-        cbm_lsp_resolution_index_find(lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor);
+        cbm_lsp_resolution_index_find(lsp_idx, lsp_calls, call, ctx->lsp_confidence_floor,
+                                      allow_tail_match);
     bool lsp_target_unindexed = false;
     if (lsp) {
-        const cbm_gbuf_node_t *target_node = calls_lsp_target_node(ctx, lsp->callee_qn);
+        const cbm_gbuf_node_t *target_node =
+            calls_lsp_target_node(ctx, lsp->callee_qn, allow_tail_match);
         if (target_node && source_node->id != target_node->id) {
             cbm_resolution_t res = {0};
             /* Use the gbuf node's QN so downstream edge props show the canonical
@@ -317,7 +383,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
             if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn,
-                                     imp_keys, imp_vals, imp_count)) {
+                                     imp_keys, imp_vals, imp_count, false) &&
+                !cbm_service_pattern_is_global_fetch(call->callee_name)) {
+                /* A resolved bare fetch is a local/imported shadow. Global
+                 * fetch is classified only after resolution misses (#856). */
                 cbm_pipeline_detect_url_arg_routes(ctx->gbuf, source_node, call, rel, lang);
             }
             return SKIP_ONE;
@@ -327,6 +396,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
             if (route_path &&
                 ((handler_ref && handler_ref[0] != '\0') ||
+                 cbm_service_pattern_is_php_route_facade(call->callee_name) ||
                  cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
                 handle_route_registration(ctx, call, source_node, route_path, handler_ref,
                                           module_qn, imp_keys, imp_vals, imp_count);
@@ -341,9 +411,45 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
         if (route_path &&
             ((handler_ref && handler_ref[0] != '\0') ||
+             cbm_service_pattern_is_php_route_facade(call->callee_name) ||
              cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
             handle_route_registration(ctx, call, source_node, route_path, handler_ref, module_qn,
                                       imp_keys, imp_vals, imp_count);
+            return SKIP_ONE;
+        }
+        if (route_path && (!handler_ref || handler_ref[0] == '\0') &&
+            cbm_service_pattern_is_handlerless_http_client(call->callee_name)) {
+            cbm_resolution_t client_resolution = {
+                .qualified_name = call->callee_name,
+                .confidence = PC_SVC_PATTERN_CONFIDENCE,
+                .strategy = "method_suffix",
+                .candidate_count = 0,
+            };
+            emit_http_async_edge(ctx, call, source_node, NULL, &client_resolution, CBM_SVC_HTTP,
+                                 false);
+            return SKIP_ONE;
+        }
+    }
+
+    /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the signal
+     * lives in callee_name. Registry matching can otherwise bind its short tail
+     * to an unrelated project symbol before the service fallback runs. */
+    cbm_svc_kind_t callee_service_kind = cbm_service_pattern_match(call->callee_name);
+    if (callee_service_kind == CBM_SVC_HTTP || callee_service_kind == CBM_SVC_ASYNC) {
+        const char *url_or_topic = call->first_string_arg;
+        bool has_url_or_topic =
+            url_or_topic && url_or_topic[0] != '\0' &&
+            (url_or_topic[0] == '/' || strstr(url_or_topic, "://") != NULL ||
+             (callee_service_kind == CBM_SVC_ASYNC && strlen(url_or_topic) > PAIR_LEN));
+        if (has_url_or_topic) {
+            cbm_resolution_t service_resolution = {
+                .qualified_name = call->callee_name,
+                .confidence = PC_SVC_PATTERN_CONFIDENCE,
+                .strategy = "service_pattern",
+                .candidate_count = 0,
+            };
+            emit_http_async_edge(ctx, call, source_node, NULL, &service_resolution,
+                                 callee_service_kind, false);
             return SKIP_ONE;
         }
     }
@@ -351,6 +457,56 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
+        /* Resolution is empty when the callee belongs to an EXTERNAL client
+         * library whose source is not in the indexed tree (e.g. `requests.get`,
+         * `httpx.post`) — the import map skips it (no node) and no project symbol
+         * matches. The service-pattern signal lives in the RAW callee_name
+         * ("requests.get" contains "requests"), so classify on that and emit the
+         * HTTP_CALLS/ASYNC_CALLS edge directly (target is a synthesized route
+         * node, not the absent library). Without this the call is dropped and
+         * cross-repo matching finds no edge to match (#523). The parallel path
+         * has the equivalent empty-resolution fallback in resolve_file_calls.
+         *
+         * Native `fetch()` (#856) belongs here too, not in the substring
+         * tables above: it only counts as the global API once resolution has
+         * already failed to find a local/imported `fetch` definition. */
+        /* Route registration on an unresolvable callee (#952): facade-style
+         * Laravel (`Route::get('/x', ...)`) — the facade class lives in
+         * vendor/ and is never indexed, so resolution is ALWAYS empty in real
+         * apps. Classify by callee suffix + path-shaped first arg, exactly
+         * like the parallel path's callee_suffix fallback; without this the
+         * sequential path minted zero Route nodes for such files. */
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            const char *handler_ref = NULL;
+            const char *route_path = cbm_pipeline_call_route_path_and_handler(call, &handler_ref);
+            if (route_path &&
+                ((handler_ref && handler_ref[0] != '\0') ||
+                 cbm_service_pattern_is_php_route_facade(call->callee_name) ||
+                 cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
+                handle_route_registration(ctx, call, source_node, route_path, handler_ref,
+                                          module_qn, imp_keys, imp_vals, imp_count);
+                return SKIP_ONE;
+            }
+        }
+        cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
+        if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
+            esvc = CBM_SVC_HTTP;
+        }
+        if (esvc == CBM_SVC_HTTP || esvc == CBM_SVC_ASYNC) {
+            const char *u = call->first_string_arg;
+            bool has_url_or_topic = u && u[0] != '\0' &&
+                                    (u[0] == '/' || strstr(u, "://") != NULL ||
+                                     (esvc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
+            if (has_url_or_topic) {
+                cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                            .confidence = PC_SVC_PATTERN_CONFIDENCE,
+                                            .strategy = "service_pattern",
+                                            .candidate_count = 0};
+                emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, esvc, false);
+                return SKIP_ONE;
+            }
+        }
         return 0;
     }
     cbm_pipeline_try_field_type_hint_ctx(ctx, &res, call->callee_name, source_node->id);
@@ -380,12 +536,51 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_pipeline_should_suppress_python_super_init_suffix_match(call, lang, &res)) {
         return 0;
     }
+
+    /* TS/JS/TSX weak-method suppression (#592/#606). A member call x.foo() only
+     * reaches the registry when the TS-LSP could not resolve the receiver type
+     * (the LSP block above already returned for type-resolved calls, including
+     * the "resolved but target out of gbuf" fall-through). Binding such a call
+     * by a weak short-name strategy fabricates an edge (`re.test()` -> a project
+     * `test`). Rather than drop it here — which would also skip the service
+     * bypasses below and emit_classified_edge's route/HTTP/CONFIG branches —
+     * defer to emit_classified_edge and suppress ONLY the plain-CALLS
+     * fall-through, so every service edge stays main-identical. res.strategy may
+     * be lsp_* here; the helper's explicit drop-list leaves lsp_* untouched. */
+    bool is_tsjs =
+        lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    bool tsjs_drop_plain_call =
+        cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
+
+    /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
+     * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
+     * name ("requests"), but that library is not in the indexed tree so
+     * cbm_gbuf_find_by_qn returns NULL. The edge target for such calls is a
+     * SYNTHESIZED route node, not the library node, so
+     * the missing target must NOT drop the call — otherwise no HTTP_CALLS edge
+     * is written and cross-repo matching finds nothing (#523). Emit directly
+     * when the call carries a URL/topic first argument. */
+    cbm_svc_kind_t svc = cbm_service_pattern_match(res.qualified_name);
+    if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
+        const char *u = call->first_string_arg;
+        bool has_url_or_topic = u && u[0] != '\0' &&
+                                (u[0] == '/' || strstr(u, "://") != NULL ||
+                                 (svc == CBM_SVC_ASYNC && strlen(u) > PAIR_LEN));
+        if (has_url_or_topic) {
+            emit_http_async_edge(ctx, call, source_node, NULL, &res, svc, false);
+            return SKIP_ONE;
+        }
+    }
+
     const cbm_gbuf_node_t *target_node = cbm_pipeline_find_node_by_qn(ctx, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
     if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
-                             imp_vals, imp_count)) {
+                             imp_vals, imp_count, tsjs_drop_plain_call) &&
+        !cbm_service_pattern_is_global_fetch(call->callee_name)) {
+        /* Do not let the generic URL-argument fallback reclassify a resolved
+         * local fetch as the global HTTP API (#856). */
         cbm_pipeline_detect_url_arg_routes(ctx->gbuf, source_node, call, rel, lang);
     }
     return SKIP_ONE;
@@ -456,8 +651,10 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         cbm_pipeline_build_import_map_from_edges(ctx->gbuf, ctx->project_name, rel, &imp_keys,
                                                  &imp_vals, &imp_count);
 
-        /* Compute module QN for same-module resolution */
-        char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, rel);
+        /* Compute module QN for same-module resolution (directory-based for
+         * Java/Go so it matches their def-node QNs in the registry). */
+        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, rel,
+                                                      pc_module_is_dir(files[i].language));
 
         cbm_registry_reach_cache_begin(result->calls.count + CBM_SZ_64);
         cbm_registry_import_map_cache_begin(imp_keys, imp_vals, imp_count);
@@ -619,7 +816,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
             continue;
         }
 
-        char *module_qn = cbm_pipeline_fqn_module(ctx->project_name, files[i].rel_path);
+        char *module_qn = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+                                                      pc_module_is_dir(files[i].language));
 
         /* Build import map for alias resolution */
         const char **imp_keys = NULL;

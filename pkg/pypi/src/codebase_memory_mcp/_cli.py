@@ -157,7 +157,10 @@ def _download(version: str) -> Path:
     # dynamically links glibc 2.38+ and fails on older distros. macOS/Windows
     # have no such variant. Keep in sync with install.sh / install.js / cli.c.
     variant = "-portable" if os_name == "linux" else ""
-    archive = f"codebase-memory-mcp-{os_name}-{arch}{variant}.{ext}"
+    # Opt into the UI build (embedded graph visualization) with CBM_VARIANT=ui.
+    # Default is the standard (headless) build. Mirrors install.sh --ui.
+    ui = "ui-" if os.environ.get("CBM_VARIANT", "").lower() == "ui" else ""
+    archive = f"codebase-memory-mcp-{ui}{os_name}-{arch}{variant}.{ext}"
     url = f"https://github.com/{REPO}/releases/download/v{version}/{archive}"
     _validate_url_scheme(url)
 

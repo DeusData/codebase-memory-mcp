@@ -27,7 +27,7 @@
 # USAGE
 #   bash scripts/check-lsp-originality.sh [--lang NAME] [--refresh]
 #                                         [--list-candidates] [--help]
-#     --lang NAME        scan against ONE reference only (py|ts|go|cs|c|java|kotlin|rust)
+#     --lang NAME        scan against ONE reference only (py|ts|go|cs|c|java|kotlin|rust|php|perl)
 #     --refresh          re-fetch reference sources even if cached
 #     --list-candidates  print the extracted local tokens and exit (no fetch; self-test)
 #   Exit 0 = no verbatim overlap found.  Exit 1 = overlap(s) to review by a human.
@@ -61,6 +61,9 @@ REFS=(
   # LSP. We scan against phpactor (MIT) — the leading OSS PHP language server —
   # purely for defensive copy-detection. NOT Intelephense (proprietary).
   "php|https://github.com/phpactor/phpactor|lib"
+  # Perl (PR #461) was authored clean-room. We scan against PerlNavigator (MIT)
+  # — the leading OSS Perl language server — for defensive copy-detection.
+  "perl|https://github.com/bscan/PerlNavigator|server/src"
 )
 
 ONLY_LANG=""; REFRESH=0; LIST_ONLY=0

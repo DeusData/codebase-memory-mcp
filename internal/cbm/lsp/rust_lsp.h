@@ -27,7 +27,9 @@
 #include "type_rep.h"
 #include "scope.h"
 #include "type_registry.h"
+#include "lsp_neg_memo.h"
 #include "../cbm.h"
+#include "go_lsp.h" // for CBMLSPDef (pipeline def), used by the Tier-2 builder
 
 /* Forward declaration — defined in rust_cargo.h. We keep it forward
  * here to avoid pulling rust_cargo.h into every consumer that only
@@ -56,6 +58,12 @@ typedef struct {
 
     const CBMTypeRegistry *registry;
     CBMScope *current_scope;
+
+    /* Negative-lookup memo for the registry-pure resolve cascades (trait
+     * method / sole-trait-impl / free-func fallback). Active ONLY when the
+     * registry is sealed (read_only) — see lsp_neg_memo.h. Arena-backed,
+     * dies with the file. Zeroed by rust_lsp_init's memset (lazy alloc). */
+    CBMNegMemo neg_memo;
 
     /* `use` map: parallel arrays mapping a local-name (the last segment, or
      * the `as` alias) to its full module path (`std::collections::HashMap`,
@@ -166,6 +174,18 @@ typedef struct {
 
     /* CBM_LSP_DEBUG=1 in env enables verbose stderr trace. */
     bool debug;
+
+    /* Per-ROOT-invocation macro-expansion memo. Kernel macro_rules are often
+     * self-recursive (define_sizes! re-invokes itself with @internal/@impls
+     * args) and the expansion fallback ("no pattern matched — still expand the
+     * first rule") makes that recursion non-convergent: with an unbounded
+     * BREADTH under the depth-8 guard, 2-44 source invocations exploded into
+     * ~200k expansions (each a full tree-sitter parse) ≈ 63 s per file.
+     * Within one expansion chain an identical (macro, substituted body) is
+     * walked once — identical text implies an identical walk, and recursive
+     * re-invocations have no distinct source site to attribute. Reset at each
+     * top-level invocation so distinct source sites keep their attribution. */
+    CBMNegMemo macro_memo;
 } RustLSPContext;
 
 /* Initialise an empty context for processing one file. */
@@ -282,6 +302,35 @@ void cbm_run_rust_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMRustLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, CBMResolvedCallArray *out);
+
+/* Same as `cbm_run_rust_lsp_cross`, plus an optional parsed Cargo manifest
+ * (NULL = manifest-free behaviour). The manifest lets call paths whose head
+ * is a workspace member / declared dependency route across the crate
+ * boundary (`crate_a::foo` → the def inside crate_a). Wired from the
+ * cross-file LSP pass (pass_lsp_cross.c) which builds the manifest once from
+ * the project root Cargo.toml. */
+void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, CBMRustLSPDef *defs, int def_count,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out);
+
+/* Tier-2: build the project-wide Rust cross registry ONCE from all defs, finalize,
+ * and seal read-only. Shared across every Rust file's resolve (mirrors C/py/cs/ts).
+ * Def-driven → byte-identical entries to the per-file build. */
+CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, int def_count);
+
+/* Cross-file Rust resolve using a pre-built shared registry (Tier-2). Skips the
+ * per-file registry build; just parse + resolve. `manifest` = the same Cargo manifest
+ * the per-file path uses (cross-crate #56). `result` may be NULL (the cross path does
+ * not synthesise proc-macro edges). Mirrors cbm_run_c_lsp_cross_with_registry. */
+void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, int source_len,
+                                          const char *module_qn, const CBMTypeRegistry *reg,
+                                          const char **import_names, const char **import_qns,
+                                          int import_count, TSTree *cached_tree,
+                                          const struct CBMCargoManifest *manifest,
+                                          CBMResolvedCallArray *out, CBMFileResult *result);
 
 /* Per-file input for batch cross-file Rust LSP processing. */
 typedef struct {

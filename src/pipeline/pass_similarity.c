@@ -92,6 +92,11 @@ typedef struct {
     const char *qualified_name;
 } fp_entry_t;
 
+/* Canonical entry order must not inherit graph-buffer insertion order: parallel
+ * extraction changes merge order across runs, which otherwise changes LSH
+ * bucket chains and per-node edge-cap truncation. Qualified name is the primary
+ * identity; file path and node id provide deterministic fallbacks for malformed
+ * or colliding inputs without weakening the schedule-independent ordering. */
 static int cmp_str_empty_last(const char *a, const char *b) {
     const char *sa = a ? a : "";
     const char *sb = b ? b : "";
@@ -252,6 +257,8 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             if (strcmp(src->ext, cand->file_ext) != 0) {
                 continue;
             }
+            /* Give each unordered pair one schedule-independent owner. Node ids
+             * alone are unsuitable because parallel merge order assigns them. */
             int endpoint_order = cmp_str_empty_last(src->qualified_name, cand->qualified_name);
             if (endpoint_order == 0) {
                 endpoint_order = cmp_str_empty_last(src->file_path, cand->file_path);

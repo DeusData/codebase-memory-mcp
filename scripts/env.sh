@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # env.sh — Shared environment detection for all build scripts.
 #
 # Sourced by test.sh, build.sh, lint.sh. Not meant to run standalone.
 #
 # Exports:
 #   ARCH        — target architecture (arm64 / x86_64)
-#   ARCH_PREFIX — "arch -arm64" on macOS, empty on Linux/Windows
+#   ARCHFLAGS   — "-arch <arch>" on macOS (target slice for clang/ld), empty elsewhere
 #   NPROC       — number of CPU cores
 #   OS          — darwin / linux / windows
 
@@ -36,16 +36,29 @@ esac
 # CBM_ARCH env var or --arch flag override (parsed by calling script)
 ARCH="${CBM_ARCH:-$HW_ARCH}"
 
-# ── Build arch prefix (macOS only) ─────────────────────────────
-ARCH_PREFIX=""
+# ── Target-architecture flags (macOS only) ─────────────────────
+# Select the target slice explicitly with clang/ld's -arch instead of
+# relaunching make under `arch -<arch>`. Explicit -arch is the only approach
+# that works across toolchains: a Nix/Homebrew clang wrapper has a fixed
+# target triple, so `arch -x86_64 make` would still emit native arm64. It also
+# lets host tools (node, codegen) keep running natively during a cross-build.
+# Makefile.cbm folds $(ARCHFLAGS) into CC/CXX so it reaches every compile and
+# link, including the vendored objects. Empty on Linux/Windows.
+ARCHFLAGS=""
 if [[ "$OS" == "darwin" ]]; then
-    ARCH_PREFIX="arch -${ARCH}"
+    ARCHFLAGS="-arch ${ARCH}"
 fi
+export ARCHFLAGS
 
 # ── Detect parallelism ─────────────────────────────────────────
 NPROC=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
-# ── Verify compiler is available for target arch ───────────────
+# ── Verify compiler can build for the target arch ──────────────
+# On macOS, PROBE actual capability instead of inspecting the compiler's own
+# Mach-O header. The driver is often a wrapper script (Nix, ccache, Homebrew)
+# or a clang that cross-compiles, so `file` on the binary says nothing about
+# what it can target — it just sees a shell script or a host-arch executable.
+# Compiling + linking a trivial program with -arch <target> is the truth.
 verify_compiler() {
     local compiler="$1"
     local bin
@@ -57,20 +70,20 @@ verify_compiler() {
     fi
 
     if [[ "$OS" == "darwin" ]]; then
-        local file_info
-        file_info="$(file "$bin" 2>/dev/null)"
-
-        if [[ "$ARCH" == "arm64" ]] && ! echo "$file_info" | grep -qE "arm64|universal"; then
-            echo "WARNING: $compiler ($bin) is x86_64 only — cannot build native arm64" >&2
-            echo "  Install arm64 GCC: arch -arm64 /opt/homebrew/bin/brew install gcc" >&2
-            echo "  Or override: scripts/test.sh --arch x86_64" >&2
+        local probe_out
+        probe_out="$(mktemp -t cbm-archprobe.XXXXXX)"
+        if ! printf 'int main(void){return 0;}\n' \
+            | "$compiler" -arch "$ARCH" -x c - -o "$probe_out" >/dev/null 2>&1; then
+            rm -f "$probe_out"
+            echo "ERROR: $compiler cannot build for -arch $ARCH ($bin)" >&2
+            echo "  A trivial $ARCH compile + link failed with this toolchain." >&2
+            if [[ "$ARCH" != "$HW_ARCH" ]]; then
+                echo "  Cross-building $HW_ARCH -> $ARCH needs the $ARCH SDK slice + runtime;" >&2
+                echo "  to build for this machine instead, re-run with: --arch $HW_ARCH" >&2
+            fi
             exit 1
         fi
-
-        if [[ "$ARCH" == "x86_64" ]] && ! echo "$file_info" | grep -qE "x86_64|universal"; then
-            echo "WARNING: $compiler ($bin) is arm64 only — cannot build x86_64" >&2
-            exit 1
-        fi
+        rm -f "$probe_out"
     fi
 }
 

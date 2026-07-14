@@ -32,7 +32,7 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     /* VCS */
     ".git", ".hg", ".svn", ".worktrees",
     /* IDE */
-    ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees",
+    ".idea", ".vs", ".vscode", ".eclipse", ".claude", ".claude-worktrees", "Antigravity",
     /* Python */
     ".cache", ".eggs", ".env", ".mypy_cache", ".nox", ".pytest_cache", ".ruff_cache", ".tox",
     ".venv", "__pycache__", "env", "htmlcov", "site-packages", "venv",
@@ -255,7 +255,7 @@ static bool expand_git_path(const char *path, char *out, size_t out_sz) {
 }
 
 static bool read_core_excludes_file(const char *config_path, char *out, size_t out_sz) {
-    FILE *f = fopen(config_path, "r");
+    FILE *f = cbm_fopen(config_path, "r");
     if (!f) {
         return false;
     }
@@ -502,6 +502,15 @@ typedef struct {
     char **excluded;
     int excluded_count;
     int excluded_cap;
+    /* Individual files dropped by ignore rules (#963 "purposely not
+     * indexed"). Collected only when requested (collect_ignored); stored
+     * entries are capped at CBM_DISCOVER_IGNORED_CAP while ignored_total
+     * keeps counting so truncation is explicit. */
+    bool collect_ignored;
+    cbm_ignored_file_t *ignored;
+    int ignored_count;
+    int ignored_cap;
+    int ignored_total;
 } file_list_t;
 
 static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
@@ -525,6 +534,35 @@ static void file_list_add_excluded(file_list_t *fl, const char *rel_path) {
         return;
     }
     fl->excluded[fl->excluded_count++] = copy;
+}
+
+static void file_list_add_ignored(file_list_t *fl, const char *rel_path, const char *reason) {
+    if (!fl->collect_ignored || !rel_path || rel_path[0] == '\0') {
+        return;
+    }
+    fl->ignored_total++;
+    if (fl->ignored_count >= CBM_DISCOVER_IGNORED_CAP) {
+        return; /* counted above — truncation stays visible via the total */
+    }
+    if (fl->ignored_count >= fl->ignored_cap) {
+        int new_cap = fl->ignored_cap ? fl->ignored_cap * PAIR_LEN : CBM_SZ_64;
+        cbm_ignored_file_t *grown = realloc(fl->ignored, new_cap * sizeof(cbm_ignored_file_t));
+        if (!grown) {
+            return;
+        }
+        fl->ignored = grown;
+        fl->ignored_cap = new_cap;
+    }
+    char *path_copy = strdup(rel_path);
+    char *reason_copy = strdup(reason ? reason : "");
+    if (!path_copy || !reason_copy) {
+        free(path_copy);
+        free(reason_copy);
+        return;
+    }
+    fl->ignored[fl->ignored_count].rel_path = path_copy;
+    fl->ignored[fl->ignored_count].reason = reason_copy;
+    fl->ignored_count++;
 }
 
 static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, CBMLanguage lang,
@@ -568,6 +606,19 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
     return rel_path;
 }
 
+/* Non-negatable safety core: built-in skip dirs that a .cbmignore negation
+ * can NEVER un-skip. A repo-committed .cbmignore must not be able to defeat
+ * OOM/safety skips: .git holds VCS internals (and the info/exclude sources,
+ * #489), node_modules explodes discovery, and the worktree-internal dirs
+ * (.worktrees / .claude-worktrees, the worktree entries in ALWAYS_SKIP_DIRS)
+ * contain parallel checkouts of the same repo whose indexing would duplicate
+ * the whole codebase (#802). */
+static bool is_safety_core_dir(const char *name) {
+    static const char *const SAFETY_CORE_DIRS[] = {".git", "node_modules", ".worktrees",
+                                                   ".claude-worktrees", NULL};
+    return str_in_list(name, SAFETY_CORE_DIRS);
+}
+
 /* Check if a directory entry should be skipped (hardcoded dirs + gitignore). */
 static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
@@ -575,7 +626,15 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix) {
     if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
-        return true;
+        /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
+         * match for this dir un-skips a built-in skip-list dir — except the
+         * non-negatable safety core. Fall through so .gitignore/global/local
+         * rules still apply to the un-skipped dir. */
+        bool unskipped = cbmignore && !is_safety_core_dir(entry_name) &&
+                         cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (!unskipped) {
+            return true;
+        }
     }
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, true)) {
         return true;
@@ -600,44 +659,50 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
 }
 
 /* Check if a regular file should be skipped (filters + gitignore + size). */
-static bool should_skip_file(const char *entry_name, const char *rel_path,
-                             const cbm_discover_opts_t *opts, const cbm_gitignore_t *gitignore,
-                             const cbm_gitignore_t *global_gi, const cbm_gitignore_t *cbmignore,
-                             const cbm_gitignore_t *local_gi, const char *local_gi_prefix,
-                             off_t file_size) {
+/* Classify why a file is skipped. Returns a static reason string (the #963
+ * "purposely not indexed" class) or NULL to keep the file. Check order and
+ * semantics — including the .cbmignore negation un-ignoring a global-gitignore
+ * match — are IDENTICAL to the original boolean predicate. */
+static const char *file_skip_reason(const char *entry_name, const char *rel_path,
+                                    const cbm_discover_opts_t *opts,
+                                    const cbm_gitignore_t *gitignore,
+                                    const cbm_gitignore_t *global_gi,
+                                    const cbm_gitignore_t *cbmignore,
+                                    const cbm_gitignore_t *local_gi, const char *local_gi_prefix,
+                                    off_t file_size) {
     cbm_index_mode_t mode = opts ? opts->mode : CBM_MODE_FULL;
     if (cbm_has_ignored_suffix(entry_name, mode)) {
-        return true;
+        return "ignored-suffix";
     }
     if (cbm_should_skip_filename(entry_name, mode)) {
-        return true;
+        return "skip-list";
     }
     if (cbm_matches_fast_pattern(entry_name, mode)) {
-        return true;
+        return "fast-pattern";
     }
     if (gitignore && cbm_gitignore_matches(gitignore, rel_path, false)) {
-        return true;
+        return "gitignore";
     }
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, false);
     if (local_gi) {
         const char *lrel = local_rel_path(rel_path, local_gi_prefix);
         if (cbm_gitignore_matches(local_gi, lrel, false)) {
-            return true;
+            return "gitignore";
         }
     }
     if (cbmignore) {
         int cbm_result = cbm_gitignore_match_result(cbmignore, rel_path, false);
         if (cbm_result > 0) {
-            return true;
+            return "cbmignore";
         }
         if (cbm_result < 0 && global_ignored) {
             global_ignored = false;
         }
     }
     if (opts && opts->max_file_size > 0 && file_size > opts->max_file_size) {
-        return true;
+        return "size-cap";
     }
-    return global_ignored;
+    return global_ignored ? "gitignore" : NULL;
 }
 
 /* Detect language for a file, handling .m disambiguation and JSON filtering. */
@@ -680,9 +745,20 @@ static int wide_stat(const char *path, struct stat *st) {
 #endif
 }
 
-/* Stat a path, skipping symlinks. Returns 0 on success, -1 to skip. */
+/* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
+ * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
+ * discovery from walking through a junction that points outside the project
+ * root, mirroring the POSIX S_ISLNK skip. */
 static int safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
+    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    if (wpath) {
+        DWORD attr = GetFileAttributesW(wpath);
+        free(wpath);
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            return CBM_NOT_FOUND;
+        }
+    }
     return wide_stat(abs_path, st);
 #else
     if (lstat(abs_path, st) != 0) {
@@ -701,8 +777,14 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore, const cbm_gitignore_t *local_gi,
                                   const char *local_gi_prefix, off_t size, file_list_t *out) {
-    if (should_skip_file(name, rel_path, opts, gitignore, global_gi, cbmignore, local_gi,
-                         local_gi_prefix, size)) {
+    const char *skip_reason = file_skip_reason(name, rel_path, opts, gitignore, global_gi,
+                                               cbmignore, local_gi, local_gi_prefix, size);
+    if (skip_reason) {
+        /* Deliberately not indexed (#963) — record so callers can surface it.
+         * Unsupported-language files below are NOT recorded: "no grammar for
+         * this extension" is not an ignore decision, and listing every
+         * README/asset would drown the signal. */
+        file_list_add_ignored(out, rel_path, skip_reason);
         return;
     }
     CBMLanguage lang = detect_file_language(name, abs_path);
@@ -832,6 +914,108 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
 
 /* ── Public API ───────────────────────────────── */
 
+static bool discover_path_is_absolute(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return true;
+    }
+#ifdef _WIN32
+    return isalpha((unsigned char)path[0]) && path[1] == ':';
+#else
+    return false;
+#endif
+}
+
+/* Resolve the shared "common" git directory for repo_path.
+ * Handles three layouts:
+ *   1. <repo>/.git is a directory    - ordinary repo; common_dir == <repo>/.git
+ *   2. <repo>/.git is a regular file - linked worktree gitlink "gitdir: <path>";
+ *      the common dir is read from <git_dir>/commondir (git stores info/exclude +
+ *      config there, shared across worktrees). Falls back to git_dir when no
+ *      commondir file exists.
+ *   3. neither - not a git repo.
+ * Returns true when a git dir was resolved. Fixes the worktree case where
+ * .git/info/exclude and core.excludesfile were silently dropped because the old
+ * check required .git to be a directory (issue #489 only covered ordinary repos). */
+static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size_t cd_sz) {
+    char dot_git[CBM_SZ_4K];
+    snprintf(dot_git, sizeof(dot_git), "%s/.git", repo_path);
+    struct stat st;
+    if (wide_stat(dot_git, &st) != 0) {
+        return false;
+    }
+    if (S_ISDIR(st.st_mode)) {
+        snprintf(common_dir, cd_sz, "%s", dot_git);
+        cbm_normalize_path_sep(common_dir);
+        return true;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        return false;
+    }
+
+    /* Linked worktree: parse "gitdir: <path>" from the gitlink file.
+     * cbm_fopen (not raw fopen) so non-ASCII repo paths open on Windows. */
+    FILE *f = cbm_fopen(dot_git, "r");
+    if (!f) {
+        return false;
+    }
+    char git_dir[CBM_SZ_4K];
+    bool got_git_dir = false;
+    char line[CBM_SZ_4K];
+    while (fgets(line, sizeof(line), f)) {
+        char *gs = trim_ws(line);
+        if (strncmp(gs, "gitdir:", 7) == 0) {
+            char *val = trim_ws(gs + 7);
+            if (val[0] != '\0') {
+                if (discover_path_is_absolute(val)) {
+                    snprintf(git_dir, sizeof(git_dir), "%s", val);
+                    cbm_normalize_path_sep(git_dir);
+                } else {
+                    path_join(git_dir, sizeof(git_dir), repo_path, val);
+                }
+                got_git_dir = true;
+            }
+            break;
+        }
+    }
+    fclose(f);
+    if (!got_git_dir) {
+        return false;
+    }
+
+    /* The shared dir holding info/exclude + config is named in <git_dir>/commondir
+     * (typically a relative path like "../.."). Absent in single-worktree gitdirs. */
+    char commondir_path[CBM_SZ_4K];
+    path_join(commondir_path, sizeof(commondir_path), git_dir, "commondir");
+    FILE *cf = cbm_fopen(commondir_path, "r");
+    if (cf) {
+        char cbuf[CBM_SZ_4K];
+        bool resolved = false;
+        if (fgets(cbuf, sizeof(cbuf), cf)) {
+            char *cs = trim_ws(cbuf);
+            if (cs[0] != '\0') {
+                if (discover_path_is_absolute(cs)) {
+                    snprintf(common_dir, cd_sz, "%s", cs);
+                    cbm_normalize_path_sep(common_dir);
+                } else {
+                    path_join(common_dir, cd_sz, git_dir, cs);
+                }
+                resolved = true;
+            }
+        }
+        fclose(cf);
+        if (resolved) {
+            return true;
+        }
+    }
+
+    snprintf(common_dir, cd_sz, "%s", git_dir);
+    cbm_normalize_path_sep(common_dir);
+    return true;
+}
+
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
     return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL);
@@ -848,27 +1032,35 @@ static int discover_walk_filtered(const char *repo_path, const cbm_discover_opts
         return CBM_NOT_FOUND;
     }
 
-    /* Load gitignore sources when a .git directory is present.
+    /* Load gitignore sources for ordinary repos AND linked worktrees.
      * Sources merged in order (later patterns win on conflict):
-     *   1. <repo>/.gitignore        — committed exclusions
-     *   2. <repo>/.git/info/exclude — per-clone exclusions, not committed
-     * Both are folded into a single matcher so all downstream call paths
-     * remain unchanged.  Fixes issue #489: OOM on repos whose worktrees
-     * are excluded only via .git/info/exclude (e.g. Sandcastle). */
+     *   1. <repo>/.gitignore     — committed exclusions
+     *   2. <common>/info/exclude — per-clone exclusions, not committed
+     * <common> is the git common dir, resolved via resolve_git_common_dir() so a
+     * worktree (where .git is a gitlink file) reads the shared info/exclude/config
+     * just like a normal checkout. Both are folded into a single matcher so all
+     * downstream call paths remain unchanged. Fixes issue #489: OOM on repos whose
+     * worktrees are excluded only via .git/info/exclude (e.g. Sandcastle). */
     cbm_gitignore_t *gitignore = NULL;
     char gi_path[CBM_SZ_4K];
-    snprintf(gi_path, sizeof(gi_path), "%s/.git", repo_path);
     struct stat gi_stat;
-    bool is_git_repo = wide_stat(gi_path, &gi_stat) == 0 && S_ISDIR(gi_stat.st_mode);
+    /* Resolve the git common dir, transparently following a worktree gitlink so the
+     * .git/info/exclude and core.excludesfile sources are honoured inside linked
+     * worktrees too (where .git is a file pointing at the shared dir, not a directory). */
+    char git_common_dir[CBM_SZ_4K];
+    bool is_git_repo = resolve_git_common_dir(repo_path, git_common_dir, sizeof(git_common_dir));
     bool has_git_config = false;
+    /* Always honour the .gitignore at the indexed-directory root, even when the
+     * directory is not a git repo root (e.g. indexing a sub-package directly).
+     * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
+    snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
+    gitignore = cbm_gitignore_load(gi_path);
     if (is_git_repo) {
-        snprintf(gi_path, sizeof(gi_path), "%s/.git/config", repo_path);
+        path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
         has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
-        snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
-        gitignore = cbm_gitignore_load(gi_path);
 
         char exc_path[CBM_SZ_4K];
-        snprintf(exc_path, sizeof(exc_path), "%s/.git/info/exclude", repo_path);
+        path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");
         cbm_gitignore_t *git_exclude = cbm_gitignore_load(exc_path);
         if (git_exclude) {
             if (!gitignore) {
@@ -909,11 +1101,28 @@ static int discover_walk_filtered(const char *repo_path, const cbm_discover_opts
 
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out) {
+    return cbm_discover_ex2(repo_path, opts, out, count, excluded_out, excluded_count_out, NULL,
+                            NULL, NULL);
+}
+
+int cbm_discover_ex2(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
+                     int *count, char ***excluded_out, int *excluded_count_out,
+                     cbm_ignored_file_t **ignored_out, int *ignored_count_out,
+                     int *ignored_total_out) {
     if (excluded_out) {
         *excluded_out = NULL;
     }
     if (excluded_count_out) {
         *excluded_count_out = 0;
+    }
+    if (ignored_out) {
+        *ignored_out = NULL;
+    }
+    if (ignored_count_out) {
+        *ignored_count_out = 0;
+    }
+    if (ignored_total_out) {
+        *ignored_total_out = 0;
     }
     if (!repo_path || !out || !count) {
         return CBM_NOT_FOUND;
@@ -922,7 +1131,7 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
     *out = NULL;
     *count = 0;
 
-    file_list_t fl = {0};
+    file_list_t fl = {.collect_ignored = ignored_out != NULL};
     if (discover_walk_filtered(repo_path, opts, &fl) != 0) {
         return CBM_NOT_FOUND;
     }
@@ -938,6 +1147,19 @@ int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_
         }
     } else {
         cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
+    }
+
+    /* Same handoff for the ignored-file list (#963). */
+    if (ignored_out) {
+        *ignored_out = fl.ignored;
+        if (ignored_count_out) {
+            *ignored_count_out = fl.ignored_count;
+        }
+        if (ignored_total_out) {
+            *ignored_total_out = fl.ignored_total;
+        }
+    } else {
+        cbm_discover_free_ignored(fl.ignored, fl.ignored_count);
     }
     return 0;
 }
@@ -975,4 +1197,15 @@ void cbm_discover_free_excluded(char **excluded, int count) {
         free(excluded[i]);
     }
     free(excluded);
+}
+
+void cbm_discover_free_ignored(cbm_ignored_file_t *ignored, int count) {
+    if (!ignored) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(ignored[i].rel_path);
+        free(ignored[i].reason);
+    }
+    free(ignored);
 }

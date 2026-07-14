@@ -7,10 +7,13 @@
  *
  * Per-project state tracks:
  *   - Last git HEAD hash (detects commits, checkout, pull)
- *   - Last dirty-tree hash (djb2 of git status --porcelain; prevents reindex
- *     loops when the worktree remains in the same dirty status)
+ *   - Dirty-state signature (#937): porcelain entries plus file metadata, so
+ *     a persistently dirty tree reindexes once per distinct state
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
+ *
+ * Baselines are committed only after a successful reindex. Busy or failed
+ * runs retain the old baseline so the same change is retried.
  *
  * Adaptive interval: 5s base + 1s per 500 files, capped at 60s.
  * Matches the Go watcher's `pollInterval()` logic.
@@ -29,11 +32,13 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 /* ── Constants ─────────────────────────────────────────────────── */
 
@@ -41,6 +46,11 @@
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
+
+/* Stale-root pruning (#286) requires both repeated missing observations and
+ * a grace period because deleting the cache can also delete user-authored ADRs. */
+#define MISSING_ROOT_DELETE_AFTER 3
+#define PRUNE_GRACE_DEFAULT_S 600
 
 /* Sleep chunk for responsive shutdown (ms) */
 #define SLEEP_CHUNK_MS 500
@@ -57,6 +67,8 @@ typedef struct {
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    int missing_root_count;
+    uint64_t first_missing_ms;
     uint64_t version;          /* increments when external calls replace or refresh state */
 } project_state_t;
 
@@ -65,11 +77,15 @@ typedef struct {
     char *root_path;
     char last_head[CBM_SZ_64];
     char last_dirty_hash[CBM_GIT_DIRTY_HASH_BUFSZ];
+    char pending_head[CBM_SZ_64];
+    char pending_dirty_hash[CBM_GIT_DIRTY_HASH_BUFSZ];
     bool is_git;
     bool baseline_done;
     int file_count;
     int interval_ms;
     int64_t next_poll_ns;
+    int missing_root_count;
+    uint64_t first_missing_ms;
     int64_t observed_next_poll_ns;
     uint64_t observed_version;
 } project_snapshot_t;
@@ -175,6 +191,8 @@ static bool snapshot_from_state(project_snapshot_t *dst, const project_state_t *
     dst->file_count = src->file_count;
     dst->interval_ms = src->interval_ms;
     dst->next_poll_ns = src->next_poll_ns;
+    dst->missing_root_count = src->missing_root_count;
+    dst->first_missing_ms = src->first_missing_ms;
     dst->observed_next_poll_ns = src->next_poll_ns;
     dst->observed_version = src->version;
     return true;
@@ -217,6 +235,65 @@ static void state_apply_snapshot(project_state_t *dst, const project_snapshot_t 
     dst->file_count = src->file_count;
     dst->interval_ms = src->interval_ms;
     dst->next_poll_ns = touched_during_poll ? 0 : src->next_poll_ns;
+    dst->missing_root_count = src->missing_root_count;
+    dst->first_missing_ms = src->first_missing_ms;
+}
+
+bool cbm_watcher_root_missing_errno(int err) {
+    /* Permission, I/O, symlink, and transient mount failures are uncertainty,
+     * never evidence that author-owned data may be deleted (#286). */
+    return err == ENOENT || err == ENOTDIR;
+}
+
+typedef enum {
+    ROOT_PRESENT = 0,
+    ROOT_MISSING,
+    ROOT_UNCERTAIN,
+} root_status_t;
+
+static root_status_t watcher_root_status(const char *root_path, int *out_errno) {
+    *out_errno = 0;
+    if (!root_path) {
+        return ROOT_UNCERTAIN;
+    }
+    struct stat st;
+    if (stat(root_path, &st) == 0) {
+        return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
+    }
+    *out_errno = errno;
+    return cbm_watcher_root_missing_errno(errno) ? ROOT_MISSING : ROOT_UNCERTAIN;
+}
+
+static long watcher_prune_grace_s(void) {
+    const char *raw = getenv("CBM_WATCHER_PRUNE_GRACE_S");
+    if (raw && raw[0]) {
+        errno = 0;
+        char *end = NULL;
+        long value = strtol(raw, &end, 10);
+        if (errno == 0 && end != raw && *end == '\0' && value >= 0) {
+            return value;
+        }
+    }
+    return PRUNE_GRACE_DEFAULT_S;
+}
+
+static void watcher_delete_cached_project_db(const char *project_name) {
+    if (!cbm_validate_project_name(project_name)) {
+        return;
+    }
+    const char *cache_dir = cbm_resolve_cache_dir();
+    if (!cache_dir) {
+        return;
+    }
+    char path[CBM_SZ_1K];
+    char wal[CBM_SZ_1K];
+    char shm[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/%s.db", cache_dir, project_name);
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    (void)cbm_unlink(path);
+    (void)cbm_unlink(wal);
+    (void)cbm_unlink(shm);
 }
 
 /* Hash table foreach callback to free state entries */
@@ -261,7 +338,8 @@ void cbm_watcher_free(cbm_watcher_t *w) {
 
 /* ── Watch list management ──────────────────────────────────────── */
 
-static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w);
+static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w,
+                          bool indexed_baseline);
 
 void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
     if (!w || !project_name || !root_path) {
@@ -316,7 +394,7 @@ void cbm_watcher_mark_indexed(cbm_watcher_t *w, const char *project_name, const 
         cbm_log_warn("watcher.indexed.oom", "project", project_name, "path", root_path);
         return;
     }
-    init_baseline(&snap, w);
+    init_baseline(&snap, w, true);
 
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *cur = cbm_ht_get(w->projects, project_name);
@@ -388,7 +466,8 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
 /* Init baseline for a project: check if git, get HEAD, count files */
-static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w) {
+static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w,
+                          bool indexed_baseline) {
     if (!cbm_file_exists(s->root_path)) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
@@ -412,7 +491,13 @@ static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w) {
 
     if (s->is_git) {
         memcpy(s->last_head, snap.head, sizeof(s->last_head));
-        memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
+        if (indexed_baseline || snap.dirty_bytes <= 0) {
+            memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
+        } else {
+            /* A pre-existing dirty tree may not be represented in a restored
+             * artifact. Reindex it once, then #937 suppresses idle repeats. */
+            s->last_dirty_hash[0] = '\0';
+        }
         s->file_count = snap.file_count;
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -424,7 +509,8 @@ static void init_baseline(project_snapshot_t *s, const cbm_watcher_t *w) {
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * (int64_t)CBM_NSEC_PER_MSEC);
 }
 
-/* Check if a project has changes. Returns true if reindex needed. */
+/* Stage the observed state without changing the committed baseline (#937).
+ * The caller commits pending_* only after index_fn succeeds. */
 static bool check_changes(project_snapshot_t *s) {
     if (!s->is_git) {
         return false;
@@ -436,27 +522,12 @@ static bool check_changes(project_snapshot_t *s) {
         return false;
     }
 
-    if (snap.head[0] != '\0' && s->last_head[0] != '\0' && strcmp(snap.head, s->last_head) != 0) {
-        /* HEAD moved: commit, checkout, pull */
-        memcpy(s->last_head, snap.head, sizeof(s->last_head));
-        s->last_dirty_hash[0] = '\0'; /* HEAD moved: clear hash to force recheck */
-        return true;
-    }
-    if (snap.head[0] != '\0') {
-        memcpy(s->last_head, snap.head, sizeof(s->last_head));
-    }
-
-    /* Check working tree: only reindex if git porcelain status changed since last poll. */
-    if (snap.dirty_bytes <= 0) {
-        /* Clean tree: clear hash so future dirt is always caught. */
-        s->last_dirty_hash[0] = '\0';
-        return false;
-    }
-    if (strcmp(snap.dirty_hash, s->last_dirty_hash) == 0) {
-        return false; /* same dirty state as last check: no new changes */
-    }
-    memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
-    return true;
+    memcpy(s->pending_head, snap.head, sizeof(s->pending_head));
+    memcpy(s->pending_dirty_hash, snap.dirty_hash, sizeof(s->pending_dirty_hash));
+    bool head_changed = snap.head[0] != '\0' && s->last_head[0] != '\0' &&
+                        strcmp(snap.head, s->last_head) != 0;
+    bool dirty_changed = strcmp(snap.dirty_hash, s->last_dirty_hash) != 0;
+    return head_changed || dirty_changed;
 }
 
 static bool watcher_snapshot_current(cbm_watcher_t *w, const project_snapshot_t *snap) {
@@ -526,6 +597,23 @@ typedef struct {
     int reindexed;
 } poll_ctx_t;
 
+static void prune_missing_project(cbm_watcher_t *w, const project_snapshot_t *snapshot) {
+    bool removed = false;
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *current = cbm_ht_get(w->projects, snapshot->project_name);
+    if (current && current->version == snapshot->observed_version &&
+        strcmp(current->root_path, snapshot->root_path) == 0) {
+        cbm_ht_delete(w->projects, snapshot->project_name);
+        state_free(current);
+        removed = true;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    if (removed) {
+        watcher_delete_cached_project_db(snapshot->project_name);
+        cbm_log_info("watcher.root_pruned", "project", snapshot->project_name);
+    }
+}
+
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
@@ -534,9 +622,38 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
 
+    /* Check roots before Git/baseline/backoff gates so non-Git projects are
+     * also pruned after sustained, unambiguous absence (#286). */
+    int stat_errno = 0;
+    root_status_t root = watcher_root_status(s->root_path, &stat_errno);
+    if (root == ROOT_UNCERTAIN) {
+        s->missing_root_count = 0;
+        s->first_missing_ms = 0;
+        cbm_log_warn("watcher.root_stat_error", "project", s->project_name);
+        return;
+    }
+    if (root == ROOT_MISSING) {
+        uint64_t now_ms = cbm_now_ms();
+        if (s->missing_root_count == 0) {
+            s->first_missing_ms = now_ms;
+        }
+        s->missing_root_count++;
+        if (s->missing_root_count >= MISSING_ROOT_DELETE_AFTER &&
+            now_ms - s->first_missing_ms >=
+                (uint64_t)watcher_prune_grace_s() * (uint64_t)CBM_MSEC_PER_SEC) {
+            prune_missing_project(ctx->w, s);
+        }
+        return;
+    }
+    if (s->missing_root_count > 0) {
+        cbm_log_info("watcher.root_restored", "project", s->project_name);
+        s->missing_root_count = 0;
+        s->first_missing_ms = 0;
+    }
+
     /* Initialize baseline on first poll */
     if (!s->baseline_done) {
-        init_baseline(s, ctx->w);
+        init_baseline(s, ctx->w, false);
         return;
     }
 
@@ -567,18 +684,20 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            cbm_git_snapshot_t snap = {0};
-            if (cbm_git_snapshot_read(s->root_path,
-                                      CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY |
-                                          CBM_GIT_SNAPSHOT_FILE_COUNT,
-                                      &snap) == 0 && snap.is_git) {
-                memcpy(s->last_head, snap.head, sizeof(s->last_head));
-                memcpy(s->last_dirty_hash, snap.dirty_hash, sizeof(s->last_dirty_hash));
-                s->file_count = snap.file_count;
-                s->interval_ms =
-                    cbm_watcher_poll_interval_ms(s->file_count, ctx->w->poll_base_ms,
-                                                 ctx->w->poll_max_ms);
+            /* Commit the state that was actually indexed. A later edit during
+             * index_fn remains different and is retried next poll (#937). */
+            memcpy(s->last_head, s->pending_head, sizeof(s->last_head));
+            memcpy(s->last_dirty_hash, s->pending_dirty_hash,
+                   sizeof(s->last_dirty_hash));
+            cbm_git_snapshot_t post = {0};
+            if (cbm_git_snapshot_read(s->root_path, CBM_GIT_SNAPSHOT_FILE_COUNT, &post) == 0 &&
+                post.is_git) {
+                s->file_count = post.file_count;
+                s->interval_ms = cbm_watcher_poll_interval_ms(
+                    s->file_count, ctx->w->poll_base_ms, ctx->w->poll_max_ms);
             }
+        } else if (rc > 0) {
+            cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
             cbm_log_warn("watcher.index.err", "project", s->project_name);
         }

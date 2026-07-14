@@ -8,8 +8,32 @@ export interface GraphNode {
   label: string;
   name: string;
   file_path?: string;
+  qualified_name?: string;
+  start_line?: number;
+  end_line?: number;
   size: number;
   color: string;
+  /* Dead-code classification from the backend layout (layout3d.c). */
+  status?: NodeStatus;
+  in_calls?: number;
+}
+
+export type NodeStatus =
+  | "dead"
+  | "single"
+  | "entry"
+  | "test"
+  | "exported"
+  | "normal"
+  | "structural";
+
+/* Git remote metadata for building GitHub deep-links (/api/repo-info). */
+export interface RepoInfo {
+  root_path: string;
+  branch: string;
+  remote_url: string;
+  web_base: string; /* e.g. github.com/<org>/<repo> */
+  blob_base: string; /* e.g. github.com/<org>/<repo>/blob/<branch> */
 }
 
 export interface GraphEdge {
@@ -26,11 +50,21 @@ export interface LinkedProject {
   cross_edges: GraphEdge[];
 }
 
+/* Missed-graph skeleton (#963): the file structure of files the indexer
+ * could not fully cover, laid out as a satellite cluster beside the code
+ * galaxy (server-computed offset, same shape as LinkedProject's). */
+export interface MissedGraph {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  offset: { x: number; y: number; z: number };
+}
+
 export interface GraphData {
   nodes: GraphNode[];
   edges: GraphEdge[];
   total_nodes: number;
   linked_projects?: LinkedProject[];
+  missed_graph?: MissedGraph;
 }
 
 export interface Project {

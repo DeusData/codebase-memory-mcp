@@ -37,3 +37,42 @@ html, body, #root {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+/* ── Graph loading constellation ─────────────────────────────── */
+
+.graph-loader-node {
+  fill: #22d3ee;
+  animation: graph-loader-pulse 2.1s ease-in-out infinite;
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.graph-loader-edge {
+  stroke: #22d3ee;
+  stroke-opacity: 0.35;
+  stroke-width: 1.2;
+  stroke-dasharray: 90;
+  stroke-dashoffset: 90;
+  animation: graph-loader-draw 2.1s ease-in-out infinite;
+}
+
+@keyframes graph-loader-pulse {
+  0%, 100% { opacity: 0.25; transform: scale(0.8); }
+  35% { opacity: 1; transform: scale(1.15); }
+  70% { opacity: 0.45; transform: scale(0.95); }
+}
+
+@keyframes graph-loader-draw {
+  0% { stroke-dashoffset: 90; stroke-opacity: 0; }
+  40% { stroke-dashoffset: 0; stroke-opacity: 0.5; }
+  80%, 100% { stroke-dashoffset: 0; stroke-opacity: 0.15; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-loader-node,
+  .graph-loader-edge {
+    animation: none;
+  }
+  .graph-loader-node { opacity: 0.8; }
+  .graph-loader-edge { stroke-dashoffset: 0; stroke-opacity: 0.35; }
+}

@@ -1516,11 +1516,19 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
         if (!fname) return;
         char *bare = cs_strip_generic_args(ctx->arena, fname);
 
-        /* Try enclosing class member. */
+        /* Try enclosing class member. cs_lookup_method walks the base chain, so
+         * a bare call may resolve to an INHERITED method. Distinguish, exactly
+         * as the instance-call path does: a method actually declared on the
+         * enclosing class is cs_self_method; one found on a base is
+         * cs_inherited_method. */
         if (ctx->enclosing_class_qn) {
             const CBMRegisteredFunc *f = cs_lookup_method(ctx, ctx->enclosing_class_qn, bare);
             if (f) {
-                cs_emit_resolved(ctx, f->qualified_name, "cs_self_method", 0.95f);
+                bool own =
+                    f->receiver_type && strcmp(f->receiver_type, ctx->enclosing_class_qn) == 0;
+                cs_emit_resolved(ctx, f->qualified_name,
+                                 own ? "cs_self_method" : "cs_inherited_method",
+                                 own ? 0.95f : 0.92f);
                 return;
             }
         }
@@ -1534,11 +1542,16 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
                 return;
             }
         }
-        /* Try `using static` imports. */
+        /* Try `using static` imports. The directive target is the namespace-
+         * qualified name as written ("Demo.MathUtil"), but types register under
+         * the file-stem QN ("proj.Client.MathUtil"); resolve the target through
+         * the type-name resolver (its short-name fallback bridges the two)
+         * before the method lookup. */
         for (int i = 0; i < ctx->using_count; i++) {
             const CBMCSUsing *u = &ctx->usings[i];
             if (u->kind != CBM_CS_USING_STATIC) continue;
-            const CBMRegisteredFunc *f = cs_lookup_method(ctx, u->target_qn, bare);
+            const char *host = cs_resolve_type_name(ctx, u->target_qn);
+            const CBMRegisteredFunc *f = cs_lookup_method(ctx, host ? host : u->target_qn, bare);
             if (f) {
                 cs_emit_resolved(ctx, f->qualified_name, "cs_using_static", 0.90f);
                 return;
@@ -1585,8 +1598,8 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
 }
 
 static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
-    /* `new Foo(...)` adds an implicit Foo..ctor edge. We synth a constructor
-     * call to give the pipeline a high-confidence target when Foo is known. */
+    /* `new Foo(...)` adds an implicit constructor CALLS edge: to Foo's ctor
+     * Method node when one is indexed, otherwise to the Foo class node. */
     TSNode tnode = ts_node_child_by_field_name(call, "type", 4);
     if (ts_node_is_null(tnode)) return;
     const CBMType *t = cs_parse_type_node(ctx, tnode);
@@ -1594,14 +1607,24 @@ static void cs_resolve_object_creation(CSLSPContext *ctx, TSNode call) {
     if (t && t->kind == CBM_TYPE_NAMED) tqn = t->data.named.qualified_name;
     else if (t && t->kind == CBM_TYPE_TEMPLATE) tqn = t->data.template_type.template_name;
     if (!tqn) return;
-    const CBMRegisteredFunc *f = cs_lookup_method(ctx, tqn, ".ctor");
+    /* A C# constructor is extracted as a Method whose short name is the class's
+     * short name (the constructor_declaration `name` field is the class
+     * identifier), so the ctor QN is `<type_qn>.<ShortName>` — never ".ctor".
+     * Look it up by the class short name, mirroring the Java resolver. */
+    const char *dot = strrchr(tqn, '.');
+    const char *short_name = dot ? dot + 1 : tqn;
+    const CBMRegisteredFunc *f = cs_lookup_method(ctx, tqn, short_name);
     if (f) {
         cs_emit_resolved(ctx, f->qualified_name, "cs_ctor", 0.95f);
         return;
     }
-    /* Synthesize: Foo..ctor. */
-    cs_emit_resolved(ctx, cbm_arena_sprintf(ctx->arena, "%s..ctor", tqn),
-                      "cs_ctor_synthetic", 0.50f);
+    /* No explicit constructor in the registry. Resolve the `new Foo()` call to
+     * the Foo CLASS node (`tqn`): its short name equals the call's textual
+     * callee_name ("Foo"), so the pipeline join matches, and the class node
+     * always exists, so a CALLS edge forms carrying the strategy — rather than
+     * the old `Foo..ctor`, whose ".ctor" short name joined nothing and resolved
+     * to no node. */
+    cs_emit_resolved(ctx, tqn, "cs_ctor_synthetic", 0.85f);
 }
 
 static void cs_resolve_calls_in_node(CSLSPContext *ctx, TSNode node) {
@@ -2931,6 +2954,7 @@ CBMTypeRegistry *cbm_cs_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, i
         cs_register_lsp_defs(arena, reg, &defs[i], 1);
     }
     cbm_registry_finalize(reg);
+    reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
 

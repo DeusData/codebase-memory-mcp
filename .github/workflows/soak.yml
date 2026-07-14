@@ -20,6 +20,8 @@ on:
         type: choice
         options: ['default', 'query-leak']
         default: 'query-leak'
+  # Iteration convenience: pushing a qa/soak-** branch starts a real run from
+  # that branch's own copy of this file (no main merge needed). Non-gating.
   push:
     branches: ['qa/soak-**']
 
@@ -27,6 +29,7 @@ permissions:
   contents: read
 
 jobs:
+  # ── Unix: full matrix (linux amd64+arm64, darwin arm64+amd64) ──────────────
   soak-unix:
     strategy:
       fail-fast: false
@@ -45,10 +48,11 @@ jobs:
             cc: cc
             cxx: c++
     runs-on: ${{ matrix.os }}
-    # Literal budget also works on push events, where inputs is unavailable.
+    # Literal budget also works on push events, where inputs is unavailable at
+    # workflow setup. It covers the default four-hour soak plus build/teardown.
     timeout-minutes: 320
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Linux)
         if: startsWith(matrix.os, 'ubuntu')
@@ -59,6 +63,8 @@ jobs:
 
       - name: Soak
         env:
+          # On push events there are no inputs → fall back to shell defaults
+          # (240 min / query-leak) so a qa/soak-** push runs the real #581 soak.
           CBM_SOAK_MODE: ${{ inputs.mode || 'query-leak' }}
           DURATION_MINUTES: ${{ inputs.duration_minutes || '240' }}
         run: scripts/soak-test.sh build/c/codebase-memory-mcp "${DURATION_MINUTES}"
@@ -71,11 +77,12 @@ jobs:
           path: soak-results/
           retention-days: 14
 
+  # ── Windows: the platform #581 actually crashes on (50+ GB → crash) ───────
   soak-windows:
     runs-on: windows-latest
     timeout-minutes: 320
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: CLANG64

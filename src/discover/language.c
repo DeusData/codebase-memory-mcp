@@ -11,6 +11,7 @@
 #include "cbm.h" // CBMLanguage, CBM_LANG_*
 
 #include "foundation/constants.h"
+#include "foundation/compat_fs.h"
 
 enum { LANG_SCAN_PASSES = 2 };
 #define SLEN(s) (sizeof(s) - 1)
@@ -185,6 +186,9 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* Meson */
     {".meson", CBM_LANG_MESON},
+
+    /* Mojo */
+    {".mojo", CBM_LANG_MOJO},
 
     /* Nix */
     {".nix", CBM_LANG_NIX},
@@ -834,6 +838,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_APEX] = "Apex",
     [CBM_LANG_SOQL] = "SOQL",
     [CBM_LANG_SOSL] = "SOSL",
+    [CBM_LANG_MOJO] = "Mojo",
 
 };
 
@@ -998,7 +1003,7 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
         return CBM_LANG_MATLAB;
     }
 
-    FILE *f = fopen(path, "r");
+    FILE *f = cbm_fopen(path, "r");
     if (!f) {
         return CBM_LANG_MATLAB;
     }

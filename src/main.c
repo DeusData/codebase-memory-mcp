@@ -15,6 +15,7 @@
  */
 #include "cbm.h" // cbm_alloc_init — bind 3rd-party allocators to mimalloc before any sqlite/git init
 #include "mcp/mcp.h"
+#include "mcp/index_supervisor.h"
 #include "watcher/watcher.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
@@ -33,16 +34,19 @@ enum {
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
     PARENT_WATCHDOG_POLL_US = CBM_USEC_PER_SEC / 2,
 };
-#define MAIN_RAM_FRACTION 0.5
-
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
 #include "foundation/profile.h"
+#include "foundation/win_utf8.h" /* cbm_wide_to_utf8 — Windows UTF-8 argv (#423/#20); no-op on POSIX */
+#ifdef _WIN32
+#include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
+#endif
 #include "ui/config.h"
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
@@ -53,6 +57,9 @@ enum {
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #ifndef CBM_VERSION
 #define CBM_VERSION "dev"
@@ -122,9 +129,9 @@ static void *parent_watchdog_thread(void *arg) {
         /* initial_ppid > 1 guards against an already-orphaned start (ppid==1),
          * where a changing ppid carries no signal. */
         if (initial_ppid > 1 && getppid() != initial_ppid) {
-            cbm_log_warn("parent.exited", "reason", "ppid_changed");
-            request_shutdown();
-            exit(0);
+            static const char msg[] = "level=warn msg=parent.exited reason=ppid_changed\n";
+            (void)write(STDERR_FILENO, msg, sizeof(msg) - 1);
+            _exit(0);
         }
     }
     return NULL;
@@ -164,19 +171,38 @@ static void *http_thread(void *arg) {
 static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
     cbm_config_t *cfg = (cbm_config_t *)user_data;
 
-    /* Skip indexing if shutdown is in progress */
+    /* Skip indexing if shutdown is in progress (skipped, not indexed) */
     if (atomic_load(&g_shutdown)) {
-        return 0;
+        return 1;
     }
 
-    /* Non-blocking: skip if another pipeline is already running.
-     * Watcher will retry on next poll cycle (5-60s). */
+    /* Non-blocking: skip if another pipeline is already running. The
+     * positive return keeps the watcher's baselines uncommitted so the
+     * change is retried on the next poll cycle (5-60s) instead of being
+     * recorded as seen and lost (#937). */
     if (!cbm_pipeline_try_lock()) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
+        return 1;
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
+
+    /* #832: route the re-index through the supervised worker subprocess so this
+     * long-lived server process hands its RSS back to the OS on every cycle
+     * instead of ratcheting (mimalloc v3 does not reclaim pages that worker
+     * threads abandon at exit). The child writes the DB; the parent only needs the
+     * return code. The pipeline lock (already held) still serialises re-indexes.
+     * Degrade to the in-process pipeline when the supervisor is off (kill switch)
+     * or the spawn fails. */
+    if (cbm_index_supervisor_should_wrap()) {
+        char *resp = cbm_mcp_index_run_supervised_path(root_path);
+        if (resp) {
+            free(resp);
+            cbm_pipeline_unlock();
+            return 0;
+        }
+        /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
@@ -281,6 +307,84 @@ static bool cli_strip_flag(int *argc, char **argv, const char *flag) {
     return false;
 }
 
+/* Strip a flag AND its following value from argv, returning the value (a pointer
+ * into the original argv strings, valid for the process lifetime) or NULL if the
+ * flag is absent. */
+static const char *cli_strip_flag_value(int *argc, char **argv, const char *flag) {
+    for (int i = 0; i < *argc; i++) {
+        if (strcmp(argv[i], flag) != 0) {
+            continue;
+        }
+        const char *value = (i + SKIP_ONE < *argc) ? argv[i + SKIP_ONE] : NULL;
+        int remove_count = value ? 2 : 1;
+        for (int j = i; j < *argc - remove_count; j++) {
+            argv[j] = argv[j + remove_count];
+        }
+        *argc -= remove_count;
+        return value;
+    }
+    return NULL;
+}
+
+/* Portable "is fd a terminal?" — _isatty on Windows, isatty on POSIX. */
+#ifdef _WIN32
+#define cli_isatty(fd) _isatty(fd)
+#else
+#define cli_isatty(fd) isatty(fd)
+#endif
+
+enum { CLI_SLURP_CHUNK = 4096 };
+
+/* Read an open stream fully into a heap, NUL-terminated string. Caller frees.
+ * Returns NULL on allocation failure. Reads binary-clean (UTF-8 JSON, no shell
+ * quoting needed). */
+static char *cli_slurp_stream(FILE *f) {
+    size_t cap = CLI_SLURP_CHUNK;
+    size_t len = 0;
+    char *buf = malloc(cap);
+    if (!buf) {
+        return NULL;
+    }
+    char tmp[CLI_SLURP_CHUNK];
+    size_t n;
+    while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0) {
+        if (len + n + 1 > cap) {
+            while (len + n + 1 > cap) {
+                cap *= 2;
+            }
+            char *nb = realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                return NULL;
+            }
+            buf = nb;
+        }
+        memcpy(buf + len, tmp, n);
+        len += n;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+/* Slurp a file path into a heap, NUL-terminated string. Caller frees. */
+static char *cli_slurp_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    char *s = cli_slurp_stream(f);
+    (void)fclose(f);
+    return s;
+}
+
+/* True if the first non-whitespace byte of s is '{' (raw-JSON detection). */
+static bool cli_first_nonspace_is_brace(const char *s) {
+    while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') {
+        s++;
+    }
+    return *s == '{';
+}
+
 static int run_cli(int argc, char **argv) {
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
@@ -290,13 +394,113 @@ static int run_cli(int argc, char **argv) {
     bool progress = cli_strip_flag(&argc, argv, "--progress");
     bool raw_json = cli_strip_flag(&argc, argv, "--json");
 
+    /* Supervisor worker role: when this process was spawned as a supervised index
+     * worker, run indexing in-process (never re-supervise) and write the result to
+     * the given file for the parent to read back. Stripped here so the tool
+     * dispatch below sees only the tool name + its args. */
+    bool index_worker = cli_strip_flag(&argc, argv, "--index-worker");
+    const char *response_out = cli_strip_flag_value(&argc, argv, "--response-out");
+    cbm_index_set_worker_role(index_worker, response_out);
+
+#ifndef _WIN32
+    /* #845: a supervised worker must not outlive its supervisor. If the parent
+     * dies without reaping us (agent killed, supervisor crashed), an orphaned
+     * worker would index on unsupervised — observed contributing to memory
+     * pressure during the 2026-07-04 host panics. Reuse the parent-death
+     * watchdog (safe outside server mode: on ppid change it only writes to
+     * stderr and _exit(0)s — no cleanup dependencies). Detached: the worker
+     * exits by returning from run_cli; exit() tears the thread down. Failure
+     * to start is non-fatal, same policy as the MCP-server watchdog. */
+    if (index_worker) {
+        static pid_t worker_initial_ppid; /* static: outlives run_cli for the thread */
+        worker_initial_ppid = getppid();
+        cbm_thread_t worker_watchdog_tid;
+        if (cbm_thread_create(&worker_watchdog_tid, PARENT_WATCHDOG_STACK_SIZE,
+                              parent_watchdog_thread, &worker_initial_ppid) == 0) {
+            (void)cbm_thread_detach(&worker_watchdog_tid);
+            cbm_log_info("worker.watchdog.start");
+        } else {
+            cbm_log_warn("worker.watchdog.unavailable", "reason", "thread_create_failed");
+        }
+    }
+#endif
+
     if (argc < MAIN_MIN_ARGC) {
         (void)fprintf(stderr, CLI_USAGE);
         return SKIP_ONE;
     }
 
     const char *tool_name = argv[0];
-    const char *args_json = argc >= MAIN_CLI_ARGC ? argv[SKIP_ONE] : "{}";
+    int rem_argc = argc - SKIP_ONE; /* args following the tool name */
+    char **rem_argv = argv + SKIP_ONE;
+
+    /* --help / -h : print per-tool help (from the tool's input_schema) and exit
+     * before any server work. */
+    for (int i = 0; i < rem_argc; i++) {
+        if (strcmp(rem_argv[i], "--help") == 0 || strcmp(rem_argv[i], "-h") == 0) {
+            if (cbm_cli_print_tool_help(tool_name) != 0) {
+                (void)fprintf(stderr, "error: unknown tool '%s'\n", tool_name);
+                return SKIP_ONE;
+            }
+            return 0;
+        }
+    }
+
+    /* Resolve the JSON arguments. Precedence: --args-file, then raw JSON
+     * (back-compat), then --flags, then piped stdin, then empty {}. */
+    char *heap_args = NULL; /* freed before return when set */
+    const char *args_json = "{}";
+
+    int args_file_idx = -1;
+    for (int i = 0; i < rem_argc; i++) {
+        if (strcmp(rem_argv[i], "--args-file") == 0) {
+            args_file_idx = i;
+            break;
+        }
+    }
+
+    if (args_file_idx >= 0) {
+        if (args_file_idx + SKIP_ONE >= rem_argc) {
+            (void)fprintf(stderr, "error: --args-file requires a path argument\n");
+            return SKIP_ONE;
+        }
+        const char *path = rem_argv[args_file_idx + SKIP_ONE];
+        heap_args = cli_slurp_file(path);
+        if (!heap_args) {
+            (void)fprintf(stderr, "error: cannot read args file '%s'\n", path);
+            return SKIP_ONE;
+        }
+        args_json = heap_args;
+    } else if (rem_argc >= SKIP_ONE && cli_first_nonspace_is_brace(rem_argv[0])) {
+        /* raw-JSON back-compat: cli <tool> '{"k":"v"}' (deprecated path). Warn on
+         * STDERR only — stdout must stay clean JSON for piping. */
+        (void)fprintf(stderr,
+                      "warning: passing raw JSON to 'cli %s' is deprecated and "
+                      "will be removed in a future release; use flags (run 'cli "
+                      "%s --help'), --args-file <path>, or piped stdin.\n",
+                      tool_name, tool_name);
+        args_json = rem_argv[0];
+    } else if (rem_argc >= SKIP_ONE && strncmp(rem_argv[0], "--", 2) == 0) {
+        /* flag form: cli <tool> --flag value --bare-bool ... */
+        char *err = NULL;
+        heap_args = cbm_cli_build_args_json(tool_name, rem_argc, rem_argv, &err);
+        if (!heap_args) {
+            (void)fprintf(stderr, "error: %s\n", err ? err : "invalid arguments");
+            free(err);
+            return SKIP_ONE;
+        }
+        args_json = heap_args;
+    } else if (!cli_isatty(0)) {
+        /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json */
+        heap_args = cli_slurp_stream(stdin);
+        if (heap_args && heap_args[0]) {
+            args_json = heap_args;
+        } else {
+            free(heap_args);
+            heap_args = NULL;
+            args_json = "{}";
+        }
+    }
 
     if (progress) {
         cbm_progress_sink_init(stderr);
@@ -325,10 +529,30 @@ static int run_cli(int argc, char **argv) {
     int exit_code = 0;
 
     if (result) {
+        /* Supervised worker: hand the full result string to the parent via the
+         * response file before printing (parent reads it back on a clean exit). */
+        const char *ro = cbm_index_worker_response_out();
+        if (ro) {
+            FILE *rf = cbm_fopen(ro, "wb");
+            if (rf) {
+                (void)fputs(result, rf);
+                (void)fclose(rf);
+            }
+        }
         if (raw_json) {
             printf("%s\n", result);
         } else {
             exit_code = cli_print_mcp_result(result);
+        }
+        if (cbm_index_worker_active()) {
+            /* Supervised worker: the response is delivered (file + stdout).
+             * Skip the multi-GB teardown (server/store frees) — the process
+             * dies now and the OS reclaims everything wholesale; piecemeal
+             * free() of a kernel-scale graph costs minutes. _Exit skips
+             * atexit/LSan by design for this prod worker path. */
+            cbm_log_info("index.worker.fast_exit", "action", "_Exit");
+            fflush(NULL);
+            _Exit(exit_code);
         }
         free(result);
     }
@@ -342,6 +566,7 @@ static int run_cli(int argc, char **argv) {
         cbm_progress_sink_fini();
     }
     cbm_pipeline_global_cleanup();
+    free(heap_args);
     return exit_code;
 }
 
@@ -400,11 +625,11 @@ static int handle_subcommand(int argc, char **argv) {
                 print_cli_help();
                 return 0;
             }
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return run_cli(cli_argc, cli_argv);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
-            cbm_mem_init(MAIN_RAM_FRACTION);
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             return cbm_cmd_hook_augment();
         }
         if (strcmp(argv[i], "install") == 0) {
@@ -460,14 +685,78 @@ static void setup_signal_handlers(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* On Windows the CRT hands main() an argv encoded in the active ANSI code page, so a
+ * non-ASCII CLI argument (e.g. a repo path like café_日本語_repo) is mangled before the
+ * program ever sees it — the documented `cli index_repository "<json>"` then fails with
+ * "repo_path is required" (#423/#20). Rebuild argv from the wide command line
+ * (GetCommandLineW → CommandLineToArgvW) and convert each element to UTF-8 so the rest
+ * of the program receives the same UTF-8 bytes it gets on POSIX. Returns a
+ * NULL-terminated argv and sets *out_argc, or NULL on any failure (caller then keeps
+ * the original narrow argv). The returned block lives for the whole process (argv must
+ * stay valid until exit), so it is intentionally never freed. */
+static char **cbm_win_utf8_argv(int *out_argc) {
+    int wargc = 0;
+    LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+    if (!wargv) {
+        return NULL;
+    }
+    if (wargc <= 0) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    char **u8argv = (char **)calloc((size_t)wargc + 1, sizeof(char *));
+    if (!u8argv) {
+        LocalFree(wargv);
+        return NULL;
+    }
+    for (int i = 0; i < wargc; i++) {
+        u8argv[i] = cbm_wide_to_utf8(wargv[i]);
+        if (!u8argv[i]) {
+            for (int j = 0; j < i; j++) {
+                free(u8argv[j]);
+            }
+            free(u8argv);
+            LocalFree(wargv);
+            return NULL;
+        }
+    }
+    LocalFree(wargv);
+    *out_argc = wargc;
+    return u8argv; /* NULL-terminated (calloc'd wargc+1) */
+}
+#endif /* _WIN32 */
+
 int main(int argc, char **argv) {
-    /* Defense-in-depth: bind tree-sitter, sqlite3, and libgit2 to mimalloc so a
+    /* Defense-in-depth: bind tree-sitter and sqlite3 to mimalloc so a
      * correct binary does not rely on the fragile MI_OVERRIDE symbol override
      * (#424). MUST be the VERY FIRST statement: SQLITE_CONFIG_MALLOC has to run
      * before the first sqlite3_open* (cbm_mcp_server_new → cbm_store_open_memory
      * below opens sqlite early), else sqlite3_config returns SQLITE_MISUSE and
      * the bind is silently ignored. No-op in the test build. */
     cbm_alloc_init();
+#ifdef _WIN32
+    /* Replace the ANSI-code-page argv the CRT handed us with a UTF-8 argv rebuilt from
+     * the wide command line, so non-ASCII CLI arguments survive (#423/#20). Falls back
+     * to the original argv if the wide rebuild fails. Done after cbm_alloc_init (which
+     * must stay the very first statement) but before argv is first read below. */
+    {
+        int win_argc = 0;
+        char **win_argv = cbm_win_utf8_argv(&win_argc);
+        if (win_argv) {
+            argc = win_argc;
+            argv = win_argv;
+        }
+    }
+#endif
+    /* #845: mark this process as the REAL binary so the index supervisor may
+     * wrap index_repository in a worker subprocess. Must run before any
+     * subcommand dispatch so MCP-server, CLI, and HTTP paths are all covered.
+     * Embedders of cbm_mcp_handle_tool (test binaries) never mark themselves,
+     * so they index in-process instead of re-invoking themselves as
+     * `<self> cli --index-worker …` (recursive suite re-runs / spawn chains). */
+    cbm_index_supervisor_mark_host();
+    cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init(); /* reads CBM_PROFILE env var, gates all prof macros */
     /* CBM_LOG_LEVEL support — distilled from #414 (closes #413). Apply before
      * the first log statement so the configured level governs all output. */
@@ -500,12 +789,10 @@ int main(int argc, char **argv) {
 #endif
 
     /* Default: MCP server on stdio */
-    cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
-                                      * memory (C + C++ allocations) via global override.
-                                      * No more untracked heap blind spots. */
+    cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
     /* Store binary path for subprocess spawning + hook log sink */
     cbm_http_server_set_binary_path(argv[0]);
-    cbm_log_set_sink(cbm_ui_log_append);
+    cbm_log_set_sink_ex(cbm_ui_log_append, CBM_LOG_SINK_TEE);
     cbm_log_info("server.start", "version", CBM_VERSION);
     cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */
 
@@ -587,6 +874,7 @@ int main(int argc, char **argv) {
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
+            cbm_http_server_set_watcher(g_http_server, g_watcher);
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
                 http_started = true;
             }

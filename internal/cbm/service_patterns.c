@@ -830,6 +830,10 @@ void cbm_service_patterns_init(void) {
     /* No-op — tables are static const */
 }
 
+bool cbm_service_pattern_is_global_fetch(const char *callee_name) {
+    return callee_name != NULL && strcmp(callee_name, "fetch") == 0;
+}
+
 cbm_svc_kind_t cbm_service_pattern_match(const char *resolved_qn) {
     if (!resolved_qn || !resolved_qn[0]) {
         return CBM_SVC_NONE;
@@ -910,6 +914,26 @@ bool cbm_service_pattern_route_suffix_allows_no_handler(const char *callee_name)
         }
     }
     return false;
+}
+
+bool cbm_service_pattern_is_php_route_facade(const char *callee_name) {
+    static const char php_route_facade_prefix[] = "Route::";
+    return callee_name != NULL &&
+           strncmp(callee_name, php_route_facade_prefix,
+                   sizeof(php_route_facade_prefix) - 1) == 0 &&
+           cbm_service_pattern_route_method(callee_name) != NULL;
+}
+
+bool cbm_service_pattern_is_handlerless_http_client(const char *callee_name) {
+    /* The overlap between the route and HTTP-method tables is intentional:
+     * dotted verbs such as api.get('/x') are clients without a handler, while
+     * framework-only registration suffixes (MapGet/Handle) and the PHP Route
+     * facade (#952 inverse guard: not Cache::get) are not. Explicitly
+     * handlerless route APIs remain routes. */
+    return cbm_service_pattern_route_method(callee_name) != NULL &&
+           cbm_service_pattern_http_method(callee_name) != NULL &&
+           !cbm_service_pattern_is_php_route_facade(callee_name) &&
+           !cbm_service_pattern_route_suffix_allows_no_handler(callee_name);
 }
 
 const char *cbm_service_pattern_broker(const char *resolved_qn) {

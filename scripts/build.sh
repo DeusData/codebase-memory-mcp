@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # build.sh — Clean build of production binary (standard or with UI).
 #
 # Usage:
@@ -87,12 +87,12 @@ verify_compiler "$CC"
 # Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
 rm -rf "$ROOT/build/c"
 
-# Step 2: Build (with arch prefix on macOS)
+# Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then
-    $ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
+    make -j"$NPROC" -f Makefile.cbm cbm-with-ui \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 else
-    $ARCH_PREFIX make -j"$NPROC" -f Makefile.cbm cbm \
+    make -j"$NPROC" -f Makefile.cbm cbm \
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 

@@ -109,6 +109,13 @@ while (( SECONDS < deadline )); do
     echo "ok: child ${child_pid} exited after parent death"
     exit 0
   fi
+  # A zombie no longer holds stdin or runs the MCP loop; kill -0 still reports
+  # it until launchd/test parent reaps it, so treat that as a successful exit.
+  child_state="$(ps -p "${child_pid}" -o stat= 2>/dev/null | tr -d '[:space:]' || true)"
+  if [[ "${child_state}" == Z* ]]; then
+    echo "ok: child ${child_pid} exited after parent death (zombie awaiting reap)"
+    exit 0
+  fi
   sleep "${WATCHDOG_EXIT_POLL_SECONDS}"
 done
 
