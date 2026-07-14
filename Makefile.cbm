@@ -884,15 +884,15 @@ test-tsan: $(BUILD_DIR)/test-runner-tsan
 # Note: if false positives appear from system libraries on Linux, create lsan.supp
 #   and set LSAN_OPTIONS=suppressions=lsan.supp
 LEAK_LOG = $(BUILD_DIR)/leak-report.txt
-# Apple's leaks debugger stops descendant test binaries, so crash and socket-
-# inheritance probes cannot run under `leaks --atExit` without deadlocking their
-# parent. Cover the allocation-owning stores, pipelines, rankers, and parallel workers explicitly
-# instead. The test runner
+# Apple's leaks debugger stops descendant test binaries, so crash, socket-
+# inheritance, and UI child-process probes cannot run under `leaks --atExit`
+# without deadlocking or failing their parent. Cover the allocation-owning
+# stores, pipelines, rankers, and parallel workers explicitly instead. The test runner
 # also always includes httplink, token_reduction, depindex, pagerank,
 # tool_consolidation, and input_validation when suite arguments are present.
 TEST_LEAK_SUITES ?= arena hash_table dyn_array str_intern store_nodes store_edges \
 	store_search store_bulk store_pragmas store_checkpoint dump_verify_io \
-	graph_buffer registry pipeline worker_pool parallel slab_alloc mem ui \
+	graph_buffer registry pipeline worker_pool parallel slab_alloc mem \
 	integration incremental
 ifeq ($(UNAME_S),Darwin)
 # macOS: 'leaks' cannot inspect ASan-instrumented processes (ASan replaces malloc).

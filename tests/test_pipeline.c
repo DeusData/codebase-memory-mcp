@@ -10941,6 +10941,7 @@ static int pipeline_build_exact_scratch_for_changed_files_ex(
     CBMHashTable *pkgmap = NULL;
     atomic_int cancelled;
     atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {0};
     int rc = CBM_STORE_ERR;
     if (!changed_paths || !result_cache || !scratch || !registry) {
         goto cleanup;
@@ -10960,7 +10961,7 @@ static int pipeline_build_exact_scratch_for_changed_files_ex(
     cbm_pipeline_set_pkgmap(pkgmap);
 
     const double pipeline_default_threshold = 0.0; /* Pipeline constructor sentinel: use pass defaults. */
-    cbm_pipeline_ctx_t ctx = {.project_name = project,
+    ctx = (cbm_pipeline_ctx_t){.project_name = project,
                               .repo_path = repo_path,
                               .gbuf = scratch,
                               .registry = registry,
@@ -11017,6 +11018,10 @@ static int pipeline_build_exact_scratch_for_changed_files_ex(
     rc = CBM_STORE_OK;
 
 cleanup:
+    if (ctx.seq_cross_arena_live) {
+        cbm_arena_destroy(&ctx.seq_cross_arena);
+        ctx.seq_cross_arena_live = false;
+    }
     for (int i = 0; i < changed_count; i++) {
         if (result_cache && result_cache[i]) {
             cbm_free_result(result_cache[i]);
@@ -14017,6 +14022,10 @@ TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs) {
     ASSERT_FALSE(pipeline_resolved_call_contains(&result_cache[0]->resolved_calls, "Service.run",
                                                  "provider.OtherLogger.log"));
 
+    if (ctx.seq_cross_arena_live) {
+        cbm_arena_destroy(&ctx.seq_cross_arena);
+        ctx.seq_cross_arena_live = false;
+    }
     cbm_free_result(result_cache[0]);
     cbm_registry_free(registry);
     cbm_gbuf_free(scratch);

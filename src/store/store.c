@@ -1181,6 +1181,10 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
 
     int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
     if (rc != SQLITE_OK) {
+        /* sqlite3_open_v2 may return a live error handle even when opening
+         * fails (for example, READWRITE without CREATE on a missing path).
+         * It must be closed before releasing the wrapper. */
+        sqlite3_close(s->db);
         free(s);
         return NULL;
     }
