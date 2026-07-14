@@ -682,6 +682,24 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count);
 
+/* ── Importance (repo_map) ──────────────────────────────────────── */
+
+/* Count symbol nodes (Function/Method/Class) and how many of them carry a
+ * persisted numeric "importance" key in properties (pass_importance, P3).
+ * Used by repo_map's score-absence gate: total>0 && scored==0 means the
+ * project was indexed by a pre-importance binary and must be re-indexed.
+ * Returns CBM_STORE_OK or CBM_STORE_ERR. */
+int cbm_store_importance_coverage(cbm_store_t *s, const char *project, int *out_scored,
+                                  int *out_total);
+
+/* Top symbol nodes (Function/Method/Class) ordered by persisted importance
+ * DESC with deterministic qualified_name ASC tie-break. Nodes without an
+ * importance key sort last (SQLite NULLs-last under DESC). Returns an
+ * allocated array (caller frees with cbm_store_free_nodes).
+ * Returns CBM_STORE_OK or CBM_STORE_ERR. */
+int cbm_store_top_symbols_by_importance(cbm_store_t *s, const char *project, int limit,
+                                        cbm_node_t **out, int *count);
+
 /* ── Memory management helpers ──────────────────────────────────── */
 
 /* Free heap-allocated strings in a stack-allocated node (does NOT free the node itself). */

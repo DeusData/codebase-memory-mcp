@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 15 graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -491,6 +491,24 @@ static const tool_def_t TOOLS[] = {
      "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\"]},"
      "\"description\":\"Aspects to include. 'all' = everything; 'overview' = compact summary "
      "(all except file_tree); omit = all.\"}},\"required\":[\"project\"]}"},
+
+    {"repo_map", "Repo map",
+     "Token-budgeted repository map: the most important symbols (persisted importance score, "
+     "Aider-style weighted degree) rendered one per line as 'file: signature' — no bodies. "
+     "Two modes: pass seed_anchors (symbol names, qualified names, or file paths relevant to "
+     "the task) to boost the seed neighbourhood to the top (seed-boost mode, recommended); "
+     "omit or pass unresolvable seeds for the global importance-ranked map. Output always "
+     "fits token_budget. Requires an index built by an importance-scoring binary — errors "
+     "with 'unscored' if the project needs re-indexing.",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
+     "\"seed_anchors\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Task-relevant anchors: exact symbol name, qualified name, or file "
+     "path. Seed neighbourhoods (1-hop CALLS/USAGE, widened for weakly-connected seeds) are "
+     "boosted above globally-important symbols. Empty/unresolvable anchors fall back to the "
+     "global map.\"},"
+     "\"token_budget\":{\"type\":\"integer\",\"default\":1600,\"description\":\"Approximate "
+     "output ceiling in tokens (chars/4 estimate). Must be positive.\"}},"
+     "\"required\":[\"project\"]}"},
 
     {"search_code", "Search code",
      "Graph-augmented code search. Finds text patterns via grep, then enriches results with "
@@ -6955,6 +6973,552 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* ══════════════════════════════════════════════════════════════════
+ *  REPO_MAP — token-budgeted, seed-aware repository map (P4)
+ *
+ *  Reads the persisted per-symbol importance score (pass_importance, P3)
+ *  and renders the top symbols as one 'file: signature' line each, fitted
+ *  to a token budget (chars/4 estimate — no LLM tokenizer exists server-
+ *  side; the budget contract is defined against this estimator).
+ *
+ *  Two first-class modes (P2 finding: seed-boost mandatory, global is the
+ *  fallback — pai/p2-query-time-validation-finding):
+ *    seeded: resolved seed_anchors and their 1-hop CALLS/USAGE
+ *            neighbourhood are boosted x50; when the whole 1-hop set is
+ *            tiny (<= REPO_MAP_WEAK_NEIGHBOR_THRESHOLD) the walk widens
+ *            with file-of-symbol seeding + 2-hop expansion at x25
+ *            (P2 shape hints for weakly-connected seeds).
+ *    global: no/unresolvable seeds -> pure importance ranking.
+ *
+ *  Determinism: effective score DESC, qualified_name ASC (total order).
+ *  Score-absence gate (spec AC7): a project whose symbol nodes carry no
+ *  importance key was indexed by a pre-P3 binary -> explicit 'unscored'
+ *  error, never a silently unranked map.
+ * ══════════════════════════════════════════════════════════════════ */
+
+enum {
+    REPO_MAP_DEFAULT_BUDGET = 1600, /* spec: default tunable ~1-2k tokens */
+    REPO_MAP_MAX_SEEDS = 50,        /* anchors beyond this are dropped */
+    REPO_MAP_NODES_PER_ANCHOR = 16, /* multi-resolving anchor cap */
+    REPO_MAP_WEAK_NEIGHBOR_THRESHOLD = 3,
+    REPO_MAP_MAX_BOOSTED = 512, /* total boosted-node ceiling */
+    REPO_MAP_MIN_CANDIDATES = 200,
+    REPO_MAP_MAX_CANDIDATES = 10000,
+    REPO_MAP_TOKEN_CHARS = 4, /* chars-per-token estimate divisor */
+};
+static const double REPO_MAP_SEED_BOOST = 50.0;  /* P2's validated multiplier */
+static const double REPO_MAP_WIDEN_BOOST = 25.0; /* weak-seed widened set */
+
+typedef struct {
+    int64_t id;
+    double boost;
+} rm_boost_t;
+
+typedef struct {
+    rm_boost_t items[REPO_MAP_MAX_BOOSTED];
+    int count;
+} rm_boost_list_t;
+
+/* Add (or raise) a node's boost. Never downgrades an existing boost. */
+static void rm_boost_add(rm_boost_list_t *bl, int64_t id, double boost) {
+    for (int i = 0; i < bl->count; i++) {
+        if (bl->items[i].id == id) {
+            if (boost > bl->items[i].boost) {
+                bl->items[i].boost = boost;
+            }
+            return;
+        }
+    }
+    if (bl->count < REPO_MAP_MAX_BOOSTED) {
+        bl->items[bl->count].id = id;
+        bl->items[bl->count].boost = boost;
+        bl->count++;
+    }
+}
+
+static double rm_boost_get(const rm_boost_list_t *bl, int64_t id) {
+    for (int i = 0; i < bl->count; i++) {
+        if (bl->items[i].id == id) {
+            return bl->items[i].boost;
+        }
+    }
+    return 1.0;
+}
+
+/* Append id to a fixed array if absent. Returns true if present after call. */
+static bool rm_id_add(int64_t *arr, int *count, int cap, int64_t id) {
+    for (int i = 0; i < *count; i++) {
+        if (arr[i] == id) {
+            return true;
+        }
+    }
+    if (*count < cap) {
+        arr[(*count)++] = id;
+        return true;
+    }
+    return false;
+}
+
+static bool rm_id_contains(const int64_t *arr, int count, int64_t id) {
+    for (int i = 0; i < count; i++) {
+        if (arr[i] == id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Collect the 1-hop CALLS|USAGE neighbour ids of `id` (both directions)
+ * into out (deduped, capped). */
+static void rm_collect_neighbors(cbm_store_t *store, int64_t id, int64_t *out, int *count,
+                                 int cap) {
+    cbm_edge_t *edges = NULL;
+    int ecount = 0;
+    if (cbm_store_find_edges_by_source(store, id, &edges, &ecount) == CBM_STORE_OK) {
+        for (int i = 0; i < ecount; i++) {
+            if (edges[i].type &&
+                (strcmp(edges[i].type, "CALLS") == 0 || strcmp(edges[i].type, "USAGE") == 0)) {
+                rm_id_add(out, count, cap, edges[i].target_id);
+            }
+        }
+        cbm_store_free_edges(edges, ecount);
+    }
+    edges = NULL;
+    ecount = 0;
+    if (cbm_store_find_edges_by_target(store, id, &edges, &ecount) == CBM_STORE_OK) {
+        for (int i = 0; i < ecount; i++) {
+            if (edges[i].type &&
+                (strcmp(edges[i].type, "CALLS") == 0 || strcmp(edges[i].type, "USAGE") == 0)) {
+                rm_id_add(out, count, cap, edges[i].source_id);
+            }
+        }
+        cbm_store_free_edges(edges, ecount);
+    }
+}
+
+/* Collapse whitespace runs (incl. newlines) to single spaces, in place.
+ * Multi-line signatures otherwise break the one-line-per-symbol map shape
+ * (observed on the real connectors corpus: black-formatted Python defs). */
+static void rm_flatten_ws(char *s) {
+    char *r = s;
+    char *w = s;
+    bool in_ws = false;
+    while (*r) {
+        char c = *r;
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            in_ws = true;
+        } else {
+            if (in_ws && w != s) {
+                *w++ = ' ';
+            }
+            in_ws = false;
+            *w++ = c;
+        }
+        r++;
+    }
+    *w = '\0';
+}
+
+/* Parse importance (default 0.0) and signature (heap copy, whitespace-
+ * flattened, or NULL) from a node's properties_json. */
+static void rm_parse_props(const char *props, double *out_importance, char **out_sig) {
+    *out_importance = 0.0;
+    *out_sig = NULL;
+    if (!props || !props[0]) {
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(props, strlen(props), 0);
+    if (!doc) {
+        return;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (yyjson_is_obj(root)) {
+        yyjson_val *imp = yyjson_obj_get(root, "importance");
+        if (yyjson_is_num(imp)) {
+            *out_importance = yyjson_get_num(imp);
+        }
+        yyjson_val *sig = yyjson_obj_get(root, "signature");
+        if (yyjson_is_str(sig)) {
+            *out_sig = heap_strdup(yyjson_get_str(sig));
+            if (*out_sig) {
+                rm_flatten_ws(*out_sig);
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+}
+
+/* A ranked, rendered map candidate. */
+typedef struct {
+    cbm_node_t node; /* owned */
+    double eff;      /* importance x boost */
+    char *line;      /* owned: "file: signature\n" */
+    size_t line_len;
+} rm_cand_t;
+
+static int rm_cand_cmp(const void *pa, const void *pb) {
+    const rm_cand_t *a = (const rm_cand_t *)pa;
+    const rm_cand_t *b = (const rm_cand_t *)pb;
+    if (a->eff > b->eff) {
+        return -1;
+    }
+    if (a->eff < b->eff) {
+        return 1;
+    }
+    /* qualified_name ASC tie-break: total order (QNs unique per project). */
+    const char *qa = a->node.qualified_name ? a->node.qualified_name : "";
+    const char *qb = b->node.qualified_name ? b->node.qualified_name : "";
+    return strcmp(qa, qb);
+}
+
+/* Resolved seed record (id + file path for the file-of-symbol widen). */
+typedef struct {
+    int64_t id;
+    char *file_path; /* owned */
+} rm_seed_t;
+
+/* Resolve one anchor: exact name -> exact qualified_name -> exact file path.
+ * Appends up to REPO_MAP_NODES_PER_ANCHOR seed records + x50 boosts.
+ * Returns true if the anchor resolved to at least one node. */
+static bool rm_resolve_anchor(cbm_store_t *store, const char *project, const char *anchor,
+                              rm_boost_list_t *boosts, rm_seed_t *seeds, int *seed_count,
+                              int seed_cap) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    cbm_store_find_nodes_by_name(store, project, anchor, &nodes, &count);
+    if (count == 0) {
+        cbm_store_free_nodes(nodes, count);
+        nodes = NULL;
+        cbm_node_t one = {0};
+        if (cbm_store_find_node_by_qn(store, project, anchor, &one) == CBM_STORE_OK) {
+            nodes = malloc(sizeof(cbm_node_t));
+            if (nodes) {
+                nodes[0] = one; /* ownership moves into the array */
+                count = 1;
+            } else {
+                cbm_node_free_fields(&one);
+            }
+        }
+    }
+    if (count == 0) {
+        cbm_store_free_nodes(nodes, count);
+        nodes = NULL;
+        cbm_store_find_nodes_by_file(store, project, anchor, &nodes, &count);
+    }
+    if (count == 0) {
+        cbm_store_free_nodes(nodes, count);
+        return false;
+    }
+    int take = count < REPO_MAP_NODES_PER_ANCHOR ? count : REPO_MAP_NODES_PER_ANCHOR;
+    for (int i = 0; i < take; i++) {
+        rm_boost_add(boosts, nodes[i].id, REPO_MAP_SEED_BOOST);
+        if (*seed_count < seed_cap) {
+            seeds[*seed_count].id = nodes[i].id;
+            seeds[*seed_count].file_path =
+                nodes[i].file_path ? heap_strdup(nodes[i].file_path) : NULL;
+            (*seed_count)++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return true;
+}
+
+static char *handle_repo_map(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    char *not_indexed = verify_project_indexed(store, project);
+    if (not_indexed) {
+        free(project);
+        return not_indexed;
+    }
+
+    int budget = cbm_mcp_get_int_arg(args, "token_budget", REPO_MAP_DEFAULT_BUDGET);
+    if (budget <= 0) {
+        free(project);
+        return cbm_mcp_text_result("token_budget must be a positive integer", true);
+    }
+
+    /* Score-absence gate (spec AC7): symbols exist but none carries an
+     * importance score -> the index predates pass_importance. Refuse with
+     * an explicit signal rather than emit a silently unranked map. */
+    int scored = 0;
+    int total_symbols = 0;
+    if (cbm_store_importance_coverage(store, project, &scored, &total_symbols) != CBM_STORE_OK) {
+        free(project);
+        return cbm_mcp_text_result("importance coverage query failed", true);
+    }
+    if (total_symbols > 0 && scored == 0) {
+        char msg[CBM_SZ_1K];
+        snprintf(msg, sizeof(msg),
+                 "project '%s' is unscored: its index has no persisted importance scores "
+                 "(indexed by a pre-importance binary). Re-run index_repository("
+                 "repo_path=..., mode='full') with a current binary, then retry repo_map.",
+                 project);
+        free(project);
+        return cbm_mcp_text_result(msg, true);
+    }
+
+    /* Parse seed_anchors: array of strings. Documented leniency (AC7
+     * graceful-input): a bare string is coerced to a one-element list,
+     * non-string elements are skipped, the list is capped at
+     * REPO_MAP_MAX_SEEDS. Anything else counts as no seeds. */
+    char *anchors[REPO_MAP_MAX_SEEDS];
+    int anchor_count = 0;
+    int seeds_requested = 0;
+    {
+        yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
+        if (adoc) {
+            yyjson_val *sa = yyjson_obj_get(yyjson_doc_get_root(adoc), "seed_anchors");
+            if (yyjson_is_str(sa)) {
+                seeds_requested = 1;
+                anchors[anchor_count++] = heap_strdup(yyjson_get_str(sa));
+            } else if (yyjson_is_arr(sa)) {
+                seeds_requested = (int)yyjson_arr_size(sa);
+                size_t idx;
+                size_t max;
+                yyjson_val *elem;
+                yyjson_arr_foreach(sa, idx, max, elem) {
+                    if (yyjson_is_str(elem) && anchor_count < REPO_MAP_MAX_SEEDS) {
+                        anchors[anchor_count++] = heap_strdup(yyjson_get_str(elem));
+                    }
+                }
+            }
+            yyjson_doc_free(adoc);
+        }
+    }
+
+    /* Resolve seeds -> x50 boosts + seed records. */
+    rm_boost_list_t *boosts = calloc(CBM_ALLOC_ONE, sizeof(*boosts));
+    if (!boosts) {
+        for (int i = 0; i < anchor_count; i++) {
+            free(anchors[i]);
+        }
+        free(project);
+        return cbm_mcp_text_result("repo_map: allocation failed", true);
+    }
+    rm_seed_t seeds[REPO_MAP_MAX_BOOSTED];
+    int seed_count = 0;
+    int seeds_resolved = 0;
+    for (int i = 0; i < anchor_count; i++) {
+        if (rm_resolve_anchor(store, project, anchors[i], boosts, seeds, &seed_count,
+                              REPO_MAP_MAX_BOOSTED)) {
+            seeds_resolved++;
+        }
+        free(anchors[i]);
+    }
+
+    /* 1-hop CALLS|USAGE neighbourhood of all seeds -> x50. */
+    int64_t onehop[REPO_MAP_MAX_BOOSTED];
+    int onehop_count = 0;
+    for (int i = 0; i < seed_count; i++) {
+        rm_collect_neighbors(store, seeds[i].id, onehop, &onehop_count, REPO_MAP_MAX_BOOSTED);
+    }
+    /* Boost the 1-hop set. A Module/File neighbour (file-level USAGE edge —
+     * "this file uses the seed") is not renderable itself, but its file's
+     * symbols ARE the co-change neighbourhood P2's ground truth names
+     * (sender.py/gmail_client.py members reach extract_address exactly this
+     * way) — expand it to those symbols at the widen tier. Only SYMBOL
+     * neighbours count toward the weak-seed threshold. */
+    int fresh_onehop = 0;
+    for (int i = 0; i < onehop_count; i++) {
+        bool is_seed = false;
+        for (int j = 0; j < seed_count; j++) {
+            if (seeds[j].id == onehop[i]) {
+                is_seed = true;
+                break;
+            }
+        }
+        rm_boost_add(boosts, onehop[i], REPO_MAP_SEED_BOOST);
+
+        cbm_node_t nb = {0};
+        if (cbm_store_find_node_by_id(store, onehop[i], &nb) != CBM_STORE_OK) {
+            continue;
+        }
+        bool is_module =
+            nb.label && (strcmp(nb.label, "Module") == 0 || strcmp(nb.label, "File") == 0);
+        if (is_module && nb.file_path && nb.project && strcmp(nb.project, project) == 0) {
+            cbm_node_t *fnodes = NULL;
+            int fcount = 0;
+            cbm_store_find_nodes_by_file(store, project, nb.file_path, &fnodes, &fcount);
+            for (int j = 0; j < fcount; j++) {
+                rm_boost_add(boosts, fnodes[j].id, REPO_MAP_WIDEN_BOOST);
+            }
+            cbm_store_free_nodes(fnodes, fcount);
+        } else if (!is_module && !is_seed) {
+            fresh_onehop++;
+        }
+        cbm_node_free_fields(&nb);
+    }
+
+    /* Weak-seed widen (P2 shape hints): a tiny 1-hop neighbourhood means the
+     * seed alone under-boosts (P2 task A). Widen with (a) file-of-symbol
+     * seeding and (b) 2-hop expansion, both at x25. */
+    if (seed_count > 0 && fresh_onehop <= REPO_MAP_WEAK_NEIGHBOR_THRESHOLD) {
+        for (int i = 0; i < seed_count; i++) {
+            if (!seeds[i].file_path) {
+                continue;
+            }
+            cbm_node_t *fnodes = NULL;
+            int fcount = 0;
+            cbm_store_find_nodes_by_file(store, project, seeds[i].file_path, &fnodes, &fcount);
+            for (int j = 0; j < fcount; j++) {
+                rm_boost_add(boosts, fnodes[j].id, REPO_MAP_WIDEN_BOOST);
+            }
+            cbm_store_free_nodes(fnodes, fcount);
+        }
+        int64_t twohop[REPO_MAP_MAX_BOOSTED];
+        int twohop_count = 0;
+        for (int i = 0; i < onehop_count; i++) {
+            rm_collect_neighbors(store, onehop[i], twohop, &twohop_count, REPO_MAP_MAX_BOOSTED);
+        }
+        for (int i = 0; i < twohop_count; i++) {
+            rm_boost_add(boosts, twohop[i], REPO_MAP_WIDEN_BOOST);
+        }
+    }
+    for (int i = 0; i < seed_count; i++) {
+        free(seeds[i].file_path);
+    }
+
+    /* Candidate pool: top-N global by persisted importance (N adaptive from
+     * the budget: ~10 tokens/line means budget/2 is a generous line ceiling)
+     * + every boosted node not already in the pool. */
+    int limit = budget / 2;
+    if (limit < REPO_MAP_MIN_CANDIDATES) {
+        limit = REPO_MAP_MIN_CANDIDATES;
+    }
+    if (limit > REPO_MAP_MAX_CANDIDATES) {
+        limit = REPO_MAP_MAX_CANDIDATES;
+    }
+    cbm_node_t *top = NULL;
+    int top_count = 0;
+    if (cbm_store_top_symbols_by_importance(store, project, limit, &top, &top_count) !=
+        CBM_STORE_OK) {
+        free(boosts);
+        free(project);
+        return cbm_mcp_text_result("importance ranking query failed", true);
+    }
+
+    int cand_cap = top_count + boosts->count;
+    if (cand_cap == 0) {
+        cand_cap = 1;
+    }
+    rm_cand_t *cands = calloc((size_t)cand_cap, sizeof(rm_cand_t));
+    int cand_count = 0;
+    int64_t seen[REPO_MAP_MAX_CANDIDATES + REPO_MAP_MAX_BOOSTED];
+    int seen_count = 0;
+    for (int i = 0; i < top_count; i++) {
+        cands[cand_count].node = top[i]; /* ownership moves */
+        rm_id_add(seen, &seen_count, (int)(sizeof(seen) / sizeof(seen[0])), top[i].id);
+        cand_count++;
+    }
+    free(top); /* rows moved into cands; free only the array shell */
+
+    /* Boosted nodes outside the top-N pool (project-checked: edges could in
+     * principle cross rows in a shared test store — never leak them). */
+    for (int i = 0; i < boosts->count; i++) {
+        if (rm_id_contains(seen, seen_count, boosts->items[i].id)) {
+            continue;
+        }
+        cbm_node_t extra = {0};
+        if (cbm_store_find_node_by_id(store, boosts->items[i].id, &extra) != CBM_STORE_OK) {
+            continue;
+        }
+        bool symbol_label = extra.label && (strcmp(extra.label, "Function") == 0 ||
+                                            strcmp(extra.label, "Method") == 0 ||
+                                            strcmp(extra.label, "Class") == 0);
+        if (!symbol_label || !extra.project || strcmp(extra.project, project) != 0) {
+            cbm_node_free_fields(&extra);
+            continue;
+        }
+        cands[cand_count].node = extra;
+        rm_id_add(seen, &seen_count, (int)(sizeof(seen) / sizeof(seen[0])), extra.id);
+        cand_count++;
+    }
+
+    /* Score + render each candidate. */
+    for (int i = 0; i < cand_count; i++) {
+        double importance = 0.0;
+        char *sig = NULL;
+        rm_parse_props(cands[i].node.properties_json, &importance, &sig);
+        cands[i].eff = importance * rm_boost_get(boosts, cands[i].node.id);
+        const char *fp = cands[i].node.file_path ? cands[i].node.file_path : "";
+        const char *nm = cands[i].node.name ? cands[i].node.name : "";
+        const char *shown = sig ? sig : nm;
+        /* Several grammars persist only the parameter list as the signature
+         * ("(self, x)") — prefix the symbol name so every line reads
+         * 'file: symbol(sig)' (spec shape; observed on the real connectors
+         * corpus where bare "(self)" lines carried no information). */
+        const char *prefix = (sig && sig[0] == '(') ? nm : "";
+        size_t need = strlen(fp) + strlen(prefix) + strlen(shown) + MCP_COL_4;
+        cands[i].line = malloc(need); /* ": " + "\n" + NUL */
+        if (cands[i].line) {
+            int w = snprintf(cands[i].line, need, "%s: %s%s\n", fp, prefix, shown);
+            cands[i].line_len = w > 0 ? (size_t)w : 0;
+        }
+        free(sig);
+    }
+    free(boosts);
+
+    qsort(cands, (size_t)cand_count, sizeof(rm_cand_t), rm_cand_cmp);
+
+    /* Budget fit: greedy prefix accumulation over the ranked lines (monotone
+     * — the maximal prefix under the ceiling; estimator = ceil(chars/4)). */
+    size_t cum_chars = 0;
+    int included = 0;
+    for (int i = 0; i < cand_count; i++) {
+        size_t next = cum_chars + cands[i].line_len;
+        if ((next + REPO_MAP_TOKEN_CHARS - 1) / REPO_MAP_TOKEN_CHARS > (size_t)budget) {
+            break;
+        }
+        cum_chars = next;
+        included = i + 1;
+    }
+
+    char *map = malloc(cum_chars + 1);
+    size_t pos = 0;
+    for (int i = 0; i < included; i++) {
+        if (cands[i].line && map) {
+            memcpy(map + pos, cands[i].line, cands[i].line_len);
+            pos += cands[i].line_len;
+        }
+    }
+    if (map) {
+        map[pos] = '\0';
+    }
+
+    int estimated_tokens = (int)((cum_chars + REPO_MAP_TOKEN_CHARS - 1) / REPO_MAP_TOKEN_CHARS);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "project", project);
+    yyjson_mut_obj_add_str(doc, root, "mode", seeds_resolved > 0 ? "seeded" : "global");
+    yyjson_mut_obj_add_int(doc, root, "budget", budget);
+    yyjson_mut_obj_add_int(doc, root, "estimated_tokens", estimated_tokens);
+    yyjson_mut_obj_add_int(doc, root, "symbol_count", included);
+    yyjson_mut_obj_add_int(doc, root, "total_symbols", total_symbols);
+    yyjson_mut_obj_add_int(doc, root, "seed_anchors_requested", seeds_requested);
+    yyjson_mut_obj_add_int(doc, root, "seed_anchors_resolved", seeds_resolved);
+    yyjson_mut_obj_add_str(doc, root, "map", map ? map : "");
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+
+    for (int i = 0; i < cand_count; i++) {
+        cbm_node_free_fields(&cands[i].node);
+        free(cands[i].line);
+    }
+    free(cands);
+    free(map);
+    free(project);
+
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
@@ -6985,6 +7549,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+    if (strcmp(tool_name, "repo_map") == 0) {
+        return handle_repo_map(srv, args_json);
     }
 
     /* Pipeline-dependent tools */

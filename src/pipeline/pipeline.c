@@ -722,6 +722,9 @@ static void predump_cfg(cbm_pipeline_ctx_t *ctx) {
 static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_complexity(ctx);
 }
+static void predump_importance(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_importance(ctx);
+}
 
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
@@ -729,11 +732,19 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         const char *name;
         bool moderate_only; /* true = skip in fast mode */
     } passes[] = {
-        {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},   {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
+        {predump_deco, "decorator_tags", false},
+        {predump_cfg, "configlink", false},
+        {predump_route, "route_match", false},
+        {predump_sim, "similarity", true},
+        {predump_sem, "semantic_edges", true},
+        {predump_complexity, "complexity", false},
+        /* MUST run after pass_tests (TESTS/TESTS_FILE edges, run_tests_and_history --
+         * always precedes run_predump_passes) and after CALLS/USAGE edges (populated
+         * during sequential extraction, before run_post_extraction). Placed last so
+         * every edge type the score depends on is guaranteed to exist. */
+        {predump_importance, "importance", false},
     };
-    enum { PREDUMP_PASS_COUNT = 6 };
+    enum { PREDUMP_PASS_COUNT = 7 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,

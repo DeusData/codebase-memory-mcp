@@ -6651,6 +6651,78 @@ int cbm_store_find_architecture_docs(cbm_store_t *s, const char *project, char *
     return CBM_STORE_OK;
 }
 
+/* ── Importance (repo_map) ──────────────────────────────────────── */
+
+int cbm_store_importance_coverage(cbm_store_t *s, const char *project, int *out_scored,
+                                  int *out_total) {
+    *out_scored = 0;
+    *out_total = 0;
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    const char *sql =
+        "SELECT COUNT(*), "
+        "SUM(CASE WHEN json_extract(properties, '$.importance') IS NOT NULL THEN 1 ELSE 0 END) "
+        "FROM nodes WHERE project=?1 AND label IN ('Function','Method','Class')";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "importance_coverage");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    int rc = CBM_STORE_ERR;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *out_total = sqlite3_column_int(stmt, 0);
+        *out_scored = sqlite3_column_int(stmt, SKIP_ONE); /* SUM over 0 rows is NULL -> 0 */
+        rc = CBM_STORE_OK;
+    } else {
+        store_set_error_sqlite(s, "importance_coverage_step");
+    }
+    sqlite3_finalize(stmt);
+    return rc;
+}
+
+int cbm_store_top_symbols_by_importance(cbm_store_t *s, const char *project, int limit,
+                                        cbm_node_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || limit <= 0) {
+        return CBM_STORE_ERR;
+    }
+    /* NULL importance sorts LAST under DESC (SQLite: NULL < everything), so a
+     * partially-scored project ranks its unscored nodes at the bottom.
+     * qualified_name ASC tie-break makes the order total (unique per project)
+     * — repo_map's determinism contract. */
+    const char *sql = "SELECT id, project, label, name, qualified_name, file_path, "
+                      "start_line, end_line, properties FROM nodes "
+                      "WHERE project=?1 AND label IN ('Function','Method','Class') "
+                      "ORDER BY json_extract(properties, '$.importance') DESC, "
+                      "qualified_name ASC LIMIT ?2";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "top_symbols_by_importance");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    sqlite3_bind_int(stmt, ST_COL_2, limit);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_t *arr = malloc(cap * sizeof(cbm_node_t));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, cap * sizeof(cbm_node_t));
+        }
+        scan_node(stmt, &arr[n]);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 /* ── Memory management ──────────────────────────────────────────── */
 
 void cbm_node_free_fields(cbm_node_t *n) {
