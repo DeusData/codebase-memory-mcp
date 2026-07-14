@@ -31,6 +31,7 @@
 #include "yyjson/yyjson.h"
 #include "foundation/compat_fs.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,6 +42,11 @@ enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
 };
+
+/* Hash-table keys reject empty strings, but Java/Kotlin's default package is a
+ * real shared namespace: sibling files can reference its declarations without
+ * imports. Use an internal key that cannot be a legal JVM package name. */
+static const char PXC_DEFAULT_JVM_NAMESPACE[] = "<jvm-default-package>";
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
  * Mirrors the itoa_log helper in pass_calls.c — kept local so passes don't
@@ -467,13 +473,26 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     CBMArena keys;
     cbm_arena_init(&keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
+    CBMHashTable *by_call = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
+
+    if (!seen || !by_call) {
+        cbm_ht_free(seen);
+        cbm_ht_free(by_call);
+        cbm_arena_destroy(&keys);
+        return;
+    }
 
     for (int i = 0; i < dst_calls->count; i++) {
-        const CBMResolvedCall *rc = &dst_calls->items[i];
+        CBMResolvedCall *rc = &dst_calls->items[i];
         if (rc->caller_qn && rc->callee_qn) {
             char *k = cbm_arena_sprintf(&keys, "%s\x1f%s", rc->caller_qn, rc->callee_qn);
             if (k) {
                 cbm_ht_set(seen, k, (void *)1);
+            }
+            char *call_key = cbm_arena_sprintf(&keys, "%s\x1f%s", rc->caller_qn,
+                                               pxc_last_component(rc->callee_qn));
+            if (call_key && !cbm_ht_has(by_call, call_key)) {
+                cbm_ht_set(by_call, call_key, (void *)(uintptr_t)(i + 1));
             }
         }
     }
@@ -482,6 +501,25 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         const CBMResolvedCall *src = &src_out->items[j];
         if (!src->caller_qn || !src->callee_qn)
             continue;
+        char *call_key = cbm_arena_sprintf(&keys, "%s\x1f%s", src->caller_qn,
+                                           pxc_last_component(src->callee_qn));
+        uintptr_t encoded_index = call_key ? (uintptr_t)cbm_ht_get(by_call, call_key) : 0;
+        if (encoded_index > 0) {
+            CBMResolvedCall *existing = &dst_calls->items[encoded_index - 1];
+            /* The source array is produced by the cross-file pass and has a
+             * project-wide registry. On equal confidence it must replace the
+             * earlier per-file guess (for example stdlib maxOf versus a local
+             * maxOf); strictly weaker cross results never displace it. */
+            if (src->confidence >= existing->confidence &&
+                strcmp(src->callee_qn, existing->callee_qn) != 0) {
+                existing->callee_qn = cbm_arena_strdup(dst_arena, src->callee_qn);
+                existing->strategy =
+                    src->strategy ? cbm_arena_strdup(dst_arena, src->strategy) : NULL;
+                existing->confidence = src->confidence;
+                existing->reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
+            }
+            continue;
+        }
         char *k = cbm_arena_sprintf(&keys, "%s\x1f%s", src->caller_qn, src->callee_qn);
         if (k && cbm_ht_has(seen, k))
             continue;
@@ -496,9 +534,13 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         dst.confidence = src->confidence;
         dst.reason = src->reason ? cbm_arena_strdup(dst_arena, src->reason) : NULL;
         cbm_resolvedcall_push(dst_calls, dst_arena, dst);
+        if (call_key) {
+            cbm_ht_set(by_call, call_key, (void *)(uintptr_t)dst_calls->count);
+        }
     }
 
     cbm_ht_free(seen);
+    cbm_ht_free(by_call);
     cbm_arena_destroy(&keys);
 }
 
@@ -1273,8 +1315,11 @@ CBMModuleDefIndex *cbm_pxc_build_module_def_index(CBMLSPDef *all_defs, int def_c
     for (int i = 0; i < def_count; i++) {
         pxc_module_entry_add_index(pxc_module_entry_get_or_create(ht, all_defs[i].def_module_qn),
                                    i);
-        pxc_module_entry_add_index(
-            pxc_module_entry_get_or_create(namespace_ht, all_defs[i].namespace_name), i);
+        const char *namespace_key = all_defs[i].namespace_name;
+        if (pxc_is_jvm_lang(all_defs[i].lang) && (!namespace_key || !namespace_key[0])) {
+            namespace_key = PXC_DEFAULT_JVM_NAMESPACE;
+        }
+        pxc_module_entry_add_index(pxc_module_entry_get_or_create(namespace_ht, namespace_key), i);
     }
 
     CBMModuleDefIndex *idx = (CBMModuleDefIndex *)calloc(1, sizeof(*idx));
@@ -1327,10 +1372,12 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
     for (int i = 0; i < imp_count; i++) {
         pxc_mark_module_defs(idx, selected, all_defs, caller_lang, imp_qns[i], &total);
     }
-    if (pxc_is_jvm_lang(caller_lang) && caller_namespace && caller_namespace[0] &&
-        idx->namespace_ht) {
+    if (pxc_is_jvm_lang(caller_lang) && idx->namespace_ht) {
+        const char *namespace_key =
+            (caller_namespace && caller_namespace[0]) ? caller_namespace
+                                                      : PXC_DEFAULT_JVM_NAMESPACE;
         pxc_module_entry_t *e =
-            (pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, caller_namespace);
+            (pxc_module_entry_t *)cbm_ht_get(idx->namespace_ht, namespace_key);
         total += pxc_mark_entry_defs(selected, e, all_defs, caller_lang);
     }
 
