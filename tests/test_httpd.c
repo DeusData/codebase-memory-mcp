@@ -378,11 +378,26 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
 TEST(httpd_listen_ephemeral_port) {
     cbm_httpd_t *d = cbm_httpd_listen(0);
     ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(cbm_httpd_listener_close_on_exec(d));
     int port = cbm_httpd_port(d);
     ASSERT_GT(port, 0);
     /* accept with a short timeout and no client → NULL, promptly */
     cbm_http_conn_t *c = cbm_httpd_accept(d, 50);
     ASSERT_NULL(c);
+    cbm_httpd_close(d);
+    PASS();
+}
+
+TEST(httpd_accepted_socket_close_on_exec) {
+    cbm_httpd_t *d = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(d);
+    th_sock_t client = th_connect(cbm_httpd_port(d));
+    ASSERT_TRUE(client != TH_SOCK_BAD);
+    cbm_http_conn_t *c = cbm_httpd_accept(d, 1000);
+    ASSERT_NOT_NULL(c);
+    ASSERT_TRUE(cbm_http_conn_close_on_exec(c));
+    cbm_httpd_conn_close(c);
+    th_sock_close(client);
     cbm_httpd_close(d);
     PASS();
 }
@@ -1194,6 +1209,7 @@ SUITE(httpd) {
 
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
+    RUN_TEST(httpd_accepted_socket_close_on_exec);
     RUN_TEST(httpd_listen_port_collision_returns_null);
 
     /* Full UI server */
