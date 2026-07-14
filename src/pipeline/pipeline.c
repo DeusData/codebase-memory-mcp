@@ -82,7 +82,8 @@ struct cbm_pipeline {
     char *branch_qn;
     cbm_index_mode_t mode;
     atomic_int cancelled;
-    bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    bool persistence;  /* write .codebase-memory/graph.db.zst after indexing */
+    char *version_tag; /* version label stamped on every node (e.g. "28.0") */
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -194,6 +195,14 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     }
 }
 
+void cbm_pipeline_set_version(cbm_pipeline_t *p, const char *version_tag) {
+    if (!p) {
+        return;
+    }
+    free(p->version_tag);
+    p->version_tag = version_tag ? strdup(version_tag) : NULL;
+}
+
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name) {
     if (!p || !name || !name[0]) {
         return false;
@@ -239,6 +248,7 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     p->file_errors_count = 0;
     p->file_errors_cap = 0;
     free(p->branch_qn);
+    free(p->version_tag);
     free(p->saved_adr); /* freed here too: error paths can exit before the
                          * restore in dump_and_persist_hashes runs. Issue #516. */
     p->saved_adr = NULL;
@@ -1077,7 +1087,8 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_get_file_hashes(check_store, p->project_name, &hashes, &hash_count);
         cbm_store_free_file_hashes(hashes, hash_count);
         cbm_store_close(check_store);
-        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
+        if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN) &&
+            !p->version_tag) {
             cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
@@ -1547,6 +1558,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         .path_aliases = path_aliases,
         .excluded_dirs = p->excluded_dirs,
         .excluded_count = p->excluded_count,
+        .version_tag = p->version_tag,
     };
 
     rc = run_extraction_phase(p, &ctx, files, file_count);

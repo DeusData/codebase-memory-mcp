@@ -457,7 +457,8 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     *pos = p;
 }
 
-static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def) {
+static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def,
+                            const char *version_tag) {
     /* Complexity/loop/recursion metrics are meaningful only for Function/Method.
      * Gate the block so the millions of Macro/Field/Variable/Class/Enum nodes
      * keep a lean properties blob (lossless — those fields are always zero for
@@ -520,6 +521,11 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     /* Body tokens — raw identifiers from function body AST for semantic search. */
     if (def->body_tokens && pos + CBM_SZ_512 < bufsize) {
         append_json_string(buf, bufsize, &pos, "bt", def->body_tokens);
+    }
+
+    /* Version tag for cross-version diff queries */
+    if (version_tag && version_tag[0] && pos + CBM_SZ_256 < bufsize) {
+        append_json_string(buf, bufsize, &pos, "version", version_tag);
     }
 
     if (pos < bufsize - SKIP_ONE) {
@@ -714,6 +720,7 @@ typedef struct {
 
     const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
     const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
+    const char *version_tag; /* borrowed from pipeline ctx — version label for nodes */
 } extract_ctx_t;
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
@@ -722,9 +729,9 @@ enum { PP_OVERSIZED_WARN_MAX = 32 };
 
 /* Insert one definition node (and its route if present) into the local gbuf. */
 static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info_t *fi,
-                                 CBMDefinition *def) {
+                                 CBMDefinition *def, const char *version_tag) {
     char props[CBM_SZ_2K];
-    build_def_props(props, sizeof(props), def);
+    build_def_props(props, sizeof(props), def, version_tag);
     int64_t func_id =
         cbm_gbuf_upsert_node(ws->local_gbuf, def->label ? def->label : "Function", def->name,
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
@@ -952,7 +959,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
-                insert_def_into_gbuf(ws, fi, def);
+                insert_def_into_gbuf(ws, fi, def, ec->version_tag);
             }
         }
 
@@ -1173,6 +1180,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .retain_per_file_max_bytes = resolved_opts.retain_per_file_max_bytes,
         .macro_table = pp_macro_table,
         .return_type_table = ctx->return_type_table,
+        .version_tag = ctx->version_tag,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
