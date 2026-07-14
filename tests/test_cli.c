@@ -167,6 +167,51 @@ static size_t test_count_substring(const char *text, const char *needle) {
     return count;
 }
 
+#ifdef _WIN32
+static bool test_append_command_hook(yyjson_mut_doc *doc, yyjson_mut_val *event_entries,
+                                     const char *matcher, const char *command) {
+    yyjson_mut_val *entry = yyjson_mut_obj(doc);
+    yyjson_mut_val *hooks = yyjson_mut_arr(doc);
+    yyjson_mut_val *hook = yyjson_mut_obj(doc);
+    return entry && hooks && hook && yyjson_mut_obj_add_str(doc, entry, "matcher", matcher) &&
+           yyjson_mut_obj_add_str(doc, hook, "type", "command") &&
+           yyjson_mut_obj_add_str(doc, hook, "command", command) &&
+           yyjson_mut_arr_append(hooks, hook) &&
+           yyjson_mut_obj_add_val(doc, entry, "hooks", hooks) &&
+           yyjson_mut_arr_append(event_entries, entry);
+}
+
+static size_t test_count_hook_command(yyjson_val *root, const char *event_name,
+                                      const char *expected_command) {
+    yyjson_val *hooks = root ? yyjson_obj_get(root, "hooks") : NULL;
+    yyjson_val *entries = hooks && yyjson_is_obj(hooks) ? yyjson_obj_get(hooks, event_name) : NULL;
+    if (!entries || !yyjson_is_arr(entries)) {
+        return 0U;
+    }
+    size_t count = 0U;
+    size_t entry_index;
+    size_t entry_count;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, entry_index, entry_count, entry) {
+        yyjson_val *entry_hooks = yyjson_is_obj(entry) ? yyjson_obj_get(entry, "hooks") : NULL;
+        if (!entry_hooks || !yyjson_is_arr(entry_hooks)) {
+            continue;
+        }
+        size_t hook_index;
+        size_t hook_count;
+        yyjson_val *hook;
+        yyjson_arr_foreach(entry_hooks, hook_index, hook_count, hook) {
+            yyjson_val *command = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "command") : NULL;
+            if (command && yyjson_is_str(command) &&
+                strcmp(yyjson_get_str(command), expected_command) == 0) {
+                count++;
+            }
+        }
+    }
+    return count;
+}
+#endif
+
 static char *save_test_env(const char *name) {
     const char *value = getenv(name);
     return value ? strdup(value) : NULL;
@@ -4454,11 +4499,16 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
 #else
         test_plan_hook_contains(plan_root, "GitLab Duo CLI", gitlab_hooks);
 #endif
+    bool devin_hook_plan_ok =
+#ifdef _WIN32
+        !test_plan_hook_contains(plan_root, "Devin CLI / Local", devin_config);
+#else
+        test_plan_hook_contains(plan_root, "Devin CLI / Local", devin_config);
+#endif
     bool plan_ok =
         plan && test_json_string_array_contains(plan_root, "config_files_planned", gitlab_mcp) &&
         test_json_string_array_contains(plan_root, "config_files_planned", devin_config) &&
-        gitlab_hook_plan_ok &&
-        test_plan_hook_contains(plan_root, "Devin CLI / Local", devin_config) &&
+        gitlab_hook_plan_ok && devin_hook_plan_ok &&
         test_json_string_array_contains(plan_root, "instruction_files_planned", devin_agents) &&
         test_json_string_array_contains(plan_root, "skill_files_planned", devin_skill);
     yyjson_doc_free(plan_doc);
@@ -4487,14 +4537,22 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
                                  test_count_substring(gitlab_data, "hook-augment") == 1U &&
                                  !strstr(gitlab_data, "enable-project-hooks");
 #endif
-    bool installed =
-        first_rc == 0 && second_rc == 0 && gitlab_hook_installed && devin_data &&
-        strstr(devin_data, "theme_mode") && strstr(devin_data, "SessionStart") &&
+    bool devin_hooks_installed =
+#ifdef _WIN32
+        devin_data && strstr(devin_data, "theme_mode") && !strstr(devin_data, "SessionStart") &&
+        !strstr(devin_data, "UserPromptSubmit") && !strstr(devin_data, "PostCompaction") &&
+        !strstr(devin_data, "--dialect devin");
+#else
+        devin_data && strstr(devin_data, "theme_mode") && strstr(devin_data, "SessionStart") &&
         strstr(devin_data, "UserPromptSubmit") && strstr(devin_data, "PostCompaction") &&
         strstr(devin_data, "--dialect devin") &&
         test_count_substring(devin_data, "--dialect devin") == 3U &&
-        !strstr(devin_data, "SubagentStart") && devin_agents_data &&
-        strstr(devin_agents_data, devin_personal) && strstr(devin_agents_data, "search_graph") &&
+        !strstr(devin_data, "SubagentStart");
+#endif
+    bool installed =
+        first_rc == 0 && second_rc == 0 && gitlab_hook_installed && devin_hooks_installed &&
+        devin_agents_data && strstr(devin_agents_data, devin_personal) &&
+        strstr(devin_agents_data, "search_graph") &&
         test_file_contains_all(
             devin_skill,
             (const char *const[]){"search_graph", "trace_path", "Sessions and Subagents"}, 3U) &&
@@ -4511,10 +4569,14 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     devin_data = read_test_file_alloc(devin_config);
     devin_agents_data = read_test_file_alloc(devin_agents);
     char *gitlab_mcp_data = read_test_file_alloc(gitlab_mcp);
-    bool gitlab_clean = gitlab_data && strstr(gitlab_data, "/usr/bin/user-hook") &&
-                        strstr(gitlab_data, "\"keep\":true") &&
-                        !strstr(gitlab_data, "hook-augment") &&
-                        (!gitlab_mcp_data || !strstr(gitlab_mcp_data, "codebase-memory-mcp"));
+    bool gitlab_clean =
+#ifdef _WIN32
+        gitlab_data && strcmp(gitlab_data, gitlab_original) == 0 &&
+#else
+        gitlab_data && strstr(gitlab_data, "/usr/bin/user-hook") &&
+        strstr(gitlab_data, "\"keep\":true") && !strstr(gitlab_data, "hook-augment") &&
+#endif
+        (!gitlab_mcp_data || !strstr(gitlab_mcp_data, "codebase-memory-mcp"));
     bool devin_clean =
         devin_data && strstr(devin_data, "theme_mode") && !strstr(devin_data, "--dialect devin") &&
         !strstr(devin_data, "codebase-memory-mcp") && devin_agents_data &&
@@ -4707,10 +4769,16 @@ TEST(cli_devin_does_not_duplicate_owned_claude_session_start) {
 
     char *claude = read_test_file_alloc(claude_settings);
     char *devin = read_test_file_alloc(devin_config);
-    bool no_duplicate = rc == 0 && claude && strstr(claude, "SessionStart") && devin &&
-                        !strstr(devin, "SessionStart") && strstr(devin, "UserPromptSubmit") &&
-                        strstr(devin, "PostCompaction") &&
-                        test_count_substring(devin, "--dialect devin") == 2U;
+    bool devin_hook_contract_ok =
+#ifdef _WIN32
+        devin && !strstr(devin, "SessionStart") && !strstr(devin, "UserPromptSubmit") &&
+        !strstr(devin, "PostCompaction") && !strstr(devin, "--dialect devin");
+#else
+        devin && !strstr(devin, "SessionStart") && strstr(devin, "UserPromptSubmit") &&
+        strstr(devin, "PostCompaction") && test_count_substring(devin, "--dialect devin") == 2U;
+#endif
+    bool no_duplicate =
+        rc == 0 && claude && strstr(claude, "SessionStart") && devin_hook_contract_ok;
     free(claude);
     free(devin);
     restore_test_env("HOME", saved_home);
@@ -5981,6 +6049,64 @@ TEST(cli_claude_subagent_hook) {
     ASSERT_NULL(strstr(d, "SubagentStart"));
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_claude_hook_mutation_converges_mixed_owned_duplicates) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX fixture for platform-neutral hook mutation");
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-duplicates-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char cfg[640];
+    char current_command[1024];
+    char released_command[1024];
+    char original[8192];
+    snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
+    snprintf(cfg, sizeof(cfg), "%s/settings.json", config_dir);
+    snprintf(released_command, sizeof(released_command), "%s/hooks/cbm-subagent-reminder",
+             config_dir);
+    test_mkdirp(config_dir);
+
+    char *saved_config = save_test_env("CLAUDE_CONFIG_DIR");
+    cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
+    ASSERT_EQ(cbm_resolve_claude_hook_command_for_testing("cbm-subagent-reminder", false,
+                                                          current_command, sizeof(current_command)),
+              0);
+    snprintf(original, sizeof(original),
+             "{\"hooks\":{\"SubagentStart\":["
+             "{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"%s\"}]},"
+             "{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\",\"command\":\"%s\"}]},"
+             "{\"matcher\":\"*\",\"hooks\":[{\"type\":\"command\","
+             "\"command\":\"echo user-subagent-hook\"}]}]}}\n",
+             current_command, released_command);
+
+    write_test_file(cfg, original);
+    int upsert_rc = cbm_upsert_claude_subagent_hooks(cfg);
+    char *after_upsert = read_test_file_alloc(cfg);
+    bool converged = upsert_rc == 0 && after_upsert &&
+                     test_count_substring(after_upsert, "cbm-subagent-reminder") == 1U &&
+                     strstr(after_upsert, "echo user-subagent-hook");
+    free(after_upsert);
+
+    write_test_file(cfg, original);
+    int remove_rc = cbm_remove_claude_subagent_hooks(cfg);
+    char *after_remove = read_test_file_alloc(cfg);
+    bool removed_all = remove_rc == 0 && after_remove &&
+                       !strstr(after_remove, "cbm-subagent-reminder") &&
+                       strstr(after_remove, "echo user-subagent-hook");
+    free(after_remove);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
+    test_rmdir_r(tmpdir);
+
+    if (!converged || !removed_all)
+        FAIL("hook mutation must converge mixed exact-owned duplicates while preserving foreign "
+             "siblings");
+#endif
     PASS();
 }
 
@@ -8392,12 +8518,19 @@ TEST(cli_hook_scripts_platform_shape_issue929) {
     snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
 
 #ifdef _WIN32
-    /* Upgrade path: pre-create the pre-#929 extensionless file; the install
-     * must remove it so the Open-With trigger disappears. */
+    /* Upgrade path: seed byte-exact pre-#929 owned content at the extensionless
+     * path. Only exact-owned bytes may be removed. */
     cbm_mkdir_p(hooks_dir, 0755);
     char legacy_path[512];
+    char seed_path[512];
     snprintf(legacy_path, sizeof(legacy_path), "%s/cbm-code-discovery-gate", hooks_dir);
-    write_test_file(legacy_path, "#!/bin/bash\nexit 0\n");
+    snprintf(seed_path, sizeof(seed_path), "%s/cbm-code-discovery-gate.cmd", hooks_dir);
+    ASSERT_TRUE(cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp"));
+    char *owned_legacy = read_test_file_alloc(seed_path);
+    ASSERT_NOT_NULL(owned_legacy);
+    ASSERT_EQ(write_test_file(legacy_path, owned_legacy), 0);
+    free(owned_legacy);
+    ASSERT_EQ(cbm_unlink(seed_path), 0);
 #endif
 
     cbm_install_hook_gate_script(tmpdir, "/usr/local/bin/codebase-memory-mcp");
@@ -8435,6 +8568,152 @@ TEST(cli_hook_scripts_platform_shape_issue929) {
     test_rmdir_r(tmpdir);
     PASS();
 }
+
+#ifdef _WIN32
+TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-windows-legacy-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char hooks_dir[640];
+    char settings_path[640];
+    char appdata[512];
+    char binary_path[640];
+    snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+    test_mkdirp(hooks_dir);
+
+    const char *const script_names[] = {
+        "cbm-code-discovery-gate",
+        "cbm-session-reminder",
+        "cbm-subagent-reminder",
+    };
+    const char *foreign_script = "@echo off\r\necho user-owned-hook\r\n";
+    for (size_t i = 0U; i < sizeof(script_names) / sizeof(script_names[0]); i++) {
+        char path[768];
+        snprintf(path, sizeof(path), "%s/%s", hooks_dir, script_names[i]);
+        write_test_file(path, foreign_script);
+    }
+
+    const char *const env_names[] = {"HOME", "PATH", "CLAUDE_CONFIG_DIR", "APPDATA"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
+    cbm_setenv("APPDATA", appdata, 1);
+
+    char session_current[1024] = {0};
+    char session_previous[1024] = {0};
+    char session_released[1024] = {0};
+    char subagent_current[1024] = {0};
+    char subagent_previous[1024] = {0};
+    char subagent_released[1024] = {0};
+    bool commands_ready =
+        cbm_resolve_claude_hook_command_for_testing(
+            "cbm-session-reminder.cmd", true, session_current, sizeof(session_current)) == 0 &&
+        cbm_resolve_claude_hook_command_for_testing("cbm-session-reminder", false, session_previous,
+                                                    sizeof(session_previous)) == 0 &&
+        cbm_resolve_claude_hook_command_for_testing(
+            "cbm-subagent-reminder.cmd", true, subagent_current, sizeof(subagent_current)) == 0 &&
+        cbm_resolve_claude_hook_command_for_testing(
+            "cbm-subagent-reminder", false, subagent_previous, sizeof(subagent_previous)) == 0;
+    snprintf(session_released, sizeof(session_released), "%s/cbm-session-reminder", hooks_dir);
+    snprintf(subagent_released, sizeof(subagent_released), "%s/cbm-subagent-reminder", hooks_dir);
+    const char *foreign_command = "cmd.exe /d /s /c user-owned-hook.cmd";
+
+    yyjson_mut_doc *initial_doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = initial_doc ? yyjson_mut_obj(initial_doc) : NULL;
+    yyjson_mut_val *hooks = initial_doc ? yyjson_mut_obj(initial_doc) : NULL;
+    yyjson_mut_val *session_entries = initial_doc ? yyjson_mut_arr(initial_doc) : NULL;
+    yyjson_mut_val *subagent_entries = initial_doc ? yyjson_mut_arr(initial_doc) : NULL;
+    if (initial_doc && root) {
+        yyjson_mut_doc_set_root(initial_doc, root);
+    }
+    bool json_ready =
+        commands_ready && initial_doc && root && hooks && session_entries && subagent_entries &&
+        yyjson_mut_obj_add_val(initial_doc, root, "hooks", hooks) &&
+        yyjson_mut_obj_add_val(initial_doc, hooks, "SessionStart", session_entries) &&
+        yyjson_mut_obj_add_val(initial_doc, hooks, "SubagentStart", subagent_entries) &&
+        test_append_command_hook(initial_doc, session_entries, "startup", session_current) &&
+        test_append_command_hook(initial_doc, session_entries, "startup", session_previous) &&
+        test_append_command_hook(initial_doc, session_entries, "startup", session_released) &&
+        test_append_command_hook(initial_doc, session_entries, "startup", foreign_command) &&
+        test_append_command_hook(initial_doc, subagent_entries, "*", subagent_current) &&
+        test_append_command_hook(initial_doc, subagent_entries, "*", subagent_previous) &&
+        test_append_command_hook(initial_doc, subagent_entries, "*", subagent_released) &&
+        test_append_command_hook(initial_doc, subagent_entries, "*", foreign_command);
+    char *initial_json =
+        json_ready ? yyjson_mut_write(initial_doc, YYJSON_WRITE_PRETTY, NULL) : NULL;
+    bool seeded = initial_json && write_test_file(settings_path, initial_json) == 0;
+    free(initial_json);
+    yyjson_mut_doc_free(initial_doc);
+
+    int install_rc = seeded ? cbm_install_agent_configs(tmpdir, binary_path, false, false) : -1;
+    char *installed_settings = read_test_file_alloc(settings_path);
+    yyjson_doc *installed_doc =
+        installed_settings ? yyjson_read(installed_settings, strlen(installed_settings), 0) : NULL;
+    yyjson_val *installed_root = installed_doc ? yyjson_doc_get_root(installed_doc) : NULL;
+    bool commands_migrated =
+        install_rc == 0 &&
+        test_count_hook_command(installed_root, "SessionStart", session_current) == 4U &&
+        test_count_hook_command(installed_root, "SessionStart", session_previous) == 0U &&
+        test_count_hook_command(installed_root, "SessionStart", session_released) == 0U &&
+        test_count_hook_command(installed_root, "SessionStart", foreign_command) == 1U &&
+        test_count_hook_command(installed_root, "SubagentStart", subagent_current) == 1U &&
+        test_count_hook_command(installed_root, "SubagentStart", subagent_previous) == 0U &&
+        test_count_hook_command(installed_root, "SubagentStart", subagent_released) == 0U &&
+        test_count_hook_command(installed_root, "SubagentStart", foreign_command) == 1U;
+    yyjson_doc_free(installed_doc);
+    free(installed_settings);
+
+    bool foreign_scripts_preserved = true;
+    for (size_t i = 0U; i < sizeof(script_names) / sizeof(script_names[0]); i++) {
+        char path[768];
+        snprintf(path, sizeof(path), "%s/%s", hooks_dir, script_names[i]);
+        char *data = read_test_file_alloc(path);
+        foreign_scripts_preserved =
+            foreign_scripts_preserved && data && strcmp(data, foreign_script) == 0;
+        free(data);
+    }
+
+    char *uninstall_argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cbm_cmd_uninstall(2, uninstall_argv);
+    char *uninstalled_settings = read_test_file_alloc(settings_path);
+    yyjson_doc *uninstalled_doc =
+        uninstalled_settings ? yyjson_read(uninstalled_settings, strlen(uninstalled_settings), 0)
+                             : NULL;
+    yyjson_val *uninstalled_root = uninstalled_doc ? yyjson_doc_get_root(uninstalled_doc) : NULL;
+    bool commands_clean =
+        uninstall_rc == 0 &&
+        test_count_hook_command(uninstalled_root, "SessionStart", session_current) == 0U &&
+        test_count_hook_command(uninstalled_root, "SessionStart", session_previous) == 0U &&
+        test_count_hook_command(uninstalled_root, "SessionStart", session_released) == 0U &&
+        test_count_hook_command(uninstalled_root, "SessionStart", foreign_command) == 1U &&
+        test_count_hook_command(uninstalled_root, "SubagentStart", subagent_current) == 0U &&
+        test_count_hook_command(uninstalled_root, "SubagentStart", subagent_previous) == 0U &&
+        test_count_hook_command(uninstalled_root, "SubagentStart", subagent_released) == 0U &&
+        test_count_hook_command(uninstalled_root, "SubagentStart", foreign_command) == 1U;
+    yyjson_doc_free(uninstalled_doc);
+    free(uninstalled_settings);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!commands_migrated || !foreign_scripts_preserved || !commands_clean)
+        FAIL("Windows lifecycle migration must converge exact-owned commands and preserve foreign "
+             "extensionless scripts");
+    PASS();
+}
+#endif
 
 /* Claude may execute shell-form hooks through PowerShell when Git Bash is not
  * available. Windows registrations must therefore invoke the .cmd shim via an
@@ -9373,6 +9652,7 @@ SUITE(cli) {
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_claude_subagent_hook);
+    RUN_TEST(cli_claude_hook_mutation_converges_mixed_owned_duplicates);
     RUN_TEST(cli_claude_subagent_hook_preserves_user_entry);
     RUN_TEST(cli_claude_session_hook_preserves_user_entry);
     RUN_TEST(cli_claude_lifecycle_hooks_delegate_to_augmenter);
@@ -9461,6 +9741,9 @@ SUITE(cli) {
     /* Claude Code hooks (5 tests — group D) */
     RUN_TEST(cli_hook_gate_script_no_predictable_tmp_issue384);
     RUN_TEST(cli_hook_scripts_platform_shape_issue929);
+#ifdef _WIN32
+    RUN_TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state);
+#endif
     RUN_TEST(cli_windows_claude_hook_command_is_shell_portable);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
