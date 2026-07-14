@@ -227,6 +227,9 @@ bool cbm_build_win_cmdline(char *buf, size_t cap, const char *const *argv) {
 #ifdef _WIN32
 
 static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
+    if (opts->child_pid_out) {
+        atomic_store(opts->child_pid_out, 0);
+    }
     const char *bin = opts->bin;
     const char *const default_argv[] = {bin, NULL};
     const char *const *argv = opts->argv ? opts->argv : default_argv;
@@ -274,6 +277,9 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         out->term_signal = 0;
         return -1;
     }
+    if (opts->child_pid_out) {
+        atomic_store(opts->child_pid_out, (long)pi.dwProcessId);
+    }
 
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
@@ -297,6 +303,9 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
     DWORD code = 1;
     GetExitCodeProcess(pi.hProcess, &code);
+    if (opts->child_pid_out) {
+        atomic_store(opts->child_pid_out, 0); /* reaped: pid may be recycled by the OS */
+    }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     if (opts->log_file && opts->delete_log_on_exit) {
@@ -312,6 +321,9 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 #else /* POSIX */
 
 static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
+    if (opts->child_pid_out) {
+        atomic_store(opts->child_pid_out, 0);
+    }
     pid_t pid = fork();
     if (pid < 0) {
         out->outcome = CBM_PROC_SPAWN_FAILED;
@@ -340,6 +352,9 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         }
         execv(bin, (char *const *)argv);
         _exit(127); /* exec failed */
+    }
+    if (opts->child_pid_out) {
+        atomic_store(opts->child_pid_out, (long)pid);
     }
 
     long tail_pos = 0;
@@ -370,6 +385,9 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         }
         struct timespec ts = {0, 100000000L}; /* 100 ms poll */
         cbm_nanosleep(&ts, NULL);
+    }
+    if (opts->child_pid_out) {
+        atomic_store(opts->child_pid_out, 0); /* reaped: pid may be recycled by the OS */
     }
 
     if (opts->log_file && opts->delete_log_on_exit) {

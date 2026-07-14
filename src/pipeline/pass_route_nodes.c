@@ -883,22 +883,38 @@ static const char *find_args_in_props(const char *props) {
     return p + RN_ARGS_SKIP; /* skip "args":[ , points to first { or ] */
 }
 
-/* Append handler_params and caller_args to DATA_FLOWS props. Closes with '}'. */
+/* Append handler_params and caller_args to DATA_FLOWS props. Closes with '}'.
+ * pos is clamped after every snprintf: the return value is the WOULD-BE length
+ * on truncation, and unclamped accumulation would walk pos past propsz — an
+ * out-of-bounds `props + pos` write plus a `propsz - pos` size_t underflow the
+ * moment any buffer-size constant upstream of this call changes. */
 static void finish_data_flow_props(char *props, size_t propsz, size_t pos,
                                    const char *handler_params, const char *args_json) {
+    if (propsz == 0) {
+        return;
+    }
+    if (pos >= propsz) {
+        pos = propsz - SKIP_ONE;
+    }
     if (handler_params[0]) {
         int w = snprintf(props + pos, propsz - pos, ",\"handler_params\":[%s]", handler_params);
         if (w > 0) {
-            pos += (size_t)w;
+            size_t room = propsz - pos - SKIP_ONE;
+            pos += ((size_t)w > room) ? room : (size_t)w;
         }
     }
     if (args_json) {
+        size_t start = pos;
         int w = snprintf(props + pos, propsz - pos, ",\"caller_args\":[%.*s", 400, args_json);
         if (w > 0) {
-            pos += (size_t)w;
-            char *close = strchr(props + (pos - (size_t)w) + RN_CALLEE_SKIP, ']');
-            if (close && close < props + propsz - PAIR_LEN) {
-                pos = (size_t)(close - props) + SKIP_ONE;
+            size_t room = propsz - pos - SKIP_ONE;
+            pos += ((size_t)w > room) ? room : (size_t)w;
+            /* Scan only the region actually written this call. */
+            if (start + RN_CALLEE_SKIP < pos) {
+                char *close = strchr(props + start + RN_CALLEE_SKIP, ']');
+                if (close && close < props + propsz - PAIR_LEN) {
+                    pos = (size_t)(close - props) + SKIP_ONE;
+                }
             }
         }
     }

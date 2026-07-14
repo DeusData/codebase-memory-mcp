@@ -1581,11 +1581,12 @@ static char *normalize_project_arg(char *project) {
     return project;
 }
 
+static bool project_is_path(const char *s);
+
 /* Forward decls — defined below alongside store resolution. */
 static const char *cache_dir(char *buf, size_t bufsz);
 static bool is_project_db_file(const char *name, size_t len);
 bool cbm_validate_project_name(const char *project);
-
 /* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
  * but indexed project names derive from the full path
  * (E:\project\graph\x -> "E-project-graph-x"), so the exact lookup fails
@@ -1648,7 +1649,7 @@ static char *resolve_project_tail(char *project) {
  * "project_name" is the usual guess; "project_id" / "projectName" are accepted
  * too. NOT bare "name" — index_repository uses "name" for an explicit
  * project-name override. Caller must free() the result. */
-static char *get_project_arg(const char *args_json) {
+static char *get_raw_project_arg(const char *args_json) {
     char *p = cbm_mcp_get_string_arg(args_json, "project");
     if (!p) {
         p = cbm_mcp_get_string_arg(args_json, "project_name");
@@ -1659,7 +1660,22 @@ static char *get_project_arg(const char *args_json) {
     if (!p) {
         p = cbm_mcp_get_string_arg(args_json, "projectName");
     }
-    return resolve_project_tail(normalize_project_arg(p));
+    return p;
+}
+
+static char *get_project_arg(const char *args_json) {
+    return resolve_project_tail(normalize_project_arg(get_raw_project_arg(args_json)));
+}
+
+/* Store-resolving handlers need the original filesystem path so
+ * resolve_project_store() can auto-index it. Ordinary names must still take
+ * the #1025 normalization/tail-resolution path used by every other handler. */
+static char *get_store_project_arg(const char *args_json) {
+    char *project = get_raw_project_arg(args_json);
+    if (project && project_is_path(project)) {
+        return project;
+    }
+    return resolve_project_tail(normalize_project_arg(project));
 }
 
 int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val) {
@@ -1826,7 +1842,32 @@ struct cbm_mcp_server {
     _Atomic(cbm_pipeline_t *) active_pipeline; /* non-NULL while index_repository runs */
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
+
+    /* Shutdown request from a signal handler or watchdog thread. The run loop
+     * polls with a bounded interval, so a plain atomic store here (the only
+     * async-signal-safe primitive available in a handler) ends the loop within
+     * one poll tick without touching stdio state from signal context. */
+    atomic_bool stop_requested;
+
+    /* Deferred store invalidation. A supervised index worker replaces the DB
+     * file, so the parent's cached srv->store handle goes stale at reap time —
+     * but the reap may happen on the background auto-index thread, and only the
+     * request thread may close srv->store (store.h: one handle per thread; the
+     * request thread may be mid-query). Reapers SET this flag; the request
+     * thread consumes it at the top of resolve_store()/resolve_resource_store()
+     * and performs the actual close + reopen there. */
+    atomic_bool store_stale;
 };
+
+void cbm_mcp_server_request_stop(cbm_mcp_server_t *srv) {
+    if (srv) {
+        atomic_store(&srv->stop_requested, true);
+    }
+}
+
+/* Defined with the supervisor plumbing below; used by resolve_store /
+ * resolve_resource_store above it. */
+static void reap_stale_store(cbm_mcp_server_t *srv);
 
 static bool cbm_mcp_tool_mode_is_classic(cbm_mcp_server_t *srv) {
     /* Env var keeps script/test overrides independent from the persisted config. */
@@ -2723,6 +2764,12 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     srv->store_last_used = time(NULL);
 
+    /* Consume a deferred invalidation from a supervised worker reap (possibly
+     * on the auto-index thread) BEFORE trusting the cached handle: the worker
+     * replaced the DB file, so the fast path below must not serve the stale
+     * connection to the unlinked inode. */
+    reap_stale_store(srv);
+
     /* Dep projects (e.g., "myapp.dep.pandas") live in the parent project's DB
      * ("myapp.db"), not in a separate "myapp.dep.pandas.db". Extract parent. */
     char parent_buf[1024];
@@ -3215,6 +3262,66 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
 
     yyjson_mut_obj_add_val(doc, root, "_context", ctx);
+}
+
+/* TOON-path context delivery: the TOON early-returns in handle_search_graph
+ * bypass the yyjson response doc, which silently dropped the one-shot
+ * `_context` header and `session_project` — the only reliable push channel
+ * into the model (see the delivery-channel note above inject_context_once).
+ * Reuse inject_context_once verbatim on a scratch doc so the config gate,
+ * one-shot flag, and payload stay defined exactly once, then emit the result
+ * as a single trailing `context: {…}` line. The value is a raw JSON fragment
+ * (not TOON-quoted) on purpose: it is machine-parseable, greppable as
+ * "_context":, and read once by the model. Emits nothing when the context was
+ * already delivered and no session_project is set. */
+static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_store_t *store) {
+    if (!sb || !srv) {
+        return;
+    }
+    yyjson_mut_doc *cdoc = yyjson_mut_doc_new(NULL);
+    if (!cdoc) {
+        return;
+    }
+    yyjson_mut_val *croot = yyjson_mut_obj(cdoc);
+    yyjson_mut_doc_set_root(cdoc, croot);
+    inject_context_once(cdoc, croot, srv, store);
+    if (yyjson_mut_obj_size(croot) > 0) {
+        char *cjson = yyjson_mut_write(cdoc, 0, NULL);
+        if (cjson) {
+            cbm_sb_append(sb, "context: ");
+            cbm_sb_append(sb, cjson);
+            cbm_sb_append(sb, "\n");
+            free(cjson);
+        }
+    }
+    yyjson_mut_doc_free(cdoc);
+}
+
+/* Same delivery for TOON payloads built as plain heap strings (the BM25 path
+ * builds its table inside bm25_search and returns a finished string). Returns
+ * a new heap string with the context line appended, or NULL when nothing needs
+ * appending (caller keeps using the original). */
+static char *toon_payload_with_context_once(const char *payload, cbm_mcp_server_t *srv,
+                                            cbm_store_t *store) {
+    if (!payload) {
+        return NULL;
+    }
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    toon_append_context_once(&sb, srv, store);
+    if (sb.len == 0) {
+        cbm_sb_free(&sb);
+        return NULL;
+    }
+    cbm_sb_t out;
+    cbm_sb_init(&out);
+    cbm_sb_append(&out, payload);
+    char *ctx_line = cbm_sb_finish(&sb);
+    if (ctx_line) {
+        cbm_sb_append(&out, ctx_line);
+        free(ctx_line);
+    }
+    return cbm_sb_finish(&out);
 }
 
 /* ── Smart project param expansion ─────────────────────────────── */
@@ -3754,7 +3861,7 @@ static bool store_has_adr(cbm_store_t *store, const char *project) {
 }
 
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
@@ -5040,7 +5147,7 @@ static char *glob_to_regex(const char *glob) {
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
@@ -5111,7 +5218,14 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             }
             const char *payload_json = composed_json ? composed_json : bm25_json;
             char *fresh_json = add_dirty_file_freshness_to_json(payload_json, store, project);
-            char *result = cbm_mcp_text_result(fresh_json ? fresh_json : payload_json, false);
+            const char *payload_final = fresh_json ? fresh_json : payload_json;
+            /* TOON responses (q_require_json false) also carry the one-shot
+             * _context/session_project line (JSON responses get it via
+             * inject_context_once in their own builder paths). */
+            char *ctx_payload =
+                q_require_json ? NULL : toon_payload_with_context_once(payload_final, srv, store);
+            char *result = cbm_mcp_text_result(ctx_payload ? ctx_payload : payload_final, false);
+            free(ctx_payload);
             free(fresh_json);
             free(pe.value);
             free(composed_json);
@@ -5369,12 +5483,15 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                 yyjson_doc_free(fields_owner);
             }
             cbm_store_search_free(&tout);
-            free(project);
             free(label);
             free(name_pattern);
             free(qn_pattern);
             free(file_pattern);
             free(relationship);
+            /* One-shot _context/session_project delivery on the TOON path —
+             * the early return here previously skipped inject_context_once. */
+            toon_append_context_once(&sb, srv, store);
+            free(project);
             char *text = cbm_sb_finish(&sb);
             char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
             free(text);
@@ -5600,7 +5717,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
     char *query = cbm_mcp_get_string_arg(args, "cypher");
     if (!query) query = cbm_mcp_get_string_arg(args, "query"); /* backward compat */
     /* CQ-2: use resolve_project_store for "self"/"dep"/path expansion */
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
@@ -5638,12 +5755,10 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         return _res;
     }
 
-    char *not_indexed = verify_project_indexed(store, project);
-    if (not_indexed) {
-        free(project);
-        free(query);
-        return not_indexed;
-    }
+    /* No verify_project_indexed here: store resolution above already reports
+     * missing/unindexed projects, and the check breaks in-memory/embedded
+     * stores that have no project row (removed once before — commit 5d882c55 —
+     * and re-added by the upstream merge). */
 
     char coverage_project[CBM_SZ_512];
     const char *cypher_project = project;
@@ -5909,7 +6024,7 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
 }
 
 static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
@@ -6275,7 +6390,7 @@ static void arch_join_list(char *buf, size_t size, const char **items, int count
 }
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
@@ -7307,7 +7422,7 @@ static int clamp_mcp_depth(int depth, const char *tool_name) {
 static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *qn_input = cbm_mcp_get_string_arg(args, "qualified_name"); /* cross-tool chaining */
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     char *direction = cbm_mcp_get_string_arg(args, "direction");
     char *trace_mode = cbm_mcp_get_string_arg(args, "mode"); /* calls|data_flow|cross_service */
     char *param_name = cbm_mcp_get_string_arg(args, "parameter_name");
@@ -8241,6 +8356,22 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
  * to invalidate. */
 static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
     if (!srv) {
+        return;
+    }
+    /* Deferred: only MARK the cached handle stale. This runs both on the
+     * request thread (handle_index_repository) and on the background
+     * auto-index thread (autoindex_thread → index_run_supervised); closing
+     * srv->store or freeing srv->current_project here would race a request
+     * mid-query on the same handle. The request thread consumes the flag in
+     * resolve_store()/resolve_resource_store() and closes/reopens there. */
+    atomic_store(&srv->store_stale, true);
+}
+
+/* Request-thread half of the deferred invalidation above: close the cached
+ * handle if a worker reap marked it stale since it was opened. Call only from
+ * the request thread, before trusting srv->store / srv->current_project. */
+static void reap_stale_store(cbm_mcp_server_t *srv) {
+    if (!atomic_exchange(&srv->store_stale, false)) {
         return;
     }
     if (srv->owns_store && srv->store) {
@@ -9384,7 +9515,7 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
 
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
     char *project = pe.value;
@@ -11442,7 +11573,7 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 /* ── index_dependencies ───────────────────────────────────────── */
 
 static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) {
-    char *raw_project = get_project_arg(args);
+    char *raw_project = get_store_project_arg(args);
     char *pkg_mgr_str = cbm_mcp_get_string_arg(args, "package_manager");
 
     if (!raw_project) {
@@ -11857,11 +11988,24 @@ static void *autoindex_thread(void *arg) {
 
 
     if (rc == 0) {
-        /* Re-index dependencies after fresh dump */
-        cbm_store_t *resolved_store = resolve_store(srv, srv->session_project);
-        cbm_store_t *owned_writable_store = NULL;
-        cbm_store_t *store =
-            cbm_mcp_writable_existing_store(resolved_store, &owned_writable_store);
+        /* Re-index dependencies after fresh dump.
+         *
+         * Open an INDEPENDENT writable handle (overlay_compaction_thread
+         * pattern) instead of calling resolve_store(): this still runs on the
+         * background auto-index thread while the request thread may be
+         * mid-query on srv->store, and resolve_store() mutates srv->store /
+         * srv->current_project / srv->owns_store without synchronization —
+         * including cbm_store_close(srv->store) and free(srv->current_project),
+         * a use-after-free under the store.h one-handle-per-thread contract.
+         * The request thread's join in REQUIRE_STORE_EX only covers the
+         * store==NULL path, so it does not serialize this case. */
+        cbm_store_t *store = NULL;
+        char autoindex_db_path[CBM_SZ_1K];
+        autoindex_db_path[0] = '\0';
+        project_db_path(srv->session_project, autoindex_db_path, sizeof(autoindex_db_path));
+        if (autoindex_db_path[0]) {
+            store = cbm_store_open_path_existing(autoindex_db_path);
+        }
         if (store) {
             int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
             int deps_reindexed = cbm_mcp_auto_index_deps(
@@ -11870,9 +12014,7 @@ static void *autoindex_thread(void *arg) {
             (void)cbm_pagerank_refresh_after_publish(
                 store, srv->session_project, srv->config, graph_changed, deps_reindexed,
                 cbm_rank_refresh_publish_from_pipeline(publish_kind, incremental_fallback));
-        }
-        if (owned_writable_store) {
-            cbm_store_close(owned_writable_store);
+            cbm_store_close(store);
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);
@@ -12265,6 +12407,8 @@ static const char *active_project_name(cbm_mcp_server_t *srv) {
  * (set by the most recent tool call) over the session project, so resources
  * reflect data the user is actually querying — not the empty CWD project. */
 static cbm_store_t *resolve_resource_store(cbm_mcp_server_t *srv) {
+    /* Consume a deferred invalidation first — same contract as resolve_store. */
+    reap_stale_store(srv);
     /* 1. Use currently-open project (set by last resolve_store call) */
     if (srv->current_project && srv->store)
         return srv->store;
@@ -12995,6 +13139,9 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     int fd = cbm_fileno(in);
 
     for (;;) {
+        if (atomic_load(&srv->stop_requested)) {
+            break; /* signal-handler/watchdog shutdown (see request_stop) */
+        }
         /* Poll with idle timeout so we can evict unused stores between requests.
          *
          * IMPORTANT: poll() operates on the raw fd, but getline() reads from a

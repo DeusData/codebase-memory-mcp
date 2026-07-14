@@ -467,6 +467,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int total_calls = 0;
     int total_imports = 0;
     int errors = 0;
+    bool hard_fail = false; /* run-level failure (OOM) — unlike recorded skips */
 
     /* Sequential pass must extract all defs (which create Module/Function/...
      * nodes) BEFORE resolving imports — otherwise a workspace import in the
@@ -529,6 +530,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                              itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
             } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
+                if (rst == CBM_READ_OOM) {
+                    /* Run-level resource failure — publishing after OOM would
+                     * be silently incomplete. Mirrors the parallel path. */
+                    hard_fail = true;
+                }
             }
             continue;
         }
@@ -634,5 +640,10 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",
                  itoa_log(errors));
-    return errors == 0 ? 0 : CBM_NOT_FOUND;
+    /* Counted errors were all RECORDED as reportable skips (oversized / read /
+     * extract → skipped[] + logfile), so the run still publishes and reports
+     * "indexed" — skip-and-report, never fail (Track B; guarded by
+     * tests/test_index_resilience.c). Only a run-level resource failure (OOM),
+     * which could publish a silently incomplete graph, fails the pass. */
+    return hard_fail ? CBM_NOT_FOUND : 0;
 }

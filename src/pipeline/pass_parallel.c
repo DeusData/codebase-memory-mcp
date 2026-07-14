@@ -840,6 +840,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 if (!pp_err_add(errs, fi->rel_path, "read failed", "read")) {
                     atomic_store_explicit(&ec->worker_failed, 1, memory_order_relaxed);
                 }
+                if (rst == CBM_READ_OOM) {
+                    /* Out-of-memory is a run-level resource failure, not a
+                     * property of this file — publishing a partial graph after
+                     * OOM would be silently incomplete. Fail the pass. */
+                    atomic_store_explicit(&ec->worker_failed, 1, memory_order_relaxed);
+                }
             }
             continue;
         }
@@ -1209,7 +1215,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     cbm_log_info("parallel.extract.done", "nodes", itoa_log(total_nodes), "errors",
                  itoa_log(total_errors));
-    return total_errors == 0 ? 0 : CBM_NOT_FOUND;
+    /* Every counted error above was RECORDED as a reportable skip
+     * (oversized / read / extract → skipped[] + logfile via pp_err_add), so
+     * the run must still publish and report "indexed" — skip-and-report, not
+     * fail (Track B; guarded by tests/test_index_resilience.c). Internal
+     * failures that could publish a silently incomplete graph (worker alloc
+     * failure, OOM, gbuf merge, pkgmap) already returned nonzero above via
+     * worker_failed / merge_rc / pkgmap_rc. */
+    return 0;
 }
 
 int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,

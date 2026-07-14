@@ -2663,10 +2663,12 @@ TEST(source_grep_case_sensitive_flag_works) {
         "\"project\":\"_tc_cs_test_\",\"case_sensitive\":true}");
     ASSERT_NOT_NULL(resp);
     /* After fix: no -i flag → case-sensitive grep must NOT find "hello_world" via "HELLO_WORLD" */
-    /* Response format uses "total_grep_matches" and "total_results" fields */
-    /* The outer wrapper JSON-encodes the inner result, so "key":val becomes \"key\":val in resp.
-     * Search for the escaped form: \\\" in C source == \" in bytes == the escaped JSON quote. */
-    ASSERT_NOT_NULL(strstr(resp, "\\\"total_grep_matches\\\":0"));
+    /* Accept both encodings of the zero-match count: the TOON scalar
+     * "total_grep_matches: 0" (the search_code compact default) and the
+     * escaped legacy JSON field \"total_grep_matches\":0 (format:"json"). */
+    bool zero_matches = strstr(resp, "total_grep_matches: 0") != NULL ||
+                        strstr(resp, "\\\"total_grep_matches\\\":0") != NULL;
+    ASSERT_TRUE(zero_matches);
     free(resp);
 
     cbm_mcp_server_free(srv);
