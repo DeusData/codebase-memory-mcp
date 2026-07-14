@@ -409,6 +409,43 @@ TEST(gbuf_imports_multi_symbol_dedup) {
     PASS();
 }
 
+/* Incremental indexing deletes and recreates every node owned by a changed
+ * file.  Both sibling imports must remain insertable after the shared target
+ * is cascade-deleted; a stale dedup key would silently discard one symbol. */
+TEST(gbuf_imports_multi_symbol_reinsert_after_target_delete) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t consumer =
+        cbm_gbuf_upsert_node(gb, "File", "consumer.py", "pkg.consumer", "consumer.py", 1, 1,
+                             "{}");
+    int64_t target =
+        cbm_gbuf_upsert_node(gb, "Method", "openapi", "pkg.FastAPI.openapi", "target.py", 1, 1,
+                             "{}");
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, consumer, target, "IMPORTS",
+                                   "{\"local_name\":\"METHODS_WITH_BODY\"}"),
+              0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, consumer, target, "IMPORTS",
+                                   "{\"local_name\":\"REF_PREFIX\"}"),
+              0);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(gb, "IMPORTS"), 2);
+
+    ASSERT_EQ(cbm_gbuf_delete_by_file(gb, "target.py"), 1);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(gb, "IMPORTS"), 0);
+
+    target =
+        cbm_gbuf_upsert_node(gb, "Method", "openapi", "pkg.FastAPI.openapi", "target.py", 1, 1,
+                             "{}");
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, consumer, target, "IMPORTS",
+                                   "{\"local_name\":\"METHODS_WITH_BODY\"}"),
+              0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, consumer, target, "IMPORTS",
+                                   "{\"local_name\":\"REF_PREFIX\"}"),
+              0);
+    ASSERT_EQ(cbm_gbuf_edge_count_by_type(gb, "IMPORTS"), 2);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* #768 hardening: the dedup key lives in a fixed-size stack buffer. Two long
  * local_names sharing a prefix must NOT silently collide when the verbatim
  * key would be truncated — the key builder re-keys oversized local_names with
@@ -1751,6 +1788,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_insert_edge);
     RUN_TEST(gbuf_edge_dedup);
     RUN_TEST(gbuf_imports_multi_symbol_dedup);
+    RUN_TEST(gbuf_imports_multi_symbol_reinsert_after_target_delete);
     RUN_TEST(gbuf_imports_long_local_name_no_collision);
     RUN_TEST(gbuf_find_edges_by_source_type);
     RUN_TEST(gbuf_find_edges_by_target_type);
