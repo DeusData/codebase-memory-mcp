@@ -60,6 +60,48 @@ def config_label(reports: list[dict[str, Any]]) -> str:
     return " / ".join(sorted(labels))
 
 
+def compact_witness(value: Any, limit: int = 96) -> str:
+    if not isinstance(value, str) or not value:
+        return ""
+    single_line = " ".join(value.split())
+    return single_line if len(single_line) <= limit else single_line[: limit - 1] + "…"
+
+
+def correctness_findings(cases: list[dict[str, Any]]) -> list[str]:
+    findings: list[str] = []
+    for case in cases:
+        canonical = case.get("canonical_graph")
+        if isinstance(canonical, dict) and canonical.get("equal") is False:
+            kind = canonical.get("kind") or "canonical graph"
+            detail = (
+                f"{kind} mismatch (incremental={canonical.get('left_count', 'n/a')}, "
+                f"fresh={canonical.get('right_count', 'n/a')})"
+            )
+            witnesses = [
+                compact_witness(canonical.get("left_only")),
+                compact_witness(canonical.get("right_only")),
+            ]
+            witnesses = [value for value in witnesses if value]
+            if witnesses:
+                detail += "; witness: " + " vs ".join(witnesses)
+            findings.append(detail)
+
+        case_oracles = case.get("oracles")
+        if not isinstance(case_oracles, dict):
+            continue
+        for name, oracle in case_oracles.items():
+            if not isinstance(oracle, dict) or name == "quality":
+                continue
+            quality = oracle.get("quality")
+            if isinstance(quality, dict) and quality.get("passed") is False:
+                expected = compact_witness(quality.get("expected_substring"))
+                finding = f"{name} failed"
+                if expected:
+                    finding += f" (expected {expected})"
+                findings.append(finding)
+    return list(dict.fromkeys(findings))
+
+
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
     canonical = [
@@ -182,6 +224,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "peak_rss_mb": max(peak_rss) if peak_rss else None,
         "cleanup": ratio(cleanup_passes, len(reports)),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
+        "findings": correctness_findings(cases),
         "pareto": "unclassified",
     }
 
@@ -307,11 +350,18 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             )
             + " |"
         )
+    lines.extend(("", "## Correctness and quality findings", "", "| Candidate | Evidence |", "|---|---|"))
+    for row in rows:
+        evidence = row["findings"] or ["All applicable canonical-graph and task-oracle checks passed."]
+        lines.append(f"| {display(row['candidate'])} | {display('; '.join(evidence))} |")
     lines.extend(
         (
             "",
             "* Response tokens use the recorded `utf8_bytes_div_4_ceil` deterministic estimate; "
-            "bytes remain the exact canonical JSON payload measurement.",
+            "bytes remain the exact default tool-response payload measurement.",
+            "",
+            "Each candidate uses one real-repository mutation case. Query p50 aggregates the "
+            "five task-oracle calls in that case; each indexing latency is one observation.",
             "",
             "Pareto status considers only candidates that pass correctness/quality and have every "
             "axis measured. It maximizes quality while minimizing incremental and query latency, "
