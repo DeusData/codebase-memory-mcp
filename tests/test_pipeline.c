@@ -9,6 +9,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
+#include "pipeline/artifact.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "store/store.h"
@@ -6221,7 +6222,435 @@ TEST(full_reindex_preserves_exact_long_db_path) {
     PASS();
 }
 #endif
+static bool project_has_index_mode(cbm_store_t *store, const char *project,
+                                   const char *expected_mode) {
+    cbm_node_t node = {0};
+    if (cbm_store_find_node_by_qn(store, project, project, &node) != CBM_STORE_OK) {
+        return false;
+    }
 
+    bool matches = false;
+    if (node.properties_json) {
+        yyjson_doc *doc = yyjson_read_opts((char *)node.properties_json,
+                                           strlen(node.properties_json), 0, NULL, NULL);
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_val *mode = root ? yyjson_obj_get(root, "index_mode") : NULL;
+        matches = yyjson_equals_str(mode, expected_mode);
+        if (doc) {
+            yyjson_doc_free(doc);
+        }
+    }
+
+    cbm_node_free_fields(&node);
+    return matches;
+}
+
+static int project_count_nodes_by_label(cbm_store_t *store, const char *project,
+                                        const char *label) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(store, project, label, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return count;
+}
+
+static int setup_mode_upgrade_repo(char *tmpdir, size_t tmpdir_size, char *dbpath,
+                                   size_t dbpath_size) {
+    snprintf(tmpdir, tmpdir_size, "/tmp/cbm_mode_upgrade_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return -1;
+    }
+    snprintf(dbpath, dbpath_size, "%s/test.db", tmpdir);
+
+    if (th_write_file(
+            TH_PATH(tmpdir, "user_validator.go"),
+            "package validation\n"
+            "import \"errors\"\n"
+            "import \"strings\"\n"
+            "func ValidateUser(u User) error {\n"
+            "    if u.Name == \"\" { return errors.New(\"name required\") }\n"
+            "    if len(u.Name) > 100 { return errors.New(\"name too long\") }\n"
+            "    if u.Age < 0 { return errors.New(\"invalid age\") }\n"
+            "    if u.Age > 200 { return errors.New(\"age too high\") }\n"
+            "    if u.Email == \"\" { return errors.New(\"email required\") }\n"
+            "    if !strings.Contains(u.Email, \"@\") { return errors.New(\"invalid email\") }\n"
+            "    if u.Phone == \"\" { return errors.New(\"phone required\") }\n"
+            "    if len(u.Phone) < 7 { return errors.New(\"phone too short\") }\n"
+            "    if u.Country == \"\" { return errors.New(\"country required\") }\n"
+            "    for _, tag := range u.Tags {\n"
+            "        if tag == \"\" { return errors.New(\"empty tag\") }\n"
+            "    }\n"
+            "    return nil\n"
+            "}\n") != 0) {
+        return -1;
+    }
+
+    return th_write_file(
+        TH_PATH(tmpdir, "order_validator.go"),
+        "package validation\n"
+        "import \"errors\"\n"
+        "import \"strings\"\n"
+        "func ValidateOrder(o Order) error {\n"
+        "    if o.Title == \"\" { return errors.New(\"title required\") }\n"
+        "    if len(o.Title) > 100 { return errors.New(\"title too long\") }\n"
+        "    if o.Amount < 0 { return errors.New(\"invalid amount\") }\n"
+        "    if o.Amount > 200 { return errors.New(\"amount too high\") }\n"
+        "    if o.Status == \"\" { return errors.New(\"status required\") }\n"
+        "    if !strings.Contains(o.Status, \"@\") { return errors.New(\"invalid status\") }\n"
+        "    if o.Region == \"\" { return errors.New(\"region required\") }\n"
+        "    if len(o.Region) < 7 { return errors.New(\"region too short\") }\n"
+        "    if o.Vendor == \"\" { return errors.New(\"vendor required\") }\n"
+        "    for _, item := range o.Items {\n"
+        "        if item == \"\" { return errors.New(\"empty item\") }\n"
+        "    }\n"
+        "    return nil\n"
+        "}\n");
+}
+
+TEST(incremental_mode_upgrade_reindexes_capabilities) {
+    char tmpdir[256];
+    char dbpath[512];
+    ASSERT_EQ(setup_mode_upgrade_repo(tmpdir, sizeof(tmpdir), dbpath, sizeof(dbpath)), 0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_pipeline_set_persistence(pipeline, true);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, project, "SIMILAR_TO"), 0);
+    ASSERT_TRUE(project_has_index_mode(store, project, "fast"));
+    cbm_store_close(store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    int similarity_edges = cbm_store_count_edges_by_type(store, project, "SIMILAR_TO");
+    ASSERT_GT(similarity_edges, 0);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_store_close(store);
+
+    char artifact_dbpath[512];
+    snprintf(artifact_dbpath, sizeof(artifact_dbpath), "%s/artifact-upgrade.db", tmpdir);
+    ASSERT_EQ(cbm_artifact_import(tmpdir, artifact_dbpath), 0);
+    cbm_store_t *artifact_store = cbm_store_open_path(artifact_dbpath);
+    ASSERT_NOT_NULL(artifact_store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(artifact_store, project, "SIMILAR_TO"),
+              similarity_edges);
+    ASSERT_TRUE(project_has_index_mode(artifact_store, project, "moderate"));
+    cbm_store_close(artifact_store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, project, "SIMILAR_TO"), similarity_edges);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_store_close(store);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_mode_downgrade_preserves_similarity_for_changed_file) {
+    char tmpdir[256];
+    char dbpath[512];
+    ASSERT_EQ(setup_mode_upgrade_repo(tmpdir, sizeof(tmpdir), dbpath, sizeof(dbpath)), 0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    int similarity_edges = cbm_store_count_edges_by_type(store, project, "SIMILAR_TO");
+    ASSERT_GT(similarity_edges, 0);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_store_close(store);
+
+    FILE *changed = fopen(TH_PATH(tmpdir, "user_validator.go"), "a");
+    ASSERT_NOT_NULL(changed);
+    ASSERT_GT(fprintf(changed, "\n// changed before fast reindex\n"), 0);
+    fclose(changed);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, project, "SIMILAR_TO"), similarity_edges);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_store_close(store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, project, "SIMILAR_TO"), similarity_edges);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_store_close(store);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_mode_downgrade_preserves_full_extraction_for_changed_file) {
+    char tmpdir[256];
+    char dbpath[512];
+    ASSERT_EQ(setup_mode_upgrade_repo(tmpdir, sizeof(tmpdir), dbpath, sizeof(dbpath)), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "macros.c"),
+                            "#define REVIEW_LIMIT 42\n"
+                            "int review_value(void) { return REVIEW_LIMIT; }\n"),
+              0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(project_count_nodes_by_label(store, project, "Macro"), 0);
+    ASSERT_TRUE(project_has_index_mode(store, project, "moderate"));
+    cbm_store_close(store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    int macro_nodes = project_count_nodes_by_label(store, project, "Macro");
+    ASSERT_GT(macro_nodes, 0);
+    ASSERT_TRUE(project_has_index_mode(store, project, "full"));
+    cbm_store_close(store);
+
+    FILE *changed = fopen(TH_PATH(tmpdir, "macros.c"), "a");
+    ASSERT_NOT_NULL(changed);
+    ASSERT_GT(fprintf(changed, "\n/* changed before moderate reindex */\n"), 0);
+    fclose(changed);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_MODERATE);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(project_count_nodes_by_label(store, project, "Macro"), macro_nodes);
+    ASSERT_TRUE(project_has_index_mode(store, project, "full"));
+    cbm_store_close(store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(project_count_nodes_by_label(store, project, "Macro"), macro_nodes);
+    ASSERT_TRUE(project_has_index_mode(store, project, "full"));
+    cbm_store_close(store);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_noop_downgrade_honors_explicit_persistence) {
+    char tmpdir[256];
+    char dbpath[512];
+    ASSERT_EQ(setup_mode_upgrade_repo(tmpdir, sizeof(tmpdir), dbpath, sizeof(dbpath)), 0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+    ASSERT_FALSE(cbm_artifact_exists(tmpdir));
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_pipeline_set_persistence(pipeline, true);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    ASSERT_TRUE(cbm_artifact_exists(tmpdir));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_changed_file_propagates_explicit_persistence_failure) {
+    char tmpdir[256];
+    char dbpath[512];
+    ASSERT_EQ(setup_mode_upgrade_repo(tmpdir, sizeof(tmpdir), dbpath, sizeof(dbpath)), 0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    FILE *changed = fopen(TH_PATH(tmpdir, "user_validator.go"), "a");
+    ASSERT_NOT_NULL(changed);
+    ASSERT_GT(fprintf(changed, "\n// force incremental artifact export\n"), 0);
+    fclose(changed);
+
+    char artifact_dir[512];
+    snprintf(artifact_dir, sizeof(artifact_dir), "%s/.codebase-memory", tmpdir);
+    cbm_mkdir_p(artifact_dir, 0755);
+    char artifact_path[512];
+    snprintf(artifact_path, sizeof(artifact_path), "%s/graph.db.zst", artifact_dir);
+    cbm_mkdir_p(artifact_path, 0755);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_pipeline_set_persistence(pipeline, true);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+
+    ASSERT_NEQ(rc, 0);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_missing_mode_metadata_forces_reindex) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_legacy_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"hello\") }\n"),
+              0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t project_node = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project, project, &project_node), CBM_STORE_OK);
+    cbm_node_t legacy_project_node = project_node;
+    legacy_project_node.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(store, &legacy_project_node), 0);
+    cbm_node_free_fields(&project_node);
+
+    char sentinel_qn[512];
+    snprintf(sentinel_qn, sizeof(sentinel_qn), "%s.legacy_sentinel", project);
+    cbm_node_t sentinel = {.project = project,
+                           .label = "Function",
+                           .name = "legacy_sentinel",
+                           .qualified_name = sentinel_qn,
+                           .file_path = "legacy.go",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &sentinel), 0);
+    cbm_store_close(store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t sentinel_after = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project, sentinel_qn, &sentinel_after),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_TRUE(project_has_index_mode(store, project, "fast"));
+    cbm_store_close(store);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incremental_escaped_nul_mode_metadata_forces_reindex) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_nul_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"hello\") }\n"),
+              0);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    char *project = strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    /* Valid JSON whose mode string carries an escaped NUL: yyjson unescapes it
+     * to "full\0garbage" (12 chars), which a prefix strcmp would accept but an
+     * exact comparison must reject as unknown mode metadata. */
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t corrupt_project = {.project = project,
+                                  .label = "Project",
+                                  .name = project,
+                                  .qualified_name = project,
+                                  .file_path = "",
+                                  .properties_json = "{\"index_mode\":\"full\\u0000garbage\"}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &corrupt_project), 0);
+    ASSERT_FALSE(project_has_index_mode(store, project, "full"));
+
+    char sentinel_qn[512];
+    snprintf(sentinel_qn, sizeof(sentinel_qn), "%s.nul_mode_sentinel", project);
+    cbm_node_t sentinel = {.project = project,
+                           .label = "Function",
+                           .name = "nul_mode_sentinel",
+                           .qualified_name = sentinel_qn,
+                           .file_path = "nul-mode.go",
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &sentinel), 0);
+    cbm_store_close(store);
+
+    pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t sentinel_after = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, project, sentinel_qn, &sentinel_after),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_TRUE(project_has_index_mode(store, project, "fast"));
+    cbm_store_close(store);
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
 TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
      * was silently destroying every file under FAST_SKIP_DIRS directories
@@ -7517,6 +7946,13 @@ SUITE(pipeline) {
 #ifdef __linux__
     RUN_TEST(full_reindex_preserves_exact_long_db_path);
 #endif
+    RUN_TEST(incremental_mode_upgrade_reindexes_capabilities);
+    RUN_TEST(incremental_mode_downgrade_preserves_similarity_for_changed_file);
+    RUN_TEST(incremental_mode_downgrade_preserves_full_extraction_for_changed_file);
+    RUN_TEST(incremental_noop_downgrade_honors_explicit_persistence);
+    RUN_TEST(incremental_changed_file_propagates_explicit_persistence_failure);
+    RUN_TEST(incremental_missing_mode_metadata_forces_reindex);
+    RUN_TEST(incremental_escaped_nul_mode_metadata_forces_reindex);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);

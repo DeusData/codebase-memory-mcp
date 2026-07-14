@@ -69,19 +69,6 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 #endif
 }
 
-static const char *incr_mode_name(int mode) {
-    switch (mode) {
-    case CBM_MODE_FULL:
-        return "full";
-    case CBM_MODE_MODERATE:
-        return "moderate";
-    case CBM_MODE_FAST:
-        return "fast";
-    default:
-        return "unknown";
-    }
-}
-
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored hashes using mtime+size.
@@ -633,6 +620,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
                      itoa_buf((int)elapsed_ms(t)));
     }
 }
+
 /* Delete old DB and dump merged graph + hashes to disk.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
@@ -707,11 +695,12 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
 /* ── Incremental pipeline entry point ────────────────────────────── */
 
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count) {
+                                 int file_count, cbm_index_mode_t effective_mode) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
 
     const char *project = cbm_pipeline_project_name(p);
+    cbm_index_mode_t requested_mode = (cbm_index_mode_t)cbm_pipeline_get_mode(p);
 
     /* Open existing disk DB */
     cbm_store_t *store = cbm_store_open_path(db_path);
@@ -873,7 +862,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
         .pipeline = p, /* so passes can record per-file skips (Track B) */
-        .mode = cbm_pipeline_get_mode(p),
+        .mode = effective_mode,
         .path_aliases = path_aliases,
         .excluded_dirs = excluded_dirs,
         .excluded_count = excluded_count,
@@ -897,7 +886,12 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
     }
 
+    /* Discovery already used requested_mode. Re-extraction must preserve the
+     * stronger capabilities recorded in Project.index_mode, including full-only
+     * C/C++ Macro nodes. Restore the process-wide gate immediately afterwards. */
+    cbm_set_macro_extraction(effective_mode == CBM_MODE_FULL);
     run_extract_resolve(&ctx, changed_files, ci);
+    cbm_set_macro_extraction(requested_mode == CBM_MODE_FULL);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
     run_postpasses(&ctx, changed_files, ci, project);
 
@@ -923,6 +917,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * Rows for deleted files are pruned against file_hashes inside the
      * replace. Borrowed strings: old_cov and the pipeline own them past the
      * dump_and_persist call below. */
+    int cov_n = 0;
     cbm_file_error_t *run_errs = NULL;
     int run_err_count = 0;
     cbm_pipeline_get_file_errors(p, &run_errs, &run_err_count);
@@ -934,7 +929,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int run_ignored_total = 0;
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
     cbm_coverage_row_t *cov = NULL;
-    int cov_n = 0;
     int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
@@ -995,9 +989,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
-    int index_mode = cbm_pipeline_get_mode(p);
     cbm_coverage_meta_t coverage_meta = {
-        .index_mode = incr_mode_name(index_mode),
+        .index_mode = cbm_pipeline_mode_name((cbm_index_mode_t)cbm_pipeline_get_mode(p)),
         .recording_status =
             !coverage_rows_available
                 ? "unavailable"
@@ -1013,6 +1006,10 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 
+    if (persist_rc != 0) {
+        return persist_rc;
+    }
+
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
-    return persist_rc;
+    return 0;
 }

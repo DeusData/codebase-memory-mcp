@@ -463,6 +463,8 @@ typedef struct {
 typedef struct {
     const char *project;
     const char *generation;
+    /* Requested discovery mode of the last run; the effective capability
+     * mode lives in the Project node's properties.index_mode. */
     const char *index_mode;
     const char *recorded_at;
     const char *recording_status;

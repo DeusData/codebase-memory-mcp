@@ -375,7 +375,8 @@ static const tool_def_t TOOLS[] = {
      "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
-     "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     "Teammates can bootstrap from the artifact instead of full re-indexing. "
+     "An existing artifact is refreshed after any reindex even when persistence is false.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph", "Search graph",
