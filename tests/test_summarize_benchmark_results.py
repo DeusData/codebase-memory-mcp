@@ -71,7 +71,14 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "passed": True,
             "canonical_graph": {"equal": True},
             "oracles": {
-                "quality": {"passed": True, "passed_count": 2, "applicable_count": 2},
+                "quality": {
+                    "passed": True,
+                    "passed_count": 2,
+                    "applicable_count": 2,
+                    "score": 0.75,
+                    "hit_at_1": 0.5,
+                    "hit_at_5": 1.0,
+                },
                 "marker": {
                     "elapsed_ms": 5,
                     "response_bytes": 80,
@@ -85,7 +92,14 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         slower_case = {
             **compact_case,
             "oracles": {
-                "quality": {"passed": True, "passed_count": 2, "applicable_count": 2},
+                "quality": {
+                    "passed": True,
+                    "passed_count": 2,
+                    "applicable_count": 2,
+                    "score": 0.75,
+                    "hit_at_1": 0.5,
+                    "hit_at_5": 1.0,
+                },
                 "marker": {
                     "elapsed_ms": 8,
                     "response_bytes": 120,
@@ -99,7 +113,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             SUMMARY.summarize_group("slower", [report(slower_case)]),
         ]
         SUMMARY.mark_pareto_frontier(rows)
-        self.assertEqual(rows[0]["quality_score"], 1.0)
+        self.assertEqual(rows[0]["quality_score"], 0.75)
+        self.assertEqual(rows[0]["hit_at_1"], 0.5)
+        self.assertEqual(rows[0]["hit_at_5"], 1.0)
         self.assertEqual(rows[0]["query_response_p50_bytes"], 80.0)
         self.assertEqual(rows[0]["query_response_p50_tokens"], 20.0)
         self.assertEqual(rows[0]["query_latency_p50_ms"], 5.0)

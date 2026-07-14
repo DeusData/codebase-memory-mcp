@@ -47,6 +47,31 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertFalse(oracles["changed_file_query_graph"]["quality"]["passed"])
         self.assertFalse(oracles["route_freshness_probe"]["quality"]["applicable"])
 
+    def test_quality_summary_records_rank_and_hit_rates(self) -> None:
+        oracles = {
+            "ranked": {
+                "response": {
+                    "results": [
+                        {"name": "unrelated"},
+                        {"name": "wanted_marker"},
+                    ]
+                }
+            }
+        }
+        summary = BENCHMARK.score_quality_oracles(
+            oracles, {"ranked": ("wanted_marker", "marker is ranked")}
+        )
+        quality = oracles["ranked"]["quality"]
+        self.assertEqual(quality["rank"], 2)
+        self.assertFalse(quality["hit_at_1"])
+        self.assertTrue(quality["hit_at_5"])
+        self.assertEqual(quality["reciprocal_rank"], 0.5)
+        self.assertEqual(quality["returned_count"], 2)
+        self.assertEqual(summary["mean_reciprocal_rank"], 0.5)
+        self.assertEqual(summary["hit_at_1"], 0.0)
+        self.assertEqual(summary["hit_at_5"], 1.0)
+        self.assertEqual(summary["score"], 0.5)
+
     def test_binary_metadata_records_content_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "cbm"

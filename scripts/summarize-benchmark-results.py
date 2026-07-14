@@ -88,6 +88,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     query_response_tokens: list[float] = []
     quality_passed = 0
     quality_applicable = 0
+    quality_score_weighted = 0.0
+    quality_score_count = 0
+    hit_at_1_weighted = 0.0
+    hit_at_5_weighted = 0.0
     for case in cases:
         incremental = case.get("incremental", {})
         full = case.get("fresh_fast_full_after_change", {})
@@ -107,8 +111,19 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if isinstance(case_oracles, dict):
             quality = case_oracles.get("quality", {})
             if isinstance(quality, dict):
+                applicable = int(quality.get("applicable_count") or 0)
                 quality_passed += int(quality.get("passed_count") or 0)
-                quality_applicable += int(quality.get("applicable_count") or 0)
+                quality_applicable += applicable
+                score = quality.get("score")
+                hit_at_1 = quality.get("hit_at_1")
+                hit_at_5 = quality.get("hit_at_5")
+                if applicable and isinstance(score, (int, float)):
+                    quality_score_weighted += float(score) * applicable
+                    quality_score_count += applicable
+                if applicable and isinstance(hit_at_1, (int, float)):
+                    hit_at_1_weighted += float(hit_at_1) * applicable
+                if applicable and isinstance(hit_at_5, (int, float)):
+                    hit_at_5_weighted += float(hit_at_5) * applicable
             for oracle in case_oracles.values():
                 if not isinstance(oracle, dict):
                     continue
@@ -149,8 +164,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "canonical": ratio(sum(canonical), len(canonical)),
         "oracles": ratio(sum(oracles), len(oracles)),
         "quality_score": (
-            quality_passed / quality_applicable if quality_applicable else None
+            quality_score_weighted / quality_score_count
+            if quality_score_count
+            else quality_passed / quality_applicable if quality_applicable else None
         ),
+        "hit_at_1": hit_at_1_weighted / quality_score_count if quality_score_count else None,
+        "hit_at_5": hit_at_5_weighted / quality_score_count if quality_score_count else None,
         "quality_checks": ratio(quality_passed, quality_applicable),
         "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
@@ -242,10 +261,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Codebase Memory performance and quality summary",
         "",
-        "| Candidate | Decision | Quality | Checks | Canonical | Task oracles | "
+        "| Candidate | Decision | Quality MRR | Hit@1 | Hit@5 | Checks | Canonical | Task oracles | "
         "Response p50 bytes | Response p50 tokens* | Query p50 ms | Incremental p50 ms | "
         "Peak RSS MB | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -255,6 +274,8 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["candidate"]),
                     display(row["decision"]),
                     display(row["quality_score"], 3),
+                    display(row["hit_at_1"], 3),
+                    display(row["hit_at_5"], 3),
                     display(row["quality_checks"]),
                     display(row["canonical"]),
                     display(row["oracles"]),
