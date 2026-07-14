@@ -49,7 +49,7 @@ The MCP server core is written in C and has its own test suite under `tests/`:
 
 ```bash
 make -f Makefile.cbm test          # full suite with ASan + UBSan
-make -f Makefile.cbm test-tsan     # full suite with ThreadSanitizer
+make -f Makefile.cbm test-tsan     # thread-sensitive suites with ThreadSanitizer
 make -f Makefile.cbm test-leak     # heap leak check (see below)
 make -f Makefile.cbm test-memory   # macOS MallocScribble/PreScribble nosan run
 make -f Makefile.cbm test-gmalloc  # macOS Guard Malloc nosan run
@@ -66,7 +66,20 @@ CBM_ONLY_SUITE=pipeline CBM_ONLY_TEST=exact build/c/test-runner
 By default, tests isolate `CBM_CACHE_DIR` in a temporary directory so local indexes are not
 polluted. Set `CBM_TEST_NO_ISOLATE=1` only when intentionally testing the user's configured cache.
 
-Build flags follow the Makefile conventions:
+### Build profiles
+
+Use `scripts/build.sh` for a clean local release build. It is the same entry point used by the
+release workflow and produces the default installable binary with `-O2`. For a faster incremental
+release rebuild, use `make -f Makefile.cbm cbm`; `make -f Makefile.cbm install` installs that same
+optimized artifact.
+
+Use `scripts/test.sh` for normal development validation. Its C test binary uses `-g -O1` with
+ASan and UBSan, then it builds the production binary for the parent/worker watchdog checks. Use
+the dedicated `test-tsan`, `test-leak`, `test-memory`, and `test-gmalloc` targets above when
+diagnosing concurrency or allocator lifetime behavior. These diagnostic binaries are not valid
+performance-benchmark inputs.
+
+Additional build flags follow the Makefile conventions:
 
 ```bash
 make -f Makefile.cbm test SANITIZE=      # disable ASan/UBSan, mainly for unsupported toolchains
@@ -77,8 +90,11 @@ make -f Makefile.cbm cbm STATIC=1        # static link where supported
 **Memory leak detection:**
 
 On **macOS**, `test-leak` builds a sanitizer-free binary (`test-runner-nosan`) and runs Apple's
-`leaks --atExit` on it. ASan replaces malloc, so the standard `test-runner` cannot be inspected
-by `leaks` — the separate nosan build is required.
+`leaks --atExit` on allocation-owning store, pipeline, ranker, and parallel-worker
+suites. ASan replaces malloc, so the standard `test-runner` cannot be inspected by `leaks` — the
+separate nosan build is required. Deliberate crash tests are excluded because Apple's debugger
+stops their child processes before the parent can reap them; this includes the subprocess,
+stack-overflow, MCP crash-quarantine, and HTTP socket-inheritance suites.
 
 On **Linux**, `test-leak` runs the regular `test-runner` with `ASAN_OPTIONS=detect_leaks=1` to
 activate LSan.
