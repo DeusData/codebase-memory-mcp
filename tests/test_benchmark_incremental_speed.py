@@ -12,6 +12,11 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_benchmark_environment_retains_worker_measurement_log(self) -> None:
+        env = BENCHMARK.build_env(Path("/tmp/cbm-benchmark-cache"))
+        self.assertEqual(env["CBM_PROFILE"], "1")
+        self.assertEqual(env["CBM_AUTO_INDEX"], "false")
+
     def test_tool_result_separates_default_payload_quality_json_and_transport(self) -> None:
         default_payload = b"total: 1\nresults[1]{name}:\n  alpha\n"
         result = BENCHMARK.build_tool_call_result(
