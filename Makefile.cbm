@@ -1000,7 +1000,8 @@ cbm: $(BUILD_DIR)/codebase-memory-mcp
 INSTALL_DIR ?= $(HOME)/.local/bin
 install: cbm
 	@echo "Installing to $(INSTALL_DIR)/codebase-memory-mcp ..."
-	cp $(BUILD_DIR)/codebase-memory-mcp $(INSTALL_DIR)/codebase-memory-mcp
+	install -d "$(INSTALL_DIR)"
+	install -m 755 "$(BUILD_DIR)/codebase-memory-mcp" "$(INSTALL_DIR)/codebase-memory-mcp"
 	$(call codesign_binary,$(INSTALL_DIR)/codebase-memory-mcp)
 	@echo "Done. Run: $(INSTALL_DIR)/codebase-memory-mcp"
 
