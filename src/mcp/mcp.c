@@ -2395,12 +2395,13 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
+    /* Free is a shutdown boundary, not a wait-for-work API. Tell a supervised
+     * auto-index child to terminate before joining its owner thread. */
+    cbm_mcp_server_request_stop(srv);
     if (srv->update_thread_active) {
         cbm_thread_join(&srv->update_tid);
     }
-    if (srv->autoindex_active) {
-        cbm_thread_join(&srv->autoindex_tid);
-    }
+    (void)cbm_mcp_server_join_autoindex(srv);
     (void)cbm_mcp_server_join_overlay_compaction(srv, NULL);
     cbm_mutex_destroy(&srv->overlay_compaction_lock);
     cbm_mutex_destroy(&srv->update_notice_lock);
@@ -2411,6 +2412,15 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     free(srv->current_project);
     free(srv->active_request_id_str);
     free(srv);
+}
+
+int cbm_mcp_server_join_autoindex(cbm_mcp_server_t *srv) {
+    if (!srv || !srv->autoindex_active) {
+        return 0;
+    }
+    int rc = cbm_thread_join(&srv->autoindex_tid);
+    srv->autoindex_active = false;
+    return rc;
 }
 
 /* ── Idle store eviction ──────────────────────────────────────── */
@@ -8521,10 +8531,11 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
  * degrades to the in-process path. */
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     supervisor_invalidate_store(srv);
+    const atomic_bool *cancel_requested = srv ? &srv->stop_requested : NULL;
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
-    int rc = cbm_index_spawn_worker(args, false, NULL, NULL, &wr);
+    int rc = cbm_index_spawn_worker(args, false, NULL, NULL, cancel_requested, &wr);
 
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
         cbm_index_worker_result_free(&wr);
@@ -8542,6 +8553,12 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         cbm_index_worker_result_free(&wr);
         supervisor_invalidate_store(srv);
         return resp;
+    }
+    if (cancel_requested && atomic_load(cancel_requested)) {
+        cbm_proc_outcome_t cancelled_outcome = wr.outcome;
+        cbm_index_worker_result_free(&wr);
+        supervisor_invalidate_store(srv);
+        return build_worker_failure_response(args, cancelled_outcome);
     }
 
     /* Crash / hang / nonzero exit → skip-and-continue recovery. Re-run the
@@ -8590,7 +8607,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     for (int i = 0; i < cap; i++) {
         cbm_index_worker_result_t wr2;
         int rc2 = cbm_index_spawn_worker(args, /*single_thread=*/false, marker_path,
-                                         quarantine_path, &wr2);
+                                         quarantine_path, cancel_requested, &wr2);
         if (rc2 != 0) {
             last_outcome = wr2.outcome;
             cbm_index_worker_result_free(&wr2);
@@ -8669,8 +8686,8 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
      * so it cannot itself hang. Rare given monotonic progress. */
     if (!resp && quarantined > 0) {
         cbm_index_worker_result_t wrp;
-        int rcp =
-            cbm_index_spawn_worker(args, /*single_thread=*/false, NULL, quarantine_path, &wrp);
+        int rcp = cbm_index_spawn_worker(args, /*single_thread=*/false, NULL, quarantine_path,
+                                         cancel_requested, &wrp);
         if (rcp == 0 && wrp.outcome == CBM_PROC_CLEAN && wrp.response) {
             resp = wrp.response; /* transfer ownership to caller */
             wrp.response = NULL;
@@ -11968,6 +11985,10 @@ static void *autoindex_thread(void *arg) {
         char *resp = index_run_supervised_path(srv, srv->session_root);
         if (resp) {
             free(resp);
+            if (atomic_load(&srv->stop_requested)) {
+                cbm_log_info("autoindex.cancelled", "project", srv->session_project);
+                return NULL;
+            }
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
@@ -11977,6 +11998,11 @@ static void *autoindex_thread(void *arg) {
             return NULL;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
+    }
+
+    if (atomic_load(&srv->stop_requested)) {
+        cbm_log_info("autoindex.cancelled", "project", srv->session_project);
+        return NULL;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);

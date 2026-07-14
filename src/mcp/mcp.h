@@ -117,6 +117,10 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);
 
+/* Wait for a launched session auto-index without requesting cancellation.
+ * Returns the thread join status, or 0 when no auto-index is pending. */
+int cbm_mcp_server_join_autoindex(cbm_mcp_server_t *srv);
+
 /* Set external watcher reference (for auto-index registration). Not owned. */
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 

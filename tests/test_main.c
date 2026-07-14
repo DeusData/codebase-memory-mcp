@@ -362,6 +362,7 @@ int main(int argc, char **argv) {
         if (strstr("log", only_suite)) RUN_SUITE(log);
         if (strstr("str_util", only_suite)) RUN_SUITE(str_util);
         if (strstr("platform", only_suite)) RUN_SUITE(platform);
+        if (strstr("subprocess", only_suite)) RUN_SUITE(subprocess);
         if (strstr("dump_verify", only_suite)) RUN_SUITE(dump_verify);
         if (strstr("ac", only_suite)) RUN_SUITE(ac);
         if (strstr("extraction", only_suite)) RUN_SUITE(extraction);

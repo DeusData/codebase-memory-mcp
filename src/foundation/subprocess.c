@@ -265,17 +265,42 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         }
     }
 
+    /* Put the worker in a kill-on-close Job before it can run, so cancellation
+     * reaps descendants as well as the direct process. Fall back to direct
+     * process termination if the host forbids nested Jobs. */
+    HANDLE job = CreateJobObjectW(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits,
+                                     sizeof(limits))) {
+            CloseHandle(job);
+            job = NULL;
+        }
+    }
+
     PROCESS_INFORMATION pi = {0};
-    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    DWORD create_flags = job ? CREATE_SUSPENDED : 0;
+    BOOL ok = CreateProcessW(NULL, wcmd, NULL, NULL, TRUE, create_flags, NULL, NULL, &si, &pi);
     free(wcmd);
     if (hlog != INVALID_HANDLE_VALUE) {
         CloseHandle(hlog);
     }
     if (!ok) {
+        if (job) {
+            CloseHandle(job);
+        }
         out->outcome = CBM_PROC_SPAWN_FAILED;
         out->exit_code = -1;
         out->term_signal = 0;
         return -1;
+    }
+    if (job && !AssignProcessToJobObject(job, pi.hProcess)) {
+        CloseHandle(job);
+        job = NULL;
+    }
+    if (create_flags & CREATE_SUSPENDED) {
+        ResumeThread(pi.hThread);
     }
     if (opts->child_pid_out) {
         atomic_store(opts->child_pid_out, (long)pi.dwProcessId);
@@ -284,6 +309,7 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
+    bool cancelled = false;
     for (;;) {
         DWORD w = WaitForSingleObject(pi.hProcess, 200);
         if (cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud)) {
@@ -292,9 +318,23 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         if (w == WAIT_OBJECT_0) {
             break;
         }
+        if (opts->cancel_requested && atomic_load(opts->cancel_requested)) {
+            if (job) {
+                TerminateJobObject(job, 1);
+            } else {
+                TerminateProcess(pi.hProcess, 1);
+            }
+            WaitForSingleObject(pi.hProcess, INFINITE);
+            cancelled = true;
+            break;
+        }
         if (opts->quiet_timeout_ms > 0 &&
             (cbm_now_ms() - last_activity) >= (uint64_t)opts->quiet_timeout_ms) {
-            TerminateProcess(pi.hProcess, 1);
+            if (job) {
+                TerminateJobObject(job, 1);
+            } else {
+                TerminateProcess(pi.hProcess, 1);
+            }
             WaitForSingleObject(pi.hProcess, INFINITE);
             timed_out = true;
             break;
@@ -308,13 +348,17 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     }
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    if (job) {
+        CloseHandle(job); /* kill-on-close cleans any descendant still running */
+    }
     if (opts->log_file && opts->delete_log_on_exit) {
         DeleteFileA(opts->log_file);
     }
 
     out->exit_code = (int)code;
     out->term_signal = 0;
-    out->outcome = cbm_proc_classify(true, (int)code, 0, timed_out);
+    out->outcome = cancelled ? CBM_PROC_KILLED
+                             : cbm_proc_classify(true, (int)code, 0, timed_out);
     return 0;
 }
 
@@ -338,6 +382,9 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
          * threads plus mimalloc/sqlite global state), and a fork() copies
          * only the calling thread — a malloc between fork and exec could deadlock on
          * a lock another thread held at fork time. open/dup2/execv touch no heap. */
+        /* Isolate the worker and every command it launches (git, compiler,
+         * scanner) so timeout/cancellation can terminate the whole tree. */
+        (void)setpgid(0, 0);
         const char *bin = opts->bin;
         const char *const default_argv[] = {bin, NULL};
         const char *const *argv = opts->argv ? opts->argv : default_argv;
@@ -353,6 +400,9 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         execv(bin, (char *const *)argv);
         _exit(127); /* exec failed */
     }
+    /* Close the fork/exec race where the parent cancels before the child has
+     * installed its own process group. EACCES means exec already won. */
+    (void)setpgid(pid, pid);
     if (opts->child_pid_out) {
         atomic_store(opts->child_pid_out, (long)pid);
     }
@@ -360,6 +410,7 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
     bool timed_out = false;
+    bool cancelled = false;
     int wstatus = 0;
     for (;;) {
         pid_t wr;
@@ -374,9 +425,21 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
         if (done) {
             break;
         }
+        if (opts->cancel_requested && atomic_load(opts->cancel_requested)) {
+            if (kill(-pid, SIGKILL) != 0 && errno == ESRCH) {
+                (void)kill(pid, SIGKILL); /* process-group setup was unavailable */
+            }
+            do {
+                wr = waitpid(pid, &wstatus, 0);
+            } while (wr < 0 && errno == EINTR);
+            cancelled = true;
+            break;
+        }
         if (opts->quiet_timeout_ms > 0 &&
             (cbm_now_ms() - last_activity) >= (uint64_t)opts->quiet_timeout_ms) {
-            kill(pid, SIGKILL);
+            if (kill(-pid, SIGKILL) != 0 && errno == ESRCH) {
+                (void)kill(pid, SIGKILL); /* process-group setup was unavailable */
+            }
             do {
                 wr = waitpid(pid, &wstatus, 0);
             } while (wr < 0 && errno == EINTR);
@@ -397,11 +460,13 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     if (WIFEXITED(wstatus)) {
         out->exit_code = WEXITSTATUS(wstatus);
         out->term_signal = 0;
-        out->outcome = cbm_proc_classify(true, out->exit_code, 0, timed_out);
+        out->outcome = cancelled ? CBM_PROC_KILLED
+                                 : cbm_proc_classify(true, out->exit_code, 0, timed_out);
     } else if (WIFSIGNALED(wstatus)) {
         out->exit_code = -1;
         out->term_signal = WTERMSIG(wstatus);
-        out->outcome = cbm_proc_classify(false, -1, out->term_signal, timed_out);
+        out->outcome = cancelled ? CBM_PROC_KILLED
+                                 : cbm_proc_classify(false, -1, out->term_signal, timed_out);
     } else {
         out->exit_code = -1;
         out->term_signal = 0;

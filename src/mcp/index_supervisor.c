@@ -145,7 +145,8 @@ static void worker_tmp_path(char *out, size_t out_sz, int pid, const char *suffi
 }
 
 int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
-                           const char *quarantine_file, cbm_index_worker_result_t *result) {
+                           const char *quarantine_file, const atomic_bool *cancel_requested,
+                           cbm_index_worker_result_t *result) {
     g_spawn_count++; /* test hook (#845) — see cbm_index_supervisor_spawn_count */
     if (single_thread) {
         g_spawn_st_count++; /* test hook — must stay 0: recovery is parallel-only */
@@ -206,6 +207,7 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
     opts.argv = argv;
     opts.log_file = log_path;
     opts.quiet_timeout_ms = cbm_index_worker_quiet_timeout_ms();
+    opts.cancel_requested = cancel_requested;
     /* We manage log deletion ourselves after reaping (below): keep it on failure
      * for post-mortem, delete it only on a clean run. See the observability
      * note at the reap site. */
@@ -258,7 +260,9 @@ int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char
      * msg=prof pass/sub-phase report is only written there, and deleting it on
      * success made profiling clean runs impossible. Keep it and say where it is. */
     bool response_is_error = result->response && strstr(result->response, "\"isError\":true");
-    if (r.outcome == CBM_PROC_CLEAN && !cbm_profile_active && !response_is_error) {
+    bool cancelled = cancel_requested && atomic_load(cancel_requested);
+    if (cancelled ||
+        (r.outcome == CBM_PROC_CLEAN && !cbm_profile_active && !response_is_error)) {
         (void)remove(log_path);
     } else if (r.outcome == CBM_PROC_CLEAN && response_is_error) {
         cbm_log_warn("index.supervisor.worker_response_error", "log", log_path);
