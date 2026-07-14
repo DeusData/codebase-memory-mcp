@@ -261,6 +261,12 @@ static bool cli_args_request_help(int argc, char **argv) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             return true;
         }
+        /* Once a tool name is present, run_cli() must handle a later help
+         * flag so it can render that tool's JSON-schema flags. Only global
+         * CLI options may precede the general `cli --help` form. */
+        if (strcmp(argv[i], "--json") != 0 && strcmp(argv[i], "--progress") != 0) {
+            return false;
+        }
     }
     return false;
 }
