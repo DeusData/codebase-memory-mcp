@@ -1030,9 +1030,52 @@ static bool delta_path_in_batch(const char *path, const cbm_pipeline_file_delta_
     return false;
 }
 
+/* Store and graph-buffer uniqueness distinguish sibling IMPORTS edges by
+ * local_name.  Exact-delta preflight/preservation must use the same identity;
+ * otherwise preserving the first import to a shared target suppresses every
+ * subsequent named import with the same source, target, and type. */
+static bool delta_import_local_name_equal(const char *lhs_properties,
+                                          const char *rhs_properties) {
+    const char *lhs_json = lhs_properties ? lhs_properties : "{}";
+    const char *rhs_json = rhs_properties ? rhs_properties : "{}";
+    if (strcmp(lhs_json, rhs_json) == 0) {
+        return true;
+    }
+
+    yyjson_doc *lhs_doc = yyjson_read(lhs_json, strlen(lhs_json), 0);
+    yyjson_doc *rhs_doc = yyjson_read(rhs_json, strlen(rhs_json), 0);
+    yyjson_val *lhs_root = lhs_doc ? yyjson_doc_get_root(lhs_doc) : NULL;
+    yyjson_val *rhs_root = rhs_doc ? yyjson_doc_get_root(rhs_doc) : NULL;
+    yyjson_val *lhs_value = lhs_root ? yyjson_obj_get(lhs_root, "local_name") : NULL;
+    yyjson_val *rhs_value = rhs_root ? yyjson_obj_get(rhs_root, "local_name") : NULL;
+    const char *lhs_name = yyjson_is_str(lhs_value) ? yyjson_get_str(lhs_value) : "";
+    const char *rhs_name = yyjson_is_str(rhs_value) ? yyjson_get_str(rhs_value) : "";
+    bool equal = strcmp(lhs_name, rhs_name) == 0;
+    if (lhs_doc) {
+        yyjson_doc_free(lhs_doc);
+    }
+    if (rhs_doc) {
+        yyjson_doc_free(rhs_doc);
+    }
+    return equal;
+}
+
+static bool delta_edge_identity_equal(const cbm_store_delta_edge_t *edge,
+                                      const char *source_qn, const char *target_qn,
+                                      const char *type, const char *properties_json) {
+    if (!edge || !edge->source_qn || !edge->target_qn || !edge->type ||
+        strcmp(edge->source_qn, source_qn) != 0 ||
+        strcmp(edge->target_qn, target_qn) != 0 || strcmp(edge->type, type) != 0) {
+        return false;
+    }
+    return strcmp(type, cbm_delta_edge_imports) != 0 ||
+           delta_import_local_name_equal(edge->properties_json, properties_json);
+}
+
 static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *deltas,
                                       int delta_count, const char *source_qn,
-                                      const char *target_qn, const char *type) {
+                                      const char *target_qn, const char *type,
+                                      const char *properties_json) {
     if (!deltas || !source_qn || !target_qn || !type) {
         return false;
     }
@@ -1043,9 +1086,7 @@ static bool delta_batch_contains_edge(const cbm_pipeline_file_delta_t *const *de
         }
         for (int j = 0; j < delta->delta.edge_count; j++) {
             const cbm_store_delta_edge_t *edge = &delta->delta.edges[j];
-            if (edge->source_qn && edge->target_qn && edge->type &&
-                strcmp(edge->source_qn, source_qn) == 0 &&
-                strcmp(edge->target_qn, target_qn) == 0 && strcmp(edge->type, type) == 0) {
+            if (delta_edge_identity_equal(edge, source_qn, target_qn, type, properties_json)) {
                 return true;
             }
         }
@@ -1061,7 +1102,7 @@ static bool delta_inbound_edge_is_regenerated_by_batch(
     return edge && edge->source_rel_path && edge->source_rel_path[0] == '\0' &&
            delta_path_in_batch(edge->edge_rel_path, deltas, delta_count) &&
            delta_batch_contains_edge(deltas, delta_count, edge->source_qn, edge->target_qn,
-                                     edge->type);
+                                     edge->type, edge->properties_json);
 }
 
 static void delta_inbound_debug_unsupported(const cbm_store_file_delta_t *delta,
@@ -1107,7 +1148,8 @@ static bool delta_inbound_edges_supported(cbm_store_t *store,
     for (int i = 0; i < edge_count; i++) {
         if (!delta_path_in_batch(edges[i].source_rel_path, deltas, delta_count) &&
             !delta_batch_contains_edge(deltas, delta_count, edges[i].source_qn,
-                                       edges[i].target_qn, edges[i].type) &&
+                                       edges[i].target_qn, edges[i].type,
+                                       edges[i].properties_json) &&
             !delta_inbound_edge_is_regenerated_by_batch(&edges[i], deltas, delta_count) &&
             !delta_owned_inbound_edge_is_deleted(&edges[i], delta)) {
             delta_inbound_debug_unsupported(&delta->delta, &edges[i], delta_count);
@@ -1198,7 +1240,7 @@ int cbm_pipeline_file_delta_add_preserved_inbound_edges(cbm_store_t *store,
         if (cbm_pipeline_delta_edge_type_is_recomputed(edge->type) ||
             !delta_node_qn_present(&delta->delta, edge->target_qn) ||
             delta_batch_contains_edge(single_delta, 1, edge->source_qn, edge->target_qn,
-                                      edge->type)) {
+                                      edge->type, edge->properties_json)) {
             continue;
         }
         rc = delta_append_preserved_inbound_edge(delta, edge);

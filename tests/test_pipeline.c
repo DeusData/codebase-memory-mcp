@@ -5120,6 +5120,62 @@ TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay) {
     PASS();
 }
 
+TEST(pipeline_file_delta_preserves_sibling_named_imports_to_shared_target) {
+    const char *project = "test";
+    const char *target_rel = "target.py";
+    const char *caller_rel = "consumer.py";
+    const char *target_qn = "test.target.Service.openapi";
+    const char *caller_qn = "test.consumer.py.__file__";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    int64_t target_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, target_rel, target_qn);
+    int64_t caller_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, caller_rel, caller_qn);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(caller_id, 0);
+
+    cbm_edge_t first = {.project = (char *)project,
+                        .source_id = caller_id,
+                        .target_id = target_id,
+                        .type = "IMPORTS",
+                        .properties_json = "{\"local_name\":\"METHODS_WITH_BODY\"}"};
+    cbm_edge_t second = {.project = (char *)project,
+                         .source_id = caller_id,
+                         .target_id = target_id,
+                         .type = "IMPORTS",
+                         .properties_json = "{\"local_name\":\"REF_PREFIX\"}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &first), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &second), 0);
+    ASSERT_EQ(cbm_store_rebuild_file_delta_owners(s, project, 1), CBM_STORE_OK);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Method", "openapi", target_qn, target_rel, 3, 7,
+                                   "{\"is_exported\":true}"),
+              0);
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, project, target_rel, 1, &delta),
+              CBM_STORE_OK);
+
+    int added = -1;
+    ASSERT_EQ(cbm_pipeline_file_delta_add_preserved_inbound_edges(s, &delta, &added),
+              CBM_STORE_OK);
+    ASSERT_EQ(added, 2);
+    ASSERT_EQ(delta.delta.edge_count, 2);
+    ASSERT_TRUE(strstr(delta.delta.edges[0].properties_json, "METHODS_WITH_BODY") != NULL ||
+                strstr(delta.delta.edges[1].properties_json, "METHODS_WITH_BODY") != NULL);
+    ASSERT_TRUE(strstr(delta.delta.edges[0].properties_json, "REF_PREFIX") != NULL ||
+                strstr(delta.delta.edges[1].properties_json, "REF_PREFIX") != NULL);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(pipeline_file_delta_descriptor_marks_unsupported_edges) {
     cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
     ASSERT_NOT_NULL(gb);
@@ -16850,6 +16906,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_file_delta_detects_cross_file_node_qn_collision);
     RUN_TEST(pipeline_file_delta_owns_target_header_usage_edges);
     RUN_TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay);
+    RUN_TEST(pipeline_file_delta_preserves_sibling_named_imports_to_shared_target);
     RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
     RUN_TEST(pipeline_file_delta_metadata_from_file);
     RUN_TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint);
