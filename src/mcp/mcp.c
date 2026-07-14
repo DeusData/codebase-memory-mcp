@@ -5439,7 +5439,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             /* Semantic-only calls get semantic results only: the legacy
              * behavior also ran the UNFILTERED regex search and prepended
              * up to `limit` unrelated enriched nodes to the response. */
-            bool has_filters = label || name_pattern || qn_pattern || file_pattern ||
+            bool has_filters = label || name_pattern || qn_pattern || unified_pattern ||
+                               file_pattern ||
                                relationship || exclude_entry_points ||
                                min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
             bool semantic_only = sq_present && !has_filters;
@@ -5486,8 +5487,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             free(label);
             free(name_pattern);
             free(qn_pattern);
+            free(unified_pattern);
             free(file_pattern);
             free(relationship);
+            free(sort_by);
+            free(search_mode);
+            free_string_array(exclude);
             /* One-shot _context/session_project delivery on the TOON path —
              * the early return here previously skipped inject_context_once. */
             toon_append_context_once(&sb, srv, store);
@@ -5505,8 +5510,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(label);
         free(name_pattern);
         free(qn_pattern);
+        free(unified_pattern);
         free(file_pattern);
         free(relationship);
+        free(sort_by);
+        free(search_mode);
+        free_string_array(exclude);
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
             "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "

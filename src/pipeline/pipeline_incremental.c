@@ -1008,6 +1008,13 @@ static void incr_free_result_cache(CBMFileResult **cache, int count) {
     free(cache);
 }
 
+static void incr_release_seq_cross_arena(cbm_pipeline_ctx_t *ctx) {
+    if (ctx && ctx->seq_cross_arena_live) {
+        cbm_arena_destroy(&ctx->seq_cross_arena);
+        ctx->seq_cross_arena_live = false;
+    }
+}
+
 /* Run parallel or sequential extract+resolve for changed files. */
 static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
     struct timespec t;
@@ -1108,13 +1115,14 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         if (cbm_pipeline_test_fail_phase_enabled(CBM_TEST_FAIL_INCREMENTAL_EXTRACT)) {
             cbm_log_error("incremental.err", "phase", CBM_TEST_FAIL_INCREMENTAL_EXTRACT, "rc",
                           itoa_buf_incr(CBM_NOT_FOUND));
-            return CBM_NOT_FOUND;
+            rc = CBM_NOT_FOUND;
+            goto sequential_cleanup;
         }
         rc = cbm_pipeline_pass_definitions(ctx, changed_files, ci);
         if (rc != 0) {
             cbm_log_error("incremental.err", "phase", "incr_definitions", "rc",
                           itoa_buf_incr(rc));
-            return rc;
+            goto sequential_cleanup;
         }
         if (ctx->result_cache) {
             cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1124,22 +1132,31 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
             if (rc != 0) {
                 cbm_log_error("incremental.err", "phase", "incr_lsp_cross", "rc",
                               itoa_buf_incr(rc));
-                return rc;
+                goto sequential_cleanup;
             }
         }
         rc = cbm_pipeline_pass_calls(ctx, changed_files, ci);
         if (rc != 0) {
             cbm_log_error("incremental.err", "phase", "incr_calls", "rc", itoa_buf_incr(rc));
-            return rc;
+            goto sequential_cleanup;
         }
         rc = cbm_pipeline_pass_usages(ctx, changed_files, ci);
         if (rc != 0) {
             cbm_log_error("incremental.err", "phase", "incr_usages", "rc", itoa_buf_incr(rc));
-            return rc;
+            goto sequential_cleanup;
         }
         rc = cbm_pipeline_pass_semantic(ctx, changed_files, ci);
         if (rc != 0) {
             cbm_log_error("incremental.err", "phase", "incr_semantic", "rc", itoa_buf_incr(rc));
+            goto sequential_cleanup;
+        }
+
+    sequential_cleanup:
+        /* Cross-language registries own interned names borrowed by the calls,
+         * usages, and semantic passes. Release them only after the final
+         * borrower, including every injected-failure path. */
+        incr_release_seq_cross_arena(ctx);
+        if (rc != 0) {
             return rc;
         }
     }

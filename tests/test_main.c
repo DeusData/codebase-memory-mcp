@@ -449,6 +449,10 @@ int main(int argc, char **argv) {
         if (strstr("grammar_probe_f", only_suite)) RUN_SUITE(grammar_probe_f);
         if (strstr("grammar_probe_g", only_suite)) RUN_SUITE(grammar_probe_g);
         if (strstr("incremental", only_suite)) RUN_SUITE(incremental);
+        /* Match the full-run exit path so focused sanitizer/leak runs do not
+         * report process-lifetime caches as suite-owned allocations. */
+        cbm_kind_in_set_free_cache();
+        sqlite3_shutdown();
         require_test_cache_cleanup();
         TEST_SUMMARY();
         return 0;
