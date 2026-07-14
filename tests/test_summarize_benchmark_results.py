@@ -24,8 +24,23 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
     def test_quality_failure_blocks_acceptance_even_with_high_speedup(self) -> None:
         case = {
             "passed": False,
-            "canonical_graph": {"equal": False},
-            "oracles": {"passed": True},
+            "canonical_graph": {
+                "equal": False,
+                "kind": "canonical nodes",
+                "left_count": 10,
+                "right_count": 11,
+                "left_only": "Function\told_value",
+                "right_only": "Function\tnew_value",
+            },
+            "oracles": {
+                "passed": True,
+                "route": {
+                    "quality": {
+                        "passed": False,
+                        "expected_substring": "/api/pan4-oracle",
+                    }
+                },
+            },
             "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
             "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
             "speedup_full_rebuild_over_incremental": 10.0,
@@ -34,6 +49,14 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["decision"], "REJECT: quality/correctness")
         self.assertEqual(row["canonical"], "0/1")
         self.assertEqual(row["speedup_p50"], 10.0)
+        self.assertEqual(
+            row["findings"],
+            [
+                "canonical nodes mismatch (incremental=10, fresh=11); "
+                "witness: Function old_value vs Function new_value",
+                "route failed (expected /api/pan4-oracle)",
+            ],
+        )
 
     def test_aggregate_reports_p50_p95_peak_rss_and_cleanup(self) -> None:
         reports = []
@@ -65,6 +88,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
         self.assertLess(markdown.index("Decision"), markdown.index("Speedup p50"))
         self.assertIn("Binary SHA-256", markdown)
+        self.assertIn("Correctness and quality findings", markdown)
+        self.assertIn("exact default tool-response payload", markdown)
+        self.assertIn("one real-repository mutation case", markdown)
 
     def test_query_quality_size_latency_and_pareto_frontier(self) -> None:
         compact_case = {
