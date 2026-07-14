@@ -10,16 +10,105 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char CBM_GIT_EMPTY_DIRTY_HASH[CBM_GIT_DIRTY_HASH_BUFSZ] = "0000000000000000";
 static const uint64_t CBM_GIT_DIRTY_HASH_SEED = 5381u;
 enum { CBM_GIT_STATUS_PREFIX_LEN = 3 };
+
+static int git_status_paths_parse_z(const char *buf, size_t len, char ***out_paths,
+                                    int *out_count);
 
 static uint64_t git_dirty_hash_update(uint64_t h, const unsigned char *buf, size_t n) {
     for (size_t i = 0; i < n; i++) {
         h = ((h << 5) + h) ^ buf[i];
     }
     return h;
+}
+
+static int64_t git_snapshot_mtime_ns(const struct stat *st) {
+#if defined(__APPLE__)
+    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
+static void git_dirty_hash_file_metadata(const char *repo_path, char **paths, int path_count,
+                                         uint64_t *hash) {
+    for (int i = 0; i < path_count; i++) {
+        char abs_path[CBM_PATH_MAX];
+        int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", repo_path, paths[i]);
+        if (n < 0 || (size_t)n >= sizeof(abs_path)) {
+            continue;
+        }
+        struct stat st;
+        if (stat(abs_path, &st) == 0) {
+            int64_t mtime_ns = git_snapshot_mtime_ns(&st);
+            int64_t size = (int64_t)st.st_size;
+            *hash = git_dirty_hash_update(*hash, (const unsigned char *)&mtime_ns,
+                                          sizeof(mtime_ns));
+            *hash = git_dirty_hash_update(*hash, (const unsigned char *)&size, sizeof(size));
+        }
+    }
+}
+
+static int git_capture_command(const char *cmd, char **out, size_t *out_len) {
+    *out = NULL;
+    *out_len = 0;
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+    char *buf = NULL;
+    size_t len = 0;
+    size_t cap = 0;
+    char chunk[CBM_SZ_4K];
+    size_t got = 0;
+    while ((got = fread(chunk, CBM_ALLOC_ONE, sizeof(chunk), fp)) > 0) {
+        if (got > SIZE_MAX - len - 1) {
+            free(buf);
+            (void)cbm_pclose(fp);
+            return CBM_NOT_FOUND;
+        }
+        if (len + got + 1 > cap) {
+            size_t new_cap = cap > 0 ? cap : CBM_SZ_4K;
+            while (new_cap < len + got + 1) {
+                if (new_cap > SIZE_MAX / PAIR_LEN) {
+                    free(buf);
+                    (void)cbm_pclose(fp);
+                    return CBM_NOT_FOUND;
+                }
+                new_cap *= PAIR_LEN;
+            }
+            char *tmp = safe_realloc(buf, new_cap);
+            if (!tmp) {
+                free(buf);
+                (void)cbm_pclose(fp);
+                return CBM_NOT_FOUND;
+            }
+            buf = tmp;
+            cap = new_cap;
+        }
+        memcpy(buf + len, chunk, got);
+        len += got;
+    }
+    bool read_error = ferror(fp) != 0;
+    int rc = cbm_pclose(fp);
+    if (read_error || rc != 0) {
+        free(buf);
+        return CBM_NOT_FOUND;
+    }
+    if (buf) {
+        buf[len] = '\0';
+    }
+    *out = buf;
+    *out_len = len;
+    return 0;
 }
 
 static int git_hash_command_output(const char *cmd, uint64_t *hash, int *bytes_read) {
@@ -75,15 +164,31 @@ static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size
     memcpy(out_hash, CBM_GIT_EMPTY_DIRTY_HASH, sizeof(CBM_GIT_EMPTY_DIRTY_HASH));
 
     char cmd[CBM_GIT_CMD_BUFSZ];
-    if (!cbm_git_format_status_command(cmd, sizeof(cmd), repo_path)) {
+    int command_len = snprintf(cmd, sizeof(cmd),
+                               "git --no-optional-locks -C \"%s\" status --porcelain=v1 -z "
+                               "--untracked-files=all 2>%s",
+                               repo_path, cbm_git_null_device());
+    if (!cbm_git_command_fits(command_len, sizeof(cmd))) {
         return CBM_NOT_FOUND;
     }
 
     uint64_t h = CBM_GIT_DIRTY_HASH_SEED;
-    int bytes = 0;
-    if (git_hash_command_output(cmd, &h, &bytes) != 0) {
+    char *status = NULL;
+    size_t status_len = 0;
+    if (git_capture_command(cmd, &status, &status_len) != 0) {
         return CBM_NOT_FOUND;
     }
+    h = git_dirty_hash_update(h, (const unsigned char *)status, status_len);
+    int bytes = status_len > (size_t)INT32_MAX ? INT32_MAX : (int)status_len;
+
+    char **paths = NULL;
+    int path_count = 0;
+    if (status_len > 0 &&
+        git_status_paths_parse_z(status, status_len, &paths, &path_count) != 0) {
+        free(status);
+        return CBM_NOT_FOUND;
+    }
+    free(status);
 
 #if !defined(_WIN32)
     if (git_format_submodule_status_command(cmd, sizeof(cmd), repo_path)) {
@@ -91,8 +196,14 @@ static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size
     }
 #endif
     if (bytes <= 0) {
+        cbm_git_status_paths_free(paths, path_count);
         return 0;
     }
+
+    /* #937: porcelain text alone is stable while an already-dirty file keeps
+     * changing. Fold metadata so each distinct dirty state is indexed once. */
+    git_dirty_hash_file_metadata(repo_path, paths, path_count, &h);
+    cbm_git_status_paths_free(paths, path_count);
 
     // NOLINTNEXTLINE(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
     int n = snprintf(out_hash, out_size, "%016llx", (unsigned long long)h);
@@ -124,21 +235,18 @@ static int git_file_count(const char *repo_path) {
     return rc == 0 && !read_error ? count : 0;
 }
 
-static bool git_status_path_seen(char **paths, int count, const char *path) {
-    for (int i = 0; i < count; i++) {
-        if (strcmp(paths[i], path) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 static int git_status_paths_add(char ***paths, int *count, int *cap, const char *path) {
-    if (!path || !path[0] || git_status_path_seen(*paths, *count, path)) {
+    if (!path || !path[0]) {
         return 0;
     }
     if (*count >= *cap) {
+        if (*cap > INT32_MAX / PAIR_LEN) {
+            return CBM_NOT_FOUND;
+        }
         int new_cap = *cap > 0 ? *cap * PAIR_LEN : CBM_SZ_16;
+        if ((size_t)new_cap > SIZE_MAX / sizeof(**paths)) {
+            return CBM_NOT_FOUND;
+        }
         char **tmp = (char **)safe_realloc(*paths, (size_t)new_cap * sizeof(**paths));
         if (!tmp) {
             return CBM_NOT_FOUND;
@@ -230,60 +338,21 @@ int cbm_git_status_paths(const char *repo_path, char ***out_paths, int *out_coun
     char cmd[CBM_GIT_CMD_BUFSZ];
     int n = snprintf(cmd, sizeof(cmd),
                      "git --no-optional-locks -C \"%s\" status --porcelain=v1 -z "
-                     "--untracked-files=normal 2>%s",
+                     "--untracked-files=all 2>%s",
                      repo_path, cbm_git_null_device());
     if (!cbm_git_command_fits(n, sizeof(cmd))) {
         return CBM_NOT_FOUND;
     }
 
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return CBM_NOT_FOUND;
-    }
-
     char *buf = NULL;
     size_t len = 0;
-    size_t cap = 0;
-    char chunk[CBM_SZ_4K];
-    size_t got = 0;
-    while ((got = fread(chunk, CBM_ALLOC_ONE, sizeof(chunk), fp)) > 0) {
-        if (got > SIZE_MAX - len - 1) {
-            free(buf);
-            (void)cbm_pclose(fp);
-            return CBM_NOT_FOUND;
-        }
-        if (len + got + 1 > cap) {
-            size_t new_cap = cap > 0 ? cap : CBM_SZ_4K;
-            while (new_cap < len + got + 1) {
-                if (new_cap > SIZE_MAX / PAIR_LEN) {
-                    free(buf);
-                    (void)cbm_pclose(fp);
-                    return CBM_NOT_FOUND;
-                }
-                new_cap *= PAIR_LEN;
-            }
-            char *tmp = (char *)safe_realloc(buf, new_cap);
-            if (!tmp) {
-                free(buf);
-                (void)cbm_pclose(fp);
-                return CBM_NOT_FOUND;
-            }
-            buf = tmp;
-            cap = new_cap;
-        }
-        memcpy(buf + len, chunk, got);
-        len += got;
-    }
-    bool read_error = ferror(fp) != 0;
-    int rc = cbm_pclose(fp);
-    if (read_error || rc != 0) {
-        free(buf);
+    int rc = git_capture_command(cmd, &buf, &len);
+    if (rc != 0) {
         return CBM_NOT_FOUND;
     }
     if (!buf) {
         return 0;
     }
-    buf[len] = '\0';
     rc = git_status_paths_parse_z(buf, len, out_paths, out_count);
     free(buf);
     return rc;

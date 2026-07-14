@@ -265,6 +265,19 @@ void cbm_pipeline_detect_url_arg_routes(cbm_gbuf_t *gb, const cbm_gbuf_node_t *s
     if (cbm_is_test_file(source_path, lang)) {
         return;
     }
+    const char *route_handler = NULL;
+    const char *registered_path = cbm_pipeline_call_route_path_and_handler(call, &route_handler);
+    if (cbm_service_pattern_route_method(call->callee_name) != NULL && registered_path &&
+        ((route_handler && route_handler[0] != '\0') ||
+         cbm_service_pattern_is_php_route_facade(call->callee_name) ||
+         cbm_service_pattern_route_suffix_allows_no_handler(call->callee_name))) {
+        /* The call-resolution pass already emitted this registration with its
+         * exact method. Running the generic URL fallback as well would create
+         * an `ANY` clone (for example r.GET(path, handler)) and split the
+         * canonical Route rendezvous. Handlerless dotted verbs remain eligible
+         * because they may be HTTP clients rather than registrations. */
+        return;
+    }
     for (int ai = 0; ai < call->arg_count; ai++) {
         const CBMCallArg *ca = &call->args[ai];
         const char *url = ca->value ? ca->value : ca->expr;

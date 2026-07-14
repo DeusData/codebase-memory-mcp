@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 # A new push to the PR supersedes the running validation — cancel it
 # instead of stacking zombie pipelines.
@@ -35,10 +36,91 @@ jobs:
       # dry runs and releases where a flaky red does not block a merge.
       skip_perf: true
 
+  # ── Which files changed? Gate the (heavier) build+smoke on product code so
+  #    docs / CI / test-only PRs stay fast. ──
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      product: ${{ steps.f.outputs.product }}
+    steps:
+      - name: Detect product-code changes
+        id: f
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          FILES=$(gh pr diff "$PR" --repo "$REPO" --name-only)
+          printf '%s\n' "$FILES"
+          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|scripts/build\.sh|scripts/smoke-test\.sh|scripts/env\.sh|Makefile\.cbm)'; then
+            echo "product=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "product=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── Light smoke: build the PRODUCTION binary and run the core smoke on the
+  #    three RELIABLE NATIVE platforms. Catches built-binary regressions at PR
+  #    time (e.g. the Windows CreateProcess argv-quoting class that previously
+  #    only surfaced in the release dry run). The full broad/emulated smoke stays
+  #    in the dry run. Only product-code PRs pay this; every leg gates.
+  #    SMOKE_DOWNLOAD_URL is intentionally unset — the download/update phases of
+  #    smoke-test.sh self-skip; the core index/search/trace phases still run. ──
+  pr-smoke:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        if: matrix.os == 'windows-latest'
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            coreutils
+
+      - name: Build prod + smoke (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          scripts/build.sh CC=gcc CXX=g++
+          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+
+      - name: Build prod + smoke (macOS)
+        if: matrix.os == 'macos-14'
+        run: |
+          scripts/build.sh CC=cc CXX=c++
+          codesign --sign - --force build/c/codebase-memory-mcp
+          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+
+      - name: Build prod + smoke (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: |
+          scripts/build.sh CC=clang CXX=clang++
+          BIN="$(pwd)/build/c/codebase-memory-mcp"
+          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
+          scripts/smoke-test.sh "$BIN"
+
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage
-    # succeeded, so matrix renames can never silently deadlock merges.
-    needs: [security, lint, test]
+    # succeeded, so matrix renames can never silently deadlock merges. `skipped`
+    # is OK: pr-smoke skips on docs/CI/test-only PRs (changes.product == false).
+    needs: [security, lint, test, changes, pr-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -50,7 +132,7 @@ jobs:
           echo "$RESULTS" | python3 -c "
           import json, sys
           needs = json.load(sys.stdin)
-          bad = {k: v['result'] for k, v in needs.items() if v['result'] != 'success'}
+          bad = {k: v['result'] for k, v in needs.items() if v['result'] not in ('success', 'skipped')}
           if bad:
               print('CI NOT OK:', bad)
               sys.exit(1)

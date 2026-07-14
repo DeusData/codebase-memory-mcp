@@ -6,6 +6,7 @@
 #include "foundation/constants.h"
 #include <string.h>
 #include <ctype.h>
+#include <stdio.h>
 
 enum {
     JSON_ESC_LEN = 2, /* escaped char takes 2 bytes (backslash + char) */

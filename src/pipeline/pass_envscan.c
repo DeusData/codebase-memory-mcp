@@ -331,7 +331,7 @@ static int scan_line(const char *line, file_type_t ft, char *key_out, size_t key
 /* Scan a single file for env URL bindings. Returns number of bindings added. */
 static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
                          cbm_env_binding_t *out, int max_out) {
-    FILE *f = fopen(full_path, "r");
+    FILE *f = cbm_fopen(full_path, "r");
     if (!f) {
         return 0;
     }
@@ -375,16 +375,22 @@ static int scan_env_file(const char *full_path, const char *rel, file_type_t ft,
 /* Process a single directory entry for env scanning. Returns bindings added. */
 static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char *root_path,
                              cbm_env_binding_t *out, int max_out, char path_stack[][CBM_SZ_512],
-                             int *stack_top) {
+                             int *stack_top, char **excluded_dirs, int excluded_count) {
     char full_path[CBM_SZ_512];
     snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, ent->name);
+    const char *rel = full_path + strlen(root_path);
+    while (*rel == '/') {
+        rel++;
+    }
 
     struct stat st;
     if (stat(full_path, &st) != 0) {
         return 0;
     }
     if (S_ISDIR(st.st_mode)) {
-        if (!is_ignored_dir(ent->name) && *stack_top < CBM_SZ_256) {
+        if (!is_ignored_dir(ent->name) &&
+            !cbm_pipeline_relpath_is_excluded(rel, excluded_dirs, excluded_count) &&
+            *stack_top < CBM_SZ_256) {
             cbm_str_copy(path_stack[*stack_top], sizeof(path_stack[0]), full_path);
             (*stack_top)++;
         }
@@ -397,14 +403,11 @@ static int process_env_entry(cbm_dirent_t *ent, const char *dir_path, const char
     if (ft == FT_UNKNOWN) {
         return 0;
     }
-    const char *rel = full_path + strlen(root_path);
-    while (*rel == '/') {
-        rel++;
-    }
     return scan_env_file(full_path, rel, ft, out, max_out);
 }
 
-int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out) {
+int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t *out, int max_out,
+                                       char **excluded_dirs, int excluded_count) {
     if (!root_path || !out || max_out <= 0) {
         return 0;
     }
@@ -427,9 +430,13 @@ int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int
         cbm_dirent_t *ent;
         while ((ent = cbm_readdir(d)) && count < max_out) {
             count += process_env_entry(ent, dir_path, root_path, out + count, max_out - count,
-                                       path_stack, &stack_top);
+                                       path_stack, &stack_top, excluded_dirs, excluded_count);
         }
         cbm_closedir(d);
     }
     return count;
+}
+
+int cbm_scan_project_env_urls(const char *root_path, cbm_env_binding_t *out, int max_out) {
+    return cbm_scan_project_env_urls_excluded(root_path, out, max_out, NULL, 0);
 }

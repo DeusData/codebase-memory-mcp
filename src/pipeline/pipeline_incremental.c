@@ -11,7 +11,12 @@
  */
 #include "foundation/constants.h"
 
-enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
+enum {
+    INCR_RING_BUF = 4,
+    INCR_RING_MASK = 3,
+    INCR_TS_BUF = 24,
+    INCR_NOT_INDEXED_PREFIX_LEN = sizeof("not_indexed") - 1
+};
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
 #include <stdio.h>
@@ -1787,9 +1792,14 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         goto cleanup;
     }
 
-    path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    /* Keep overlay auxiliary walks inside discovery exclusions (#792/#804). */
+    char **excluded_dirs = NULL;
+    int excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
+    path_aliases = cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs,
+                                                  excluded_count);
     pkgmap = cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), changed_files, changed_count,
-                                        project);
+                                        project, excluded_dirs, excluded_count);
     cbm_pipeline_set_pkgmap(pkgmap);
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -1805,6 +1815,8 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
         .extract_timeout_micros = cbm_pipeline_extract_timeout_micros(p),
         .path_aliases = path_aliases,
+        .excluded_dirs = excluded_dirs,
+        .excluded_count = excluded_count,
         .pkgmap_preseeded = true,
         .result_cache = result_cache,
         .store_backed_node_lookup = store,
@@ -2152,9 +2164,14 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         goto cleanup;
     }
 
-    path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    /* Keep exact-delta auxiliary walks inside discovery exclusions (#792/#804). */
+    char **excluded_dirs = NULL;
+    int excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
+    path_aliases = cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs,
+                                                  excluded_count);
     pkgmap = cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), exact_files, exact_count,
-                                        project);
+                                        project, excluded_dirs, excluded_count);
     cbm_pipeline_set_pkgmap(pkgmap);
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -2170,6 +2187,8 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
         .extract_timeout_micros = cbm_pipeline_extract_timeout_micros(p),
         .path_aliases = path_aliases,
+        .excluded_dirs = excluded_dirs,
+        .excluded_count = excluded_count,
         .pkgmap_preseeded = true,
         .result_cache = result_cache,
         .store_backed_node_lookup = store,
@@ -2461,6 +2480,85 @@ cleanup:
     return CBM_STORE_OK;
 }
 
+/* Index-coverage merge contract (#963). */
+static bool incr_coverage_is_by_design(const char *kind) {
+    return kind && strncmp(kind, "not_indexed", INCR_NOT_INDEXED_PREFIX_LEN) == 0;
+}
+
+static int incr_build_coverage(cbm_pipeline_t *p, const cbm_coverage_row_t *previous,
+                               int previous_count, const cbm_file_info_t *changed_files,
+                               int changed_count, cbm_coverage_row_t **out, int *out_count) {
+    if (!p || !out || !out_count || previous_count < 0 || changed_count < 0 ||
+        (previous_count > 0 && !previous) || (changed_count > 0 && !changed_files)) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *out_count = 0;
+
+    cbm_file_error_t *run_errors = NULL;
+    int run_error_count = 0;
+    cbm_pipeline_get_file_errors(p, &run_errors, &run_error_count);
+    char **run_excluded = NULL;
+    int run_excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &run_excluded, &run_excluded_count);
+    cbm_ignored_file_t *run_ignored = NULL;
+    int run_ignored_count = 0;
+    cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, NULL);
+
+    size_t capacity = (size_t)previous_count + (size_t)run_error_count +
+                      (size_t)run_excluded_count + (size_t)run_ignored_count;
+    if (capacity > (size_t)INT_MAX ||
+        (capacity > 0 && capacity > SIZE_MAX / sizeof(cbm_coverage_row_t))) {
+        return CBM_STORE_ERR;
+    }
+    cbm_coverage_row_t *rows =
+        capacity > 0 ? malloc(capacity * sizeof(*rows)) : NULL;
+    if (capacity > 0 && !rows) {
+        return CBM_STORE_ERR;
+    }
+
+    CBMHashTable *changed = NULL;
+    if (changed_count > 0) {
+        changed = cbm_ht_create((uint32_t)changed_count);
+        if (!changed) {
+            free(rows);
+            return CBM_STORE_ERR;
+        }
+        for (int i = 0; i < changed_count; i++) {
+            cbm_ht_set(changed, changed_files[i].rel_path, (void *)(uintptr_t)1);
+        }
+    }
+
+    /* #963: retain failures for untouched files, replace changed-file failures
+     * with this run's result, and rebuild not_indexed_* from fresh discovery. */
+    int count = 0;
+    for (int i = 0; i < previous_count; i++) {
+        if (!incr_coverage_is_by_design(previous[i].kind) && previous[i].rel_path &&
+            (!changed || !cbm_ht_has(changed, previous[i].rel_path))) {
+            rows[count++] = previous[i];
+        }
+    }
+    cbm_ht_free(changed);
+    for (int i = 0; i < run_error_count; i++) {
+        rows[count++] = (cbm_coverage_row_t){.rel_path = run_errors[i].path,
+                                             .kind = run_errors[i].phase,
+                                             .detail = run_errors[i].reason};
+    }
+    for (int i = 0; i < run_excluded_count; i++) {
+        rows[count++] = (cbm_coverage_row_t){.rel_path = run_excluded[i],
+                                             .kind = "not_indexed_dir",
+                                             .detail = "excluded subtree"};
+    }
+    for (int i = 0; i < run_ignored_count; i++) {
+        rows[count++] = (cbm_coverage_row_t){.rel_path = run_ignored[i].rel_path,
+                                             .kind = "not_indexed_file",
+                                             .detail = run_ignored[i].reason};
+    }
+    *out = rows;
+    *out_count = count;
+    return CBM_STORE_OK;
+}
+
 /* Transactionally publish the merged project graph + hashes.
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
@@ -2469,72 +2567,91 @@ static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char
                                cbm_file_info_t *files, int file_count,
                                const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
                                const char *repo_path, const char *pass_fingerprint, int mode,
-                               bool semantic_edges_refreshed) {
+                               bool semantic_edges_refreshed,
+                               cbm_pipeline_t *pipeline,
+                               const cbm_file_info_t *changed_files, int changed_count) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
-    if (hash_store) {
-        int flush_rc = cbm_gbuf_flush_to_store(gbuf, hash_store);
-        cbm_log_info("incremental.flush", "rc", itoa_buf_incr(flush_rc), "elapsed_ms",
-                     itoa_buf_incr((int)elapsed_ms_incr(t)));
-        if (flush_rc != 0) {
-            cbm_log_error("incremental.err", "phase", "flush", "rc", itoa_buf_incr(flush_rc));
-            cbm_store_close(hash_store);
-            return flush_rc;
-        }
-
-        int hash_rc =
-            persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
-        int state_rc = CBM_STORE_OK;
-        if (hash_rc == CBM_STORE_OK) {
-            state_rc = cbm_pipeline_persist_file_states(hash_store, project, files, file_count,
-                                                        CBM_PIPELINE_COMPAT_GENERATION,
-                                                        pass_fingerprint);
-        }
-        if (hash_rc != CBM_STORE_OK) {
-            cbm_store_close(hash_store);
-            return hash_rc;
-        }
-        if (state_rc != CBM_STORE_OK) {
-            cbm_log_error("incremental.err", "phase", "persist_file_state", "rc",
-                          itoa_buf_incr(state_rc));
-            cbm_store_close(hash_store);
-            return state_rc;
-        }
-
-        int owner_rc =
-            cbm_store_rebuild_file_delta_owners(hash_store, project, CBM_PIPELINE_COMPAT_GENERATION);
-        if (owner_rc != CBM_STORE_OK) {
-            cbm_log_error("incremental.err", "phase", "rebuild_file_delta_owners", "rc",
-                          itoa_buf_incr(owner_rc));
-            cbm_store_close(hash_store);
-            return owner_rc;
-        }
-
-        /* Project replacement rewrites node IDs and the contentless FTS table
-         * has no backing content to cascade from, so rebuild it after publish. */
-        int fts_rc = cbm_store_rebuild_nodes_fts(hash_store);
-        if (fts_rc != CBM_STORE_OK) {
-            cbm_log_error("incremental.err", "phase", "rebuild_nodes_fts", "rc",
-                          itoa_buf_incr(fts_rc));
-            cbm_store_close(hash_store);
-            return fts_rc;
-        }
-        int derived_rc =
-            cbm_pipeline_mark_replacement_derived_views(hash_store, project, mode,
-                                                        semantic_edges_refreshed);
-        if (derived_rc != CBM_STORE_OK) {
-            cbm_log_error("incremental.err", "phase", "mark_derived_views", "rc",
-                          itoa_buf_incr(derived_rc));
-            cbm_store_close(hash_store);
-            return derived_rc;
-        }
-
-        cbm_store_close(hash_store);
-    } else {
+    if (!hash_store) {
         cbm_log_error("incremental.err", "phase", "hash_store_open");
         return CBM_NOT_FOUND;
+    }
+
+    cbm_coverage_row_t *previous_coverage = NULL;
+    int previous_coverage_count = 0;
+    cbm_coverage_row_t *coverage = NULL;
+    int coverage_count = 0;
+    /* Project replacement cascades through index_coverage (#963). Capture the
+     * old failures so unchanged files retain their diagnostic state. */
+    int rc = cbm_store_coverage_get(hash_store, project, &previous_coverage,
+                                    &previous_coverage_count);
+    if (rc == CBM_STORE_OK) {
+        rc = incr_build_coverage(pipeline, previous_coverage, previous_coverage_count,
+                                 changed_files, changed_count, &coverage, &coverage_count);
+    }
+
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_gbuf_flush_to_store(gbuf, hash_store);
+        cbm_log_info("incremental.flush", "rc", itoa_buf_incr(rc), "elapsed_ms",
+                     itoa_buf_incr((int)elapsed_ms_incr(t)));
+        if (rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "flush", "rc", itoa_buf_incr(rc));
+        }
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = persist_hashes(hash_store, project, files, file_count, mode_skipped,
+                            mode_skipped_count);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_pipeline_persist_file_states(hash_store, project, files, file_count,
+                                              CBM_PIPELINE_COMPAT_GENERATION, pass_fingerprint);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "persist_file_state", "rc",
+                          itoa_buf_incr(rc));
+        }
+    }
+    if (rc == CBM_STORE_OK) {
+        /* Hashes must be authoritative before coverage replacement: its prune
+         * removes stale failure rows for files deleted from the repository. */
+        rc = cbm_store_coverage_replace(hash_store, project, coverage, coverage_count);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "persist_coverage", "rc",
+                          itoa_buf_incr(rc));
+        }
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_store_rebuild_file_delta_owners(hash_store, project,
+                                                 CBM_PIPELINE_COMPAT_GENERATION);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "rebuild_file_delta_owners", "rc",
+                          itoa_buf_incr(rc));
+        }
+    }
+    if (rc == CBM_STORE_OK) {
+        /* Replacement rewrites node IDs, while contentless FTS has no backing
+         * content or cascade path that can keep rowids synchronized. */
+        rc = cbm_store_rebuild_nodes_fts(hash_store);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "rebuild_nodes_fts", "rc",
+                          itoa_buf_incr(rc));
+        }
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_pipeline_mark_replacement_derived_views(hash_store, project, mode,
+                                                         semantic_edges_refreshed);
+        if (rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "mark_derived_views", "rc",
+                          itoa_buf_incr(rc));
+        }
+    }
+
+    free(coverage);
+    cbm_store_free_coverage(previous_coverage, previous_coverage_count);
+    cbm_store_close(hash_store);
+    if (rc != CBM_STORE_OK) {
+        return rc;
     }
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
@@ -2542,6 +2659,26 @@ static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
     return 0;
+}
+
+static int incr_refresh_coverage(cbm_store_t *store, cbm_pipeline_t *pipeline,
+                                 const char *project, const cbm_file_info_t *changed_files,
+                                 int changed_count) {
+    cbm_coverage_row_t *previous = NULL;
+    int previous_count = 0;
+    cbm_coverage_row_t *coverage = NULL;
+    int coverage_count = 0;
+    int rc = cbm_store_coverage_get(store, project, &previous, &previous_count);
+    if (rc == CBM_STORE_OK) {
+        rc = incr_build_coverage(pipeline, previous, previous_count, changed_files,
+                                 changed_count, &coverage, &coverage_count);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = cbm_store_coverage_replace(store, project, coverage, coverage_count);
+    }
+    free(coverage);
+    cbm_store_free_coverage(previous, previous_count);
+    return rc;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -2616,6 +2753,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         CBM_PROF_END_N("incremental", "4_noop_metadata_refresh", t_incr_noop_refresh,
                        cls.n_metadata_only);
+        int coverage_rc = incr_refresh_coverage(store, p, project, NULL, 0);
+        if (coverage_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "noop_coverage", "rc",
+                          itoa_buf_incr(coverage_rc));
+            incr_classification_free(&cls);
+            cbm_store_free_file_hashes(stored, stored_count);
+            cbm_store_close(store);
+            return coverage_rc;
+        }
         cbm_log_info("incremental.noop", "reason", "no_changes");
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
         incr_classification_free(&cls);
@@ -2637,6 +2783,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     (void)incr_try_exact_delete_route(p, store, db_path, project, cls.deleted, cls.deleted_count,
                                       ci, &exact_applied);
     if (exact_applied) {
+        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
+        if (coverage_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "exact_delete_coverage", "rc",
+                          itoa_buf_incr(coverage_rc));
+            incr_classification_free(&cls);
+            cbm_store_close(store);
+            return coverage_rc;
+        }
         if (cbm_pipeline_publish_kind(p) != CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY &&
             incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
             cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_exact_delete");
@@ -2650,6 +2804,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     (void)incr_try_overlay_upsert_route(p, store, project, changed_files, ci, cls.deleted_count,
                                         pass_fingerprint, &exact_applied);
     if (exact_applied) {
+        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
+        if (coverage_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "overlay_coverage", "rc",
+                          itoa_buf_incr(coverage_rc));
+            incr_classification_free(&cls);
+            cbm_store_close(store);
+            return coverage_rc;
+        }
         incr_classification_free(&cls);
         cbm_store_close(store);
         cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
@@ -2660,6 +2822,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                       file_count, cls.deleted, cls.deleted_count,
                                       pass_fingerprint, &exact_applied);
     if (exact_applied) {
+        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
+        if (coverage_rc != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "phase", "exact_upsert_coverage", "rc",
+                          itoa_buf_incr(coverage_rc));
+            incr_classification_free(&cls);
+            cbm_store_close(store);
+            return coverage_rc;
+        }
         if (cbm_pipeline_publish_kind(p) != CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY &&
             incr_clear_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
             cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_exact_upsert");
@@ -2818,7 +2988,16 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_log_info("incremental.registry_seed", "symbols", itoa_buf_incr(cbm_registry_size(registry)),
                  "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t)));
 
-    cbm_path_alias_collection_t *path_aliases = cbm_load_path_aliases(cbm_pipeline_repo_path(p));
+    /* Discovery exclusions (gitignore + skip dirs) captured by the run that
+     * routed here. Borrowed from the pipeline so the auxiliary repo walks
+     * (pkgmap via merge_pkg_entries, path aliases) skip excluded subtrees on
+     * incremental runs too — same borrow as the full path (#792/#804). */
+    char **excluded_dirs = NULL;
+    int excluded_count = 0;
+    cbm_pipeline_get_excluded(p, &excluded_dirs, &excluded_count);
+
+    cbm_path_alias_collection_t *path_aliases =
+        cbm_load_path_aliases_excluded(cbm_pipeline_repo_path(p), excluded_dirs, excluded_count);
 
     cbm_pipeline_ctx_t ctx = {
         .project_name = project,
@@ -2826,6 +3005,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .gbuf = existing,
         .registry = registry,
         .cancelled = cbm_pipeline_cancelled_ptr(p),
+        .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = cbm_pipeline_get_mode(p),
         .similarity_threshold = cbm_pipeline_similarity_threshold(p),
         .httplink_min_confidence = cbm_pipeline_httplink_min_confidence(p),
@@ -2834,6 +3014,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .lsp_confidence_floor = cbm_pipeline_lsp_confidence_floor(p),
         .extract_timeout_micros = cbm_pipeline_extract_timeout_micros(p),
         .path_aliases = path_aliases,
+        .excluded_dirs = excluded_dirs,
+        .excluded_count = excluded_count,
     };
 
     const char *structure_root_qn = incremental_structure_root_qn(existing, project);
@@ -2854,7 +3036,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
          * changed-file batch cannot resolve identical imports to broader
          * module nodes merely because it stayed below the parallel threshold. */
         CBMHashTable *incremental_pkgmap =
-            cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), files, file_count, project);
+            cbm_pkgmap_build_from_repo(cbm_pipeline_repo_path(p), files, file_count, project,
+                                       excluded_dirs, excluded_count);
         cbm_pipeline_set_pkgmap(incremental_pkgmap);
         ctx.pkgmap_preseeded = true;
         pipeline_rc = run_extract_resolve(&ctx, changed_files, ci);
@@ -2954,7 +3137,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     int persist_rc = publish_and_persist(existing, db_path, project, files, file_count,
                                          cls.mode_skipped, cls.mode_skipped_count,
                                          cbm_pipeline_repo_path(p), pass_fingerprint,
-                                         cbm_pipeline_get_mode(p), semantic_edges_refreshed);
+                                         cbm_pipeline_get_mode(p), semantic_edges_refreshed, p,
+                                         changed_files, ci);
     if (persist_rc == 0) {
         cbm_pipeline_set_graph_changed(p, true);
         cbm_pipeline_set_publish_kind(p, CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);

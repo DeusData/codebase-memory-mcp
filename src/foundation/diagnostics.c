@@ -35,6 +35,12 @@ static cbm_thread_t g_diag_thread;
 static bool g_diag_started = false;
 static time_t g_start_time = 0;
 static char g_diag_path[CBM_SZ_256] = "";
+/* Persistent NDJSON time-series (the memory TRAJECTORY users send us to diagnose
+ * slow leaks like #581). Unlike g_diag_path (a latest-snapshot file overwritten
+ * every interval and deleted on stop), this is appended-to and KEPT on exit. */
+static char g_diag_ndjson_path[CBM_SZ_256] = "";
+static size_t g_diag_ndjson_size = 0;
+#define DIAG_NDJSON_CAP_BYTES (8u * 1024u * 1024u) /* rotate to .1 past this */
 
 /* ── Query stats ─────────────────────────────────────────────────── */
 
@@ -89,6 +95,35 @@ static int count_open_fds(void) {
 #define DIAG_INTERVAL_S 5
 #define DIAG_PATH_EXTRA 24 /* ".tmp" + safety margin */
 
+/* Append one compact JSON line to the persistent NDJSON trajectory, rotating to
+ * <path>.1 once it passes the cap. Best-effort: a failed append never disrupts
+ * the server. The trajectory (a monotonic rss/committed climb over hours) is
+ * what reveals a slow leak like #581 — the single latest-snapshot file cannot. */
+static void append_trajectory(long uptime, size_t rss, size_t peak_rss, size_t commit,
+                              size_t peak_commit, size_t page_faults, int fds, int qcount) {
+    if (g_diag_ndjson_path[0] == '\0') {
+        return;
+    }
+    if (g_diag_ndjson_size > DIAG_NDJSON_CAP_BYTES) {
+        char rot[sizeof(g_diag_ndjson_path) + DIAG_PATH_EXTRA];
+        snprintf(rot, sizeof(rot), "%s.1", g_diag_ndjson_path);
+        (void)rename(g_diag_ndjson_path, rot); /* keep one previous generation */
+        g_diag_ndjson_size = 0;
+    }
+    FILE *f = fopen(g_diag_ndjson_path, "a");
+    if (!f) {
+        return;
+    }
+    int n = fprintf(f,
+                    "{\"uptime_s\":%ld,\"rss\":%zu,\"peak_rss\":%zu,\"committed\":%zu,"
+                    "\"peak_committed\":%zu,\"page_faults\":%zu,\"fd\":%d,\"queries\":%d}\n",
+                    uptime, rss, peak_rss, commit, peak_commit, page_faults, fds, qcount);
+    if (n > 0) {
+        g_diag_ndjson_size += (size_t)n;
+    }
+    (void)fclose(f);
+}
+
 static void write_diagnostics(void) {
     /* Collect mimalloc stats */
     size_t elapsed_ms = 0;
@@ -142,6 +177,10 @@ static void write_diagnostics(void) {
         return;
     }
     (void)cbm_write_file_atomic(g_diag_path, json, (size_t)n, NULL);
+
+    /* Also append to the persistent trajectory (kept on exit for users to send). */
+    append_trajectory(uptime, current_rss, peak_rss, current_commit, peak_commit, page_faults, fds,
+                      qcount);
 }
 
 static void *diag_thread_fn(void *arg) {
@@ -174,14 +213,23 @@ bool cbm_diag_start(void) {
         g_diag_path[0] = '\0';
         return false;
     }
+    path_len = snprintf(g_diag_ndjson_path, sizeof(g_diag_ndjson_path),
+                        "%s/cbm-diagnostics-%d.ndjson", cbm_tmpdir(), (int)getpid());
+    if (path_len < 0 || (size_t)path_len >= sizeof(g_diag_ndjson_path)) {
+        g_diag_path[0] = '\0';
+        g_diag_ndjson_path[0] = '\0';
+        return false;
+    }
+    g_diag_ndjson_size = 0;
 
     if (cbm_thread_create(&g_diag_thread, 0, diag_thread_fn, NULL) != 0) {
         return false;
     }
 
     g_diag_started = true;
-    (void)fprintf(stderr, "level=info msg=diagnostics.start path=%s interval=%ds\n", g_diag_path,
-                  DIAG_INTERVAL_S);
+    (void)fprintf(stderr,
+                  "level=info msg=diagnostics.start snapshot=%s trajectory=%s interval=%ds\n",
+                  g_diag_path, g_diag_ndjson_path, DIAG_INTERVAL_S);
     return true;
 }
 
@@ -193,11 +241,16 @@ void cbm_diag_stop(void) {
     cbm_thread_join(&g_diag_thread);
     g_diag_started = false;
 
-    /* Clean up file */
+    /* Remove the live latest-snapshot file (and its .tmp), but KEEP the
+     * trajectory NDJSON so the user can send it after the server exits. */
     cbm_unlink(g_diag_path);
     char tmp_path[sizeof(g_diag_path) + DIAG_PATH_EXTRA];
     int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", g_diag_path);
     if (tmp_len >= 0 && (size_t)tmp_len < sizeof(tmp_path)) {
         cbm_unlink(tmp_path);
+    }
+    if (g_diag_ndjson_path[0] != '\0') {
+        (void)fprintf(stderr, "level=info msg=diagnostics.trajectory_kept path=%s\n",
+                      g_diag_ndjson_path);
     }
 }

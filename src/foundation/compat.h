@@ -10,9 +10,11 @@
 
 #include <stddef.h>
 #include <stdio.h>
-/* getenv and, on Windows, _putenv_s are used by these compatibility helpers.
- * Include stdlib.h directly so strict toolchains do not depend on transitive
- * declarations from other headers. */
+/* stdlib.h declares getenv (cbm_tmpdir) and, on Windows, _putenv_s (cbm_setenv/
+ * cbm_unsetenv). The x86-64 mingw toolchain pulled it in transitively, but the
+ * aarch64 (CLANGARM64) include chain does not, so include it directly — without
+ * it those calls become implicit declarations that conflict with the real
+ * stdlib.h types and fail to compile on native ARM64 Windows. */
 #include <stdlib.h>
 
 /* ── Thread-local storage ─────────────────────────────────────── */

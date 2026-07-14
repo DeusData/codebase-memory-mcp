@@ -52,6 +52,8 @@ struct cbm_httpd {
 struct cbm_http_conn {
     cbm_sock_t fd;
     int recv_deadline_ms;
+    int response_status;
+    size_t response_bytes;
 };
 
 /* ── Small platform helpers ───────────────────────────────────── */
@@ -215,6 +217,14 @@ void cbm_httpd_conn_close(cbm_http_conn_t *c) {
     free(c);
 }
 
+int cbm_http_conn_status(const cbm_http_conn_t *c) {
+    return c ? c->response_status : 0;
+}
+
+size_t cbm_http_conn_response_bytes(const cbm_http_conn_t *c) {
+    return c ? c->response_bytes : 0;
+}
+
 /* ── Head parsing ─────────────────────────────────────────────── */
 
 static bool header_name_is(const char *line, size_t name_len, const char *name) {
@@ -332,6 +342,10 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
 
         if (header_name_is(p, nlen, "origin")) {
             copy_header_value(colon + 1, eol, req->origin, sizeof(req->origin));
+        } else if (header_name_is(p, nlen, "host")) {
+            copy_header_value(colon + 1, eol, req->host, sizeof(req->host));
+        } else if (header_name_is(p, nlen, "accept-language")) {
+            copy_header_value(colon + 1, eol, req->accept_language, sizeof(req->accept_language));
         } else if (header_name_is(p, nlen, "transfer-encoding")) {
             /* Chunked (or any transfer coding) is not supported. */
             return 411;
@@ -506,6 +520,8 @@ void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_header
                         size_t len) {
     if (!c)
         return;
+    c->response_status = status;
+    c->response_bytes = len;
     char head[1024];
     int hn = snprintf(head, sizeof(head),
                       "HTTP/1.1 %d %s\r\n"

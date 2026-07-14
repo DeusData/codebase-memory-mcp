@@ -19,6 +19,8 @@
 #include "discover/discover.h"
 #include "foundation/log.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/limits.h"
 #include "cbm.h"
 
 #include <stdlib.h>
@@ -30,7 +32,7 @@
 /* Read entire file into heap-allocated buffer. Returns NULL on error.
  * Caller must free(). Sets *out_len to byte count. */
 static char *k8s_read_file(const char *path, int *out_len) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = cbm_fopen(path, "rb");
     if (!f) {
         return NULL;
     }
@@ -39,7 +41,7 @@ static char *k8s_read_file(const char *path, int *out_len) {
     long size = ftell(f);
     (void)fseek(f, 0, SEEK_SET);
 
-    if (size <= 0 || size > (long)CBM_PERCENT * CBM_SZ_1K * CBM_SZ_1K) {
+    if (size <= 0 || size > cbm_max_file_bytes()) { /* generous, env-configurable cap (B4) */
         (void)fclose(f);
         return NULL;
     }

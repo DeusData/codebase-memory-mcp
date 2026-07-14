@@ -518,6 +518,47 @@ TEST(rustlsp_crossfile_method_dispatch) {
     PASS();
 }
 
+/* F4 Tier-2: the build-once shared registry path (cbm_rust_build_cross_registry +
+ * cbm_run_rust_lsp_cross_with_registry) must resolve IDENTICALLY to the per-file
+ * cbm_run_rust_lsp_cross — same fixture as rustlsp_crossfile_method_dispatch. Also
+ * asserts the registry is sealed read-only. */
+TEST(rustlsp_shared_registry_resolves_like_per_file) {
+    const char *caller = "fn run(d: &demo::Database) { d.query(\"select\"); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.demo.Database";
+    defs[0].short_name = "Database";
+    defs[0].label = "Type";
+    defs[0].def_module_qn = "test.demo";
+    defs[1].qualified_name = "test.demo.Database.query";
+    defs[1].short_name = "query";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.demo.Database";
+    defs[1].def_module_qn = "test.demo";
+    defs[1].return_types = "alloc.string.String";
+
+    const char *imp_names[] = {"demo"};
+    const char *imp_qns[] = {"test::demo"};
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    ASSERT_TRUE(reg->read_only);
+
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
+                                         imp_names, imp_qns, 1, NULL, /*manifest=*/NULL, &out,
+                                         /*result=*/NULL);
+
+    ASSERT_GTE(find_confident(&out, "run", "Database.query"), 0);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(rustlsp_crossfile_free_function) {
     const char *caller = "fn main() { utils::greet(\"x\"); }\n";
     CBMArena a;
@@ -5973,6 +6014,7 @@ void suite_rust_lsp(void) {
 
     /* Cross-file */
     RUN_TEST(rustlsp_crossfile_method_dispatch);
+    RUN_TEST(rustlsp_shared_registry_resolves_like_per_file);
     RUN_TEST(rustlsp_crossfile_free_function);
 
     /* Robustness */

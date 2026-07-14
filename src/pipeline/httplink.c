@@ -678,7 +678,7 @@ bool cbm_is_path_excluded(const char *path, const char **exclude_paths, int coun
 /* ── URL extraction ────────────────────────────────────────────── */
 
 int cbm_extract_url_paths(const char *text, char **out, int max_out) {
-    if (!text || !*text) {
+    if (!text || !*text || !out || max_out <= 0) {
         return 0;
     }
 
@@ -708,6 +708,15 @@ int cbm_extract_url_paths(const char *text, char **out, int max_out) {
         int path_len = path_end - path_start;
         if (path_len > 0 && path_len < 256) {
             out[count] = malloc((size_t)path_len + 1);
+            if (!out[count]) {
+                for (int path_index = 0; path_index < count; path_index++) {
+                    free(out[path_index]);
+                    out[path_index] = NULL;
+                }
+                cbm_regfree(&url_re);
+                cbm_regfree(&path_re);
+                return -1;
+            }
             memcpy(out[count], p + path_start, (size_t)path_len);
             out[count][path_len] = '\0';
             count++;
@@ -724,6 +733,15 @@ int cbm_extract_url_paths(const char *text, char **out, int max_out) {
         if (path_len > 0 && path_len < 256) {
             /* Check not already captured as part of a URL */
             char *path_str = malloc((size_t)path_len + 1);
+            if (!path_str) {
+                for (int path_index = 0; path_index < count; path_index++) {
+                    free(out[path_index]);
+                    out[path_index] = NULL;
+                }
+                cbm_regfree(&url_re);
+                cbm_regfree(&path_re);
+                return -1;
+            }
             memcpy(path_str, p + path_start, (size_t)path_len);
             path_str[path_len] = '\0';
 

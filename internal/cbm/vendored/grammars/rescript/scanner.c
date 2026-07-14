@@ -44,7 +44,8 @@ unsigned tree_sitter_rescript_external_scanner_serialize(void* state, char *buff
 }
 
 void tree_sitter_rescript_external_scanner_deserialize(void* state, const char *buffer, unsigned n_bytes) {
-  memcpy(state, buffer, n_bytes);
+  if (n_bytes > 0)
+    memcpy(state, buffer, n_bytes);
 }
 
 static void advance(TSLexer *lexer) { lexer->advance(lexer, false); }

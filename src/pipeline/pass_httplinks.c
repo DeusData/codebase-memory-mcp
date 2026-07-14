@@ -9,7 +9,7 @@
  *   - HANDLES edges: handler function → Route
  *   - HTTP_CALLS edges: caller → Route (cross-service calls)
  *   - ASYNC_CALLS edges: caller → Route (async dispatch)
- *   - CALLS edges with via=route_registration (registrar → handler)
+ *   - CALLS edges with via=route_registration (registrar → Route)
  *
  * Operates on graph buffer (pre-flush): reads Function/Method/Module nodes,
  * parses decorator properties via yyjson, reads source from disk, and writes
@@ -33,6 +33,7 @@
 #include "yyjson/yyjson.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,17 +267,16 @@ static bool is_jsts_file(const char *path) {
 static bool has_source_route_extractor(const char *path) {
     /* Keep this in lockstep with the source extractor dispatch below.
      * Decorator-based routes are handled before this gate and remain
-     * language-driven by definition properties rather than file extension. */
+     * language-driven by definition properties rather than file extension.
+     * PHP Route:: registrations are handled by call extraction, which retains
+     * enclosing prefix()->group() AST context (#952); rescanning them here with
+     * the context-free Laravel regex would mint prefix-dropped duplicates. */
     // NOLINTNEXTLINE(readability-implicit-bool-conversion)
-    return has_suffix(path, ".go") || is_jsts_file(path) || has_suffix(path, ".php") ||
-           has_suffix(path, ".kt") || has_suffix(path, ".kts");
+    return has_suffix(path, ".go") || is_jsts_file(path) || has_suffix(path, ".kt") ||
+           has_suffix(path, ".kts");
 }
 
 /* ── Route discovery ───────────────────────────────────────────── */
-
-/* Max routes per pass */
-#define MAX_ROUTES 4096
-#define MAX_CALL_SITES 4096
 
 /* Discover routes from a single Function/Method node. */
 static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx_t *ctx,
@@ -320,11 +320,6 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
                                                 max_out - total);
                 total += nr;
             }
-            if (has_suffix(fp, ".php")) {
-                nr = cbm_extract_laravel_routes(n->name, n->qualified_name, source, out + total,
-                                                max_out - total);
-                total += nr;
-            }
             if (has_suffix(fp, ".kt") || has_suffix(fp, ".kts")) {
                 nr = cbm_extract_ktor_routes(n->name, n->qualified_name, source, out + total,
                                              max_out - total);
@@ -338,16 +333,16 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
     return total;
 }
 
-/* Discover module-level routes (PHP Laravel, JS/TS Express at top level). */
+/* Discover module-level JS/TS Express routes. PHP Route facade calls are
+ * already emitted with their AST-composed group prefixes during call passes. */
 static int discover_module_routes(const cbm_gbuf_node_t *mod, const cbm_pipeline_ctx_t *ctx,
                                   cbm_route_handler_t *out, int max_out) {
     if (!mod->file_path) {
         return 0;
     }
 
-    bool is_php = has_suffix(mod->file_path, ".php");
     bool is_js = is_jsts_file(mod->file_path);
-    if (!is_php && !is_js) {
+    if (!is_js) {
         return 0;
     }
 
@@ -358,14 +353,8 @@ static int discover_module_routes(const cbm_gbuf_node_t *mod, const cbm_pipeline
     }
 
     int total = 0;
-    if (is_php) {
-        total += cbm_extract_laravel_routes(mod->name, mod->qualified_name, source, out + total,
-                                            max_out - total);
-    }
-    if (is_js) {
-        total += cbm_extract_express_routes(mod->name, mod->qualified_name, source, out + total,
-                                            max_out - total);
-    }
+    total += cbm_extract_express_routes(mod->name, mod->qualified_name, source, out + total,
+                                        max_out - total);
     free(source);
     return total;
 }
@@ -813,21 +802,18 @@ static void resolve_cross_file_group_prefixes(cbm_pipeline_ctx_t *ctx, cbm_route
     cbm_regfree(&group_var_re);
 }
 
-/* ── Registration call edges ───────────────────────────────────── */
+/* ── Registration handler resolution ───────────────────────────── */
 
-/* Create CALLS edges from route-registering functions to handler functions.
- * e.g., RegisterRoutes has .POST("/path", h.CreateOrder) → CALLS edge to CreateOrder. */
-static int create_registration_call_edges(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes,
-                                          int route_count) {
+/* Resolve source-extracted handler references before canonical Route insertion.
+ * The AST resolver already models registration as registrar → Route (CALLS) and
+ * handler → Route (HANDLES). Do not recreate the pre-b00e1f74 direct
+ * registrar → handler CALLS shape here; doing so splits route semantics and
+ * duplicates registrations whenever both discovery paths recognize a call. */
+static int resolve_registration_handlers(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes,
+                                         int route_count) {
     int count = 0;
     for (int i = 0; i < route_count; i++) {
         if (routes[i].handler_ref[0] == '\0') {
-            continue;
-        }
-
-        /* Find the registering function node */
-        const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_qn(ctx->gbuf, routes[i].qualified_name);
-        if (!registrar) {
             continue;
         }
 
@@ -853,10 +839,6 @@ static int create_registration_call_edges(cbm_pipeline_ctx_t *ctx, cbm_route_han
         /* Store resolved handler QN for later use in insertRouteNodes */
         snprintf(routes[i].resolved_handler_qn, sizeof(routes[i].resolved_handler_qn), "%s",
                  handler->qualified_name);
-
-        /* Create CALLS edge with via=route_registration */
-        cbm_gbuf_insert_edge(ctx->gbuf, registrar->id, handler->id, "CALLS",
-                             "{\"via\":\"route_registration\"}");
         count++;
     }
     return count;
@@ -864,42 +846,27 @@ static int create_registration_call_edges(cbm_pipeline_ctx_t *ctx, cbm_route_han
 
 /* ── Route node insertion ──────────────────────────────────────── */
 
-/* Insert Route nodes and HANDLES edges for discovered routes.
- * Uses ResolvedHandlerQN if set (from createRegistrationCallEdges). */
+/* Insert source-discovered routes through the shared canonical identity.
+ * Source regexes remain required fallbacks (for example handlerless Ktor), but
+ * AST-resolved Go/Express registrations may already own the canonical Route.
+ * In that case an existing HANDLES edge is stronger evidence than the source
+ * scanner's registrar/module fallback, so retain it without adding clones. */
 static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *routes,
                               int route_count) {
     int count = 0;
     for (int i = 0; i < route_count; i++) {
         cbm_route_handler_t *rh = &routes[i];
 
-        /* Build Route QN and name */
-        char normal_method[16];
-        snprintf(normal_method, sizeof(normal_method), "%s", rh->method[0] ? rh->method : "ANY");
-
-        /* Normalize path for QN: replace / with _ */
-        char normal_path[256];
-        snprintf(normal_path, sizeof(normal_path), "%s", rh->path);
-        for (char *c = normal_path; *c; c++) {
-            if (*c == '/') {
-                *c = '_';
-            }
+        const char *method = rh->method[0] ? rh->method : CBM_ROUTE_DEFAULT_METHOD;
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_props[CBM_SZ_256];
+        if (!cbm_pipeline_build_service_route_identity(
+                rh->path, CBM_SVC_HTTP, method, NULL, NULL, route_qn, sizeof(route_qn),
+                route_props, sizeof(route_props))) {
+            continue;
         }
-        /* Trim leading/trailing underscores */
-        char *np = normal_path;
-        while (*np == '_') {
-            np++;
-        }
-        size_t nplen = strlen(np);
-        while (nplen > 0 && np[nplen - 1] == '_') {
-            np[--nplen] = '\0';
-        }
-
-        char route_qn[1024];
-        snprintf(route_qn, sizeof(route_qn), "%s.route.%s.%s", rh->qualified_name, normal_method,
-                 np);
-
-        char route_name[256];
-        snprintf(route_name, sizeof(route_name), "%s %s", normal_method, rh->path);
+        const cbm_gbuf_node_t *existing_route = cbm_gbuf_find_by_qn(ctx->gbuf, route_qn);
+        int64_t existing_route_id = existing_route ? existing_route->id : 0;
 
         /* Use resolved handler QN if available */
         const char *handler_qn = rh->qualified_name;
@@ -941,47 +908,88 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
         }
         /* handler_node pointer is NOT used below — only the copies above */
 
-        /* Build properties JSON */
-        char props[512];
-        int n =
-            snprintf(props, sizeof(props), "{\"method\":\"%s\",\"path\":\"%s\",\"handler\":\"%s\"",
-                     rh->method, rh->path, handler_qn);
+        char protocol[CBM_SZ_32] = "";
         if (rh->protocol[0]) {
-            n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"protocol\":\"%s\"",
-                          rh->protocol);
+            snprintf(protocol, sizeof(protocol), "%s", rh->protocol);
         } else if (h_id > 0 && h_file[0] && h_start > 0) {
             /* Detect protocol from handler source */
             char *hsource = read_source_lines(ctx, h_file, h_start, h_end);
             if (hsource) {
                 const char *proto = cbm_detect_protocol(hsource);
                 if (proto[0]) {
-                    n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"protocol\":\"%s\"",
-                                  proto);
+                    snprintf(protocol, sizeof(protocol), "%s", proto);
                 }
                 free(hsource);
             }
         }
-        snprintf(props + n, sizeof(props) - (size_t)n, "}");
 
-        /* Create Route node */
-        int64_t route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", route_name, route_qn, h_file,
-                                                h_start, h_end, props);
+        int64_t route_id = existing_route_id;
+        if (route_id <= 0) {
+            char props[CBM_SZ_512];
+            char esc_handler[CBM_SZ_256];
+            char esc_path[CBM_SZ_256];
+            cbm_json_escape(esc_handler, sizeof(esc_handler), handler_qn);
+            cbm_json_escape(esc_path, sizeof(esc_path), rh->path);
+            int n = snprintf(props, sizeof(props),
+                             "{\"method\":\"%s\",\"path\":\"%s\",\"handler\":\"%s\"",
+                             method, esc_path, esc_handler);
+            if (protocol[0] && n >= 0 && (size_t)n < sizeof(props)) {
+                char esc_protocol[CBM_SZ_32];
+                cbm_json_escape(esc_protocol, sizeof(esc_protocol), protocol);
+                n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"protocol\":\"%s\"",
+                              esc_protocol);
+            }
+            if (n < 0 || (size_t)n >= sizeof(props) - SKIP_ONE) {
+                continue;
+            }
+            snprintf(props + n, sizeof(props) - (size_t)n, "}");
+            route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", rh->path, route_qn, h_file,
+                                            h_start, h_end, props);
+        }
         if (route_id <= 0) {
             continue;
         }
 
-        /* Create HANDLES edge: handler → Route */
+        const cbm_gbuf_edge_t **existing_handles = NULL;
+        int existing_handle_count = 0;
+        cbm_gbuf_find_edges_by_target_type(ctx->gbuf, route_id, "HANDLES", &existing_handles,
+                                           &existing_handle_count);
+
+        /* Create HANDLES only when the canonical Route has no stronger AST or
+         * decorator handler. This preserves regex-only fallback coverage while
+         * preventing Function/Module scans from adding weaker pseudo-handlers. */
         if (h_id > 0) {
-            int64_t source = h_id;
-            int64_t target = route_id;
-            cbm_gbuf_insert_edge(ctx->gbuf, source, target, "HANDLES", "{}");
+            bool has_handler = false;
+            for (int eh = 0; eh < existing_handle_count; eh++) {
+                if (existing_handles[eh]->source_id == h_id) {
+                    has_handler = true;
+                    break;
+                }
+            }
+            if (existing_handle_count == 0 || has_handler) {
+                cbm_gbuf_insert_edge(ctx->gbuf, h_id, route_id, "HANDLES", "{}");
+            }
 
             /* Mark handler as entry point */
-            char *new_props = set_entry_point(h_props_json);
-            if (new_props) {
-                cbm_gbuf_upsert_node(ctx->gbuf, h_label, h_name, h_qn, h_file, h_start, h_end,
-                                     new_props);
-                free(new_props);
+            if (existing_handle_count == 0 || has_handler) {
+                char *new_props = set_entry_point(h_props_json);
+                if (new_props) {
+                    cbm_gbuf_upsert_node(ctx->gbuf, h_label, h_name, h_qn, h_file, h_start, h_end,
+                                         new_props);
+                    free(new_props);
+                }
+            }
+        }
+
+        /* Regex-only registrations with an explicit handler still retain a
+         * registrar → Route edge. Existing AST registrations already have it,
+         * and graph-buffer insertion deduplicates the identical edge. */
+        if (rh->handler_ref[0] != '\0') {
+            const cbm_gbuf_node_t *registrar =
+                cbm_gbuf_find_by_qn(ctx->gbuf, rh->qualified_name);
+            if (registrar) {
+                cbm_gbuf_insert_edge(ctx->gbuf, registrar->id, route_id, "CALLS",
+                                     "{\"via\":\"route_registration\"}");
             }
         }
 
@@ -1075,11 +1083,10 @@ typedef struct {
     bool is_module; /* true = Module, false = Function/Method */
 } hl_work_item_t;
 
-/* Per-worker buffer for route discovery. */
-#define HL_ROUTES_PER_WORKER 512
 typedef struct {
-    cbm_route_handler_t routes[HL_ROUTES_PER_WORKER];
+    cbm_route_handler_t *routes;
     int count;
+    int capacity;
 } hl_route_buf_t;
 
 /* Context for parallel route discovery. */
@@ -1090,8 +1097,80 @@ typedef struct {
     hl_route_buf_t *worker_bufs; /* one per worker */
     int worker_count;
     _Atomic int next_idx;
+    _Atomic int allocation_failed;
     _Atomic int *cancelled;
 } hl_route_ctx_t;
+
+static bool hl_reserve_items(void **items, int *capacity, int required, size_t item_size) {
+    if (!items || !capacity || required < 0 || item_size == 0) {
+        return false;
+    }
+    if (required <= *capacity) {
+        return true;
+    }
+    int next_capacity = *capacity > 0 ? *capacity : CBM_SZ_8;
+    while (next_capacity < required) {
+        if (next_capacity > INT_MAX / 2) {
+            next_capacity = required;
+            break;
+        }
+        next_capacity *= 2;
+    }
+    if ((size_t)next_capacity > SIZE_MAX / item_size) {
+        return false;
+    }
+    void *grown = realloc(*items, (size_t)next_capacity * item_size);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *capacity = next_capacity;
+    return true;
+}
+
+static bool hl_append_items(void **items, int *count, int *capacity, const void *new_items,
+                            int new_count, size_t item_size) {
+    if (!items || !count || !capacity || new_count < 0 ||
+        (new_count > 0 && !new_items) || new_count > INT_MAX - *count) {
+        return false;
+    }
+    int required = *count + new_count;
+    if (!hl_reserve_items(items, capacity, required, item_size)) {
+        return false;
+    }
+    if (new_count > 0) {
+        memcpy((char *)*items + (size_t)*count * item_size, new_items,
+               (size_t)new_count * item_size);
+    }
+    *count = required;
+    return true;
+}
+
+static bool hl_discover_item_routes(hl_route_buf_t *buf, const hl_work_item_t *item,
+                                    const cbm_pipeline_ctx_t *ctx) {
+    int first = buf->count;
+    for (;;) {
+        if (!hl_reserve_items((void **)&buf->routes, &buf->capacity, first + 1,
+                              sizeof(*buf->routes))) {
+            return false;
+        }
+        int available = buf->capacity - first;
+        int discovered = item->is_module
+                             ? discover_module_routes(item->node, ctx, buf->routes + first,
+                                                      available)
+                             : discover_node_routes(item->node, ctx, buf->routes + first,
+                                                    available);
+        if (discovered < available) {
+            buf->count = first + discovered;
+            return true;
+        }
+        if (buf->capacity == INT_MAX ||
+            !hl_reserve_items((void **)&buf->routes, &buf->capacity, buf->capacity + 1,
+                              sizeof(*buf->routes))) {
+            return false;
+        }
+    }
+}
 
 static int hl_active_worker_count(int max_workers, int item_count) {
     if (item_count <= 0) {
@@ -1108,6 +1187,9 @@ static void hl_route_worker(int worker_id, void *arg) {
     hl_route_buf_t *buf = &rc->worker_bufs[worker_id];
 
     while (1) {
+        if (atomic_load_explicit(&rc->allocation_failed, memory_order_relaxed)) {
+            break;
+        }
         int idx = atomic_fetch_add_explicit(&rc->next_idx, 1, memory_order_relaxed);
         if (idx >= rc->item_count) {
             break;
@@ -1123,26 +1205,17 @@ static void hl_route_worker(int worker_id, void *arg) {
             continue;
         }
 
-        int space = HL_ROUTES_PER_WORKER - buf->count;
-        if (space <= 0) {
-            continue; /* worker buffer full */
+        if (!hl_discover_item_routes(buf, item, rc->ctx)) {
+            atomic_store_explicit(&rc->allocation_failed, 1, memory_order_relaxed);
+            break;
         }
-
-        int nr;
-        if (item->is_module) {
-            nr = discover_module_routes(item->node, rc->ctx, buf->routes + buf->count, space);
-        } else {
-            nr = discover_node_routes(item->node, rc->ctx, buf->routes + buf->count, space);
-        }
-        buf->count += nr;
     }
 }
 
-/* Per-worker buffer for call site discovery. */
-#define HL_SITES_PER_WORKER 512
 typedef struct {
-    cbm_http_call_site_t sites[HL_SITES_PER_WORKER];
+    cbm_http_call_site_t *sites;
     int count;
+    int capacity;
 } hl_site_buf_t;
 
 /* Context for parallel call site discovery. */
@@ -1154,14 +1227,55 @@ typedef struct {
     hl_site_buf_t *worker_bufs;
     int worker_count;
     _Atomic int next_idx;
+    _Atomic int allocation_failed;
     _Atomic int *cancelled;
 } hl_site_ctx_t;
+
+static void hl_free_paths(char **paths, int path_count) {
+    for (int path_index = 0; path_index < path_count; path_index++) {
+        free(paths[path_index]);
+    }
+}
+
+static bool hl_extract_all_url_paths(const char *source, char ***out_paths, int *out_count) {
+    char **paths = NULL;
+    int capacity = 0;
+    if (!out_paths || !out_count) {
+        return false;
+    }
+    *out_paths = NULL;
+    *out_count = 0;
+    for (;;) {
+        if (!hl_reserve_items((void **)&paths, &capacity, capacity + 1, sizeof(*paths))) {
+            free(paths);
+            return false;
+        }
+        int path_count = cbm_extract_url_paths(source, paths, capacity);
+        if (path_count < 0) {
+            free(paths);
+            return false;
+        }
+        if (path_count < capacity) {
+            *out_paths = paths;
+            *out_count = path_count;
+            return true;
+        }
+        hl_free_paths(paths, path_count);
+        if (capacity == INT_MAX) {
+            free(paths);
+            return false;
+        }
+    }
+}
 
 static void hl_site_worker(int worker_id, void *arg) {
     hl_site_ctx_t *sc = arg;
     hl_site_buf_t *buf = &sc->worker_bufs[worker_id];
 
     while (1) {
+        if (atomic_load_explicit(&sc->allocation_failed, memory_order_relaxed)) {
+            break;
+        }
         int idx = atomic_fetch_add_explicit(&sc->next_idx, 1, memory_order_relaxed);
         if (idx >= sc->node_count) {
             break;
@@ -1210,12 +1324,19 @@ static void hl_site_worker(int worker_id, void *arg) {
         // NOLINTNEXTLINE(readability-implicit-bool-conversion)
         bool is_async = has_async && !has_http;
 
-        /* Extract URL paths */
-        char *paths[64];
-        int path_count = cbm_extract_url_paths(source, paths, 64);
-
-        int space = HL_SITES_PER_WORKER - buf->count;
-        for (int p = 0; p < path_count && space > 0; p++) {
+        char **paths = NULL;
+        int path_count = 0;
+        if (!hl_extract_all_url_paths(source, &paths, &path_count) ||
+            path_count > INT_MAX - buf->count ||
+            !hl_reserve_items((void **)&buf->sites, &buf->capacity, buf->count + path_count,
+                              sizeof(*buf->sites))) {
+            hl_free_paths(paths, path_count);
+            free(paths);
+            free(source);
+            atomic_store_explicit(&sc->allocation_failed, 1, memory_order_relaxed);
+            break;
+        }
+        for (int p = 0; p < path_count; p++) {
             cbm_http_call_site_t *site = &buf->sites[buf->count];
             snprintf(site->path, sizeof(site->path), "%s", paths[p]);
             site->method[0] = '\0';
@@ -1224,13 +1345,9 @@ static void hl_site_worker(int worker_id, void *arg) {
             snprintf(site->source_label, sizeof(site->source_label), "%s", sc->labels[idx]);
             site->is_async = is_async;
             buf->count++;
-            space--;
         }
-        /* Free any remaining paths we couldn't store */
-        for (int p = 0; p < path_count; p++) {
-            free(paths[p]);
-        }
-
+        hl_free_paths(paths, path_count);
+        free(paths);
         free(source);
     }
 }
@@ -1250,10 +1367,11 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     }
 
     /* ── Phase 1: Route collection via parallel discovery ──
-     * Routes are discovered directly from disk by scanning Function/Method/
-     * Module nodes in parallel. (The fork's prescan cache that pre-extracted
-     * routes during the extraction phase was removed by the upstream merge, so
-     * we always compute routes directly here.) */
+     * Decorator routes come from extracted node properties. The bounded source
+     * fallbacks scan Function/Method/Module ranges in parallel for registrations
+     * the call extractor cannot model completely (for example handlerless Ktor).
+     * The fork's extraction-phase prescan cache was removed by the upstream
+     * merge, so this pass owns that fallback work directly. */
     const char *route_labels[] = {"Function", "Method", "Module"};
     const cbm_gbuf_node_t **label_nodes[3] = {NULL, NULL, NULL};
     int label_counts[3] = {0, 0, 0};
@@ -1265,11 +1383,9 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     int total_label_nodes = label_counts[0] + label_counts[1] + label_counts[2];
     CBM_PROF_END_N("httplinks", "0_collect_nodes_seq", t_collect_nodes, total_label_nodes);
 
-    cbm_route_handler_t *routes = calloc(MAX_ROUTES, sizeof(cbm_route_handler_t));
-    if (!routes) {
-        return -1;
-    }
+    cbm_route_handler_t *routes = NULL;
     int route_count = 0;
+    int route_capacity = 0;
 
     {
         /* Parallel route discovery from disk. */
@@ -1285,7 +1401,7 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
         }
 
         int wi = 0;
-        if (work_items) {
+        if (total_route_nodes == 0 || work_items) {
             for (int li = 0; li < 3; li++) {
                 for (int i = 0; i < label_counts[li]; i++) {
                     work_items[wi].node = label_nodes[li][i];
@@ -1298,8 +1414,10 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
         int route_workers = hl_active_worker_count(worker_count, wi);
         hl_route_buf_t *route_bufs =
             route_workers > 0 ? calloc((size_t)route_workers, sizeof(hl_route_buf_t)) : NULL;
+        bool route_collection_failed =
+            (total_route_nodes > 0 && !work_items) || (route_workers > 0 && !route_bufs);
 
-        if (work_items && route_bufs && route_workers > 0) {
+        if (!route_collection_failed && route_workers > 0) {
             hl_route_ctx_t rc = {
                 .items = work_items,
                 .item_count = wi,
@@ -1309,25 +1427,36 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
                 .cancelled = ctx->cancelled,
             };
             atomic_init(&rc.next_idx, 0);
+            atomic_init(&rc.allocation_failed, 0);
 
             cbm_parallel_for_opts_t opts = {.max_workers = route_workers, .force_pthreads = false};
             cbm_parallel_for(route_workers, hl_route_worker, &rc, opts);
 
-            for (int w = 0; w < route_workers; w++) {
-                int to_copy = route_bufs[w].count;
-                if (to_copy > MAX_ROUTES - route_count) {
-                    to_copy = MAX_ROUTES - route_count;
-                }
-                if (to_copy > 0) {
-                    memcpy(routes + route_count, route_bufs[w].routes,
-                           (size_t)to_copy * sizeof(cbm_route_handler_t));
-                    route_count += to_copy;
+            route_collection_failed =
+                atomic_load_explicit(&rc.allocation_failed, memory_order_relaxed) != 0;
+            if (!route_collection_failed) {
+                for (int w = 0; w < route_workers; w++) {
+                    if (!hl_append_items((void **)&routes, &route_count, &route_capacity,
+                                         route_bufs[w].routes, route_bufs[w].count,
+                                         sizeof(*routes))) {
+                        route_collection_failed = true;
+                        break;
+                    }
                 }
             }
         }
         free(work_items);
+        if (route_bufs) {
+            for (int worker_index = 0; worker_index < route_workers; worker_index++) {
+                free(route_bufs[worker_index].routes);
+            }
+        }
         free(route_bufs);
         CBM_PROF_END_N("httplinks", "1_route_discovery_parallel", t_routes, wi);
+        if (route_collection_failed) {
+            free(routes);
+            return -1;
+        }
     }
 
     cbm_log_info("httplink.routes", "count", itoa_hl(route_count));
@@ -1349,12 +1478,12 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     resolve_express_prefixes(ctx, routes, route_count);
     CBM_PROF_END_N("httplinks", "2_prefix_resolution_seq", t_prefix, route_count);
 
-    /* ── Phase 3: Registration edges (serial) ─────────────────── */
+    /* ── Phase 3: Registration handler resolution (serial) ───── */
     CBM_PROF_START(t_registration);
-    int reg_edges = create_registration_call_edges(ctx, routes, route_count);
-    CBM_PROF_END_N("httplinks", "3_registration_edges_seq", t_registration, route_count);
-    if (reg_edges > 0) {
-        cbm_log_info("httplink.registration_edges", "count", itoa_hl(reg_edges));
+    int handlers_resolved = resolve_registration_handlers(ctx, routes, route_count);
+    CBM_PROF_END_N("httplinks", "3_handler_resolution_seq", t_registration, route_count);
+    if (handlers_resolved > 0) {
+        cbm_log_info("httplink.handlers_resolved", "count", itoa_hl(handlers_resolved));
     }
 
     /* ── Phase 4: Route nodes + HANDLES edges (serial) ────────── */
@@ -1368,71 +1497,85 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
      * cache that pre-extracted these during extraction was removed by the
      * upstream merge, so we always compute call sites directly here.) */
 
-    cbm_http_call_site_t *sites = calloc(MAX_CALL_SITES, sizeof(cbm_http_call_site_t));
+    cbm_http_call_site_t *sites = NULL;
     int site_count = 0;
+    int site_capacity = 0;
     int total_site_nodes = label_counts[0] + label_counts[1];
 
     CBM_PROF_START(t_sites);
-    if (sites) {
-        const char *site_labels[] = {"Function", "Method"};
-        const cbm_gbuf_node_t **all_site_nodes = NULL;
-        const char **all_site_labels = NULL;
+    const char *site_labels[] = {"Function", "Method"};
+    const cbm_gbuf_node_t **all_site_nodes = NULL;
+    const char **all_site_labels = NULL;
+    bool site_collection_failed = false;
 
-        if (total_site_nodes > 0) {
-            all_site_nodes = malloc((size_t)total_site_nodes * sizeof(cbm_gbuf_node_t *));
-            // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
-            all_site_labels = malloc((size_t)total_site_nodes * sizeof(const char *));
-        }
-
-        if (all_site_nodes && all_site_labels) {
-            int si2 = 0;
-            for (int li = 0; li < 2; li++) {
-                for (int i = 0; i < label_counts[li]; i++) {
-                    all_site_nodes[si2] = label_nodes[li][i];
-                    all_site_labels[si2] = site_labels[li];
-                    si2++;
-                }
-            }
-
-            int site_workers = hl_active_worker_count(worker_count, si2);
-            hl_site_buf_t *site_bufs =
-                site_workers > 0 ? calloc((size_t)site_workers, sizeof(hl_site_buf_t)) : NULL;
-            if (site_bufs && site_workers > 0) {
-                hl_site_ctx_t sc = {
-                    .nodes = all_site_nodes,
-                    .labels = all_site_labels,
-                    .node_count = si2,
-                    .ctx = ctx,
-                    .worker_bufs = site_bufs,
-                    .worker_count = site_workers,
-                    .cancelled = ctx->cancelled,
-                };
-                atomic_init(&sc.next_idx, 0);
-
-                cbm_parallel_for_opts_t opts = {.max_workers = site_workers,
-                                                .force_pthreads = false};
-                cbm_parallel_for(site_workers, hl_site_worker, &sc, opts);
-
-                for (int w = 0; w < site_workers; w++) {
-                    int to_copy = site_bufs[w].count;
-                    if (to_copy > MAX_CALL_SITES - site_count) {
-                        to_copy = MAX_CALL_SITES - site_count;
-                    }
-                    if (to_copy > 0) {
-                        memcpy(sites + site_count, site_bufs[w].sites,
-                               (size_t)to_copy * sizeof(cbm_http_call_site_t));
-                        site_count += to_copy;
-                    }
-                }
-            }
-            free(site_bufs);
-        }
+    if (total_site_nodes > 0) {
+        all_site_nodes = malloc((size_t)total_site_nodes * sizeof(cbm_gbuf_node_t *));
         // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
-        free(all_site_nodes);
-        // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
-        free(all_site_labels);
+        all_site_labels = malloc((size_t)total_site_nodes * sizeof(const char *));
+        site_collection_failed = !all_site_nodes || !all_site_labels;
     }
+
+    int site_node_count = 0;
+    if (!site_collection_failed) {
+        for (int li = 0; li < 2; li++) {
+            for (int i = 0; i < label_counts[li]; i++) {
+                all_site_nodes[site_node_count] = label_nodes[li][i];
+                all_site_labels[site_node_count] = site_labels[li];
+                site_node_count++;
+            }
+        }
+
+        int site_workers = hl_active_worker_count(worker_count, site_node_count);
+        hl_site_buf_t *site_bufs =
+            site_workers > 0 ? calloc((size_t)site_workers, sizeof(hl_site_buf_t)) : NULL;
+        site_collection_failed = site_workers > 0 && !site_bufs;
+        if (!site_collection_failed && site_workers > 0) {
+            hl_site_ctx_t sc = {
+                .nodes = all_site_nodes,
+                .labels = all_site_labels,
+                .node_count = site_node_count,
+                .ctx = ctx,
+                .worker_bufs = site_bufs,
+                .worker_count = site_workers,
+                .cancelled = ctx->cancelled,
+            };
+            atomic_init(&sc.next_idx, 0);
+            atomic_init(&sc.allocation_failed, 0);
+
+            cbm_parallel_for_opts_t opts = {.max_workers = site_workers,
+                                            .force_pthreads = false};
+            cbm_parallel_for(site_workers, hl_site_worker, &sc, opts);
+
+            site_collection_failed =
+                atomic_load_explicit(&sc.allocation_failed, memory_order_relaxed) != 0;
+            if (!site_collection_failed) {
+                for (int w = 0; w < site_workers; w++) {
+                    if (!hl_append_items((void **)&sites, &site_count, &site_capacity,
+                                         site_bufs[w].sites, site_bufs[w].count,
+                                         sizeof(*sites))) {
+                        site_collection_failed = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (site_bufs) {
+            for (int worker_index = 0; worker_index < site_workers; worker_index++) {
+                free(site_bufs[worker_index].sites);
+            }
+        }
+        free(site_bufs);
+    }
+    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+    free(all_site_nodes);
+    // NOLINTNEXTLINE(bugprone-multi-level-implicit-pointer-conversion)
+    free(all_site_labels);
     CBM_PROF_END_N("httplinks", "5_callsite_scan_parallel", t_sites, total_site_nodes);
+    if (site_collection_failed) {
+        free(routes);
+        free(sites);
+        return -1;
+    }
 
     cbm_log_info("httplink.callsites", "count", itoa_hl(site_count));
 

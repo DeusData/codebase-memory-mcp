@@ -3,11 +3,15 @@
 #include "helpers.h"
 #include "lang_specs.h"
 #include "foundation/constants.h"
+#include "foundation/platform.h" // safe_realloc (frees old on failure)
+#include "foundation/log.h"      // cbm_log_warn
 #include "extract_node_stack.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include <stdint.h>          // uint32_t
+#include <stdio.h>           // snprintf
+#include <stdlib.h>          // getenv, atoi
 #include <string.h>
 #include <ctype.h>
 
@@ -23,8 +27,10 @@
 // Tree traversal limits.
 enum {
     TEMPLATE_DEPTH_LIMIT = 4,
-    DECLARATOR_DEPTH_LIMIT = 8,
+    DECLARATOR_DEPTH_LIMIT = CBM_DECLARATOR_DEPTH_LIMIT, // shared define in helpers.h
+
     EXPORT_ANCESTOR_DEPTH = 4,
+    FUNC_PARENT_CLIMB_LIMIT = 4, /* fun_expr -> term -> uni_term -> let_binding (Nickel) */
     DECORATOR_SCAN_LIMIT = 3,
     C_RETURN_WALK_DEPTH = 5,
     VAR_RECURSION_LIMIT = 8,
@@ -314,6 +320,10 @@ static TSNode resolve_func_name_scripting(TSNode node, CBMLanguage lang, const c
     if (lang == CBM_LANG_JULIA && strcmp(kind, "function_definition") == 0) {
         return resolve_julia_func_name(node);
     }
+    /* Julia short-form `name(args) = body` parses as an `assignment` whose LHS is
+     * a call_expression (`name(args)`); the function name is that call's head
+     * identifier. A plain `x = 5` (non-call LHS) is not a function — resolve NULL
+     * so it is neither extracted as a def nor scoped. */
     if (lang == CBM_LANG_JULIA && strcmp(kind, "assignment") == 0) {
         if (ts_node_named_child_count(node) > 0) {
             TSNode lhs = ts_node_named_child(node, 0);
@@ -471,7 +481,7 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
 // or NULL when the declarator is unqualified (a plain free function). Without
 // this, an out-of-line definition — whose class body lives declaration-only in a
 // header — would be recorded as a free Function with no link to its class.
-static char *cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
+char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source) {
     // Descend the declarator chain to its qualified_identifier, if any.
     TSNode qid = {0};
     TSNode decl = ts_node_child_by_field_name(node, TS_FIELD("declarator"));
@@ -565,8 +575,9 @@ static TSNode find_first_descendant_by_kind(TSNode node,
     return null_node;
 }
 
-// Forward declaration for mutual recursion.
-static TSNode resolve_func_name(TSNode node, CBMLanguage lang);
+// Forward declaration for mutual recursion. Exported (see helpers.h) so the
+// unified/calls extractor shares this one resolver — see cbm_resolve_func_name.
+TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
 static bool is_cpp_template_inner_kind(const char *kind) {
     return strcmp(kind, "function_definition") == 0 || strcmp(kind, "declaration") == 0 ||
@@ -613,8 +624,15 @@ static TSNode resolve_toplevel_arrow_name(TSNode node, const char *kind) {
         return null_node;
     }
     const char *pk = ts_node_type(parent);
-    if (strcmp(pk, "variable_declarator") == 0) {
+    if (strcmp(pk, "variable_declarator") == 0 || strcmp(pk, "public_field_definition") == 0) {
+        /* `const f = () => {}` and the class-field form `f = () => {}` both name
+         * the arrow via the parent's `name` child (#new_ts_class_field_arrow):
+         * resolving it lets push_boundary_scopes push a SCOPE_FUNC so in-body
+         * calls source to the method, not the enclosing class/module. */
         return ts_node_child_by_field_name(parent, TS_FIELD("name"));
+    }
+    if (strcmp(pk, "field_definition") == 0) {
+        return ts_node_child_by_field_name(parent, TS_FIELD("property"));
     }
     if (strcmp(pk, "pair") == 0) {
         return ts_node_child_by_field_name(parent, TS_FIELD("key"));
@@ -638,7 +656,10 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
          lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
          lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC) &&
         strcmp(kind, "function_definition") == 0) {
-        return cbm_c_family_declarator_name(*node_ptr);
+        /* Objective-C top-level C functions (`static int helper(int x) {...}`)
+         * have the same declarator structure as C — without this they get no
+         * name node and are dropped, so a call to them never resolves an edge. */
+        return cbm_resolve_c_declarator_name_node(*node_ptr);
     }
     TSNode null_node = {0};
     return null_node;
@@ -646,7 +667,7 @@ static TSNode resolve_func_name_c_family(TSNode *node_ptr, CBMLanguage lang, con
 
 // Resolve the name node for a function, handling language-specific quirks.
 // Uses a loop to handle template_declaration unwrapping (avoids recursion).
-static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
+TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
     enum { MAX_TEMPLATE_DEPTH = 2 };
     for (int tmpl_depth = 0; tmpl_depth < MAX_TEMPLATE_DEPTH; tmpl_depth++) {
         const char *kind = ts_node_type(node);
@@ -750,6 +771,44 @@ static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
 
+        /* Nickel: the lambda is a `fun_expr` with no name; the binding name is on
+         * the enclosing let_binding's `pat` field (a `pattern` wrapping an `ident`).
+         * Resolving via the parent keeps anonymous lambdas (e.g. `map (fun x => x)
+         * xs`), whose parent is not a let_binding, out of func_types. */
+        if (lang == CBM_LANG_NICKEL && strcmp(kind, "fun_expr") == 0) {
+            TSNode parent = ts_node_parent(node);
+            /* let_binding wraps the bound term in a `term`/`uni_term` chain, so the
+             * fun_expr's immediate parent is not the let_binding directly. */
+            for (int up = 0; up < FUNC_PARENT_CLIMB_LIMIT && !ts_node_is_null(parent); up++) {
+                if (strcmp(ts_node_type(parent), "let_binding") == 0) {
+                    TSNode pat = ts_node_child_by_field_name(parent, TS_FIELD("pat"));
+                    if (!ts_node_is_null(pat)) {
+                        TSNode inner = ts_node_child_by_field_name(pat, TS_FIELD("pat"));
+                        return ts_node_is_null(inner) ? pat : inner;
+                    }
+                    break;
+                }
+                parent = ts_node_parent(parent);
+            }
+        }
+
+        /* Nix: a named function is a `function_expression` (lambda `x: body`) with
+         * no name of its own — the binding name lives on the enclosing `binding`'s
+         * `attrpath` field (`name = x: ...`). Resolve through the parent binding to
+         * the attrpath's `attr` identifier so `addOne = x: ...` mints a Function
+         * def. A lambda whose parent is not a binding (e.g. an inline `map (x: x)`
+         * argument) resolves null and stays out of func_types. */
+        if (lang == CBM_LANG_NIX && strcmp(kind, "function_expression") == 0) {
+            TSNode parent = ts_node_parent(node);
+            if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "binding") == 0) {
+                TSNode attrpath = ts_node_child_by_field_name(parent, TS_FIELD("attrpath"));
+                if (!ts_node_is_null(attrpath)) {
+                    TSNode attr = ts_node_child_by_field_name(attrpath, TS_FIELD("attr"));
+                    return ts_node_is_null(attr) ? attrpath : attr;
+                }
+            }
+        }
+
         /* Fortran: subroutine/function wrap an inner *_statement that carries the
          * `name` field; the outer node walk_defs matched has no name itself. */
         if (lang == CBM_LANG_FORTRAN &&
@@ -828,6 +887,85 @@ static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
                 TSNode pname = cbm_find_child_by_kind(iddiv, "program_name");
                 if (!ts_node_is_null(pname)) {
                     return pname;
+                }
+            }
+        }
+
+        /* Teal: the `local function foo()` form reduces to a function_statement
+         * whose name is carried on a `function_name` child rather than the `name`
+         * field (the field is only populated for the bare `function foo()` form).
+         * func_name_node() already handled the field case above; here we cover the
+         * function_name child so local functions also produce a Function def. */
+        if (lang == CBM_LANG_TEAL &&
+            (strcmp(kind, "function_statement") == 0 || strcmp(kind, "function_signature") == 0)) {
+            TSNode fn = cbm_find_child_by_kind(node, "function_name");
+            if (!ts_node_is_null(fn)) {
+                return fn;
+            }
+        }
+
+        /* SCSS: function_statement/mixin_statement have no `name` field; the def
+         * name is a plain `name` child node. */
+        if (lang == CBM_LANG_SCSS &&
+            (strcmp(kind, "function_statement") == 0 || strcmp(kind, "mixin_statement") == 0)) {
+            TSNode nm = cbm_find_child_by_kind(node, "name");
+            if (!ts_node_is_null(nm)) {
+                return nm;
+            }
+        }
+
+        /* Jsonnet: a function binding is a `bind` node carrying the name on the
+         * `function` field (an `id`), plus a `params` field. Plain value binds
+         * (`local x = 1`) have no `params` field -> resolve null -> skipped, so
+         * only function binds become Function defs. */
+        if (lang == CBM_LANG_JSONNET && strcmp(kind, "bind") == 0) {
+            TSNode params = ts_node_child_by_field_name(node, TS_FIELD("params"));
+            if (!ts_node_is_null(params)) {
+                TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(nm)) {
+                    return nm;
+                }
+            }
+        }
+
+        /* Typst: `#let greet(name) = ...` parses to a `let` whose `pattern` field
+         * is a `call` node (the function signature); the name is that call's
+         * `item` field (an ident). A plain `#let x = 1` has a non-call pattern ->
+         * resolve null -> skipped, keeping value bindings out of func_types. */
+        if (lang == CBM_LANG_TYPST && strcmp(kind, "let") == 0) {
+            TSNode pat = ts_node_child_by_field_name(node, TS_FIELD("pattern"));
+            if (!ts_node_is_null(pat) && strcmp(ts_node_type(pat), "call") == 0) {
+                TSNode item = ts_node_child_by_field_name(pat, TS_FIELD("item"));
+                if (!ts_node_is_null(item)) {
+                    return item;
+                }
+            }
+        }
+
+        /* SQL: create_function has no `name` field; the function name is nested as
+         * object_reference > `name` field (an identifier). */
+        if (lang == CBM_LANG_SQL && strcmp(kind, "create_function") == 0) {
+            TSNode oref = cbm_find_child_by_kind(node, "object_reference");
+            if (!ts_node_is_null(oref)) {
+                TSNode nm = ts_node_child_by_field_name(oref, TS_FIELD("name"));
+                if (!ts_node_is_null(nm)) {
+                    return nm;
+                }
+            }
+        }
+
+        /* Elm: value_declaration carries its name on the
+         * `functionDeclarationLeft` field's function_declaration_left child,
+         * whose first lower_case_identifier is the function name. */
+        if (lang == CBM_LANG_ELM && strcmp(kind, "value_declaration") == 0) {
+            TSNode lhs = ts_node_child_by_field_name(node, TS_FIELD("functionDeclarationLeft"));
+            if (ts_node_is_null(lhs)) {
+                lhs = cbm_find_child_by_kind(node, "function_declaration_left");
+            }
+            if (!ts_node_is_null(lhs)) {
+                TSNode nm = cbm_find_child_by_kind(lhs, "lower_case_identifier");
+                if (!ts_node_is_null(nm)) {
+                    return nm;
                 }
             }
         }
@@ -953,6 +1091,32 @@ static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
             TSNode id = cbm_find_child_by_kind(node, "ident");
             if (!ts_node_is_null(id)) {
                 return id;
+            }
+        }
+
+        /* BitBake: a shell task `do_foo() {...}` is a function_definition and a
+         * python task `python do_foo() {...}` is an anonymous_python_function;
+         * both carry the task name on a direct `identifier` child (no `name`
+         * field). */
+        if (lang == CBM_LANG_BITBAKE && (strcmp(kind, "function_definition") == 0 ||
+                                         strcmp(kind, "anonymous_python_function") == 0)) {
+            TSNode id = cbm_find_child_by_kind(node, "identifier");
+            if (!ts_node_is_null(id)) {
+                return id;
+            }
+        }
+
+        /* PKL: a classMethod/objectMethod (`function foo(): T = ...`) has no
+         * `name` field; the name is the `identifier` inside its methodHeader
+         * child. */
+        if (lang == CBM_LANG_PKL &&
+            (strcmp(kind, "classMethod") == 0 || strcmp(kind, "objectMethod") == 0)) {
+            TSNode hdr = cbm_find_child_by_kind(node, "methodHeader");
+            if (!ts_node_is_null(hdr)) {
+                TSNode id = cbm_find_child_by_kind(hdr, "identifier");
+                if (!ts_node_is_null(id)) {
+                    return id;
+                }
             }
         }
 
@@ -1159,38 +1323,179 @@ static TSNode find_decorator_args(TSNode call_node) {
     return args;
 }
 
+static bool is_route_string_kind(const char *kind) {
+    return strcmp(kind, "string") == 0 || strcmp(kind, "string_literal") == 0 ||
+           strcmp(kind, "interpreted_string_literal") == 0;
+}
+
+static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source) {
+    if (!is_route_string_kind(ts_node_type(node))) {
+        return NULL;
+    }
+    char *path = cbm_node_text(a, node, source);
+    if (!path) {
+        return NULL;
+    }
+    int plen = (int)strlen(path);
+    if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
+        path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
+    }
+    return (path && path[0] == '/') ? path : NULL;
+}
+
+static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
+                                           int max_depth) {
+    if (ts_node_is_null(node) || max_depth < 0) {
+        return NULL;
+    }
+    const char *path = route_path_from_string_node(a, node, source);
+    if (path || max_depth == 0) {
+        return path;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && i < DECORATOR_SCAN_LIMIT; i++) {
+        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1);
+        if (path) {
+            return path;
+        }
+    }
+    return NULL;
+}
+
 // Extract route path from decorator arguments (first string that starts with /).
 static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc && ai < DECORATOR_SCAN_LIMIT; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
-        const char *ak = ts_node_type(arg);
-        /* Kotlin wraps each annotation argument in a `value_argument` node
-         * (and supports the named form `value = "/x"`); unwrap to the string. */
-        if (strcmp(ak, "value_argument") == 0) {
-            TSNode s = cbm_find_child_by_kind(arg, "string_literal");
-            if (ts_node_is_null(s)) {
-                continue;
-            }
-            arg = s;
-            ak = ts_node_type(arg);
-        }
-        if (strcmp(ak, "string") != 0 && strcmp(ak, "string_literal") != 0 &&
-            strcmp(ak, "interpreted_string_literal") != 0) {
-            continue;
-        }
-        char *path = cbm_node_text(a, arg, source);
+        /* Spring/Kotlin frequently uses named or array-valued annotation args:
+         *   @RequestMapping(value = ["/internal/v1"])
+         *   @GetMapping(path = {"/orders"})
+         * Walk a bounded subtree and keep the first string literal that is
+         * path-shaped, while ignoring non-route literals such as media types. */
+        const char *path = find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH);
         if (path) {
-            int plen = (int)strlen(path);
-            if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
-                path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
-            }
-            if (path && path[0] == '/') {
-                return path;
-            }
+            return path;
         }
     }
     return NULL;
+}
+
+// Find a keyword argument by name in an argument_list node and return its value child.
+static TSNode find_drf_kwarg_in_args(CBMArena *a, TSNode args, const char *kwarg_name,
+                                     const char *source) {
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t ai = 0; ai < nc; ai++) {
+        TSNode child = ts_node_named_child(args, ai);
+        if (strcmp(ts_node_type(child), "keyword_argument") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(child, TS_FIELD("name"));
+        if (ts_node_is_null(name_node))
+            continue;
+        char *name = cbm_node_text(a, name_node, source);
+        if (name && strcmp(name, kwarg_name) == 0) {
+            return ts_node_child_by_field_name(child, TS_FIELD("value"));
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+// Try to extract a route from a Django REST Framework @action decorator on a
+// ViewSet method:
+//   @action(detail=True, methods=["post"], url_path="approve")
+// Sets *out_path/*out_method so the downstream Route+HANDLES pipeline (Phase 2a
+// ensure_one_decorator_route) emits the handler->Route edge in the normal
+// direction. Falls back to the method name for url_path and "GET" for methods.
+// Known limitation: multi-method actions (methods=["get","post"]) capture only
+// the first method -> a single Route rather than one per method.
+static bool try_drf_action_decorator(CBMArena *a, TSNode dchild, const char *source,
+                                     TSNode func_node, const char **out_path,
+                                     const char **out_method) {
+    TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        fn = ts_node_named_child(dchild, 0);
+    }
+    if (ts_node_is_null(fn)) {
+        return false;
+    }
+    const char *fn_type = ts_node_type(fn);
+    if (strcmp(fn_type, "identifier") != 0) {
+        return false;
+    }
+    char *fn_text = cbm_node_text(a, fn, source);
+    if (!fn_text || strcmp(fn_text, "action") != 0) {
+        return false;
+    }
+    TSNode args = find_decorator_args(dchild);
+    if (ts_node_is_null(args)) {
+        return false;
+    }
+    const char *method = NULL;
+    TSNode methods_val = find_drf_kwarg_in_args(a, args, "methods", source);
+    if (!ts_node_is_null(methods_val) && strcmp(ts_node_type(methods_val), "list") == 0) {
+        uint32_t mc = ts_node_named_child_count(methods_val);
+        for (uint32_t mi = 0; mi < mc && !method; mi++) {
+            TSNode item = ts_node_named_child(methods_val, mi);
+            if (strcmp(ts_node_type(item), "string") != 0)
+                continue;
+            char *text = cbm_node_text(a, item, source);
+            if (!text)
+                continue;
+            int tlen = (int)strlen(text);
+            if (tlen < PAIR_CHARS || (text[0] != '"' && text[0] != '\''))
+                continue;
+            char inner[CBM_SZ_16];
+            int ilen = tlen - PAIR_CHARS;
+            if (ilen <= 0 || ilen >= (int)sizeof(inner))
+                continue;
+            memcpy(inner, text + SKIP_CHAR, (size_t)ilen);
+            inner[ilen] = '\0';
+            for (int ci = 0; inner[ci]; ci++) {
+                if (inner[ci] >= 'a' && inner[ci] <= 'z')
+                    inner[ci] -= 32;
+            }
+            method = cbm_arena_strdup(a, inner);
+        }
+    }
+    if (!method) {
+        method = "GET";
+    }
+    const char *segment = NULL;
+    TSNode url_path_val = find_drf_kwarg_in_args(a, args, "url_path", source);
+    if (!ts_node_is_null(url_path_val) && strcmp(ts_node_type(url_path_val), "string") == 0) {
+        char *text = cbm_node_text(a, url_path_val, source);
+        if (text) {
+            int tlen = (int)strlen(text);
+            if (tlen >= PAIR_CHARS && (text[0] == '"' || text[0] == '\'')) {
+                segment = cbm_arena_strndup(a, text + SKIP_CHAR, (size_t)(tlen - PAIR_CHARS));
+            }
+        }
+    }
+    if (!segment) {
+        TSNode name_node = func_name_node(func_node);
+        if (!ts_node_is_null(name_node)) {
+            segment = cbm_node_text(a, name_node, source);
+        }
+    }
+    if (!segment) {
+        return false;
+    }
+    // Extract detail kwarg (default True in DRF)
+    bool detail = true;
+    TSNode detail_val = find_drf_kwarg_in_args(a, args, "detail", source);
+    if (!ts_node_is_null(detail_val)) {
+        const char *dv = ts_node_type(detail_val);
+        if (strcmp(dv, "false") == 0) {
+            detail = false;
+        }
+    }
+    if (detail) {
+        *out_path = cbm_arena_sprintf(a, "/{pk}/%s", segment);
+    } else {
+        *out_path = cbm_arena_sprintf(a, "/%s", segment);
+    }
+    *out_method = method;
+    return true;
 }
 
 // Try to extract a route from a single decorator call node.
@@ -1367,6 +1672,9 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
             if (try_route_from_decorator_call(a, dchild, source, out_path, out_method)) {
                 return;
             }
+            if (try_drf_action_decorator(a, dchild, source, func_node, out_path, out_method)) {
+                return;
+            }
         }
         /* JVM/C# annotation-form route mapping (Spring @GetMapping etc.) — the
          * prev-sibling itself may be the annotation node. */
@@ -1379,6 +1687,38 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
     /* Spring/JAX-RS annotations live inside the method's `modifiers` child, not
      * as prev-siblings — scan there too. */
     extract_route_from_annotations(a, func_node, source, spec, out_path, out_method);
+}
+
+static const char *join_route_paths(CBMArena *a, const char *prefix, const char *path) {
+    if (!path || !path[0]) {
+        return prefix;
+    }
+    if (!prefix || !prefix[0] || strcmp(prefix, "/") == 0) {
+        return path;
+    }
+    if (strcmp(path, "/") == 0) {
+        return prefix;
+    }
+    size_t plen = strlen(prefix);
+    bool prefix_slash = prefix[plen - 1] == '/';
+    bool path_slash = path[0] == '/';
+    if (prefix_slash && path_slash) {
+        return cbm_arena_sprintf(a, "%s%s", prefix, path + SKIP_CHAR);
+    }
+    if (!prefix_slash && !path_slash) {
+        return cbm_arena_sprintf(a, "%s/%s", prefix, path);
+    }
+    return cbm_arena_sprintf(a, "%s%s", prefix, path);
+}
+
+static const char *spring_class_route_prefix(CBMArena *a, TSNode class_node, const char *source,
+                                             const CBMLangSpec *spec) {
+    const char *prefix = NULL;
+    const char *method = NULL;
+    if (extract_route_from_annotations(a, class_node, source, spec, &prefix, &method)) {
+        return prefix;
+    }
+    return NULL;
 }
 
 // Extract decorator names from preceding decorator/annotation nodes
@@ -1532,6 +1872,67 @@ static const char **extract_decorators(CBMArena *a, TSNode node, const char *sou
     }
     result[idx] = NULL;
     return result;
+}
+
+/* Rust: two same-named functions guarded by mutually-exclusive #[cfg(...)]
+ * attributes both parse as distinct function_item nodes and otherwise receive
+ * the SAME qualified_name, so the second graph upsert silently overwrites the
+ * first and one branch is lost (#495). Fold the cfg predicate into the QN so
+ * each cfg-gated twin gets a DISTINCT, predicate-encoding QN. Returns the
+ * (possibly suffixed) QN; the original QN when no cfg attribute is present. */
+/* Rust: mark a function as a test when it carries a test attribute (#855).
+ * cbm's test detection is otherwise file-path-based (cbm_is_test_file:
+ * *_test.rs / test_*), so inline #[test]/#[tokio::test] functions inside a
+ * regular .rs file are indexed as ordinary Functions (is_test=false) and leak
+ * past the store.c `is_test != 1` filter into graph/agent context. The
+ * attribute_item text extract_decorators stores is the bracketed form
+ * ("#[test]", "#[tokio::test]", "#[tokio::test(...)]", ...). */
+static bool rust_def_is_test(const char *const *decorators) {
+    if (!decorators) {
+        return false;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        const char *d = decorators[i];
+        /* Path-qualified async/param test macros (substring match, robust to the
+         * optional argument list and the surrounding #[ ]). */
+        if (strstr(d, "tokio::test") || strstr(d, "async_std::test") ||
+            strstr(d, "actix_rt::test") || strstr(d, "test_case::case")) {
+            return true;
+        }
+        /* Bare #[test] / #[test(...)]: match the bracketed path exactly so we do
+         * NOT match the unrelated #[test_case::case] (handled above) or a
+         * hypothetical #[test_crate]. */
+        if (strstr(d, "#[test]") || strstr(d, "#[test(")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
+                                           const char *const *decorators) {
+    if (!decorators) {
+        return base_qn;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        const char *cfg = strstr(decorators[i], "cfg(");
+        if (!cfg) {
+            continue;
+        }
+        /* Build a compact predicate suffix from the cfg(...) text, dropping
+         * whitespace and quotes so the QN stays readable and stable. */
+        char buf[CBM_SZ_256];
+        size_t bi = 0;
+        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
+            if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
+                continue;
+            }
+            buf[bi++] = *p;
+        }
+        buf[bi] = '\0';
+        return cbm_arena_sprintf(a, "%s#%s", base_qn, buf);
+    }
+    return base_qn;
 }
 
 // Extract base class name text from a single base_class child node.
@@ -2689,13 +3090,21 @@ static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source)
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
-    TSNode name_node = resolve_func_name(node, ctx->language);
+    TSNode name_node = cbm_resolve_func_name(node, ctx->language);
     if (ts_node_is_null(name_node)) {
         return;
     }
 
-    char *name = cbm_node_text(a, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(a, name_node, ctx->source);
     if (!name || !name[0] || strcmp(name, "function") == 0) {
+        return;
+    }
+
+    // Makefile special targets (.PHONY, .DEFAULT, .SUFFIXES, …) are directives,
+    // not build-rule defs. Their leading '.' would also make cbm_fqn_compute
+    // emit a "..PHONY" segment (a "double dot") and thus a malformed QN. Skip
+    // any dot-prefixed Make target.
+    if (ctx->language == CBM_LANG_MAKEFILE && name[0] == '.') {
         return;
     }
 
@@ -2705,7 +3114,23 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     memset(&def, 0, sizeof(def));
 
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    /* Java/Go derive the module from the containing directory (package), so the
+     * filename stem is NOT baked into the QN (Go func in myapp/db/conn.go ->
+     * proj.myapp.db.Func, not proj.myapp.db.conn.Func). Other langs unchanged. */
+    def.qualified_name =
+        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
+    /* A free function declared inside a namespace (C++/C#/PHP) is qualified by
+     * the namespace scope the def walk carries (enclosing_class_qn was extended
+     * by is_namespace_scope_kind), so `ns::serialize` is `proj.file.ns.serialize`
+     * — without this it collapses to the file scope and namespace-aware
+     * resolution (ADL, namespace-function lookup) can never see it. Class methods
+     * never reach here (they go through extract_class_methods), so a set
+     * enclosing scope here is always a namespace. The out-of-line method path
+     * below overrides this for `Ns::Cls::method` definitions. */
+    if (ctx->enclosing_class_qn &&
+        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA)) {
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
+    }
     def.label = "Function";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -2754,7 +3179,10 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
          * is computed the same way (cbm_fqn_compute on the type name). */
         char *recv_type = go_receiver_type_name(a, recv, ctx->source);
         if (recv_type && recv_type[0]) {
-            def.parent_class = cbm_fqn_compute(a, ctx->project, ctx->rel_path, recv_type);
+            /* Must match the Go type node QN (directory-based module) so the
+             * DEFINES_METHOD edge links the method to its owning type. */
+            def.parent_class = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
+                                                           recv_type, ctx->language);
         }
     }
 
@@ -2765,7 +3193,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // class node QN computed the same way) so DEFINES_METHOD edges resolve.
     if ((ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA) &&
         strcmp(ts_node_type(node), "function_definition") == 0) {
-        char *scope_name = cpp_out_of_line_parent_class(a, node, ctx->source);
+        char *scope_name = cbm_cpp_out_of_line_parent_class(a, node, ctx->source);
         if (scope_name && scope_name[0]) {
             const char *class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, scope_name);
             def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
@@ -2774,9 +3202,38 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    // Pony: fun/be/new (method/constructor/ffi_method) live in pony_func_types,
+    // so the main def-walk extracts them here as "Function"; but one declared
+    // inside a class/actor/struct/trait/interface/primitive IS a method. Detect
+    // the enclosing class-like ancestor and promote it to "Method" with a
+    // parent_class link (the class name is the first identifier child — no field).
+    if (ctx->language == CBM_LANG_PONY && def.label && strcmp(def.label, "Function") == 0 &&
+        spec->class_node_types) {
+        for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+            if (cbm_kind_in_set(cur, spec->class_node_types)) {
+                def.label = "Method";
+                TSNode cn = cbm_find_child_by_kind(cur, "identifier");
+                if (!ts_node_is_null(cn)) {
+                    char *cname = cbm_node_text(a, cn, ctx->source);
+                    if (cname && cname[0]) {
+                        def.parent_class = cbm_fqn_compute(a, ctx->project, ctx->rel_path, cname);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+
+    // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
+    // predicate into the QN so both branches survive the graph upsert (#495).
+    if (ctx->language == CBM_LANG_RUST) {
+        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.is_test = rust_def_is_test(def.decorators);
+    }
 
     // Docstring
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
@@ -2808,12 +3265,52 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 // --- Class definition extraction ---
 
 // Push a simple class definition (used by config language extractors).
+// Replace each run of whitespace in `name` with a single '-' so the value is a
+// well-formed QN segment. Markdown headings (e.g. "Codebase Memory") legitimately
+// contain spaces; embedding them verbatim in a QN makes it malformed. Returns the
+// original pointer when there is no whitespace to collapse. The human-readable
+// def.name is kept intact; only the QN segment is slugified.
+static const char *qn_safe_segment(CBMArena *a, const char *name) {
+    if (!name) {
+        return name;
+    }
+    bool has_ws = false;
+    for (const char *p = name; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+            has_ws = true;
+            break;
+        }
+    }
+    if (!has_ws) {
+        return name;
+    }
+    char *out = cbm_arena_strdup(a, name);
+    if (!out) {
+        return name;
+    }
+    char *w = out;
+    bool in_ws = false;
+    for (char *r = out; *r; r++) {
+        if (*r == ' ' || *r == '\t' || *r == '\n' || *r == '\r') {
+            if (!in_ws && w != out) {
+                *w++ = '-';
+            }
+            in_ws = true;
+        } else {
+            *w++ = *r;
+            in_ws = false;
+        }
+    }
+    *w = '\0';
+    return out;
+}
+
 static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, qn_safe_segment(a, name));
     def.label = label;
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -2921,9 +3418,19 @@ static char *extract_markdown_heading_name(CBMArena *a, TSNode node, const char 
 static char *find_ini_section_name(CBMArena *a, TSNode node, const char *source) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
-        if (strcmp(ts_node_type(ts_node_child(node, i)), "section_name") == 0) {
-            return cbm_node_text(a, ts_node_child(node, i), source);
+        TSNode child = ts_node_child(node, i);
+        if (strcmp(ts_node_type(child), "section_name") != 0) {
+            continue;
         }
+        // The section_name node spans the whole header line including the
+        // surrounding brackets and the trailing newline (e.g. "[database]\n"),
+        // which would put '[' / ']' and a '\n' into the QN (malformed). Its
+        // inner `text` child holds the bare name ("database").
+        TSNode text = cbm_find_child_by_kind(child, "text");
+        if (!ts_node_is_null(text)) {
+            return cbm_node_text(a, text, source);
+        }
+        return cbm_node_text(a, child, source);
     }
     return NULL;
 }
@@ -2981,6 +3488,9 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     } else if (ctx->language == CBM_LANG_MARKDOWN &&
                (strcmp(kind, "atx_heading") == 0 || strcmp(kind, "setext_heading") == 0)) {
         name = extract_markdown_heading_name(a, node, kind, ctx->source);
+        // A heading is a Section (a valid label), not a Class — keep the accurate
+        // label rather than degrade it to match a test. The markdown repro asserts
+        // "Class"; that assertion is the inaccurate side and is flagged for review.
         label = "Section";
     } else if (ctx->language == CBM_LANG_HCL && strcmp(kind, "block") == 0) {
         name = find_hcl_block_name(a, node, ctx->source);
@@ -3023,11 +3533,11 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             name_node = cbm_find_child_by_kind(node, "enum_name");
         }
     }
-    // Thrift / Smithy / Pony (no `name` field): class-type defs carry the name on
-    // a plain `identifier` child.
+    // Thrift / Smithy / Pony / PKL (no `name` field): class-type defs carry the
+    // name on a plain `identifier` child (PKL `clazz` -> `(identifier) (classBody)`).
     if (ts_node_is_null(name_node) &&
         (ctx->language == CBM_LANG_THRIFT || ctx->language == CBM_LANG_SMITHY ||
-         ctx->language == CBM_LANG_PONY)) {
+         ctx->language == CBM_LANG_PONY || ctx->language == CBM_LANG_PKL)) {
         name_node = cbm_find_child_by_kind(node, "identifier");
     }
     // F#: type_definition wraps an `anon_type_defn` (or similar) whose
@@ -3229,6 +3739,16 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
             break;
         }
+        case CBM_LANG_ZIG: { // `const Foo = struct {...}`: struct/enum/union_declaration
+                             // is the value of a variable_declaration; the name is the
+                             // parent variable_declaration's identifier child.
+            TSNode parent = ts_node_parent(node);
+            if (!ts_node_is_null(parent) &&
+                strcmp(ts_node_type(parent), "variable_declaration") == 0) {
+                name_node = cbm_find_child_by_kind(parent, "identifier");
+            }
+            break;
+        }
         default:
             break;
         }
@@ -3242,19 +3762,21 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         return;
     }
 
-    // For nested classes, prefix with enclosing class QN (e.g., Outer.Inner)
+    // For nested classes, prefix with enclosing class QN (e.g., Outer.Inner).
+    // Top-level classes use the language-aware module QN so Java/Go don't double
+    // the filename stem (Java `Outer` in Outer.java -> proj.Outer, not
+    // proj.Outer.Outer); the nested prefix then yields proj.Outer.Inner.
     const char *class_qn;
     if (ctx->enclosing_class_qn) {
         class_qn = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
     } else {
-        class_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+        class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
     }
     const char *label = class_label_for_kind(kind);
 
     // Sway/WGSL: label struct defs as "Struct" and Sway `abi` blocks as
     // "Interface". C/C++/ObjC/Cap'n Proto keep historical struct-as-"Class"
-    // semantics because those grammars model class-like records through the
-    // same downstream resolver paths.
+    // semantics because downstream class-like record resolvers depend on it.
     if (ctx->language == CBM_LANG_SWAY || ctx->language == CBM_LANG_WGSL) {
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
             label = "Struct";
@@ -3262,15 +3784,39 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             label = "Interface";
         }
     }
+    // Rust/Swift/D: a struct is a distinct kind from a class — emit the precise
+    // "Struct" label rather than collapsing it to "Class". Scoped to these three
+    // grammar/LSP languages. Rust's struct node is `struct_item`; D's is
+    // `struct_declaration`. C/C++/Obj-C keep `struct_specifier` → "Class"
+    // (a C++ struct is class-like). "Struct" is a type-like container: every
+    // type-resolution / registry / IMPLEMENTS / LSP-registrar consumer routes
+    // through cbm_label_is_type_like(), so a struct still resolves as a type for
+    // its methods, fields, inheritance and impls.
     if (ctx->language == CBM_LANG_RUST || ctx->language == CBM_LANG_SWIFT ||
         ctx->language == CBM_LANG_DLANG) {
         if (strcmp(kind, "struct_item") == 0 || strcmp(kind, "struct_declaration") == 0) {
             label = "Struct";
         }
     }
-    if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0 &&
-        !ts_node_is_null(cbm_find_child_by_kind(node, "struct"))) {
-        label = "Struct";
+    // Swift: tree-sitter-swift does NOT have a dedicated `struct_declaration`
+    // node — `struct`, `class` and `actor` all parse to `class_declaration`,
+    // distinguished only by the `declaration_kind` field (the leading keyword
+    // token). Read that field and emit "Struct" when the keyword is `struct`
+    // (and "Class" for `class`/`actor`, which class_label_for_kind already gives).
+    if (ctx->language == CBM_LANG_SWIFT && strcmp(kind, "class_declaration") == 0) {
+        TSNode dk = ts_node_child_by_field_name(node, TS_FIELD("declaration_kind"));
+        if (!ts_node_is_null(dk)) {
+            char *dk_text = cbm_node_text(a, dk, ctx->source);
+            if (dk_text && strcmp(dk_text, "struct") == 0) {
+                label = "Struct";
+            }
+        }
+        /* Older grammar shapes may omit the field while retaining the keyword
+         * child; preserve that structural fallback for compatibility. */
+        if (strcmp(label, "Struct") != 0 &&
+            !ts_node_is_null(cbm_find_child_by_kind(node, "struct"))) {
+            label = "Struct";
+        }
     }
     // F#: a `type_definition` that has a primary constructor (`type Foo(...) =`)
     // or an `inherit` clause is an OOP class, not a plain type alias. Label it
@@ -3286,7 +3832,10 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
 
-    // Go type_spec: check inner type for interface/struct.
+    // Go type_spec: check inner type for interface/struct. A Go `type T struct
+    // {...}` is a struct → emit the precise "Struct" label (a type-like container;
+    // its methods/fields/embedding resolve through cbm_label_is_type_like(), and
+    // cbm_pipeline_implements_go() collects Struct nodes too).
     if (strcmp(kind, "type_spec") == 0) {
         TSNode type_inner = ts_node_child_by_field_name(node, TS_FIELD("type"));
         if (!ts_node_is_null(type_inner)) {
@@ -3307,6 +3856,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
@@ -3404,6 +3954,27 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     if (lang == CBM_LANG_SQUIRREL) {
         return class_node;
     }
+    // Smali: field_definition nodes are direct children of class_definition (no
+    // dedicated body node) — iterate the class node itself.
+    if (lang == CBM_LANG_SMALI) {
+        return class_node;
+    }
+    // GraphQL: object/interface fields live in a fields_definition child.
+    if (lang == CBM_LANG_GRAPHQL) {
+        TSNode b = cbm_find_child_by_kind(class_node, "fields_definition");
+        if (!ts_node_is_null(b)) {
+            return b;
+        }
+    }
+    // Prisma: model columns live in a statement_block child. Gated to Prisma so
+    // the common "statement_block" kind can never hijack another language's
+    // class body via the generic fallback below.
+    if (lang == CBM_LANG_PRISMA) {
+        TSNode b = cbm_find_child_by_kind(class_node, "statement_block");
+        if (!ts_node_is_null(b)) {
+            return b;
+        }
+    }
     // Fallback: search children for known body node types
     static const char *body_types[] = {"class_body",
                                        "interface_body",
@@ -3484,7 +4055,7 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
          lang == CBM_LANG_GLSL) &&
         strcmp(ck, "function_definition") == 0) {
-        return resolve_func_name(child, lang);
+        return cbm_resolve_func_name(child, lang);
     }
 
     if (lang == CBM_LANG_GROOVY && strcmp(ck, "function_definition") == 0) {
@@ -3500,6 +4071,14 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     }
 
     if (lang == CBM_LANG_OBJC && strcmp(ck, "method_definition") == 0) {
+        return cbm_find_child_by_kind(child, "identifier");
+    }
+
+    // Pony: `fun`/`be`/`new` members are `method`/`constructor`/`ffi_method`
+    // nodes with no `name` field; the name is the first plain `identifier` child
+    // (mirrors the free-function case in cbm_resolve_func_name).
+    if (lang == CBM_LANG_PONY && (strcmp(ck, "method") == 0 || strcmp(ck, "constructor") == 0 ||
+                                  strcmp(ck, "ffi_method") == 0)) {
         return cbm_find_child_by_kind(child, "identifier");
     }
 
@@ -3522,11 +4101,11 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 }
 
 // Push a single method definition
-static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_qn,
-                            const CBMLangSpec *spec, TSNode name_node) {
+static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
+                            const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
 
-    char *name = cbm_node_text(a, name_node, ctx->source);
+    char *name = cbm_func_name_node_text(a, name_node, ctx->source);
     if (!name || !name[0]) {
         return;
     }
@@ -3571,6 +4150,10 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, const char *class_
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
+    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
+        const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
+        def.route_path = join_route_paths(a, prefix, def.route_path);
+    }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -3595,7 +4178,7 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
         if (cbm_kind_in_set(inner, spec->function_node_types)) {
             TSNode nm = resolve_method_name(inner, ctx->language);
             if (!ts_node_is_null(nm)) {
-                push_method_def(ctx, inner, class_qn, spec, nm);
+                push_method_def(ctx, inner, impl_node, class_qn, spec, nm);
             }
         }
     }
@@ -3644,6 +4227,24 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             method_node = def;
         }
 
+        // TS/JS class-field arrow functions: `handleClick = () => {...}` is a
+        // public_field_definition whose `value` is an arrow_function (a common
+        // React event-handler pattern). It is not in function_node_types, so it
+        // would otherwise be dropped. Peek through to the inner arrow and take
+        // the method name from the field's `name` child (#new_ts_class_field_arrow).
+        if (strcmp(ts_node_type(child), "public_field_definition") == 0) {
+            TSNode value = ts_node_child_by_field_name(child, TS_FIELD("value"));
+            if (ts_node_is_null(value) || !cbm_kind_in_set(value, spec->function_node_types)) {
+                continue;
+            }
+            TSNode fname = ts_node_child_by_field_name(child, TS_FIELD("name"));
+            if (ts_node_is_null(fname)) {
+                continue;
+            }
+            push_method_def(ctx, value, class_node, class_qn, spec, fname);
+            continue;
+        }
+
         if (!cbm_kind_in_set(method_node, spec->function_node_types)) {
             continue;
         }
@@ -3653,7 +4254,7 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
-        push_method_def(ctx, method_node, class_qn, spec, name_node);
+        push_method_def(ctx, method_node, class_node, class_qn, spec, name_node);
     }
 }
 
@@ -3888,7 +4489,10 @@ static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
-    def.qualified_name = cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    /* Java/Go: directory-based module (package), so a Go package-level var in
+     * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
+    def.qualified_name =
+        cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
     def.label = "Variable";
     def.file_path = ctx->rel_path;
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
@@ -4058,6 +4662,37 @@ static void extract_destructured_vars(CBMExtractCtx *ctx, TSNode pattern, TSNode
     }
 }
 
+/* True for `require("...")` call_expressions with a string-literal path — the
+ * CommonJS import form that extract_imports records with local_name = the
+ * enclosing declarator's identifier. Same string-argument kinds as
+ * process_commonjs_require so the two stay in lockstep. */
+static bool is_require_import_call(TSNode value, const char *source, CBMArena *a) {
+    if (strcmp(ts_node_type(value), "call_expression") != 0) {
+        return false;
+    }
+    TSNode fn = ts_node_child_by_field_name(value, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0) {
+        return false;
+    }
+    char *fn_name = cbm_node_text(a, fn, source);
+    if (!fn_name || strcmp(fn_name, "require") != 0) {
+        return false;
+    }
+    TSNode args = ts_node_child_by_field_name(value, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return false;
+    }
+    uint32_t argc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < argc; i++) {
+        const char *ak = ts_node_type(ts_node_named_child(args, i));
+        if (strcmp(ak, "string") == 0 || strcmp(ak, "string_literal") == 0 ||
+            strcmp(ak, "template_string") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // JS/TS variable extraction: skip function-assigned declarators.
 static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -4066,6 +4701,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
         if (strcmp(ts_node_type(child), "variable_declarator") != 0) {
             continue;
         }
+        bool is_require = false;
         TSNode value = ts_node_child_by_field_name(child, TS_FIELD("value"));
         if (!ts_node_is_null(value)) {
             const char *vk = ts_node_type(value);
@@ -4073,6 +4709,7 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 strcmp(vk, "generator_function") == 0) {
                 continue;
             }
+            is_require = is_require_import_call(value, ctx->source, a);
         }
         TSNode vname = ts_node_child_by_field_name(child, TS_FIELD("name"));
         if (!ts_node_is_null(vname)) {
@@ -4082,6 +4719,15 @@ static void extract_js_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
             if (strcmp(nk, "object_pattern") == 0 || strcmp(nk, "array_pattern") == 0) {
                 extract_destructured_vars(ctx, vname, child, a);
             } else {
+                /* `const foo = require('./foo')` is an import binding, not a
+                 * definition — extract_imports records local_name="foo". A
+                 * Variable node here shadows call resolution onto the alias
+                 * and orphans the imported callee (#871); ESM `import`
+                 * bindings emit no Variable either. Destructured requires
+                 * keep theirs: the import row only records the module. */
+                if (is_require) {
+                    continue;
+                }
                 push_var_def(ctx, cbm_node_text(a, vname, ctx->source), child);
             }
         }
@@ -4094,8 +4740,23 @@ static void extract_vars_mainstream(CBMExtractCtx *ctx, TSNode node, CBMArena *a
     switch (ctx->language) {
     case CBM_LANG_PYTHON: {
         TSNode left = ts_node_child_by_field_name(node, TS_FIELD("left"));
-        if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "identifier") == 0) {
+        if (ts_node_is_null(left)) {
+            break;
+        }
+        const char *lt = ts_node_type(left);
+        if (strcmp(lt, "identifier") == 0) {
             push_var_def(ctx, cbm_node_text(a, left, ctx->source), node);
+        } else if (strcmp(lt, "pattern_list") == 0 || strcmp(lt, "tuple_pattern") == 0 ||
+                   strcmp(lt, "list_pattern") == 0) {
+            /* Tuple/list unpacking: `x, y = f()` — emit a Variable def for each
+             * unpacked identifier on the LHS (#new_py_tuple_unpack). */
+            uint32_t ln = ts_node_named_child_count(left);
+            for (uint32_t li = 0; li < ln; li++) {
+                TSNode part = ts_node_named_child(left, li);
+                if (strcmp(ts_node_type(part), "identifier") == 0) {
+                    push_var_def(ctx, cbm_node_text(a, part, ctx->source), node);
+                }
+            }
         }
         break;
     }
@@ -4561,6 +5222,65 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     case CBM_LANG_SCSS:
         extract_vars_config(ctx, node, a, kind);
         return;
+    /* Dockerfile: `ENV K=V ...` is an env_instruction holding one or more
+     * env_pair children, each with a `name` field; `ARG K=V` is an
+     * arg_instruction whose name is the first unquoted_string child. The default
+     * fallback misses both (no `name` field on the instruction, child is an
+     * env_pair rather than a bare identifier). */
+    case CBM_LANG_DOCKERFILE:
+        if (strcmp(kind, "env_instruction") == 0) {
+            uint32_t ec = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < ec; i++) {
+                TSNode pair = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(pair), "env_pair") != 0) {
+                    continue;
+                }
+                TSNode nm = ts_node_child_by_field_name(pair, TS_FIELD("name"));
+                if (!ts_node_is_null(nm)) {
+                    push_var_def(ctx, cbm_node_text(a, nm, ctx->source), pair);
+                }
+            }
+        } else if (strcmp(kind, "arg_instruction") == 0) {
+            TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (ts_node_is_null(nm)) {
+                nm = cbm_find_child_by_kind(node, "unquoted_string");
+            }
+            if (!ts_node_is_null(nm)) {
+                push_var_def(ctx, cbm_node_text(a, nm, ctx->source), node);
+            }
+        }
+        return;
+    /* .properties: `key=value` is a `property` node whose name is the `key`
+     * child (a bare `key` kind, not an identifier or a `name` field), so the
+     * default fallback misses it. */
+    case CBM_LANG_PROPERTIES:
+        if (strcmp(kind, "property") == 0) {
+            TSNode key = cbm_find_child_by_kind(node, "key");
+            if (!ts_node_is_null(key)) {
+                push_var_def(ctx, cbm_node_text(a, key, ctx->source), node);
+            }
+        }
+        return;
+    /* go.mod: a `require_directive` wraps one or more `require_spec` children,
+     * each `(module_path version)`. Mint one Variable per required module,
+     * named by its module_path. The default fallback misses both (no `name`
+     * field; child is a require_spec, not a bare identifier). */
+    case CBM_LANG_GOMOD:
+        if (strcmp(kind, "require_directive") == 0 || strcmp(kind, "replace_directive") == 0) {
+            uint32_t rc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < rc; i++) {
+                TSNode req_spec = ts_node_named_child(node, i);
+                const char *sk = ts_node_type(req_spec);
+                if (strcmp(sk, "require_spec") != 0 && strcmp(sk, "replace_spec") != 0) {
+                    continue;
+                }
+                TSNode mp = cbm_find_child_by_kind(req_spec, "module_path");
+                if (!ts_node_is_null(mp)) {
+                    push_var_def(ctx, cbm_node_text(a, mp, ctx->source), req_spec);
+                }
+            }
+        }
+        return;
     default:
         break;
     }
@@ -4787,6 +5507,58 @@ static TSNode resolve_field_name_node(TSNode child) {
     return name_node;
 }
 
+/* Schema/grammar languages whose field node carries the field name on a plain
+ * child (no C-style `declarator`/`type` field), so the generic field path below
+ * skips them. Emit a "Field" def (with optional return_type) and return true if
+ * handled. GraphQL: field_definition (name)(type:named_type); Prisma:
+ * column_declaration (identifier)(column_type); Smali: field_definition
+ * (field_identifier)(field_type). */
+static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    TSNode name_node = {0};
+    TSNode type_node = {0};
+
+    if (ctx->language == CBM_LANG_GRAPHQL) {
+        name_node = ts_node_child_by_field_name(child, TS_FIELD("name"));
+        if (ts_node_is_null(name_node)) {
+            name_node = cbm_find_child_by_kind(child, "name");
+        }
+        type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
+    } else if (ctx->language == CBM_LANG_PRISMA) {
+        name_node = cbm_find_child_by_kind(child, "identifier");
+        type_node = cbm_find_child_by_kind(child, "column_type");
+    } else if (ctx->language == CBM_LANG_SMALI) {
+        name_node = cbm_find_child_by_kind(child, "field_identifier");
+        type_node = cbm_find_child_by_kind(child, "field_type");
+    } else {
+        return false;
+    }
+
+    if (ts_node_is_null(name_node)) {
+        return true; // language matched but no name → nothing to emit
+    }
+    char *name = cbm_node_text(a, name_node, ctx->source);
+    if (!name || !name[0]) {
+        return true;
+    }
+
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
+    def.label = "Field";
+    def.file_path = ctx->rel_path;
+    def.parent_class = class_qn;
+    if (!ts_node_is_null(type_node)) {
+        def.return_type = cbm_node_text(a, type_node, ctx->source);
+    }
+    def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+    def.is_exported = cbm_is_exported(name, ctx->language);
+    cbm_defs_push(&ctx->result->defs, a, def);
+    return true;
+}
+
 static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                  const CBMLangSpec *spec) {
     if (!spec->field_node_types || !spec->field_node_types[0]) {
@@ -4807,6 +5579,13 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         }
 
         if (is_func_ptr_field(child)) {
+            continue;
+        }
+
+        /* Schema/grammar languages (GraphQL/Prisma/Smali) carry the field name on
+         * a plain child rather than a C-style declarator/type field; handle them
+         * up front so the generic "type"-field path below doesn't skip them. */
+        if (extract_schema_field(ctx, child, class_qn)) {
             continue;
         }
 
@@ -4910,12 +5689,122 @@ typedef struct {
     const char *enclosing_class_qn; // saved context for class nesting
 } walk_defs_frame_t;
 
-#define CBM_WALK_DEFS_STACK_CAP 4096
+/* #668: walk_defs previously used a fixed `walk_defs_frame_t stack[4096]` — a
+ * single ~160 KB C-stack frame. That overflowed small thread stacks (the
+ * pre-2026-03 Windows 1 MB main thread) on the definitions pass, and its
+ * `top < 4096` push guards SILENTLY DROPPED every top-level definition past
+ * 4096. Use a growable heap stack instead: a tiny initial footprint that doubles
+ * on demand, bounded by a generous, env-configurable ceiling that WARNs (once)
+ * rather than dropping — so a file with thousands of top-level defs is fully
+ * extracted, and a pathological one degrades to a warned, bounded skip instead
+ * of an OOM or a stack overflow. */
+typedef struct {
+    walk_defs_frame_t *data;
+    int top;
+    int cap;
+    const char *path; // for the WARN when the ceiling is hit (may be NULL)
+    bool warned;
+} wd_stack_t;
+
+// Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
+// Realistic files never approach this; it only bounds a pathological/adversarial
+// file so extraction degrades to a warned skip rather than unbounded memory.
+static int wd_stack_max(void) {
+    const char *e = getenv("CBM_WALK_DEFS_MAX");
+    if (e) {
+        int v = atoi(e);
+        if (v > 0) {
+            return v;
+        }
+    }
+    return 8 * 1024 * 1024; // 8M frames (~320 MB) default
+}
+
+static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    if (s->top >= s->cap) {
+        int ncap = s->cap ? s->cap * 2 : 256;
+        if (ncap > wd_stack_max()) {
+            if (!s->warned) {
+                char lim[24];
+                snprintf(lim, sizeof(lim), "%d", wd_stack_max());
+                cbm_log_warn("extract.walk_defs_capped", "limit", lim, "path",
+                             s->path ? s->path : "");
+                s->warned = true;
+            }
+            return; // bounded: stop growing (warned, not silent)
+        }
+        walk_defs_frame_t *nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        if (!nd) {
+            /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
+             * pending frames so the walk_defs loop drains and exits without a NULL
+             * deref; extraction keeps whatever was already emitted. */
+            s->data = NULL;
+            s->cap = 0;
+            s->top = 0;
+            return;
+        }
+        s->data = nd;
+        s->cap = ncap;
+    }
+    s->data[s->top++] = (walk_defs_frame_t){node, enclosing_qn};
+}
+
+/* Push all children of `node` in REVERSE order (so they pop in source order)
+ * using a LINEAR traversal. Index-based ts_node_child(i) is O(i) per call in
+ * tree-sitter, so a reverse index loop is O(n^2) per node — a file whose
+ * root has ~580k flat siblings (ms-typescript's reallyLargeFile.ts fourslash
+ * fixture) needed ~1.7e11 child-iterator steps and hung extraction for
+ * hours; the supervisor then killed the silent worker as a hang and
+ * quarantined innocent files off the stale marker. Collect the children
+ * FORWARD with a TSTreeCursor (O(1) amortized per step) into a scratch
+ * buffer, then push in reverse. Small nodes keep the direct index loop —
+ * no cursor/buffer overhead on the overwhelmingly common case. */
+enum { WD_CURSOR_MIN_CHILDREN = 64 };
+
+/* Collect all `cc` children of `node` linearly via a TSTreeCursor into a
+ * malloc'd array (caller frees). Returns NULL for small nodes and on OOM —
+ * the caller then uses indexed ts_node_child access, which is fine (and
+ * cheaper) at small child counts and merely quadratic-but-correct on OOM. */
+static TSNode *wd_collect_children(TSNode node, uint32_t cc) {
+    if (cc < WD_CURSOR_MIN_CHILDREN) {
+        return NULL;
+    }
+    TSNode *buf = (TSNode *)malloc((size_t)cc * sizeof(TSNode));
+    if (!buf) {
+        return NULL;
+    }
+    TSTreeCursor cur = ts_tree_cursor_new(node);
+    uint32_t got = 0;
+    if (ts_tree_cursor_goto_first_child(&cur)) {
+        do {
+            buf[got++] = ts_tree_cursor_current_node(&cur);
+        } while (got < cc && ts_tree_cursor_goto_next_sibling(&cur));
+    }
+    ts_tree_cursor_delete(&cur);
+    if (got != cc) {
+        /* Defensive: cursor and child_count disagree — fall back to indexed. */
+        free(buf);
+        return NULL;
+    }
+    return buf;
+}
+
+static void wd_push_children_reverse(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
+    uint32_t cc = ts_node_child_count(node);
+    if (cc == 0) {
+        return;
+    }
+    TSNode *kids = wd_collect_children(node, cc);
+    for (int i = (int)cc - SKIP_CHAR; i >= 0; i--) {
+        wd_push(s, kids ? kids[i] : ts_node_child(node, (uint32_t)i), enclosing_qn);
+    }
+    free(kids);
+}
 
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
-static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                    int *top, const char *enclosing_qn, CBMArena *arena) {
+static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_stack_t *s,
+                                    const char *enclosing_qn, CBMArena *arena) {
     TSNodeStack nc_stack;
     ts_nstack_init(&nc_stack, arena, NESTED_CLASS_STACK_CAP);
     ts_nstack_push(&nc_stack, arena, body);
@@ -4923,12 +5812,12 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_d
     while (nc_stack.count > 0) {
         TSNode cur = ts_nstack_pop(&nc_stack);
         uint32_t nc = ts_node_child_count(cur);
+        /* Linear child access for wide class bodies (see wd_collect_children). */
+        TSNode *kids = wd_collect_children(cur, nc);
         for (int i = (int)nc - SKIP_CHAR; i >= 0; i--) {
-            TSNode child = ts_node_child(cur, (uint32_t)i);
+            TSNode child = kids ? kids[i] : ts_node_child(cur, (uint32_t)i);
             if (cbm_kind_in_set(child, spec->class_node_types)) {
-                if (*top < CBM_WALK_DEFS_STACK_CAP) {
-                    stack[(*top)++] = (walk_defs_frame_t){child, enclosing_qn};
-                }
+                wd_push(s, child, enclosing_qn);
             } else {
                 const char *ck = ts_node_type(child);
                 if (strcmp(ck, "field_declaration") == 0 ||
@@ -4937,6 +5826,7 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, walk_d
                 }
             }
         }
+        free(kids);
     }
 }
 
@@ -4958,6 +5848,20 @@ static bool is_template_class_node(TSNode node, CBMLanguage lang) {
 }
 
 // Compute the enclosing class QN for a class node (for nested class context).
+/* A namespace contributes a QN segment so a symbol declared in `namespace ns`
+ * is `proj.file.ns.sym`, not a top-level `proj.file.sym`. Without the namespace
+ * in the QN, namespace-aware resolution (C++ ADL) is starved: a bare call
+ * collapses to the file scope and resolves directly instead. Unlike a class, a
+ * namespace emits no def of its own — it only extends the enclosing scope for
+ * its members. C#/PHP need the same treatment paired with their LSP resolvers
+ * (a def-only change breaks their existing namespace handling), done separately. */
+static bool is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        return strcmp(kind, "namespace_definition") == 0;
+    }
+    return false;
+}
+
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char *saved_enclosing) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
@@ -4972,15 +5876,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
             if (saved_enclosing) {
                 return cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
             }
-            return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, cname);
+            /* Top-level: language-aware module so Java/Go don't double the
+             * filename stem (matches extract_class_def above). */
+            return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, cname,
+                                               ctx->language);
         }
     }
     return saved_enclosing;
 }
 
 // Push nested class children from a class body container onto the walk stack.
-static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_defs_frame_t *stack,
-                                     int *top, const char *new_enclosing, CBMArena *arena) {
+static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
+                                     const char *new_enclosing, CBMArena *arena) {
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t ci = 0; ci < nc; ci++) {
         TSNode child = ts_node_child(node, ci);
@@ -4993,13 +5900,13 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, walk_
             // double-extracted) as top-level functions. Gated to Groovy so other
             // grammars that also name a node "closure" are unaffected.
             (strcmp(ck, "closure") == 0 && spec->language == CBM_LANG_GROOVY)) {
-            push_nested_class_nodes(child, spec, stack, top, new_enclosing, arena);
+            push_nested_class_nodes(child, spec, s, new_enclosing, arena);
             return;
         }
     }
     // No body found — push all children directly
-    for (int ci = (int)nc - SKIP_CHAR; ci >= 0 && *top < CBM_WALK_DEFS_STACK_CAP; ci--) {
-        stack[(*top)++] = (walk_defs_frame_t){ts_node_child(node, (uint32_t)ci), new_enclosing};
+    for (int ci = (int)nc - SKIP_CHAR; ci >= 0; ci--) {
+        wd_push(s, ts_node_child(node, (uint32_t)ci), new_enclosing);
     }
 }
 
@@ -5385,12 +6292,12 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
 
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused) {
     (void)depth_unused;
-    walk_defs_frame_t stack[CBM_WALK_DEFS_STACK_CAP];
-    int top = 0;
-    stack[top++] = (walk_defs_frame_t){root, ctx->enclosing_class_qn};
+    wd_stack_t s = {0};
+    s.path = ctx->rel_path;
+    wd_push(&s, root, ctx->enclosing_class_qn);
 
-    while (top > 0) {
-        walk_defs_frame_t frame = stack[--top];
+    while (s.top > 0) {
+        walk_defs_frame_t frame = s.data[--s.top];
         TSNode node = frame.node;
         ctx->enclosing_class_qn = frame.enclosing_class_qn;
         const char *kind = ts_node_type(node);
@@ -5420,12 +6327,25 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
 
         if (ctx->language == CBM_LANG_CFML && strcmp(kind, "cf_function_tag") == 0) {
             extract_cfml_function_tag(ctx, node);
-            // fall through: descend into the body for nested tags / calls
+            // cf_function_tag is in cfml_func_types (for call-scope attribution),
+            // but its name lives in a cf_attribute, not a `name` field — so the
+            // generic extract_func_def below must NOT also run on it (it would
+            // resolve a null name and, for grammars where the kind has a `name`
+            // field, double-mint). Push children so nested tags/defs are still
+            // traversed, then skip the generic func path.
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
+            continue;
         }
 
         if (ctx->language == CBM_LANG_GOTEMPLATE && strcmp(kind, "define_action") == 0) {
             extract_gotemplate_define(ctx, node);
-            // fall through: descend into the body for nested defines
+            // define_action is in gotemplate_func_types (for call-scope
+            // attribution), but its `name` field is a quoted string literal — the
+            // generic extract_func_def below would double-mint a def whose name
+            // still carries the quotes. Push children so nested defines are still
+            // traversed, then skip the generic func path.
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
+            continue;
         }
 
         if ((ctx->language == CBM_LANG_CLOJURE || ctx->language == CBM_LANG_RACKET ||
@@ -5449,11 +6369,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             (strcmp(kind, "export_item") == 0 || strcmp(kind, "import_item") == 0) &&
             ts_node_is_null(
                 find_first_descendant_by_kind(node, "func_type", CBM_DESCENDANT_MAX_DEPTH))) {
-            uint32_t cc = ts_node_child_count(node);
-            for (int i = (int)cc - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-                stack[top++] =
-                    (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
-            }
+            wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
             continue;
         }
 
@@ -5483,19 +6399,32 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
             continue;
         }
 
-        if (cbm_kind_in_set(node, spec->class_node_types)) {
-            extract_class_def(ctx, node, spec);
+        /* A namespace extends the enclosing scope (so members are QN-qualified by
+         * it) without being a def itself. Push its children (its declaration_list
+         * body and any nested namespaces) under the extended scope so each member
+         * is walked normally — functions AND classes, unlike a class body which
+         * routes methods through extract_class_methods. Do NOT emit a def or run
+         * the class/func paths on the namespace node itself. */
+        if (is_namespace_scope_kind(ctx->language, kind)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            push_class_body_children(node, spec, stack, &top, new_enclosing, ctx->arena);
+            wd_push_children_reverse(&s, node, new_enclosing);
             continue;
         }
 
-        uint32_t count = ts_node_child_count(node);
-        for (int i = (int)count - SKIP_CHAR; i >= 0 && top < CBM_WALK_DEFS_STACK_CAP; i--) {
-            stack[top++] =
-                (walk_defs_frame_t){ts_node_child(node, (uint32_t)i), frame.enclosing_class_qn};
+        if (cbm_kind_in_set(node, spec->class_node_types)) {
+            extract_class_def(ctx, node, spec);
+            const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
+            push_class_body_children(node, spec, &s, new_enclosing, ctx->arena);
+            continue;
         }
+
+        /* Default descent — THE hot loop: a file whose root has hundreds of
+         * thousands of flat siblings (580k comment lines in ms-typescript's
+         * reallyLargeFile.ts) lands here every visit, so linear child
+         * collection is mandatory (see wd_push_children_reverse). */
+        wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
+    free(s.data);
 }
 
 void cbm_extract_definitions(CBMExtractCtx *ctx) {

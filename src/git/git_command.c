@@ -52,7 +52,7 @@ bool cbm_git_format_status_command(char *cmd, size_t cmd_size, const char *repo_
     }
     int n = snprintf(cmd, cmd_size,
                      "git --no-optional-locks -C \"%s\" status --porcelain "
-                     "--untracked-files=normal 2>%s",
+                     "--untracked-files=all 2>%s",
                      repo_path, cbm_git_null_device());
     return cbm_git_command_fits(n, cmd_size);
 }

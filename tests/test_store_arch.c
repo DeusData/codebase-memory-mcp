@@ -1813,6 +1813,7 @@ SUITE(store_arch) {
     RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
+    RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
     RUN_TEST(arch_file_summaries_use_overlay_active_tombstones);

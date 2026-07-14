@@ -89,11 +89,12 @@ bool cbm_is_path_excluded(const char *path, const char **exclude_paths, int coun
 /* ── URL extraction ────────────────────────────────────────────── */
 
 /* Extract URL paths from text (https://host/path or "/path" patterns).
- * Returns count of paths written to out[]. Caller must free each string. */
+ * Returns the count written to out[], or -1 on allocation failure after
+ * freeing any partial result. Caller must free each string on success. */
 int cbm_extract_url_paths(const char *text, char **out, int max_out);
 
 /* Extract URL paths from JSON strings in text.
- * Returns count. Caller must free each string. */
+ * Uses the same ownership and error contract. */
 int cbm_extract_json_string_paths(const char *text, char **out, int max_out);
 
 /* ── Route extraction ──────────────────────────────────────────── */

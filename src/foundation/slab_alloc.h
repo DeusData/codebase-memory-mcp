@@ -1,12 +1,17 @@
 /*
- * slab_alloc.h — Thread-local slab allocator for tree-sitter.
+ * slab_alloc.h — Slab allocator for tree-sitter.
  *
  * Replaces malloc/calloc/realloc/free for ALL tree-sitter allocations
  * to eliminate ptmalloc2's per-thread arena fragmentation.
  *
  * Tier 1 (≤64B): Fixed-size slab free list — O(1) alloc/free.
  *   Matches tree-sitter SubtreeHeapData (CBM_SZ_64 bytes). Backed by
- *   64KB slab pages via malloc (= mimalloc in production).
+ *   64KB slab pages, each allocated aligned to its own size so the owning
+ *   page of any chunk is recovered in O(1) by masking the pointer. Pages are
+ *   reused per thread; cross-thread frees are recognized as slab pointers
+ *   (never handed to plain free()) and a page holding a still-live chunk is
+ *   retired, then freed when the final chunk returns. No global lock and no
+ *   per-op scan on the alloc/free hot path.
  *
  * All allocations >64B go directly to malloc (= mimalloc in production),
  * which handles size classes, thread caching, and OS page return
@@ -15,7 +20,7 @@
  * Usage:
  *   cbm_slab_install();         // once, before any parsing
  *   ... parse files ...
- *   cbm_slab_destroy_thread();  // on thread exit — frees all memory
+ *   cbm_slab_destroy_thread();  // on thread exit — frees owned memory
  */
 #ifndef CBM_SLAB_ALLOC_H
 #define CBM_SLAB_ALLOC_H
@@ -26,20 +31,23 @@
  * Must be called once before any ts_parser_new() calls. Thread-safe. */
 void cbm_slab_install(void);
 
-/* Reset the current thread's slab: all chunks become available.
+/* Reset the current thread's slab: owned pages are reclaimed or retired.
  * WARNING: Do NOT call between files if the parser retains live state.
  * Only safe after cbm_destroy_thread_parser() has been called. */
 void cbm_slab_reset_thread(void);
 
-/* Destroy the current thread's allocator state: free all slab pages.
- * Call on thread exit. */
+/* Destroy the current thread's allocator state. Pages with no live chunks are
+ * freed; pages still holding cross-thread live chunks are retired and freed on
+ * the last free. Call on thread exit. */
 void cbm_slab_destroy_thread(void);
 
-/* Reclaim all slab memory for the current thread.
- * Call ONLY when no live allocations remain (after ts_tree_delete AND
- * ts_parser_delete). Keeps the allocator installed — next allocation
- * will grow fresh pages as needed. This bounds peak memory per-file
- * rather than accumulating across all files in a worker. */
+/* Reclaim current-thread slab memory.
+ * Call ONLY when no LOCAL live allocations remain (after ts_tree_delete AND
+ * ts_parser_delete). If another parser thread still holds a chunk from one of
+ * these pages, that page is retired instead of freed and released on the final
+ * cross-thread free. Keeps the allocator installed — next allocation will grow
+ * fresh pages as needed. This bounds peak memory per-file rather than
+ * accumulating across all files in a worker. */
 void cbm_slab_reclaim(void);
 
 /* Test/diagnostic API: direct access to the slab allocator.
