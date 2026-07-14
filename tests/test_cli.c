@@ -7331,6 +7331,53 @@ TEST(cli_hook_upsert_rejects_concurrent_same_event_update) {
     PASS();
 }
 
+static const char test_released_session_hook_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
+    "cat << 'REMINDER'\n"
+    "CRITICAL - Code Discovery Protocol:\n"
+    "1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:\n"
+    "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
+    "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
+    "   - get_code_snippet(qualified_name) for exact symbol source (precise ranges)\n"
+    "   - query_graph(query) for complex Cypher patterns\n"
+    "   - get_architecture(aspects) for project structure\n"
+    "   - search_code(pattern) for text search (graph-augmented grep)\n"
+    "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
+    "   always Read a file before editing it.\n"
+    "3. If a project is not indexed yet, run index_repository FIRST.\n"
+    "REMINDER\n";
+
+static const char test_released_subagent_hook_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires when any subagent is spawned.\n"
+    "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
+    "cat << 'REMINDER'\n"
+    "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
+    "\"additionalContext\":\"Code discovery: prefer codebase-memory-mcp tools "
+    "(search_graph, trace_path, get_code_snippet, query_graph, get_architecture, "
+    "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
+    "text, configs, and non-code files.\"}}\n"
+    "REMINDER\n";
+
+static bool test_build_released_gate_hook_script(const char *binary_path, char *script,
+                                                 size_t script_size) {
+    int written = snprintf(script, script_size,
+                           "#!/usr/bin/env bash\n"
+                           "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
+                           "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
+                           "# Despite the name this NEVER blocks a tool call - it only adds\n"
+                           "# graph context. Any failure is silent (exit 0, no output).\n"
+                           "BIN=\"%s\"\n"
+                           "[ -x \"$BIN\" ] || exit 0\n"
+                           "\"$BIN\" hook-augment 2>/dev/null\n"
+                           "exit 0\n",
+                           binary_path);
+    return written > 0 && (size_t)written < script_size;
+}
+
 #ifndef _WIN32
 TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     char tmpdir[256];
@@ -7350,44 +7397,11 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     snprintf(settings_path, sizeof(settings_path), "%s/.claude/settings.json", tmpdir);
     test_mkdirp(hooks_dir);
 
-    const char *legacy_gate = "#!/usr/bin/env bash\n"
-                              "# codebase-memory-mcp search augmenter (Claude Code PreToolUse).\n"
-                              "# NOTE: the legacy filename is kept for zero-migration upgrades.\n"
-                              "# Despite the name this NEVER blocks a tool call - it only adds\n"
-                              "# graph context. Any failure is silent (exit 0, no output).\n"
-                              "BIN=\"/opt/codebase-memory-mcp\"\n"
-                              "[ -x \"$BIN\" ] || exit 0\n"
-                              "\"$BIN\" hook-augment 2>/dev/null\n"
-                              "exit 0\n";
-    const char *legacy_session =
-        "#!/usr/bin/env bash\n"
-        "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
-        "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
-        "cat << 'REMINDER'\n"
-        "CRITICAL - Code Discovery Protocol:\n"
-        "1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:\n"
-        "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
-        "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
-        "   - get_code_snippet(qualified_name) for exact symbol source (precise ranges)\n"
-        "   - query_graph(query) for complex Cypher patterns\n"
-        "   - get_architecture(aspects) for project structure\n"
-        "   - search_code(pattern) for text search (graph-augmented grep)\n"
-        "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
-        "   always Read a file before editing it.\n"
-        "3. If a project is not indexed yet, run index_repository FIRST.\n"
-        "REMINDER\n";
-    const char *legacy_subagent =
-        "#!/usr/bin/env bash\n"
-        "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
-        "# Installed by codebase-memory-mcp. Fires when any subagent is spawned.\n"
-        "# SubagentStart injects context via JSON additionalContext, not plain stdout.\n"
-        "cat << 'REMINDER'\n"
-        "{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\","
-        "\"additionalContext\":\"Code discovery: prefer codebase-memory-mcp tools "
-        "(search_graph, trace_path, get_code_snippet, query_graph, get_architecture, "
-        "search_code) over grep/file-read for navigating code. Use Grep/Glob/Read for "
-        "text, configs, and non-code files.\"}}\n"
-        "REMINDER\n";
+    char legacy_gate[8192];
+    ASSERT_TRUE(test_build_released_gate_hook_script("/opt/codebase-memory-mcp", legacy_gate,
+                                                     sizeof(legacy_gate)));
+    const char *legacy_session = test_released_session_hook_script;
+    const char *legacy_subagent = test_released_subagent_hook_script;
     write_test_file(gate_path, legacy_gate);
     write_test_file(session_path, legacy_session);
     write_test_file(subagent_path, legacy_subagent);
@@ -7610,16 +7624,28 @@ TEST(cli_uninstall_removes_claude_hook_scripts) {
     cbm_unsetenv("COPILOT_HOME");
 
     char binary[640];
+#ifdef _WIN32
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
     snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
     cbm_install_agent_configs(tmpdir, binary, false, false);
 
     char *args[] = {"-n"};
     int rc = cbm_cmd_uninstall(1, args);
+#ifdef _WIN32
+    const char *const names[] = {
+        "cbm-code-discovery-gate.cmd",
+        "cbm-session-reminder.cmd",
+        "cbm-subagent-reminder.cmd",
+    };
+#else
     const char *const names[] = {
         "cbm-code-discovery-gate",
         "cbm-session-reminder",
         "cbm-subagent-reminder",
     };
+#endif
     bool removed = true;
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         char path[640];
@@ -8713,6 +8739,131 @@ TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
              "extensionless scripts");
     PASS();
 }
+
+TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-windows-owned-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char hooks_dir[640];
+    char appdata[512];
+    char binary_path[640];
+    snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+    test_mkdirp(hooks_dir);
+
+    const char *const env_names[] = {"HOME",        "PATH",       "CLAUDE_CONFIG_DIR",
+                                     "APPDATA",     "CODEX_HOME", "OPENCODE_CONFIG",
+                                     "COPILOT_HOME"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+    }
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
+    cbm_setenv("APPDATA", appdata, 1);
+    cbm_unsetenv("CODEX_HOME");
+    cbm_unsetenv("OPENCODE_CONFIG");
+    cbm_unsetenv("COPILOT_HOME");
+
+    const char *const legacy_names[] = {
+        "cbm-code-discovery-gate",
+        "cbm-session-reminder",
+        "cbm-subagent-reminder",
+    };
+    const char *const current_names[] = {
+        "cbm-code-discovery-gate.cmd",
+        "cbm-session-reminder.cmd",
+        "cbm-subagent-reminder.cmd",
+    };
+    char *current_scripts[sizeof(current_names) / sizeof(current_names[0])] = {0};
+
+    int initial_install_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    bool current_scripts_ready = initial_install_rc == 0;
+    for (size_t i = 0U; i < sizeof(current_names) / sizeof(current_names[0]); i++) {
+        char current_path[768];
+        char legacy_path[768];
+        snprintf(current_path, sizeof(current_path), "%s/%s", hooks_dir, current_names[i]);
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_names[i]);
+        current_scripts[i] = read_test_file_alloc(current_path);
+        current_scripts_ready = current_scripts_ready && current_scripts[i] &&
+                                write_test_file(legacy_path, current_scripts[i]) == 0;
+    }
+
+    int current_upgrade_rc =
+        current_scripts_ready ? cbm_install_agent_configs(tmpdir, binary_path, false, false) : -1;
+    bool current_legacy_removed = current_upgrade_rc == 0;
+    for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
+        char current_path[768];
+        char legacy_path[768];
+        struct stat state;
+        snprintf(current_path, sizeof(current_path), "%s/%s", hooks_dir, current_names[i]);
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_names[i]);
+        current_legacy_removed = current_legacy_removed && stat(legacy_path, &state) != 0 &&
+                                 stat(current_path, &state) == 0;
+    }
+
+    char released_gate[8192];
+    bool released_ready =
+        test_build_released_gate_hook_script(binary_path, released_gate, sizeof(released_gate));
+    const char *const released_scripts[] = {
+        released_gate,
+        test_released_session_hook_script,
+        test_released_subagent_hook_script,
+    };
+    for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
+        char legacy_path[768];
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_names[i]);
+        released_ready = released_ready && write_test_file(legacy_path, released_scripts[i]) == 0;
+    }
+
+    int released_upgrade_rc =
+        released_ready ? cbm_install_agent_configs(tmpdir, binary_path, false, false) : -1;
+    bool released_legacy_removed = released_upgrade_rc == 0;
+    for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
+        char legacy_path[768];
+        struct stat state;
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_names[i]);
+        released_legacy_removed = released_legacy_removed && stat(legacy_path, &state) != 0;
+    }
+
+    bool uninstall_seeded = current_scripts_ready;
+    for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
+        char legacy_path[768];
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_names[i]);
+        uninstall_seeded = uninstall_seeded && current_scripts[i] &&
+                           write_test_file(legacy_path, current_scripts[i]) == 0;
+    }
+    char *uninstall_argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = uninstall_seeded ? cbm_cmd_uninstall(2, uninstall_argv) : -1;
+    bool all_owned_shapes_removed = uninstall_rc == 0;
+    for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
+        char current_path[768];
+        char legacy_path[768];
+        struct stat state;
+        snprintf(current_path, sizeof(current_path), "%s/%s", hooks_dir, current_names[i]);
+        snprintf(legacy_path, sizeof(legacy_path), "%s/%s", hooks_dir, legacy_names[i]);
+        all_owned_shapes_removed = all_owned_shapes_removed && stat(current_path, &state) != 0 &&
+                                   stat(legacy_path, &state) != 0;
+    }
+
+    for (size_t i = 0U; i < sizeof(current_scripts) / sizeof(current_scripts[0]); i++) {
+        free(current_scripts[i]);
+    }
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!current_legacy_removed || !released_legacy_removed || !all_owned_shapes_removed)
+        FAIL("Windows lifecycle must migrate and uninstall current and released owned hook "
+             "script shapes");
+    PASS();
+}
 #endif
 
 /* Claude may execute shell-form hooks through PowerShell when Git Bash is not
@@ -9743,6 +9894,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_scripts_platform_shape_issue929);
 #ifdef _WIN32
     RUN_TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state);
+    RUN_TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes);
 #endif
     RUN_TEST(cli_windows_claude_hook_command_is_shell_portable);
     RUN_TEST(cli_hook_augment_path_is_abs);
