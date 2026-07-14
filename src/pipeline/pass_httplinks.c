@@ -276,6 +276,26 @@ static bool has_source_route_extractor(const char *path) {
            has_suffix(path, ".kts");
 }
 
+static int compare_route_handlers(const void *lhs, const void *rhs) {
+    const cbm_route_handler_t *a = lhs;
+    const cbm_route_handler_t *b = rhs;
+    int cmp = strcmp(a->method, b->method);
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = strcmp(a->path, b->path);
+    if (cmp != 0) {
+        return cmp;
+    }
+    const char *a_qn = a->resolved_handler_qn[0] ? a->resolved_handler_qn : a->qualified_name;
+    const char *b_qn = b->resolved_handler_qn[0] ? b->resolved_handler_qn : b->qualified_name;
+    cmp = strcmp(a_qn, b_qn);
+    if (cmp != 0) {
+        return cmp;
+    }
+    return strcmp(a->handler_ref, b->handler_ref);
+}
+
 /* ── Route discovery ───────────────────────────────────────────── */
 
 /* Discover routes from a single Function/Method node. */
@@ -968,18 +988,27 @@ static int insert_route_nodes(cbm_pipeline_ctx_t *ctx, cbm_route_handler_t *rout
          * preventing Function/Module scans from adding weaker pseudo-handlers. */
         if (h_id > 0) {
             bool has_handler = false;
+            int live_handle_count = 0;
             for (int eh = 0; eh < existing_handle_count; eh++) {
-                if (existing_handles[eh]->source_id == h_id) {
+                const cbm_gbuf_node_t *existing_handler =
+                    cbm_gbuf_find_by_id(ctx->gbuf, existing_handles[eh]->source_id);
+                if (!existing_handler) {
+                    continue;
+                }
+                live_handle_count++;
+                if (existing_handles[eh]->source_id == h_id ||
+                    (existing_handler->qualified_name && h_qn[0] &&
+                     strcmp(existing_handler->qualified_name, h_qn) == 0)) {
                     has_handler = true;
                     break;
                 }
             }
-            if (existing_handle_count == 0 || has_handler) {
+            if (live_handle_count == 0 || has_handler) {
                 cbm_gbuf_insert_edge(ctx->gbuf, h_id, route_id, "HANDLES", "{}");
             }
 
             /* Mark handler as entry point */
-            if (existing_handle_count == 0 || has_handler) {
+            if (live_handle_count == 0 || has_handler) {
                 char *new_props = set_entry_point(h_props_json);
                 if (new_props) {
                     cbm_gbuf_upsert_node(ctx->gbuf, h_label, h_name, h_qn, h_file, h_start, h_end,
@@ -1493,6 +1522,12 @@ int cbm_pipeline_pass_httplinks(cbm_pipeline_ctx_t *ctx) {
     if (handlers_resolved > 0) {
         cbm_log_info("httplink.handlers_resolved", "count", itoa_hl(handlers_resolved));
     }
+
+    /* Workers claim graph nodes through an atomic cursor, so concatenating
+     * their private buffers does not preserve graph order. Canonical routes
+     * can share a method/path across handlers; sort after prefix and handler
+     * resolution so full and incremental runs select the same handler. */
+    qsort(routes, (size_t)route_count, sizeof(*routes), compare_route_handlers);
 
     /* ── Phase 4: Route nodes + HANDLES edges (serial) ────────── */
     CBM_PROF_START(t_insert_routes);

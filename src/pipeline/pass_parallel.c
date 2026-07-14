@@ -1837,6 +1837,9 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
             emit_http_async_service_edge(gbuf, source, call, res, CBM_SVC_HTTP, route_path);
             return;
         }
+        if (suffix_only_route_reg && !target) {
+            return;
+        }
         /* A resolved route-registration API with no route literal is still a
          * normal call to that API. The suffix-only unresolved fallback has no
          * real target and must not fabricate a source-to-source CALLS edge. */
@@ -2024,7 +2027,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
-                emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
+                emit_service_edge(ws->local_edge_buf, source_node, NULL, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
                                   imp_count, false, rel, lang);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {

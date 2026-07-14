@@ -930,6 +930,55 @@ typedef struct {
     const char *edge_type;
 } caller_edge_ref_t;
 
+static int compare_caller_edges(const cbm_gbuf_t *gb, const caller_edge_ref_t *a,
+                                const caller_edge_ref_t *b) {
+    const cbm_gbuf_node_t *a_source = cbm_gbuf_find_by_id(gb, a->source_id);
+    const cbm_gbuf_node_t *b_source = cbm_gbuf_find_by_id(gb, b->source_id);
+    const char *a_qn = a_source && a_source->qualified_name ? a_source->qualified_name : "";
+    const char *b_qn = b_source && b_source->qualified_name ? b_source->qualified_name : "";
+    int cmp = strcmp(a_qn, b_qn);
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = strcmp(a->edge_type ? a->edge_type : "", b->edge_type ? b->edge_type : "");
+    if (cmp != 0) {
+        return cmp;
+    }
+    cmp = strcmp(a->props ? a->props : "", b->props ? b->props : "");
+    if (cmp != 0) {
+        return cmp;
+    }
+    if (a->source_id == b->source_id) {
+        return 0;
+    }
+    return a->source_id < b->source_id ? CBM_NOT_FOUND : SKIP_ONE;
+}
+
+/* Retain the canonical first max_out callers without allocating in proportion
+ * to a high-fan-in route. max_out is fixed at CBM_SZ_64, so insertion is
+ * O(total_callers * 64) = O(total_callers) time and O(64) memory. */
+static void insert_caller_edge_bounded(cbm_gbuf_t *gb, caller_edge_ref_t *out, int *count,
+                                       int max_out, caller_edge_ref_t candidate) {
+    if (max_out <= 0) {
+        return;
+    }
+    int pos = 0;
+    while (pos < *count && compare_caller_edges(gb, &out[pos], &candidate) <= 0) {
+        pos++;
+    }
+    if (pos >= max_out) {
+        return;
+    }
+    int last = *count < max_out ? *count : max_out - SKIP_ONE;
+    for (int i = last; i > pos; i--) {
+        out[i] = out[i - SKIP_ONE];
+    }
+    out[pos] = candidate;
+    if (*count < max_out) {
+        (*count)++;
+    }
+}
+
 static bool http_call_edge_has_valid_route(const cbm_gbuf_edge_t *edge) {
     char url_buf[CBM_SZ_512];
     if (!extract_json_string_prop(edge->properties_json, "url_path", url_buf, sizeof(url_buf))) {
@@ -1024,23 +1073,23 @@ static int collect_caller_edges(cbm_gbuf_t *gb, int64_t route_id, caller_edge_re
     const cbm_gbuf_edge_t **http_edges = NULL;
     int http_count = 0;
     cbm_gbuf_find_edges_by_target_type(gb, route_id, "HTTP_CALLS", &http_edges, &http_count);
-    for (int i = 0; i < http_count && n < max_out; i++) {
+    for (int i = 0; i < http_count; i++) {
         if (!http_call_edge_has_valid_route(http_edges[i])) {
             continue;
         }
-        out[n].source_id = http_edges[i]->source_id;
-        out[n].props = http_edges[i]->properties_json;
-        out[n].edge_type = "HTTP_CALLS";
-        n++;
+        caller_edge_ref_t candidate = {.source_id = http_edges[i]->source_id,
+                                       .props = http_edges[i]->properties_json,
+                                       .edge_type = "HTTP_CALLS"};
+        insert_caller_edge_bounded(gb, out, &n, max_out, candidate);
     }
     const cbm_gbuf_edge_t **async_edges = NULL;
     int async_count = 0;
     cbm_gbuf_find_edges_by_target_type(gb, route_id, "ASYNC_CALLS", &async_edges, &async_count);
-    for (int i = 0; i < async_count && n < max_out; i++) {
-        out[n].source_id = async_edges[i]->source_id;
-        out[n].props = async_edges[i]->properties_json;
-        out[n].edge_type = "ASYNC_CALLS";
-        n++;
+    for (int i = 0; i < async_count; i++) {
+        caller_edge_ref_t candidate = {.source_id = async_edges[i]->source_id,
+                                       .props = async_edges[i]->properties_json,
+                                       .edge_type = "ASYNC_CALLS"};
+        insert_caller_edge_bounded(gb, out, &n, max_out, candidate);
     }
     return n;
 }
