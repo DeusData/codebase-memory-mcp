@@ -29,6 +29,7 @@ struct cbm_config;
 #define CBM_CONFIG_PAGERANK_EPSILON  "pagerank_epsilon"
 #define CBM_CONFIG_RANK_SCOPE        "rank_scope"
 #define CBM_CONFIG_RANK_REFRESH      "rank_refresh"
+#define CBM_CONFIG_RANK_ENABLED      "rank_enabled"
 
 #define CBM_RANK_REFRESH_EAGER          "eager"
 #define CBM_RANK_REFRESH_STALE_ON_EXACT "stale_on_exact"

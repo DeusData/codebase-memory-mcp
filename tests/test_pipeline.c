@@ -5435,6 +5435,7 @@ TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
     char full_tuned[CBM_SZ_256];
     char full_tuned_again[CBM_SZ_256];
     char fast_default[CBM_SZ_256];
+    char capabilities_disabled[CBM_SZ_256];
 
     cbm_pipeline_t *full = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
     cbm_pipeline_t *fast = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FAST);
@@ -5455,10 +5456,18 @@ TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
               CBM_STORE_OK);
     ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(fast, fast_default, sizeof(fast_default)),
               CBM_STORE_OK);
+    cbm_pipeline_set_similarity_enabled(full, false);
+    cbm_pipeline_set_semantic_edges_enabled(full, false);
+    cbm_pipeline_set_githistory_enabled(full, false);
+    cbm_pipeline_set_httplinks_enabled(full, false);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, capabilities_disabled,
+                                                    sizeof(capabilities_disabled)),
+              CBM_STORE_OK);
 
     ASSERT_NEQ(strcmp(full_default, full_tuned), 0);
     ASSERT_STR_EQ(full_tuned, full_tuned_again);
     ASSERT_NEQ(strcmp(full_default, fast_default), 0);
+    ASSERT_NEQ(strcmp(full_tuned, capabilities_disabled), 0);
 
     cbm_pipeline_free(full);
     cbm_pipeline_free(fast);
@@ -15660,6 +15669,10 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, "0.76"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.31"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, "0.61"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, "false"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "17000"), 0);
     char max_changed[CBM_SZ_32];
     char max_affected[CBM_SZ_32];
@@ -15686,6 +15699,10 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) < 0.32);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) > 0.60);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
+    ASSERT_FALSE(cbm_pipeline_similarity_enabled(p));
+    ASSERT_FALSE(cbm_pipeline_semantic_edges_enabled(p));
+    ASSERT_FALSE(cbm_pipeline_githistory_enabled(p));
+    ASSERT_FALSE(cbm_pipeline_httplinks_enabled(p));
     ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p), 17000000);
     ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
     ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
@@ -15704,6 +15721,71 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     cbm_pipeline_free(p);
     cbm_config_close(cfg);
     rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_capability_gates_default_enabled) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_similarity_enabled(p));
+    ASSERT_TRUE(cbm_pipeline_semantic_edges_enabled(p));
+    ASSERT_TRUE(cbm_pipeline_githistory_enabled(p));
+    ASSERT_TRUE(cbm_pipeline_httplinks_enabled(p));
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_disabled_capabilities_skip_expensive_passes) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create capability-gate repo");
+    }
+    char db_path[CBM_PATH_MAX];
+    int n = snprintf(db_path, sizeof(db_path), "%s/capabilities.db", g_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(db_path));
+
+    cbm_config_t *cfg = cbm_config_open(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, "false"), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=githistory reason=disabled"));
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=similarity reason=disabled"));
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=semantic_edges reason=disabled"));
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=httplinks reason=disabled"));
+
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_capability_combinations_have_unique_fingerprints) {
+    enum { PIPELINE_CAPABILITY_COMBINATIONS = 16 };
+    char fingerprints[PIPELINE_CAPABILITY_COMBINATIONS][CBM_SZ_256];
+    for (int mask = 0; mask < PIPELINE_CAPABILITY_COMBINATIONS; mask++) {
+        cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        cbm_pipeline_set_similarity_enabled(p, (mask & 1) != 0);
+        cbm_pipeline_set_semantic_edges_enabled(p, (mask & 2) != 0);
+        cbm_pipeline_set_githistory_enabled(p, (mask & 4) != 0);
+        cbm_pipeline_set_httplinks_enabled(p, (mask & 8) != 0);
+        ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(
+                      p, fingerprints[mask], sizeof(fingerprints[mask])),
+                  CBM_STORE_OK);
+        cbm_pipeline_free(p);
+        for (int prior = 0; prior < mask; prior++) {
+            ASSERT_NEQ(strcmp(fingerprints[prior], fingerprints[mask]), 0);
+        }
+    }
     PASS();
 }
 
@@ -16038,6 +16120,20 @@ TEST(config_registry_includes_rank_refresh_policy) {
     ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
     ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_EXACT));
     ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_INCREMENTAL));
+    PASS();
+}
+
+TEST(config_registry_includes_capability_gates) {
+    const char *keys[] = {CBM_CONFIG_RANK_ENABLED, CBM_CONFIG_SIMILARITY_ENABLED,
+                          CBM_CONFIG_SEMANTIC_EDGES_ENABLED, CBM_CONFIG_GITHISTORY_ENABLED,
+                          CBM_CONFIG_HTTPLINKS_ENABLED};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const cbm_config_entry_t *entry = find_config_entry(keys[i]);
+        ASSERT_NOT_NULL(entry);
+        ASSERT_STR_EQ(entry->default_val, "true");
+        ASSERT_STR_EQ(entry->range, "true|false");
+        ASSERT_NOT_NULL(strstr(entry->guidance, "config set"));
+    }
     PASS();
 }
 
@@ -16886,6 +16982,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_run_null);
     RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
+    RUN_TEST(pipeline_capability_gates_default_enabled);
+    RUN_TEST(pipeline_disabled_capabilities_skip_expensive_passes);
+    RUN_TEST(pipeline_capability_combinations_have_unique_fingerprints);
     RUN_TEST(pipeline_exact_delta_limits_keep_safe_defaults);
     RUN_TEST(pipeline_semantic_edges_independent_of_call_insertion_order);
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
@@ -16899,6 +16998,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
     RUN_TEST(config_registry_includes_incremental_derived_refresh_policy);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
+    RUN_TEST(config_registry_includes_capability_gates);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
     RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
     RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);

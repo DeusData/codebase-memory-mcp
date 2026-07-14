@@ -77,6 +77,7 @@ typedef struct {
 
 enum {
     CBM_PAGERANK_GROWTH_FACTOR = 2,
+    CBM_RANK_SQL_BUF = 256,
 };
 
 /* ── ISO timestamp helper ────────────────────────────────────── */
@@ -192,6 +193,52 @@ static cbm_rank_scope_t rank_scope_from_config(cbm_config_t *cfg) {
         return CBM_RANK_SCOPE_DEPS;
     }
     return CBM_DEFAULT_RANK_SCOPE;
+}
+
+static bool rank_enabled_from_config(cbm_config_t *cfg) {
+    return cfg ? cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true) : true;
+}
+
+static int clear_rank_rows_for_project(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) return -1;
+    sqlite3 *db = cbm_store_get_db(store);
+    if (!db || cbm_store_exec(store, "SAVEPOINT cbm_disable_rank") != CBM_STORE_OK) return -1;
+
+    static const char *tables[] = {"pagerank", "linkrank", "node_degree"};
+    sqlite3_stmt *stmt = NULL;
+    for (size_t i = 0; i < sizeof(tables) / sizeof(tables[0]); i++) {
+        char sql[CBM_RANK_SQL_BUF];
+        int n = snprintf(sql, sizeof(sql), "DELETE FROM %s WHERE %s", tables[i],
+                         scope_where(CBM_RANK_SCOPE_FULL));
+        if (n < 0 || (size_t)n >= sizeof(sql) ||
+            sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            goto rollback;
+        }
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE) goto rollback;
+        sqlite3_finalize(stmt);
+        stmt = NULL;
+    }
+
+    if (sqlite3_prepare_v2(
+            db,
+            "DELETE FROM derived_view_state WHERE project = ?1 AND view_name IN "
+            "('pagerank', 'linkrank', 'node_degree')",
+            -1, &stmt, NULL) != SQLITE_OK) {
+        goto rollback;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) goto rollback;
+    sqlite3_finalize(stmt);
+    stmt = NULL;
+    if (cbm_store_exec(store, "RELEASE cbm_disable_rank") != CBM_STORE_OK) goto rollback;
+    return 0;
+
+rollback:
+    sqlite3_finalize(stmt);
+    (void)cbm_store_exec(store, "ROLLBACK TO cbm_disable_rank");
+    (void)cbm_store_exec(store, "RELEASE cbm_disable_rank");
+    return -1;
 }
 
 typedef enum {
@@ -677,6 +724,10 @@ int cbm_pagerank_compute_default(cbm_store_t *store, const char *project) {
 
 int cbm_pagerank_compute_with_config(cbm_store_t *store, const char *project,
                                      cbm_config_t *cfg) {
+    if (!rank_enabled_from_config(cfg)) {
+        cbm_log_info("pagerank.skip", "project", project ? project : "", "reason", "disabled");
+        return clear_rank_rows_for_project(store, project);
+    }
     if (!cfg) return cbm_pagerank_compute_default(store, project);
 
     cbm_edge_weights_t w;
@@ -747,6 +798,10 @@ int cbm_pagerank_refresh_after_publish(cbm_store_t *store, const char *project,
                                        cbm_rank_refresh_publish_t publish_kind) {
     if (!store || !project || !project[0]) {
         return -1;
+    }
+    if (!rank_enabled_from_config(cfg)) {
+        cbm_log_info("pagerank.skip", "project", project, "reason", "disabled");
+        return clear_rank_rows_for_project(store, project);
     }
     if (!graph_changed && deps_reindexed <= 0 && cbm_pagerank_views_complete(store, project)) {
         cbm_log_info("pagerank.skip", "project", project, "reason", "graph_unchanged");

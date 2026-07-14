@@ -11710,8 +11710,9 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
 
-    /* Recompute PageRank after adding dep nodes so relevance sort includes them */
-    cbm_pagerank_compute_default(store, project);
+    /* Recompute rank views after adding dependency nodes unless the coupled
+     * PageRank/LinkRank/node-degree capability is disabled. */
+    (void)cbm_pagerank_compute_with_config(store, project, srv->config);
 
     /* Notify resource-capable clients that graph data changed */
     notify_resources_updated(srv);

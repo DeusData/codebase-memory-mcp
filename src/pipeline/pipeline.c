@@ -108,6 +108,10 @@ struct cbm_pipeline {
     char *branch_qn;
     bool git_context_resolved;
     cbm_index_mode_t mode;
+    bool similarity_enabled;
+    bool httplinks_enabled;
+    bool semantic_edges_enabled;
+    bool githistory_enabled;
     double similarity_threshold; /* Jaccard threshold for SIMILAR edges; <=0 = default (#41) */
     double httplink_min_confidence;
     double semantic_threshold;
@@ -222,6 +226,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->db_path = db_path ? cbm_strdup(db_path) : NULL;
     p->project_name = cbm_project_name_from_path(repo_path);
     p->mode = mode;
+    p->similarity_enabled = true;
+    p->httplinks_enabled = true;
+    p->semantic_edges_enabled = true;
+    p->githistory_enabled = true;
     p->similarity_threshold = 0.0; /* 0 = use CBM_MINHASH_JACCARD_THRESHOLD default */
     p->httplink_min_confidence = 0.0;
     p->semantic_threshold = 0.0;
@@ -282,10 +290,18 @@ void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold) 
     }
 }
 
+void cbm_pipeline_set_similarity_enabled(cbm_pipeline_t *p, bool enabled) {
+    if (p) p->similarity_enabled = enabled;
+}
+
 void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshold) {
     if (p) {
         p->httplink_min_confidence = pipeline_unit_threshold(threshold);
     }
+}
+
+void cbm_pipeline_set_httplinks_enabled(cbm_pipeline_t *p, bool enabled) {
+    if (p) p->httplinks_enabled = enabled;
 }
 
 void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold) {
@@ -294,10 +310,18 @@ void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold) {
     }
 }
 
+void cbm_pipeline_set_semantic_edges_enabled(cbm_pipeline_t *p, bool enabled) {
+    if (p) p->semantic_edges_enabled = enabled;
+}
+
 void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold) {
     if (p) {
         p->githistory_min_coupling = pipeline_unit_threshold(threshold);
     }
+}
+
+void cbm_pipeline_set_githistory_enabled(cbm_pipeline_t *p, bool enabled) {
+    if (p) p->githistory_enabled = enabled;
 }
 
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold) {
@@ -328,6 +352,12 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
     if (!p || !cfg) {
         return;
     }
+
+    p->similarity_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, true);
+    p->httplinks_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, true);
+    p->semantic_edges_enabled =
+        cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true);
+    p->githistory_enabled = cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, true);
 
     double sim_thresh =
         cbm_config_get_double(cfg, CBM_CONFIG_SIMILARITY_THRESHOLD, 0.0);
@@ -411,16 +441,32 @@ double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p) {
     return p ? p->httplink_min_confidence : 0.0;
 }
 
+bool cbm_pipeline_httplinks_enabled(const cbm_pipeline_t *p) {
+    return p ? p->httplinks_enabled : true;
+}
+
 double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p) {
     return p ? p->similarity_threshold : 0.0;
+}
+
+bool cbm_pipeline_similarity_enabled(const cbm_pipeline_t *p) {
+    return p ? p->similarity_enabled : true;
 }
 
 double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p) {
     return p ? p->semantic_threshold : 0.0;
 }
 
+bool cbm_pipeline_semantic_edges_enabled(const cbm_pipeline_t *p) {
+    return p ? p->semantic_edges_enabled : true;
+}
+
 double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p) {
     return p ? p->githistory_min_coupling : 0.0;
+}
+
+bool cbm_pipeline_githistory_enabled(const cbm_pipeline_t *p) {
+    return p ? p->githistory_enabled : true;
 }
 
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p) {
@@ -442,12 +488,25 @@ int cbm_pipeline_exact_max_affected_paths(const cbm_pipeline_t *p) {
 }
 
 int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, size_t out_sz) {
-    if (!p) {
+    if (!p || !out || out_sz == 0) {
         return CBM_STORE_ERR;
     }
-    return cbm_pipeline_format_file_delta_pass_fingerprint(
-        out, out_sz, p->mode, p->similarity_threshold, p->httplink_min_confidence,
-        p->semantic_threshold, p->githistory_min_coupling, p->lsp_confidence_floor);
+    char base[CBM_SZ_256];
+    if (cbm_pipeline_format_file_delta_pass_fingerprint(
+            base, sizeof(base), p->mode, p->similarity_threshold,
+            p->httplink_min_confidence, p->semantic_threshold,
+            p->githistory_min_coupling, p->lsp_confidence_floor) != CBM_STORE_OK) {
+        out[0] = '\0';
+        return CBM_STORE_ERR;
+    }
+    int n = snprintf(out, out_sz, "%s|cap=%d%d%d%d", base, p->similarity_enabled ? 1 : 0,
+                     p->semantic_edges_enabled ? 1 : 0, p->githistory_enabled ? 1 : 0,
+                     p->httplinks_enabled ? 1 : 0);
+    if (n < 0 || (size_t)n >= out_sz) {
+        out[0] = '\0';
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
 }
 
 static bool pipeline_file_state_metadata_current(cbm_store_t *store, const char *project,
@@ -1327,20 +1386,36 @@ static int predump_complexity(cbm_pipeline_ctx_t *ctx) {
 }
 
 static int run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+    typedef enum {
+        PREDUMP_ALWAYS = 0,
+        PREDUMP_SIMILARITY,
+        PREDUMP_SEMANTIC_EDGES,
+    } predump_capability_t;
     static const struct {
         predump_pass_fn fn;
         const char *name;
         bool global_semantic; /* true = only modes that build global semantic views */
+        predump_capability_t capability;
     } passes[] = {
-        {predump_deco, "decorator_tags", false}, {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},   {predump_sim, "similarity", true},
-        {predump_sem, "semantic_edges", true},   {predump_complexity, "complexity", false},
+        {predump_deco, "decorator_tags", false, PREDUMP_ALWAYS},
+        {predump_cfg, "configlink", false, PREDUMP_ALWAYS},
+        {predump_route, "route_match", false, PREDUMP_ALWAYS},
+        {predump_sim, "similarity", true, PREDUMP_SIMILARITY},
+        {predump_sem, "semantic_edges", true, PREDUMP_SEMANTIC_EDGES},
+        {predump_complexity, "complexity", false, PREDUMP_ALWAYS},
     };
     enum { PREDUMP_PASS_COUNT = 6 };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         if (passes[i].global_semantic &&
             !cbm_pipeline_mode_builds_global_semantic_edges(p->mode)) {
+            continue;
+        }
+        bool disabled =
+            (passes[i].capability == PREDUMP_SIMILARITY && !p->similarity_enabled) ||
+            (passes[i].capability == PREDUMP_SEMANTIC_EDGES && !p->semantic_edges_enabled);
+        if (disabled) {
+            cbm_log_info("pass.skip", "pass", passes[i].name, "reason", "disabled");
             continue;
         }
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -1838,6 +1913,11 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
 
 /* Run githistory pass. */
 static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
+    if (!p->githistory_enabled) {
+        cbm_log_info("pass.skip", "pass", "githistory", "reason", "disabled");
+        cbm_log_info("pass.done", "pass", "githistory", "commits", "0", "edges", "0");
+        return 0;
+    }
     struct timespec t_gh;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_gh);
 
@@ -2074,7 +2154,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
 
     /* httplinks: fork-only HTTP endpoint discovery pass. Upstream dropped this
      * feature, so it is not inside run_predump_passes(); run it here. */
-    if (!check_cancel(p)) {
+    if (!check_cancel(p) && p->httplinks_enabled) {
         cbm_clock_gettime(CLOCK_MONOTONIC, &t);
         rc = cbm_pipeline_pass_httplinks(&ctx);
         cbm_log_info("pass.timing", "pass", "httplinks", "elapsed_ms",
@@ -2086,6 +2166,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             rc = -1;
             goto cleanup;
         }
+    } else if (!check_cancel(p)) {
+        cbm_log_info("pass.skip", "pass", "httplinks", "reason", "disabled");
     }
 
     /* Normalization: enforce structural invariants (I2: Method->Class,
