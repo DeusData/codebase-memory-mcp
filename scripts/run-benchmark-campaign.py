@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -273,6 +274,47 @@ def expanded_command(command: list[str], attempt_root: Path, result_path: Path) 
     return [replacements.get(item, item) for item in command]
 
 
+def cell_process_group_options() -> dict[str, Any]:
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    return {"start_new_session": True}
+
+
+def stop_cell_process_tree(
+    process: subprocess.Popen[bytes], initial_signal: int, grace_seconds: float = 30.0
+) -> int | None:
+    """Stop an isolated benchmark process group, allowing harness cleanup first."""
+    if process.poll() is not None:
+        return process.returncode
+    try:
+        if os.name == "nt":
+            process.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            os.killpg(process.pid, initial_signal)
+    except (OSError, ProcessLookupError):
+        pass
+    try:
+        return process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        pass
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        return process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        return process.poll()
+
+
 def run_cell(
     campaign_root: Path,
     cell: dict[str, Any],
@@ -320,6 +362,7 @@ def run_cell(
         started = time.monotonic()
         returncode: int | None = None
         error: str | None = None
+        interrupted = False
     except Exception:
         if lock_path.exists():
             lock_path.unlink()
@@ -329,18 +372,22 @@ def run_cell(
             attempt_root / "stderr.log"
         ).open("wb") as stderr:
             try:
-                process = subprocess.run(
+                process = subprocess.Popen(
                     command,
                     cwd=cwd,
                     env=environment,
                     stdout=stdout,
                     stderr=stderr,
-                    timeout=cell.get("timeout_seconds"),
-                    check=False,
+                    **cell_process_group_options(),
                 )
-                returncode = process.returncode
+                returncode = process.wait(timeout=cell.get("timeout_seconds"))
             except subprocess.TimeoutExpired as exc:
                 error = f"command timed out after {exc.timeout} seconds"
+                returncode = stop_cell_process_tree(process, signal.SIGTERM)
+            except KeyboardInterrupt:
+                error = "command interrupted by SIGINT"
+                interrupted = True
+                returncode = stop_cell_process_tree(process, signal.SIGINT)
         accepted_codes = cell.get("accepted_exit_codes", [0])
         if error is None and returncode not in accepted_codes:
             error = f"command exited with {returncode}; accepted={accepted_codes}"
@@ -359,6 +406,8 @@ def run_cell(
             "error": error,
         }
         atomic_write_json(attempt_root / "attempt.json", attempt_record)
+        if interrupted:
+            raise KeyboardInterrupt
         if error is not None:
             return {
                 "cell_identity": identity,

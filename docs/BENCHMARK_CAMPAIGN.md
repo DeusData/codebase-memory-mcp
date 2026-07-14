@@ -98,6 +98,10 @@ Each cell retains immutable timestamped attempts with `command.json`, `stdout.lo
 `stderr.log`, `result.json`, and `attempt.json`. `complete.json` is written with an
 atomic replace only after validation. Per-cell exclusive locks reject a live or
 recent competing run; stale lock recovery is recorded instead of hidden.
+Each benchmark command runs in an isolated process group. Timeout or user interrupt
+signals the whole group, waits up to 30 seconds for the harness to remove its cache
+and detached worktrees, then force-stops any remaining descendants. The immutable
+attempt record is written before an interrupt is re-raised.
 
 Every invocation also writes:
 
@@ -116,6 +120,11 @@ membership is restricted to candidates that pass every applicable quality/correc
 gate and have query latency, response tokens, incremental latency, and peak RSS
 measurements. It maximizes quality while minimizing those cost axes. Exact bytes remain
 visible so the token estimate is never presented as tokenizer ground truth.
+Peak RSS and internal indexing time are extracted in one streaming pass from the
+worker logfile named by the index response. Only the exact `mem.phase`,
+`pipeline.done`, and `incremental.done` marker lines (at most 512) are retained in
+the result, keeping memory bounded while preserving the evidence after transient
+worker logs are cleaned.
 
 Use `--audit-only` to scan and regenerate the report without running missing cells.
 Use `--minimum-free-gb` and `--stale-lock-hours` only when the recorded defaults are
