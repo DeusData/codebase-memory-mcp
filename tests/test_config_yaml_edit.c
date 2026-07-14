@@ -20,7 +20,7 @@
 #endif
 
 /* Expected test seams for races after final verification and failures after
- * lock-directory creation. Production code must not expose them outside the
+ * lock-object creation. Production code must not expose them outside the
  * test API build. */
 void cbm_yaml_set_prepublish_hook_for_testing(cbm_yaml_precommit_test_hook_t hook, void *context);
 #ifndef _WIN32
@@ -105,6 +105,17 @@ static size_t yaml_temp_file_count(const yaml_fixture_t *fixture) {
     return count;
 }
 
+static bool yaml_lock_released_state_is_safe(const char *path) {
+    struct stat state;
+#ifdef _WIN32
+    return stat(path, &state) != 0;
+#else
+    return lstat(path, &state) == 0 && S_ISREG(state.st_mode) && state.st_nlink == 1 &&
+           state.st_uid == geteuid() && (state.st_mode & 0777U) == 0600U &&
+           (state.st_mode & (S_ISUID | S_ISGID | S_ISVTX)) == 0;
+#endif
+}
+
 static bool yaml_upsert_failed_unchanged(const char *path, const char *original) {
     const char *block = "    command: codebase-memory-mcp\n";
     if (th_write_file(path, original) != 0 ||
@@ -151,8 +162,15 @@ static void yaml_attempt_competing_edit(const char *path, void *context) {
     char lock_path[1024];
     int written = snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", path);
     struct stat state;
-    contention->lock_observed = written > 0 && (size_t)written < sizeof(lock_path) &&
-                                stat(lock_path, &state) == 0 && S_ISDIR(state.st_mode);
+    bool expected_type = false;
+    if (written > 0 && (size_t)written < sizeof(lock_path) && stat(lock_path, &state) == 0) {
+#ifdef _WIN32
+        expected_type = S_ISDIR(state.st_mode);
+#else
+        expected_type = S_ISREG(state.st_mode);
+#endif
+    }
+    contention->lock_observed = expected_type;
     contention->competing_result = cbm_yaml_upsert_string_list_item(path, "read", "COMPETING.md");
     contention->lock_observed = contention->lock_observed || contention->competing_result == -1;
 }
@@ -180,8 +198,7 @@ TEST(config_yaml_edit_serializes_two_editor_instances) {
     free(after);
     char lock_path[1024];
     ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
-    struct stat state;
-    ASSERT(stat(lock_path, &state) != 0);
+    ASSERT(yaml_lock_released_state_is_safe(lock_path));
     ASSERT_EQ(yaml_temp_file_count(&fixture), 0U);
     th_cleanup(fixture.dir);
     PASS();
@@ -210,8 +227,7 @@ TEST(config_yaml_edit_missing_target_appearance_fails_without_replace) {
     free(after);
     char lock_path[1024];
     ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
-    struct stat state;
-    ASSERT(stat(lock_path, &state) != 0);
+    ASSERT(yaml_lock_released_state_is_safe(lock_path));
     ASSERT_EQ(yaml_temp_file_count(&fixture), 0U);
     th_cleanup(fixture.dir);
     PASS();
@@ -307,14 +323,13 @@ TEST(config_yaml_edit_existing_target_swap_after_check_preserves_winner) {
     ASSERT_EQ(cbm_unlink(backup), 0);
     char lock_path[1024];
     ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
-    struct stat lock_state;
-    ASSERT(stat(lock_path, &lock_state) != 0);
+    ASSERT(yaml_lock_released_state_is_safe(lock_path));
     th_cleanup(fixture.dir);
     PASS();
 }
 
 #ifndef _WIN32
-TEST(config_yaml_edit_lock_postcreate_verification_failure_cleans_owned_lock) {
+TEST(config_yaml_edit_lock_postcreate_verification_failure_preserves_unsafe_sidecar) {
     yaml_fixture_t fixture;
     ASSERT_EQ(yaml_fixture_init(&fixture, "model: fast\n"), 0);
     int mutation_result = -1;
@@ -328,8 +343,113 @@ TEST(config_yaml_edit_lock_postcreate_verification_failure_cleans_owned_lock) {
     char lock_path[1024];
     ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
     struct stat state;
-    ASSERT(stat(lock_path, &state) != 0);
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+    ASSERT(S_ISREG(state.st_mode));
+    ASSERT_EQ(state.st_uid, geteuid());
+    ASSERT_EQ(state.st_mode & 0777U, 0755U);
     ASSERT_EQ(yaml_temp_file_count(&fixture), 0U);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar) {
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, "model: fast\n"), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), 0);
+    char lock_path[1024];
+    ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
+    ASSERT(yaml_lock_released_state_is_safe(lock_path));
+    struct stat first;
+    ASSERT_EQ(lstat(lock_path, &first), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "CONVENTIONS.md"), 0);
+    ASSERT(yaml_lock_released_state_is_safe(lock_path));
+    struct stat second;
+    ASSERT_EQ(lstat(lock_path, &second), 0);
+    ASSERT_EQ(first.st_dev, second.st_dev);
+    ASSERT_EQ(first.st_ino, second.st_ino);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "AGENTS.md"));
+    ASSERT_NOT_NULL(strstr(after, "CONVENTIONS.md"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_rejects_symlink_lock_sidecar) {
+    const char *original = "model: fast\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    char lock_path[1024];
+    char target_path[1024];
+    ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
+    ASSERT(snprintf(target_path, sizeof(target_path), "%s/foreign-lock", fixture.dir) > 0);
+    ASSERT_EQ(th_write_file(target_path, "foreign\n"), 0);
+    ASSERT_EQ(symlink(target_path, lock_path), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), -1);
+    struct stat link_state;
+    ASSERT_EQ(lstat(lock_path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, original);
+    free(after);
+    char *target = yaml_read_alloc(target_path);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target, "foreign\n");
+    free(target);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_rejects_hard_linked_lock_sidecar) {
+    const char *original = "model: fast\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    char lock_path[1024];
+    char source_path[1024];
+    ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
+    ASSERT(snprintf(source_path, sizeof(source_path), "%s/foreign-lock", fixture.dir) > 0);
+    ASSERT_EQ(th_write_file(source_path, "foreign\n"), 0);
+    ASSERT_EQ(chmod(source_path, 0600), 0);
+    ASSERT_EQ(link(source_path, lock_path), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), -1);
+    struct stat source_state;
+    struct stat lock_state;
+    ASSERT_EQ(lstat(source_path, &source_state), 0);
+    ASSERT_EQ(lstat(lock_path, &lock_state), 0);
+    ASSERT_EQ(source_state.st_ino, lock_state.st_ino);
+    ASSERT_EQ(source_state.st_nlink, 2);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, original);
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_rejects_unsafe_mode_lock_sidecar) {
+    const char *original = "model: fast\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, original), 0);
+    char lock_path[1024];
+    ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
+    ASSERT_EQ(th_write_file(lock_path, "foreign\n"), 0);
+    ASSERT_EQ(chmod(lock_path, 0644), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), -1);
+    struct stat state;
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+    ASSERT(S_ISREG(state.st_mode));
+    ASSERT_EQ(state.st_mode & 0777U, 0644U);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, original);
+    free(after);
     th_cleanup(fixture.dir);
     PASS();
 }
@@ -1413,7 +1533,11 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_rejects_stale_identity_with_same_content);
     RUN_TEST(config_yaml_edit_existing_target_swap_after_check_preserves_winner);
 #ifndef _WIN32
-    RUN_TEST(config_yaml_edit_lock_postcreate_verification_failure_cleans_owned_lock);
+    RUN_TEST(config_yaml_edit_lock_postcreate_verification_failure_preserves_unsafe_sidecar);
+    RUN_TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar);
+    RUN_TEST(config_yaml_edit_rejects_symlink_lock_sidecar);
+    RUN_TEST(config_yaml_edit_rejects_hard_linked_lock_sidecar);
+    RUN_TEST(config_yaml_edit_rejects_unsafe_mode_lock_sidecar);
 #endif
     RUN_TEST(config_yaml_edit_rejects_non_regular_path);
 #ifndef _WIN32

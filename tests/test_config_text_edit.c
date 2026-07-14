@@ -26,6 +26,7 @@
  * these declarations here makes this RED test file independent of production
  * header edits while the implementation is developed. */
 void cbm_text_set_prepublish_hook_for_testing(cbm_text_precommit_test_hook_t hook, void *context);
+void cbm_text_set_temp_closed_hook_for_testing(cbm_text_precommit_test_hook_t hook, void *context);
 int cbm_text_write_owned_document_if_unchanged(const char *file_path, const char *owned_content,
                                                const char *expected_content,
                                                size_t expected_length);
@@ -133,6 +134,20 @@ static void cte_change_before_commit(const char *path, void *context) {
     }
     change->result = th_write_file(path, change->content);
 }
+
+#ifndef _WIN32
+static void cte_replace_closed_temp(const char *path, void *context) {
+    cte_precommit_change_t *change = (cte_precommit_change_t *)context;
+    if (!change->backup_path || cbm_rename_replace(path, change->backup_path) != 0) {
+        change->result = -1;
+        return;
+    }
+    change->result = th_write_file(path, change->content);
+    if (change->result == 0 && chmod(path, 0644) != 0) {
+        change->result = -1;
+    }
+}
+#endif
 
 TEST(config_text_managed_insert_preserves_bom_comments_and_is_idempotent) {
     char dir[CTE_PATH_CAP];
@@ -282,6 +297,10 @@ TEST(config_text_owned_document_migrates_exact_releases_only) {
     ASSERT_EQ(th_write_file(path, modified), 0);
     ASSERT_EQ(cbm_text_migrate_owned_document(path, current, released, 2U), 1);
     ASSERT(cte_assert_bytes(path, modified, strlen(modified)));
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 2U, 04755U), -1);
+    ASSERT(cte_assert_bytes(path, modified, strlen(modified)));
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 2U, 0200U), -1);
+    ASSERT(cte_assert_bytes(path, modified, strlen(modified)));
 
     ASSERT_EQ(cbm_text_remove_owned_document_any(path, current, released, 2U), 1);
     ASSERT(cte_assert_bytes(path, modified, strlen(modified)));
@@ -366,11 +385,13 @@ TEST(config_text_rejects_links_privileged_mode_and_preserves_metadata) {
     ASSERT_EQ(th_write_file(target, "target\n"), 0);
     ASSERT_EQ(symlink(target, path), 0);
     ASSERT_EQ(cbm_text_write_owned_document(path, "owned\n"), -1);
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, "owned\n", NULL, 0U, 0755U), -1);
     ASSERT_EQ(cbm_unlink(path), 0);
 
     ASSERT_EQ(th_write_file(path, "shared\n"), 0);
     ASSERT_EQ(link(path, alias), 0);
     ASSERT_EQ(cbm_text_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned"), -1);
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, "owned\n", NULL, 0U, 0755U), -1);
     ASSERT_EQ(cbm_unlink(alias), 0);
 
     ASSERT_EQ(chmod(path, 04755), 0);
@@ -389,6 +410,107 @@ TEST(config_text_rejects_links_privileged_mode_and_preserves_metadata) {
     ASSERT_EQ(after.st_uid, before.st_uid);
     ASSERT_EQ(after.st_gid, before.st_gid);
     ASSERT_EQ(cte_temp_count(dir), 0U);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_text_owned_document_mode_publishes_exact_bytes_atomically) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    const char *current = "#!/bin/sh\necho current\n";
+    const char *released[] = {"#!/bin/sh\necho released\n"};
+    const char *foreign = "#!/bin/sh\necho foreign\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 1U, 0755U), 0);
+    struct stat state;
+    ASSERT_EQ(stat(path, &state), 0);
+    ASSERT_EQ(state.st_mode & 0777U, 0755U);
+    ASSERT_EQ(state.st_uid, geteuid());
+    ASSERT(cte_assert_bytes(path, current, strlen(current)));
+    struct stat stable;
+    ASSERT_EQ(stat(path, &stable), 0);
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 1U, 0755U), 0);
+    ASSERT_EQ(stat(path, &state), 0);
+    ASSERT_EQ(state.st_ino, stable.st_ino);
+
+    ASSERT_EQ(chmod(path, 0600), 0);
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 1U, 0755U), 0);
+    ASSERT_EQ(stat(path, &state), 0);
+    ASSERT_EQ(state.st_mode & 0777U, 0755U);
+    ASSERT(state.st_ino != before.st_ino);
+    ASSERT(cte_assert_bytes(path, current, strlen(current)));
+
+    ASSERT_EQ(th_write_file(path, released[0]), 0);
+    ASSERT_EQ(chmod(path, 0640), 0);
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 1U, 0755U), 0);
+    ASSERT_EQ(stat(path, &state), 0);
+    ASSERT_EQ(state.st_mode & 0777U, 0755U);
+    ASSERT(cte_assert_bytes(path, current, strlen(current)));
+
+    ASSERT_EQ(th_write_file(path, foreign), 0);
+    ASSERT_EQ(chmod(path, 0640), 0);
+    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, current, released, 1U, 0755U), 1);
+    ASSERT_EQ(stat(path, &state), 0);
+    ASSERT_EQ(state.st_mode & 0777U, 0640U);
+    ASSERT(cte_assert_bytes(path, foreign, strlen(foreign)));
+    ASSERT_EQ(cte_temp_count(dir), 0U);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_text_owned_document_mode_rejects_prepublish_replacement) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char backup[CTE_PATH_CAP];
+    const char *current = "#!/bin/sh\necho current\n";
+    const char *winner = "#!/bin/sh\necho winner\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT(snprintf(backup, sizeof(backup), "%s/original.sh", dir) > 0);
+    ASSERT_EQ(th_write_file(path, current), 0);
+    ASSERT_EQ(chmod(path, 0600), 0);
+    cte_precommit_change_t race = {
+        .content = winner, .backup_path = backup, .replace_identity = 1, .result = -1};
+
+    cbm_text_set_prepublish_hook_for_testing(cte_change_before_commit, &race);
+    int result = cbm_text_migrate_owned_document_mode(path, current, NULL, 0U, 0755U);
+    cbm_text_set_prepublish_hook_for_testing(NULL, NULL);
+
+    ASSERT_EQ(race.result, 0);
+    ASSERT_EQ(result, -1);
+    ASSERT(cte_assert_bytes(path, winner, strlen(winner)));
+    struct stat state;
+    ASSERT_EQ(stat(path, &state), 0);
+    ASSERT_EQ(state.st_mode & 0111U, 0U);
+    ASSERT_EQ(cte_temp_count(dir), 0U);
+    ASSERT_EQ(cbm_unlink(backup), 0);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(config_text_owned_document_mode_rejects_closed_temp_replacement) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char backup[CTE_PATH_CAP];
+    const char *current = "#!/bin/sh\necho current\n";
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT(snprintf(backup, sizeof(backup), "%s/original-temp", dir) > 0);
+    cte_precommit_change_t race = {
+        .content = current, .backup_path = backup, .replace_identity = 1, .result = -1};
+
+    cbm_text_set_temp_closed_hook_for_testing(cte_replace_closed_temp, &race);
+    int result = cbm_text_migrate_owned_document_mode(path, current, NULL, 0U, 0755U);
+    cbm_text_set_temp_closed_hook_for_testing(NULL, NULL);
+
+    ASSERT_EQ(race.result, 0);
+    ASSERT_EQ(result, -1);
+    ASSERT_FALSE(cte_path_exists(path));
+    ASSERT(cte_assert_bytes(backup, current, strlen(current)));
+    struct stat trusted;
+    ASSERT_EQ(stat(backup, &trusted), 0);
+    ASSERT_EQ(trusted.st_mode & 0777U, 0755U);
     th_cleanup(dir);
     PASS();
 }
@@ -548,6 +670,9 @@ SUITE(config_text_edit) {
     RUN_TEST(config_text_rejects_non_regular_paths);
 #ifndef _WIN32
     RUN_TEST(config_text_rejects_links_privileged_mode_and_preserves_metadata);
+    RUN_TEST(config_text_owned_document_mode_publishes_exact_bytes_atomically);
+    RUN_TEST(config_text_owned_document_mode_rejects_prepublish_replacement);
+    RUN_TEST(config_text_owned_document_mode_rejects_closed_temp_replacement);
 #endif
     RUN_TEST(config_text_rejects_stale_content_and_identity);
     RUN_TEST(config_text_missing_target_race_does_not_replace_winner);

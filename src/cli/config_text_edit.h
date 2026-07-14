@@ -31,6 +31,14 @@ int cbm_text_ensure_owned_document(const char *file_path, const char *owned_cont
  * 1 for user-modified/unowned content. */
 int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
                                     const char *const *released_contents, size_t released_count);
+/* As above, but publish the owned document with the requested low permission
+ * bits as part of the same atomic replacement. The mode must include owner-read
+ * permission. Existing POSIX documents must be owned by the effective user.
+ * On Windows the mode is validated but otherwise ignored because command
+ * scripts do not use POSIX execute bits. */
+int cbm_text_migrate_owned_document_mode(const char *file_path, const char *current_content,
+                                         const char *const *released_contents,
+                                         size_t released_count, unsigned int mode);
 /* Returns 0 when removed/missing, 1 when a regular document exists but is not
  * byte-for-byte owned by the caller, and -1 for unsafe state or I/O failure. */
 int cbm_text_remove_owned_document(const char *file_path, const char *expected_owned_content);
@@ -44,6 +52,9 @@ void cbm_text_set_precommit_hook_for_testing(cbm_text_precommit_test_hook_t hook
 /* Runs after the first stale-snapshot check and before the final identity
  * revalidation used for publication or exact deletion. */
 void cbm_text_set_prepublish_hook_for_testing(cbm_text_precommit_test_hook_t hook, void *context);
+/* Runs after the synced temporary descriptor is closed but before its pathname
+ * is reopened and matched against the descriptor-bound snapshot. */
+void cbm_text_set_temp_closed_hook_for_testing(cbm_text_precommit_test_hook_t hook, void *context);
 #endif
 
 #endif

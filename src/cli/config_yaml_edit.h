@@ -18,10 +18,13 @@ extern "C" {
  * replacement, the editor verifies that both the file identity and bytes still
  * match the version it read. POSIX replacements preserve owner, group, and
  * permission bits and sync the parent directory.
- * Cooperating editor processes are serialized by an adjacent atomic
- * "<file_path>.cbm-yaml.lock" directory held across read, transform, final
- * verification, and replacement. Contention fails closed. An interrupted
- * process can leave a stale lock directory that must be removed explicitly.
+ * Cooperating editor processes are serialized across read, transform, final
+ * verification, and replacement. POSIX uses an adjacent persistent
+ * "<file_path>.cbm-yaml.lock" regular file, created with mode 0600 and held by
+ * a non-blocking advisory lock; release unlocks and closes it without removing
+ * the pathname, and process exit releases the lock automatically. Windows uses
+ * an adjacent temporary lock directory removed by its verified open handle.
+ * Contention and unsafe lock metadata fail closed.
  * Initially missing targets use no-replace publication. A non-cooperating
  * writer can still race an existing-target replacement in the narrow interval
  * after the final verification on platforms without destination-identity CAS.
@@ -113,8 +116,8 @@ void cbm_yaml_set_precommit_hook_for_testing(cbm_yaml_precommit_test_hook_t hook
 /* Runs after the first stale-snapshot check and before final destination and
  * temporary-file identity revalidation. */
 void cbm_yaml_set_prepublish_hook_for_testing(cbm_yaml_precommit_test_hook_t hook, void *context);
-/* Runs after the adjacent lock directory's initial identity is captured and
- * before its final ownership, mode, and handle identity verification. */
+/* Runs after the adjacent lock object's initial identity is captured and
+ * before locking and final ownership, mode, and handle identity verification. */
 typedef void (*cbm_yaml_lock_postcreate_test_hook_t)(const char *lock_path, void *context);
 void cbm_yaml_set_lock_postcreate_hook_for_testing(cbm_yaml_lock_postcreate_test_hook_t hook,
                                                    void *context);

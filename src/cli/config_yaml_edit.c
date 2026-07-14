@@ -33,6 +33,7 @@
 #define YAML_PROCESS_ID _getpid
 #define YAML_SYNC _commit
 #else
+#include <sys/file.h>
 #include <sys/types.h>
 #include <unistd.h>
 #define YAML_PROCESS_ID getpid
@@ -71,6 +72,7 @@ enum {
     YAML_BOM_BYTE_0 = 0xef,
     YAML_BOM_BYTE_1 = 0xbb,
     YAML_BOM_BYTE_2 = 0xbf,
+    YAML_LOCK_FILE_MODE = 0600,
     YAML_NEW_FILE_MODE = 0600,
     YAML_PERMISSION_MASK = 0777,
 };
@@ -334,22 +336,32 @@ static int yaml_build_lock_path(const char *path, char **out_path) {
     return 0;
 }
 
-#ifndef _WIN32
-static int yaml_remove_owned_lock_directory(const char *path, dev_t device, ino_t inode,
-                                            uid_t owner) {
-    struct stat current;
-    if (lstat(path, &current) != 0 || !S_ISDIR(current.st_mode) || current.st_dev != device ||
-        current.st_ino != inode || current.st_uid != owner) {
-        return YAML_ERROR;
-    }
-    return rmdir(path) == 0 ? 0 : YAML_ERROR;
-}
-#else
+#ifdef _WIN32
 static void yaml_remove_open_lock_directory(HANDLE handle) {
     FILE_DISPOSITION_INFO disposition = {.DeleteFile = TRUE};
     (void)SetFileInformationByHandle(handle, FileDispositionInfo, &disposition,
                                      sizeof(disposition));
     (void)CloseHandle(handle);
+}
+#else
+static bool yaml_lock_file_state_is_safe(const struct stat *state) {
+    return S_ISREG(state->st_mode) && state->st_nlink == 1 && state->st_uid == geteuid() &&
+           (state->st_mode & YAML_PERMISSION_MASK) == YAML_LOCK_FILE_MODE &&
+           (state->st_mode & (S_ISUID | S_ISGID | S_ISVTX)) == 0;
+}
+
+static bool yaml_lock_file_state_matches(const struct stat *left, const struct stat *right) {
+    return left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+           left->st_mode == right->st_mode && left->st_nlink == right->st_nlink &&
+           left->st_uid == right->st_uid;
+}
+
+static int yaml_flock_nointr(int descriptor, int operation) {
+    int result = 0;
+    do {
+        result = flock(descriptor, operation);
+    } while (result != 0 && errno == EINTR);
+    return result == 0 ? 0 : YAML_ERROR;
 }
 #endif
 
@@ -421,14 +433,34 @@ static int yaml_lock_acquire(const char *path, yaml_config_lock_t *lock) {
     lock->file_index_high = info.nFileIndexHigh;
     lock->file_index_low = info.nFileIndexLow;
 #else
-    if (mkdir(lock->path, 0700) != 0) {
+#ifndef O_NOFOLLOW
+    free(lock->path);
+    lock->path = NULL;
+    return YAML_ERROR;
+#else
+    int flags = O_RDWR | O_NOFOLLOW | O_NONBLOCK;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    bool created = false;
+    int descriptor = open(lock->path, flags | O_CREAT | O_EXCL, YAML_LOCK_FILE_MODE);
+    if (descriptor >= 0) {
+        created = true;
+    } else if (errno == EEXIST) {
+        descriptor = open(lock->path, flags);
+    }
+    if (descriptor < 0 || (created && fchmod(descriptor, YAML_LOCK_FILE_MODE) != 0)) {
+        if (descriptor >= 0) {
+            (void)close(descriptor);
+        }
         free(lock->path);
         lock->path = NULL;
         return YAML_ERROR;
     }
-    struct stat created_state;
-    if (lstat(lock->path, &created_state) != 0) {
-        (void)rmdir(lock->path);
+
+    struct stat opened_state;
+    if (fstat(descriptor, &opened_state) != 0 || !yaml_lock_file_state_is_safe(&opened_state)) {
+        (void)close(descriptor);
         free(lock->path);
         lock->path = NULL;
         return YAML_ERROR;
@@ -438,45 +470,23 @@ static int yaml_lock_acquire(const char *path, yaml_config_lock_t *lock) {
         yaml_lock_postcreate_test_hook(lock->path, yaml_lock_postcreate_test_context);
     }
 #endif
-    struct stat path_state;
-    if (lstat(lock->path, &path_state) != 0) {
-        (void)yaml_remove_owned_lock_directory(lock->path, created_state.st_dev,
-                                               created_state.st_ino, created_state.st_uid);
+    if (yaml_flock_nointr(descriptor, LOCK_EX | LOCK_NB) != 0) {
+        (void)close(descriptor);
         free(lock->path);
         lock->path = NULL;
         return YAML_ERROR;
     }
-#ifndef O_NOFOLLOW
-    (void)yaml_remove_owned_lock_directory(lock->path, created_state.st_dev, created_state.st_ino,
-                                           created_state.st_uid);
-    free(lock->path);
-    lock->path = NULL;
-    return YAML_ERROR;
-#else
-    int flags = O_RDONLY | O_NOFOLLOW;
-#ifdef O_DIRECTORY
-    flags |= O_DIRECTORY;
-#endif
-#ifdef O_CLOEXEC
-    flags |= O_CLOEXEC;
-#endif
-    int descriptor = open(lock->path, flags);
+
     struct stat handle_state;
-    bool safe =
-        descriptor >= 0 && fstat(descriptor, &handle_state) == 0 && S_ISDIR(path_state.st_mode) &&
-        S_ISDIR(handle_state.st_mode) && path_state.st_dev == created_state.st_dev &&
-        path_state.st_ino == created_state.st_ino && path_state.st_uid == created_state.st_uid &&
-        path_state.st_dev == handle_state.st_dev && path_state.st_ino == handle_state.st_ino &&
-        path_state.st_uid == geteuid() && handle_state.st_uid == geteuid() &&
-        (path_state.st_mode & 0777U) == 0700U && (handle_state.st_mode & 0777U) == 0700U &&
-        (path_state.st_mode & (S_ISUID | S_ISGID | S_ISVTX)) == 0 &&
-        (handle_state.st_mode & (S_ISUID | S_ISGID | S_ISVTX)) == 0;
+    struct stat path_state;
+    bool safe = fstat(descriptor, &handle_state) == 0 && lstat(lock->path, &path_state) == 0 &&
+                yaml_lock_file_state_is_safe(&handle_state) &&
+                yaml_lock_file_state_is_safe(&path_state) &&
+                yaml_lock_file_state_matches(&opened_state, &handle_state) &&
+                yaml_lock_file_state_matches(&handle_state, &path_state);
     if (!safe) {
-        if (descriptor >= 0) {
-            (void)close(descriptor);
-        }
-        (void)yaml_remove_owned_lock_directory(lock->path, created_state.st_dev,
-                                               created_state.st_ino, created_state.st_uid);
+        (void)yaml_flock_nointr(descriptor, LOCK_UN);
+        (void)close(descriptor);
         free(lock->path);
         lock->path = NULL;
         return YAML_ERROR;
@@ -511,14 +521,16 @@ static int yaml_lock_release(yaml_config_lock_t *lock) {
 #else
     if (lock->descriptor >= 0) {
         struct stat handle_state;
-        bool same = fstat(lock->descriptor, &handle_state) == 0 && S_ISDIR(handle_state.st_mode) &&
-                    handle_state.st_dev == lock->device && handle_state.st_ino == lock->inode &&
-                    handle_state.st_uid == lock->owner;
-        int removed = same ? yaml_remove_owned_lock_directory(lock->path, lock->device, lock->inode,
-                                                              lock->owner)
-                           : YAML_ERROR;
+        struct stat path_state;
+        bool same =
+            fstat(lock->descriptor, &handle_state) == 0 && lstat(lock->path, &path_state) == 0 &&
+            yaml_lock_file_state_is_safe(&handle_state) &&
+            yaml_lock_file_state_is_safe(&path_state) && handle_state.st_dev == lock->device &&
+            handle_state.st_ino == lock->inode && handle_state.st_uid == lock->owner &&
+            yaml_lock_file_state_matches(&handle_state, &path_state);
+        int unlocked = yaml_flock_nointr(lock->descriptor, LOCK_UN);
         int closed = close(lock->descriptor);
-        result = removed == 0 && closed == 0 ? 0 : YAML_ERROR;
+        result = same && unlocked == 0 && closed == 0 ? 0 : YAML_ERROR;
         lock->descriptor = -1;
     }
 #endif

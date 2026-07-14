@@ -3632,41 +3632,8 @@ static int cbm_powershell_quote_word(const char *value, char *out, size_t out_si
 static bool cbm_write_owned_hook_script_with_legacy(const char *path, const char *script,
                                                     const char *const *legacy_scripts,
                                                     size_t legacy_count) {
-    int write_result = cbm_text_ensure_owned_document(path, script);
-    for (size_t index = 0U; write_result != 0 && index < legacy_count; index++) {
-        const char *legacy = legacy_scripts ? legacy_scripts[index] : NULL;
-        if (legacy) {
-            write_result =
-                cbm_text_write_owned_document_if_unchanged(path, script, legacy, strlen(legacy));
-        }
-    }
-    if (write_result != 0) {
-        return false;
-    }
-#ifndef _WIN32
-    struct stat expected;
-    if (lstat(path, &expected) != 0 || !S_ISREG(expected.st_mode) || expected.st_nlink != 1U) {
-        return false;
-    }
-    int flags = O_RDONLY;
-#ifdef O_NOFOLLOW
-    flags |= O_NOFOLLOW;
-#endif
-#ifdef O_CLOEXEC
-    flags |= O_CLOEXEC;
-#endif
-    int descriptor = open(path, flags);
-    struct stat state;
-    bool ok = descriptor >= 0 && fstat(descriptor, &state) == 0 && S_ISREG(state.st_mode) &&
-              state.st_nlink == 1U && state.st_dev == expected.st_dev &&
-              state.st_ino == expected.st_ino && fchmod(descriptor, CLI_OCTAL_PERM) == 0;
-    if (descriptor >= 0) {
-        (void)close(descriptor);
-    }
-    return ok;
-#else
-    return chmod(path, CLI_OCTAL_PERM) == 0;
-#endif
+    return cbm_text_migrate_owned_document_mode(path, script, legacy_scripts, legacy_count,
+                                                CLI_OCTAL_PERM) == CLI_OK;
 }
 
 static bool cbm_write_owned_hook_script(const char *path, const char *script) {

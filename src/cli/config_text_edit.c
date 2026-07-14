@@ -43,12 +43,15 @@
 #define TEXT_MAX_MARKER_BYTES 4096U
 #define TEXT_TEMP_SUFFIX_BYTES 80U
 #define TEXT_TEMP_ATTEMPTS 64U
+#define TEXT_OWNER_READ 0400U
 
 #ifdef CBM_TEXT_EDIT_ENABLE_TEST_API
 static CBM_TLS cbm_text_precommit_test_hook_t text_precommit_test_hook = NULL;
 static CBM_TLS void *text_precommit_test_context = NULL;
 static CBM_TLS cbm_text_precommit_test_hook_t text_prepublish_test_hook = NULL;
 static CBM_TLS void *text_prepublish_test_context = NULL;
+static CBM_TLS cbm_text_precommit_test_hook_t text_temp_closed_test_hook = NULL;
+static CBM_TLS void *text_temp_closed_test_context = NULL;
 #endif
 
 static atomic_uint text_temp_sequence = 1U;
@@ -287,6 +290,20 @@ static int text_snapshot_equal(const text_file_snapshot_t *left,
 #endif
 }
 
+static int text_snapshot_publication_equal(const text_file_snapshot_t *trusted,
+                                           const text_file_snapshot_t *reopened) {
+#ifdef _WIN32
+    return trusted->exists == reopened->exists && trusted->exists &&
+           trusted->volume_serial == reopened->volume_serial &&
+           trusted->file_index_high == reopened->file_index_high &&
+           trusted->file_index_low == reopened->file_index_low &&
+           trusted->attributes == reopened->attributes &&
+           trusted->link_count == reopened->link_count && trusted->size == reopened->size;
+#else
+    return text_snapshot_equal(trusted, reopened);
+#endif
+}
+
 #ifdef _WIN32
 static int text_snapshot_from_handle(HANDLE handle, text_file_snapshot_t *snapshot) {
     BY_HANDLE_FILE_INFORMATION info;
@@ -343,6 +360,27 @@ static int text_snapshot_from_stat(const struct stat *state, text_file_snapshot_
     return TEXT_OK;
 }
 #endif
+
+static int text_snapshot_from_file(FILE *file, text_file_snapshot_t *snapshot) {
+    if (!file || !snapshot) {
+        return TEXT_ERROR;
+    }
+#ifdef _WIN32
+    intptr_t native_handle = _get_osfhandle(cbm_fileno(file));
+    return native_handle == -1
+               ? TEXT_ERROR
+               : text_snapshot_from_handle((HANDLE)(uintptr_t)native_handle, snapshot);
+#else
+    struct stat state;
+    return fstat(cbm_fileno(file), &state) == 0 ? text_snapshot_from_stat(&state, snapshot)
+                                                : TEXT_ERROR;
+#endif
+}
+
+static int text_requested_mode_valid(int override_mode, unsigned int requested_mode) {
+    return !override_mode ||
+           ((requested_mode & ~0777U) == 0U && (requested_mode & TEXT_OWNER_READ) != 0U);
+}
 
 static int text_read_file(const char *path, char **data_out, size_t *len_out,
                           text_file_snapshot_t *snapshot_out) {
@@ -551,13 +589,23 @@ static int text_replace_file(const char *temp_path, const char *path, int destin
 #endif
 }
 
-static int text_write_atomic(const char *path, const char *new_data, size_t new_len,
-                             const char *old_data, size_t old_len,
-                             const text_file_snapshot_t *snapshot) {
-    if (new_len > TEXT_MAX_BYTES || old_len > TEXT_MAX_BYTES) {
+static int text_write_atomic_mode(const char *path, const char *new_data, size_t new_len,
+                                  const char *old_data, size_t old_len,
+                                  const text_file_snapshot_t *snapshot, int override_mode,
+                                  unsigned int requested_mode) {
+    if (new_len > TEXT_MAX_BYTES || old_len > TEXT_MAX_BYTES ||
+        !text_requested_mode_valid(override_mode, requested_mode)) {
         return TEXT_ERROR;
     }
-    if (new_len == old_len && (new_len == 0U || memcmp(new_data, old_data, new_len) == 0)) {
+    int content_same =
+        new_len == old_len && (new_len == 0U || memcmp(new_data, old_data, new_len) == 0);
+#ifndef _WIN32
+    int mode_same =
+        snapshot->exists && (snapshot->mode & 0777U) == (mode_t)(requested_mode & 0777U);
+#else
+    int mode_same = snapshot->exists;
+#endif
+    if (content_same && (!override_mode || mode_same)) {
         return TEXT_OK;
     }
     size_t path_len = 0U;
@@ -583,7 +631,9 @@ static int text_write_atomic(const char *path, const char *new_data, size_t new_
         }
         errno = 0;
 #ifdef _WIN32
-        file = cbm_fopen(temp_path, "wbx");
+        /* The descriptor-bound identity snapshot uses GetFileInformationByHandle,
+         * so request read access as well as exclusive binary creation. */
+        file = cbm_fopen(temp_path, "w+bx");
 #else
 #ifndef O_NOFOLLOW
         free(temp_path);
@@ -627,7 +677,9 @@ static int text_write_atomic(const char *path, const char *new_data, size_t new_
         fchown(cbm_fileno(file), snapshot->owner, snapshot->group) != 0) {
         failed = 1;
     }
-    mode_t mode = snapshot->exists ? snapshot->mode & 0777U : 0600U;
+    mode_t mode = override_mode      ? (mode_t)(requested_mode & 0777U)
+                  : snapshot->exists ? snapshot->mode & 0777U
+                                     : 0600U;
     if (!failed && fchmod(cbm_fileno(file), mode) != 0) {
         failed = 1;
     }
@@ -635,6 +687,17 @@ static int text_write_atomic(const char *path, const char *new_data, size_t new_
     if (!failed && TEXT_SYNC(cbm_fileno(file)) != 0) {
         failed = 1;
     }
+    text_file_snapshot_t trusted_temp_snapshot = {0};
+    if (!failed && text_snapshot_from_file(file, &trusted_temp_snapshot) != TEXT_OK) {
+        failed = 1;
+    }
+#ifndef _WIN32
+    if (!failed && override_mode &&
+        (trusted_temp_snapshot.owner != geteuid() ||
+         (trusted_temp_snapshot.mode & 0777U) != (mode_t)(requested_mode & 0777U))) {
+        failed = 1;
+    }
+#endif
     if (fclose(file) != 0) {
         failed = 1;
     }
@@ -643,12 +706,17 @@ static int text_write_atomic(const char *path, const char *new_data, size_t new_
         free(temp_path);
         return TEXT_ERROR;
     }
+#ifdef CBM_TEXT_EDIT_ENABLE_TEST_API
+    if (text_temp_closed_test_hook) {
+        text_temp_closed_test_hook(temp_path, text_temp_closed_test_context);
+    }
+#endif
     char *temp_data = NULL;
     size_t temp_len = 0U;
     text_file_snapshot_t temp_snapshot;
     if (text_read_file(temp_path, &temp_data, &temp_len, &temp_snapshot) != TEXT_OK ||
-        !temp_snapshot.exists || temp_len != new_len ||
-        (new_len != 0U && memcmp(temp_data, new_data, new_len) != 0)) {
+        !text_snapshot_publication_equal(&trusted_temp_snapshot, &temp_snapshot) ||
+        temp_len != new_len || (new_len != 0U && memcmp(temp_data, new_data, new_len) != 0)) {
         free(temp_data);
         (void)cbm_unlink(temp_path);
         free(temp_path);
@@ -680,6 +748,12 @@ static int text_write_atomic(const char *path, const char *new_data, size_t new_
     }
     free(temp_path);
     return TEXT_OK;
+}
+
+static int text_write_atomic(const char *path, const char *new_data, size_t new_len,
+                             const char *old_data, size_t old_len,
+                             const text_file_snapshot_t *snapshot) {
+    return text_write_atomic_mode(path, new_data, new_len, old_data, old_len, snapshot, 0, 0U);
 }
 
 static int text_delete_file(const char *path, const char *old_data, size_t old_len,
@@ -725,6 +799,11 @@ void cbm_text_set_precommit_hook_for_testing(cbm_text_precommit_test_hook_t hook
 void cbm_text_set_prepublish_hook_for_testing(cbm_text_precommit_test_hook_t hook, void *context) {
     text_prepublish_test_hook = hook;
     text_prepublish_test_context = context;
+}
+
+void cbm_text_set_temp_closed_hook_for_testing(cbm_text_precommit_test_hook_t hook, void *context) {
+    text_temp_closed_test_hook = hook;
+    text_temp_closed_test_context = context;
 }
 #endif
 
@@ -1143,13 +1222,15 @@ static int text_matches_candidate(const char *data, size_t data_len, const char 
     return TEXT_OK;
 }
 
-int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
-                                    const char *const *released_contents, size_t released_count) {
+static int text_migrate_owned_document(const char *file_path, const char *current_content,
+                                       const char *const *released_contents, size_t released_count,
+                                       int override_mode, unsigned int requested_mode) {
     size_t current_len = 0U;
     if (!text_valid_path(file_path) ||
         text_bounded_strlen(current_content, TEXT_MAX_BYTES, &current_len) != TEXT_OK ||
         text_validate_bytes(current_content, current_len, 1) != TEXT_OK ||
-        (released_count > 0U && !released_contents)) {
+        (released_count > 0U && !released_contents) ||
+        !text_requested_mode_valid(override_mode, requested_mode)) {
         return TEXT_ERROR;
     }
     for (size_t i = 0U; i < released_count; i++) {
@@ -1167,9 +1248,15 @@ int cbm_text_migrate_owned_document(const char *file_path, const char *current_c
         free(old_data);
         return TEXT_ERROR;
     }
+#ifndef _WIN32
+    if (override_mode && snapshot.exists && snapshot.owner != geteuid()) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+#endif
     if (!snapshot.exists) {
-        int result = text_write_atomic(file_path, current_content, current_len, old_data, old_len,
-                                       &snapshot);
+        int result = text_write_atomic_mode(file_path, current_content, current_len, old_data,
+                                            old_len, &snapshot, override_mode, requested_mode);
         free(old_data);
         return result;
     }
@@ -1180,6 +1267,14 @@ int cbm_text_migrate_owned_document(const char *file_path, const char *current_c
         return TEXT_ERROR;
     }
     if (matches) {
+#ifndef _WIN32
+        if (override_mode && (snapshot.mode & 0777U) != (mode_t)(requested_mode & 0777U)) {
+            int result = text_write_atomic_mode(file_path, current_content, current_len, old_data,
+                                                old_len, &snapshot, override_mode, requested_mode);
+            free(old_data);
+            return result;
+        }
+#endif
         free(old_data);
         return TEXT_OK;
     }
@@ -1189,14 +1284,27 @@ int cbm_text_migrate_owned_document(const char *file_path, const char *current_c
             return TEXT_ERROR;
         }
         if (matches) {
-            int result = text_write_atomic(file_path, current_content, current_len, old_data,
-                                           old_len, &snapshot);
+            int result = text_write_atomic_mode(file_path, current_content, current_len, old_data,
+                                                old_len, &snapshot, override_mode, requested_mode);
             free(old_data);
             return result;
         }
     }
     free(old_data);
     return TEXT_UNOWNED;
+}
+
+int cbm_text_migrate_owned_document(const char *file_path, const char *current_content,
+                                    const char *const *released_contents, size_t released_count) {
+    return text_migrate_owned_document(file_path, current_content, released_contents,
+                                       released_count, 0, 0U);
+}
+
+int cbm_text_migrate_owned_document_mode(const char *file_path, const char *current_content,
+                                         const char *const *released_contents,
+                                         size_t released_count, unsigned int mode) {
+    return text_migrate_owned_document(file_path, current_content, released_contents,
+                                       released_count, 1, mode);
 }
 
 int cbm_text_remove_owned_document(const char *file_path, const char *expected_owned_content) {
