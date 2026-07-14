@@ -24,6 +24,7 @@ typedef SOCKET cbm_sock_t;
 #else
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -109,6 +110,30 @@ static int send_all(cbm_sock_t fd, const void *data, size_t len) {
     return 0;
 }
 
+static bool socket_close_on_exec(cbm_sock_t fd) {
+#ifdef _WIN32
+    (void)fd;
+    return true;
+#else
+    int flags = fcntl(fd, F_GETFD);
+    return flags >= 0 && (flags & FD_CLOEXEC) != 0;
+#endif
+}
+
+static int ensure_socket_close_on_exec(cbm_sock_t fd) {
+#ifdef _WIN32
+    (void)fd;
+    return 0;
+#else
+    int flags = fcntl(fd, F_GETFD);
+    if (flags < 0)
+        return -1;
+    if ((flags & FD_CLOEXEC) != 0)
+        return 0;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+#endif
+}
+
 /* ── Listener ─────────────────────────────────────────────────── */
 
 cbm_httpd_t *cbm_httpd_listen(int port) {
@@ -121,9 +146,17 @@ cbm_httpd_t *cbm_httpd_listen(int port) {
     }
 #endif
 
-    cbm_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    int socket_type = SOCK_STREAM;
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+    socket_type |= SOCK_CLOEXEC;
+#endif
+    cbm_sock_t fd = socket(AF_INET, socket_type, 0);
     if (fd == CBM_SOCK_BAD)
         return NULL;
+    if (ensure_socket_close_on_exec(fd) != 0) {
+        cbm_sock_close(fd);
+        return NULL;
+    }
 
     /* POSIX: SO_REUSEADDR only permits rebinding a TIME_WAIT port.
      * Windows: SO_REUSEADDR would let ANY local user hijack the port, so
@@ -170,6 +203,10 @@ int cbm_httpd_port(const cbm_httpd_t *d) {
     return d ? d->port : -1;
 }
 
+bool cbm_httpd_listener_close_on_exec(const cbm_httpd_t *d) {
+    return d && socket_close_on_exec(d->fd);
+}
+
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms) {
     if (d && ms > 0)
         d->recv_deadline_ms = ms;
@@ -190,9 +227,17 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     if (wait_readable(d->fd, timeout_ms) != 1)
         return NULL;
 
+#if defined(__linux__) && defined(SOCK_CLOEXEC)
+    cbm_sock_t cfd = accept4(d->fd, NULL, NULL, SOCK_CLOEXEC);
+#else
     cbm_sock_t cfd = accept(d->fd, NULL, NULL);
+#endif
     if (cfd == CBM_SOCK_BAD)
         return NULL;
+    if (ensure_socket_close_on_exec(cfd) != 0) {
+        cbm_sock_close(cfd);
+        return NULL;
+    }
 
     int one = 1;
     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
@@ -215,6 +260,10 @@ void cbm_httpd_conn_close(cbm_http_conn_t *c) {
         return;
     cbm_sock_close(c->fd);
     free(c);
+}
+
+bool cbm_http_conn_close_on_exec(const cbm_http_conn_t *c) {
+    return c && socket_close_on_exec(c->fd);
 }
 
 int cbm_http_conn_status(const cbm_http_conn_t *c) {

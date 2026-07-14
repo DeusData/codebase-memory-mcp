@@ -64,6 +64,13 @@ cbm_httpd_t *cbm_httpd_listen(int port);
 /* The actually-bound port (differs from the requested one for port 0). */
 int cbm_httpd_port(const cbm_httpd_t *d);
 
+/* Diagnostic lifecycle invariants used by transport tests. On POSIX, both
+ * listener and accepted sockets must be closed by exec so an unrelated child
+ * process cannot retain the UI server. Windows sockets are non-inheritable by
+ * default and report true. */
+bool cbm_httpd_listener_close_on_exec(const cbm_httpd_t *d);
+bool cbm_http_conn_close_on_exec(const cbm_http_conn_t *c);
+
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms);
 
