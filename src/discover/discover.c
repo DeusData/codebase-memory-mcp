@@ -632,7 +632,7 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
      * detected by content; otherwise .xml stays XML. */
     if (lang == CBM_LANG_XML) {
-        FILE *xf = fopen(abs_path, "r");
+        FILE *xf = cbm_fopen(abs_path, "r");
         if (xf) {
             char xbuf[CBM_SZ_256];
             size_t xn = fread(xbuf, SKIP_ONE, sizeof(xbuf) - SKIP_ONE, xf);
