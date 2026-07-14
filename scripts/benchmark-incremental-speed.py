@@ -1479,28 +1479,63 @@ def score_quality_oracles(
     """Attach auditable per-oracle verdicts and summarize applicable checks."""
     applicable_count = 0
     passed_count = 0
+    reciprocal_rank_total = 0.0
+    hit_at_1_count = 0
+    hit_at_5_count = 0
     for name, result in oracles.items():
         if not isinstance(result, dict):
             continue
         expected, criterion = expectations.get(name, (None, "no quality criterion"))
         applicable = expected is not None
         passed = False
+        rank: int | None = None
+        returned_count: int | None = None
         if applicable:
             applicable_count += 1
             response = result.get("response")
             passed = expected in json.dumps(response, separators=(",", ":"), sort_keys=True)
             passed_count += int(passed)
+            ranked_items = (
+                response.get("results")
+                if isinstance(response, dict) and isinstance(response.get("results"), list)
+                else response if isinstance(response, list) else [response]
+            )
+            returned_count = len(ranked_items)
+            for position, item in enumerate(ranked_items, start=1):
+                if expected in json.dumps(item, separators=(",", ":"), sort_keys=True):
+                    rank = position
+                    break
+            reciprocal_rank = 1.0 / rank if rank is not None else 0.0
+            reciprocal_rank_total += reciprocal_rank
+            hit_at_1_count += int(rank == 1)
+            hit_at_5_count += int(rank is not None and rank <= 5)
+        else:
+            reciprocal_rank = None
         result["quality"] = {
             "applicable": applicable,
             "passed": passed if applicable else None,
             "criterion": criterion,
             "expected_substring": expected,
+            "rank": rank,
+            "returned_count": returned_count,
+            "reciprocal_rank": reciprocal_rank,
+            "hit_at_1": rank == 1 if applicable else None,
+            "hit_at_5": rank is not None and rank <= 5 if applicable else None,
         }
+    mean_reciprocal_rank = (
+        reciprocal_rank_total / applicable_count if applicable_count else None
+    )
     return {
         "passed": passed_count == applicable_count,
         "passed_count": passed_count,
         "applicable_count": applicable_count,
-        "score": round(passed_count / applicable_count, 6) if applicable_count else None,
+        "binary_pass_rate": round(passed_count / applicable_count, 6) if applicable_count else None,
+        "mean_reciprocal_rank": (
+            round(mean_reciprocal_rank, 6) if mean_reciprocal_rank is not None else None
+        ),
+        "hit_at_1": round(hit_at_1_count / applicable_count, 6) if applicable_count else None,
+        "hit_at_5": round(hit_at_5_count / applicable_count, 6) if applicable_count else None,
+        "score": round(mean_reciprocal_rank, 6) if mean_reciprocal_rank is not None else None,
     }
 
 
