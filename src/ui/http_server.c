@@ -1210,6 +1210,13 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
         return;
     }
+    if (!cbm_validate_project_name(name)) {
+        /* Treat unsafe/non-project identifiers as absent without touching a
+         * watcher entry. db_path_for_project() also rejects them, but its empty
+         * sentinel otherwise gets misreported as an internal path-length error. */
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return;
+    }
 
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
