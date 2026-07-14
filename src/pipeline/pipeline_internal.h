@@ -583,6 +583,19 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
 
+/* Pre-dump pass: persisted per-symbol importance score (spec Part 1 / AC1).
+ * importance = sqrt(num_refs) x priv x generic x distinct x test_penalty --
+ * see pass_importance.c for the full formula. MUST run after pass_tests and
+ * calls/usages have populated their edges (run_tests_and_history precedes
+ * run_predump_passes in run_post_extraction) -- a pass registered earlier
+ * would see zero TESTS edges and num_refs=0. */
+void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
+
+/* Append a numeric "importance" key to a node's properties JSON object.
+ * Exposed (non-static) for direct unit testing of the JSON-validity guard
+ * (AC1 test-plan #12) -- otherwise internal to pass_importance.c. */
+void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
+
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 
 typedef struct {
