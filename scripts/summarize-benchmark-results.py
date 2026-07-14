@@ -65,16 +65,27 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         for case in cases
         if isinstance(case.get("canonical_graph"), dict)
     ]
-    oracles = [
-        bool(case["oracles"].get("passed"))
-        for case in cases
-        if isinstance(case.get("oracles"), dict)
-    ]
+    oracles: list[bool] = []
+    for case in cases:
+        case_oracles = case.get("oracles")
+        if not isinstance(case_oracles, dict):
+            continue
+        verdict = case_oracles.get("passed")
+        if not isinstance(verdict, bool):
+            quality = case_oracles.get("quality")
+            verdict = quality.get("passed") if isinstance(quality, dict) else None
+        if isinstance(verdict, bool):
+            oracles.append(verdict)
     case_passes = [bool(case.get("passed")) for case in cases]
     incremental_ms: list[float] = []
     full_ms: list[float] = []
     speedups: list[float] = []
     peak_rss: list[int] = []
+    query_latency_ms: list[float] = []
+    query_response_bytes: list[float] = []
+    query_response_tokens: list[float] = []
+    quality_passed = 0
+    quality_applicable = 0
     for case in cases:
         incremental = case.get("incremental", {})
         full = case.get("fresh_fast_full_after_change", {})
@@ -90,6 +101,21 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 peak_rss.append(full["peak_rss_mb"])
         if isinstance(case.get("speedup_full_rebuild_over_incremental"), (int, float)):
             speedups.append(float(case["speedup_full_rebuild_over_incremental"]))
+        case_oracles = case.get("oracles", {})
+        if isinstance(case_oracles, dict):
+            quality = case_oracles.get("quality", {})
+            if isinstance(quality, dict):
+                quality_passed += int(quality.get("passed_count") or 0)
+                quality_applicable += int(quality.get("applicable_count") or 0)
+            for oracle in case_oracles.values():
+                if not isinstance(oracle, dict):
+                    continue
+                if isinstance(oracle.get("elapsed_ms"), (int, float)):
+                    query_latency_ms.append(float(oracle["elapsed_ms"]))
+                if isinstance(oracle.get("response_bytes"), (int, float)):
+                    query_response_bytes.append(float(oracle["response_bytes"]))
+                if isinstance(oracle.get("response_token_estimate"), (int, float)):
+                    query_response_tokens.append(float(oracle["response_token_estimate"]))
 
     quality_failed = any(not value for value in canonical) or any(not value for value in oracles)
     if quality_failed:
@@ -120,6 +146,13 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "cases": ratio(sum(case_passes), len(case_passes)),
         "canonical": ratio(sum(canonical), len(canonical)),
         "oracles": ratio(sum(oracles), len(oracles)),
+        "quality_score": (
+            quality_passed / quality_applicable if quality_applicable else None
+        ),
+        "quality_checks": ratio(quality_passed, quality_applicable),
+        "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
+        "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
+        "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
         "capabilities": config_label(reports),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
         "incremental_p95_ms": percentile(incremental_ms, 0.95),
@@ -128,7 +161,56 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "peak_rss_mb": max(peak_rss) if peak_rss else None,
         "cleanup": ratio(cleanup_passes, len(reports)),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
+        "pareto": "unclassified",
     }
+
+
+PARETO_MINIMIZE = (
+    "incremental_p50_ms",
+    "query_latency_p50_ms",
+    "query_response_p50_tokens",
+    "peak_rss_mb",
+)
+
+
+def dominates(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    left_quality = left.get("quality_score")
+    right_quality = right.get("quality_score")
+    if not isinstance(left_quality, (int, float)) or not isinstance(
+        right_quality, (int, float)
+    ):
+        return False
+    left_values = [left.get(key) for key in PARETO_MINIMIZE]
+    right_values = [right.get(key) for key in PARETO_MINIMIZE]
+    if not all(isinstance(value, (int, float)) for value in left_values + right_values):
+        return False
+    no_worse = left_quality >= right_quality and all(
+        left_value <= right_value
+        for left_value, right_value in zip(left_values, right_values, strict=True)
+    )
+    strictly_better = left_quality > right_quality or any(
+        left_value < right_value
+        for left_value, right_value in zip(left_values, right_values, strict=True)
+    )
+    return no_worse and strictly_better
+
+
+def mark_pareto_frontier(rows: list[dict[str, Any]]) -> None:
+    """Mark correctness-admissible, fully measured non-dominated candidates."""
+    eligible = [
+        row
+        for row in rows
+        if row.get("decision") == "PASS"
+        and isinstance(row.get("quality_score"), (int, float))
+        and all(isinstance(row.get(key), (int, float)) for key in PARETO_MINIMIZE)
+    ]
+    for row in rows:
+        row["pareto"] = "ineligible"
+    for row in eligible:
+        dominators = [other for other in eligible if other is not row and dominates(other, row)]
+        row["pareto"] = (
+            f"dominated by {dominators[0]['candidate']}" if dominators else "frontier"
+        )
 
 
 def display(value: Any, digits: int = 1) -> str:
@@ -140,13 +222,14 @@ def display(value: Any, digits: int = 1) -> str:
 
 
 def render_markdown(rows: list[dict[str, Any]]) -> str:
+    mark_pareto_frontier(rows)
     lines = [
         "# Codebase Memory performance and quality summary",
         "",
-        "| Candidate | Decision | Cases | Canonical | Task oracles | Capabilities | "
-        "Incremental p50 ms | Incremental p95 ms | Full p50 ms | Speedup p50 | "
-        "Peak RSS MB | Cleanup | Binary SHA-256 |",
-        "|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---|",
+        "| Candidate | Decision | Quality | Checks | Canonical | Task oracles | "
+        "Response p50 bytes | Response p50 tokens* | Query p50 ms | Incremental p50 ms | "
+        "Peak RSS MB | Pareto |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -155,15 +238,32 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                 (
                     display(row["candidate"]),
                     display(row["decision"]),
-                    display(row["cases"]),
+                    display(row["quality_score"], 3),
+                    display(row["quality_checks"]),
                     display(row["canonical"]),
                     display(row["oracles"]),
-                    display(row["capabilities"]),
+                    display(row["query_response_p50_bytes"]),
+                    display(row["query_response_p50_tokens"]),
+                    display(row["query_latency_p50_ms"]),
                     display(row["incremental_p50_ms"]),
+                    display(row["peak_rss_mb"]),
+                    display(row["pareto"]),
+                )
+            )
+            + " |"
+        )
+    lines.extend(("", "## Performance and provenance", "", "| Candidate | Cases | Capabilities | Incremental p95 ms | Full p50 ms | Speedup p50 | Cleanup | Binary SHA-256 |", "|---|---:|---|---:|---:|---:|---:|---|"))
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    display(row["candidate"]),
+                    display(row["cases"]),
+                    display(row["capabilities"]),
                     display(row["incremental_p95_ms"]),
                     display(row["full_p50_ms"]),
                     display(row["speedup_p50"], 2),
-                    display(row["peak_rss_mb"]),
                     display(row["cleanup"]),
                     display(row["binary_sha256"]),
                 )
@@ -172,6 +272,13 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         )
     lines.extend(
         (
+            "",
+            "* Response tokens use the recorded `utf8_bytes_div_4_ceil` deterministic estimate; "
+            "bytes remain the exact canonical JSON payload measurement.",
+            "",
+            "Pareto status considers only candidates that pass correctness/quality and have every "
+            "axis measured. It maximizes quality while minimizing incremental and query latency, "
+            "response-token estimate, and peak RSS.",
             "",
             "A speedup is accepted only when the case gate and every applicable canonical-graph "
             "and task-oracle check pass. `n/a` means the input artifact did not measure that axis.",
@@ -199,9 +306,7 @@ def main() -> int:
         if not isinstance(document, dict):
             raise SystemExit(f"error: expected JSON object in {path}")
         grouped[label].append(document)
-    markdown = render_markdown(
-        [summarize_group(label, reports) for label, reports in grouped.items()]
-    )
+    markdown = render_markdown([summarize_group(label, reports) for label, reports in grouped.items()])
     if args.out:
         output = Path(args.out).expanduser()
         output.parent.mkdir(parents=True, exist_ok=True)

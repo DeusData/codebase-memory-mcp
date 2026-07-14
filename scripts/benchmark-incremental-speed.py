@@ -269,6 +269,19 @@ def unwrap_mcp_result(response: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+TOKEN_ESTIMATOR = "utf8_bytes_div_4_ceil"
+
+
+def canonical_response_bytes(data: dict[str, Any]) -> bytes:
+    """Serialize the tool payload independently of CLI/MCP envelopes."""
+    return json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def estimate_response_tokens(payload: bytes) -> int:
+    """Return a deterministic, dependency-free byte/4 token estimate."""
+    return (len(payload) + 3) // 4
+
+
 class McpClient:
     def __init__(self, binary: Path, env: dict[str, str], timeout: int) -> None:
         self.binary = binary
@@ -713,9 +726,16 @@ def build_tool_call_result(
     elapsed_ms: float,
     include_logs: bool,
 ) -> dict[str, Any]:
+    payload = canonical_response_bytes(data)
     result: dict[str, Any] = {
         "elapsed_ms": round(elapsed_ms, 3),
+        # Preserve the historical field while separating transport framing from
+        # the canonical payload used for cross-transport comparisons.
         "stdout_bytes": stdout_bytes,
+        "transport_response_bytes": stdout_bytes,
+        "response_bytes": len(payload),
+        "response_token_estimate": estimate_response_tokens(payload),
+        "token_estimator": TOKEN_ESTIMATOR,
         "response": data,
         "freshness_state": response_freshness_state(data) or None,
         "freshness": response_freshness(data),
@@ -1452,6 +1472,38 @@ def oracle_passed(tool_result: dict[str, Any], marker: str | None) -> bool:
     return marker in json.dumps(response, sort_keys=True)
 
 
+def score_quality_oracles(
+    oracles: dict[str, Any],
+    expectations: dict[str, tuple[str | None, str]],
+) -> dict[str, Any]:
+    """Attach auditable per-oracle verdicts and summarize applicable checks."""
+    applicable_count = 0
+    passed_count = 0
+    for name, result in oracles.items():
+        if not isinstance(result, dict):
+            continue
+        expected, criterion = expectations.get(name, (None, "no quality criterion"))
+        applicable = expected is not None
+        passed = False
+        if applicable:
+            applicable_count += 1
+            response = result.get("response")
+            passed = expected in json.dumps(response, separators=(",", ":"), sort_keys=True)
+            passed_count += int(passed)
+        result["quality"] = {
+            "applicable": applicable,
+            "passed": passed if applicable else None,
+            "criterion": criterion,
+            "expected_substring": expected,
+        }
+    return {
+        "passed": passed_count == applicable_count,
+        "passed_count": passed_count,
+        "applicable_count": applicable_count,
+        "score": round(passed_count / applicable_count, 6) if applicable_count else None,
+    }
+
+
 def run_self_dogfood_oracles(
     transport: str,
     binary: Path,
@@ -1465,6 +1517,7 @@ def run_self_dogfood_oracles(
     changed_paths = list(mutation.get("changed_paths") or [])
     first_changed = changed_paths[0] if changed_paths else ""
     oracles: dict[str, Any] = {}
+    expectations: dict[str, tuple[str | None, str]] = {}
     if marker:
         search_code_args: dict[str, Any] = {"project": project, "pattern": marker, "limit": 5}
         if first_changed:
@@ -1480,6 +1533,7 @@ def run_self_dogfood_oracles(
             args.include_logs,
             client,
         )
+        expectations["marker_search_graph"] = (marker, "mutated symbol appears in graph search")
         oracles["marker_search_code"] = run_tool_call_for_transport(
             transport,
             binary,
@@ -1490,6 +1544,7 @@ def run_self_dogfood_oracles(
             args.include_logs,
             client,
         )
+        expectations["marker_search_code"] = (marker, "mutated symbol appears in source search")
     if first_changed:
         oracles["changed_file_query_graph"] = run_tool_call_for_transport(
             transport,
@@ -1507,6 +1562,10 @@ def run_self_dogfood_oracles(
             args.include_logs,
             client,
         )
+        expectations["changed_file_query_graph"] = (
+            first_changed,
+            "changed file path appears in graph query",
+        )
         oracles["scoped_architecture"] = run_tool_call_for_transport(
             transport,
             binary,
@@ -1516,6 +1575,10 @@ def run_self_dogfood_oracles(
             args.timeout,
             args.include_logs,
             client,
+        )
+        expectations["scoped_architecture"] = (
+            first_changed,
+            "changed file path appears in scoped architecture",
         )
     oracles["route_freshness_probe"] = run_tool_call_for_transport(
         transport,
@@ -1527,11 +1590,16 @@ def run_self_dogfood_oracles(
         args.include_logs,
         client,
     )
-    oracles["passed"] = all(
-        oracle_passed(result, marker)
-        for key, result in oracles.items()
-        if key in {"marker_search_graph", "marker_search_code"}
+    route_expected = "/api/pan4-oracle" if mutation.get("description", "").startswith(
+        "HTTP UI handler"
+    ) else None
+    expectations["route_freshness_probe"] = (
+        route_expected,
+        "new route literal appears in route search" if route_expected else "route mutation not applicable",
     )
+    quality = score_quality_oracles(oracles, expectations)
+    oracles["quality"] = quality
+    oracles["passed"] = quality["passed"]
     return oracles
 
 
