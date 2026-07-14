@@ -55,6 +55,8 @@ typedef struct {
     int quiet_timeout_ms;        /* <= 0 => no timeout; else kill+HANG after this many
                                   * ms with no new completed log line */
     bool delete_log_on_exit;     /* unlink log_file after reaping */
+    const atomic_bool *cancel_requested; /* optional cooperative supervisor stop flag;
+                                          * when set, terminate and reap the child */
     _Atomic long *child_pid_out; /* optional: the live child's pid is published here
                                   * right after a successful fork/CreateProcess and
                                   * reset to 0 once the child is reaped, so another

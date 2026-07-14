@@ -9283,8 +9283,9 @@ static int idx853_supervised_autowatch_check(const char *repo_dir, const char *c
         char *resp = cbm_mcp_server_handle(
             srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
         free(resp);
-        /* free() joins the autoindex thread → the supervised worker has finished
-         * and the registration decision (buggy or gated) has executed. */
+        /* Wait for the supervised worker to finish so the registration decision
+         * (buggy or gated) has executed; free() is now a cancellation boundary. */
+        (void)cbm_mcp_server_join_autoindex(srv);
         cbm_mcp_server_free(srv);
 
         int spawns_after = cbm_index_supervisor_spawn_count();

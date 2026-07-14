@@ -90,7 +90,8 @@ typedef struct {
  * Any of the three may be false/NULL to leave that knob unset (the normal first
  * attempt passes single_thread=false, marker_file=NULL, quarantine_file=NULL). */
 int cbm_index_spawn_worker(const char *args_json, bool single_thread, const char *marker_file,
-                           const char *quarantine_file, cbm_index_worker_result_t *result);
+                           const char *quarantine_file, const atomic_bool *cancel_requested,
+                           cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
 

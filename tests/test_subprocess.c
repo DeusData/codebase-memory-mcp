@@ -138,6 +138,27 @@ TEST(subprocess_run_hang_is_hang) {
 #endif
 }
 
+/* A shutdown request must terminate and reap a live child without waiting for
+ * the quiet-timeout. Pre-setting the flag makes the test deterministic: the
+ * supervisor observes it on its first poll after spawning `sleep 30`. */
+TEST(subprocess_run_cancel_reaps_child) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    const char *argv[] = {"/bin/sh", "-c", "sleep 30", NULL};
+    atomic_bool cancel_requested = true;
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    opts.cancel_requested = &cancel_requested;
+    cbm_proc_result_t r;
+    int rc = cbm_subprocess_run(&opts, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.outcome, CBM_PROC_KILLED);
+    PASS();
+#endif
+}
+
 /* A spawn of a non-existent binary fails cleanly (no child), not a crash. */
 TEST(subprocess_run_spawn_failure) {
 #ifdef _WIN32
@@ -328,6 +349,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
+    RUN_TEST(subprocess_run_cancel_reaps_child);
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
     RUN_TEST(win_cmdline_index_worker_json);

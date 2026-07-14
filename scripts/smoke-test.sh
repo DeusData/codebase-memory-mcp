@@ -605,6 +605,8 @@ cat > "$MCP_INPUT" << 'MCPEOF'
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"smoke-test","version":"1.0"}}}
 {"jsonrpc":"2.0","method":"notifications/initialized"}
 {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"_hidden_tools","arguments":{}}}
+{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}
 MCPEOF
 
 mcp_run "$MCP_INPUT" "$MCP_OUTPUT" 10
@@ -628,18 +630,46 @@ if ! grep -q '"id":2' "$MCP_OUTPUT"; then
   exit 1
 fi
 echo "OK: tools/list response received (id:2)"
+MCP_DEFAULT_TOOLS=$(grep '"id":2' "$MCP_OUTPUT" | head -n 1)
 
-# 5c: Verify expected tools are present
-for TOOL in index_repository search_graph trace_path get_code_snippet search_code; do
-  if ! grep -q "\"$TOOL\"" "$MCP_OUTPUT"; then
-    echo "FAIL: tool '$TOOL' not found in tools/list response"
+# 5c: Verify the streamlined default surface is present. Advanced tools are
+# intentionally absent until _hidden_tools reveals them (progressive disclosure).
+for TOOL in search_graph query_graph search_code trace_path get_code _hidden_tools; do
+  if ! echo "$MCP_DEFAULT_TOOLS" | grep -q "\"$TOOL\""; then
+    echo "FAIL: streamlined tool '$TOOL' not found in tools/list response"
     rm -f "$MCP_INPUT" "$MCP_OUTPUT"
     exit 1
   fi
 done
-echo "OK: all 5 core MCP tools present in tools/list"
+for TOOL in index_repository get_code_snippet; do
+  if echo "$MCP_DEFAULT_TOOLS" | grep -q "\"$TOOL\""; then
+    echo "FAIL: advanced tool '$TOOL' leaked into streamlined tools/list"
+    rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+    exit 1
+  fi
+done
+echo "OK: streamlined MCP tools present in tools/list"
 
-# 5d: Verify protocol version in initialize response
+# 5d: The reveal call must complete and the next tools/list must expose classic
+# tools such as index_repository and get_code_snippet on the same connection.
+for ID in 3 4; do
+  if ! grep -q "\"id\":$ID" "$MCP_OUTPUT"; then
+    echo "FAIL: no progressive-disclosure response (id:$ID)"
+    rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+    exit 1
+  fi
+done
+MCP_REVEALED_TOOLS=$(grep '"id":4' "$MCP_OUTPUT" | head -n 1)
+for TOOL in index_repository get_code_snippet; do
+  if ! echo "$MCP_REVEALED_TOOLS" | grep -q "\"$TOOL\""; then
+    echo "FAIL: revealed tool '$TOOL' not found after _hidden_tools"
+    rm -f "$MCP_INPUT" "$MCP_OUTPUT"
+    exit 1
+  fi
+done
+echo "OK: _hidden_tools reveals classic MCP tools"
+
+# 5e: Verify protocol version in initialize response
 if ! grep -q '"protocolVersion"' "$MCP_OUTPUT"; then
   echo "FAIL: protocolVersion missing from initialize response"
   rm -f "$MCP_INPUT" "$MCP_OUTPUT"
@@ -649,9 +679,9 @@ echo "OK: protocolVersion present in initialize response"
 
 rm -f "$MCP_INPUT" "$MCP_OUTPUT"
 
-# 5e: MCP tool call via JSON-RPC (index + search round-trip)
+# 5f: MCP tool call via JSON-RPC (index + search round-trip)
 echo ""
-echo "--- Phase 5e: MCP tool call round-trip ---"
+echo "--- Phase 5f: MCP tool call round-trip ---"
 MCP_TOOL_INPUT=$(mktemp)
 MCP_TOOL_OUTPUT=$(mktemp)
 
@@ -679,9 +709,9 @@ if ! grep -q '"id":3' "$MCP_TOOL_OUTPUT"; then
 fi
 echo "OK: MCP tool call round-trip (index + search) succeeded"
 
-# 5f: Content-Length framing (OpenCode compatibility)
+# 5g: Content-Length framing (OpenCode compatibility)
 echo ""
-echo "--- Phase 5f: Content-Length framing ---"
+echo "--- Phase 5g: Content-Length framing ---"
 MCP_CL_INPUT=$(mktemp)
 MCP_CL_OUTPUT=$(mktemp)
 
