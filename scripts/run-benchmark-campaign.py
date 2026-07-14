@@ -239,6 +239,15 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(
             f"result binary SHA-256 mismatch: expected={cell['binary_sha256']} actual={actual_sha}"
         )
+    if result.get("error"):
+        raise ValueError(f"benchmark result contains an error: {result['error']}")
+    derived = result.get("derived")
+    if not isinstance(derived, dict) or not isinstance(derived.get("passed"), bool):
+        raise ValueError("benchmark result must contain derived.passed as a boolean")
+    cases = result.get("cases")
+    measurements = result.get("measurements")
+    if not (isinstance(cases, list) and cases) and not isinstance(measurements, dict):
+        raise ValueError("benchmark result must contain non-empty cases or measurements")
     return result
 
 
