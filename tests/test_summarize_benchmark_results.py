@@ -62,9 +62,68 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "speedup_full_rebuild_over_incremental": 10.0,
         }
         markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
-        header = markdown.splitlines()[2]
-        self.assertLess(header.index("Decision"), header.index("Speedup p50"))
+        self.assertLess(markdown.index("Decision"), markdown.index("Speedup p50"))
         self.assertIn("Binary SHA-256", markdown)
+
+    def test_query_quality_size_latency_and_pareto_frontier(self) -> None:
+        compact_case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "quality": {"passed": True, "passed_count": 2, "applicable_count": 2},
+                "marker": {
+                    "elapsed_ms": 5,
+                    "response_bytes": 80,
+                    "response_token_estimate": 20,
+                },
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
+            "speedup_full_rebuild_over_incremental": 10.0,
+        }
+        slower_case = {
+            **compact_case,
+            "oracles": {
+                "quality": {"passed": True, "passed_count": 2, "applicable_count": 2},
+                "marker": {
+                    "elapsed_ms": 8,
+                    "response_bytes": 120,
+                    "response_token_estimate": 30,
+                },
+            },
+            "incremental": {"elapsed_ms": 20, "peak_rss_mb": 100},
+        }
+        rows = [
+            SUMMARY.summarize_group("compact", [report(compact_case)]),
+            SUMMARY.summarize_group("slower", [report(slower_case)]),
+        ]
+        SUMMARY.mark_pareto_frontier(rows)
+        self.assertEqual(rows[0]["quality_score"], 1.0)
+        self.assertEqual(rows[0]["query_response_p50_bytes"], 80.0)
+        self.assertEqual(rows[0]["query_response_p50_tokens"], 20.0)
+        self.assertEqual(rows[0]["query_latency_p50_ms"], 5.0)
+        self.assertEqual(rows[0]["pareto"], "frontier")
+        self.assertEqual(rows[1]["pareto"], "dominated by compact")
+
+    def test_failed_quality_is_not_pareto_eligible(self) -> None:
+        case = {
+            "passed": False,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "quality": {"passed": False, "passed_count": 1, "applicable_count": 2},
+                "marker": {
+                    "elapsed_ms": 1,
+                    "response_bytes": 4,
+                    "response_token_estimate": 1,
+                },
+            },
+            "incremental": {"elapsed_ms": 1, "peak_rss_mb": 1},
+            "fresh_fast_full_after_change": {"elapsed_ms": 2, "peak_rss_mb": 2},
+        }
+        row = SUMMARY.summarize_group("bad-quality", [report(case)])
+        SUMMARY.mark_pareto_frontier([row])
+        self.assertEqual(row["decision"], "REJECT: quality/correctness")
+        self.assertEqual(row["pareto"], "ineligible")
 
 
 if __name__ == "__main__":

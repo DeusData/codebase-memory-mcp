@@ -12,6 +12,41 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_tool_result_measures_canonical_payload_not_transport_envelope(self) -> None:
+        result = BENCHMARK.build_tool_call_result(
+            {"name": "alpha", "items": [1, 2]}, "", 999, 12.5, False
+        )
+        canonical = b'{"items":[1,2],"name":"alpha"}'
+        self.assertEqual(result["transport_response_bytes"], 999)
+        self.assertEqual(result["response_bytes"], len(canonical))
+        self.assertEqual(
+            result["response_token_estimate"], BENCHMARK.estimate_response_tokens(canonical)
+        )
+        self.assertEqual(result["token_estimator"], "utf8_bytes_div_4_ceil")
+
+    def test_quality_summary_requires_every_applicable_oracle(self) -> None:
+        oracles = {
+            "marker_search_graph": {
+                "response": {"results": [{"name": "wanted_marker"}]}
+            },
+            "changed_file_query_graph": {
+                "response": {"results": [{"file_path": "wrong.c"}]}
+            },
+            "route_freshness_probe": {"response": {"routes": []}},
+        }
+        expectations = {
+            "marker_search_graph": ("wanted_marker", "marker returned"),
+            "changed_file_query_graph": ("src/wanted.c", "changed path returned"),
+            "route_freshness_probe": (None, "route check not applicable"),
+        }
+        summary = BENCHMARK.score_quality_oracles(oracles, expectations)
+        self.assertFalse(summary["passed"])
+        self.assertEqual(summary["passed_count"], 1)
+        self.assertEqual(summary["applicable_count"], 2)
+        self.assertEqual(summary["score"], 0.5)
+        self.assertFalse(oracles["changed_file_query_graph"]["quality"]["passed"])
+        self.assertFalse(oracles["route_freshness_probe"]["quality"]["applicable"])
+
     def test_binary_metadata_records_content_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "cbm"
