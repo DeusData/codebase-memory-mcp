@@ -104,12 +104,13 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
-# Production flags (CFLAGS_EXTRA allows CI to inject -DCBM_VERSION)
+# Production flags. CFLAGS_EXTRA carries the generated version define;
+# EXTRA_{C,CXX,LD}FLAGS are explicit developer/CI overrides appended last.
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
+CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA) $(EXTRA_CFLAGS)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(EXTRA_CXXFLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -138,7 +139,7 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS)
+LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAGS) $(EXTRA_LDFLAGS)
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 # nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement)

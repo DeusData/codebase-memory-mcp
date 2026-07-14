@@ -346,6 +346,19 @@ scripts/build.sh --with-ui          # with graph visualization
 # Binary at: build/c/codebase-memory-mcp
 ```
 
+The standard and release pathways use the Makefile's optimized production defaults
+(`-O2`). For an inspectable local development binary, append debug flags through the
+same build entry point; the final override wins over the production optimization:
+
+```bash
+scripts/build.sh EXTRA_CFLAGS="-g -O0 -fno-omit-frame-pointer" \
+  EXTRA_CXXFLAGS="-g -O0 -fno-omit-frame-pointer"
+```
+
+Use `make -f Makefile.cbm test`, `test-tsan`, or `test-leak` for sanitizer and
+lifecycle validation; those targets already select their purpose-built compiler and
+allocator configurations.
+
 ### Manual MCP Configuration
 
 <details>

@@ -222,7 +222,7 @@ jobs:
       - name: Build (ASan)
         run: |
           SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} EXTRA_CFLAGS="$SANITIZE" EXTRA_CXXFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
       - name: ASan soak (15 min)
         env:
           ASAN_OPTIONS: "detect_leaks=1:halt_on_error=0:log_path=soak-results/asan"
@@ -258,7 +258,7 @@ jobs:
         shell: msys2 {0}
         run: |
           SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer"
-          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++ EXTRA_CFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
+          scripts/build.sh ${{ inputs.version && format('--version {0}', inputs.version) || '' }} CC=clang CXX=clang++ EXTRA_CFLAGS="$SANITIZE" EXTRA_CXXFLAGS="$SANITIZE" EXTRA_LDFLAGS="$SANITIZE"
       - name: ASan soak (15 min, no leak detection)
         shell: msys2 {0}
         env:
