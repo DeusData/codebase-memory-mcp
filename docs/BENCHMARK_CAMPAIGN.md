@@ -107,12 +107,15 @@ Every invocation also writes:
   run directories;
 - `reports/summary.md`, regenerated from validated completion records only.
 
-The report lists exact canonical response bytes and a clearly labeled deterministic
-`ceil(UTF-8 bytes / 4)` token estimate. Pareto membership is restricted to candidates
-that pass every applicable quality/correctness gate and have query latency, response
-tokens, incremental latency, and peak RSS measurements. It maximizes quality while
-minimizing those cost axes. Exact bytes remain visible so the token estimate is never
-presented as tokenizer ground truth.
+The report lists exact bytes from each tool's default response encoding and a clearly
+labeled deterministic `ceil(UTF-8 bytes / 4)` token estimate. Each quality oracle makes
+a second request with `format=json`; its latency and canonical JSON size are recorded
+separately as `quality_probe_elapsed_ms` and `quality_response_bytes`, so parsing the
+oracle cannot silently replace or inflate the default user-facing measurement. Pareto
+membership is restricted to candidates that pass every applicable quality/correctness
+gate and have query latency, response tokens, incremental latency, and peak RSS
+measurements. It maximizes quality while minimizing those cost axes. Exact bytes remain
+visible so the token estimate is never presented as tokenizer ground truth.
 
 Use `--audit-only` to scan and regenerate the report without running missing cells.
 Use `--minimum-free-gb` and `--stale-lock-hours` only when the recorded defaults are
