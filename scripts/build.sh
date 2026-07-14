@@ -7,6 +7,7 @@
 #   scripts/build.sh --version v0.8.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
+#   scripts/build.sh EXTRA_CFLAGS="-g -O0" EXTRA_CXXFLAGS="-g -O0" # Debug
 #
 # This script is the SINGLE source of truth for building release binaries.
 # Used identically in local development and CI workflows.
