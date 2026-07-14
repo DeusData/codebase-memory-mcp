@@ -629,6 +629,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
+    {"diff_versions", true, false, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
