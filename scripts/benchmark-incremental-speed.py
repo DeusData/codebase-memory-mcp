@@ -1254,6 +1254,9 @@ def build_env(cache_dir: Path) -> dict[str, str]:
     env["CBM_CACHE_DIR"] = str(cache_dir)
     env["CBM_AUTO_INDEX"] = "false"
     env["CBM_CONTEXT_INJECTION"] = "false"
+    # The supervisor retains successful worker logs only in profile mode. The
+    # harness streams their exact memory/timing markers before cleaning the cache.
+    env["CBM_PROFILE"] = "1"
     return env
 
 

@@ -121,7 +121,10 @@ gate and have query latency, response tokens, incremental latency, and peak RSS
 measurements. It maximizes quality while minimizing those cost axes. Exact bytes remain
 visible so the token estimate is never presented as tokenizer ground truth.
 Peak RSS and internal indexing time are extracted in one streaming pass from the
-worker logfile named by the index response. Only the exact `mem.phase`,
+worker logfile named by the index response. The harness sets `CBM_PROFILE=1` for
+every candidate because successful supervisors otherwise delete that logfile; this
+also makes the profiling configuration consistent and visible across revisions.
+Only the exact `mem.phase`,
 `pipeline.done`, and `incremental.done` marker lines (at most 512) are retained in
 the result, keeping memory bounded while preserving the evidence after transient
 worker logs are cleaned.
