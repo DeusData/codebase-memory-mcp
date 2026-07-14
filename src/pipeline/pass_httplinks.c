@@ -283,9 +283,17 @@ static int discover_node_routes(const cbm_gbuf_node_t *n, const cbm_pipeline_ctx
                                 cbm_route_handler_t *out, int max_out) {
     int total = 0;
 
-    /* 1. Decorator-based routes (Python, Java, Rust, ASP.NET) */
+    /* 1. Decorator-based routes (Python, Java, Rust, ASP.NET).
+     * Definition extraction already composes class-level Spring prefixes into
+     * route_path and pass_route_nodes.c mints that canonical Route. Rescanning
+     * the method decorators here would also mint the unprefixed method path
+     * (for example /orders beside /api/orders). Keep the rescan only for legacy
+     * or source-derived nodes that do not carry the extracted route contract. */
     int ndec = 0;
-    char **decs = extract_decorators(n->properties_json, &ndec);
+    char **decs = NULL;
+    if (!n->properties_json || !strstr(n->properties_json, "\"route_path\"")) {
+        decs = extract_decorators(n->properties_json, &ndec);
+    }
     if (decs && ndec > 0) {
         int nr = cbm_extract_python_routes(n->name, n->qualified_name, (const char **)decs, ndec,
                                            out + total, max_out - total);

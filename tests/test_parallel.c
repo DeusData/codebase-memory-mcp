@@ -378,7 +378,7 @@ TEST(parallel_empty_files) {
     PASS();
 }
 
-TEST(extraction_errors_fail_parallel_and_sequential_paths) {
+TEST(extraction_errors_are_nonfatal_in_parallel_and_sequential_paths) {
     char dir[256];
     snprintf(dir, sizeof(dir), "/tmp/cbm_extract_error_XXXXXX");
     ASSERT_TRUE(cbm_mkdtemp(dir) != NULL);
@@ -424,11 +424,15 @@ TEST(extraction_errors_fail_parallel_and_sequential_paths) {
     fputs("content\n", f);
     fclose(f);
     file.language = (CBMLanguage)-1;
-    ASSERT_NEQ(cbm_parallel_extract(&ctx, &file, 1, cache, &shared_ids, 1), 0);
+    /* Unsupported-language extraction is a per-file skip, not a run-level
+     * failure. Both paths must leave the graph unchanged and allow the caller
+     * to publish the successfully indexed subset. The production pipeline
+     * supplies ctx.pipeline and records this file in skipped[]. */
+    ASSERT_EQ(cbm_parallel_extract(&ctx, &file, 1, cache, &shared_ids, 1), 0);
     ASSERT_NULL(cache[0]);
     ASSERT_EQ(cbm_gbuf_node_count(gbuf), nodes_after_empty);
 
-    ASSERT_NEQ(cbm_pipeline_pass_definitions(&ctx, &file, 1), 0);
+    ASSERT_EQ(cbm_pipeline_pass_definitions(&ctx, &file, 1), 0);
     ASSERT_EQ(cbm_gbuf_node_count(gbuf), nodes_after_empty);
 
     cbm_registry_free(registry);
@@ -1968,7 +1972,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_total_edges);
     RUN_TEST(parallel_full_pipeline_worker_count_parity_64_files);
     RUN_TEST(parallel_empty_files);
-    RUN_TEST(extraction_errors_fail_parallel_and_sequential_paths);
+    RUN_TEST(extraction_errors_are_nonfatal_in_parallel_and_sequential_paths);
     RUN_TEST(parallel_args_json_no_overflow);
     RUN_TEST(parallel_unresolved_route_suffix_does_not_emit_self_call);
     RUN_TEST(parallel_top_level_raise_matches_sequential_no_file_fallback);
