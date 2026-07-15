@@ -12,14 +12,21 @@ set -euo pipefail
 BINARY="${1:?usage: smoke-test.sh <binary-path>}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 TMPDIR=$(mktemp -d)
+SMOKE_STATE=$(mktemp -d)
 DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
+    SMOKE_STATE=$(cygpath -m "$SMOKE_STATE")
 fi
-trap 'rm -rf "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
+SMOKE_CACHE="$SMOKE_STATE/cache"
+SMOKE_CONFIG="$SMOKE_STATE/config"
+mkdir -p "$SMOKE_CACHE" "$SMOKE_CONFIG"
+export CBM_CACHE_DIR="$SMOKE_CACHE"
+export XDG_CONFIG_HOME="$SMOKE_CONFIG"
+trap 'rm -rf "$TMPDIR" "$SMOKE_STATE" "${DRYRUN_HOME:-}"' EXIT
 
-CLI_STDERR=$(mktemp)
+CLI_STDERR="$SMOKE_STATE/cli-stderr.log"
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
 
 echo "=== Phase 1: version ==="
@@ -585,10 +592,13 @@ echo "=== Phase 5: MCP stdio transport (agent handshake) ==="
 # Test the actual MCP protocol as an agent (Claude Code, OpenCode, etc.) would use it.
 # Uses background process + kill instead of timeout (portable across macOS/Linux).
 
-# Helper: run binary in background with input, wait up to N seconds, collect output
+# Helper: run binary in background with input, wait up to N seconds, collect output.
+# Set the tool mode explicitly so a user's persistent config cannot change which
+# MCP surface an individual protocol scenario is validating.
 mcp_run() {
   local input_file="$1" output_file="$2" max_wait="${3:-10}"
-  "$BINARY" < "$input_file" > "$output_file" 2>/dev/null &
+  local tool_mode="${4:-streamlined}"
+  CBM_TOOL_MODE="$tool_mode" "$BINARY" < "$input_file" > "$output_file" 2>/dev/null &
   local pid=$!
   local waited=0
   while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$max_wait" ]; do
@@ -692,7 +702,7 @@ cat > "$MCP_TOOL_INPUT" << TOOLEOF
 {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_graph","arguments":{"name_pattern":"compute"}}}
 TOOLEOF
 
-mcp_run "$MCP_TOOL_INPUT" "$MCP_TOOL_OUTPUT" 30
+mcp_run "$MCP_TOOL_INPUT" "$MCP_TOOL_OUTPUT" 30 classic
 
 if ! grep -q '"id":2' "$MCP_TOOL_OUTPUT"; then
   echo "FAIL: no index_repository response (id:2)"
@@ -884,7 +894,7 @@ cat > "$MCP_SC_INPUT" << SCEOF
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"get_code_snippet","arguments":{"qualified_name":"compute"}}}
 SCEOF
 
-mcp_run "$MCP_SC_INPUT" "$MCP_SC_OUTPUT" 30
+mcp_run "$MCP_SC_INPUT" "$MCP_SC_OUTPUT" 30 classic
 
 if ! grep -q '"id":3' "$MCP_SC_OUTPUT"; then
   echo "FAIL: search_code response (id:3) missing"
