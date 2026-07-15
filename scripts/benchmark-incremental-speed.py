@@ -34,6 +34,29 @@ DEFAULT_RANK_REFRESH = "stale_on_exact"
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
+CONFIG_PROFILE_DEFAULT = "default"
+CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
+CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
+CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
+CONFIG_PROFILES: dict[str, dict[str, str]] = {
+    CONFIG_PROFILE_DEFAULT: {},
+    CONFIG_PROFILE_RANK_DISABLED: {"rank_enabled": "false"},
+    CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: {
+        "githistory_enabled": "false",
+        "httplinks_enabled": "false",
+        "rank_enabled": "false",
+        "semantic_edges_enabled": "false",
+        "similarity_enabled": "false",
+    },
+    CONFIG_PROFILE_MINIMAL_INDEXING: {
+        "auto_index_deps": "false",
+        "githistory_enabled": "false",
+        "httplinks_enabled": "false",
+        "rank_enabled": "false",
+        "semantic_edges_enabled": "false",
+        "similarity_enabled": "false",
+    },
+}
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
@@ -614,6 +637,15 @@ def parse_config_overrides(items: list[str]) -> dict[str, str]:
         if not sep or not key or not value:
             raise SystemExit(f"error: --config must be key=value, got {item!r}")
         overrides[key] = value
+    return overrides
+
+
+def resolve_config_overrides(profile: str, items: list[str]) -> dict[str, str]:
+    """Return one explicit benchmark profile plus higher-priority per-key overrides."""
+    if profile not in CONFIG_PROFILES:
+        raise ValueError(f"unknown config profile: {profile}")
+    overrides = dict(CONFIG_PROFILES[profile])
+    overrides.update(parse_config_overrides(items))
     return overrides
 
 
@@ -1857,6 +1889,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             "files": args.files,
             "functions_per_file": args.functions_per_file,
             "rank_refresh": args.rank_refresh,
+            "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
@@ -2016,6 +2049,7 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         "mode": "self_dogfood",
         "parameters": {
             "rank_refresh": args.rank_refresh,
+            "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
@@ -2067,6 +2101,16 @@ def parse_args() -> argparse.Namespace:
         "--rank-refresh",
         choices=("eager", "stale_on_exact", "stale_on_incremental"),
         default=DEFAULT_RANK_REFRESH,
+    )
+    parser.add_argument(
+        "--config-profile",
+        choices=tuple(CONFIG_PROFILES),
+        default=CONFIG_PROFILE_DEFAULT,
+        help=(
+            "Named, auditable capability profile. minimal_indexing disables dependency "
+            "indexing plus every optional graph/rank pass; repeated --config KEY=VALUE "
+            "arguments take priority over the profile."
+        ),
     )
     parser.add_argument(
         "--config",
@@ -2133,7 +2177,7 @@ def parse_args() -> argparse.Namespace:
         help="Existing MCP tool used by --overhead-probes.",
     )
     args = parser.parse_args()
-    args.config_overrides = parse_config_overrides(args.config)
+    args.config_overrides = resolve_config_overrides(args.config_profile, args.config)
     return args
 
 
@@ -2182,6 +2226,7 @@ def main() -> int:
             "changed_files": args.changed_files,
             "min_speedup": args.min_speedup,
             "rank_refresh": args.rank_refresh,
+            "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,

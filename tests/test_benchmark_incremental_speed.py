@@ -12,6 +12,28 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_minimal_indexing_profile_disables_every_optional_cost_center(self) -> None:
+        overrides = BENCHMARK.resolve_config_overrides("minimal_indexing", [])
+        self.assertEqual(
+            overrides,
+            {
+                "auto_index_deps": "false",
+                "githistory_enabled": "false",
+                "httplinks_enabled": "false",
+                "rank_enabled": "false",
+                "semantic_edges_enabled": "false",
+                "similarity_enabled": "false",
+            },
+        )
+
+    def test_explicit_config_override_takes_priority_over_profile(self) -> None:
+        overrides = BENCHMARK.resolve_config_overrides(
+            "minimal_indexing", ["rank_enabled=true", "auto_index_deps=true"]
+        )
+        self.assertEqual(overrides["rank_enabled"], "true")
+        self.assertEqual(overrides["auto_index_deps"], "true")
+        self.assertEqual(overrides["semantic_edges_enabled"], "false")
+
     def test_benchmark_environment_retains_worker_measurement_log(self) -> None:
         env = BENCHMARK.build_env(Path("/tmp/cbm-benchmark-cache"))
         self.assertEqual(env["CBM_PROFILE"], "1")
