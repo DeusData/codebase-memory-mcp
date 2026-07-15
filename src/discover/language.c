@@ -860,7 +860,6 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_SOQL] = "SOQL",
     [CBM_LANG_SOSL] = "SOSL",
     [CBM_LANG_MOJO] = "Mojo",
-    [CBM_LANG_PLSQL] = "PL/SQL",
     [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
