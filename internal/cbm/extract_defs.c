@@ -1192,7 +1192,18 @@ static bool is_comment_node(const char *kind) {
 static char *extract_comment_text(CBMArena *a, TSNode node, const char *source) {
     char *text = cbm_node_text(a, node, source);
     if (text && strlen(text) > MAX_COMMENT_LEN) {
-        text[MAX_COMMENT_LEN] = '\0';
+        /* #1017: snap the cut back to a UTF-8 character boundary so a
+         * multi-byte character straddling MAX_COMMENT_LEN (e.g. a 3-byte
+         * CJK char in a Japanese docstring) is never split — a byte-offset
+         * cut leaves an incomplete sequence that lands as invalid UTF-8 in
+         * nodes.properties, and strict decoders (Python's sqlite3) throw on
+         * read. Continuation bytes are 10xxxxxx; back up over them to the
+         * lead byte, dropping the partial character. */
+        size_t cut = MAX_COMMENT_LEN;
+        while (cut > 0 && ((unsigned char)text[cut] & 0xC0) == 0x80) {
+            cut--;
+        }
+        text[cut] = '\0';
     }
     return text;
 }

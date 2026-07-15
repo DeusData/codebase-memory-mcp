@@ -1917,6 +1917,71 @@ TEST(wolfram_nested_def) {
  * Group I: cbm_test.go ports
  * ═══════════════════════════════════════════════════════════════════ */
 
+/* #1017: a docstring longer than MAX_COMMENT_LEN (500) that has a multi-byte
+ * UTF-8 character straddling the cap must be truncated at a CHARACTER
+ * boundary, never mid-sequence — a byte-offset cut leaves an incomplete
+ * UTF-8 sequence that lands as invalid UTF-8 in nodes.properties and makes
+ * strict decoders (Python sqlite3) throw. Verified by decoding the captured
+ * docstring as UTF-8. */
+static int is_valid_utf8(const char *s) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (*p) {
+        int n;
+        if (*p < 0x80) {
+            n = 0;
+        } else if ((*p & 0xE0) == 0xC0) {
+            n = 1;
+        } else if ((*p & 0xF0) == 0xE0) {
+            n = 2;
+        } else if ((*p & 0xF8) == 0xF0) {
+            n = 3;
+        } else {
+            return 0; /* invalid lead byte (or stray continuation) */
+        }
+        p++;
+        for (int i = 0; i < n; i++) {
+            if ((*p & 0xC0) != 0x80) {
+                return 0; /* missing/short continuation → truncated mid-char */
+            }
+            p++;
+        }
+    }
+    return 1;
+}
+
+TEST(python_docstring_utf8_boundary_truncation_issue1017) {
+    /* 495 ASCII bytes then 3-byte CJK chars (E3 81 82 = U+3042 あ): the cap at
+     * byte 500 lands in the middle of the second あ. */
+    char src[900];
+    int off = snprintf(src, sizeof(src), "def f():\n    \"\"\"");
+    for (int i = 0; i < 495; i++) {
+        src[off++] = 'x';
+    }
+    for (int i = 0; i < 5; i++) {
+        src[off++] = (char)0xE3;
+        src[off++] = (char)0x81;
+        src[off++] = (char)0x82;
+    }
+    off += snprintf(src + off, sizeof(src) - off, "\"\"\"\n    return 1\n");
+    (void)off;
+    CBMFileResult *r = extract(src, CBM_LANG_PYTHON, "test", "test.py");
+    ASSERT_NOT_NULL(r);
+    const char *doc = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "f") == 0) {
+            doc = r->defs.items[i].docstring;
+        }
+    }
+    ASSERT_NOT_NULL(doc);
+    if (!is_valid_utf8(doc)) {
+        fprintf(stderr, "  [1017] FAIL docstring truncated mid-UTF-8-char (len=%zu)\n",
+                strlen(doc));
+    }
+    ASSERT_TRUE(is_valid_utf8(doc));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(python_docstring) {
     CBMFileResult *r = extract(
         "def compute(x, y):\n    \"\"\"Compute the sum of x and y.\"\"\"\n    return x + y\n",
@@ -4723,6 +4788,7 @@ SUITE(extraction) {
     RUN_TEST(wolfram_nested_def);
 
     /* cbm_test.go ports */
+    RUN_TEST(python_docstring_utf8_boundary_truncation_issue1017);
     RUN_TEST(python_docstring);
     RUN_TEST(go_function_extraction);
     RUN_TEST(js_arrow_function);
