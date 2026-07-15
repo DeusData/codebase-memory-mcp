@@ -50,9 +50,19 @@ prev=""
 for arg in "$@"; do
     if [ "$prev" = "--dir" ]; then
         INSTALL_DIR="$arg"
+        prev=""
+        continue
     fi
-    prev="$arg"
+    if [ "$arg" = "--dir" ]; then
+        prev="--dir"
+    else
+        prev=""
+    fi
 done
+if [ "$prev" = "--dir" ]; then
+    echo "error: --dir requires a path argument" >&2
+    exit 1
+fi
 
 detect_os() {
     case "$(uname -s)" in
@@ -82,12 +92,14 @@ detect_arch() {
 
 OS=$(detect_os)
 ARCH=$(detect_arch)
+BIN_NAME="codebase-memory-mcp"
+[ "$OS" = "windows" ] && BIN_NAME="${BIN_NAME}.exe"
 
 echo "codebase-memory-mcp installer"
 echo "  os:      $OS"
 echo "  arch:    $ARCH"
 echo "  variant: $VARIANT"
-echo "  target:  $INSTALL_DIR/codebase-memory-mcp"
+echo "  target:  $INSTALL_DIR/$BIN_NAME"
 echo ""
 
 # Build download URL
@@ -127,8 +139,19 @@ fi
 
 # Checksum verification
 CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
-if curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
-    EXPECTED=$(grep "$ARCHIVE" "$DLDIR/checksums.txt" | awk '{print $1}')
+CHECKSUM_READY=false
+if command -v curl &>/dev/null; then
+    if curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
+        CHECKSUM_READY=true
+    fi
+elif command -v wget &>/dev/null; then
+    if wget -q -O "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
+        CHECKSUM_READY=true
+    fi
+fi
+
+if [ "$CHECKSUM_READY" = true ]; then
+    EXPECTED=$(awk -v f="$ARCHIVE" '{name=$2; sub(/^\*/, "", name); if (name == f) {print $1; exit}}' "$DLDIR/checksums.txt")
     if [ -n "$EXPECTED" ]; then
         if command -v sha256sum &>/dev/null; then
             ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
@@ -158,6 +181,9 @@ else
 fi
 
 DLBIN="$DLDIR/codebase-memory-mcp"
+if [ "$OS" = "windows" ] && [ ! -f "$DLBIN" ] && [ -f "$DLDIR/codebase-memory-mcp.exe" ]; then
+    DLBIN="$DLDIR/codebase-memory-mcp.exe"
+fi
 if [ ! -f "$DLBIN" ]; then
     echo "error: binary not found after extraction" >&2
     exit 1
@@ -172,7 +198,7 @@ fi
 
 # Install
 mkdir -p "$INSTALL_DIR"
-DEST="$INSTALL_DIR/codebase-memory-mcp"
+DEST="$INSTALL_DIR/$BIN_NAME"
 if [ -f "$DEST" ]; then
     rm -f "$DEST"
 fi
