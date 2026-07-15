@@ -885,8 +885,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
         if (file_qn) {
-            cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
-                                 changed_files[i].rel_path, 0, 0, "{}");
+            /* #994: the name must be the BASENAME with extension props,
+             * mirroring the full build's File node (pipeline.c) — upserts
+             * match by QN, so any other name here renames the node in place
+             * and the incremental graph diverges from a full build. */
+            const char *rel = changed_files[i].rel_path;
+            const char *slash = strrchr(rel, '/');
+            const char *basename = slash ? slash + SKIP_ONE : rel;
+            char props[CBM_SZ_256];
+            const char *ext = strrchr(basename, '.');
+            snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+            cbm_gbuf_upsert_node(existing, "File", basename, file_qn, rel, 0, 0, props);
             free(file_qn);
         }
     }

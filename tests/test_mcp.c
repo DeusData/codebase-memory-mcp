@@ -4780,6 +4780,81 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     PASS();
 }
 
+/* ── #1044: a "<name>::missed" shadow row must not hide the project ──
+ *
+ * The miss-graph pass inserts a second `projects` row ("<name>::missed") so
+ * its nodes satisfy the FK on nodes.project. db_internal_project_name
+ * required the projects table to hold EXACTLY ONE row, so any project with
+ * a miss graph vanished from list_projects and the graph UI, and the
+ * fallback-scan resolve path failed.
+ *
+ * RED on buggy code / GREEN on the fix:
+ *   A. list_projects still advertises "delta1044" while the shadow row exists.
+ *   B. the shadow name itself is never advertised.
+ *   C. search_graph(project="delta1044") still resolves and returns the node.
+ */
+TEST(tool_list_projects_ignores_missed_shadow_issue1044) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-issue1044-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails — not a #1044 signal */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    ASSERT_TRUE(issue704_make_db(cache, "delta1044.db", "delta1044", "deltaFunc1044"));
+
+    /* Add the shadow row exactly the way the miss-graph pass does. */
+    char db_path[700];
+    snprintf(db_path, sizeof(db_path), "%s/delta1044.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, "delta1044::missed", ""), CBM_STORE_OK);
+    cbm_store_close(st);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* ── A + B: primary advertised, shadow hidden ─────────────────── */
+    char *list =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(strstr(list, "delta1044")); /* RED before: db skipped as ghost */
+    ASSERT_NULL(strstr(list, "::missed"));      /* shadow never advertised */
+    free(list);
+
+    /* ── C: the project still resolves and returns its node ───────── */
+    char *q = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"delta1044\",\"name_pattern\":\"deltaFunc1044\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "deltaFunc1044"));
+    ASSERT_NULL(strstr(q, "not found"));
+    free(q);
+
+    cbm_mcp_server_free(srv);
+
+    /* ── cleanup ───────────────────────────────────────────────────── */
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(db_path);
+    char side1044[740];
+    snprintf(side1044, sizeof(side1044), "%s-wal", db_path);
+    cbm_unlink(side1044);
+    snprintf(side1044, sizeof(side1044), "%s-shm", db_path);
+    cbm_unlink(side1044);
+    cbm_rmdir(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  QUERY STORE READ-ONLY  (data-integrity reproductions)
  *
@@ -6439,6 +6514,7 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+    RUN_TEST(tool_list_projects_ignores_missed_shadow_issue1044);
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);

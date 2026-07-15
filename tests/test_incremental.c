@@ -964,6 +964,36 @@ static int resp_lacks_key(const char *resp, const char *key) {
 
 /* ── list_projects ─────────────────────────────────────────────── */
 
+TEST(incr_file_node_name_stays_basename) {
+    /* #994: File nodes must keep their basename NAME through an incremental
+     * re-index (the bug renamed touched files' nodes to rel_path, diverging
+     * from a full build). Modify a file, re-index, assert no File node name
+     * contains a path separator. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    FILE *f = fopen(path, "a");
+    ASSERT(f != NULL);
+    fprintf(f, "\n# incr_file_node_name_stays_basename touch\n");
+    fclose(f);
+
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    double ms;
+    char *r = call_tool_timed("query_graph", &ms,
+                              "{\"project\":\"%s\",\"format\":\"json\","
+                              "\"query\":\"MATCH (n:File) WHERE n.name CONTAINS '/'"
+                              " RETURN n.name LIMIT 5\"}",
+                              g_project);
+    TOOL_OK(r, ms);
+    /* No File node may carry a path separator in its name; the query engine
+     * returns an empty rows array when nothing matches. */
+    ASSERT(strstr(r, "\"rows\":[]") != NULL || strstr(r, "\\\"rows\\\":[]") != NULL);
+    free(r);
+    PASS();
+}
+
 TEST(tool_list_projects_basic) {
     double ms;
     char *r = call_tool_timed("list_projects", &ms, "{}");
@@ -2970,6 +3000,7 @@ SUITE(incremental) {
 
     /* Phase 3: Incremental deltas */
     RUN_TEST(incr_modify_file);
+    RUN_TEST(incr_file_node_name_stays_basename);
     RUN_TEST(incr_formatter_run);
     RUN_TEST(incr_add_file);
     RUN_TEST(incr_delete_file);

@@ -72,6 +72,10 @@ typedef struct {
     const char *content;
 } EILangFile;
 
+typedef struct {
+    const char *name; /* fixture filename relative to a checked-in fixture root */
+} EILangFixtureFile;
+
 static void ei_to_fwd_slashes(char *p) {
     for (; *p; p++) {
         if (*p == '\\') *p = '/';
@@ -121,6 +125,89 @@ static cbm_store_t *ei_index_files(EILangProj *lp, const EILangFile *files, int 
     if (resp) free(resp);
 
     return cbm_store_open_path(lp->dbpath);
+}
+
+static char *ei_slurp_file(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    char *buf = (char *)calloc((size_t)size + 1, 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t nread = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[nread] = '\0';
+    return buf;
+}
+
+static cbm_store_t *ei_index_fixture_files(EILangProj *lp, const char *fixture_root,
+                                           const EILangFixtureFile *files, int nfiles) {
+    EILangFile *loaded = (EILangFile *)calloc((size_t)nfiles, sizeof(EILangFile));
+    char **contents = (char **)calloc((size_t)nfiles, sizeof(char *));
+    if (!loaded || !contents) {
+        free(loaded);
+        free(contents);
+        return NULL;
+    }
+
+    cbm_store_t *store = NULL;
+    for (int i = 0; i < nfiles; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", fixture_root, files[i].name);
+        contents[i] = ei_slurp_file(path);
+        if (!contents[i]) {
+            goto done;
+        }
+        loaded[i].name = files[i].name;
+        loaded[i].content = contents[i];
+    }
+
+    store = ei_index_files(lp, loaded, nfiles);
+
+done:
+    for (int i = 0; i < nfiles; i++) {
+        free(contents[i]);
+    }
+    free(contents);
+    free(loaded);
+    return store;
+}
+
+static int64_t ei_node_id_for_file_label(cbm_store_t *store, const char *project,
+                                         const char *file_path, const char *label) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_file(store, project, file_path, &nodes, &count) != CBM_STORE_OK) {
+        return 0;
+    }
+    int64_t id = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0) {
+            id = nodes[i].id;
+            break;
+        }
+    }
+    if (id == 0 && count > 0) {
+        id = nodes[0].id;
+    }
+    cbm_store_free_nodes(nodes, count);
+    return id;
 }
 
 static void ei_cleanup(EILangProj *lp, cbm_store_t *store) {
@@ -406,6 +493,68 @@ TEST(ei_go_two_consumers_same_package) {
         {"b/b.go",       "package b\n\nimport \"example.com/two/util\"\n\n"
                          "func Run() int { return util.Helper(2) }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 4, "IMPORTS", 2));
+    PASS();
+}
+
+/* C++: header include should resolve to the header file node, not the same-stem
+ * source node. Also exercises angle-bracket include resolution. */
+TEST(ei_cpp_header_include_targets_header_file) {
+    static const EILangFixtureFile fixture_files[] = {
+        {"main.cpp"},
+        {"NodeController.h"},
+        {"NodeController.cpp"},
+        {"SystemController.h"},
+        {"SystemController.cpp"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_fixture_files(&lp, "tests/fixtures/cpp_include",
+                                                fixture_files,
+                                                (int)(sizeof(fixture_files) / sizeof(fixture_files[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t main_id = ei_node_id_for_file_label(store, lp.project, "main.cpp", "File");
+    int64_t node_source_id = ei_node_id_for_file_label(store, lp.project, "NodeController.cpp", "File");
+    int64_t system_source_id = ei_node_id_for_file_label(store, lp.project, "SystemController.cpp", "File");
+
+    ASSERT_GT(main_id, 0);
+    ASSERT_GT(node_source_id, 0);
+    ASSERT_GT(system_source_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int rc = cbm_store_find_edges_by_source_type(store, main_id, "IMPORTS", &edges, &edge_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_TRUE(edge_count >= 2);
+
+    bool saw_node_header = false;
+    bool saw_system_header = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        
+        /* Pass target directly (no &) because it is already a pointer */
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        ASSERT_EQ(edges[i].source_id, main_id);
+        ASSERT_NEQ(edges[i].target_id, node_source_id);
+        ASSERT_NEQ(edges[i].target_id, system_source_id);
+        
+        /* Use -> instead of . to access fields on a pointer */
+        if (target->file_path && strcmp(target->file_path, "NodeController.h") == 0) {
+            saw_node_header = true;
+        }
+        if (target->file_path && strcmp(target->file_path, "SystemController.h") == 0) {
+            saw_system_header = true;
+        }
+        
+        /* Free the node inside the loop */
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+
+    ASSERT_TRUE(saw_node_header);
+    ASSERT_TRUE(saw_system_header);
+
+    ei_cleanup(&lp, store);
     PASS();
 }
 
@@ -868,6 +1017,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_subpackage_import);
     RUN_TEST(ei_go_blank_import);
     RUN_TEST(ei_go_two_consumers_same_package);
+    RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */
     RUN_TEST(ei_rust_mod_plus_use);

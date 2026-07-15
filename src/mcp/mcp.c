@@ -1793,10 +1793,23 @@ static bool db_internal_project_name(const char *full_path, char *name_out, size
     cbm_project_t *projs = NULL;
     int n = 0;
     bool ok = false;
-    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK && n == 1 && projs[0].name &&
-        projs[0].name[0]) {
-        snprintf(name_out, name_sz, "%s", projs[0].name);
-        ok = true;
+    if (cbm_store_list_projects(st, &projs, &n) == CBM_STORE_OK) {
+        /* Ignore internal shadow projects ("<name>::missed" miss-graph rows):
+         * they share the db with the primary project and must not make it
+         * unresolvable — requiring n == 1 over ALL rows made every project
+         * with a miss graph vanish from list_projects and the UI (#1044). */
+        int primary = -1;
+        int primary_count = 0;
+        for (int i = 0; i < n; i++) {
+            if (projs[i].name && projs[i].name[0] && !strstr(projs[i].name, "::")) {
+                primary = i;
+                primary_count++;
+            }
+        }
+        if (primary_count == 1) {
+            snprintf(name_out, name_sz, "%s", projs[primary].name);
+            ok = true;
+        }
     }
     cbm_store_free_projects(projs, n);
     if (ok && out_store) {

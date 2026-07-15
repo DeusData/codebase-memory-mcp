@@ -381,6 +381,31 @@ TEST(handles_spring_kotlin) {
     PASS();
 }
 
+/* JAX-RS (Java): the verb (@GET) and the path (@Path) are sibling
+ * annotations, and the class-level @Path must prefix method-level paths.
+ * Reproduce-first (#1005): the first-mapping-annotation scan dropped every
+ * method-level @Path, collapsing all methods onto a single "/" Route node;
+ * only the exact Route-name set catches that through the emission dedup. */
+TEST(handles_jaxrs_java) {
+    static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
+    static const EtFile f[] = {
+        {"WidgetResource.java",
+         "package com.example;\n\n"
+         "import jakarta.ws.rs.GET;\n"
+         "import jakarta.ws.rs.Path;\n\n"
+         "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
+         "    @GET\n"
+         "    public String list() {\n"
+         "        return \"widgets\";\n    }\n\n"
+         "    @GET\n"
+         "    @Path(\"/count\")\n"
+         "    public String count() {\n"
+         "        return \"42\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* ASP.NET Minimal API (C#) — route registration via static MapGet/MapPost calls
  * with identifier handlers, under a Microsoft/AspNetCore path so the resolved
  * callee QN carries the "MapGet"/"Microsoft.AspNetCore" route-reg substrings.
@@ -1488,7 +1513,7 @@ TEST(override_go_interface) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(edge_types_probe) {
-    /* HANDLES — route→handler across web frameworks (8 frameworks) */
+    /* HANDLES — route→handler across web frameworks */
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);
     RUN_TEST(handles_drf_action_python);
@@ -1497,6 +1522,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
     RUN_TEST(handles_spring_kotlin);
+    RUN_TEST(handles_jaxrs_java);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
