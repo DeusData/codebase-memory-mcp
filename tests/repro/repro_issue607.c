@@ -173,6 +173,68 @@ TEST(repro_issue607_reinstall_preserves_index) {
     PASS();
 }
 
+/* A large cache must not bury the install plan beneath hundreds of paths.
+ * The preservation notice should show a small sample and an explicit omitted
+ * count while leaving every database untouched. */
+TEST(repro_issue607_reinstall_bounds_index_listing) {
+    char tmp_cache[512];
+    snprintf(tmp_cache, sizeof(tmp_cache), "/tmp/cbm_repro607many_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp_cache));
+
+#if defined(_WIN32)
+    char ev[600];
+    snprintf(ev, sizeof(ev), "CBM_CACHE_DIR=%s", tmp_cache);
+    _putenv(ev);
+#else
+    setenv("CBM_CACHE_DIR", tmp_cache, 1);
+#endif
+
+    enum { INDEX_COUNT = 8 };
+    char paths[INDEX_COUNT][700];
+    for (int i = 0; i < INDEX_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/sample-%02d.db", tmp_cache, i);
+        FILE *db = fopen(paths[i], "wb");
+        ASSERT_NOT_NULL(db);
+        fclose(db);
+    }
+
+    int saved_stdout = dup(STDOUT_FILENO);
+    FILE *capture = tmpfile();
+    ASSERT_TRUE(saved_stdout >= 0);
+    ASSERT_NOT_NULL(capture);
+    fflush(stdout);
+    ASSERT_TRUE(dup2(fileno(capture), STDOUT_FILENO) >= 0);
+
+    int proceed = cbm_install_handle_existing_indexes(tmp_cache, false, false);
+
+    fflush(stdout);
+    ASSERT_TRUE(dup2(saved_stdout, STDOUT_FILENO) >= 0);
+    close(saved_stdout);
+    rewind(capture);
+    char output[4096] = {0};
+    size_t output_len = fread(output, 1, sizeof(output) - 1, capture);
+    output[output_len] = '\0';
+    fclose(capture);
+
+    bool all_preserved = true;
+    for (int i = 0; i < INDEX_COUNT; i++) {
+        all_preserved = all_preserved && file_exists_607(paths[i]);
+        unlink(paths[i]);
+    }
+    rmdir(tmp_cache);
+#if defined(_WIN32)
+    _putenv("CBM_CACHE_DIR=");
+#else
+    unsetenv("CBM_CACHE_DIR");
+#endif
+
+    ASSERT_EQ(1, proceed);
+    ASSERT_TRUE(all_preserved);
+    ASSERT_NOT_NULL(strstr(output, "... and 3 more index(es)"));
+    ASSERT_NULL(strstr(output, "sample-05.db"));
+    PASS();
+}
+
 /* ── Test 2: opt-in (reset=true) STILL deletes the index ──────────────
  *
  * Proves the destroy primitive remains reachable ONLY behind the explicit
@@ -231,5 +293,6 @@ TEST(repro_issue607_reset_indexes_deletes) {
 /* ── Suite ─────────────────────────────────────────────────────────── */
 SUITE(repro_issue607) {
     RUN_TEST(repro_issue607_reinstall_preserves_index);
+    RUN_TEST(repro_issue607_reinstall_bounds_index_listing);
     RUN_TEST(repro_issue607_reset_indexes_deletes);
 }
