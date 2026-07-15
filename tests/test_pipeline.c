@@ -11862,7 +11862,7 @@ TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild) {
     PASS();
 }
 
-TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full) {
+TEST(incremental_fast_configured_cap_uses_containment_for_oversized_inbound_frontier) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -16166,6 +16166,7 @@ TEST(config_registry_includes_incremental_exact_frontier_caps) {
     ASSERT_STR_EQ(affected->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS);
     ASSERT_STR_EQ(affected->category, "Indexing");
     ASSERT_STR_EQ(affected->range, "1-100000");
+    ASSERT_NOT_NULL(strstr(affected->guidance, "does not bound total indexing cost"));
 
     PASS();
 }
@@ -17354,7 +17355,8 @@ SUITE(pipeline) {
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
     RUN_TEST(incremental_fast_body_only_change_uses_graph_noop);
     RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
-    RUN_TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full);
+    RUN_TEST(
+        incremental_fast_configured_cap_uses_containment_for_oversized_inbound_frontier);
     RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
     RUN_TEST(incremental_fast_default_c_header_frontier_cap_allows_bounded_exact);
     RUN_TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild);
