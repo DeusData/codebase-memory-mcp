@@ -13727,6 +13727,74 @@ TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild) {
     PASS();
 }
 
+TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow) {
+    enum { PIPELINE_EXACT_AFFECTED_CAP = 64 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char leaf_path[CBM_PATH_MAX];
+    int n = snprintf(leaf_path, sizeof(leaf_path), "%s/leaf.js", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(leaf_path));
+    ASSERT_EQ(th_write_file(leaf_path, "export function leaf() { return 1; }\n"), 0);
+    char consumer_path[CBM_PATH_MAX];
+    n = snprintf(consumer_path, sizeof(consumer_path), "%s/consumer.js", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(consumer_path));
+    ASSERT_EQ(th_write_file(consumer_path,
+                            "import { leaf } from './leaf.js';\n"
+                            "export function consume() { return leaf(); }\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(leaf_path,
+                            "export function leaf() { return 2; }\n"
+                            "export function leafExtra() { return leaf() + 1; }\n"),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "scoped_lsp_gap");
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.affected_paths_limit, PIPELINE_EXACT_AFFECTED_CAP);
+    ASSERT_FALSE(stats.affected_paths_truncated);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "JavaScript scoped-LSP fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild) {
     enum { PIPELINE_EXACT_ONE_PATH = 1 };
     if (setup_incremental_repo() != 0) {
@@ -17383,6 +17451,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild);
+    RUN_TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow);
     RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);

@@ -17,6 +17,16 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             "go_inbound_frontier": ("go", "leaf.go", "LeafExtra"),
             "python_inbound_frontier": ("python", "leaf.py", "leaf_extra"),
             "c_header_inbound_frontier": ("c_header", "shared.h", "shared_extra"),
+            "cpp_inbound_frontier": ("cpp", "shared.hpp", "shared_extra"),
+            "cuda_inbound_frontier": ("cuda", "shared.cuh", "shared_extra"),
+            "javascript_inbound_frontier": ("javascript", "leaf.js", "leafExtra"),
+            "typescript_inbound_frontier": ("typescript", "leaf.ts", "leafExtra"),
+            "tsx_inbound_frontier": ("tsx", "leaf.tsx", "leafExtra"),
+            "php_inbound_frontier": ("php", "Leaf.php", "leaf_extra"),
+            "csharp_inbound_frontier": ("csharp", "Leaf.cs", "Extra"),
+            "java_inbound_frontier": ("java", "Leaf.java", "extra"),
+            "kotlin_inbound_frontier": ("kotlin", "Leaf.kt", "leafExtra"),
+            "rust_inbound_frontier": ("rust", "leaf.rs", "leaf_extra"),
         }
         for scenario, (language, changed_path, marker) in cases.items():
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmpdir:
@@ -26,16 +36,59 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
 
                 self.assertEqual(metadata["language"], language)
                 self.assertEqual(metadata["requested_inbound_dependents"], 7)
-                self.assertEqual(metadata["expected_minimum_affected_files"], 8)
+                resolver_language = "c" if language == "c_header" else language
+                if resolver_language in BENCHMARK.SCOPED_EXACT_FRONTIER_LANGUAGES:
+                    self.assertEqual(metadata["incremental_contract"], "exact_frontier")
+                    self.assertEqual(metadata["expected_minimum_affected_files"], 8)
+                else:
+                    self.assertEqual(metadata["incremental_contract"], "safe_full_rebuild")
+                    self.assertEqual(metadata["expected_publish_kind"], "full")
+                    self.assertEqual(metadata["expected_reason"], "scoped_lsp_gap")
                 self.assertEqual(changed, [changed_path])
                 self.assertIn(marker, (repo / changed_path).read_text(encoding="utf-8"))
                 for index in range(7):
                     self.assertTrue((repo / metadata["dependent_paths"][index]).is_file())
 
+    def test_frontier_catalog_matches_cross_file_resolver_languages(self) -> None:
+        fixture_languages = {
+            "c" if language == "c_header" else language
+            for language in BENCHMARK.MATRIX_FRONTIER_SCENARIOS.values()
+        }
+        self.assertEqual(fixture_languages, set(BENCHMARK.CROSS_FILE_RESOLVER_LANGUAGES))
+
     def test_frontier_fixture_rejects_nonpositive_dependent_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             with self.assertRaisesRegex(ValueError, "frontier files must be positive"):
                 BENCHMARK.create_inbound_frontier_repo(Path(tmpdir), "go", 0)
+
+    def test_frontier_gate_rejects_fixture_that_did_not_expand(self) -> None:
+        metadata = {"expected_minimum_affected_files": 8}
+        incremental = {"response": {"exact_delta": {"affected_paths": 1}}}
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental)
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["expected_minimum_affected_files"], 8)
+        self.assertEqual(gate["observed_affected_files"], 1)
+        self.assertEqual(gate["reason"], "observed frontier is smaller than the fixture contract")
+
+    def test_frontier_gate_is_not_applicable_to_nonfrontier_scenarios(self) -> None:
+        gate = BENCHMARK.frontier_coverage_gate({}, {"response": {}})
+
+        self.assertTrue(gate["passed"])
+        self.assertFalse(gate["applicable"])
+
+    def test_frontier_gate_accepts_declared_scoped_lsp_full_rebuild(self) -> None:
+        metadata = {
+            "expected_publish_kind": "full",
+            "expected_reason": "scoped_lsp_gap",
+        }
+        incremental = {"publish_kind": "full", "exact_reason": "scoped_lsp_gap"}
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental)
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["contract"], "safe_full_rebuild")
 
     def test_minimal_indexing_profile_disables_every_optional_cost_center(self) -> None:
         overrides = BENCHMARK.resolve_config_overrides("minimal_indexing", [])

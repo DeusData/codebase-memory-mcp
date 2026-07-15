@@ -568,6 +568,7 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR "frontier_error"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
+#define CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP "scoped_lsp_gap"
 #define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
 #define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER "c_family_header"
 #define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE "c_family_source"
