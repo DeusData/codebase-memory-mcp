@@ -12,6 +12,31 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_frontier_fixture_counts_dependents_and_mutates_one_definition_file(self) -> None:
+        cases = {
+            "go_inbound_frontier": ("go", "leaf.go", "LeafExtra"),
+            "python_inbound_frontier": ("python", "leaf.py", "leaf_extra"),
+            "c_header_inbound_frontier": ("c_header", "shared.h", "shared_extra"),
+        }
+        for scenario, (language, changed_path, marker) in cases.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmpdir:
+                repo = Path(tmpdir)
+                metadata = BENCHMARK.create_inbound_frontier_repo(repo, language, 7)
+                changed = BENCHMARK.mutate_inbound_frontier_repo(repo, language)
+
+                self.assertEqual(metadata["language"], language)
+                self.assertEqual(metadata["requested_inbound_dependents"], 7)
+                self.assertEqual(metadata["expected_minimum_affected_files"], 8)
+                self.assertEqual(changed, [changed_path])
+                self.assertIn(marker, (repo / changed_path).read_text(encoding="utf-8"))
+                for index in range(7):
+                    self.assertTrue((repo / metadata["dependent_paths"][index]).is_file())
+
+    def test_frontier_fixture_rejects_nonpositive_dependent_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "frontier files must be positive"):
+                BENCHMARK.create_inbound_frontier_repo(Path(tmpdir), "go", 0)
+
     def test_minimal_indexing_profile_disables_every_optional_cost_center(self) -> None:
         overrides = BENCHMARK.resolve_config_overrides("minimal_indexing", [])
         self.assertEqual(
@@ -163,6 +188,18 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             include_logs=False,
         )
         self.assertEqual(result["peak_rss_mb"], 256)
+
+    def test_build_index_result_reads_final_peak_for_sequential_and_incremental_runs(self) -> None:
+        for marker in ("pipeline.done", "incremental.done"):
+            with self.subTest(marker=marker):
+                result = BENCHMARK.build_index_result(
+                    {"publish_kind": "incremental_exact"},
+                    f"level=info msg={marker} elapsed_ms=18 rss_mb=42 peak_mb=64",
+                    stdout_bytes=10,
+                    elapsed_ms=20.0,
+                    include_logs=False,
+                )
+                self.assertEqual(result["peak_rss_mb"], 64)
 
     def test_build_index_result_reads_bounded_worker_log_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

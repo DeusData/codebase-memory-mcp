@@ -33,6 +33,7 @@ DEFAULT_TIMEOUT_SECONDS = 240
 DEFAULT_RANK_REFRESH = "stale_on_exact"
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
+DEFAULT_FRONTIER_FILES = 16
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
 CONFIG_PROFILE_DEFAULT = "default"
 CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
@@ -67,6 +68,11 @@ FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
+MATRIX_FRONTIER_SCENARIOS = {
+    "go_inbound_frontier": "go",
+    "python_inbound_frontier": "python",
+    "c_header_inbound_frontier": "c_header",
+}
 SELF_DOGFOOD_SCENARIOS_DEFAULT = "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
 SELF_DOGFOOD_MARKER_PREFIX = "cbm_pan4_oracle"
 SELF_DOGFOOD_REPO_SUBDIR = "repo"
@@ -172,6 +178,94 @@ def create_route_repo(repo_dir: Path, route_path: str) -> None:
         "def orders():\n"
         "    return {'ok': True}\n",
     )
+
+
+def create_inbound_frontier_repo(
+    repo_dir: Path, language: str, dependent_files: int
+) -> dict[str, Any]:
+    """Create one definition file with a requested number of inbound dependents."""
+    if dependent_files <= 0:
+        raise ValueError("frontier files must be positive")
+    dependent_paths: list[str] = []
+    if language == "go":
+        write_text(repo_dir / "go.mod", "module example.com/cbmfrontier\n\ngo 1.22\n")
+        write_text(repo_dir / "leaf.go", "package frontier\n\nfunc Leaf() int { return 1 }\n")
+        for index in range(dependent_files):
+            relative = f"caller_{index:04d}.go"
+            write_text(
+                repo_dir / relative,
+                "package frontier\n\n"
+                f"func Caller{index:04d}() int {{ return Leaf() + {index} }}\n",
+            )
+            dependent_paths.append(relative)
+        changed_path = "leaf.go"
+    elif language == "python":
+        write_text(repo_dir / "leaf.py", "def leaf():\n    return 1\n")
+        for index in range(dependent_files):
+            relative = f"caller_{index:04d}.py"
+            write_text(
+                repo_dir / relative,
+                "from leaf import leaf\n\n"
+                f"def caller_{index:04d}():\n    return leaf() + {index}\n",
+            )
+            dependent_paths.append(relative)
+        changed_path = "leaf.py"
+    elif language == "c_header":
+        write_text(
+            repo_dir / "shared.h",
+            "#ifndef SHARED_H\n"
+            "#define SHARED_H\n"
+            "static int shared_value(void) { return 1; }\n"
+            "#endif\n",
+        )
+        for index in range(dependent_files):
+            relative = f"consumer_{index:04d}.c"
+            write_text(
+                repo_dir / relative,
+                '#include "shared.h"\n\n'
+                f"int consumer_{index:04d}(void) {{ return shared_value() + {index}; }}\n",
+            )
+            dependent_paths.append(relative)
+        changed_path = "shared.h"
+    else:
+        raise ValueError(f"unsupported frontier language: {language}")
+    return {
+        "source": "synthetic_inbound_frontier",
+        "language": language,
+        "changed_path": changed_path,
+        "requested_inbound_dependents": dependent_files,
+        "expected_minimum_affected_files": dependent_files + 1,
+        "dependent_paths": dependent_paths,
+    }
+
+
+def mutate_inbound_frontier_repo(repo_dir: Path, language: str) -> list[str]:
+    if language == "go":
+        changed_path = "leaf.go"
+        content = (
+            "package frontier\n\n"
+            "func Leaf() int { return 2 }\n\n"
+            "func LeafExtra() int { return Leaf() + 1 }\n"
+        )
+    elif language == "python":
+        changed_path = "leaf.py"
+        content = (
+            "def leaf():\n    return 2\n\n"
+            "def leaf_extra():\n    return leaf() + 1\n"
+        )
+    elif language == "c_header":
+        changed_path = "shared.h"
+        content = (
+            "#ifndef SHARED_H\n"
+            "#define SHARED_H\n"
+            "static int shared_value(void) { return 2; }\n"
+            "static int shared_extra(void) { return shared_value() + 1; }\n"
+            "#endif\n"
+        )
+    else:
+        raise ValueError(f"unsupported frontier language: {language}")
+    write_text(repo_dir / changed_path, content)
+    return [changed_path]
 
 
 def command_result(
@@ -704,9 +798,14 @@ def build_index_result(
     )
     freshness = response_freshness(data)
     freshness_state = response_freshness_state(data)
+    peak_candidates = [
+        parse_log_max_int_field(measurement_text, marker, "peak_mb")
+        for marker in ("mem.phase", LOG_MARKER_PIPELINE_DONE, LOG_MARKER_INCREMENTAL_DONE)
+    ]
+    peak_rss_mb = max((value for value in peak_candidates if value is not None), default=None)
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
-        "peak_rss_mb": parse_log_max_int_field(measurement_text, "mem.phase", "peak_mb"),
+        "peak_rss_mb": peak_rss_mb,
         "measurement_log_markers": measurement_log_markers,
         "indexed_work_elapsed_ms": indexed_ms,
         "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
@@ -1319,6 +1418,9 @@ def prepare_matrix_scenario(
     args: argparse.Namespace,
     case_root: Path,
 ) -> dict[str, Any]:
+    frontier_language = MATRIX_FRONTIER_SCENARIOS.get(name)
+    if frontier_language:
+        return create_inbound_frontier_repo(repo_dir, frontier_language, args.frontier_files)
     if name in {
         "go_modify_1",
         "go_modify_2",
@@ -1341,6 +1443,9 @@ def prepare_matrix_scenario(
 
 
 def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> list[str]:
+    frontier_language = MATRIX_FRONTIER_SCENARIOS.get(name)
+    if frontier_language:
+        return mutate_inbound_frontier_repo(repo_dir, frontier_language)
     if name == "go_modify_1":
         return modify_existing_files(repo_dir, 1, funcs_per_file)
     if name == "go_modify_2":
@@ -1888,6 +1993,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
         "parameters": {
             "files": args.files,
             "functions_per_file": args.functions_per_file,
+            "frontier_files": args.frontier_files,
             "rank_refresh": args.rank_refresh,
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
@@ -2132,6 +2238,15 @@ def parse_args() -> argparse.Namespace:
         "--matrix-scenarios",
         default=MATRIX_SCENARIOS_DEFAULT,
         help="Comma-separated matrix scenarios to run.",
+    )
+    parser.add_argument(
+        "--frontier-files",
+        type=int,
+        default=DEFAULT_FRONTIER_FILES,
+        help=(
+            "Number of inbound-dependent source files created by each *_inbound_frontier "
+            "matrix scenario. The changed definition file is additional."
+        ),
     )
     parser.add_argument(
         "--fastapi-repo",
