@@ -68,6 +68,17 @@ def config_label(reports: list[dict[str, Any]]) -> str:
     return " / ".join(sorted(labels))
 
 
+def config_signature(reports: list[dict[str, Any]]) -> tuple[tuple[str, str], ...] | None:
+    signatures: set[tuple[tuple[str, str], ...]] = set()
+    for report in reports:
+        parameters = report.get("parameters")
+        overrides = parameters.get("config_overrides", {}) if isinstance(parameters, dict) else {}
+        if not isinstance(overrides, dict):
+            return None
+        signatures.add(tuple(sorted((str(key), str(value)) for key, value in overrides.items())))
+    return next(iter(signatures)) if len(signatures) == 1 else None
+
+
 def quality_oracle_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     details: list[dict[str, Any]] = []
     for case_index, case in enumerate(cases, start=1):
@@ -393,6 +404,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
         "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
         "capabilities": config_label(reports),
+        "capability_signature": config_signature(reports),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
         "incremental_work_p50_ms": percentile(incremental_work_ms, 0.50),
         "incremental_peak_p50_mb": percentile(incremental_peak_rss, 0.50),
@@ -412,6 +424,47 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "pareto": "unclassified",
         "pareto_reason": "not evaluated",
     }
+
+
+def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest_by_signature = {
+        row.get("capability_signature"): row
+        for row in rows
+        if str(row.get("candidate", "")).startswith("latest-")
+        and row.get("capability_signature") is not None
+    }
+    comparisons: list[dict[str, Any]] = []
+    for baseline in rows:
+        if str(baseline.get("candidate", "")).startswith("latest-"):
+            continue
+        latest = latest_by_signature.get(baseline.get("capability_signature"))
+        if latest is None:
+            continue
+
+        def speedup(metric: str) -> float | None:
+            old = baseline.get(metric)
+            new = latest.get(metric)
+            return (
+                old / new
+                if isinstance(old, (int, float))
+                and isinstance(new, (int, float))
+                and new > 0
+                else None
+            )
+
+        comparisons.append(
+            {
+                "latest": latest["candidate"],
+                "baseline": baseline["candidate"],
+                "incremental_speedup": speedup("incremental_p50_ms"),
+                "full_speedup": speedup("full_p50_ms"),
+                "query_speedup": speedup("query_latency_p50_ms"),
+                "latest_quality": latest.get("overall_quality_score"),
+                "baseline_quality": baseline.get("overall_quality_score"),
+                "baseline_decision": baseline.get("decision"),
+            }
+        )
+    return comparisons
 
 
 def frontier_crossover_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -609,6 +662,41 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             )
             + " |"
         )
+    comparisons = historical_delta_rows(rows)
+    if comparisons:
+        lines.extend(
+            (
+                "",
+                "## Historical performance deltas",
+                "",
+                "Rows compare only matching capability overrides. Speedup is baseline latency "
+                "divided by latest latency, so values above 1× favor latest.",
+                "",
+                "| Latest | Baseline | Incremental speedup | Fresh rebuild speedup | "
+                "Query speedup | Latest quality | Baseline quality | Baseline gate |",
+                "|---|---|---:|---:|---:|---:|---:|---|",
+            )
+        )
+        for comparison in comparisons:
+            def multiple(value: Any) -> str:
+                return f"{value:.2f}×" if isinstance(value, (int, float)) else "n/a"
+
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        display(comparison["latest"]),
+                        display(comparison["baseline"]),
+                        multiple(comparison["incremental_speedup"]),
+                        multiple(comparison["full_speedup"]),
+                        multiple(comparison["query_speedup"]),
+                        display(comparison["latest_quality"], 3),
+                        display(comparison["baseline_quality"], 3),
+                        display(comparison["baseline_decision"]),
+                    )
+                )
+                + " |"
+            )
     lines.extend(
         (
             "",
