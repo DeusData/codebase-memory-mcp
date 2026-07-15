@@ -128,7 +128,7 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS "incremental_exact_max_changed_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS "incremental_exact_max_affected_paths"
 #define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS "2"
-#define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS "16"
+#define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS "32"
 #define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH "incremental_derived_refresh"
 #define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "eager"
 #define CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT "stale_on_exact"
