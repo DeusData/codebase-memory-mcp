@@ -35,6 +35,7 @@ IDENTITY_FIELDS = (
     "command",
     "cwd",
     "environment",
+    "parameters",
     "timeout_seconds",
     "accepted_exit_codes",
 )
@@ -160,6 +161,194 @@ def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
         identities.add(identity)
         typed_cells.append(value)
     return typed_cells
+
+
+def _string_map(value: Any, field: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict) or not all(
+        isinstance(key, str) and isinstance(item, str) for key, item in value.items()
+    ):
+        raise ValueError(f"{field} must be a string-to-string object")
+    return dict(value)
+
+
+def _nonempty_list(value: Any, field: str) -> list[Any]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{field} must be a non-empty array")
+    return value
+
+
+def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Expand a compact benchmark grid into immutable campaign cells."""
+    if spec.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
+    harness_version = spec.get("harness_version")
+    benchmark_script = spec.get("benchmark_script")
+    cwd = spec.get("cwd")
+    repetitions = spec.get("repetitions")
+    benchmark_timeout = spec.get("timeout_seconds", 240)
+    if not isinstance(harness_version, str) or not harness_version:
+        raise ValueError("harness_version must be a non-empty string")
+    if not isinstance(benchmark_script, str) or not benchmark_script:
+        raise ValueError("benchmark_script must be a non-empty string")
+    if not isinstance(cwd, str) or not cwd:
+        raise ValueError("cwd must be a non-empty string")
+    if not isinstance(repetitions, int) or repetitions <= 0:
+        raise ValueError("repetitions must be a positive integer")
+    if not isinstance(benchmark_timeout, int) or benchmark_timeout <= 0:
+        raise ValueError("timeout_seconds must be a positive integer")
+    cell_timeout = spec.get("cell_timeout_seconds", benchmark_timeout * 4)
+    if not isinstance(cell_timeout, int) or cell_timeout <= 0:
+        raise ValueError("cell_timeout_seconds must be a positive integer")
+    benchmark_path = Path(benchmark_script).expanduser().resolve()
+    if not benchmark_path.is_file():
+        raise ValueError(f"benchmark_script does not exist: {benchmark_path}")
+    benchmark_sha256 = file_sha256(benchmark_path)
+
+    candidates = _nonempty_list(spec.get("candidates"), "candidates")
+    profiles = _nonempty_list(spec.get("profiles"), "profiles")
+    scenarios = _nonempty_list(spec.get("scenarios"), "scenarios")
+    transports = _nonempty_list(spec.get("transports"), "transports")
+    if not all(isinstance(item, str) and item for item in transports):
+        raise ValueError("transports must contain non-empty strings")
+    common_environment = _string_map(spec.get("environment"), "environment")
+
+    cells: list[dict[str, Any]] = []
+    for candidate_index, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            raise ValueError(f"candidates[{candidate_index}] must be an object")
+        candidate_label = candidate.get("label")
+        revision = candidate.get("revision")
+        binary_value = candidate.get("binary")
+        build = candidate.get("build")
+        if not isinstance(candidate_label, str) or not candidate_label or "=" in candidate_label:
+            raise ValueError(f"candidates[{candidate_index}].label is invalid")
+        if not isinstance(revision, str) or len(revision) != 40:
+            raise ValueError(f"candidates[{candidate_index}].revision must be a full commit hash")
+        if not isinstance(binary_value, str) or not binary_value:
+            raise ValueError(f"candidates[{candidate_index}].binary must be a path string")
+        if not isinstance(build, dict):
+            raise ValueError(f"candidates[{candidate_index}].build must be an object")
+        binary = Path(binary_value).expanduser().resolve()
+        if not binary.is_file():
+            raise ValueError(f"candidate binary does not exist: {binary}")
+        binary_sha = file_sha256(binary)
+        declared_sha = candidate.get("binary_sha256")
+        if declared_sha is not None and declared_sha != binary_sha:
+            raise ValueError(
+                f"candidates[{candidate_index}].binary_sha256 does not match {binary}"
+            )
+        candidate_environment = _string_map(
+            candidate.get("environment"), f"candidates[{candidate_index}].environment"
+        )
+
+        for profile_index, profile in enumerate(profiles):
+            if not isinstance(profile, dict):
+                raise ValueError(f"profiles[{profile_index}] must be an object")
+            profile_label = profile.get("label")
+            config_profile = profile.get("config_profile")
+            capabilities = profile.get("capabilities")
+            if not isinstance(profile_label, str) or not profile_label or "=" in profile_label:
+                raise ValueError(f"profiles[{profile_index}].label is invalid")
+            if not isinstance(config_profile, str) or not config_profile:
+                raise ValueError(f"profiles[{profile_index}].config_profile is invalid")
+            if not isinstance(capabilities, dict):
+                raise ValueError(f"profiles[{profile_index}].capabilities must be an object")
+            overrides = _string_map(
+                profile.get("config_overrides"),
+                f"profiles[{profile_index}].config_overrides",
+            )
+            if "incremental_exact_max_affected_paths" in overrides:
+                raise ValueError("exact cap belongs in scenarios[].exact_caps, not profile overrides")
+            profile_environment = _string_map(
+                profile.get("environment"), f"profiles[{profile_index}].environment"
+            )
+
+            for scenario_index, scenario in enumerate(scenarios):
+                if not isinstance(scenario, dict):
+                    raise ValueError(f"scenarios[{scenario_index}] must be an object")
+                scenario_name = scenario.get("name")
+                frontier_values = _nonempty_list(
+                    scenario.get("frontier_files"),
+                    f"scenarios[{scenario_index}].frontier_files",
+                )
+                cap_values = _nonempty_list(
+                    scenario.get("exact_caps"), f"scenarios[{scenario_index}].exact_caps"
+                )
+                if not isinstance(scenario_name, str) or not scenario_name:
+                    raise ValueError(f"scenarios[{scenario_index}].name is invalid")
+                if not all(isinstance(item, int) and item > 0 for item in frontier_values):
+                    raise ValueError("frontier_files must contain positive integers")
+                if not all(isinstance(item, int) and item > 0 for item in cap_values):
+                    raise ValueError("exact_caps must contain positive integers")
+
+                for transport in transports:
+                    for frontier_files in frontier_values:
+                        for exact_cap in cap_values:
+                            effective_capabilities = dict(capabilities)
+                            effective_capabilities.update(overrides)
+                            effective_capabilities["incremental_exact_max_affected_paths"] = str(
+                                exact_cap
+                            )
+                            command = [
+                                str(benchmark_path),
+                                "--binary",
+                                str(binary),
+                                "--matrix",
+                                "--matrix-scenarios",
+                                scenario_name,
+                                "--frontier-files",
+                                str(frontier_files),
+                                "--transport",
+                                transport,
+                                "--config-profile",
+                                config_profile,
+                                "--config",
+                                f"incremental_exact_max_affected_paths={exact_cap}",
+                            ]
+                            for key, value in sorted(overrides.items()):
+                                command.extend(("--config", f"{key}={value}"))
+                            command.extend(("--timeout", str(benchmark_timeout), "--out", "{result_path}"))
+                            parameters = {
+                                "frontier_files": frontier_files,
+                                "exact_cap": exact_cap,
+                                "config_profile": config_profile,
+                                "config_overrides": dict(sorted(overrides.items())),
+                                "benchmark_script_sha256": benchmark_sha256,
+                            }
+                            label = (
+                                f"{candidate_label}.{profile_label}.{transport}.{scenario_name}."
+                                f"f{frontier_files}.cap{exact_cap}"
+                            )
+                            environment = {
+                                **common_environment,
+                                **candidate_environment,
+                                **profile_environment,
+                            }
+                            for repetition in range(1, repetitions + 1):
+                                cell = {
+                                    "label": label,
+                                    "revision": revision,
+                                    "binary_sha256": binary_sha,
+                                    "build": build,
+                                    "capabilities": effective_capabilities,
+                                    "transport": transport,
+                                    "scenario": scenario_name,
+                                    "repetition": repetition,
+                                    "harness_version": harness_version,
+                                    "command": command,
+                                    "cwd": str(Path(cwd).expanduser().resolve()),
+                                    "parameters": parameters,
+                                    "timeout_seconds": cell_timeout,
+                                    "accepted_exit_codes": [0],
+                                }
+                                if environment:
+                                    cell["environment"] = environment
+                                cells.append(cell)
+    plan = {"schema_version": SCHEMA_VERSION, "cells": cells}
+    validate_plan(plan)
+    return plan
 
 
 def ensure_disk_space(root: Path, minimum_free_bytes: int) -> None:
@@ -532,7 +721,13 @@ def write_manifest(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--plan", required=True, type=Path)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--plan", type=Path, help="Fully expanded immutable campaign plan.")
+    source.add_argument(
+        "--matrix-spec",
+        type=Path,
+        help="Compact deterministic grid expanded and archived before execution.",
+    )
     parser.add_argument("--campaign-root", required=True, type=Path)
     parser.add_argument("--minimum-free-gb", type=float, default=2.0)
     parser.add_argument("--stale-lock-hours", type=float, default=6.0)
@@ -544,19 +739,35 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    plan = read_json_object(args.plan)
-    cells = validate_plan(plan)
     campaign_root = args.campaign_root.expanduser().resolve()
     minimum_free_bytes = max(0, int(args.minimum_free_gb * 1024**3))
     stale_lock_seconds = max(1, int(args.stale_lock_hours * 3600))
     ensure_disk_space(campaign_root, minimum_free_bytes)
-    archived_plan = campaign_root / "plans" / f"{file_sha256(args.plan)}.json"
-    if not archived_plan.exists():
-        atomic_write_bytes(archived_plan, args.plan.read_bytes())
+    if args.matrix_spec:
+        spec_path = args.matrix_spec.expanduser().resolve()
+        spec = read_json_object(spec_path)
+        plan = expand_matrix_spec(spec)
+        plan["matrix_spec_sha256"] = file_sha256(spec_path)
+        archived_spec = campaign_root / "specs" / f"{file_sha256(spec_path)}.json"
+        if not archived_spec.exists():
+            atomic_write_bytes(archived_spec, spec_path.read_bytes())
+        plan_payload = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        plan_digest = hashlib.sha256(plan_payload).hexdigest()
+        plan_path = campaign_root / "plans" / f"{plan_digest}.json"
+        if not plan_path.exists():
+            atomic_write_bytes(plan_path, plan_payload)
+    else:
+        plan_path = args.plan.expanduser().resolve()
+        plan = read_json_object(plan_path)
+        archived_plan = campaign_root / "plans" / f"{file_sha256(plan_path)}.json"
+        if not archived_plan.exists():
+            atomic_write_bytes(archived_plan, plan_path.read_bytes())
+        plan_path = archived_plan
+    cells = validate_plan(plan)
     snapshot_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + ".json"
     atomic_write_json(
         campaign_root / "environments" / snapshot_name,
-        environment_snapshot(args.plan),
+        environment_snapshot(plan_path),
     )
 
     failures = 0
@@ -579,7 +790,7 @@ def main() -> int:
             else campaign_root / "reports" / "summary.md"
         )
         report_metadata = generate_report(campaign_root, cells, report_path)
-    manifest_path = write_manifest(campaign_root, args.plan, cells, report_metadata)
+    manifest_path = write_manifest(campaign_root, plan_path, cells, report_metadata)
     print(json.dumps({"manifest": str(manifest_path), "audit": audit}, indent=2, sort_keys=True))
     return 1 if failures or audit["counts"]["missing"] or audit["counts"]["corrupt"] else 0
 

@@ -568,6 +568,7 @@ typedef struct {
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_ERROR "frontier_error"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_REQUIRES_BATCH "frontier_requires_batch"
 #define CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE "frontier_too_large"
+#define CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP "scoped_lsp_gap"
 #define CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL "inbound_edges_require_full"
 #define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER "c_family_header"
 #define CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE "c_family_source"
@@ -578,7 +579,7 @@ typedef struct {
 
 /* Conservative default exact-delta caps. Larger affected sets fall back to the
  * containment path unless config opts into a benchmarked frontier size. */
-enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_4 };
+enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_32 };
 /* Default changed-file batch cap. Larger batches need explicit config and
  * same-batch parity coverage for deletes, renames, folders, and derived views. */
 enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS = CBM_SZ_2 };

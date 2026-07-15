@@ -33,7 +33,31 @@ DEFAULT_TIMEOUT_SECONDS = 240
 DEFAULT_RANK_REFRESH = "stale_on_exact"
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
+DEFAULT_FRONTIER_FILES = 16
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
+CONFIG_PROFILE_DEFAULT = "default"
+CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
+CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
+CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
+CONFIG_PROFILES: dict[str, dict[str, str]] = {
+    CONFIG_PROFILE_DEFAULT: {},
+    CONFIG_PROFILE_RANK_DISABLED: {"rank_enabled": "false"},
+    CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: {
+        "githistory_enabled": "false",
+        "httplinks_enabled": "false",
+        "rank_enabled": "false",
+        "semantic_edges_enabled": "false",
+        "similarity_enabled": "false",
+    },
+    CONFIG_PROFILE_MINIMAL_INDEXING: {
+        "auto_index_deps": "false",
+        "githistory_enabled": "false",
+        "httplinks_enabled": "false",
+        "rank_enabled": "false",
+        "semantic_edges_enabled": "false",
+        "similarity_enabled": "false",
+    },
+}
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
@@ -44,6 +68,37 @@ FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
+CROSS_FILE_RESOLVER_LANGUAGES = (
+    "go",
+    "c",
+    "cpp",
+    "cuda",
+    "python",
+    "javascript",
+    "typescript",
+    "tsx",
+    "php",
+    "csharp",
+    "java",
+    "kotlin",
+    "rust",
+)
+SCOPED_EXACT_FRONTIER_LANGUAGES = frozenset({"go", "c", "cpp", "cuda", "python"})
+MATRIX_FRONTIER_SCENARIOS = {
+    "go_inbound_frontier": "go",
+    "python_inbound_frontier": "python",
+    "c_header_inbound_frontier": "c_header",
+    "cpp_inbound_frontier": "cpp",
+    "cuda_inbound_frontier": "cuda",
+    "javascript_inbound_frontier": "javascript",
+    "typescript_inbound_frontier": "typescript",
+    "tsx_inbound_frontier": "tsx",
+    "php_inbound_frontier": "php",
+    "csharp_inbound_frontier": "csharp",
+    "java_inbound_frontier": "java",
+    "kotlin_inbound_frontier": "kotlin",
+    "rust_inbound_frontier": "rust",
+}
 SELF_DOGFOOD_SCENARIOS_DEFAULT = "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
 SELF_DOGFOOD_MARKER_PREFIX = "cbm_pan4_oracle"
 SELF_DOGFOOD_REPO_SUBDIR = "repo"
@@ -149,6 +204,254 @@ def create_route_repo(repo_dir: Path, route_path: str) -> None:
         "def orders():\n"
         "    return {'ok': True}\n",
     )
+
+
+def create_inbound_frontier_repo(
+    repo_dir: Path, language: str, dependent_files: int
+) -> dict[str, Any]:
+    """Create one definition file with a requested number of inbound dependents."""
+    if dependent_files <= 0:
+        raise ValueError("frontier files must be positive")
+    dependent_paths: list[str] = []
+    if language == "go":
+        write_text(repo_dir / "go.mod", "module example.com/cbmfrontier\n\ngo 1.22\n")
+        write_text(repo_dir / "leaf.go", "package frontier\n\nfunc Leaf() int { return 1 }\n")
+        for index in range(dependent_files):
+            relative = f"caller_{index:04d}.go"
+            write_text(
+                repo_dir / relative,
+                "package frontier\n\n"
+                f"func Caller{index:04d}() int {{ return Leaf() + {index} }}\n",
+            )
+            dependent_paths.append(relative)
+        changed_path = "leaf.go"
+    elif language == "python":
+        write_text(repo_dir / "leaf.py", "def leaf():\n    return 1\n")
+        for index in range(dependent_files):
+            relative = f"caller_{index:04d}.py"
+            write_text(
+                repo_dir / relative,
+                "from leaf import leaf\n\n"
+                f"def caller_{index:04d}():\n    return leaf() + {index}\n",
+            )
+            dependent_paths.append(relative)
+        changed_path = "leaf.py"
+    elif language == "c_header":
+        write_text(
+            repo_dir / "shared.h",
+            "#ifndef SHARED_H\n"
+            "#define SHARED_H\n"
+            "static int shared_value(void) { return 1; }\n"
+            "#endif\n",
+        )
+        for index in range(dependent_files):
+            relative = f"consumer_{index:04d}.c"
+            write_text(
+                repo_dir / relative,
+                '#include "shared.h"\n\n'
+                f"int consumer_{index:04d}(void) {{ return shared_value() + {index}; }}\n",
+            )
+            dependent_paths.append(relative)
+        changed_path = "shared.h"
+    elif language in {"cpp", "cuda"}:
+        header_ext, source_ext = ("hpp", "cpp") if language == "cpp" else ("cuh", "cu")
+        changed_path = f"shared.{header_ext}"
+        write_text(repo_dir / changed_path, "inline int shared_value() { return 1; }\n")
+        for index in range(dependent_files):
+            relative = f"consumer_{index:04d}.{source_ext}"
+            write_text(
+                repo_dir / relative,
+                f'#include "{changed_path}"\n\n'
+                f"int consumer_{index:04d}() {{ return shared_value() + {index}; }}\n",
+            )
+            dependent_paths.append(relative)
+    elif language in {"javascript", "typescript", "tsx"}:
+        extension = {"javascript": "js", "typescript": "ts", "tsx": "tsx"}[language]
+        changed_path = f"leaf.{extension}"
+        return_type = "" if language == "javascript" else ": number"
+        write_text(repo_dir / changed_path, f"export function leaf(){return_type} {{ return 1; }}\n")
+        for index in range(dependent_files):
+            relative = f"caller_{index:04d}.{extension}"
+            import_suffix = ".js" if language == "javascript" else ""
+            write_text(
+                repo_dir / relative,
+                f"import {{ leaf }} from './leaf{import_suffix}';\n\n"
+                f"export function caller{index:04d}(){return_type} "
+                f"{{ return leaf() + {index}; }}\n",
+            )
+            dependent_paths.append(relative)
+    elif language == "php":
+        changed_path = "Leaf.php"
+        write_text(
+            repo_dir / changed_path,
+            "<?php\nnamespace Frontier;\nfunction leaf_value(): int { return 1; }\n",
+        )
+        for index in range(dependent_files):
+            relative = f"Caller{index:04d}.php"
+            write_text(
+                repo_dir / relative,
+                "<?php\nnamespace Frontier;\nrequire_once __DIR__ . '/Leaf.php';\n"
+                f"function caller_{index:04d}(): int {{ return leaf_value() + {index}; }}\n",
+            )
+            dependent_paths.append(relative)
+    elif language == "csharp":
+        changed_path = "Leaf.cs"
+        write_text(
+            repo_dir / changed_path,
+            "namespace Frontier { public static class LeafApi { "
+            "public static int Value() { return 1; } } }\n",
+        )
+        for index in range(dependent_files):
+            relative = f"Caller{index:04d}.cs"
+            write_text(
+                repo_dir / relative,
+                "namespace Frontier { "
+                f"public class Caller{index:04d} {{ public int Call() "
+                f"{{ return LeafApi.Value() + {index}; }} }} }}\n",
+            )
+            dependent_paths.append(relative)
+    elif language == "java":
+        changed_path = "Leaf.java"
+        write_text(
+            repo_dir / changed_path,
+            "package frontier;\npublic class Leaf { public static int value() { return 1; } }\n",
+        )
+        for index in range(dependent_files):
+            relative = f"Caller{index:04d}.java"
+            write_text(
+                repo_dir / relative,
+                "package frontier;\n"
+                f"class Caller{index:04d} {{ int call() {{ return Leaf.value() + {index}; }} }}\n",
+            )
+            dependent_paths.append(relative)
+    elif language == "kotlin":
+        changed_path = "Leaf.kt"
+        write_text(repo_dir / changed_path, "package frontier\n\nfun leafValue(): Int = 1\n")
+        for index in range(dependent_files):
+            relative = f"Caller{index:04d}.kt"
+            write_text(
+                repo_dir / relative,
+                f"package frontier\n\nfun caller{index:04d}(): Int = leafValue() + {index}\n",
+            )
+            dependent_paths.append(relative)
+    elif language == "rust":
+        changed_path = "leaf.rs"
+        write_text(repo_dir / "Cargo.toml", "[package]\nname='cbm-frontier'\nversion='0.1.0'\n")
+        write_text(repo_dir / changed_path, "pub fn leaf_value() -> i32 { 1 }\n")
+        modules = ["mod leaf;"]
+        for index in range(dependent_files):
+            module = f"caller_{index:04d}"
+            relative = f"{module}.rs"
+            modules.append(f"mod {module};")
+            write_text(
+                repo_dir / relative,
+                "use crate::leaf::leaf_value;\n"
+                f"pub fn caller_{index:04d}() -> i32 {{ leaf_value() + {index} }}\n",
+            )
+            dependent_paths.append(relative)
+        write_text(repo_dir / "lib.rs", "\n".join(modules) + "\n")
+    else:
+        raise ValueError(f"unsupported frontier language: {language}")
+    resolver_language = "c" if language == "c_header" else language
+    metadata = {
+        "source": "synthetic_inbound_frontier",
+        "language": language,
+        "cross_file_resolver_language": resolver_language,
+        "changed_path": changed_path,
+        "requested_inbound_dependents": dependent_files,
+        "dependent_paths": dependent_paths,
+    }
+    if resolver_language in SCOPED_EXACT_FRONTIER_LANGUAGES:
+        metadata.update(
+            {
+                "incremental_contract": "exact_frontier",
+                "expected_minimum_affected_files": dependent_files + 1,
+            }
+        )
+    else:
+        metadata.update(
+            {
+                "incremental_contract": "safe_full_rebuild",
+                "expected_publish_kind": PUBLISH_FULL,
+                "expected_reason": "scoped_lsp_gap",
+            }
+        )
+    return metadata
+
+
+def mutate_inbound_frontier_repo(repo_dir: Path, language: str) -> list[str]:
+    if language == "go":
+        changed_path = "leaf.go"
+        content = (
+            "package frontier\n\n"
+            "func Leaf() int { return 2 }\n\n"
+            "func LeafExtra() int { return Leaf() + 1 }\n"
+        )
+    elif language == "python":
+        changed_path = "leaf.py"
+        content = (
+            "def leaf():\n    return 2\n\n"
+            "def leaf_extra():\n    return leaf() + 1\n"
+        )
+    elif language == "c_header":
+        changed_path = "shared.h"
+        content = (
+            "#ifndef SHARED_H\n"
+            "#define SHARED_H\n"
+            "static int shared_value(void) { return 2; }\n"
+            "static int shared_extra(void) { return shared_value() + 1; }\n"
+            "#endif\n"
+        )
+    elif language in {"cpp", "cuda"}:
+        header_ext = "hpp" if language == "cpp" else "cuh"
+        changed_path = f"shared.{header_ext}"
+        content = (
+            "inline int shared_value() { return 2; }\n"
+            "inline int shared_extra() { return shared_value() + 1; }\n"
+        )
+    elif language in {"javascript", "typescript", "tsx"}:
+        extension = {"javascript": "js", "typescript": "ts", "tsx": "tsx"}[language]
+        changed_path = f"leaf.{extension}"
+        return_type = "" if language == "javascript" else ": number"
+        content = (
+            f"export function leaf(){return_type} {{ return 2; }}\n"
+            f"export function leafExtra(){return_type} {{ return leaf() + 1; }}\n"
+        )
+    elif language == "php":
+        changed_path = "Leaf.php"
+        content = (
+            "<?php\nnamespace Frontier;\nfunction leaf_value(): int { return 2; }\n"
+            "function leaf_extra(): int { return leaf_value() + 1; }\n"
+        )
+    elif language == "csharp":
+        changed_path = "Leaf.cs"
+        content = (
+            "namespace Frontier { public static class LeafApi { "
+            "public static int Value() { return 2; } "
+            "public static int Extra() { return Value() + 1; } } }\n"
+        )
+    elif language == "java":
+        changed_path = "Leaf.java"
+        content = (
+            "package frontier;\npublic class Leaf { public static int value() { return 2; } "
+            "public static int extra() { return value() + 1; } }\n"
+        )
+    elif language == "kotlin":
+        changed_path = "Leaf.kt"
+        content = (
+            "package frontier\n\nfun leafValue(): Int = 2\n"
+            "fun leafExtra(): Int = leafValue() + 1\n"
+        )
+    elif language == "rust":
+        changed_path = "leaf.rs"
+        content = (
+            "pub fn leaf_value() -> i32 { 2 }\n"
+            "pub fn leaf_extra() -> i32 { leaf_value() + 1 }\n"
+        )
+    else:
+        raise ValueError(f"unsupported frontier language: {language}")
+    write_text(repo_dir / changed_path, content)
+    return [changed_path]
 
 
 def command_result(
@@ -617,6 +920,15 @@ def parse_config_overrides(items: list[str]) -> dict[str, str]:
     return overrides
 
 
+def resolve_config_overrides(profile: str, items: list[str]) -> dict[str, str]:
+    """Return one explicit benchmark profile plus higher-priority per-key overrides."""
+    if profile not in CONFIG_PROFILES:
+        raise ValueError(f"unknown config profile: {profile}")
+    overrides = dict(CONFIG_PROFILES[profile])
+    overrides.update(parse_config_overrides(items))
+    return overrides
+
+
 def apply_config_overrides(
     binary: Path, env: dict[str, str], overrides: dict[str, str], timeout: int
 ) -> None:
@@ -672,9 +984,14 @@ def build_index_result(
     )
     freshness = response_freshness(data)
     freshness_state = response_freshness_state(data)
+    peak_candidates = [
+        parse_log_max_int_field(measurement_text, marker, "peak_mb")
+        for marker in ("mem.phase", LOG_MARKER_PIPELINE_DONE, LOG_MARKER_INCREMENTAL_DONE)
+    ]
+    peak_rss_mb = max((value for value in peak_candidates if value is not None), default=None)
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
-        "peak_rss_mb": parse_log_max_int_field(measurement_text, "mem.phase", "peak_mb"),
+        "peak_rss_mb": peak_rss_mb,
         "measurement_log_markers": measurement_log_markers,
         "indexed_work_elapsed_ms": indexed_ms,
         "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
@@ -1268,6 +1585,75 @@ def graph_gate_for_publish_kind(
     }
 
 
+def frontier_coverage_gate(
+    scenario_metadata: dict[str, Any],
+    incremental: dict[str, Any],
+    exact_cap: int | None = None,
+) -> dict[str, Any]:
+    expected_publish_kind = scenario_metadata.get("expected_publish_kind")
+    expected_reason = scenario_metadata.get("expected_reason")
+    if isinstance(expected_publish_kind, str) and isinstance(expected_reason, str):
+        observed_publish_kind = incremental.get("publish_kind")
+        observed_reason = incremental.get("exact_reason")
+        passed = observed_publish_kind == expected_publish_kind and observed_reason == expected_reason
+        result = {
+            "passed": passed,
+            "applicable": True,
+            "contract": "safe_full_rebuild",
+            "expected_publish_kind": expected_publish_kind,
+            "observed_publish_kind": observed_publish_kind,
+            "expected_reason": expected_reason,
+            "observed_reason": observed_reason,
+        }
+        if not passed:
+            result["reason"] = "observed fallback route does not match the fixture contract"
+        return result
+    expected = scenario_metadata.get("expected_minimum_affected_files")
+    if not isinstance(expected, int):
+        return {"passed": True, "applicable": False}
+    exact_delta = incremental.get("response", {}).get("exact_delta", {})
+    observed = exact_delta.get("affected_paths")
+    if not isinstance(observed, int):
+        observed = incremental.get("exact_route_detail", {}).get("frontier_expanded_files")
+    if isinstance(exact_cap, int) and exact_cap < expected:
+        observed_publish_kind = incremental.get("publish_kind")
+        observed_reason = incremental.get("exact_reason")
+        truncated = exact_delta.get("affected_paths_truncated") is True
+        passed = (
+            observed_publish_kind in {PUBLISH_FULL, PUBLISH_INCREMENTAL_CONTAINMENT}
+            and observed_reason == "frontier_too_large"
+            and truncated
+        )
+        result = {
+            "passed": passed,
+            "applicable": True,
+            "contract": "configured_cap_fallback",
+            "configured_exact_cap": exact_cap,
+            "expected_minimum_affected_files": expected,
+            "observed_affected_files": observed,
+            "observed_publish_kind": observed_publish_kind,
+            "observed_reason": observed_reason,
+            "affected_paths_truncated": truncated,
+        }
+        if not passed:
+            result["reason"] = (
+                "configured cap fallback requires containment/full publication, "
+                "frontier_too_large, and truncation evidence"
+            )
+        return result
+    passed = isinstance(observed, int) and observed >= expected
+    result = {
+        "passed": passed,
+        "applicable": True,
+        "contract": "exact_frontier",
+        "expected_minimum_affected_files": expected,
+        "observed_affected_files": observed,
+    }
+    if not passed:
+        result["reason"] = "observed frontier is smaller than the fixture contract"
+    return result
+
+
 def build_env(cache_dir: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = str(cache_dir)
@@ -1287,6 +1673,9 @@ def prepare_matrix_scenario(
     args: argparse.Namespace,
     case_root: Path,
 ) -> dict[str, Any]:
+    frontier_language = MATRIX_FRONTIER_SCENARIOS.get(name)
+    if frontier_language:
+        return create_inbound_frontier_repo(repo_dir, frontier_language, args.frontier_files)
     if name in {
         "go_modify_1",
         "go_modify_2",
@@ -1309,6 +1698,9 @@ def prepare_matrix_scenario(
 
 
 def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> list[str]:
+    frontier_language = MATRIX_FRONTIER_SCENARIOS.get(name)
+    if frontier_language:
+        return mutate_inbound_frontier_repo(repo_dir, frontier_language)
     if name == "go_modify_1":
         return modify_existing_files(repo_dir, 1, funcs_per_file)
     if name == "go_modify_2":
@@ -1817,8 +2209,14 @@ def run_matrix_case(
     graph_gate = graph_gate_for_publish_kind(
         canonical, str(publish_kind or ""), active_overlay=active_overlay
     )
+    configured_cap = args.config_overrides.get("incremental_exact_max_affected_paths")
+    try:
+        exact_cap = int(configured_cap) if configured_cap is not None else None
+    except ValueError:
+        exact_cap = None
+    frontier_gate = frontier_coverage_gate(scenario_metadata, incremental, exact_cap=exact_cap)
     explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
-    passed = bool(graph_gate.get("passed")) and explicit_route
+    passed = bool(graph_gate.get("passed")) and bool(frontier_gate.get("passed")) and explicit_route
     speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
     return {
         "scenario": scenario,
@@ -1832,6 +2230,7 @@ def run_matrix_case(
         "canonical_graph": canonical,
         "active_overlay_graph": active_overlay,
         "graph_gate": graph_gate,
+        "frontier_coverage_gate": frontier_gate,
         "explicit_exact_or_fallback": explicit_route,
         "explicit_incremental_route": explicit_route,
         "exact_reason": incremental_reason,
@@ -1856,7 +2255,9 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
         "parameters": {
             "files": args.files,
             "functions_per_file": args.functions_per_file,
+            "frontier_files": args.frontier_files,
             "rank_refresh": args.rank_refresh,
+            "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
@@ -2016,6 +2417,7 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         "mode": "self_dogfood",
         "parameters": {
             "rank_refresh": args.rank_refresh,
+            "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
@@ -2069,6 +2471,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_RANK_REFRESH,
     )
     parser.add_argument(
+        "--config-profile",
+        choices=tuple(CONFIG_PROFILES),
+        default=CONFIG_PROFILE_DEFAULT,
+        help=(
+            "Named, auditable capability profile. minimal_indexing disables dependency "
+            "indexing plus every optional graph/rank pass; repeated --config KEY=VALUE "
+            "arguments take priority over the profile."
+        ),
+    )
+    parser.add_argument(
         "--config",
         action="append",
         default=[],
@@ -2088,6 +2500,15 @@ def parse_args() -> argparse.Namespace:
         "--matrix-scenarios",
         default=MATRIX_SCENARIOS_DEFAULT,
         help="Comma-separated matrix scenarios to run.",
+    )
+    parser.add_argument(
+        "--frontier-files",
+        type=int,
+        default=DEFAULT_FRONTIER_FILES,
+        help=(
+            "Number of inbound-dependent source files created by each *_inbound_frontier "
+            "matrix scenario. The changed definition file is additional."
+        ),
     )
     parser.add_argument(
         "--fastapi-repo",
@@ -2133,7 +2554,7 @@ def parse_args() -> argparse.Namespace:
         help="Existing MCP tool used by --overhead-probes.",
     )
     args = parser.parse_args()
-    args.config_overrides = parse_config_overrides(args.config)
+    args.config_overrides = resolve_config_overrides(args.config_profile, args.config)
     return args
 
 
@@ -2182,6 +2603,7 @@ def main() -> int:
             "changed_files": args.changed_files,
             "min_speedup": args.min_speedup,
             "rank_refresh": args.rank_refresh,
+            "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,

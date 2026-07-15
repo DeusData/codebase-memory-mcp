@@ -63,22 +63,31 @@ still requires a parseable result whose `binary_metadata.sha256` matches the pla
 Crashes, timeouts, other exit codes, missing results, and mismatched binaries remain
 failed attempts and never receive `complete.json`.
 
-Capability ablations use repeated `--config KEY=VALUE` command arguments. The
-default configuration uses no overrides. The PageRank/LinkRank ablation is:
+Capability ablations should use the named `--config-profile` values so an important
+cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
+remain available and take priority over the selected profile. The default profile
+uses no overrides. The PageRank/LinkRank ablation is:
 
 ```text
---config rank_enabled=false
+--config-profile rank_disabled
 ```
 
-The full optional-indexing ablation is:
+The optional graph-pass ablation keeps dependency indexing enabled and is:
 
 ```text
---config rank_enabled=false
---config similarity_enabled=false
---config semantic_edges_enabled=false
---config githistory_enabled=false
---config httplinks_enabled=false
+--config-profile optional_graph_disabled
 ```
+
+The lowest-cost indexing baseline also disables installed-package indexing and is:
+
+```text
+--config-profile minimal_indexing
+```
+
+`minimal_indexing` expands to `auto_index_deps=false`, `rank_enabled=false`,
+`similarity_enabled=false`, `semantic_edges_enabled=false`,
+`githistory_enabled=false`, and `httplinks_enabled=false`. Reports retain both the
+profile name and the fully expanded `config_overrides` map for auditability.
 
 Only apply gates a candidate revision actually supports. Record unsupported
 combinations as compatibility findings rather than silently treating them as the
