@@ -168,8 +168,7 @@ static int mkc_edge(const MKC_File *files, int nfiles, const char *edge_type, in
         mkc_diag(store, lp.project, label);
     } else if (!is_green) {
         fprintf(stderr,
-                "  [MKC] %s UNEXPECTED PASS %s=%d "
-                "(bug may be fixed — promote to GREEN)\n",
+                "  [MKC] %s CAPABILITY PRESENT (baseline expected absent) %s=%d\n",
                 label, edge_type, got);
     }
     mkc_cleanup(&lp, store);

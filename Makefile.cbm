@@ -638,6 +638,13 @@ TS_RUNTIME_OBJ_TSAN = $(BUILD_DIR)/tsan_ts_runtime.o
 LSP_OBJ_TSAN = $(BUILD_DIR)/tsan_lsp_all.o
 PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
+# Grammar wrappers include generated parser/scanner C files. Compiler-generated
+# dependency files keep incremental builds correct after grammar refreshes and
+# branch/worktree switches. The v1 stamp forces pre-depfile objects to rebuild
+# once; subsequent builds invalidate only the grammar whose included files moved.
+GRAMMAR_DEP_STAMP = $(BUILD_DIR)/.grammar-deps-v1
+GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
+
 # ── Targets ──────────────────────────────────────────────────────
 
 .PHONY: test test-repro test-foundation test-tsan test-leak test-analyze \
@@ -660,8 +667,11 @@ test-foundation: $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
-$(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
+$(GRAMMAR_DEP_STAMP): | $(BUILD_DIR)
+	@touch $@
+
+$(GRAMMAR_OBJS_TEST): $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
@@ -672,8 +682,8 @@ $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
-$(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+$(GRAMMAR_OBJS_TSAN): $(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(BUILD_DIR)/tsan_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
@@ -760,13 +770,14 @@ endif
 NOSAN_DIR            = $(BUILD_DIR)/nosan
 GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
 GRAMMAR_OBJS_NOSAN   = $(patsubst $(CBM_DIR)/%.c,$(NOSAN_DIR)/%.o,$(GRAMMAR_SRCS))
+GRAMMAR_DEPFILES += $(addsuffix .d,$(GRAMMAR_OBJS_NOSAN))
 
 $(NOSAN_DIR):
 	mkdir -p $(NOSAN_DIR)
 
 # Grammar C files (tree-sitter parsers) — recompiled without ASan/UBSan
-$(NOSAN_DIR)/%.o: $(CBM_DIR)/%.c | $(NOSAN_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
+$(GRAMMAR_OBJS_NOSAN): $(NOSAN_DIR)/%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(NOSAN_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(NOSAN_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
@@ -955,9 +966,12 @@ GRAMMAR_OBJS_PROD = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/prod_%.o,$(GRAMMAR_SR
 TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
+GRAMMAR_DEPFILES += $(addsuffix .d,$(GRAMMAR_OBJS_PROD))
 
-$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+-include $(GRAMMAR_DEPFILES)
+
+$(GRAMMAR_OBJS_PROD): $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<

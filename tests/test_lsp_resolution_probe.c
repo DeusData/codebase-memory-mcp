@@ -218,9 +218,9 @@ static int lrp_assert_calls(const LRP_File *files, int nfiles, int min_calls,
                 scenario, got, min_calls, expect_green ? "(GREEN regression)" : "(RED reproduction)");
         lrp_diag(store, lp.project, scenario);
     } else if (!expect_green) {
-        /* Unexpectedly passing — the lsp_cross wiring may have been added. */
-        fprintf(stderr, "  [LRP] %s UNEXPECTED PASS calls=%d "
-                "(lsp_cross may now be wired — promote to GREEN)\n", scenario, got);
+        fprintf(stderr,
+                "  [LRP] %s CAPABILITY PRESENT (baseline expected absent) calls=%d\n",
+                scenario, got);
     }
     lrp_cleanup(&lp, store);
     return got >= min_calls;
