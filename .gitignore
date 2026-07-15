@@ -56,6 +56,7 @@ reference/
 
 # Local-only scratch / session notes (never pushed)
 private/
+notes/
 
 # Build artifacts
 build/
