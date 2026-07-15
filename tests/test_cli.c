@@ -9408,6 +9408,53 @@ TEST(cli_config_persists) {
     PASS();
 }
 
+TEST(cli_config_watcher_enabled_default_and_persist) {
+    /* #335: the background watcher is on by default and can be disabled via the
+     * persisted `watcher_enabled` key. cbm_config_watcher_enabled() is the seam
+     * main() gates watcher-thread startup on, so asserting it here proves the
+     * watcher is NOT initialized when disabled — without spinning up the real
+     * server (main() is not linked into the test binary). */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* A NULL config (store failed to open) defaults to ON — a config failure
+     * must never silently disable the watcher. */
+    ASSERT_TRUE(cbm_config_watcher_enabled(NULL));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    /* Default: absent key → watcher runs. */
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+
+    /* Disable: false / 0 / off all turn the watcher off. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "false");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "0");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "off");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+
+    /* Re-enable: true / 1 / on all turn it back on. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "on");
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "1");
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+
+    /* Persistence: the disabled state survives close + reopen. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "false");
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -9915,13 +9962,14 @@ SUITE(cli) {
     /* Skill directive descriptions (1 test — group E) */
     RUN_TEST(cli_skill_descriptions_directive);
 
-    /* Config store (6 tests — group F) */
+    /* Config store (7 tests — group F) */
     RUN_TEST(cli_config_open_close);
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
+    RUN_TEST(cli_config_watcher_enabled_default_and_persist);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32
