@@ -2065,10 +2065,10 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         cbm_pipeline_incremental_derived_refresh_stale_on_exact(p);
     if (unsupported_scoped_exact_gap) {
         cbm_pipeline_set_exact_delta_stats_with_limit(
-            p, input_path_count, input_path_count, -1, max_affected_paths, true);
-        cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
-        cbm_log_info("incremental.exact.skip", "reason", "scoped_lsp_gap", "action",
-                     "full_reindex");
+            p, input_path_count, input_path_count, -1, max_affected_paths, false);
+        cbm_pipeline_set_publish_reason(p, CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP);
+        cbm_log_info("incremental.exact.skip", "reason",
+                     CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP, "action", "full_reindex");
         return CBM_STORE_OK;
     }
     if (deleted_count < 0 || changed_count > max_changed_paths ||
@@ -2900,12 +2900,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return CBM_NOT_FOUND;
     }
     if (strcmp(exact_reason ? exact_reason : "",
-               CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE) == 0 &&
+               CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP) == 0 &&
         incr_changed_has_scoped_overlay_gap(changed_files, ci)) {
         incr_classification_free(&cls);
         cbm_store_close(store);
-        cbm_log_info("incremental.fallback", "reason", "scoped_lsp_gap", "exact_reason",
-                     CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE);
+        cbm_log_info("incremental.fallback", "reason",
+                     CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP, "exact_reason",
+                     CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP);
         return CBM_NOT_FOUND;
     }
 
