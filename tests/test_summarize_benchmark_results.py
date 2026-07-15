@@ -314,6 +314,31 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("end-to-end", markdown)
         self.assertIn("isolates indexing work", markdown)
 
+    def test_markdown_computes_latest_speedups_for_matching_capabilities(self) -> None:
+        def measured_case(incremental_ms: int, full_ms: int, query_ms: int) -> dict:
+            return {
+                "passed": True,
+                "canonical_graph": {"equal": True},
+                "oracles": {
+                    "quality": {"passed": True, "passed_count": 1, "applicable_count": 1},
+                    "probe": {
+                        "elapsed_ms": query_ms,
+                        "response_token_estimate": 10,
+                    },
+                },
+                "incremental": {"elapsed_ms": incremental_ms, "peak_rss_mb": 100},
+                "fresh_fast_full_after_change": {"elapsed_ms": full_ms},
+            }
+
+        rows = [
+            SUMMARY.summarize_group("baseline-rank-off", [report(measured_case(20, 100, 8))]),
+            SUMMARY.summarize_group("latest-rank-off", [report(measured_case(10, 50, 4))]),
+        ]
+        markdown = SUMMARY.render_markdown(rows)
+
+        self.assertIn("## Historical performance deltas", markdown)
+        self.assertIn("| latest-rank-off | baseline-rank-off | 2.00× | 2.00× | 2.00× |", markdown)
+
     def test_failed_quality_is_not_pareto_eligible(self) -> None:
         case = {
             "passed": False,
