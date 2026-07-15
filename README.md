@@ -34,7 +34,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
 - **156 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
+- **One command across supported agents** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, OpenClaw, Kiro, and Junie, then adds only the MCP entries, owned instruction blocks, skills, and hooks each client supports.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **15 MCP tools** (classic mode; a streamlined subset is the default) — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
@@ -390,21 +390,25 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob graph augment, non-blocking) |
 | Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | SessionStart reminder |
 | Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) + SessionStart reminder |
+| Qwen Code | `.qwen/settings.json` | `.qwen/QWEN.md` | — |
+| ForgeCode | `forge/.mcp.json` | `forge/AGENTS.md` | — |
 | Zed | `settings.json` (JSONC) | — | — |
 | OpenCode | `opencode.json` | `AGENTS.md` | — |
 | Antigravity | `.gemini/config/mcp_config.json` (shared) | `antigravity-cli/AGENTS.md` | SessionStart reminder |
 | Aider | — | `CONVENTIONS.md` | — |
 | KiloCode | `mcp_settings.json` | `~/.kilocode/rules/` | — |
 | VS Code | `Code/User/mcp.json` | — | — |
+| Cursor | `.cursor/mcp.json` | — | — |
+| Windsurf | `.codeium/windsurf/mcp_config.json` | — | — |
 | OpenClaw | `openclaw.json` | — | — |
 | Kiro | `.kiro/settings/mcp.json` | — | — |
+| Junie | `.junie/mcp/mcp.json` | — | — |
 
 **Hooks are structurally non-blocking** (exit code 0, every failure path).
-For Claude Code, the `PreToolUse` hook intercepts `Grep`/`Glob` (never `Read` —
-gating `Read` breaks the read-before-edit invariant) and, when the search
-token matches indexed symbols, injects them as `additionalContext` via
-`search_graph` so the agent gets structured context alongside its normal
-search results. For Codex, Gemini CLI, and Antigravity, a `SessionStart` hook
+For Claude Code, the non-blocking `PreToolUse` augmenter observes `Grep`, `Glob`,
+and `Read`. It injects graph matches for searches and indexing-coverage notes for
+reads as `additionalContext`; it never denies the underlying tool call. For Codex,
+Gemini CLI, and Antigravity, a `SessionStart` hook
 injects a one-line code-discovery reminder as session context (Gemini CLI also
 keeps its `BeforeTool` reminder).
 The installed Claude shim file is named `cbm-code-discovery-gate` for
