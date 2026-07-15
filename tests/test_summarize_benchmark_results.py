@@ -14,7 +14,10 @@ SPEC.loader.exec_module(SUMMARY)
 def report(case: dict, sha: str = "a" * 64) -> dict:
     return {
         "binary_metadata": {"sha256": sha, "size_bytes": 123},
-        "parameters": {"config_overrides": {"rank_enabled": "false"}},
+        "parameters": {
+            "config_profile": "rank_disabled",
+            "config_overrides": {"rank_enabled": "false"},
+        },
         "cleanup": {"requested": True, "removed": True},
         "cases": [case],
     }
@@ -90,7 +93,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("Binary SHA-256", markdown)
         self.assertIn("Correctness and quality findings", markdown)
         self.assertIn("exact default tool-response payload", markdown)
-        self.assertIn("one real-repository mutation case", markdown)
+        self.assertIn("consult Cases and the immutable campaign manifest", markdown)
 
     def test_query_quality_size_latency_and_pareto_frontier(self) -> None:
         compact_case = {
@@ -140,6 +143,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         ]
         SUMMARY.mark_pareto_frontier(rows)
         self.assertEqual(rows[0]["quality_score"], 0.75)
+        self.assertAlmostEqual(rows[0]["overall_quality_score"], 0.75 ** (1 / 3))
+        self.assertEqual(rows[0]["graph_fidelity_score"], 1.0)
+        self.assertEqual(rows[0]["task_success_score"], 1.0)
         self.assertEqual(rows[0]["hit_at_1"], 0.5)
         self.assertEqual(rows[0]["hit_at_5"], 1.0)
         self.assertEqual(rows[0]["query_response_p50_bytes"], 80.0)
@@ -147,6 +153,97 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(rows[0]["query_latency_p50_ms"], 5.0)
         self.assertEqual(rows[0]["pareto"], "frontier")
         self.assertEqual(rows[1]["pareto"], "dominated by compact")
+
+    def test_markdown_names_oracles_and_explains_quality_categories(self) -> None:
+        case = {
+            "scenario": "route_handler",
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "passed": True,
+                "quality": {
+                    "passed": True,
+                    "passed_count": 1,
+                    "applicable_count": 1,
+                    "score": 0.5,
+                    "hit_at_1": 0.0,
+                    "hit_at_5": 1.0,
+                },
+                "route_freshness_probe": {
+                    "elapsed_ms": 3,
+                    "response_bytes": 20,
+                    "response_token_estimate": 5,
+                    "quality": {
+                        "applicable": True,
+                        "passed": True,
+                        "criterion": "new route literal appears in route search",
+                        "expected_substring": "/api/pan4-oracle",
+                        "rank": 2,
+                        "returned_count": 5,
+                        "reciprocal_rank": 0.5,
+                        "hit_at_1": False,
+                        "hit_at_5": True,
+                    },
+                },
+                "not_applicable_probe": {
+                    "quality": {
+                        "applicable": False,
+                        "passed": None,
+                        "criterion": "not applicable to this mutation",
+                    }
+                },
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
+        }
+        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("rank-off", [report(case)])])
+        self.assertIn("Overall quality", markdown)
+        self.assertIn("Retrieval MRR", markdown)
+        self.assertIn("Graph fidelity", markdown)
+        self.assertIn("Task success", markdown)
+        self.assertIn("route_freshness_probe", markdown)
+        self.assertIn("new route literal appears in route search", markdown)
+        self.assertIn("PASS (rank 2 of 5)", markdown)
+        self.assertIn("N/A", markdown)
+        self.assertIn("geometric mean", markdown)
+        self.assertIn("trec.nist.gov", markdown)
+        self.assertIn("rank_disabled", markdown)
+
+    def test_partial_probe_success_remains_visible_beside_hard_rejection(self) -> None:
+        case = {
+            "passed": False,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "passed": False,
+                "quality": {
+                    "passed": False,
+                    "passed_count": 4,
+                    "applicable_count": 5,
+                    "score": 0.7,
+                    "hit_at_1": 0.6,
+                    "hit_at_5": 0.8,
+                },
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
+        }
+        row = SUMMARY.summarize_group("partial", [report(case)])
+        self.assertEqual(row["decision"], "REJECT: quality/correctness")
+        self.assertEqual(row["task_success_score"], 0.8)
+        self.assertAlmostEqual(row["overall_quality_score"], (0.7 * 1.0 * 0.8) ** (1 / 3))
+        markdown = SUMMARY.render_markdown([row])
+        self.assertIn("0.800", markdown)
+        self.assertIn("4/5 / 1/1 / 0/1", markdown)
+
+    def test_pareto_reason_lists_missing_axes_for_ineligible_row(self) -> None:
+        row = SUMMARY.summarize_group(
+            "incomplete",
+            [report({"passed": True, "canonical_graph": {"equal": True}})],
+        )
+        SUMMARY.mark_pareto_frontier([row])
+        self.assertEqual(row["pareto"], "ineligible")
+        self.assertIn("missing", row["pareto_reason"])
+        self.assertIn("incremental_p50_ms", row["pareto_reason"])
 
     def test_failed_quality_is_not_pareto_eligible(self) -> None:
         case = {
