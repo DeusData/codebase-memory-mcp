@@ -286,6 +286,34 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("2.00×", markdown)
         self.assertIn("fallback faster", markdown)
 
+    def test_markdown_breaks_out_source_mutation_and_reindex_phases(self) -> None:
+        case = {
+            "scenario": "route_handler",
+            "mutation": {
+                "description": "HTTP handler source edit with route literal oracle",
+                "changed_paths": ["src/ui/http_server.c"],
+            },
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "incremental": {
+                "elapsed_ms": 120,
+                "indexed_work_elapsed_ms": 45,
+                "publish_kind": "incremental_exact",
+                "exact_reason": None,
+            },
+            "fresh_fast_full_after_change": {"elapsed_ms": 600},
+            "speedup_full_rebuild_over_incremental": 5.0,
+        }
+        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
+
+        self.assertIn("## Incremental mutation and reindex breakdown", markdown)
+        self.assertIn("HTTP handler source edit with route literal oracle", markdown)
+        self.assertIn("src/ui/http_server.c", markdown)
+        self.assertIn("incremental_exact", markdown)
+        self.assertIn("| 120.0 | 45.0 | 600.0 | 5.00 |", markdown)
+        self.assertIn("end-to-end", markdown)
+        self.assertIn("isolates indexing work", markdown)
+
     def test_failed_quality_is_not_pareto_eligible(self) -> None:
         case = {
             "passed": False,

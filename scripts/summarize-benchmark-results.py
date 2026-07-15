@@ -152,6 +152,85 @@ def correctness_findings(cases: list[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(findings))
 
 
+def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Aggregate repeated measurements without hiding the mutated source or publish route."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for case_index, case in enumerate(cases, start=1):
+        scenario = str(case.get("scenario") or f"case {case_index}")
+        group = grouped.setdefault(
+            scenario,
+            {
+                "descriptions": set(),
+                "changed_paths": set(),
+                "routes": set(),
+                "reasons": set(),
+                "incremental_ms": [],
+                "work_ms": [],
+                "full_ms": [],
+                "speedups": [],
+                "canonical": [],
+            },
+        )
+        mutation = case.get("mutation")
+        if isinstance(mutation, dict):
+            description = mutation.get("description")
+            if isinstance(description, str) and description:
+                group["descriptions"].add(description)
+            changed_paths = mutation.get("changed_paths")
+            if isinstance(changed_paths, list):
+                group["changed_paths"].update(
+                    str(path) for path in changed_paths if isinstance(path, str) and path
+                )
+        incremental = case.get("incremental")
+        if isinstance(incremental, dict):
+            if isinstance(incremental.get("elapsed_ms"), (int, float)):
+                group["incremental_ms"].append(float(incremental["elapsed_ms"]))
+            if isinstance(incremental.get("indexed_work_elapsed_ms"), (int, float)):
+                group["work_ms"].append(float(incremental["indexed_work_elapsed_ms"]))
+            route = incremental.get("publish_kind")
+            if isinstance(route, str) and route:
+                group["routes"].add(route)
+            reason = incremental.get("exact_reason")
+            if isinstance(reason, str) and reason:
+                group["reasons"].add(reason)
+        full = case.get("fresh_fast_full_after_change")
+        if isinstance(full, dict) and isinstance(full.get("elapsed_ms"), (int, float)):
+            group["full_ms"].append(float(full["elapsed_ms"]))
+        speedup = case.get("speedup_full_rebuild_over_incremental")
+        if isinstance(speedup, (int, float)):
+            group["speedups"].append(float(speedup))
+        canonical = case.get("canonical_graph")
+        if isinstance(canonical, dict) and isinstance(canonical.get("equal"), bool):
+            group["canonical"].append(canonical["equal"])
+
+    details: list[dict[str, Any]] = []
+    for scenario, group in grouped.items():
+        routes = sorted(group["routes"])
+        reasons = sorted(group["reasons"])
+        route = ", ".join(routes) if routes else "not reported"
+        if reasons:
+            route += " (" + ", ".join(reasons) + ")"
+        canonical = group["canonical"]
+        details.append(
+            {
+                "scenario": scenario,
+                "mutation": "; ".join(sorted(group["descriptions"])) or "not reported",
+                "changed_paths": ", ".join(sorted(group["changed_paths"])) or "not reported",
+                "publication": route,
+                "incremental_p50_ms": percentile(group["incremental_ms"], 0.50),
+                "work_p50_ms": percentile(group["work_ms"], 0.50),
+                "full_p50_ms": percentile(group["full_ms"], 0.50),
+                "speedup_p50": (
+                    float(statistics.median(group["speedups"]))
+                    if group["speedups"]
+                    else None
+                ),
+                "canonical": ratio(sum(canonical), len(canonical)),
+            }
+        )
+    return details
+
+
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
     canonical = [
@@ -325,6 +404,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": correctness_findings(cases),
         "quality_details": quality_oracle_details(cases),
+        "mutation_details": mutation_reindex_details(cases),
         "scenario": next(iter(scenarios)) if len(scenarios) == 1 else None,
         "frontier_files": next(iter(frontier_files)) if len(frontier_files) == 1 else None,
         "exact_cap": next(iter(exact_caps)) if len(exact_caps) == 1 else None,
@@ -529,6 +609,46 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             )
             + " |"
         )
+    lines.extend(
+        (
+            "",
+            "## Incremental mutation and reindex breakdown",
+            "",
+            "| Candidate | Scenario | Source mutation | Changed paths | Publication route/reason | "
+            "Incremental p50 ms | Indexing work p50 ms | Fresh rebuild p50 ms | "
+            "Fresh / incremental | Canonical equality |",
+            "|---|---|---|---|---|---:|---:|---:|---:|---:|",
+        )
+    )
+    for row in rows:
+        for detail in row["mutation_details"]:
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        display(row["candidate"]),
+                        display(detail["scenario"]),
+                        display(detail["mutation"]),
+                        display(detail["changed_paths"]),
+                        display(detail["publication"]),
+                        display(detail["incremental_p50_ms"]),
+                        display(detail["work_p50_ms"]),
+                        display(detail["full_p50_ms"]),
+                        display(detail["speedup_p50"], 2),
+                        display(detail["canonical"]),
+                    )
+                )
+                + " |"
+            )
+    lines.extend(
+        (
+            "",
+            "Incremental p50 is the end-to-end response time after applying the named source "
+            "mutation. Indexing work p50 isolates indexing work reported inside that response. "
+            "Fresh rebuild p50 indexes a separate copy of the same post-mutation tree; canonical "
+            "equality compares the incremental graph with that fresh reference graph.",
+        )
+    )
     crossovers = frontier_crossover_rows(rows)
     if crossovers:
         lines.extend(
