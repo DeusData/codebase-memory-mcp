@@ -3174,8 +3174,9 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Indexing",
      "Max changed plus inbound-dependent source files exact delta may reparse",
      "1-100000",
-     "Default is conservative. Raise only with canonical-graph benchmarks for your workload; larger "
-     "frontiers can approach full-rebuild cost."},
+     "Default 16 keeps small cross-file C/C++ edit frontiers on the canonical exact path. Lower for "
+     "tighter latency/memory bounds or raise only with canonical-graph benchmarks for your workload; "
+     "larger frontiers can approach full-rebuild cost."},
     {CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
      CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT,
      NULL,
