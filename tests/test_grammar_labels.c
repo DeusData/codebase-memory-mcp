@@ -345,7 +345,7 @@ TEST(grammar_code_extracts_defs) {
             failures++;
         }
     }
-    fprintf(stderr, "  [CODE-DEFS] %d code/IDL grammars: %d under-extraction FAILURES\n",
+    fprintf(stderr, "  [CODE-DEFS] %d code/IDL grammars checked; observed gaps=%d\n",
             (int)(sizeof(MUST_EXTRACT_DEFS) / sizeof(MUST_EXTRACT_DEFS[0])) - 1, failures);
     ASSERT_EQ(failures, 0);
     PASS();

@@ -860,8 +860,8 @@ TEST(contract_calls_breadth) {
         }
     }
     fprintf(stderr,
-            "  [CALLS-BREADTH] %d langs: %d FAILURES (each = a language that does not "
-            "resolve a same-file CALLS edge)\n",
+            "  [CALLS-BREADTH] %d languages checked; observed gaps=%d "
+            "(gap = no same-file CALLS edge)\n",
             n, failures);
     ASSERT_EQ(failures, 0);
     PASS();

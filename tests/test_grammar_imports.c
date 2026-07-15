@@ -140,8 +140,8 @@ TEST(grammar_imports_extracted) {
             failures++;
         }
     }
-    fprintf(stderr, "  [IMPORTS] %d import-capable grammars: %d FAILURES (each = a grammar whose "
-                    "imports are not extracted)\n",
+    fprintf(stderr, "  [IMPORTS] %d import-capable grammars checked; observed gaps=%d "
+                    "(gap = imports not extracted)\n",
             n, failures);
     ASSERT_EQ(failures, 0);
     PASS();
