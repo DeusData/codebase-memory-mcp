@@ -33,6 +33,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/profile.h"
+#include "foundation/mem.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -63,6 +64,19 @@ static const char *itoa_buf_incr(int v) {
     idx = (idx + SKIP_ONE) & INCR_RING_MASK;
     snprintf(buf[idx], sizeof(buf[idx]), "%d", v);
     return buf[idx];
+}
+
+static void log_incremental_done(struct timespec start) {
+    enum { INCR_BYTES_PER_MB = 1024 * 1024 };
+    if (cbm_profile_active) {
+        cbm_log_info("incremental.done", "elapsed_ms",
+                     itoa_buf_incr((int)elapsed_ms_incr(start)), "rss_mb",
+                     itoa_buf_incr((int)(cbm_mem_rss() / INCR_BYTES_PER_MB)), "peak_mb",
+                     itoa_buf_incr((int)(cbm_mem_peak_rss() / INCR_BYTES_PER_MB)));
+    } else {
+        cbm_log_info("incremental.done", "elapsed_ms",
+                     itoa_buf_incr((int)elapsed_ms_incr(start)));
+    }
 }
 
 static void free_mode_skipped(cbm_file_hash_t *ms, int count);
@@ -2814,7 +2828,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         incr_classification_free(&cls);
         cbm_store_close(store);
-        cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+        log_incremental_done(t0);
         return 0;
     }
 
@@ -2831,7 +2845,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         incr_classification_free(&cls);
         cbm_store_close(store);
-        cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+        log_incremental_done(t0);
         return 0;
     }
 
@@ -2853,7 +2867,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         }
         incr_classification_free(&cls);
         cbm_store_close(store);
-        cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+        log_incremental_done(t0);
         return 0;
     }
     const char *exact_reason = cbm_pipeline_publish_reason(p);
@@ -3172,6 +3186,6 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return persist_rc;
     }
 
-    cbm_log_info("incremental.done", "elapsed_ms", itoa_buf_incr((int)elapsed_ms_incr(t0)));
+    log_incremental_done(t0);
     return 0;
 }
