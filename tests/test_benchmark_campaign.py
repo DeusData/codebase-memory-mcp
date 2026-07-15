@@ -41,10 +41,103 @@ class BenchmarkCampaignTest(unittest.TestCase):
             ("scenario", "matrix"),
             ("repetition", 2),
             ("environment", {"CBM_TEST_SEED": "2"}),
+            ("parameters", {"frontier_files": 64, "exact_cap": 128}),
         ):
             variant = dict(base)
             variant[key] = changed
             self.assertNotEqual(base_id, CAMPAIGN.cell_identity(variant), key)
+
+    def test_matrix_spec_expands_structured_frontier_cap_and_repetition_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            binary = root / "cbm"
+            binary.write_bytes(b"optimized-binary")
+            benchmark = root / "benchmark-incremental-speed.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "frontier-v2",
+                "benchmark_script": str(benchmark),
+                "cwd": str(root),
+                "timeout_seconds": 300,
+                "repetitions": 2,
+                "transports": ["cli"],
+                "candidates": [
+                    {
+                        "label": "latest",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "build": {"target": "cbm", "cflags": "-O2"},
+                    }
+                ],
+                "profiles": [
+                    {
+                        "label": "minimal",
+                        "config_profile": "minimal_indexing",
+                        "capabilities": {"rank_enabled": "false"},
+                        "config_overrides": {"auto_index_deps": "false"},
+                    }
+                ],
+                "scenarios": [
+                    {
+                        "name": "go_inbound_frontier",
+                        "frontier_files": [4, 16],
+                        "exact_caps": [4, 64],
+                    }
+                ],
+            }
+
+            plan = CAMPAIGN.expand_matrix_spec(spec)
+
+            self.assertEqual(plan["schema_version"], 1)
+            self.assertEqual(len(plan["cells"]), 8)
+            self.assertEqual(len({CAMPAIGN.cell_identity(item) for item in plan["cells"]}), 8)
+            first = plan["cells"][0]
+            self.assertEqual(first["binary_sha256"], CAMPAIGN.file_sha256(binary))
+            self.assertEqual(first["parameters"]["frontier_files"], 4)
+            self.assertEqual(first["parameters"]["exact_cap"], 4)
+            self.assertEqual(
+                first["parameters"]["benchmark_script_sha256"], CAMPAIGN.file_sha256(benchmark)
+            )
+            self.assertIn("--frontier-files", first["command"])
+            self.assertIn("incremental_exact_max_affected_paths=4", first["command"])
+
+    def test_matrix_spec_rejects_candidate_sha_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            binary = Path(tmpdir) / "cbm"
+            binary.write_bytes(b"binary")
+            benchmark = Path(tmpdir) / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "frontier-v2",
+                "benchmark_script": str(benchmark),
+                "cwd": tmpdir,
+                "repetitions": 1,
+                "transports": ["cli"],
+                "candidates": [
+                    {
+                        "label": "latest",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "binary_sha256": "0" * 64,
+                        "build": {"target": "cbm", "cflags": "-O2"},
+                    }
+                ],
+                "profiles": [
+                    {
+                        "label": "minimal",
+                        "config_profile": "minimal_indexing",
+                        "capabilities": {},
+                    }
+                ],
+                "scenarios": [
+                    {"name": "go_inbound_frontier", "frontier_files": [4], "exact_caps": [8]}
+                ],
+            }
+
+            with self.assertRaisesRegex(ValueError, "binary_sha256 does not match"):
+                CAMPAIGN.expand_matrix_spec(spec)
 
     def test_successful_cell_resumes_without_second_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
