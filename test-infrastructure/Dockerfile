@@ -1,7 +1,7 @@
 # Mirrors the Ubuntu CI environment exactly:
 #   - Ubuntu 24.04 (same as GitHub Actions ubuntu-latest / ubuntu-24.04-arm)
 #   - GCC (system default) with ASan + UBSan + LeakSanitizer
-#   - zlib1g-dev (sqlite3 is vendored in this repo)
+#   - libsqlite3-dev + zlib1g-dev (same as CI "Install deps" step)
 #
 # Build:  docker build -t cbm-test test-infrastructure/
 # Run:    docker run --rm -v $(pwd):/src cbm-test
