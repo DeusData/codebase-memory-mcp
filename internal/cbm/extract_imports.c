@@ -963,11 +963,10 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
 }
 
 // --- Kotlin imports ---
-// tree-sitter-kotlin nests imports: source_file -> import_list -> import_header*.
-// parse_generic_imports only scans the DIRECT children of root, and "import" is
-// the keyword token (anon_sym_import), not a statement node — so a generic
-// match on "import" finds nothing.  Descend into import_list (and accept a bare
-// import_header for grammar variants) and reuse the generic path extractors.
+// Kotlin grammar revisions expose imports either directly as named `import`
+// nodes or nested as source_file -> import_list -> import_header*. Accept both
+// layouts while scanning only root children and (when present) one container
+// level, keeping the pass linear in the number of top-level syntax nodes.
 static void extract_one_import_header(CBMExtractCtx *ctx, TSNode header) {
     if (!try_generic_path_fields(ctx, header)) {
         generic_import_from_text(ctx, header);
@@ -983,13 +982,15 @@ static void parse_kotlin_imports(CBMExtractCtx *ctx) {
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         const char *kind = ts_node_type(node);
-        if (strcmp(kind, "import_header") == 0) {
+        if (strcmp(kind, "import") == 0 || strcmp(kind, "import_header") == 0) {
             extract_one_import_header(ctx, node);
         } else if (strcmp(kind, "import_list") == 0) {
             uint32_t nc = ts_node_child_count(node);
             for (uint32_t j = 0; j < nc; j++) {
                 TSNode child = ts_node_child(node, j);
-                if (strcmp(ts_node_type(child), "import_header") == 0) {
+                const char *child_kind = ts_node_type(child);
+                if (strcmp(child_kind, "import") == 0 ||
+                    strcmp(child_kind, "import_header") == 0) {
                     extract_one_import_header(ctx, child);
                 }
             }

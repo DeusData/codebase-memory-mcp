@@ -2215,32 +2215,52 @@ static const char **extract_php_bases(CBMArena *a, TSNode node, const char *sour
     return result;
 }
 
-/* Kotlin: supertypes live in `delegation_specifier` children.  Each holds
- * either a bare `user_type` (interface) or a `constructor_invocation` whose
- * `user_type` is the superclass.  Descend to the `type_identifier`. */
+/* Kotlin: a grammar revision may expose one `delegation_specifier` directly or
+ * wrap all of them in `delegation_specifiers`. Each leaf holds either a bare
+ * `user_type` (interface) or a `constructor_invocation` (superclass). */
+static void collect_kotlin_delegation_specifier(CBMArena *a, TSNode node, const char *source,
+                                                const char **bases, int *count) {
+    if (*count >= MAX_BASES_MINUS_1 ||
+        strcmp(ts_node_type(node), "delegation_specifier") != 0) {
+        return;
+    }
+    TSNode ut = ts_node_named_child(node, 0);
+    if (!ts_node_is_null(ut) && strcmp(ts_node_type(ut), "constructor_invocation") == 0) {
+        ut = ts_node_named_child(ut, 0);
+    }
+    if (ts_node_is_null(ut)) {
+        return;
+    }
+    TSNode ti = ut;
+    if (strcmp(ts_node_type(ut), "user_type") == 0 && ts_node_named_child_count(ut) > 0) {
+        ti = ts_node_named_child(ut, 0);
+    }
+    push_base_text(a, ti, source, bases, MAX_BASES_MINUS_1, count);
+}
+
+static void collect_kotlin_delegations(CBMArena *a, TSNode node, const char *source,
+                                       const char **bases, int *count) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "delegation_specifier") == 0) {
+        collect_kotlin_delegation_specifier(a, node, source, bases, count);
+        return;
+    }
+    if (strcmp(kind, "delegation_specifiers") != 0) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && *count < MAX_BASES_MINUS_1; i++) {
+        collect_kotlin_delegation_specifier(a, ts_node_named_child(node, i), source, bases,
+                                            count);
+    }
+}
+
 static const char **extract_kotlin_bases(CBMArena *a, TSNode node, const char *source) {
     const char *bases[MAX_BASES];
     int count = 0;
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc && count < MAX_BASES_MINUS_1; i++) {
-        TSNode child = ts_node_child(node, i);
-        if (strcmp(ts_node_type(child), "delegation_specifier") != 0) {
-            continue;
-        }
-        /* Find the user_type (directly or under a constructor_invocation). */
-        TSNode ut = ts_node_named_child(child, 0);
-        if (!ts_node_is_null(ut) && strcmp(ts_node_type(ut), "constructor_invocation") == 0) {
-            ut = ts_node_named_child(ut, 0);
-        }
-        if (ts_node_is_null(ut)) {
-            continue;
-        }
-        /* user_type → type_identifier (first child); strip generic args. */
-        TSNode ti = ut;
-        if (strcmp(ts_node_type(ut), "user_type") == 0 && ts_node_named_child_count(ut) > 0) {
-            ti = ts_node_named_child(ut, 0);
-        }
-        push_base_text(a, ti, source, bases, MAX_BASES_MINUS_1, &count);
+        collect_kotlin_delegations(a, ts_node_child(node, i), source, bases, &count);
     }
     if (count == 0) {
         return NULL;
@@ -6195,9 +6215,10 @@ static void extract_lisp_def(CBMExtractCtx *ctx, TSNode node) {
  * delegation class Tree    { inner class Node : BaseNode() { ... } }            // inner +
  * delegation
  *
- * Inside the ERROR node the tokens are still present as a flat child list:
- *   `class`/`object` keyword token → simple_identifier/type_identifier (name)
- *   → optional `:` then one or more `delegation_specifier` siblings (bases).
+ * Depending on the grammar revision, declaration keywords may be flat children
+ * or omitted from the ERROR node while the declaration name remains as a direct
+ * identifier child. In the latter case, validate the source prefix before
+ * recovering the identifier so arbitrary syntax errors do not become classes.
  *
  * Recover each named class/object declaration from that flat sequence and emit a
  * Class definition (with bases) so it is discoverable. Strictly additive and
@@ -6205,26 +6226,244 @@ static void extract_lisp_def(CBMExtractCtx *ctx, TSNode node) {
  * recovering names from it cannot regress a correct parse. Anonymous declarations
  * (e.g. a `companion object` with no name) are skipped — there is nothing to emit.
  */
+static bool kotlin_identifier_kind(const char *kind) {
+    return strcmp(kind, "identifier") == 0 || strcmp(kind, "simple_identifier") == 0 ||
+           strcmp(kind, "type_identifier") == 0;
+}
+
+static bool kotlin_source_ident_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static bool kotlin_source_ident_continue(char c) {
+    return kotlin_source_ident_start(c) || (c >= '0' && c <= '9');
+}
+
+static bool kotlin_result_has_def_name(const CBMFileResult *result, const char *name) {
+    for (int i = 0; i < result->defs.count; i++) {
+        if (result->defs.items[i].name && strcmp(result->defs.items[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end,
+                                const char **bases, int *count) {
+    const char *source = ctx->source;
+    int paren_depth = 0;
+    int angle_depth = 0;
+    uint32_t colon = end;
+    uint32_t header_end = end;
+    for (uint32_t i = start; i < end; i++) {
+        char c = source[i];
+        if (c == '(') {
+            paren_depth++;
+        } else if (c == ')' && paren_depth > 0) {
+            paren_depth--;
+        } else if (c == '<') {
+            angle_depth++;
+        } else if (c == '>' && angle_depth > 0) {
+            angle_depth--;
+        } else if (paren_depth == 0 && angle_depth == 0 && c == ':' && colon == end) {
+            colon = i;
+        } else if (paren_depth == 0 && angle_depth == 0 &&
+                   (c == '{' || c == '=' || c == ';' || c == '}')) {
+            header_end = i;
+            break;
+        }
+    }
+    if (colon >= header_end) {
+        return;
+    }
+
+    uint32_t i = colon + 1;
+    while (i < header_end && *count < MAX_BASES_MINUS_1) {
+        while (i < header_end &&
+               (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' ||
+                source[i] == '\n' || source[i] == ',')) {
+            i++;
+        }
+        if (i >= header_end || !kotlin_source_ident_start(source[i])) {
+            break;
+        }
+        uint32_t name_start = i;
+        while (i < header_end &&
+               (kotlin_source_ident_continue(source[i]) || source[i] == '.')) {
+            i++;
+        }
+        char *base = cbm_arena_strndup(ctx->arena, source + name_start, (size_t)(i - name_start));
+        if (base && base[0] && strcmp(base, "by") != 0) {
+            bases[(*count)++] = base;
+        }
+
+        paren_depth = 0;
+        angle_depth = 0;
+        while (i < header_end) {
+            char c = source[i];
+            if (c == '(') {
+                paren_depth++;
+            } else if (c == ')' && paren_depth > 0) {
+                paren_depth--;
+            } else if (c == '<') {
+                angle_depth++;
+            } else if (c == '>' && angle_depth > 0) {
+                angle_depth--;
+            } else if (c == ',' && paren_depth == 0 && angle_depth == 0) {
+                i++;
+                break;
+            }
+            i++;
+        }
+    }
+}
+
+static void recover_kotlin_error_source(CBMExtractCtx *ctx, TSNode err_node) {
+    const char *source = ctx->source;
+    uint32_t start = ts_node_start_byte(err_node);
+    uint32_t end = ts_node_end_byte(err_node);
+    if (end > (uint32_t)ctx->source_len) {
+        end = (uint32_t)ctx->source_len;
+    }
+    bool line_comment = false;
+    bool block_comment = false;
+    bool string_literal = false;
+    bool char_literal = false;
+    for (uint32_t i = start; i < end;) {
+        char c = source[i];
+        char next = i + 1 < end ? source[i + 1] : '\0';
+        if (line_comment) {
+            line_comment = c != '\n';
+            i++;
+            continue;
+        }
+        if (block_comment) {
+            if (c == '*' && next == '/') {
+                block_comment = false;
+                i += 2;
+            } else {
+                i++;
+            }
+            continue;
+        }
+        if (string_literal || char_literal) {
+            char quote = string_literal ? '"' : '\'';
+            if (c == '\\' && i + 1 < end) {
+                i += 2;
+            } else {
+                if (c == quote) {
+                    string_literal = false;
+                    char_literal = false;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (c == '/' && next == '/') {
+            line_comment = true;
+            i += 2;
+            continue;
+        }
+        if (c == '/' && next == '*') {
+            block_comment = true;
+            i += 2;
+            continue;
+        }
+        if (c == '"' || c == '\'') {
+            string_literal = c == '"';
+            char_literal = c == '\'';
+            i++;
+            continue;
+        }
+        if (!kotlin_source_ident_start(c)) {
+            i++;
+            continue;
+        }
+
+        uint32_t word_start = i++;
+        while (i < end && kotlin_source_ident_continue(source[i])) {
+            i++;
+        }
+        size_t word_len = (size_t)(i - word_start);
+        const char *label = NULL;
+        if (word_len == sizeof("interface") - 1 &&
+            strncmp(source + word_start, "interface", word_len) == 0) {
+            label = "Interface";
+        } else if ((word_len == sizeof("class") - 1 &&
+                    strncmp(source + word_start, "class", word_len) == 0) ||
+                   (word_len == sizeof("object") - 1 &&
+                    strncmp(source + word_start, "object", word_len) == 0)) {
+            label = "Class";
+        }
+        if (!label) {
+            continue;
+        }
+        while (i < end &&
+               (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' ||
+                source[i] == '\n')) {
+            i++;
+        }
+        if (i >= end || !kotlin_source_ident_start(source[i])) {
+            continue;
+        }
+        uint32_t name_start = i++;
+        while (i < end && kotlin_source_ident_continue(source[i])) {
+            i++;
+        }
+        char *name = cbm_arena_strndup(ctx->arena, source + name_start, (size_t)(i - name_start));
+        if (!name || !name[0] || kotlin_result_has_def_name(ctx->result, name)) {
+            continue;
+        }
+
+        const char *bases[MAX_BASES];
+        int base_count = 0;
+        kotlin_source_bases(ctx, i, end, bases, &base_count);
+        CBMDefinition def;
+        memset(&def, 0, sizeof(def));
+        def.name = name;
+        def.qualified_name = ctx->enclosing_class_qn
+                                 ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->enclosing_class_qn,
+                                                     name)
+                                 : cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+        def.label = label;
+        def.file_path = ctx->rel_path;
+        def.start_line = ts_node_start_point(err_node).row + TS_LINE_OFFSET;
+        def.end_line = ts_node_end_point(err_node).row + TS_LINE_OFFSET;
+        def.is_exported = cbm_is_exported(name, ctx->language);
+        if (base_count > 0) {
+            const char **result = (const char **)cbm_arena_alloc(
+                ctx->arena, (size_t)(base_count + NULL_TERM) * sizeof(const char *));
+            if (result) {
+                for (int j = 0; j < base_count; j++) {
+                    result[j] = bases[j];
+                }
+                result[base_count] = NULL;
+                def.base_classes = result;
+            }
+        }
+        cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+    }
+}
+
 static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
     CBMArena *a = ctx->arena;
     uint32_t cc = ts_node_child_count(err_node);
     for (uint32_t i = 0; i < cc; i++) {
-        TSNode kw = ts_node_child(err_node, i);
-        const char *kwt = ts_node_type(kw);
-        /* Anonymous `class` / `object` keyword token starts a declaration. */
-        if (strcmp(kwt, "class") != 0 && strcmp(kwt, "object") != 0) {
+        TSNode keyword = ts_node_child(err_node, i);
+        const char *kind = ts_node_type(keyword);
+        if (strcmp(kind, "class") != 0 && strcmp(kind, "object") != 0 &&
+            strcmp(kind, "interface") != 0) {
             continue;
         }
-        /* The name is the next child, when it is an identifier token. */
         if (i + 1 >= cc) {
             continue;
         }
         TSNode name_node = ts_node_child(err_node, i + 1);
-        const char *nt = ts_node_type(name_node);
-        if (strcmp(nt, "simple_identifier") != 0 && strcmp(nt, "type_identifier") != 0) {
-            /* Anonymous declaration (e.g. `companion object :`) — nothing to emit. */
+        if (!kotlin_identifier_kind(ts_node_type(name_node))) {
             continue;
         }
+        const char *label = strcmp(kind, "interface") == 0 ? "Interface" : "Class";
+        uint32_t base_start = i + 2;
         char *name = cbm_node_text(a, name_node, ctx->source);
         if (!name || !name[0]) {
             continue;
@@ -6241,36 +6480,20 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
          * name (until the class body `{` or the next class/object keyword). */
         const char *bases[MAX_BASES];
         int bcount = 0;
-        for (uint32_t j = i + 2; j < cc && bcount < MAX_BASES_MINUS_1; j++) {
+        for (uint32_t j = base_start; j < cc && bcount < MAX_BASES_MINUS_1; j++) {
             TSNode sib = ts_node_child(err_node, j);
             const char *st = ts_node_type(sib);
             if (strcmp(st, "{") == 0 || strcmp(st, "class") == 0 || strcmp(st, "object") == 0) {
                 break;
             }
-            if (strcmp(st, "delegation_specifier") != 0) {
-                continue;
-            }
-            /* delegation_specifier → user_type (directly or under
-             * constructor_invocation) → type_identifier; strip generic args. */
-            TSNode ut = ts_node_named_child(sib, 0);
-            if (!ts_node_is_null(ut) && strcmp(ts_node_type(ut), "constructor_invocation") == 0) {
-                ut = ts_node_named_child(ut, 0);
-            }
-            if (ts_node_is_null(ut)) {
-                continue;
-            }
-            TSNode ti = ut;
-            if (strcmp(ts_node_type(ut), "user_type") == 0 && ts_node_named_child_count(ut) > 0) {
-                ti = ts_node_named_child(ut, 0);
-            }
-            push_base_text(a, ti, ctx->source, bases, MAX_BASES_MINUS_1, &bcount);
+            collect_kotlin_delegations(a, sib, ctx->source, bases, &bcount);
         }
 
         CBMDefinition def;
         memset(&def, 0, sizeof(def));
         def.name = name;
         def.qualified_name = class_qn;
-        def.label = "Class";
+        def.label = label;
         def.file_path = ctx->rel_path;
         def.start_line = ts_node_start_point(name_node).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(err_node).row + TS_LINE_OFFSET;
@@ -6287,7 +6510,9 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
             }
         }
         cbm_defs_push(&ctx->result->defs, a, def);
+        i++;
     }
+    recover_kotlin_error_source(ctx, err_node);
 }
 
 static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, int depth_unused) {
