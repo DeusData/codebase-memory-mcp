@@ -912,7 +912,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                 for (int d = 0; d < xr->defs.count; d++) {
                     CBMDefinition *def = &xr->defs.items[d];
                     if (def->qualified_name && def->name) {
-                        insert_def_into_gbuf(ws, fi, def);
+                        insert_def_into_gbuf(ws, fi, def, ec->version_tag);
                     }
                 }
                 cbm_free_result(xr);
