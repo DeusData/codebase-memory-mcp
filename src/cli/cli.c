@@ -2910,7 +2910,7 @@ static bool is_project_index_db_name(const char *name) {
     return strcmp(name, "_config.db") != 0;
 }
 
-int cbm_list_indexes(const char *home_dir) {
+static int cbm_list_indexes_bounded(const char *home_dir, int print_limit) {
     const char *cache_dir = get_cache_dir(home_dir);
     if (!cache_dir) {
         return 0;
@@ -2925,12 +2925,21 @@ int cbm_list_indexes(const char *home_dir) {
     cbm_dirent_t *ent;
     while ((ent = cbm_readdir(d)) != NULL) {
         if (is_project_index_db_name(ent->name)) {
-            printf("  %s/%s\n", cache_dir, ent->name);
+            if (print_limit < 0 || count < print_limit) {
+                printf("  %s/%s\n", cache_dir, ent->name);
+            }
             count++;
         }
     }
     cbm_closedir(d);
+    if (print_limit >= 0 && count > print_limit) {
+        printf("  ... and %d more index(es)\n", count - print_limit);
+    }
     return count;
+}
+
+int cbm_list_indexes(const char *home_dir) {
+    return cbm_list_indexes_bounded(home_dir, -1);
 }
 
 int cbm_remove_indexes(const char *home_dir) {
@@ -4594,6 +4603,7 @@ static int count_db_indexes(const char *home) {
  */
 int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run);
 int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_run) {
+    enum { INSTALL_INDEX_SAMPLE_LIMIT = 5 };
     int index_count = count_db_indexes(home);
     if (index_count <= 0) {
         return 1; /* nothing to handle, proceed */
@@ -4604,14 +4614,14 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
         printf("Found %d existing index(es). Keeping them. After install, "
                "re-index to pick up this version's improvements:\n",
                index_count);
-        cbm_list_indexes(home);
+        cbm_list_indexes_bounded(home, INSTALL_INDEX_SAMPLE_LIMIT);
         printf("\n");
         return 1; /* proceed without deleting */
     }
 
     /* Opt-in reset (--reset-indexes): the original prompt-and-delete path. */
     printf("Found %d existing index(es):\n", index_count);
-    cbm_list_indexes(home);
+    cbm_list_indexes_bounded(home, INSTALL_INDEX_SAMPLE_LIMIT);
     printf("\n");
     if (!prompt_yn("Delete these indexes and continue with install?")) {
         printf("Install cancelled.\n");
