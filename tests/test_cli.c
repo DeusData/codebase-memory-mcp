@@ -1321,11 +1321,23 @@ TEST(cli_install_copies_binary_to_target_issue472) {
 
     /* Overwrite an existing (stale) target with new content. */
     write_test_file(dst, "STALE");
+#ifndef _WIN32
+    struct stat stale_st;
+    ASSERT_EQ(stat(dst, &stale_st), 0);
+#endif
     write_test_file(src, "upgraded build bytes");
     rc = cbm_copy_binary_to_target(src, dst);
     ASSERT_EQ(rc, 0);
     data = read_test_file(dst);
     ASSERT_STR_EQ(data, "upgraded build bytes");
+#ifndef _WIN32
+    /* Replacement must publish a completed temporary file with rename(2),
+     * not truncate the installed executable in place. A new inode proves the
+     * old file can remain mapped by a just-stopped MCP process safely. */
+    struct stat upgraded_st;
+    ASSERT_EQ(stat(dst, &upgraded_st), 0);
+    ASSERT_NEQ(stale_st.st_ino, upgraded_st.st_ino);
+#endif
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2116,6 +2128,16 @@ TEST(cli_reference_harnesses_are_planned_without_mutation) {
     ASSERT(strstr(json, "forge/.mcp.json") != NULL);
     ASSERT(strstr(json, "forge/AGENTS.md") != NULL);
     ASSERT(strstr(json, ".codeium/windsurf/mcp_config.json") != NULL);
+    const char *detected = strstr(json, "\"agents_detected\"");
+    const char *configs = strstr(json, "\"config_files_planned\"");
+    ASSERT_NOT_NULL(detected);
+    ASSERT_NOT_NULL(configs);
+    const char *qwen_detected = strstr(detected, "\"qwen\"");
+    const char *forge_detected = strstr(detected, "\"forgecode\"");
+    const char *windsurf_detected = strstr(detected, "\"windsurf\"");
+    ASSERT(qwen_detected != NULL && qwen_detected < configs);
+    ASSERT(forge_detected != NULL && forge_detected < configs);
+    ASSERT(windsurf_detected != NULL && windsurf_detected < configs);
 
     /* Plan mode must not publish any of the planned files. */
     char path[768];

@@ -382,21 +382,42 @@ static bool cbm_same_file(const char *a, const char *b) {
 }
 
 /* Copy the running binary into the canonical install target, preserving the
- * executable bit. When src and dst are the same on-disk file the copy is
- * skipped: cbm_copy_file opens dst "wb" before reading src, so copying a file
- * onto itself would truncate it to zero. Returns 0 on success or skip,
- * CLI_ERR on failure. Exposed (non-static) as the regression surface for the
- * `install --force` binary-swap bug (#472). */
+ * executable bit. Publish through a sibling temporary file so a just-stopped
+ * process may keep the old inode mapped and an interrupted copy cannot leave
+ * the installed command truncated. When src and dst are the same on-disk file
+ * the copy is skipped. Returns 0 on success or skip, CLI_ERR on failure.
+ * Exposed (non-static) as the regression surface for the `install --force`
+ * binary-swap bug (#472). */
 int cbm_copy_binary_to_target(const char *src, const char *dst) {
     if (cbm_same_file(src, dst)) {
         return 0; /* already in place — nothing to copy */
     }
-    if (cbm_copy_file(src, dst) != 0) {
+
+    char tmp_path[CLI_BUF_1K];
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.installing.XXXXXX", dst);
+    if (tmp_len < 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
+        return CLI_ERR;
+    }
+    int tmp_fd = cbm_mkstemp_s(tmp_path, sizeof(tmp_path));
+    if (tmp_fd < 0) {
+        return CLI_ERR;
+    }
+    cbm_close_fd(tmp_fd);
+
+    if (cbm_copy_file(src, tmp_path) != 0) {
+        (void)cbm_unlink(tmp_path);
         return CLI_ERR;
     }
 #ifndef _WIN32
-    (void)chmod(dst, CLI_OCTAL_PERM);
+    if (chmod(tmp_path, CLI_OCTAL_PERM) != 0) {
+        (void)cbm_unlink(tmp_path);
+        return CLI_ERR;
+    }
 #endif
+    if (cbm_replace_file(tmp_path, dst) != 0) {
+        (void)cbm_unlink(tmp_path);
+        return CLI_ERR;
+    }
     return 0;
 }
 
@@ -4696,6 +4717,9 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         {det.openclaw, "openclaw"},
         {det.kiro, "kiro"},
         {det.junie, "junie"},
+        {det.qwen, "qwen"},
+        {det.forgecode, "forgecode"},
+        {det.windsurf, "windsurf"},
     };
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
