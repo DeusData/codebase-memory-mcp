@@ -1306,6 +1306,9 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     snprintf(path, sizeof(path), "%s/.cursor", home_dir);
     agents.cursor = dir_exists(path);
 
+    snprintf(path, sizeof(path), "%s/.codeium/windsurf", home_dir);
+    agents.windsurf = dir_exists(path);
+
     snprintf(path, sizeof(path), "%s/.openclaw", home_dir);
     agents.openclaw = dir_exists(path);
 
@@ -1316,6 +1319,15 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     /* Junie (JetBrains): ~/.junie/ */
     snprintf(path, sizeof(path), "%s/.junie", home_dir);
     agents.junie = dir_exists(path);
+
+    /* Qwen Code and ForgeCode both expose user-level MCP configuration in
+     * their documented config roots. Directory detection avoids mistaking an
+     * unrelated executable named `forge` for ForgeCode. */
+    snprintf(path, sizeof(path), "%s/.qwen", home_dir);
+    agents.qwen = dir_exists(path);
+
+    snprintf(path, sizeof(path), "%s/forge", home_dir);
+    agents.forgecode = dir_exists(path);
 
     return agents;
 }
@@ -4097,9 +4109,12 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->kilocode, "KiloCode"},
         {a->vscode, "VS-Code"},
         {a->cursor, "Cursor"},
+        {a->windsurf, "Windsurf"},
         {a->openclaw, "OpenClaw"},
         {a->kiro, "Kiro"},
         {a->junie, "Junie"},
+        {a->qwen, "Qwen-Code"},
+        {a->forgecode, "ForgeCode"},
     };
     printf("Detected agents:");
     bool any = false;
@@ -4384,6 +4399,22 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             printf("  instructions: %s\n", ip);
         }
     }
+    if (agents->qwen) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.qwen/settings.json", home);
+        snprintf(ip, sizeof(ip), "%s/.qwen/QWEN.md", home);
+        install_generic_agent_config("Qwen Code", binary_path, cp, ip, dry_run,
+                                     cbm_install_editor_mcp);
+    }
+    if (agents->forgecode) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/forge/.mcp.json", home);
+        snprintf(ip, sizeof(ip), "%s/forge/AGENTS.md", home);
+        install_generic_agent_config("ForgeCode", binary_path, cp, ip, dry_run,
+                                     cbm_install_editor_mcp);
+    }
 }
 
 /* Scan Code/User/profiles/ and install (or plan) a per-profile mcp.json for
@@ -4468,6 +4499,12 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         char cp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
         install_generic_agent_config("Cursor", binary_path, cp, NULL, dry_run,
+                                     cbm_install_editor_mcp);
+    }
+    if (agents->windsurf) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.codeium/windsurf/mcp_config.json", home);
+        install_generic_agent_config("Windsurf", binary_path, cp, NULL, dry_run,
                                      cbm_install_editor_mcp);
     }
     if (agents->openclaw) {
@@ -5080,6 +5117,22 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         }
         printf("Aider: removed instructions\n");
     }
+    if (agents->qwen) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.qwen/settings.json", home);
+        snprintf(ip, sizeof(ip), "%s/.qwen/QWEN.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Qwen Code", cp, ip}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
+    if (agents->forgecode) {
+        char cp[CLI_BUF_1K];
+        char ip[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/forge/.mcp.json", home);
+        snprintf(ip, sizeof(ip), "%s/forge/AGENTS.md", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"ForgeCode", cp, ip}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
 }
 
 static void uninstall_vscode_profile_configs(const char *code_user, bool dry_run) {
@@ -5159,6 +5212,12 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         char cp[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.cursor/mcp.json", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Cursor", cp, NULL}, dry_run,
+                                  cbm_remove_editor_mcp);
+    }
+    if (agents->windsurf) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.codeium/windsurf/mcp_config.json", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Windsurf", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp);
     }
     if (agents->openclaw) {

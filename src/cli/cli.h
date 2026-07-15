@@ -153,9 +153,12 @@ typedef struct {
     bool kilocode;    /* KiloCode globalStorage dir exists */
     bool vscode;      /* VS Code User config dir exists */
     bool cursor;      /* ~/.cursor/ exists */
+    bool windsurf;    /* ~/.codeium/windsurf/ exists */
     bool openclaw;    /* ~/.openclaw/ exists */
     bool kiro;        /* ~/.kiro/ exists */
     bool junie;       /* ~/.junie/ exists */
+    bool qwen;        /* ~/.qwen/ exists */
+    bool forgecode;   /* ~/forge/ exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.

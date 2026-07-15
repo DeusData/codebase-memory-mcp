@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents</title>
-    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. Works with 11 agents including Claude Code, Codex CLI, Gemini CLI, Cursor, and Zed.">
+    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. Works across Claude Code, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Cursor, Windsurf, Zed, and other MCP clients.">
     <meta name="keywords" content="MCP server, code intelligence, knowledge graph, tree-sitter, Hybrid LSP, semantic code search, code embeddings, code clone detection, cross-repo analysis, data-flow analysis, Claude Code, Codex CLI, Gemini CLI, Cursor, Zed, code exploration, token reduction, call graph, dead code detection">
     <meta name="author" content="DeusData">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
@@ -157,7 +157,7 @@
           "name": "Which AI coding agents work with codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "A single install command configures 11 agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro. Any MCP-compatible client can use the server."
+            "text": "A single install command configures detected agents including Claude Code, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, OpenClaw, Kiro, and Junie. Any MCP-compatible client can use the server."
           }
         },
         {
@@ -526,9 +526,10 @@
             <span class="cmd">"Index this project"</span>
         </div>
         <p class="muted">
-            One command configures all 11 supported agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,
-            Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — with MCP entries, instruction files, and
-            pre-tool hooks for each. Windows users run <code>install.ps1</code>. Also available via
+            One command configures detected supported agents, including Claude Code, Codex CLI, Gemini CLI,
+            Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,
+            OpenClaw, Kiro, and Junie, using each client's supported MCP, instruction, skill, and hook surfaces.
+            Windows users run <code>install.ps1</code>. Also available via
             <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
         </p>
     </section>

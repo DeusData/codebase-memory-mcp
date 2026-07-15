@@ -2096,6 +2096,103 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     PASS();
 }
 
+TEST(cli_reference_harnesses_are_planned_without_mutation) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-reference-harnesses-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *dirs[] = {".qwen", "forge", ".codeium/windsurf"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
+        ASSERT_EQ(test_mkdirp(path), 0);
+    }
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, ".qwen/settings.json") != NULL);
+    ASSERT(strstr(json, ".qwen/QWEN.md") != NULL);
+    ASSERT(strstr(json, "forge/.mcp.json") != NULL);
+    ASSERT(strstr(json, "forge/AGENTS.md") != NULL);
+    ASSERT(strstr(json, ".codeium/windsurf/mcp_config.json") != NULL);
+
+    /* Plan mode must not publish any of the planned files. */
+    char path[768];
+    struct stat st;
+    snprintf(path, sizeof(path), "%s/.qwen/settings.json", tmpdir);
+    ASSERT_NEQ(stat(path, &st), 0);
+    snprintf(path, sizeof(path), "%s/forge/.mcp.json", tmpdir);
+    ASSERT_NEQ(stat(path, &st), 0);
+    snprintf(path, sizeof(path), "%s/.codeium/windsurf/mcp_config.json", tmpdir);
+    ASSERT_NEQ(stat(path, &st), 0);
+
+    free(json);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_reference_harnesses_uninstall_owned_entries_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-reference-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *dirs[] = {".qwen", "forge", ".codeium/windsurf"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
+        ASSERT_EQ(test_mkdirp(path), 0);
+    }
+
+    const char *config_rel[] = {".qwen/settings.json", "forge/.mcp.json",
+                                ".codeium/windsurf/mcp_config.json"};
+    char config_paths[3][768];
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(config_paths[i], sizeof(config_paths[i]), "%s/%s", tmpdir, config_rel[i]);
+        ASSERT_EQ(write_test_file(
+                      config_paths[i],
+                      "{\"mcpServers\":{\"foreign\":{\"command\":\"keep-me\"}}}"),
+                  0);
+        ASSERT_EQ(cbm_install_editor_mcp("/usr/local/bin/codebase-memory-mcp", config_paths[i]),
+                  0);
+    }
+
+    const char *instruction_rel[] = {".qwen/QWEN.md", "forge/AGENTS.md"};
+    char instruction_paths[2][768];
+    for (size_t i = 0; i < 2; i++) {
+        snprintf(instruction_paths[i], sizeof(instruction_paths[i]), "%s/%s", tmpdir,
+                 instruction_rel[i]);
+        ASSERT_EQ(write_test_file(instruction_paths[i], "user-authored guidance\n"), 0);
+        ASSERT_EQ(cbm_upsert_instructions(instruction_paths[i], cbm_get_agent_instructions()), 0);
+    }
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+
+    for (size_t i = 0; i < 3; i++) {
+        const char *contents = read_test_file(config_paths[i]);
+        ASSERT_NOT_NULL(contents);
+        ASSERT(strstr(contents, "keep-me") != NULL);
+        ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+    }
+    for (size_t i = 0; i < 2; i++) {
+        const char *contents = read_test_file(instruction_paths[i]);
+        ASSERT_NOT_NULL(contents);
+        ASSERT(strstr(contents, "user-authored guidance") != NULL);
+        ASSERT(strstr(contents, "codebase-memory-mcp:start") == NULL);
+    }
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* issue #330: Codex SessionStart reminder hook in config.toml — installed,
  * idempotent, preserves other content, and cleanly removed. */
 TEST(cli_codex_session_hook_issue330) {
@@ -3974,6 +4071,8 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
+    RUN_TEST(cli_reference_harnesses_are_planned_without_mutation);
+    RUN_TEST(cli_reference_harnesses_uninstall_owned_entries_only);
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_codex_mcp_and_hook_upserts_are_idempotent);
     RUN_TEST(cli_codex_hook_strip_repairs_orphan_end_sentinel);
