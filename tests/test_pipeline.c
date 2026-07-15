@@ -11871,6 +11871,7 @@ TEST(incremental_fast_falls_back_for_oversized_inbound_frontier_and_matches_full
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, "1"), 0);
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
