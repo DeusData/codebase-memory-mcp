@@ -489,27 +489,33 @@ static const char skill_content[] =
     "| Text search | `search_code(pattern=\"...\")` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `search_graph(pattern=\"...\")` — auto-indexes the server CWD or explicit repo path when auto_index=true and under auto_index_limit\n"
+    "1. `search_graph(pattern=\"...\")` — auto-indexes the server CWD or explicit repo path when "
+    "auto_index=true and under auto_index_limit\n"
     "2. `get_code(qualified_name=\"project.path.FuncName\")` — read one symbol's source\n"
     "3. `query_graph(query=\"MATCH ...\")` — use Cypher for multi-hop graph questions\n"
-    "4. `_hidden_tools` — reveal classic tools such as list_projects and get_graph_schema if needed\n"
+    "4. `_hidden_tools` — reveal classic tools such as list_projects and get_graph_schema if "
+    "needed\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
-    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace callers and callees\n"
+    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace callers and "
+    "callees\n"
     "3. `detect_changes()` — map git diff to affected symbols\n"
     "\n"
     "## Quality Analysis\n"
     "- Dead code: `search_graph(max_degree=0, exclude_entry_points=true)`\n"
-    "- High fan-out: `query_graph(query=\"MATCH (f)-[:CALLS]->(g) RETURN f.name, count(g) AS out_degree ORDER BY out_degree DESC LIMIT 20\")`\n"
-    "- High fan-in: `query_graph(query=\"MATCH (f)<-[:CALLS]-(g) RETURN f.name, count(g) AS in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
+    "- High fan-out: `query_graph(query=\"MATCH (f)-[:CALLS]->(g) RETURN f.name, count(g) AS "
+    "out_degree ORDER BY out_degree DESC LIMIT 20\")`\n"
+    "- High fan-in: `query_graph(query=\"MATCH (f)<-[:CALLS]-(g) RETURN f.name, count(g) AS "
+    "in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
     "\n"
     "## Default MCP Tools\n"
     "`search_graph`, `query_graph`, `search_code`, `trace_path`, `get_code`\n"
     "\n"
     "Graph-backed default tools (`search_graph`, `query_graph`, `trace_path`, `get_code`)\n"
     "auto-index the server CWD or explicit repo path when auto_index=true and under\n"
-    "auto_index_limit. `search_code` searches source files for an already indexed/current project.\n"
+    "auto_index_limit. `search_code` searches source files for an already indexed/current "
+    "project.\n"
     "\n"
     "Use `_hidden_tools` to reveal advanced tools such as `index_repository`,\n"
     "`get_graph_schema`, `get_architecture`, `detect_changes`, and `index_dependencies`.\n"
@@ -530,10 +536,12 @@ static const char skill_content[] =
     "## Gotchas\n"
     "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
     "use `query_graph` with Cypher to see actual edges.\n"
-    "2. `query_graph` output is capped by query_max_output_bytes; add LIMIT or set max_output_bytes=0.\n"
+    "2. `query_graph` output is capped by query_max_output_bytes; add LIMIT or set "
+    "max_output_bytes=0.\n"
     "3. `trace_path` works best with exact names — use `search_graph(name_pattern=...)` first.\n"
     "4. `direction=\"outbound\"` returns callees only; use `direction=\"both\"` for callers too.\n"
-    "5. Results default to search_limit (50 unless configured); check `has_more` and use `offset`.\n";
+    "5. Results default to search_limit (50 unless configured); check `has_more` and use "
+    "`offset`.\n";
 
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
@@ -541,11 +549,14 @@ static const char codex_instructions_content[] =
     "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
     "Use the MCP tools to explore and understand the code:\n"
     "\n"
-    "- `search_graph` — find functions, classes, routes by pattern; graph-backed tools can auto-index the server CWD or explicit repo path when auto_index=true and under auto_index_limit\n"
+    "- `search_graph` — find functions, classes, routes by pattern; graph-backed tools can "
+    "auto-index the server CWD or explicit repo path when auto_index=true and under "
+    "auto_index_limit\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
     "- `get_code` — read function source code by qualified_name\n"
     "- `query_graph` — run Cypher queries for complex patterns\n"
-    "- `get_architecture` — high-level summary after `_hidden_tools` reveal or `CBM_TOOL_MODE=classic`\n"
+    "- `get_architecture` — high-level summary after `_hidden_tools` reveal or "
+    "`CBM_TOOL_MODE=classic`\n"
     "\n"
     "Prefer graph tools over grep for structural code discovery.\n";
 
@@ -1178,8 +1189,7 @@ static void cbm_claude_config_dir(const char *home_dir, char *out, size_t out_sz
     out[0] = '\0';
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf),
-                                      &env_present)
+    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present)
                           ? env_buf
                           : NULL;
     if (env && env[0]) {
@@ -1200,8 +1210,7 @@ static void cbm_claude_user_root(const char *home_dir, char *out, size_t out_sz)
     out[0] = '\0';
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf),
-                                      &env_present)
+    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present)
                           ? env_buf
                           : NULL;
     if (env && env[0]) {
@@ -1223,8 +1232,7 @@ static bool cbm_resolve_hook_command(const char *script_name, char *out, size_t 
     out[0] = '\0';
     char env_buf[CLI_BUF_1K];
     bool env_present = false;
-    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf),
-                                      &env_present)
+    const char *env = cbm_getenv_fits("CLAUDE_CONFIG_DIR", env_buf, sizeof(env_buf), &env_present)
                           ? env_buf
                           : NULL;
     if (env && env[0]) {
@@ -1325,7 +1333,8 @@ static const char agent_instructions_content[] =
     "2. `trace_path` — trace who calls a function or what it calls\n"
     "3. `get_code` — read specific function/class source code by qualified_name\n"
     "4. `query_graph` — run Cypher queries for complex patterns\n"
-    "5. `get_architecture` — high-level summary after `_hidden_tools` reveal or `CBM_TOOL_MODE=classic`\n"
+    "5. `get_architecture` — high-level summary after `_hidden_tools` reveal or "
+    "`CBM_TOOL_MODE=classic`\n"
     "\n"
     "## When to fall back to grep/glob\n"
     "- Searching for string literals, error messages, config values\n"
@@ -1687,7 +1696,7 @@ int cbm_remove_codex_mcp(const char *config_path) {
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
     "get_code, query_graph, search_code) before broad grep for structural code "    \
     "discovery; graph-backed tools auto-index the MCP server CWD or explicit repo " \
-    "paths when auto_index=true and under "                                        \
+    "paths when auto_index=true and under "                                         \
     "auto_index_limit; search_code needs an indexed project; call _hidden_tools "   \
     "for explicit index_repository.\""
 
@@ -2241,8 +2250,7 @@ void cbm_install_hook_gate_script(const char *home, const char *binary_path) {
 
     cbm_remove_legacy_hook_script(hooks_dir, CMM_HOOK_GATE_SCRIPT_LEGACY);
     char script_path[CLI_BUF_1K];
-    if (!cbm_format_fits(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT,
-                         hooks_dir)) {
+    if (!cbm_format_fits(script_path, sizeof(script_path), "%s/" CMM_HOOK_GATE_SCRIPT, hooks_dir)) {
         return;
     }
 
@@ -2374,10 +2382,12 @@ int cbm_upsert_claude_session_hooks(const char *settings_path) {
     }
     int rc = 0;
     for (int i = 0; i < MATCHER_COUNT; i++) {
-        if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
-                                                    .hook_event = "SessionStart",
-                                                    .matcher_str = matchers[i],
-                                                    .command_str = command}) != 0) {
+        if (upsert_hooks_json(
+                (hooks_upsert_args_t){.settings_path = settings_path,
+                                      .hook_event = "SessionStart",
+                                      .matcher_str = matchers[i],
+                                      .command_str = command,
+                                      .match_command_substr = CMM_SESSION_REMINDER_SCRIPT}) != 0) {
             rc = CLI_ERR;
         }
     }
@@ -2389,9 +2399,11 @@ int cbm_remove_claude_session_hooks(const char *settings_path) {
     enum { MATCHER_COUNT = sizeof(matchers) / sizeof(matchers[0]) };
     int rc = 0;
     for (int i = 0; i < MATCHER_COUNT; i++) {
-        if (remove_hooks_json((hooks_remove_args_t){.settings_path = settings_path,
-                                                    .hook_event = "SessionStart",
-                                                    .matcher_str = matchers[i]}) != 0) {
+        if (remove_hooks_json(
+                (hooks_remove_args_t){.settings_path = settings_path,
+                                      .hook_event = "SessionStart",
+                                      .matcher_str = matchers[i],
+                                      .match_command_substr = CMM_SESSION_REMINDER_SCRIPT}) != 0) {
             rc = CLI_ERR;
         }
     }
@@ -2530,6 +2542,7 @@ int cbm_upsert_gemini_session_hooks(const char *settings_path) {
         .hook_event = "SessionStart",
         .matcher_str = "startup",
         .command_str = CMM_SESSION_REMINDER_CMD,
+        .match_command_substr = "codebase-memory-mcp",
     });
 }
 
@@ -2538,6 +2551,7 @@ int cbm_remove_gemini_session_hooks(const char *settings_path) {
         .settings_path = settings_path,
         .hook_event = "SessionStart",
         .matcher_str = "startup",
+        .match_command_substr = "codebase-memory-mcp",
     });
 }
 
@@ -2936,9 +2950,8 @@ int cbm_remove_indexes(const char *home_dir) {
             if (tmp_len >= 0 && (size_t)tmp_len < sizeof(tmp_path)) {
                 cbm_unlink(tmp_path);
             } else {
-                (void)fprintf(stderr,
-                              "warning: skipping overlong temporary sidecar cleanup for %s\n",
-                              path);
+                (void)fprintf(
+                    stderr, "warning: skipping overlong temporary sidecar cleanup for %s\n", path);
             }
             if (cbm_unlink(path) == 0) {
                 count++;
@@ -3525,7 +3538,8 @@ const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const c
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0 && CBM_CONFIG_REGISTRY[i].env_var) {
             // NOLINTNEXTLINE(concurrency-mt-unsafe)
             const char *env = getenv(CBM_CONFIG_REGISTRY[i].env_var);
-            if (env && env[0]) return env;
+            if (env && env[0])
+                return env;
             break;
         }
     }
@@ -3585,20 +3599,18 @@ int cbm_cmd_config(int argc, char **argv) {
         for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
             const cbm_config_entry_t *e = &CBM_CONFIG_REGISTRY[i];
             if (strcmp(e->category, last_cat) != 0) {
-                if (i > 0) printf("\n");
+                if (i > 0)
+                    printf("\n");
                 printf("  [%s]\n", e->category);
                 last_cat = e->category;
             }
             if (e->env_var) {
-                printf("  %-30s default=%-14s [env: %s]\n",
-                    e->key, e->default_val, e->env_var);
+                printf("  %-30s default=%-14s [env: %s]\n", e->key, e->default_val, e->env_var);
             } else {
-                printf("  %-30s default=%-14s\n",
-                    e->key, e->default_val);
+                printf("  %-30s default=%-14s\n", e->key, e->default_val);
             }
             if (e->range || e->description)
-                printf("      [%-20s]  %s\n",
-                       e->range ? e->range : "any",
+                printf("      [%-20s]  %s\n", e->range ? e->range : "any",
                        e->description ? e->description : "");
             if (e->guidance)
                 printf("      %s\n\n", e->guidance);
@@ -3628,7 +3640,8 @@ int cbm_cmd_config(int argc, char **argv) {
             const cbm_config_entry_t *e = &CBM_CONFIG_REGISTRY[i];
             /* Print category header when it changes */
             if (strcmp(e->category, last_cat) != 0) {
-                if (i > 0) printf("\n");
+                if (i > 0)
+                    printf("\n");
                 printf("[%s]\n", e->category);
                 last_cat = e->category;
             }
@@ -3638,15 +3651,16 @@ int cbm_cmd_config(int argc, char **argv) {
             if (e->env_var) {
                 // NOLINTNEXTLINE(concurrency-mt-unsafe)
                 const char *env = getenv(e->env_var);
-                if (env && env[0]) source = " (env)";
+                if (env && env[0])
+                    source = " (env)";
             }
             /* Check if DB value differs from default */
             const char *db_val = cbm_config_get(cfg, e->key, NULL);
-            if (!source[0] && db_val) source = " (set)";
+            if (!source[0] && db_val)
+                source = " (set)";
             printf("  %-30s = %-14s%s\n", e->key, val, source);
             if (e->range || e->description)
-                printf("      [%-20s]  %s\n",
-                       e->range ? e->range : "any",
+                printf("      [%-20s]  %s\n", e->range ? e->range : "any",
                        e->description ? e->description : "");
             if (e->guidance)
                 printf("      %s\n\n", e->guidance);
@@ -3973,8 +3987,8 @@ static int cbm_stop_instances_for_target(const char *target_path) {
 static int verify_download_checksum(const char *archive_path, const char *archive_name) {
     char checksum_file[CBM_PATH_MAX];
     if (cbm_cli_make_temp_file(checksum_file, sizeof(checksum_file), "cbm-checksums") != 0) {
-        (void)fprintf(stderr,
-                      "warning: could not create temporary checksum file — skipping verification\n");
+        (void)fprintf(
+            stderr, "warning: could not create temporary checksum file — skipping verification\n");
         return CLI_ERR;
     }
 
@@ -3986,9 +4000,10 @@ static int verify_download_checksum(const char *archive_path, const char *archiv
     if (dl_base && dl_base[0]) {
         url_len = snprintf(checksum_url, sizeof(checksum_url), "%s/checksums.txt", dl_base);
     } else {
-        url_len = snprintf(checksum_url, sizeof(checksum_url), "%s",
-                           "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/"
-                           "checksums.txt");
+        url_len =
+            snprintf(checksum_url, sizeof(checksum_url), "%s",
+                     "https://github.com/DeusData/codebase-memory-mcp/releases/latest/download/"
+                     "checksums.txt");
     }
     if (url_len < 0 || (size_t)url_len >= sizeof(checksum_url)) {
         (void)fprintf(stderr, "warning: checksum URL too long — skipping verification\n");
@@ -4171,8 +4186,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
         if (cbm_format_fits(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT)) {
             plan_record("Claude Code", "hook", p);
         }
-        if (cbm_format_fits(p, sizeof(p), "%s/hooks/%s", config_dir,
-                            CMM_SESSION_REMINDER_SCRIPT)) {
+        if (cbm_format_fits(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT)) {
             plan_record("Claude Code", "hook", p);
         }
         if (cbm_format_fits(p, sizeof(p), "%s/hooks/%s", config_dir,
@@ -4798,8 +4812,8 @@ int cbm_cmd_install(int argc, char **argv) {
 
     char bin_target[CLI_BUF_1K];
 #ifdef _WIN32
-    if (!cbm_format_fits(bin_target, sizeof(bin_target),
-                         "%s/.local/bin/codebase-memory-mcp.exe", home)) {
+    if (!cbm_format_fits(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp.exe",
+                         home)) {
         (void)fprintf(stderr, "error: install target path is too long\n");
         return CLI_TRUE;
     }
@@ -4943,8 +4957,36 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
         cbm_remove_claude_hooks(settings_path);
         cbm_remove_claude_session_hooks(settings_path);
         cbm_remove_claude_subagent_hooks(settings_path);
+
+        /* Hook registrations and their executable shims are one owned unit.
+         * Leaving the scripts behind makes uninstall incomplete and can revive
+         * stale behavior if a user later restores an old settings file. */
+        char hooks_dir[CLI_BUF_1K];
+        if (cbm_format_fits(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir)) {
+            const char *const scripts[] = {CMM_HOOK_GATE_SCRIPT, CMM_SESSION_REMINDER_SCRIPT,
+                                           CMM_SUBAGENT_REMINDER_SCRIPT};
+            for (size_t i = 0; i < sizeof(scripts) / sizeof(scripts[0]); i++) {
+                char script_path[CLI_BUF_1K];
+                if (cbm_format_fits(script_path, sizeof(script_path), "%s/%s", hooks_dir,
+                                    scripts[i])) {
+                    cbm_unlink(script_path);
+                }
+            }
+#ifdef _WIN32
+            const char *const legacy_scripts[] = {CMM_HOOK_GATE_SCRIPT_LEGACY,
+                                                  CMM_SESSION_REMINDER_SCRIPT_LEGACY,
+                                                  CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY};
+            for (size_t i = 0; i < sizeof(legacy_scripts) / sizeof(legacy_scripts[0]); i++) {
+                char script_path[CLI_BUF_1K];
+                if (cbm_format_fits(script_path, sizeof(script_path), "%s/%s", hooks_dir,
+                                    legacy_scripts[i])) {
+                    cbm_unlink(script_path);
+                }
+            }
+#endif
+        }
     }
-    printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
+    printf("  removed PreToolUse + SessionStart + SubagentStart hooks and scripts\n");
 }
 
 /* Remove MCP + instructions for a generic agent. */
@@ -4997,6 +5039,13 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                                   cbm_remove_codex_mcp);
         if (!dry_run) {
             cbm_remove_codex_hooks(cp);
+            /* Codex supports hooks.json as an alternative representation. The
+             * installer selects it when present, so uninstall must remove the
+             * owned SessionStart entry there as well while preserving foreign
+             * hooks. Also clean config.toml above for older dual installs. */
+            char hooks_json[CLI_BUF_1K];
+            snprintf(hooks_json, sizeof(hooks_json), "%s/.codex/hooks.json", home);
+            cbm_remove_gemini_session_hooks(hooks_json);
         }
     }
     if (agents->gemini) {
@@ -5033,6 +5082,34 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
     }
 }
 
+static void uninstall_vscode_profile_configs(const char *code_user, bool dry_run) {
+    char profiles_dir[CLI_BUF_1K];
+    snprintf(profiles_dir, sizeof(profiles_dir), "%s/profiles", code_user);
+    cbm_dir_t *d = cbm_opendir(profiles_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0) {
+            continue;
+        }
+        char profile_path[CLI_BUF_1K];
+        snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
+        struct stat st;
+        if (stat(profile_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+            continue;
+        }
+        char config_path[CLI_BUF_1K];
+        snprintf(config_path, sizeof(config_path), "%s/mcp.json", profile_path);
+        if (!dry_run) {
+            cbm_remove_vscode_mcp(config_path);
+        }
+        printf("  removed VS Code profile MCP entry: %s\n", config_path);
+    }
+    cbm_closedir(d);
+}
+
 /* Remove editor agent configs (Zed, KiloCode, VS Code, OpenClaw). */
 static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const char *home,
                                     bool dry_run) {
@@ -5067,13 +5144,16 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
     }
     if (agents->vscode) {
         char cp[CLI_BUF_1K];
+        char code_user[CLI_BUF_1K];
 #ifdef __APPLE__
-        snprintf(cp, sizeof(cp), "%s/Library/Application Support/Code/User/mcp.json", home);
+        snprintf(code_user, sizeof(code_user), "%s/Library/Application Support/Code/User", home);
 #else
-        snprintf(cp, sizeof(cp), "%s/Code/User/mcp.json", cbm_app_config_dir());
+        snprintf(code_user, sizeof(code_user), "%s/Code/User", cbm_app_config_dir());
 #endif
+        snprintf(cp, sizeof(cp), "%s/mcp.json", code_user);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"VS Code", cp, NULL}, dry_run,
                                   cbm_remove_vscode_mcp);
+        uninstall_vscode_profile_configs(code_user, dry_run);
     }
     if (agents->cursor) {
         char cp[CLI_BUF_1K];
@@ -5134,7 +5214,15 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     if (index_count > 0) {
         printf("\nFound %d index(es):\n", index_count);
         cbm_list_indexes(home);
-        if (prompt_yn("Delete these indexes?")) {
+        if (dry_run) {
+            if (g_auto_answer == AUTO_YES) {
+                printf("Dry-run: would remove %d index(es).\n", index_count);
+            } else if (g_auto_answer == AUTO_NO) {
+                printf("Dry-run: would keep indexes.\n");
+            } else {
+                printf("Dry-run: would prompt before deleting indexes.\n");
+            }
+        } else if (prompt_yn("Delete these indexes?")) {
             int idx_removed = cbm_remove_indexes(home);
             printf("Removed %d index(es).\n", idx_removed);
         } else {
@@ -5223,7 +5311,7 @@ static int extract_and_install_binary(extract_install_args_t args) {
 
 /* Build the download URL for the update command. */
 static int build_update_url(char *url, int url_sz, const char *os, const char *arch,
-                             const char *ext, bool want_ui) {
+                            const char *ext, bool want_ui) {
     char base_url_buf[CLI_BUF_512];
     const char *base_url =
         cbm_safe_getenv("CBM_DOWNLOAD_URL", base_url_buf, sizeof(base_url_buf), NULL);
@@ -5491,8 +5579,7 @@ int cbm_cmd_update(int argc, char **argv) {
         return CLI_TRUE;
     }
 #else
-    if (!cbm_format_fits(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp",
-                         home)) {
+    if (!cbm_format_fits(bin_dest, sizeof(bin_dest), "%s/.local/bin/codebase-memory-mcp", home)) {
         (void)fprintf(stderr, "error: update target path is too long\n");
         return CLI_TRUE;
     }

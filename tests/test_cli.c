@@ -1646,6 +1646,157 @@ TEST(cli_uninstall_dry_run) {
     PASS();
 }
 
+/* A dry-run is a read-only preview even when -y is supplied.  In particular,
+ * it must not route the automatic answer through the destructive index-removal
+ * branch. */
+TEST(cli_uninstall_dry_run_preserves_indexes) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-preview-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char cache_dir[512];
+    char project_db[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(project_db, sizeof(project_db), "%s/project.db", cache_dir);
+    ASSERT_EQ(test_mkdirp(cache_dir), 0);
+    ASSERT_EQ(write_test_file(project_db, "indexed graph"), 0);
+
+    cli_env_snapshot_t home = {0};
+    cli_env_snapshot_t cache = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char *args[] = {"--dry-run", "-y"};
+    ASSERT_EQ(cbm_cmd_uninstall(2, args), 0);
+
+    struct stat st;
+    ASSERT_EQ(stat(project_db, &st), 0);
+
+    /* parse_auto_answer() is process-global; do not leak this test's -y into
+     * later lifecycle tests. */
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&cache);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_uninstall_removes_codex_json_hook_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char hooks_path[768];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
+    ASSERT_EQ(test_mkdirp(codex_dir), 0);
+    ASSERT_EQ(write_test_file(hooks_path, "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"startup\","
+                                          "\"hooks\":[{\"type\":\"command\","
+                                          "\"command\":\"echo user-hook\"}]}]}}"),
+              0);
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(hooks_path), 0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+
+    const char *contents = read_test_file(hooks_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "echo user-hook") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp reminder") == NULL);
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_uninstall_removes_owned_claude_hook_scripts) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-claude-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char hooks_dir[512];
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/.claude/hooks", tmpdir);
+    ASSERT_EQ(test_mkdirp(hooks_dir), 0);
+#ifdef _WIN32
+    const char *names[] = {"cbm-code-discovery-gate.cmd", "cbm-session-reminder.cmd",
+                           "cbm-subagent-reminder.cmd"};
+#else
+    const char *names[] = {"cbm-code-discovery-gate", "cbm-session-reminder",
+                           "cbm-subagent-reminder"};
+#endif
+    char paths[3][768];
+    for (size_t i = 0; i < 3; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", hooks_dir, names[i]);
+        ASSERT_EQ(write_test_file(paths[i], "#!/bin/sh\n"), 0);
+    }
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+
+    struct stat st;
+    for (size_t i = 0; i < 3; i++)
+        ASSERT_NEQ(stat(paths[i], &st), 0);
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_uninstall_removes_vscode_profile_mcp_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-vscode-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char profile_dir[768];
+    char profile_mcp[1024];
+#ifdef __APPLE__
+    snprintf(profile_dir, sizeof(profile_dir),
+             "%s/Library/Application Support/Code/User/profiles/profile-a", tmpdir);
+#else
+    snprintf(profile_dir, sizeof(profile_dir), "%s/.config/Code/User/profiles/profile-a", tmpdir);
+#endif
+    snprintf(profile_mcp, sizeof(profile_mcp), "%s/mcp.json", profile_dir);
+    ASSERT_EQ(test_mkdirp(profile_dir), 0);
+    ASSERT_EQ(
+        write_test_file(profile_mcp, "{\"servers\":{\"user-server\":{\"command\":\"user\"}}}"), 0);
+    ASSERT_EQ(cbm_install_vscode_mcp("/usr/local/bin/codebase-memory-mcp", profile_mcp), 0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+
+    const char *contents = read_test_file(profile_mcp);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "user-server") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+
+    extern void cbm_set_auto_answer_for_test(int value);
+    cbm_set_auto_answer_for_test(0);
+    cli_env_restore(&home);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_install_help_does_not_require_home) {
     ASSERT_EQ(cli_run_help_without_home(cbm_cmd_install), 0);
     PASS();
@@ -3792,6 +3943,10 @@ SUITE(cli) {
     /* Dry-run lifecycle (2 tests) */
     RUN_TEST(cli_install_dry_run);
     RUN_TEST(cli_uninstall_dry_run);
+    RUN_TEST(cli_uninstall_dry_run_preserves_indexes);
+    RUN_TEST(cli_uninstall_removes_codex_json_hook_only);
+    RUN_TEST(cli_uninstall_removes_owned_claude_hook_scripts);
+    RUN_TEST(cli_uninstall_removes_vscode_profile_mcp_only);
     RUN_TEST(cli_install_help_does_not_require_home);
     RUN_TEST(cli_uninstall_help_does_not_require_home);
     RUN_TEST(cli_update_help_does_not_require_home);
