@@ -5960,8 +5960,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
          * For the nested case, the child has no "type" field directly. Detect by
          * walking named children for a variable_declaration. */
         TSNode type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
-        TSNode name_node =
-            ts_node_is_null(type_node) ? (TSNode){0} : resolve_field_name_node(child);
+        TSNode name_node = {0};
+        if (!ts_node_is_null(type_node)) {
+            name_node = resolve_field_name_node(child);
+        }
 
         if (ts_node_is_null(type_node)) {
             uint32_t cnc = ts_node_named_child_count(child);

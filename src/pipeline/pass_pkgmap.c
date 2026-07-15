@@ -426,13 +426,14 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     pkg_entries_push(entries, name, entry);
 
     /* Also register <name>/__init__ as alternative (no src/ prefix) */
-    snprintf(suffix, sizeof(suffix), "%s/__init__", name_copy);
-    char *alt_entry = build_entry_path(rel_path, suffix);
-    if (name_copy && alt_entry) {
-        pkg_entries_push(entries, name_copy, alt_entry);
-    } else {
-        free(name_copy);
-        free(alt_entry);
+    if (name_copy) {
+        snprintf(suffix, sizeof(suffix), "%s/__init__", name_copy);
+        char *alt_entry = build_entry_path(rel_path, suffix);
+        if (alt_entry) {
+            pkg_entries_push(entries, name_copy, alt_entry);
+        } else {
+            free(name_copy);
+        }
     }
 }
 

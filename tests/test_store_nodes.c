@@ -5,11 +5,13 @@
  * TestNodeDedup, TestProjectCRUD, TestUpsertNodeBatch, etc.)
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h"
 #include <store/store.h>
 #include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
@@ -108,6 +110,45 @@ TEST(store_project_delete) {
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
 
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_project_migrates_legacy_index_metadata_defaults) {
+    char path[256];
+    snprintf(path, sizeof(path), "/tmp/cbm_store_legacy_project_XXXXXX");
+    int fd = cbm_mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "CREATE TABLE projects ("
+                           "name TEXT PRIMARY KEY,"
+                           "indexed_at TEXT NOT NULL,"
+                           "root_path TEXT NOT NULL);"
+                           "INSERT INTO projects(name, indexed_at, root_path) "
+                           "VALUES('legacy', '2024-01-01T00:00:00Z', '/tmp/legacy');",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+
+    cbm_store_t *s = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(s);
+
+    cbm_project_t p = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "legacy", &p), CBM_STORE_OK);
+    ASSERT_STR_EQ(p.name, "legacy");
+    ASSERT_STR_EQ(p.root_path, "/tmp/legacy");
+    ASSERT_TRUE(p.indexed_git_head == NULL || p.indexed_git_head[0] == '\0');
+    ASSERT_EQ(p.files_discovered, 0);
+    ASSERT_EQ(p.files_indexed, 0);
+    ASSERT_EQ(p.files_excluded, 0);
+    ASSERT_EQ(p.files_failed, 0);
+
+    cbm_project_free_fields(&p);
+    cbm_store_close(s);
+    unlink(path);
     PASS();
 }
 
@@ -1942,6 +1983,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_project_crud);
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);
+    RUN_TEST(store_project_migrates_legacy_index_metadata_defaults);
     RUN_TEST(store_node_crud);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);

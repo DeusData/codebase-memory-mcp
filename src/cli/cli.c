@@ -4840,14 +4840,14 @@ enum {
 };
 static const size_t ZIP_MAX_UNCOMP = 500U * 1024U * 1024U;
 
-static uint16_t zip_read_u16le(const unsigned char *p) {
-    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << BYTE_SHIFT));
+static uint16_t zip_read_le16(const unsigned char *p) {
+    return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[CLI_SKIP_ONE] << BYTE_SHIFT));
 }
 
-static uint32_t zip_read_u32le(const unsigned char *p) {
-    return ((uint32_t)p[0]) | ((uint32_t)p[1] << BYTE_SHIFT) |
-           ((uint32_t)p[2] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
-           ((uint32_t)p[3] << (BYTE_SHIFT * CLI_JSON_INDENT));
+static uint32_t zip_read_le32(const unsigned char *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[CLI_SKIP_ONE] << BYTE_SHIFT) |
+           ((uint32_t)p[CLI_PAIR_LEN] << (BYTE_SHIFT * CLI_PAIR_LEN)) |
+           ((uint32_t)p[CLI_JSON_INDENT] << (BYTE_SHIFT * CLI_JSON_INDENT));
 }
 
 /* Decompress a single zip entry (stored or deflated). Returns malloc'd buffer
@@ -4911,14 +4911,14 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
             break;
         }
 
-        uint16_t method = zip_read_u16le(data + pos + ZIP_OFF_METHOD);
-        uint32_t comp_size = zip_read_u32le(data + pos + ZIP_OFF_COMP);
-        uint32_t uncomp_size = zip_read_u32le(data + pos + ZIP_OFF_UNCOMP);
-        uint16_t name_len = zip_read_u16le(data + pos + ZIP_OFF_NAMELEN);
-        uint16_t extra_len = zip_read_u16le(data + pos + ZIP_OFF_EXTRALEN);
+        uint16_t method = zip_read_le16(data + pos + ZIP_OFF_METHOD);
+        size_t comp_size = zip_read_le32(data + pos + ZIP_OFF_COMP);
+        size_t uncomp_size = zip_read_le32(data + pos + ZIP_OFF_UNCOMP);
+        uint16_t name_len = zip_read_le16(data + pos + ZIP_OFF_NAMELEN);
+        uint16_t extra_len = zip_read_le16(data + pos + ZIP_OFF_EXTRALEN);
 
         int header_end = pos + ZIP_HDR_SZ + name_len + extra_len;
-        if (header_end > data_len || comp_size > (uint32_t)(data_len - header_end)) {
+        if (header_end > data_len || comp_size > (size_t)(data_len - header_end)) {
             break;
         }
 

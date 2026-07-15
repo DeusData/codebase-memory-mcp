@@ -67,6 +67,7 @@ enum {
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
 #include "foundation/str_util.h"
+#include "git/git_context.h"
 
 #define XXH_INLINE_ALL
 #include "xxhash/xxhash.h"
@@ -222,7 +223,12 @@ static int init_schema(cbm_store_t *s) {
         "CREATE TABLE IF NOT EXISTS projects ("
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
-        "  root_path TEXT NOT NULL"
+        "  root_path TEXT NOT NULL,"
+        "  indexed_git_head TEXT,"
+        "  files_discovered INTEGER NOT NULL DEFAULT 0,"
+        "  files_indexed INTEGER NOT NULL DEFAULT 0,"
+        "  files_excluded INTEGER NOT NULL DEFAULT 0,"
+        "  files_failed INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -300,6 +306,12 @@ static int init_schema(cbm_store_t *s) {
         ");";
 
     int rc = exec_sql(s, ddl);
+    (void)exec_sql(s, "ALTER TABLE projects ADD COLUMN indexed_git_head TEXT;");
+    (void)exec_sql(s,
+                   "ALTER TABLE projects ADD COLUMN files_discovered INTEGER NOT NULL DEFAULT 0;");
+    (void)exec_sql(s, "ALTER TABLE projects ADD COLUMN files_indexed INTEGER NOT NULL DEFAULT 0;");
+    (void)exec_sql(s, "ALTER TABLE projects ADD COLUMN files_excluded INTEGER NOT NULL DEFAULT 0;");
+    (void)exec_sql(s, "ALTER TABLE projects ADD COLUMN files_failed INTEGER NOT NULL DEFAULT 0;");
     if (rc != CBM_STORE_OK) {
         return rc;
     }
@@ -1154,31 +1166,69 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_project,
-                       "INSERT INTO projects (name, indexed_at, root_path) VALUES (?1, ?2, ?3) "
-                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3;");
+                       "INSERT INTO projects (name, indexed_at, root_path, indexed_git_head) "
+                       "VALUES (?1, ?2, ?3, ?4) "
+                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3, "
+                       "indexed_git_head=?4;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
 
     char ts[CBM_SZ_64];
     iso_now(ts, sizeof(ts));
+    cbm_git_context_t git = {0};
+    const char *head = NULL;
+    if (cbm_git_context_resolve(root_path, &git) == 0 && git.is_git && git.head_sha &&
+        git.head_sha[0]) {
+        head = git.head_sha;
+    }
 
     bind_text(stmt, SKIP_ONE, name);
     bind_text(stmt, ST_COL_2, ts);
     bind_text(stmt, ST_COL_3, root_path);
+    if (head) {
+        bind_text(stmt, ST_COL_4, head);
+    } else {
+        sqlite3_bind_null(stmt, ST_COL_4);
+    }
 
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "upsert_project");
+        cbm_git_context_free(&git);
         return CBM_STORE_ERR;
     }
+    cbm_git_context_free(&git);
     return CBM_STORE_OK;
 }
 
+int cbm_store_update_project_coverage(cbm_store_t *s, const char *name, int files_discovered,
+                                      int files_indexed, int files_excluded, int files_failed) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(
+        s->db,
+        "UPDATE projects SET files_discovered=?2, files_indexed=?3, files_excluded=?4, "
+        "files_failed=?5 WHERE name=?1;",
+        CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "update_project_coverage");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, name);
+    sqlite3_bind_int(stmt, 2, files_discovered);
+    sqlite3_bind_int(stmt, 3, files_indexed);
+    sqlite3_bind_int(stmt, 4, files_excluded);
+    sqlite3_bind_int(stmt, 5, files_failed);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
-    sqlite3_stmt *stmt =
-        prepare_cached(s, &s->stmt_get_project,
-                       "SELECT name, indexed_at, root_path FROM projects WHERE name = ?1;");
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_get_project,
+        "SELECT name, indexed_at, root_path, indexed_git_head, files_discovered, "
+        "files_indexed, files_excluded, files_failed FROM projects WHERE name = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1189,6 +1239,11 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
         out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        out->indexed_git_head = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+        out->files_discovered = sqlite3_column_int(stmt, ST_COL_4);
+        out->files_indexed = sqlite3_column_int(stmt, 5);
+        out->files_excluded = sqlite3_column_int(stmt, 6);
+        out->files_failed = sqlite3_column_int(stmt, 7);
         return CBM_STORE_OK;
     }
     return CBM_STORE_NOT_FOUND;
@@ -1197,7 +1252,8 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_list_projects,
-                       "SELECT name, indexed_at, root_path FROM projects ORDER BY name;");
+                       "SELECT name, indexed_at, root_path, indexed_git_head, files_discovered, "
+                       "files_indexed, files_excluded, files_failed FROM projects ORDER BY name;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1205,17 +1261,23 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     /* Collect into dynamic array */
     int cap = ST_INIT_CAP_8;
     int n = 0;
-    cbm_project_t *arr = malloc(cap * sizeof(cbm_project_t));
+    cbm_project_t *arr = calloc((size_t)cap, sizeof(cbm_project_t));
 
     int scan_rc1;
     while ((scan_rc1 = sqlite3_step(stmt)) == SQLITE_ROW) {
         if (n >= cap) {
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_project_t));
+            memset(&arr[n], 0, (size_t)(cap - n) * sizeof(cbm_project_t));
         }
         arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         arr[n].indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        arr[n].indexed_git_head = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_3));
+        arr[n].files_discovered = sqlite3_column_int(stmt, ST_COL_4);
+        arr[n].files_indexed = sqlite3_column_int(stmt, 5);
+        arr[n].files_excluded = sqlite3_column_int(stmt, 6);
+        arr[n].files_failed = sqlite3_column_int(stmt, 7);
         n++;
     }
     if (scan_rc1 != SQLITE_DONE) { /* SCANCHK:1:stmt */
@@ -4192,8 +4254,8 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
         return get_schema_impl(s, project, out, false);
     }
 
-    char sqlbuf[ST_SQL_BUF];
     {
+        char sqlbuf[ST_SQL_BUF];
         const char *base = "SELECT label, COUNT(*) FROM nodes WHERE project = ?1";
         snprintf(sqlbuf, sizeof(sqlbuf), "%s%s GROUP BY label ORDER BY COUNT(*) DESC;", base,
                  arch_path_scope_sql());
@@ -7048,6 +7110,7 @@ void cbm_project_free_fields(cbm_project_t *p) {
     safe_str_free(&p->name);
     safe_str_free(&p->indexed_at);
     safe_str_free(&p->root_path);
+    safe_str_free(&p->indexed_git_head);
 }
 
 void cbm_store_free_projects(cbm_project_t *projects, int count) {

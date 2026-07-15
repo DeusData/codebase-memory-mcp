@@ -314,6 +314,42 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     return 0;
 }
 
+int cbm_git_tracked_dirty(const char *path, bool *out_dirty) {
+    if (!out_dirty) {
+        return CBM_NOT_FOUND;
+    }
+    *out_dirty = false;
+
+    if (!path || !git_validate_repo_path(path)) {
+        return CBM_NOT_FOUND;
+    }
+
+    char cmd[GIT_CMD_MAX];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    int n = snprintf(cmd, sizeof(cmd), "git -C \"%s\" status --porcelain --untracked-files=no 2>%s",
+                     path, null_dev);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        return CBM_NOT_FOUND;
+    }
+
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+    char buf[GIT_OUTPUT_MAX];
+    bool has_output = fgets(buf, sizeof(buf), fp) != NULL;
+    int rc = cbm_pclose(fp);
+    if (rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+    *out_dirty = has_output;
+    return 0;
+}
+
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
     const char *project = project_name && project_name[0] ? project_name : "project";
     const char *slug = "working-tree";

@@ -2187,12 +2187,6 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
             if (rv && rv[0]) {
                 snprintf(out, CBM_SZ_512, "%s", rv);
                 res = out;
-            } else if (strcmp(prop, "start_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
-                res = out;
-            } else if (strcmp(prop, "end_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
-                res = out;
             } else if (full.properties_json && full.properties_json[0] == '{') {
                 const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
                 if (jv && jv[0]) {
@@ -2503,11 +2497,11 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
 
     /* IS NULL / IS NOT NULL */
     if (strcmp(c->op, "IS NULL") == 0) {
-        result = (actual[0] == '\0');
+        result = (!actual || actual[0] == '\0');
         return c->negated ? !result : result;
     }
     if (strcmp(c->op, "IS NOT NULL") == 0) {
-        result = (actual[0] != '\0');
+        result = (actual && actual[0] != '\0');
         return c->negated ? !result : result;
     }
 

@@ -1311,6 +1311,8 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
             cbm_log_warn("index.ignored_capped", "stored", itoa_buf(p->ignored_count), "total",
                          itoa_buf(p->ignored_total));
         }
+        (void)cbm_store_update_project_coverage(hash_store, p->project_name, file_count, file_count,
+                                                p->excluded_count, 0);
 
         /* FTS5 backfill: populate nodes_fts with camelCase-split names.
          * Contentless FTS5 requires the special 'delete-all' command instead of
