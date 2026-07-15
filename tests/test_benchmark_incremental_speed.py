@@ -90,6 +90,39 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertTrue(gate["passed"])
         self.assertEqual(gate["contract"], "safe_full_rebuild")
 
+    def test_frontier_gate_accepts_explicit_configured_cap_fallback(self) -> None:
+        metadata = {"expected_minimum_affected_files": 17}
+        incremental = {
+            "publish_kind": "incremental_containment",
+            "exact_reason": "frontier_too_large",
+            "response": {
+                "exact_delta": {
+                    "affected_paths": 16,
+                    "affected_paths_limit": 16,
+                    "affected_paths_truncated": True,
+                }
+            },
+        }
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental, exact_cap=16)
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["contract"], "configured_cap_fallback")
+        self.assertEqual(gate["expected_minimum_affected_files"], 17)
+
+    def test_frontier_gate_rejects_cap_fallback_without_truncation_evidence(self) -> None:
+        metadata = {"expected_minimum_affected_files": 17}
+        incremental = {
+            "publish_kind": "full",
+            "exact_reason": "frontier_too_large",
+            "response": {"exact_delta": {"affected_paths_truncated": False}},
+        }
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental, exact_cap=16)
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("truncation", gate["reason"])
+
     def test_minimal_indexing_profile_disables_every_optional_cost_center(self) -> None:
         overrides = BENCHMARK.resolve_config_overrides("minimal_indexing", [])
         self.assertEqual(

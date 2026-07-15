@@ -1586,7 +1586,9 @@ def graph_gate_for_publish_kind(
 
 
 def frontier_coverage_gate(
-    scenario_metadata: dict[str, Any], incremental: dict[str, Any]
+    scenario_metadata: dict[str, Any],
+    incremental: dict[str, Any],
+    exact_cap: int | None = None,
 ) -> dict[str, Any]:
     expected_publish_kind = scenario_metadata.get("expected_publish_kind")
     expected_reason = scenario_metadata.get("expected_reason")
@@ -1613,6 +1615,32 @@ def frontier_coverage_gate(
     observed = exact_delta.get("affected_paths")
     if not isinstance(observed, int):
         observed = incremental.get("exact_route_detail", {}).get("frontier_expanded_files")
+    if isinstance(exact_cap, int) and exact_cap < expected:
+        observed_publish_kind = incremental.get("publish_kind")
+        observed_reason = incremental.get("exact_reason")
+        truncated = exact_delta.get("affected_paths_truncated") is True
+        passed = (
+            observed_publish_kind in {PUBLISH_FULL, PUBLISH_INCREMENTAL_CONTAINMENT}
+            and observed_reason == "frontier_too_large"
+            and truncated
+        )
+        result = {
+            "passed": passed,
+            "applicable": True,
+            "contract": "configured_cap_fallback",
+            "configured_exact_cap": exact_cap,
+            "expected_minimum_affected_files": expected,
+            "observed_affected_files": observed,
+            "observed_publish_kind": observed_publish_kind,
+            "observed_reason": observed_reason,
+            "affected_paths_truncated": truncated,
+        }
+        if not passed:
+            result["reason"] = (
+                "configured cap fallback requires containment/full publication, "
+                "frontier_too_large, and truncation evidence"
+            )
+        return result
     passed = isinstance(observed, int) and observed >= expected
     result = {
         "passed": passed,
@@ -2181,7 +2209,12 @@ def run_matrix_case(
     graph_gate = graph_gate_for_publish_kind(
         canonical, str(publish_kind or ""), active_overlay=active_overlay
     )
-    frontier_gate = frontier_coverage_gate(scenario_metadata, incremental)
+    configured_cap = args.config_overrides.get("incremental_exact_max_affected_paths")
+    try:
+        exact_cap = int(configured_cap) if configured_cap is not None else None
+    except ValueError:
+        exact_cap = None
+    frontier_gate = frontier_coverage_gate(scenario_metadata, incremental, exact_cap=exact_cap)
     explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
     passed = bool(graph_gate.get("passed")) and bool(frontier_gate.get("passed")) and explicit_route
     speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
