@@ -22,26 +22,43 @@ struct cbm_config;                          /* from cli/cli.h */
 
 /* ── JSON-RPC types ───────────────────────────────────────────── */
 
+/* JSON-RPC 2.0 standard error codes shared by parsers, dispatchers, and
+ * transport adapters. Keep protocol constants in the public MCP header so
+ * callers do not duplicate magic values or private aliases. */
+enum {
+    CBM_JSONRPC_PARSE_ERROR = -32700,
+    CBM_JSONRPC_INVALID_REQUEST = -32600,
+    CBM_JSONRPC_METHOD_NOT_FOUND = -32601,
+    CBM_JSONRPC_INVALID_PARAMS = -32602,
+    CBM_JSONRPC_INTERNAL_ERROR = -32603,
+};
+
+/* MCP-defined server error codes layered on JSON-RPC. */
+enum { CBM_MCP_RESOURCE_NOT_FOUND = -32002 };
+
 typedef struct {
     const char *jsonrpc;    /* "2.0" */
     const char *method;     /* e.g. "initialize", "tools/call" */
     int64_t id;             /* request ID (numeric form; -1 if notification) */
     const char *id_str;     /* non-NULL when id is a JSON string (issue #253) */
+    bool id_is_null;        /* true when the request explicitly uses a null id */
     bool has_id;            /* false for notifications */
     const char *params_raw; /* raw JSON string of params */
 } cbm_jsonrpc_request_t;
 
 typedef struct {
     int64_t id;
-    const char *id_str;      /* non-NULL to echo a string id verbatim (issue #253) */
-    const char *result_json; /* JSON string for result (success) */
-    const char *error_json;  /* JSON string for error (failure), NULL on success */
-    int error_code;          /* JSON-RPC error code */
+    const char *id_str;        /* non-NULL to echo a string id verbatim (issue #253) */
+    bool id_is_null;           /* emit JSON null for parse/invalid-request errors */
+    const char *result_json;   /* JSON string for result (success) */
+    const char *error_json;    /* JSON string for error (failure), NULL on success */
+    int error_code;            /* JSON-RPC error code */
+    const char *error_message; /* JSON-RPC error message when error_code is set */
 } cbm_jsonrpc_response_t;
 
 /* ── JSON-RPC parsing / formatting ────────────────────────────── */
 
-/* Parse a JSON-RPC request line. Returns 0 on success, -1 on error.
+/* Parse a JSON-RPC request line. Returns 0 on success or a CBM_JSONRPC_* code.
  * Caller must call cbm_jsonrpc_request_free(). */
 int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out);
 void cbm_jsonrpc_request_free(cbm_jsonrpc_request_t *r);
