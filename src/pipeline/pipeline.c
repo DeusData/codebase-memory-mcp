@@ -12,7 +12,13 @@
  */
 #include "foundation/constants.h"
 
-enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
+enum {
+    CBM_DIR_PERMS = 0755,
+    PL_RING = 4,
+    PL_RING_MASK = 3,
+    PL_SEQ_PASSES = 6,
+    PL_BYTES_PER_MB = 1024 * 1024
+};
 #include "cli/cli.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -203,7 +209,6 @@ static const char *itoa_buf(int val) {
 
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
 static void log_phase_mem(const char *phase) {
-    enum { PL_BYTES_PER_MB = 1024 * 1024 };
     cbm_log_info("mem.phase", "phase", phase, "rss_mb",
                  itoa_buf((int)(cbm_mem_rss() / PL_BYTES_PER_MB)), "peak_mb",
                  itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)));
@@ -2280,9 +2285,17 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
             }
         }
     }
-    cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
-                 itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
-                 itoa_buf((int)elapsed_ms(t0)));
+    if (cbm_profile_active) {
+        cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
+                     itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t0)), "rss_mb",
+                     itoa_buf((int)(cbm_mem_rss() / PL_BYTES_PER_MB)), "peak_mb",
+                     itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)));
+    } else {
+        cbm_log_info("pipeline.done", "nodes", itoa_buf(cbm_gbuf_node_count(p->gbuf)), "edges",
+                     itoa_buf(cbm_gbuf_edge_count(p->gbuf)), "elapsed_ms",
+                     itoa_buf((int)elapsed_ms(t0)));
+    }
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
 
 cleanup:

@@ -12,6 +12,139 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_frontier_fixture_counts_dependents_and_mutates_one_definition_file(self) -> None:
+        cases = {
+            "go_inbound_frontier": ("go", "leaf.go", "LeafExtra"),
+            "python_inbound_frontier": ("python", "leaf.py", "leaf_extra"),
+            "c_header_inbound_frontier": ("c_header", "shared.h", "shared_extra"),
+            "cpp_inbound_frontier": ("cpp", "shared.hpp", "shared_extra"),
+            "cuda_inbound_frontier": ("cuda", "shared.cuh", "shared_extra"),
+            "javascript_inbound_frontier": ("javascript", "leaf.js", "leafExtra"),
+            "typescript_inbound_frontier": ("typescript", "leaf.ts", "leafExtra"),
+            "tsx_inbound_frontier": ("tsx", "leaf.tsx", "leafExtra"),
+            "php_inbound_frontier": ("php", "Leaf.php", "leaf_extra"),
+            "csharp_inbound_frontier": ("csharp", "Leaf.cs", "Extra"),
+            "java_inbound_frontier": ("java", "Leaf.java", "extra"),
+            "kotlin_inbound_frontier": ("kotlin", "Leaf.kt", "leafExtra"),
+            "rust_inbound_frontier": ("rust", "leaf.rs", "leaf_extra"),
+        }
+        for scenario, (language, changed_path, marker) in cases.items():
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmpdir:
+                repo = Path(tmpdir)
+                metadata = BENCHMARK.create_inbound_frontier_repo(repo, language, 7)
+                changed = BENCHMARK.mutate_inbound_frontier_repo(repo, language)
+
+                self.assertEqual(metadata["language"], language)
+                self.assertEqual(metadata["requested_inbound_dependents"], 7)
+                resolver_language = "c" if language == "c_header" else language
+                if resolver_language in BENCHMARK.SCOPED_EXACT_FRONTIER_LANGUAGES:
+                    self.assertEqual(metadata["incremental_contract"], "exact_frontier")
+                    self.assertEqual(metadata["expected_minimum_affected_files"], 8)
+                else:
+                    self.assertEqual(metadata["incremental_contract"], "safe_full_rebuild")
+                    self.assertEqual(metadata["expected_publish_kind"], "full")
+                    self.assertEqual(metadata["expected_reason"], "scoped_lsp_gap")
+                self.assertEqual(changed, [changed_path])
+                self.assertIn(marker, (repo / changed_path).read_text(encoding="utf-8"))
+                for index in range(7):
+                    self.assertTrue((repo / metadata["dependent_paths"][index]).is_file())
+
+    def test_frontier_catalog_matches_cross_file_resolver_languages(self) -> None:
+        fixture_languages = {
+            "c" if language == "c_header" else language
+            for language in BENCHMARK.MATRIX_FRONTIER_SCENARIOS.values()
+        }
+        self.assertEqual(fixture_languages, set(BENCHMARK.CROSS_FILE_RESOLVER_LANGUAGES))
+
+    def test_frontier_fixture_rejects_nonpositive_dependent_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "frontier files must be positive"):
+                BENCHMARK.create_inbound_frontier_repo(Path(tmpdir), "go", 0)
+
+    def test_frontier_gate_rejects_fixture_that_did_not_expand(self) -> None:
+        metadata = {"expected_minimum_affected_files": 8}
+        incremental = {"response": {"exact_delta": {"affected_paths": 1}}}
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental)
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["expected_minimum_affected_files"], 8)
+        self.assertEqual(gate["observed_affected_files"], 1)
+        self.assertEqual(gate["reason"], "observed frontier is smaller than the fixture contract")
+
+    def test_frontier_gate_is_not_applicable_to_nonfrontier_scenarios(self) -> None:
+        gate = BENCHMARK.frontier_coverage_gate({}, {"response": {}})
+
+        self.assertTrue(gate["passed"])
+        self.assertFalse(gate["applicable"])
+
+    def test_frontier_gate_accepts_declared_scoped_lsp_full_rebuild(self) -> None:
+        metadata = {
+            "expected_publish_kind": "full",
+            "expected_reason": "scoped_lsp_gap",
+        }
+        incremental = {"publish_kind": "full", "exact_reason": "scoped_lsp_gap"}
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental)
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["contract"], "safe_full_rebuild")
+
+    def test_frontier_gate_accepts_explicit_configured_cap_fallback(self) -> None:
+        metadata = {"expected_minimum_affected_files": 17}
+        incremental = {
+            "publish_kind": "incremental_containment",
+            "exact_reason": "frontier_too_large",
+            "response": {
+                "exact_delta": {
+                    "affected_paths": 16,
+                    "affected_paths_limit": 16,
+                    "affected_paths_truncated": True,
+                }
+            },
+        }
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental, exact_cap=16)
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["contract"], "configured_cap_fallback")
+        self.assertEqual(gate["expected_minimum_affected_files"], 17)
+
+    def test_frontier_gate_rejects_cap_fallback_without_truncation_evidence(self) -> None:
+        metadata = {"expected_minimum_affected_files": 17}
+        incremental = {
+            "publish_kind": "full",
+            "exact_reason": "frontier_too_large",
+            "response": {"exact_delta": {"affected_paths_truncated": False}},
+        }
+
+        gate = BENCHMARK.frontier_coverage_gate(metadata, incremental, exact_cap=16)
+
+        self.assertFalse(gate["passed"])
+        self.assertIn("truncation", gate["reason"])
+
+    def test_minimal_indexing_profile_disables_every_optional_cost_center(self) -> None:
+        overrides = BENCHMARK.resolve_config_overrides("minimal_indexing", [])
+        self.assertEqual(
+            overrides,
+            {
+                "auto_index_deps": "false",
+                "githistory_enabled": "false",
+                "httplinks_enabled": "false",
+                "rank_enabled": "false",
+                "semantic_edges_enabled": "false",
+                "similarity_enabled": "false",
+            },
+        )
+
+    def test_explicit_config_override_takes_priority_over_profile(self) -> None:
+        overrides = BENCHMARK.resolve_config_overrides(
+            "minimal_indexing", ["rank_enabled=true", "auto_index_deps=true"]
+        )
+        self.assertEqual(overrides["rank_enabled"], "true")
+        self.assertEqual(overrides["auto_index_deps"], "true")
+        self.assertEqual(overrides["semantic_edges_enabled"], "false")
+
     def test_benchmark_environment_retains_worker_measurement_log(self) -> None:
         env = BENCHMARK.build_env(Path("/tmp/cbm-benchmark-cache"))
         self.assertEqual(env["CBM_PROFILE"], "1")
@@ -141,6 +274,18 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             include_logs=False,
         )
         self.assertEqual(result["peak_rss_mb"], 256)
+
+    def test_build_index_result_reads_final_peak_for_sequential_and_incremental_runs(self) -> None:
+        for marker in ("pipeline.done", "incremental.done"):
+            with self.subTest(marker=marker):
+                result = BENCHMARK.build_index_result(
+                    {"publish_kind": "incremental_exact"},
+                    f"level=info msg={marker} elapsed_ms=18 rss_mb=42 peak_mb=64",
+                    stdout_bytes=10,
+                    elapsed_ms=20.0,
+                    include_logs=False,
+                )
+                self.assertEqual(result["peak_rss_mb"], 64)
 
     def test_build_index_result_reads_bounded_worker_log_markers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
