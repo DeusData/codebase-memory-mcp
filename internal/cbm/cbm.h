@@ -164,12 +164,12 @@ typedef enum {
     CBM_LANG_APEX,
     CBM_LANG_SOQL,
     CBM_LANG_SOSL,
-    CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
-    CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
-    CBM_LANG_PINE,      // Pine Script (TradingView indicator / strategy language)
-    CBM_LANG_QML,       // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
-    CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
-    CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
+    CBM_LANG_KUSTOMIZE,            // kustomization.yaml — Kubernetes overlay tool
+    CBM_LANG_K8S,                  // Generic Kubernetes manifest (apiVersion: detected)
+    CBM_LANG_PINE,                 // Pine Script (TradingView indicator / strategy language)
+    CBM_LANG_QML,                  // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
+    CBM_LANG_CFSCRIPT,             // CFML script dialect (.cfc components — Lucee/ColdFusion)
+    CBM_LANG_CFML,                 // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
     CBM_LANG_MOJO,                 // Mojo
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
