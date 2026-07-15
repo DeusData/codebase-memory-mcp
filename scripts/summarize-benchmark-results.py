@@ -172,6 +172,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             oracles.append(verdict)
     case_passes = [bool(case.get("passed")) for case in cases]
     incremental_ms: list[float] = []
+    incremental_work_ms: list[float] = []
+    incremental_peak_rss: list[float] = []
     full_ms: list[float] = []
     speedups: list[float] = []
     peak_rss: list[int] = []
@@ -190,8 +192,11 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if isinstance(incremental, dict):
             if isinstance(incremental.get("elapsed_ms"), (int, float)):
                 incremental_ms.append(float(incremental["elapsed_ms"]))
-            if isinstance(incremental.get("peak_rss_mb"), int):
-                peak_rss.append(incremental["peak_rss_mb"])
+            if isinstance(incremental.get("indexed_work_elapsed_ms"), (int, float)):
+                incremental_work_ms.append(float(incremental["indexed_work_elapsed_ms"]))
+            if isinstance(incremental.get("peak_rss_mb"), (int, float)):
+                incremental_peak_rss.append(float(incremental["peak_rss_mb"]))
+                peak_rss.append(int(incremental["peak_rss_mb"]))
         if isinstance(full, dict):
             if isinstance(full.get("elapsed_ms"), (int, float)):
                 full_ms.append(float(full["elapsed_ms"]))
@@ -266,6 +271,32 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if all(isinstance(value, (int, float)) for value in quality_categories)
         else None
     )
+    scenarios = {str(case.get("scenario")) for case in cases if case.get("scenario")}
+    contracts = {
+        str(gate.get("contract"))
+        for case in cases
+        if isinstance((gate := case.get("frontier_coverage_gate")), dict)
+        and gate.get("contract")
+    }
+    frontier_files = {
+        parameters.get("frontier_files")
+        for report in reports
+        if isinstance((parameters := report.get("parameters")), dict)
+        and isinstance(parameters.get("frontier_files"), int)
+    }
+    exact_caps: set[int] = set()
+    for report in reports:
+        parameters = report.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        overrides = parameters.get("config_overrides")
+        if not isinstance(overrides, dict):
+            continue
+        raw_cap = overrides.get("incremental_exact_max_affected_paths")
+        try:
+            exact_caps.add(int(raw_cap))
+        except (TypeError, ValueError):
+            pass
     return {
         "candidate": label,
         "decision": decision,
@@ -284,6 +315,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
         "capabilities": config_label(reports),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
+        "incremental_work_p50_ms": percentile(incremental_work_ms, 0.50),
+        "incremental_peak_p50_mb": percentile(incremental_peak_rss, 0.50),
         "incremental_p95_ms": percentile(incremental_ms, 0.95),
         "full_p50_ms": percentile(full_ms, 0.50),
         "speedup_p50": float(statistics.median(speedups)) if speedups else None,
@@ -292,9 +325,77 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": correctness_findings(cases),
         "quality_details": quality_oracle_details(cases),
+        "scenario": next(iter(scenarios)) if len(scenarios) == 1 else None,
+        "frontier_files": next(iter(frontier_files)) if len(frontier_files) == 1 else None,
+        "exact_cap": next(iter(exact_caps)) if len(exact_caps) == 1 else None,
+        "frontier_contract": next(iter(contracts)) if len(contracts) == 1 else None,
         "pareto": "unclassified",
         "pareto_reason": "not evaluated",
     }
+
+
+def frontier_crossover_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Pair the closest configured fallback and exact run for each frontier."""
+    grouped: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        scenario = row.get("scenario")
+        frontier_files = row.get("frontier_files")
+        if isinstance(scenario, str) and isinstance(frontier_files, int):
+            grouped[(scenario, frontier_files)].append(row)
+
+    crossovers: list[dict[str, Any]] = []
+    for (scenario, frontier_files), candidates in sorted(grouped.items()):
+        fallbacks = [
+            row
+            for row in candidates
+            if row.get("frontier_contract") == "configured_cap_fallback"
+            and isinstance(row.get("exact_cap"), int)
+        ]
+        exact = [
+            row
+            for row in candidates
+            if row.get("frontier_contract") == "exact_frontier"
+            and isinstance(row.get("exact_cap"), int)
+        ]
+        if not fallbacks or not exact:
+            continue
+        fallback = max(fallbacks, key=lambda row: row["exact_cap"])
+        exact_run = min(exact, key=lambda row: row["exact_cap"])
+        fallback_elapsed = fallback.get("incremental_p50_ms")
+        exact_elapsed = exact_run.get("incremental_p50_ms")
+        ratio_value = (
+            exact_elapsed / fallback_elapsed
+            if isinstance(exact_elapsed, (int, float))
+            and isinstance(fallback_elapsed, (int, float))
+            and fallback_elapsed > 0
+            else None
+        )
+        if ratio_value is None:
+            conclusion = "not measured"
+        elif ratio_value < 0.95:
+            conclusion = "exact faster"
+        elif ratio_value <= 1.05:
+            conclusion = "tied"
+        else:
+            conclusion = "fallback faster"
+        crossovers.append(
+            {
+                "scenario": scenario,
+                "affected_files": frontier_files + 1,
+                "fallback_cap": fallback["exact_cap"],
+                "fallback_p50_ms": fallback_elapsed,
+                "fallback_work_p50_ms": fallback.get("incremental_work_p50_ms"),
+                "fallback_rss_p50_mb": fallback.get("incremental_peak_p50_mb"),
+                "exact_cap": exact_run["exact_cap"],
+                "exact_p50_ms": exact_elapsed,
+                "exact_work_p50_ms": exact_run.get("incremental_work_p50_ms"),
+                "exact_rss_p50_mb": exact_run.get("incremental_peak_p50_mb"),
+                "full_p50_ms": exact_run.get("full_p50_ms"),
+                "exact_fallback_ratio": ratio_value,
+                "conclusion": conclusion,
+            }
+        )
+    return crossovers
 
 
 PARETO_MINIMIZE = (
@@ -427,6 +528,57 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                 )
             )
             + " |"
+        )
+    crossovers = frontier_crossover_rows(rows)
+    if crossovers:
+        lines.extend(
+            (
+                "",
+                "## Exact-frontier cap crossover",
+                "",
+                "Each row compares the largest cap that deliberately selected bounded full-index "
+                "fallback with the smallest measured cap that admitted exact incremental work for "
+                "the same mutation. Affected files include the changed root plus the generated frontier.",
+                "",
+                "| Scenario | Affected files | Fallback cap | Fallback p50 ms | Fallback work p50 ms | "
+                "Fallback RSS p50 MB | Exact cap | Exact p50 ms | Exact work p50 ms | "
+                "Exact RSS p50 MB | Fresh full p50 ms | Exact / fallback | Conclusion |",
+                "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            )
+        )
+        for crossover in crossovers:
+            ratio_value = crossover["exact_fallback_ratio"]
+            rendered_ratio = (
+                f"{ratio_value:.2f}×" if isinstance(ratio_value, (int, float)) else "n/a"
+            )
+            lines.append(
+                "| "
+                + " | ".join(
+                    (
+                        display(crossover["scenario"]),
+                        display(crossover["affected_files"]),
+                        display(crossover["fallback_cap"]),
+                        display(crossover["fallback_p50_ms"]),
+                        display(crossover["fallback_work_p50_ms"]),
+                        display(crossover["fallback_rss_p50_mb"]),
+                        display(crossover["exact_cap"]),
+                        display(crossover["exact_p50_ms"]),
+                        display(crossover["exact_work_p50_ms"]),
+                        display(crossover["exact_rss_p50_mb"]),
+                        display(crossover["full_p50_ms"]),
+                        rendered_ratio,
+                        display(crossover["conclusion"]),
+                    )
+                )
+                + " |"
+            )
+        lines.extend(
+            (
+                "",
+                "`p50 ms` is end-to-end incremental response latency; `work p50 ms` isolates the "
+                "indexing work reported inside that response. RSS is recorded only in benchmark "
+                "profiling mode. Ratios within ±5% are labelled tied.",
+            )
         )
     lines.extend(
         (

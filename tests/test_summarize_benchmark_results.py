@@ -245,6 +245,47 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("missing", row["pareto_reason"])
         self.assertIn("incremental_p50_ms", row["pareto_reason"])
 
+    def test_frontier_crossover_pairs_nearest_fallback_and_exact_caps(self) -> None:
+        reports = []
+        for cap, contract, elapsed, work, peak in (
+            (16, "configured_cap_fallback", 100, 20, 80),
+            (32, "exact_frontier", 200, 120, 90),
+            (64, "exact_frontier", 210, 130, 95),
+        ):
+            case = {
+                "scenario": "go_inbound_frontier",
+                "passed": True,
+                "canonical_graph": {"equal": True},
+                "frontier_coverage_gate": {"contract": contract, "passed": True},
+                "incremental": {
+                    "elapsed_ms": elapsed,
+                    "indexed_work_elapsed_ms": work,
+                    "peak_rss_mb": peak,
+                },
+                "fresh_fast_full_after_change": {"elapsed_ms": 400},
+            }
+            item = report(case)
+            item["parameters"]["frontier_files"] = 16
+            item["parameters"]["config_overrides"][
+                "incremental_exact_max_affected_paths"
+            ] = str(cap)
+            reports.append((f"cap-{cap}", item))
+
+        rows = [SUMMARY.summarize_group(label, [item]) for label, item in reports]
+        crossovers = SUMMARY.frontier_crossover_rows(rows)
+
+        self.assertEqual(len(crossovers), 1)
+        self.assertEqual(crossovers[0]["fallback_cap"], 16)
+        self.assertEqual(crossovers[0]["exact_cap"], 32)
+        self.assertEqual(crossovers[0]["affected_files"], 17)
+        self.assertEqual(crossovers[0]["exact_fallback_ratio"], 2.0)
+        self.assertEqual(crossovers[0]["conclusion"], "fallback faster")
+        markdown = SUMMARY.render_markdown(rows)
+        self.assertIn("## Exact-frontier cap crossover", markdown)
+        self.assertIn("| go_inbound_frontier | 17 | 16 | 100.0 | 20.0 | 80.0 | 32 | 200.0", markdown)
+        self.assertIn("2.00×", markdown)
+        self.assertIn("fallback faster", markdown)
+
     def test_failed_quality_is_not_pareto_eligible(self) -> None:
         case = {
             "passed": False,
