@@ -3174,7 +3174,8 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Indexing",
      "Max changed plus inbound-dependent source files exact delta may reparse",
      "1-100000",
-     "Default 16 keeps small cross-file C/C++ edit frontiers on the canonical exact path. The cap "
+     "Default 32 keeps measured small cross-file edit frontiers on the canonical exact path and "
+     "selects bounded fallback before the observed latency crossover. The cap "
      "limits exact-delta work before a correctness fallback; it does not bound total indexing cost "
      "because fallback may perform containment or a full rebuild. Change only with canonical-graph "
      "and latency/memory benchmarks for your workload."},

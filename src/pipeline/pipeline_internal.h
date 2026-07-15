@@ -579,7 +579,7 @@ typedef struct {
 
 /* Conservative default exact-delta caps. Larger affected sets fall back to the
  * containment path unless config opts into a benchmarked frontier size. */
-enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_16 };
+enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS = CBM_SZ_32 };
 /* Default changed-file batch cap. Larger batches need explicit config and
  * same-batch parity coverage for deletes, renames, folders, and derived views. */
 enum { CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS = CBM_SZ_2 };

@@ -12123,7 +12123,7 @@ TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild) {
 }
 
 TEST(incremental_fast_default_c_source_frontier_cap_allows_bounded_exact) {
-    enum { PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED = CBM_SZ_16 };
+    enum { PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED = CBM_SZ_32 };
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -15930,6 +15930,7 @@ TEST(pipeline_capability_combinations_have_unique_fingerprints) {
 
 TEST(pipeline_exact_delta_limits_keep_safe_defaults) {
     enum { PIPELINE_TEST_EXACT_INVERTED_CHANGED = CBM_SZ_8 };
+    ASSERT_EQ(CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS, CBM_SZ_32);
     cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
 
@@ -16232,9 +16233,11 @@ TEST(config_registry_includes_incremental_exact_frontier_caps) {
         find_config_entry(CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS);
     ASSERT_NOT_NULL(affected);
     ASSERT_STR_EQ(affected->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT_STR_EQ(affected->default_val, "32");
     ASSERT_STR_EQ(affected->category, "Indexing");
     ASSERT_STR_EQ(affected->range, "1-100000");
     ASSERT_NOT_NULL(strstr(affected->guidance, "does not bound total indexing cost"));
+    ASSERT_NOT_NULL(strstr(affected->guidance, "Default 32"));
 
     PASS();
 }
