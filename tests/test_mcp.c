@@ -292,7 +292,7 @@ TEST(jsonrpc_parse_notification) {
 TEST(jsonrpc_parse_invalid) {
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse("not json", &req);
-    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(rc, CBM_JSONRPC_PARSE_ERROR);
     cbm_jsonrpc_request_free(&req);
     PASS();
 }
@@ -1183,8 +1183,14 @@ TEST(tool_unknown_tool) {
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\","
                                    "\"params\":{\"name\":\"nonexistent_tool\",\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
-    /* Should return result with isError */
-    ASSERT_NOT_NULL(strstr(resp, "isError"));
+    /* MCP 2025-11-25 server/tools: unknown tools are protocol errors, not
+     * successful CallToolResult envelopes with isError=true. */
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":12"));
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Unknown tool: nonexistent_tool"));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NULL(strstr(resp, "\"isError\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -2185,6 +2191,11 @@ TEST(tool_search_graph_query_rejects_bad_semantic_query) {
              "\"arguments\":{\"project\":\"bm25-semantic\",\"query\":\"status\","
              "\"semantic_query\":\"publish\"}}}");
     ASSERT_NOT_NULL(resp);
+    /* Recognized-tool validation remains a CallToolResult execution error;
+     * only malformed protocol envelopes and unknown names use JSON-RPC error. */
+    ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NULL(strstr(resp, "\"error\":{\"code\":"));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
     ASSERT_NOT_NULL(strstr(inner, "semantic_query must be an array"));
@@ -7102,19 +7113,17 @@ TEST(snippet_source_invalid_utf8) {
 TEST(jsonrpc_parse_empty_string) {
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse("", &req);
-    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(rc, CBM_JSONRPC_PARSE_ERROR);
     cbm_jsonrpc_request_free(&req);
     PASS();
 }
 
 TEST(jsonrpc_parse_missing_jsonrpc_field) {
-    /* jsonrpc field absent — parser defaults to "2.0" if method present */
+    /* JSON-RPC 2.0 requires the version member on every request. */
     const char *line = "{\"id\":1,\"method\":\"initialize\",\"params\":{}}";
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse(line, &req);
-    ASSERT_EQ(rc, 0);
-    ASSERT_STR_EQ(req.jsonrpc, "2.0");
-    ASSERT_STR_EQ(req.method, "initialize");
+    ASSERT_EQ(rc, CBM_JSONRPC_INVALID_REQUEST);
     ASSERT_TRUE(req.has_id);
     cbm_jsonrpc_request_free(&req);
     PASS();
@@ -7125,7 +7134,17 @@ TEST(jsonrpc_parse_missing_method) {
     const char *line = "{\"jsonrpc\":\"2.0\",\"id\":1,\"params\":{}}";
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse(line, &req);
-    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(rc, CBM_JSONRPC_INVALID_REQUEST);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_rejects_wrong_version) {
+    const char *line = "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"initialize\"}";
+    cbm_jsonrpc_request_t req = {0};
+    ASSERT_EQ(cbm_jsonrpc_parse(line, &req), CBM_JSONRPC_INVALID_REQUEST);
+    ASSERT_TRUE(req.has_id);
+    ASSERT_EQ(req.id, 1);
     cbm_jsonrpc_request_free(&req);
     PASS();
 }
@@ -7173,7 +7192,7 @@ TEST(jsonrpc_parse_array_not_object) {
     /* JSON array at root — not a valid JSON-RPC request */
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse("[1,2,3]", &req);
-    ASSERT_EQ(rc, -1);
+    ASSERT_EQ(rc, CBM_JSONRPC_INVALID_REQUEST);
     cbm_jsonrpc_request_free(&req);
     PASS();
 }
@@ -7334,6 +7353,7 @@ TEST(server_handle_invalid_json) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"error\""));
     ASSERT_NOT_NULL(strstr(resp, "-32700")); /* Parse error */
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":null"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -7343,10 +7363,43 @@ TEST(server_handle_invalid_json) {
 TEST(server_handle_empty_object) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
-    /* Valid JSON but no method field → parse error */
+    /* Valid JSON but no required JSON-RPC members → Invalid Request. */
     char *resp = cbm_mcp_server_handle(srv, "{}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32600"));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":null"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_invalid_request_preserves_valid_id) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":77}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32600"));
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":77"));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(resource_error_preserves_string_id) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":\"resource-78\",\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://does-not-exist\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":\"resource-78\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32002"));
+    ASSERT_NULL(strstr(resp, "\"result\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -7361,12 +7414,113 @@ TEST(server_handle_tools_call_missing_name) {
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\","
                                    "\"params\":{\"arguments\":{}}}");
     ASSERT_NOT_NULL(resp);
-    /* Should return error about unknown/missing tool */
+    /* A missing required name fails the CallToolRequest schema and therefore
+     * uses a JSON-RPC invalid-params error rather than a tool result. */
     ASSERT_NOT_NULL(strstr(resp, "\"id\":50"));
-    ASSERT_TRUE(strstr(resp, "error") || strstr(resp, "isError") || strstr(resp, "unknown"));
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Missing tool name"));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NULL(strstr(resp, "\"isError\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_tools_call_rejects_non_object_arguments) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":51,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":\"not-an-object\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":51"));
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Tool arguments must be an object"));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NULL(strstr(resp, "\"isError\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_unknown_tool_preserves_string_id) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":\"call-52\",\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"nonexistent_tool\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":\"call-52\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NULL(strstr(resp, "\"result\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-first-call-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-first-call-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char source_path[CBM_SZ_512];
+    snprintf(source_path, sizeof(source_path), "%s/first_call.py", repo);
+    FILE *source = fopen(source_path, "w");
+    ASSERT_NOT_NULL(source);
+    fputs("def first_response_target():\n    return 42\n", source);
+    fclose(source);
+
+    char old_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(cbm_getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(cbm_chdir(repo), 0);
+
+    cbm_config_t *config = cbm_config_open(cache);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+
+    /* initialize starts the background index. The immediately following
+     * graph call must join it rather than consume the one-shot context with
+     * status=auto_indexing and force the model to poll. */
+    char *initialize = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":60,\"method\":\"initialize\",\"params\":{}}");
+    ASSERT_NOT_NULL(initialize);
+    free(initialize);
+
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"name_pattern\":\"first_response_target\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "first_response_target"));
+    ASSERT_TRUE(response_contains_json_fragment(response, "\"status\":\"ready\""));
+    ASSERT_FALSE(response_contains_json_fragment(response, "\"status\":\"auto_indexing\""));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_unlink(source_path);
+    th_rmtree(cache);
+    cbm_rmdir(repo);
     PASS();
 }
 
@@ -9485,6 +9639,7 @@ SUITE(mcp) {
     RUN_TEST(jsonrpc_parse_empty_string);
     RUN_TEST(jsonrpc_parse_missing_jsonrpc_field);
     RUN_TEST(jsonrpc_parse_missing_method);
+    RUN_TEST(jsonrpc_parse_rejects_wrong_version);
     RUN_TEST(jsonrpc_parse_string_id);
     RUN_TEST(jsonrpc_parse_no_params);
     RUN_TEST(jsonrpc_parse_extra_whitespace);
@@ -9541,7 +9696,12 @@ SUITE(mcp) {
     /* Server handle — edge cases */
     RUN_TEST(server_handle_invalid_json);
     RUN_TEST(server_handle_empty_object);
+    RUN_TEST(server_handle_invalid_request_preserves_valid_id);
+    RUN_TEST(resource_error_preserves_string_id);
     RUN_TEST(server_handle_tools_call_missing_name);
+    RUN_TEST(server_handle_tools_call_rejects_non_object_arguments);
+    RUN_TEST(server_handle_unknown_tool_preserves_string_id);
+    RUN_TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context);
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);

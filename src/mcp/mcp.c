@@ -747,10 +747,6 @@ enum {
 /* Directory permissions: rwxr-xr-x */
 #define ADR_DIR_PERMS 0755
 
-/* JSON-RPC 2.0 standard error codes */
-#define JSONRPC_PARSE_ERROR (-32700)
-#define JSONRPC_METHOD_NOT_FOUND (-32601)
-
 /* ── Helpers ────────────────────────────────────────────────────── */
 
 static char *heap_strdup(const char *s) {
@@ -779,18 +775,25 @@ static char *yy_doc_to_str(yyjson_mut_doc *doc) {
  * ══════════════════════════════════════════════════════════════════ */
 
 int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
+    if (!out) {
+        return CBM_JSONRPC_INTERNAL_ERROR;
+    }
     memset(out, 0, sizeof(*out));
     out->id = CBM_NOT_FOUND;
 
+    if (!line) {
+        return CBM_JSONRPC_PARSE_ERROR;
+    }
+
     yyjson_doc *doc = yyjson_read(line, strlen(line), 0);
     if (!doc) {
-        return CBM_NOT_FOUND;
+        return CBM_JSONRPC_PARSE_ERROR;
     }
 
     yyjson_val *root = yyjson_doc_get_root(doc);
     if (!yyjson_is_obj(root)) {
         yyjson_doc_free(doc);
-        return CBM_NOT_FOUND;
+        return CBM_JSONRPC_INVALID_REQUEST;
     }
 
     yyjson_val *v_jsonrpc = yyjson_obj_get(root, "jsonrpc");
@@ -798,28 +801,47 @@ int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
     yyjson_val *v_id = yyjson_obj_get(root, "id");
     yyjson_val *v_params = yyjson_obj_get(root, "params");
 
-    if (!v_method || !yyjson_is_str(v_method)) {
-        yyjson_doc_free(doc);
-        return CBM_NOT_FOUND;
-    }
-
-    out->jsonrpc =
-        heap_strdup(v_jsonrpc && yyjson_is_str(v_jsonrpc) ? yyjson_get_str(v_jsonrpc) : "2.0");
-    out->method = heap_strdup(yyjson_get_str(v_method));
-
+    /* Preserve a valid request ID even when another required member is bad so
+     * Invalid Request responses can echo it as required by JSON-RPC 2.0. */
     if (v_id) {
         out->has_id = true;
         if (yyjson_is_int(v_id)) {
             out->id = yyjson_get_int(v_id);
         } else if (yyjson_is_str(v_id)) {
-            /* JSON-RPC 2.0 §4 permits string ids (Claude Desktop uses them).
-             * Preserve verbatim instead of coercing via strtol (issue #253). */
             out->id_str = heap_strdup(yyjson_get_str(v_id));
+            if (!out->id_str) {
+                out->id_is_null = true;
+                yyjson_doc_free(doc);
+                return CBM_JSONRPC_INTERNAL_ERROR;
+            }
+        } else if (yyjson_is_null(v_id)) {
+            out->id_is_null = true;
+        } else {
+            out->id_is_null = true;
+            yyjson_doc_free(doc);
+            return CBM_JSONRPC_INVALID_REQUEST;
         }
+    }
+
+    if (!v_jsonrpc || !yyjson_is_str(v_jsonrpc) || strcmp(yyjson_get_str(v_jsonrpc), "2.0") != 0 ||
+        !v_method || !yyjson_is_str(v_method)) {
+        yyjson_doc_free(doc);
+        return CBM_JSONRPC_INVALID_REQUEST;
+    }
+
+    out->jsonrpc = heap_strdup(yyjson_get_str(v_jsonrpc));
+    out->method = heap_strdup(yyjson_get_str(v_method));
+    if (!out->jsonrpc || !out->method) {
+        yyjson_doc_free(doc);
+        return CBM_JSONRPC_INTERNAL_ERROR;
     }
 
     if (v_params) {
         out->params_raw = yyjson_val_write(v_params, 0, NULL);
+        if (!out->params_raw) {
+            yyjson_doc_free(doc);
+            return CBM_JSONRPC_INTERNAL_ERROR;
+        }
     }
 
     yyjson_doc_free(doc);
@@ -847,7 +869,9 @@ char *cbm_jsonrpc_format_response(const cbm_jsonrpc_response_t *resp) {
     yyjson_mut_doc_set_root(doc, root);
 
     yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
-    if (resp->id_str) {
+    if (resp->id_is_null) {
+        yyjson_mut_obj_add_null(doc, root, "id");
+    } else if (resp->id_str) {
         yyjson_mut_obj_add_str(doc, root, "id", resp->id_str);
     } else {
         yyjson_mut_obj_add_int(doc, root, "id", resp->id);
@@ -861,6 +885,12 @@ char *cbm_jsonrpc_format_response(const cbm_jsonrpc_response_t *resp) {
             yyjson_mut_obj_add_val(doc, root, "error", err_val);
             yyjson_doc_free(err_doc);
         }
+    } else if (resp->error_code != 0) {
+        yyjson_mut_val *error = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_int(doc, error, "code", resp->error_code);
+        yyjson_mut_obj_add_str(doc, error, "message",
+                               resp->error_message ? resp->error_message : "Request failed");
+        yyjson_mut_obj_add_val(doc, root, "error", error);
     } else if (resp->result_json) {
         /* Parse the result JSON and embed */
         yyjson_doc *res_doc = yyjson_read(resp->result_json, strlen(resp->result_json), 0);
@@ -880,21 +910,25 @@ char *cbm_jsonrpc_format_response(const cbm_jsonrpc_response_t *resp) {
 }
 
 char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message) {
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
-    yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
+    cbm_jsonrpc_response_t response = {
+        .id = id,
+        .error_code = code,
+        .error_message = message,
+    };
+    return cbm_jsonrpc_format_response(&response);
+}
 
-    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
-    yyjson_mut_obj_add_int(doc, root, "id", id);
-
-    yyjson_mut_val *err = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_int(doc, err, "code", code);
-    yyjson_mut_obj_add_str(doc, err, "message", message);
-    yyjson_mut_obj_add_val(doc, root, "error", err);
-
-    char *out = yy_doc_to_str(doc);
-    yyjson_mut_doc_free(doc);
-    return out;
+/* Format an error for an already-parsed request so string and null IDs are
+ * preserved through the shared cbm_jsonrpc_response_t error path. */
+static char *format_request_error(const cbm_jsonrpc_request_t *req, int code, const char *message) {
+    cbm_jsonrpc_response_t response = {
+        .id = req ? req->id : 0,
+        .id_str = req ? req->id_str : NULL,
+        .id_is_null = !req || !req->has_id || req->id_is_null,
+        .error_code = code,
+        .error_message = message,
+    };
+    return cbm_jsonrpc_format_response(&response);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1360,6 +1394,11 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
     if (!tool_name) {
         return NULL;
     }
+    /* Backward-compatible classic alias dispatches to trace_path and therefore
+     * has the same request schema even though only the canonical name is listed. */
+    if (strcmp(tool_name, "trace_call_path") == 0) {
+        tool_name = "trace_path";
+    }
     for (int i = 0; i < TOOL_COUNT; i++) {
         if (strcmp(TOOLS[i].name, tool_name) == 0) {
             return TOOLS[i].input_schema;
@@ -1371,6 +1410,11 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
         }
     }
     return NULL;
+}
+
+static bool mcp_tool_name_is_known(const char *tool_name) {
+    return cbm_mcp_tool_input_schema(tool_name) != NULL ||
+           (tool_name && strcmp(tool_name, "_hidden_tools") == 0);
 }
 
 /* cbm_mcp_tools_list() is defined after cbm_mcp_server so visibility can use config. */
@@ -1466,6 +1510,64 @@ char *cbm_mcp_get_arguments(const char *params_json) {
     }
     yyjson_doc_free(doc);
     return result ? result : heap_strdup("{}");
+}
+
+/* Parse and validate CallToolRequest params in one pass. Protocol errors must
+ * be identified before dispatch: unknown tools and malformed requests are
+ * JSON-RPC errors, while failures inside recognized tools are CallToolResult
+ * values with isError=true. Returns 0 on success or a standardized
+ * CBM_JSONRPC_* error code on failure. */
+static int parse_tool_call_params(const char *params_json, char **name_out, char **args_out,
+                                  const char **error_out) {
+    *name_out = NULL;
+    *args_out = NULL;
+    *error_out = NULL;
+
+    if (!params_json) {
+        *error_out = "Missing tools/call params";
+        return CBM_JSONRPC_INVALID_PARAMS;
+    }
+
+    yyjson_doc *doc = yyjson_read(params_json, strlen(params_json), 0);
+    if (!doc) {
+        *error_out = "Invalid tools/call params";
+        return CBM_JSONRPC_INVALID_PARAMS;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        *error_out = "Tool call params must be an object";
+        yyjson_doc_free(doc);
+        return CBM_JSONRPC_INVALID_PARAMS;
+    }
+
+    yyjson_val *name = yyjson_obj_get(root, "name");
+    if (!name || !yyjson_is_str(name) || yyjson_get_len(name) == 0) {
+        *error_out = "Missing tool name";
+        yyjson_doc_free(doc);
+        return CBM_JSONRPC_INVALID_PARAMS;
+    }
+
+    yyjson_val *args = yyjson_obj_get(root, "arguments");
+    if (args && !yyjson_is_obj(args)) {
+        *error_out = "Tool arguments must be an object";
+        yyjson_doc_free(doc);
+        return CBM_JSONRPC_INVALID_PARAMS;
+    }
+
+    *name_out = heap_strdup(yyjson_get_str(name));
+    *args_out = args ? yyjson_val_write(args, 0, NULL) : heap_strdup("{}");
+    yyjson_doc_free(doc);
+
+    if (!*name_out || !*args_out) {
+        free(*name_out);
+        free(*args_out);
+        *name_out = NULL;
+        *args_out = NULL;
+        *error_out = "Unable to allocate tool call parameters";
+        return CBM_JSONRPC_INTERNAL_ERROR;
+    }
+    return 0;
 }
 
 /* Check if name is the last dot/colon/slash-separated segment of qualified_name.
@@ -12853,7 +12955,7 @@ static void build_resource_status(yyjson_mut_doc *doc, yyjson_mut_val *root,
  * Returns result JSON on success (caller wraps in JSON-RPC response).
  * On error, sets *err_out to a pre-formatted JSON-RPC error and returns NULL. */
 static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw,
-                                   int64_t req_id, char **err_out) {
+                                   const cbm_jsonrpc_request_t *req, char **err_out) {
     *err_out = NULL;
     /* Extract URI from params */
     char *uri = NULL;
@@ -12867,7 +12969,7 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
         }
     }
     if (!uri) {
-        *err_out = cbm_jsonrpc_format_error(req_id, -32602, "Missing uri parameter");
+        *err_out = format_request_error(req, CBM_JSONRPC_INVALID_PARAMS, "Missing uri parameter");
         return NULL;
     }
 
@@ -12885,13 +12987,14 @@ static char *handle_resources_read(cbm_mcp_server_t *srv, const char *params_raw
     } else {
         yyjson_mut_doc_free(doc);
         char msg[512];
-        snprintf(msg, sizeof(msg),
+        snprintf(
+            msg, sizeof(msg),
             "Resource not found: '%s'. "
             "Available resources: codebase://schema, codebase://architecture, codebase://status. "
             "Use resources/list to discover all resources.",
             uri);
         free(uri);
-        *err_out = cbm_jsonrpc_format_error(req_id, -32002, msg);
+        *err_out = format_request_error(req, CBM_MCP_RESOURCE_NOT_FOUND, msg);
         return NULL;
     }
 
@@ -12925,10 +13028,19 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     CBM_PROF_START(prof_mcp_request_total);
     CBM_PROF_START(prof_mcp_parse);
     cbm_jsonrpc_request_t req = {0};
-    if (cbm_jsonrpc_parse(line, &req) < 0) {
+    int parse_status = cbm_jsonrpc_parse(line, &req);
+    if (parse_status != 0) {
         CBM_PROF_END("mcp_request", "parse_error", prof_mcp_parse);
         CBM_PROF_END("mcp_request_total", "parse_error", prof_mcp_request_total);
-        return cbm_jsonrpc_format_error(0, JSONRPC_PARSE_ERROR, "Parse error");
+        const char *message = "Internal error";
+        if (parse_status == CBM_JSONRPC_PARSE_ERROR) {
+            message = "Parse error";
+        } else if (parse_status == CBM_JSONRPC_INVALID_REQUEST) {
+            message = "Invalid Request";
+        }
+        char *error = format_request_error(&req, parse_status, message);
+        cbm_jsonrpc_request_free(&req);
+        return error;
     }
     CBM_PROF_END("mcp_request", "parse", prof_mcp_parse);
 
@@ -12939,9 +13051,8 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             cbm_mutex_lock(&srv->active_request_lock);
             cbm_pipeline_t *active =
                 atomic_load_explicit(&srv->active_pipeline, memory_order_acquire);
-            if (active &&
-                cbm_mcp_cancel_request_matches(req.params_raw, srv->active_request_id,
-                                               srv->active_request_id_str)) {
+            if (active && cbm_mcp_cancel_request_matches(req.params_raw, srv->active_request_id,
+                                                         srv->active_request_id_str)) {
                 cbm_pipeline_cancel(active);
                 cbm_log_info("mcp.cancelled", "match", "true");
             }
@@ -12965,10 +13076,10 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     } else if (strcmp(req.method, "resources/list") == 0) {
         result_json = handle_resources_list(srv);
     } else if (strcmp(req.method, "resources/read") == 0) {
-        /* handle_resources_read may return a pre-formatted JSON-RPC error (id=0).
-         * Detect by checking for NULL result_json — errors are returned via err_out. */
+        /* Resource protocol errors are pre-formatted with the request's exact
+         * numeric, string, or null ID and returned through err_out. */
         char *err_out = NULL;
-        result_json = handle_resources_read(srv, req.params_raw, req.id, &err_out);
+        result_json = handle_resources_read(srv, req.params_raw, &req, &err_out);
         if (err_out) {
             /* Error already formatted as JSON-RPC with correct id — return directly */
             CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown",
@@ -12988,10 +13099,37 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         result_json = cbm_mcp_tools_list_page(srv, req.params_raw);
     } else if (strcmp(req.method, "tools/call") == 0) {
         CBM_PROF_START(prof_mcp_tool_params);
-        char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
-        char *tool_args =
-            req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+        char *tool_name = NULL;
+        char *tool_args = NULL;
+        const char *params_error = NULL;
+        int protocol_error_code =
+            parse_tool_call_params(req.params_raw, &tool_name, &tool_args, &params_error);
         CBM_PROF_END("mcp_tool_call", "params", prof_mcp_tool_params);
+
+        char protocol_error[192] = {0};
+        if (protocol_error_code != 0) {
+            snprintf(protocol_error, sizeof(protocol_error), "%s",
+                     params_error ? params_error : "Invalid tools/call params");
+        } else if (!mcp_tool_name_is_known(tool_name)) {
+            protocol_error_code = CBM_JSONRPC_INVALID_PARAMS;
+            snprintf(protocol_error, sizeof(protocol_error), "Unknown tool: %.128s", tool_name);
+        }
+
+        if (protocol_error_code != 0) {
+            char *err = format_request_error(&req, protocol_error_code, protocol_error);
+            struct timespec error_t1;
+            cbm_clock_gettime(CLOCK_MONOTONIC, &error_t1);
+            long long error_dur_us =
+                ((long long)(error_t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
+                ((long long)(error_t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
+            cbm_log_mcp_request(req.method, tool_name, true, error_dur_us);
+            free(tool_name);
+            free(tool_args);
+            CBM_PROF_END("mcp_request_total", req.method, prof_mcp_request_total);
+            cbm_jsonrpc_request_free(&req);
+            return err;
+        }
+
         cbm_mutex_lock(&srv->active_request_lock);
         srv->active_request_id = req.id;
         free(srv->active_request_id_str);
@@ -13027,13 +13165,12 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         free(tool_args);
     } else {
         /* Echo the original id (string or numeric, issue #253) on the error. */
-        char err_obj[160];
-        snprintf(err_obj, sizeof(err_obj), "{\"code\":%d,\"message\":\"Method not found\"}",
-                 JSONRPC_METHOD_NOT_FOUND);
         cbm_jsonrpc_response_t err_resp = {
             .id = req.id,
             .id_str = req.id_str,
-            .error_json = err_obj,
+            .id_is_null = req.id_is_null,
+            .error_code = CBM_JSONRPC_METHOD_NOT_FOUND,
+            .error_message = "Method not found",
         };
         char *err = cbm_jsonrpc_format_response(&err_resp);
         CBM_PROF_END("mcp_request_total", req.method ? req.method : "unknown",
@@ -13058,6 +13195,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_jsonrpc_response_t resp = {
         .id = req.id,
         .id_str = req.id_str,
+        .id_is_null = req.id_is_null,
         .result_json = result_json,
     };
     CBM_PROF_START(prof_mcp_response_format);
