@@ -557,11 +557,23 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     cases = [case for report in reports for case in cases_from_report(report)]
     report_modes = {str(report.get("mode") or "") for report in reports}
     capability_quality = report_modes == {"capability_quality"}
-    canonical = [
-        bool(case["canonical_graph"].get("equal"))
-        for case in cases
-        if isinstance(case.get("canonical_graph"), dict)
-    ]
+    canonical: list[bool] = []
+    for case in cases:
+        canonical_graph = case.get("canonical_graph")
+        if isinstance(canonical_graph, dict):
+            canonical.append(bool(canonical_graph.get("equal")))
+            continue
+        lifecycle = case.get("pair_lifecycle")
+        if not isinstance(lifecycle, dict):
+            continue
+        policy = lifecycle.get("incremental_policy")
+        lifecycle_graph = lifecycle.get("canonical_graph")
+        if (
+            isinstance(policy, dict)
+            and policy.get("immediate_freshness_expected") is True
+            and isinstance(lifecycle_graph, dict)
+        ):
+            canonical.append(bool(lifecycle_graph.get("equal")))
     oracles: list[bool] = []
     quality_miss_ablation_states: list[bool] = []
     for report in reports:
@@ -823,7 +835,15 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if quality_applicable
         else sum(oracles) / len(oracles) if oracles else None
     )
-    quality_categories = (retrieval_score, graph_fidelity_score, task_success_score)
+    result_quality_values = [
+        value
+        for value in (retrieval_score, pair_f1_score)
+        if isinstance(value, (int, float))
+    ]
+    result_quality_score = (
+        statistics.mean(result_quality_values) if result_quality_values else None
+    )
+    quality_categories = (result_quality_score, graph_fidelity_score, task_success_score)
     overall_quality_score = (
         math.prod(quality_categories) ** (1.0 / len(quality_categories))
         if all(isinstance(value, (int, float)) for value in quality_categories)
@@ -1969,8 +1989,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "rather than hiding the failed task.",
             "",
             "† Overall quality is a custom descriptive score: the equal-weight geometric mean of "
-            "Retrieval MRR, graph fidelity, and task success. It is N/A unless all three categories are "
-            "measured. It never overrides a graph-correctness gate. A required mutation oracle can "
+            "result quality, graph fidelity, and task success. Result quality is Pair F1 or Retrieval "
+            "MRR when only one is measured, and their arithmetic mean when both are measured. It is "
+            "N/A unless all three categories are measured. It never overrides a graph-correctness gate. "
+            "A required mutation oracle can "
             "reject a correctness benchmark; an algorithm-ablation oracle that misses its declared "
             "cutoff is labelled BELOW QUALITY TARGET instead of being called broken. Category values "
             "remain visible so the aggregate cannot hide which capability changed.",
