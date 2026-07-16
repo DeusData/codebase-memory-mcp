@@ -71,6 +71,12 @@ For compact `--matrix-spec` grids, each scenario requires `frontier_files` and
 `incremental_exact_max_affected_paths`; the generated cell is labelled
 `capdefault` and does not inject a config override.
 
+Set top-level `"accepted_exit_codes": [0, 1]` when the matrix benchmark uses exit
+code 1 for a completed measurement that missed a correctness or quality gate. The
+expanded cells retain that policy in their identities. Result parsing, binary-hash
+validation, and the structured `error` check still prevent crashes or harness
+errors from becoming completed evidence.
+
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
 remain available and take priority over the selected profile. The default profile

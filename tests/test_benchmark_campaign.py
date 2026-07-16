@@ -92,6 +92,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "benchmark_script": str(benchmark),
                 "cwd": str(root),
                 "timeout_seconds": 300,
+                "accepted_exit_codes": [0, 1],
                 "repetitions": 2,
                 "transports": ["cli"],
                 "candidates": [
@@ -129,6 +130,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(first["binary_sha256"], CAMPAIGN.file_sha256(binary))
             self.assertEqual(first["parameters"]["frontier_files"], 4)
             self.assertEqual(first["parameters"]["exact_cap"], 4)
+            self.assertEqual(first["accepted_exit_codes"], [0, 1])
             self.assertEqual(
                 first["capability_support"], {"dependencies": True, "rank": True}
             )
