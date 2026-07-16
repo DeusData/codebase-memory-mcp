@@ -263,6 +263,48 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("1 expected positive absent", finding)
         self.assertNotIn("All applicable", markdown)
 
+    def test_eager_pair_quality_contributes_graph_fidelity_and_overall_score(self) -> None:
+        perfect = {
+            "passed": True,
+            "pair_classification": {
+                "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                "f1": 1.0,
+            },
+        }
+        case = {
+            "scenario": "semantic_edges_quality",
+            "passed": True,
+            "quality_target_met": True,
+            "fixture": {"capability": "semantic_edges"},
+            "oracles": {"passed": True},
+            "pair_lifecycle": {
+                "initial_oracles": perfect,
+                "incremental_oracles": perfect,
+                "fresh_oracles": perfect,
+                "canonical_graph": {"equal": True},
+                "pair_equality": {"passed": True},
+                "incremental_policy": {
+                    "immediate_freshness_expected": True,
+                    "policy_conformance_met": True,
+                },
+            },
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+        item["parameters"] = {
+            "config_profile": "incremental_semantic_freshness_eager",
+            "config_overrides": {"incremental_derived_refresh": "eager"},
+            "index_mode": "moderate",
+        }
+
+        row = SUMMARY.summarize_group("latest-semantic-eager", [item])
+
+        self.assertEqual(row["decision"], "PASS")
+        self.assertEqual(row["pair_f1_score"], 1.0)
+        self.assertEqual(row["graph_fidelity_score"], 1.0)
+        self.assertEqual(row["task_success_score"], 1.0)
+        self.assertEqual(row["overall_quality_score"], 1.0)
+
     def test_composition_spec_groups_validated_campaign_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
