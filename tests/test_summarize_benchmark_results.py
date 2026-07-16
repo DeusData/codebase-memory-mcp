@@ -30,8 +30,16 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             root = Path(tmpdir)
             campaign_root = root / "campaign"
             campaign_root.mkdir()
-            matrix_spec = root / "matrix.json"
-            matrix_spec.write_text('{"schema_version": 1}\n', encoding="utf-8")
+            plan = campaign_root / "immutable-plan.json"
+            plan.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "cells": [{"label": "rank"}, {"label": "incremental"}],
+                    }
+                ),
+                encoding="utf-8",
+            )
             for label in ("rank", "incremental"):
                 (campaign_root / f"{label}.json").write_text(
                     json.dumps({"binary_metadata": {"sha256": "a" * 64}, "cases": []}),
@@ -44,7 +52,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                         "schema_version": 1,
                         "campaigns": {
                             "fixture": {
-                                "matrix_spec": "matrix.json",
+                                "plan": "campaign/immutable-plan.json",
                                 "campaign_root": "campaign",
                             }
                         },
@@ -67,8 +75,11 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             class FakeCampaign:
                 @staticmethod
                 def expand_matrix_spec(spec: dict) -> dict:
-                    self.assertEqual(spec["schema_version"], 1)
-                    return {"cells": [{"label": "rank"}, {"label": "incremental"}]}
+                    raise AssertionError("report composition must not re-expand a matrix")
+
+                @staticmethod
+                def validate_plan(document: dict) -> list[dict]:
+                    return document["cells"]
 
                 @staticmethod
                 def completed_report_inputs(

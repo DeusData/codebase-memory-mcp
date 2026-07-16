@@ -1662,7 +1662,8 @@ def load_composition_groups(
         raise ValueError("composition campaigns must be a non-empty object")
     runner = campaign_runner or load_campaign_runner()
     base = composition_path.parent
-    resolved_campaigns: dict[str, tuple[Path, Path]] = {}
+    resolved_campaigns: dict[str, tuple[list[dict[str, Any]], Path]] = {}
+    campaign_records: list[dict[str, Any]] = []
     for campaign_name, campaign in campaigns.items():
         if (
             not isinstance(campaign_name, str)
@@ -1673,13 +1674,38 @@ def load_composition_groups(
                 "composition campaign entries must have non-empty names and objects"
             )
         prefix = f"campaigns.{campaign_name}"
-        resolved_campaigns[campaign_name] = (
-            _composition_path(
-                base, campaign.get("matrix_spec"), f"{prefix}.matrix_spec"
-            ),
-            _composition_path(
-                base, campaign.get("campaign_root"), f"{prefix}.campaign_root"
-            ),
+        matrix_value = campaign.get("matrix_spec")
+        plan_value = campaign.get("plan")
+        if (matrix_value is None) == (plan_value is None):
+            raise ValueError(f"{prefix} must declare exactly one of matrix_spec or plan")
+        campaign_root = _composition_path(
+            base, campaign.get("campaign_root"), f"{prefix}.campaign_root"
+        )
+        if plan_value is not None:
+            source_path = _composition_path(base, plan_value, f"{prefix}.plan")
+            with source_path.open(encoding="utf-8") as stream:
+                plan = json.load(stream)
+            cells = runner.validate_plan(plan)
+            source_kind = "immutable_plan"
+        else:
+            source_path = _composition_path(
+                base, matrix_value, f"{prefix}.matrix_spec"
+            )
+            with source_path.open(encoding="utf-8") as stream:
+                matrix_spec = json.load(stream)
+            plan = runner.expand_matrix_spec(matrix_spec)
+            cells = plan.get("cells") if isinstance(plan, dict) else None
+            if not isinstance(cells, list):
+                raise ValueError(f"{prefix}.matrix_spec did not expand to cells")
+            source_kind = "live_matrix_expansion"
+        resolved_campaigns[campaign_name] = (cells, campaign_root)
+        campaign_records.append(
+            {
+                "campaign": campaign_name,
+                "source_kind": source_kind,
+                "source_path": str(source_path),
+                "source_sha256": file_sha256(source_path),
+            }
         )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     input_records: list[dict[str, Any]] = []
@@ -1708,7 +1734,7 @@ def load_composition_groups(
                 or campaign_name not in resolved_campaigns
             ):
                 raise ValueError(f"{prefix}.campaign must name a declared campaign")
-            matrix_path, campaign_root = resolved_campaigns[campaign_name]
+            cells, campaign_root = resolved_campaigns[campaign_name]
             cell_labels = source.get("cell_labels")
             if (
                 not isinstance(cell_labels, list)
@@ -1718,12 +1744,6 @@ def load_composition_groups(
                 raise ValueError(
                     f"{prefix}.cell_labels must be a non-empty string array"
                 )
-            with matrix_path.open(encoding="utf-8") as stream:
-                matrix_spec = json.load(stream)
-            plan = runner.expand_matrix_spec(matrix_spec)
-            cells = plan.get("cells") if isinstance(plan, dict) else None
-            if not isinstance(cells, list):
-                raise ValueError(f"{prefix}.matrix_spec did not expand to cells")
             requested = set(cell_labels)
             selected = [cell for cell in cells if cell.get("label") in requested]
             found = {cell.get("label") for cell in selected}
@@ -1755,6 +1775,7 @@ def load_composition_groups(
         "schema_version": 1,
         "spec_path": str(composition_path),
         "spec_sha256": file_sha256(composition_path),
+        "campaigns": campaign_records,
         "input_count": len(input_records),
         "inputs": input_records,
     }
