@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -402,6 +404,24 @@ def summarize_capability_applicability(
     return summarized
 
 
+def quality_miss_is_explicit_ablation(
+    report: dict[str, Any], case: dict[str, Any]
+) -> bool:
+    fixture = case.get("fixture")
+    capability = fixture.get("capability") if isinstance(fixture, dict) else None
+    parameters = report.get("parameters")
+    overrides = (
+        parameters.get("config_overrides") if isinstance(parameters, dict) else None
+    )
+    if not isinstance(overrides, dict):
+        return False
+    key = "rank_enabled" if capability == "rank" else "auto_index_deps"
+    if capability not in {"rank", "dependencies"}:
+        return False
+    value = overrides.get(key)
+    return value is False or (isinstance(value, str) and value.lower() == "false")
+
+
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
     report_modes = {str(report.get("mode") or "") for report in reports}
@@ -412,16 +432,22 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if isinstance(case.get("canonical_graph"), dict)
     ]
     oracles: list[bool] = []
-    for case in cases:
-        case_oracles = case.get("oracles")
-        if not isinstance(case_oracles, dict):
-            continue
-        verdict = case_oracles.get("passed")
-        if not isinstance(verdict, bool):
-            quality = case_oracles.get("quality")
-            verdict = quality.get("passed") if isinstance(quality, dict) else None
-        if isinstance(verdict, bool):
-            oracles.append(verdict)
+    quality_miss_ablation_states: list[bool] = []
+    for report in reports:
+        for case in cases_from_report(report):
+            case_oracles = case.get("oracles")
+            if not isinstance(case_oracles, dict):
+                continue
+            verdict = case_oracles.get("passed")
+            if not isinstance(verdict, bool):
+                quality = case_oracles.get("quality")
+                verdict = quality.get("passed") if isinstance(quality, dict) else None
+            if isinstance(verdict, bool):
+                oracles.append(verdict)
+                if verdict is False and case.get("quality_target_met") is False:
+                    quality_miss_ablation_states.append(
+                        quality_miss_is_explicit_ablation(report, case)
+                    )
     case_passes = [
         bool(case.get("quality_target_met"))
         if capability_quality and isinstance(case.get("quality_target_met"), bool)
@@ -518,9 +544,15 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
 
     canonical_failed = any(not value for value in canonical)
     oracle_target_missed = any(not value for value in oracles)
+    missed_oracle_count = sum(1 for value in oracles if not value)
+    explicit_ablation_miss = (
+        bool(quality_miss_ablation_states)
+        and len(quality_miss_ablation_states) == missed_oracle_count
+        and all(quality_miss_ablation_states)
+    )
     if canonical_failed:
         decision = "REJECT: graph correctness"
-    elif oracle_target_missed and capability_quality:
+    elif oracle_target_missed and (capability_quality or explicit_ablation_miss):
         decision = "BELOW QUALITY TARGET"
     elif oracle_target_missed:
         decision = "REJECT: task correctness"
@@ -1515,9 +1547,157 @@ def parse_input(value: str) -> tuple[str, Path]:
     return label, Path(raw_path).expanduser()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def load_campaign_runner() -> Any:
+    path = Path(__file__).resolve().with_name("run-benchmark-campaign.py")
+    spec = importlib.util.spec_from_file_location(
+        "run_benchmark_campaign_for_summary", path
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load campaign runner: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _composition_path(base: Path, value: Any, field: str) -> Path:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be a non-empty path string")
+    path = Path(value).expanduser()
+    return (base / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+def load_composition_groups(
+    composition_path: Path, campaign_runner: Any | None = None
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Resolve completed campaign cells into exact cross-scenario report groups."""
+    composition_path = composition_path.expanduser().resolve()
+    with composition_path.open(encoding="utf-8") as stream:
+        composition = json.load(stream)
+    if not isinstance(composition, dict) or composition.get("schema_version") != 1:
+        raise ValueError("composition schema_version must be 1")
+    groups = composition.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("composition groups must be a non-empty array")
+    campaigns = composition.get("campaigns")
+    if not isinstance(campaigns, dict) or not campaigns:
+        raise ValueError("composition campaigns must be a non-empty object")
+    runner = campaign_runner or load_campaign_runner()
+    base = composition_path.parent
+    resolved_campaigns: dict[str, tuple[Path, Path]] = {}
+    for campaign_name, campaign in campaigns.items():
+        if (
+            not isinstance(campaign_name, str)
+            or not campaign_name
+            or not isinstance(campaign, dict)
+        ):
+            raise ValueError(
+                "composition campaign entries must have non-empty names and objects"
+            )
+        prefix = f"campaigns.{campaign_name}"
+        resolved_campaigns[campaign_name] = (
+            _composition_path(
+                base, campaign.get("matrix_spec"), f"{prefix}.matrix_spec"
+            ),
+            _composition_path(
+                base, campaign.get("campaign_root"), f"{prefix}.campaign_root"
+            ),
+        )
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    input_records: list[dict[str, Any]] = []
+    seen_labels: set[str] = set()
+    for group_index, group in enumerate(groups):
+        if not isinstance(group, dict):
+            raise ValueError(f"groups[{group_index}] must be an object")
+        label = group.get("label")
+        if not isinstance(label, str) or not label or label in seen_labels:
+            raise ValueError(
+                f"groups[{group_index}].label must be non-empty and unique"
+            )
+        seen_labels.add(label)
+        inputs = group.get("inputs")
+        if not isinstance(inputs, list) or not inputs:
+            raise ValueError(f"groups[{group_index}].inputs must be a non-empty array")
+        for source_index, source in enumerate(inputs):
+            if not isinstance(source, dict):
+                raise ValueError(
+                    f"groups[{group_index}].inputs[{source_index}] must be an object"
+                )
+            prefix = f"groups[{group_index}].inputs[{source_index}]"
+            campaign_name = source.get("campaign")
+            if (
+                not isinstance(campaign_name, str)
+                or campaign_name not in resolved_campaigns
+            ):
+                raise ValueError(f"{prefix}.campaign must name a declared campaign")
+            matrix_path, campaign_root = resolved_campaigns[campaign_name]
+            cell_labels = source.get("cell_labels")
+            if (
+                not isinstance(cell_labels, list)
+                or not cell_labels
+                or not all(isinstance(item, str) and item for item in cell_labels)
+            ):
+                raise ValueError(
+                    f"{prefix}.cell_labels must be a non-empty string array"
+                )
+            with matrix_path.open(encoding="utf-8") as stream:
+                matrix_spec = json.load(stream)
+            plan = runner.expand_matrix_spec(matrix_spec)
+            cells = plan.get("cells") if isinstance(plan, dict) else None
+            if not isinstance(cells, list):
+                raise ValueError(f"{prefix}.matrix_spec did not expand to cells")
+            requested = set(cell_labels)
+            selected = [cell for cell in cells if cell.get("label") in requested]
+            found = {cell.get("label") for cell in selected}
+            missing_labels = sorted(requested - found)
+            if missing_labels:
+                raise ValueError(
+                    f"{prefix} cell labels not found: {', '.join(missing_labels)}"
+                )
+            inputs = runner.completed_report_inputs(campaign_root, selected)
+            if len(inputs) != len(selected):
+                raise ValueError(
+                    f"{prefix} has {len(inputs)} validated completions for {len(selected)} cells"
+                )
+            for cell_label, input_path in inputs:
+                with input_path.open(encoding="utf-8") as stream:
+                    document = json.load(stream)
+                if not isinstance(document, dict):
+                    raise ValueError(f"expected JSON object in {input_path}")
+                grouped[label].append(document)
+                input_records.append(
+                    {
+                        "group": label,
+                        "cell_label": cell_label,
+                        "input_path": str(input_path.resolve()),
+                        "input_sha256": file_sha256(input_path),
+                    }
+                )
+    provenance = {
+        "schema_version": 1,
+        "spec_path": str(composition_path),
+        "spec_sha256": file_sha256(composition_path),
+        "input_count": len(input_records),
+        "inputs": input_records,
+    }
+    return grouped, provenance
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", action="append", default=[], type=parse_input)
+    parser.add_argument(
+        "--composition-spec",
+        type=Path,
+        help="Compose exact labels from validated cells in multiple durable campaigns.",
+    )
     parser.add_argument(
         "--mcp-surface-parity",
         action="append",
@@ -1543,21 +1723,32 @@ def main() -> int:
     args = parser.parse_args()
     if (
         not args.input
+        and not args.composition_spec
         and not args.mcp_surface_parity
         and not args.list_projects_scaling
         and not args.search_projection
     ):
         parser.error(
-            "at least one --input, --mcp-surface-parity, --list-projects-scaling, or "
-            "--search-projection is required"
+            "at least one --input, --composition-spec, --mcp-surface-parity, "
+            "--list-projects-scaling, or --search-projection is required"
         )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    composition_provenance: dict[str, Any] | None = None
     for label, path in args.input:
         with path.open(encoding="utf-8") as stream:
             document = json.load(stream)
         if not isinstance(document, dict):
             raise SystemExit(f"error: expected JSON object in {path}")
         grouped[label].append(document)
+    if args.composition_spec:
+        try:
+            composed, composition_provenance = load_composition_groups(
+                args.composition_spec
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"error: invalid composition spec: {exc}") from exc
+        for label, documents in composed.items():
+            grouped[label].extend(documents)
     sections: list[str] = []
     if grouped:
         sections.append(
@@ -1586,10 +1777,29 @@ def main() -> int:
         if not isinstance(document, dict):
             raise SystemExit(f"error: expected JSON object in {path}")
         sections.append(render_search_projection(document).rstrip())
+    if composition_provenance:
+        sections.append(
+            "\n".join(
+                (
+                    "## Composition provenance",
+                    "",
+                    f"- Spec: `{composition_provenance['spec_path']}`",
+                    f"- Spec SHA-256: `{composition_provenance['spec_sha256']}`",
+                    f"- Validated campaign inputs: {composition_provenance['input_count']}",
+                    "- Per-input paths and SHA-256 values are retained in the sidecar manifest.",
+                )
+            )
+        )
     markdown = "\n\n".join(sections) + "\n"
     if args.out:
         output = Path(args.out).expanduser()
         atomic_write_text(output, markdown)
+        if composition_provenance:
+            manifest_output = output.with_name(output.name + ".manifest.json")
+            atomic_write_text(
+                manifest_output,
+                json.dumps(composition_provenance, indent=2, sort_keys=True) + "\n",
+            )
     print(markdown, end="")
     return 0
 

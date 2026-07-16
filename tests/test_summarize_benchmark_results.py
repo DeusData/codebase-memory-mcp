@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,68 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_composition_spec_groups_validated_campaign_cells(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            campaign_root = root / "campaign"
+            campaign_root.mkdir()
+            matrix_spec = root / "matrix.json"
+            matrix_spec.write_text('{"schema_version": 1}\n', encoding="utf-8")
+            for label in ("rank", "incremental"):
+                (campaign_root / f"{label}.json").write_text(
+                    json.dumps({"binary_metadata": {"sha256": "a" * 64}, "cases": []}),
+                    encoding="utf-8",
+                )
+            composition = root / "composition.json"
+            composition.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "campaigns": {
+                            "fixture": {
+                                "matrix_spec": "matrix.json",
+                                "campaign_root": "campaign",
+                            }
+                        },
+                        "groups": [
+                            {
+                                "label": "latest-default-mcp",
+                                "inputs": [
+                                    {
+                                        "campaign": "fixture",
+                                        "cell_labels": ["rank", "incremental"],
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeCampaign:
+                @staticmethod
+                def expand_matrix_spec(spec: dict) -> dict:
+                    self.assertEqual(spec["schema_version"], 1)
+                    return {"cells": [{"label": "rank"}, {"label": "incremental"}]}
+
+                @staticmethod
+                def completed_report_inputs(
+                    path: Path, cells: list[dict]
+                ) -> list[tuple[str, Path]]:
+                    return [
+                        (cell["label"], path / f"{cell['label']}.json")
+                        for cell in cells
+                    ]
+
+            grouped, provenance = SUMMARY.load_composition_groups(
+                composition, FakeCampaign
+            )
+
+            self.assertEqual(len(grouped["latest-default-mcp"]), 2)
+            self.assertEqual(provenance["input_count"], 2)
+            self.assertEqual(provenance["spec_path"], str(composition.resolve()))
+
     def test_search_projection_report_keeps_identity_quality_beside_size(self) -> None:
         document = {
             "mode": "search_projection",
@@ -696,6 +759,42 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         markdown = SUMMARY.render_markdown([row])
         self.assertIn("0.800", markdown)
         self.assertIn("4/5 / 1/1 / 0/1", markdown)
+
+    def test_composed_disabled_capability_is_below_target_not_correctness_rejection(
+        self,
+    ) -> None:
+        quality_report = report(
+            {
+                "passed": False,
+                "execution_passed": True,
+                "quality_target_met": False,
+                "fixture": {"capability": "rank"},
+                "oracles": {
+                    "passed": False,
+                    "quality": {
+                        "passed": False,
+                        "passed_count": 0,
+                        "applicable_count": 1,
+                        "score": 0.1,
+                    },
+                },
+            }
+        )
+        quality_report["mode"] = "capability_quality"
+        incremental_report = report(
+            {
+                "passed": True,
+                "canonical_graph": {"equal": True},
+                "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            }
+        )
+        incremental_report["mode"] = "matrix"
+
+        row = SUMMARY.summarize_group(
+            "rank-disabled", [quality_report, incremental_report]
+        )
+
+        self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
 
     def test_pareto_reason_lists_missing_axes_for_ineligible_row(self) -> None:
         row = SUMMARY.summarize_group(
