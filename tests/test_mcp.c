@@ -417,6 +417,27 @@ TEST(mcp_initialize_response) {
     PASS();
 }
 
+TEST(mcp_initialize_resources_do_not_claim_static_list_changes) {
+    char *json = cbm_mcp_initialize_response(NULL);
+    ASSERT_NOT_NULL(json);
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *capabilities = yyjson_obj_get(root, "capabilities");
+    yyjson_val *tools = yyjson_obj_get(capabilities, "tools");
+    yyjson_val *resources = yyjson_obj_get(capabilities, "resources");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_NOT_NULL(resources);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(tools, "listChanged")));
+    ASSERT_NULL(yyjson_obj_get(resources, "listChanged"));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(resources, "subscribe")));
+
+    yyjson_doc_free(doc);
+    free(json);
+    PASS();
+}
+
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
@@ -9891,6 +9912,7 @@ SUITE(mcp) {
 
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
+    RUN_TEST(mcp_initialize_resources_do_not_claim_static_list_changes);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_classic_mode);
     RUN_TEST(mcp_tools_list_latest_metadata);
