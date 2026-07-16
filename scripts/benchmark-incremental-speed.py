@@ -35,6 +35,10 @@ DEFAULT_RANK_REFRESH = "stale_on_exact"
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
 DEFAULT_FRONTIER_FILES = 16
+DEFAULT_LIST_PROJECT_COUNTS = "1,16,64"
+DEFAULT_LIST_PROJECT_FIXTURE_MAX_MB = 512
+LIST_PROJECT_DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
+LIST_PROJECT_DISK_RESERVE_FRACTION = 0.05
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
 CONFIG_PROFILE_DEFAULT = "default"
 CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
@@ -519,6 +523,56 @@ def command_result(
     return proc, now_ms() - start
 
 
+def parse_list_project_counts(raw: str) -> list[int]:
+    """Parse a strictly increasing positive scaling series."""
+    items = raw.split(",") if raw else []
+    try:
+        counts = [int(item.strip()) for item in items if item.strip()]
+    except ValueError as exc:
+        raise ValueError("list project counts must be comma-separated integers") from exc
+    if not counts or any(count <= 0 for count in counts):
+        raise ValueError("list project counts must contain positive integers")
+    if any(left >= right for left, right in zip(counts, counts[1:])):
+        raise ValueError("list project counts must be strictly increasing")
+    return counts
+
+
+def list_project_fixture_budget(
+    *,
+    seed_bytes: int,
+    maximum_projects: int,
+    maximum_fixture_mb: int,
+    disk_free_bytes: int,
+) -> dict[str, Any]:
+    """Return a deterministic disk gate before cloning list-project fixtures."""
+    if min(seed_bytes, maximum_projects, maximum_fixture_mb, disk_free_bytes) <= 0:
+        raise ValueError("list-project fixture budget inputs must be positive")
+    mib = 1024 * 1024
+    projected_bytes = seed_bytes * maximum_projects
+    cap_bytes = maximum_fixture_mb * mib
+    reserved_bytes = max(
+        LIST_PROJECT_DISK_RESERVE_BYTES,
+        math.ceil(disk_free_bytes * LIST_PROJECT_DISK_RESERVE_FRACTION),
+    )
+    available_after_reserve = max(0, disk_free_bytes - reserved_bytes)
+    reason = ""
+    if projected_bytes > cap_bytes:
+        reason = "projected fixture exceeds configured cap"
+    elif projected_bytes > available_after_reserve:
+        reason = "projected fixture violates free-space reserve"
+    return {
+        "passed": not reason,
+        "reason": reason or None,
+        "seed_bytes": seed_bytes,
+        "maximum_projects": maximum_projects,
+        "projected_fixture_bytes": projected_bytes,
+        "configured_cap_bytes": cap_bytes,
+        "disk_free_bytes": disk_free_bytes,
+        "reserved_free_bytes": reserved_bytes,
+        "available_after_reserve_bytes": available_after_reserve,
+    }
+
+
 def text_tail(text: str, max_lines: int = FAILURE_TAIL_LINES) -> list[str]:
     lines = text.splitlines()
     return lines[-max_lines:]
@@ -644,6 +698,23 @@ def canonical_response_bytes(data: dict[str, Any]) -> bytes:
 def estimate_response_tokens(payload: bytes) -> int:
     """Return a deterministic, dependency-free byte/4 token estimate."""
     return (len(payload) + 3) // 4
+
+
+def process_rss_kb(pid: int) -> int | None:
+    """Read resident memory after a call; this is not a peak-RSS measurement."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        return int(proc.stdout.strip())
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
 
 
 def tool_schema_sha256(tool: dict[str, Any]) -> str:
@@ -1007,6 +1078,173 @@ def run_mcp_surface_parity(
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.out:
             write_text(Path(args.out).expanduser(), rendered)
+        print(rendered, end="")
+    return report, exit_code
+
+
+def run_list_projects_scaling(
+    args: argparse.Namespace, binary: Path
+) -> tuple[dict[str, Any], int]:
+    counts = parse_list_project_counts(args.list_project_counts)
+    auto_root = not bool(args.work_root)
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="cbm-list-projects-scaling-"))
+    )
+    cache_dir = work_root / "cache"
+    seed_repo = work_root / "seed-repo"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    seed_repo.mkdir(parents=True, exist_ok=True)
+    generated_at = datetime.now(timezone.utc)
+    metadata = binary_metadata(binary)
+    run_id = (
+        f"list-projects-{generated_at.strftime('%Y%m%dT%H%M%SZ')}-"
+        f"{metadata['sha256'][:12]}-{os.getpid()}"
+    )
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "generated_at_utc": generated_at.isoformat(),
+        "binary": str(binary),
+        "binary_metadata": metadata,
+        "source_revision": git_metadata(Path(__file__).resolve().parents[1], args.timeout),
+        "mode": "list_projects_scaling",
+        "parameters": {
+            "project_counts": counts,
+            "maximum_fixture_mb": args.list_project_fixture_max_mb,
+            "timeout_seconds": args.timeout,
+            "process_isolation": "fresh_mcp_server_per_count",
+            "seed_index_mode": "fast",
+            "seed_config_profile": CONFIG_PROFILE_MINIMAL_INDEXING,
+            "token_estimator": TOKEN_ESTIMATOR,
+            "rss_measurement": "post_call_resident_kb_not_peak",
+        },
+        "work_root": str(work_root),
+        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "observations": [],
+        "completion": {"status": "running"},
+    }
+    exit_code = 1
+    try:
+        create_repo(seed_repo, 1, 1)
+        env = build_env(cache_dir)
+        env.pop("CBM_PROFILE", None)
+        apply_config_overrides(
+            binary, env, CONFIG_PROFILES[CONFIG_PROFILE_MINIMAL_INDEXING], args.timeout
+        )
+        with McpClient(binary, env, args.timeout) as client:
+            seed_result, _, _, _ = client.call_tool(
+                "index_repository",
+                {**index_tool_arguments(seed_repo, "fast"), "auto_index_deps": False},
+            )
+        seed_db = find_project_db(cache_dir)
+        seed_project = str(seed_result.get("project") or seed_db.stem)
+        disk = shutil.disk_usage(work_root)
+        budget = list_project_fixture_budget(
+            seed_bytes=seed_db.stat().st_size,
+            maximum_projects=counts[-1],
+            maximum_fixture_mb=args.list_project_fixture_max_mb,
+            disk_free_bytes=disk.free,
+        )
+        report["fixture"] = {
+            "seed_project": seed_project,
+            "seed_db": str(seed_db),
+            "budget": budget,
+        }
+        if not budget["passed"]:
+            raise RuntimeError(str(budget["reason"]))
+
+        created_projects = 1
+        for requested_count in counts:
+            for fixture_index in range(created_projects, requested_count):
+                project = f"list-project-{fixture_index:06d}"
+                destination = cache_dir / f"{project}{PROJECT_DB_SUFFIX}"
+                root_path = work_root / "roots" / project
+                clone_list_project_db(seed_db, destination, project, str(root_path))
+            created_projects = requested_count
+
+            client = McpClient(binary, env, args.timeout)
+            with client:
+                data, stderr, stdout_bytes, elapsed_ms = client.call_tool("list_projects", {})
+                projects = data.get("projects")
+                returned_count = len(projects) if isinstance(projects, list) else None
+                transport_start = now_ms()
+                tools_response = client._request("tools/list", {})
+                transport_probe_ms = now_ms() - transport_start
+                transport_survived = isinstance(tools_response.get("result"), dict)
+                rss_kb = process_rss_kb(client.proc.pid) if client.proc else None
+            server_reaped = (
+                client.proc is None
+                and client.stdout_thread is None
+                and client.stderr_thread is None
+            )
+            payload = canonical_response_bytes(data)
+            db_bytes = sum(
+                path.stat().st_size
+                for path in cache_dir.glob(f"*{PROJECT_DB_SUFFIX}")
+                if path.name != CONFIG_DB_NAME
+            )
+            report["observations"].append(
+                {
+                    "requested_projects": requested_count,
+                    "returned_projects": returned_count,
+                    "response_bytes": len(payload),
+                    "response_token_estimate": estimate_response_tokens(payload),
+                    "mcp_envelope_bytes": stdout_bytes,
+                    "elapsed_ms": round(elapsed_ms, 3),
+                    "post_call_rss_kb": rss_kb,
+                    "transport_probe_ms": round(transport_probe_ms, 3),
+                    "transport_survived": transport_survived,
+                    "server_reaped": server_reaped,
+                    "fixture_db_bytes": db_bytes,
+                    "stderr_bytes": len(stderr.encode("utf-8")),
+                    "passed": (
+                        returned_count == requested_count
+                        and transport_survived
+                        and server_reaped
+                    ),
+                }
+            )
+
+        observations = report["observations"]
+        first = observations[0]
+        last = observations[-1]
+        count_delta = last["requested_projects"] - first["requested_projects"]
+        byte_delta = last["response_bytes"] - first["response_bytes"]
+        report["derived"] = {
+            "passed": all(item["passed"] for item in observations),
+            "largest_response_bytes": last["response_bytes"],
+            "largest_response_token_estimate": last["response_token_estimate"],
+            "incremental_response_bytes_per_project": (
+                round(byte_delta / count_delta, 3) if count_delta > 0 else None
+            ),
+            "claim_boundary": (
+                "Measures list_projects alone in isolated caches; does not attribute combined "
+                "multi-tool response size or claim peak RSS."
+            ),
+        }
+        exit_code = 0 if report["derived"]["passed"] else 1
+        report["completion"] = {"status": "complete", "exit_code": exit_code}
+    except Exception as exc:
+        record_report_error(report, exc)
+        report["completion"] = {"status": "failed", "exit_code": 1}
+        exit_code = 1
+    finally:
+        if auto_root and not args.keep_work_root:
+            shutil.rmtree(work_root, ignore_errors=True)
+            report["cleanup"]["removed"] = not work_root.exists()
+        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        if args.out:
+            out_path = Path(args.out).expanduser()
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_out = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
+            try:
+                write_text(temporary_out, rendered)
+                os.replace(temporary_out, out_path)
+            finally:
+                if temporary_out.exists():
+                    temporary_out.unlink()
         print(rendered, end="")
     return report, exit_code
 
@@ -1618,6 +1856,24 @@ def copy_sqlite_snapshot(source: Path, destination: Path) -> None:
     uri = f"{source.resolve().as_uri()}?mode=ro"
     with sqlite3.connect(uri, uri=True) as src, sqlite3.connect(str(destination)) as dst:
         src.backup(dst)
+
+
+def clone_list_project_db(source: Path, destination: Path, project: str, root_path: str) -> None:
+    """Clone one valid project DB and rekey rows used by list_projects."""
+    copy_sqlite_snapshot(source, destination)
+    with sqlite3.connect(str(destination)) as con:
+        project_rows = con.execute("SELECT name FROM projects").fetchall()
+        if len(project_rows) != 1:
+            raise RuntimeError(
+                f"list-project fixture seed must contain one project, found {len(project_rows)}"
+            )
+        old_project = str(project_rows[0][0])
+        con.execute(
+            "UPDATE projects SET name = ?, root_path = ? WHERE name = ?",
+            (project, root_path, old_project),
+        )
+        con.execute("UPDATE nodes SET project = ? WHERE project = ?", (project, old_project))
+        con.execute("UPDATE edges SET project = ? WHERE project = ?", (project, old_project))
 
 
 def decode_sqlite_text(data: bytes) -> str:
@@ -3117,6 +3373,25 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--list-projects-scaling",
+        action="store_true",
+        help=(
+            "Measure list_projects alone against isolated cloned project databases using "
+            "a fresh MCP server per configured count."
+        ),
+    )
+    parser.add_argument(
+        "--list-project-counts",
+        default=DEFAULT_LIST_PROJECT_COUNTS,
+        help="Strictly increasing positive project counts for --list-projects-scaling.",
+    )
+    parser.add_argument(
+        "--list-project-fixture-max-mb",
+        type=int,
+        default=DEFAULT_LIST_PROJECT_FIXTURE_MAX_MB,
+        help="Hard disk cap for cloned list-project fixtures before any clone is created.",
+    )
+    parser.add_argument(
         "--capability-quality",
         choices=CAPABILITY_QUALITY_CASES,
         default="",
@@ -3210,6 +3485,9 @@ def main() -> int:
     if not binary.is_file():
         print(f"error: binary not found: {binary}", file=sys.stderr)
         return 2
+    if args.list_projects_scaling:
+        _, list_exit_code = run_list_projects_scaling(args, binary)
+        return list_exit_code
     if args.mcp_surface_parity:
         _, surface_exit_code = run_mcp_surface_parity(args, binary)
         return surface_exit_code
