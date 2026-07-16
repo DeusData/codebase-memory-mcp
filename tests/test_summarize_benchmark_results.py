@@ -72,6 +72,69 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected an mcp_surface_parity"):
             SUMMARY.render_mcp_surface_parity({"mode": "incremental"})
 
+    def test_rank_beyond_cutoff_is_not_reported_as_missing(self) -> None:
+        case = {
+            "passed": False,
+            "oracles": {
+                "passed": False,
+                "quality": {"passed": False, "passed_count": 0, "applicable_count": 1},
+                "central_order_search": {
+                    "quality": {
+                        "applicable": True,
+                        "passed": False,
+                        "criterion": "central result appears by rank five",
+                        "expected_substring": "zz_order_core",
+                        "rank": 9,
+                        "returned_count": 9,
+                        "reciprocal_rank": 1 / 9,
+                        "hit_at_1": False,
+                        "hit_at_5": False,
+                        "ndcg_at_5": 0.0,
+                    }
+                },
+            },
+        }
+
+        details = SUMMARY.quality_oracle_details([case])
+
+        self.assertEqual(details[0]["result"], "BELOW CUTOFF (rank 9 of 9)")
+
+    def test_capability_quality_shortfall_is_not_called_correctness_failure(self) -> None:
+        item = report(
+            {
+                "scenario": "rank_quality",
+                "passed": True,
+                "execution_passed": True,
+                "quality_target_met": False,
+                "oracles": {
+                    "passed": False,
+                    "quality": {
+                        "passed": False,
+                        "passed_count": 0,
+                        "applicable_count": 1,
+                        "score": 1 / 9,
+                    },
+                    "central_order_search": {
+                        "quality": {
+                            "applicable": True,
+                            "passed": False,
+                            "expected_substring": "zz_order_core",
+                            "rank": 9,
+                            "returned_count": 9,
+                            "relevance_cutoff": 5,
+                        }
+                    },
+                },
+            }
+        )
+        item["mode"] = "capability_quality"
+
+        row = SUMMARY.summarize_group("rank-disabled", [item])
+
+        self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
+        self.assertIn("below quality cutoff (rank 9, cutoff 5)", row["findings"][0])
+        self.assertNotIn("failed", row["findings"][0])
+
     def test_report_aggregates_graded_ndcg_without_hiding_mrr(self) -> None:
         case = {
             "scenario": "rank_quality",
@@ -273,7 +336,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "speedup_full_rebuild_over_incremental": 10.0,
         }
         row = SUMMARY.summarize_group("latest-rank-off", [report(case)])
-        self.assertEqual(row["decision"], "REJECT: quality/correctness")
+        self.assertEqual(row["decision"], "REJECT: graph correctness")
         self.assertEqual(row["canonical"], "0/1")
         self.assertEqual(row["speedup_p50"], 10.0)
         self.assertEqual(
@@ -452,7 +515,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
         }
         row = SUMMARY.summarize_group("partial", [report(case)])
-        self.assertEqual(row["decision"], "REJECT: quality/correctness")
+        self.assertEqual(row["decision"], "REJECT: task correctness")
         self.assertEqual(row["task_success_score"], 0.8)
         self.assertAlmostEqual(row["overall_quality_score"], (0.7 * 1.0 * 0.8) ** (1 / 3))
         markdown = SUMMARY.render_markdown([row])
@@ -580,7 +643,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         }
         row = SUMMARY.summarize_group("bad-quality", [report(case)])
         SUMMARY.mark_pareto_frontier([row])
-        self.assertEqual(row["decision"], "REJECT: quality/correctness")
+        self.assertEqual(row["decision"], "REJECT: task correctness")
         self.assertEqual(row["pareto"], "ineligible")
 
     def test_atomic_report_write_replaces_content_without_temp_file(self) -> None:

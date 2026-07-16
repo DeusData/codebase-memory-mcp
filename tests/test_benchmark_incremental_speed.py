@@ -12,6 +12,73 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_rank_quality_fixture_separates_graph_signal_from_lexical_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata = BENCHMARK.create_rank_quality_repo(Path(tmpdir))
+            core = (Path(tmpdir) / "order_core.py").read_text()
+            stubs = (Path(tmpdir) / "order_stubs.py").read_text()
+            callers = sorted(Path(tmpdir).glob("caller_*.py"))
+            caller_sources = [path.read_text() for path in callers]
+
+        self.assertEqual(metadata["capability"], "rank")
+        self.assertEqual(metadata["relevant_symbol"], "zz_order_core")
+        self.assertEqual(len(metadata["lexical_decoys"]), 8)
+        self.assertIn("def zz_order_core", core)
+        self.assertIn("def aa_order_stub", stubs)
+        self.assertEqual(len(callers), 8)
+        self.assertTrue(all("zz_order_core" in source for source in caller_sources))
+
+    def test_rank_quality_oracle_uses_central_symbol_as_graded_judgment(self) -> None:
+        calls = []
+        original = BENCHMARK.run_tool_call_for_transport
+
+        def fake_call(*args, **kwargs):
+            calls.append((args[3], args[4]))
+            return {
+                "response": {
+                    "results": [
+                        {"name": "aa_order_stub"},
+                        {"name": "zz_order_core"},
+                    ]
+                }
+            }
+
+        class Args:
+            timeout = 10
+            include_logs = False
+
+        BENCHMARK.run_tool_call_for_transport = fake_call
+        try:
+            result = BENCHMARK.run_rank_quality_oracles(
+                "cli", Path("cbm"), {}, "fixture", Args()
+            )
+        finally:
+            BENCHMARK.run_tool_call_for_transport = original
+
+        self.assertEqual(calls[0][0], "search_graph")
+        self.assertEqual(calls[0][1]["name_pattern"], "order")
+        quality = result["central_order_search"]["quality"]
+        self.assertEqual(quality["expected_substring"], "zz_order_core")
+        self.assertEqual(quality["rank"], 2)
+        self.assertEqual(quality["reciprocal_rank"], 0.5)
+        self.assertIsNotNone(quality["ndcg_at_5"])
+
+    def test_reciprocal_rank_uses_full_bounded_result_beyond_ndcg_cutoff(self) -> None:
+        ranked = [{"name": f"decoy_{index}"} for index in range(8)]
+        ranked.append({"name": "relevant"})
+
+        result = BENCHMARK.score_ranked_relevance(
+            ranked,
+            [{"expected_substring": "relevant", "relevance": 3}],
+            cutoff=5,
+        )
+
+        self.assertEqual(result["first_relevant_rank"], 9)
+        self.assertAlmostEqual(result["reciprocal_rank"], 1 / 9)
+        self.assertFalse(result["hit_at_5"])
+        self.assertEqual(result["ndcg_at_5"], 0.0)
+        self.assertEqual(len(result["matched_relevance"]), 5)
+
     def test_frontier_fixture_counts_dependents_and_mutates_one_definition_file(self) -> None:
         cases = {
             "go_inbound_frontier": ("go", "leaf.go", "LeafExtra"),
