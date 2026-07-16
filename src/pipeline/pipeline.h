@@ -292,6 +292,11 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
 
+/* Return the borrowed repository-relative suffix after an exact `<project>.`
+ * prefix. Returns qn unchanged when either input is absent, qn is the project
+ * node itself, or the prefix is only a partial project-name match. */
+const char *cbm_pipeline_fqn_without_project(const char *project, const char *qn);
+
 /* Resolve an import specifier that uses a relative path (./foo, ../bar, .foo,
  * or an unqualified local name like "foo.h") against the importing file's
  * path.  Returns a malloc'd normalized relative path without extension

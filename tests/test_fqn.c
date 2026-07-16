@@ -378,6 +378,26 @@ TEST(fqn_folder_double_slash) {
     PASS();
 }
 
+TEST(fqn_without_project_exact_prefix) {
+    ASSERT_STR_EQ(cbm_pipeline_fqn_without_project("tmp-a.b", "tmp-a.b.pkg.worker.run"),
+                  "pkg.worker.run");
+    PASS();
+}
+
+TEST(fqn_without_project_rejects_partial_prefix) {
+    const char *qn = "tmp-a.bc.pkg.worker.run";
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project("tmp-a.b", qn) == qn);
+    PASS();
+}
+
+TEST(fqn_without_project_preserves_project_node_and_nulls) {
+    const char *project = "tmp-a.b";
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project(project, project) == project);
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project(NULL, project) == project);
+    ASSERT_TRUE(cbm_pipeline_fqn_without_project(project, NULL) == NULL);
+    PASS();
+}
+
 /* ================================================================
  * cbm_project_name_from_path
  * ================================================================ */
@@ -645,6 +665,9 @@ SUITE(fqn) {
     RUN_TEST(fqn_folder_trailing_slash);
     RUN_TEST(fqn_folder_leading_slash);
     RUN_TEST(fqn_folder_double_slash);
+    RUN_TEST(fqn_without_project_exact_prefix);
+    RUN_TEST(fqn_without_project_rejects_partial_prefix);
+    RUN_TEST(fqn_without_project_preserves_project_node_and_nulls);
 
     /* project_name_from_path */
     RUN_TEST(project_name_unix_path);
