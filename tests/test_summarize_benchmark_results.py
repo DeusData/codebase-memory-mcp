@@ -861,6 +861,50 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             ],
         )
 
+    def test_declared_stale_derived_views_are_not_core_correctness_failure(self) -> None:
+        case = {
+            "passed": True,
+            "canonical_graph": {
+                "equal": False,
+                "kind": "canonical edges",
+                "left_count": 100,
+                "right_count": 90,
+                "left_only": "SEMANTICALLY_RELATED stale row",
+            },
+            "freshness_scoped_graph": {
+                "equal": True,
+                "declared_stale_views": ["semantic_edges"],
+                "excluded_edge_types": ["SEMANTICALLY_RELATED"],
+            },
+            "graph_gate": {
+                "passed": True,
+                "policy": "declared_stale_derived_views",
+                "canonical_equal": False,
+                "freshness_scoped_equal": True,
+                "declared_stale_views": ["semantic_edges"],
+            },
+            "oracles": {
+                "passed": True,
+                "quality": {
+                    "applicable_count": 1,
+                    "passed_count": 1,
+                    "score": 1.0,
+                },
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
+        }
+
+        row = SUMMARY.summarize_group("latest-default", [report(case)])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["decision"], "PASS: DECLARED STALE VIEWS")
+        self.assertEqual(row["core_graph_fidelity_score"], 1.0)
+        self.assertEqual(row["graph_fidelity_score"], 0.0)
+        self.assertIn("declared stale derived views", " ".join(row["findings"]))
+        self.assertIn("Core graph", markdown)
+        self.assertIn("Full graph freshness", markdown)
+
     def test_aggregate_reports_p50_p95_peak_rss_and_cleanup(self) -> None:
         reports = []
         for elapsed, speedup, peak in ((10, 10.0, 90), (20, 5.0, 110), (30, 3.0, 100)):
@@ -1049,7 +1093,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertAlmostEqual(row["overall_quality_score"], (0.7 * 1.0 * 0.8) ** (1 / 3))
         markdown = SUMMARY.render_markdown([row])
         self.assertIn("0.800", markdown)
-        self.assertIn("4/5 / 1/1 / 0/1", markdown)
+        self.assertIn("4/5 / 1/1 / 1/1 / 0/1", markdown)
 
     def test_composed_disabled_capability_is_below_target_not_correctness_rejection(
         self,

@@ -19,6 +19,118 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_declared_stale_views_are_collected_from_tool_responses(self) -> None:
+        oracles = {
+            "search": {
+                "freshness": {
+                    "state": "stale_with_warning",
+                    "stale_views": ["semantic_edges", "pagerank"],
+                }
+            },
+            "architecture": {
+                "freshness": {
+                    "state": "stale_with_warning",
+                    "stale_views": ["architecture", "pagerank"],
+                }
+            },
+            "quality": {"passed": True},
+        }
+
+        self.assertEqual(
+            BENCHMARK.declared_stale_views(oracles),
+            ["architecture", "pagerank", "semantic_edges"],
+        )
+
+    def test_declared_stale_semantic_edges_preserve_core_graph_gate(self) -> None:
+        gate = BENCHMARK.graph_gate_for_publish_kind(
+            {"equal": False},
+            BENCHMARK.PUBLISH_INCREMENTAL_EXACT,
+            freshness_scoped={
+                "equal": True,
+                "declared_stale_views": ["semantic_edges"],
+                "excluded_edge_types": ["SEMANTICALLY_RELATED"],
+            },
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["policy"], "declared_stale_derived_views")
+        self.assertFalse(gate["canonical_equal"])
+        self.assertTrue(gate["freshness_scoped_equal"])
+        self.assertEqual(gate["declared_stale_views"], ["semantic_edges"])
+
+    def test_declared_stale_semantic_edges_do_not_hide_core_graph_mismatch(self) -> None:
+        gate = BENCHMARK.graph_gate_for_publish_kind(
+            {"equal": False},
+            BENCHMARK.PUBLISH_INCREMENTAL_EXACT,
+            freshness_scoped={
+                "equal": False,
+                "kind": "canonical edges excluding declared stale views",
+                "declared_stale_views": ["semantic_edges"],
+                "excluded_edge_types": ["SEMANTICALLY_RELATED"],
+            },
+        )
+
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["policy"], "canonical_graph")
+
+    def test_freshness_scoped_comparison_excludes_only_semantic_edges(self) -> None:
+        def create_graph(database: Path, extra_type: str) -> None:
+            with sqlite3.connect(database) as con:
+                con.execute(
+                    "CREATE TABLE nodes("
+                    "id INTEGER PRIMARY KEY, project TEXT, label TEXT, name TEXT, "
+                    "qualified_name TEXT, file_path TEXT, start_line INTEGER, end_line INTEGER, "
+                    "properties TEXT)"
+                )
+                con.execute(
+                    "CREATE TABLE edges("
+                    "project TEXT, source_id INTEGER, target_id INTEGER, type TEXT, properties TEXT)"
+                )
+                con.execute(
+                    "CREATE TABLE file_hashes("
+                    "project TEXT, rel_path TEXT, sha256 TEXT, mtime_ns INTEGER, size INTEGER)"
+                )
+                con.executemany(
+                    "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?)",
+                    [
+                        (1, "repo", "Function", "left", "repo.left", "a.c", 1, 2, "{}"),
+                        (2, "repo", "Function", "right", "repo.right", "a.c", 4, 5, "{}"),
+                    ],
+                )
+                con.execute(
+                    "INSERT INTO edges VALUES ('repo',1,2,?,?)",
+                    (extra_type, '{"score":0.75}' if extra_type == "SEMANTICALLY_RELATED" else "{}"),
+                )
+                con.execute(
+                    "INSERT INTO file_hashes VALUES ('repo','a.c','abc',1,10)"
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            empty = root / "empty.db"
+            semantic = root / "semantic.db"
+            core = root / "core.db"
+            create_graph(empty, "SEMANTICALLY_RELATED")
+            with sqlite3.connect(empty) as con:
+                con.execute("DELETE FROM edges")
+            create_graph(semantic, "SEMANTICALLY_RELATED")
+            create_graph(core, "CALLS")
+
+            semantic_result = BENCHMARK.compare_graph_excluding_declared_stale_views(
+                semantic, empty, "repo", ["semantic_edges"]
+            )
+            core_result = BENCHMARK.compare_graph_excluding_declared_stale_views(
+                core, empty, "repo", ["semantic_edges"]
+            )
+
+        self.assertIsNotNone(semantic_result)
+        self.assertTrue(semantic_result["equal"])
+        self.assertIsNotNone(core_result)
+        self.assertFalse(core_result["equal"])
+        self.assertEqual(
+            core_result["kind"], "canonical edges excluding declared stale views"
+        )
+
     def test_cli_default_preserves_candidate_rank_refresh_policy(self) -> None:
         with mock.patch.object(sys, "argv", [str(SCRIPT)]):
             args = BENCHMARK.parse_args()

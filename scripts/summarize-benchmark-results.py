@@ -189,6 +189,15 @@ def correctness_findings(
             witnesses = [value for value in witnesses if value]
             if witnesses:
                 detail += "; witness: " + " vs ".join(witnesses)
+            graph_gate = case.get("graph_gate")
+            if (
+                isinstance(graph_gate, dict)
+                and graph_gate.get("policy") == "declared_stale_derived_views"
+                and graph_gate.get("passed") is True
+            ):
+                views = graph_gate.get("declared_stale_views")
+                view_text = ", ".join(str(value) for value in views) if isinstance(views, list) else "unknown"
+                detail = f"declared stale derived views ({view_text}); " + detail
             findings.append(detail)
 
         case_oracles = case.get("oracles")
@@ -558,10 +567,18 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     report_modes = {str(report.get("mode") or "") for report in reports}
     capability_quality = report_modes == {"capability_quality"}
     canonical: list[bool] = []
+    core_graph: list[bool] = []
     for case in cases:
         canonical_graph = case.get("canonical_graph")
         if isinstance(canonical_graph, dict):
-            canonical.append(bool(canonical_graph.get("equal")))
+            canonical_equal = bool(canonical_graph.get("equal"))
+            canonical.append(canonical_equal)
+            graph_gate = case.get("graph_gate")
+            core_graph.append(
+                bool(graph_gate.get("passed"))
+                if isinstance(graph_gate, dict) and isinstance(graph_gate.get("passed"), bool)
+                else canonical_equal
+            )
             continue
         lifecycle = case.get("pair_lifecycle")
         if not isinstance(lifecycle, dict):
@@ -573,7 +590,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             and policy.get("immediate_freshness_expected") is True
             and isinstance(lifecycle_graph, dict)
         ):
-            canonical.append(bool(lifecycle_graph.get("equal")))
+            lifecycle_equal = bool(lifecycle_graph.get("equal"))
+            canonical.append(lifecycle_equal)
+            core_graph.append(lifecycle_equal)
     oracles: list[bool] = []
     quality_miss_ablation_states: list[bool] = []
     for report in reports:
@@ -757,7 +776,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             if isinstance(response_quality.get("response_token_estimate"), (int, float)):
                 query_response_tokens.append(float(response_quality["response_token_estimate"]))
 
-    canonical_failed = any(not value for value in canonical)
+    canonical_failed = any(not value for value in core_graph)
     oracle_target_missed = any(not value for value in oracles)
     required_pair_stage_missed = False
     for case in cases:
@@ -785,6 +804,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         detail["freshness"] == "deferred with warning"
         for detail in pair_quality_details
     )
+    declared_stale_views = any(
+        isinstance((gate := case.get("graph_gate")), dict)
+        and gate.get("policy") == "declared_stale_derived_views"
+        and gate.get("passed") is True
+        for case in cases
+    )
     freshness_policy_failed = any(
         detail.get("policy_conformance_met") is False
         for detail in pair_quality_details
@@ -802,6 +827,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         decision = "REJECT: benchmark gate"
     elif not cases:
         decision = "REJECT: no cases"
+    elif declared_stale_views:
+        decision = "PASS: DECLARED STALE VIEWS"
     elif deferred_freshness:
         decision = "PASS: DEFERRED FRESHNESS"
     else:
@@ -830,6 +857,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     )
     pair_f1_score = statistics.mean(pair_f1_values) if pair_f1_values else None
     graph_fidelity_score = sum(canonical) / len(canonical) if canonical else None
+    core_graph_fidelity_score = (
+        sum(core_graph) / len(core_graph) if core_graph else None
+    )
     task_success_score = (
         quality_passed / quality_applicable
         if quality_applicable
@@ -924,11 +954,13 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "decision": decision,
         "cases": ratio(sum(case_passes), len(case_passes)),
         "canonical": ratio(sum(canonical), len(canonical)),
+        "core_graph": ratio(sum(core_graph), len(core_graph)),
         "oracles": ratio(sum(oracles), len(oracles)),
         "quality_score": retrieval_score,
         "pair_f1_score": pair_f1_score,
         "overall_quality_score": overall_quality_score,
         "graph_fidelity_score": graph_fidelity_score,
+        "core_graph_fidelity_score": core_graph_fidelity_score,
         "task_success_score": task_success_score,
         "hit_at_1": hit_at_1_weighted / quality_score_count if quality_score_count else None,
         "hit_at_5": hit_at_5_weighted / quality_score_count if quality_score_count else None,
@@ -994,7 +1026,11 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if latest is None:
             continue
 
-        accepted_decisions = {"PASS", "PASS: DEFERRED FRESHNESS"}
+        accepted_decisions = {
+            "PASS",
+            "PASS: DEFERRED FRESHNESS",
+            "PASS: DECLARED STALE VIEWS",
+        }
         baseline_decision = baseline.get("decision")
         latest_decision = latest.get("decision")
         if baseline_decision not in accepted_decisions or latest_decision not in accepted_decisions:
@@ -1548,10 +1584,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         "# Codebase Memory performance and quality summary",
         "",
         "| Candidate | Decision | Overall quality† | Retrieval MRR | Pair F1 | Hit@1 | Hit@5 | nDCG@5 | "
-        "Graph fidelity | Task success | Evidence counts (R/G/S) | "
+        "Core graph | Full graph freshness | Task success | Evidence counts (R/Core/Full/S) | "
         "Response p50 bytes | Response p50 tokens* | Query p50 ms | Incremental p50 ms | "
         "Peak RSS MB | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -1566,10 +1602,12 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["hit_at_1"], 3),
                     display(row["hit_at_5"], 3),
                     display(row["ndcg_at_5"], 3),
+                    display(row["core_graph_fidelity_score"], 3),
                     display(row["graph_fidelity_score"], 3),
                     display(row["task_success_score"], 3),
                     display(
-                        f"{row['quality_checks']} / {row['canonical']} / {row['oracles']}"
+                        f"{row['quality_checks']} / {row['core_graph']} / "
+                        f"{row['canonical']} / {row['oracles']}"
                     ),
                     display(row["query_response_p50_bytes"]),
                     display(row["query_response_p50_tokens"]),
@@ -1980,8 +2018,12 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "[Cumulated Gain-based Evaluation of IR Techniques]"
             "(https://doi.org/10.1145/582415.582418).",
             "",
-            "Graph fidelity is the fraction of mutation cases whose incremental canonical graph equals "
-            "a matching-mode fresh rebuild. Task success is the fraction of applicable probes that find "
+            "Graph fidelity is split into two visible categories. Core graph is the fraction of "
+            "mutation cases whose non-stale canonical rows equal a "
+            "matching-mode fresh rebuild. A declared-stale gate can pass only when the harness removes "
+            "the specifically named derived rows and every remaining canonical node, edge, property, "
+            "and file hash still matches. Full graph freshness requires unfiltered canonical equality. "
+            "Task success is the fraction of applicable probes that find "
             "their required evidence. Pair F1 is the mean of the explicit initial and fresh semantic-"
             "pair classification tasks; an expected deferred post-edit view remains visible separately "
             "and does not masquerade as retrieval MRR. Evidence counts show retrieval probes / graph comparisons / strict "
@@ -1989,7 +2031,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "rather than hiding the failed task.",
             "",
             "† Overall quality is a custom descriptive score: the equal-weight geometric mean of "
-            "result quality, graph fidelity, and task success. Result quality is Pair F1 or Retrieval "
+            "result quality, full graph freshness, and task success. Result quality is Pair F1 or "
             "MRR when only one is measured, and their arithmetic mean when both are measured. It is "
             "N/A unless all three categories are measured. It never overrides a graph-correctness gate. "
             "A required mutation oracle can "
