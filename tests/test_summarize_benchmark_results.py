@@ -155,6 +155,62 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("capability-off control", row["findings"][0])
         self.assertNotIn("initial/fresh pair tasks passed", " ".join(row["findings"]))
 
+    def test_semantic_pair_policy_mismatch_rejects_capability_quality_cell(self) -> None:
+        case = {
+            "scenario": "similarity_quality",
+            "passed": True,
+            "quality_target_met": True,
+            "fixture": {
+                "capability": "similarity",
+                "relationship": "SIMILAR_TO",
+                "task_set_sha256": "c" * 64,
+            },
+            "pair_lifecycle": {
+                "initial_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                },
+                "incremental_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                },
+                "fresh_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                },
+                "canonical_graph": {"equal": False},
+                "incremental_policy": {
+                    "policy": "stale_on_incremental",
+                    "immediate_freshness_expected": False,
+                    "immediate_freshness_met": True,
+                    "stale_warning_present": False,
+                    "policy_conformance_met": False,
+                },
+            },
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+        item["parameters"] = {
+            "config_profile": "default",
+            "config_overrides": {},
+            "index_mode": "moderate",
+        }
+
+        row = SUMMARY.summarize_group("upstream-default", [item])
+
+        self.assertEqual(row["decision"], "REJECT: freshness policy")
+        self.assertIn("did not conform", " ".join(row["findings"]))
+        self.assertNotIn("All applicable", " ".join(row["findings"]))
+
     def test_composition_spec_groups_validated_campaign_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

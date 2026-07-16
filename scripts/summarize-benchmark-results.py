@@ -717,8 +717,15 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         detail["freshness"] == "deferred with warning"
         for detail in pair_quality_details
     )
+    freshness_policy_failed = any(
+        detail.get("policy_conformance_met") is False
+        for detail in pair_quality_details
+        if detail.get("capability_state") != "disabled"
+    )
     if canonical_failed:
         decision = "REJECT: graph correctness"
+    elif freshness_policy_failed:
+        decision = "REJECT: freshness policy"
     elif oracle_target_missed and (capability_quality or explicit_ablation_miss):
         decision = "BELOW QUALITY TARGET"
     elif oracle_target_missed:
@@ -805,6 +812,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             pass
     full_values = full_ms or initial_full_ms
     findings = correctness_findings(cases, capability_quality=capability_quality)
+    if freshness_policy_failed:
+        findings.append(
+            "The incremental semantic result did not conform to the recorded freshness policy; "
+            "the post-edit pair result and whole-graph canonical comparison must be interpreted "
+            "together."
+        )
     disabled_pair_controls = [
         detail
         for detail in pair_quality_details

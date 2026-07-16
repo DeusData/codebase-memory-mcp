@@ -379,6 +379,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 ["benchmark", "{result_path}"],
                 capability_support={"rank": False, "dependencies": False},
             )
+            planned["parameters"] = {
+                "execution_order": "paired_interleaved",
+                "execution_block": 2,
+                "execution_position": 7,
+            }
 
             derived = CAMPAIGN.materialize_report_input(root, planned, raw)
 
@@ -388,6 +393,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 document["parameters"]["capability_support"],
                 {"dependencies": False, "rank": False},
             )
+            self.assertEqual(document["parameters"]["execution_order"], "paired_interleaved")
+            self.assertEqual(document["parameters"]["execution_block"], 2)
+            self.assertEqual(document["parameters"]["execution_position"], 7)
             self.assertEqual(document["campaign_provenance"]["source_result_sha256"],
                              CAMPAIGN.file_sha256(raw))
             self.assertEqual(document["campaign_provenance"]["cell_identity"],
