@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -358,6 +359,21 @@ def ensure_disk_space(root: Path, minimum_free_bytes: int) -> None:
         raise RuntimeError(
             f"insufficient campaign disk space: free={free} required={minimum_free_bytes} root={root}"
         )
+
+
+def validate_campaign_root(
+    root: Path, *, allow_temporary: bool = False, temporary_root: Path | None = None
+) -> Path:
+    """Require retained campaign state to live outside the OS temporary tree."""
+    resolved = root.expanduser().resolve()
+    temp = (temporary_root or Path(tempfile.gettempdir())).expanduser().resolve()
+    if not allow_temporary and (resolved == temp or temp in resolved.parents):
+        raise ValueError(
+            f"campaign root is temporary and may be lost after a crash or reboot: {resolved}; "
+            "choose a durable ignored path, or pass --allow-temporary-campaign-root only "
+            "for disposable tests"
+        )
+    return resolved
 
 
 def process_is_live(pid: int) -> bool:
@@ -729,6 +745,11 @@ def main() -> int:
         help="Compact deterministic grid expanded and archived before execution.",
     )
     parser.add_argument("--campaign-root", required=True, type=Path)
+    parser.add_argument(
+        "--allow-temporary-campaign-root",
+        action="store_true",
+        help="Allow disposable campaign state under the OS temporary directory.",
+    )
     parser.add_argument("--minimum-free-gb", type=float, default=2.0)
     parser.add_argument("--stale-lock-hours", type=float, default=6.0)
     parser.add_argument("--audit-only", action="store_true")
@@ -739,7 +760,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    campaign_root = args.campaign_root.expanduser().resolve()
+    campaign_root = validate_campaign_root(
+        args.campaign_root,
+        allow_temporary=args.allow_temporary_campaign_root,
+    )
     minimum_free_bytes = max(0, int(args.minimum_free_gb * 1024**3))
     stale_lock_seconds = max(1, int(args.stale_lock_hours * 3600))
     ensure_disk_space(campaign_root, minimum_free_bytes)

@@ -32,6 +32,37 @@ def cell(command: list[str], **overrides: object) -> dict:
 
 
 class BenchmarkCampaignTest(unittest.TestCase):
+    def test_campaign_root_rejects_os_temporary_tree_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temporary_root = Path(tmpdir) / "system-temp"
+            campaign_root = temporary_root / "lost-after-reboot"
+            with self.assertRaisesRegex(ValueError, "campaign root is temporary"):
+                CAMPAIGN.validate_campaign_root(
+                    campaign_root,
+                    temporary_root=temporary_root,
+                )
+            self.assertEqual(
+                CAMPAIGN.validate_campaign_root(
+                    campaign_root,
+                    allow_temporary=True,
+                    temporary_root=temporary_root,
+                ),
+                campaign_root.resolve(),
+            )
+
+    def test_campaign_root_accepts_durable_path_outside_temporary_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            temporary_root = base / "system-temp"
+            campaign_root = base / "repository" / ".worktrees" / "benchmark-campaign"
+            self.assertEqual(
+                CAMPAIGN.validate_campaign_root(
+                    campaign_root,
+                    temporary_root=temporary_root,
+                ),
+                campaign_root.resolve(),
+            )
+
     def test_cell_identity_covers_binary_config_scenario_and_repetition(self) -> None:
         base = cell(["benchmark", "{result_path}"])
         base_id = CAMPAIGN.cell_identity(base)
