@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -162,6 +163,21 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(len(callers), 8)
         self.assertTrue(all("zz_order_core" in source for source in caller_sources))
 
+    def test_dependency_quality_fixture_has_local_resolvable_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metadata = BENCHMARK.create_dependency_quality_repo(Path(tmpdir))
+            manifest = json.loads((Path(tmpdir) / "package.json").read_text())
+            app_source = (Path(tmpdir) / "src" / "app.js").read_text()
+            dep_source = (
+                Path(tmpdir) / "node_modules" / "cbmbenchdep" / "index.js"
+            ).read_text()
+
+        self.assertEqual(metadata["capability"], "dependencies")
+        self.assertEqual(manifest["dependencies"], {"cbmbenchdep": "1.0.0"})
+        self.assertIn("canonicalDependencyAPI", app_source)
+        self.assertIn("canonicalDependencyAPI", dep_source)
+        self.assertEqual(metadata["relevant_symbol"], "canonicalDependencyAPI")
+
     def test_rank_quality_oracle_uses_central_symbol_as_graded_judgment(self) -> None:
         calls = []
         original = BENCHMARK.run_tool_call_for_transport
@@ -196,6 +212,52 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(quality["rank"], 2)
         self.assertEqual(quality["reciprocal_rank"], 0.5)
         self.assertIsNotNone(quality["ndcg_at_5"])
+
+    def test_dependency_quality_oracle_requires_dependency_provenance(self) -> None:
+        calls = []
+        original = BENCHMARK.run_tool_call_for_transport
+
+        def fake_call(*args, **kwargs):
+            calls.append((args[3], args[4]))
+            return {
+                "response": {
+                    "results": [
+                        {
+                            "name": "canonicalDependencyAPI",
+                            "source": "dependency",
+                            "package": "cbmbenchdep",
+                            "read_only": True,
+                        }
+                    ]
+                }
+            }
+
+        class Args:
+            timeout = 10
+            include_logs = False
+
+        BENCHMARK.run_tool_call_for_transport = fake_call
+        try:
+            result = BENCHMARK.run_dependency_quality_oracles(
+                "cli", Path("cbm"), {}, "fixture", Args()
+            )
+        finally:
+            BENCHMARK.run_tool_call_for_transport = original
+
+        self.assertEqual(calls[0][0], "search_graph")
+        self.assertTrue(calls[0][1]["include_dependencies"])
+        self.assertEqual(calls[0][1]["name_pattern"], "canonicalDependencyAPI")
+        quality = result["dependency_api_search"]["quality"]
+        self.assertTrue(quality["passed"])
+        self.assertEqual(quality["rank"], 1)
+        self.assertEqual(
+            quality["required_substrings"],
+            [
+                '\"source\":\"dependency\"',
+                '\"package\":\"cbmbenchdep\"',
+                '\"read_only\":true',
+            ],
+        )
 
     def test_reciprocal_rank_uses_full_bounded_result_beyond_ndcg_cutoff(self) -> None:
         ranked = [{"name": f"decoy_{index}"} for index in range(8)]
@@ -427,6 +489,38 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIsNone(score["first_relevant_rank"])
         self.assertEqual(score["reciprocal_rank"], 0.0)
         self.assertEqual(score["ndcg_at_5"], 0.0)
+
+    def test_graded_relevance_requires_provenance_on_the_same_result(self) -> None:
+        ranked = [
+            {
+                "name": "canonicalDependencyAPI",
+                "source": "project",
+                "package": "cbmbenchdep",
+                "read_only": False,
+            },
+            {
+                "name": "canonicalDependencyAPI",
+                "source": "dependency",
+                "package": "cbmbenchdep",
+                "read_only": True,
+            },
+        ]
+        judgments = [
+            {
+                "expected_substring": "canonicalDependencyAPI",
+                "required_substrings": [
+                    '\"source\":\"dependency\"',
+                    '\"package\":\"cbmbenchdep\"',
+                    '\"read_only\":true',
+                ],
+                "relevance": 3,
+            }
+        ]
+
+        score = BENCHMARK.score_ranked_relevance(ranked, judgments, cutoff=5)
+
+        self.assertEqual(score["first_relevant_rank"], 2)
+        self.assertEqual(score["matched_relevance"], [0, 3])
 
     def test_quality_oracle_accepts_graded_relevance_judgments(self) -> None:
         oracles = {
@@ -742,6 +836,40 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             },
         )
         self.assertIn("sub=dep_auto_index", "\n".join(result["measurement_log_markers"]))
+
+    def test_build_index_result_attributes_cold_process_overhead_after_worker_total(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logfile = Path(tmpdir) / "index.log"
+            logfile.write_text(
+                "level=info msg=pipeline.done elapsed_ms=100\n"
+                "level=info msg=prof phase=index_repository sub=dep_auto_index ms=500 us=500000\n"
+                "level=info msg=prof phase=index_repository sub=rank_refresh ms=20 us=20000\n"
+                "level=info msg=prof phase=index_repository sub=TOTAL ms=650 us=650000\n",
+                encoding="utf-8",
+            )
+            result = BENCHMARK.build_index_result(
+                {"publish_kind": "full", "dependencies_indexed": 1},
+                f"level=info msg=index.supervisor.profile_log log={logfile}",
+                stdout_bytes=10,
+                elapsed_ms=2650.0,
+                include_logs=False,
+            )
+
+        self.assertEqual(result["worker_elapsed_ms"], 650)
+        self.assertEqual(result["process_overhead_ms"], 2000)
+        self.assertEqual(result["unlogged_overhead_ms"], 2000)
+        self.assertEqual(
+            result["timing_components_ms"],
+            {
+                "main_index": 100,
+                "dependency_index": 500,
+                "rank_refresh": 20,
+                "worker_total": 650,
+                "cold_process_and_supervisor": 2000,
+            },
+        )
 
     def test_build_index_result_marks_uninstrumented_dependency_phase_unknown(self) -> None:
         result = BENCHMARK.build_index_result(

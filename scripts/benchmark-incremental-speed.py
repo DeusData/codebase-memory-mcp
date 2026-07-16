@@ -100,7 +100,7 @@ FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
-CAPABILITY_QUALITY_CASES = ("rank",)
+CAPABILITY_QUALITY_CASES = ("rank", "dependencies")
 CROSS_FILE_RESOLVER_LANGUAGES = (
     "go",
     "c",
@@ -169,6 +169,8 @@ LOG_MARKER_EXACT_FALLBACK = "incremental.exact.fallback"
 LOG_MARKER_EXACT_DELETE_FALLBACK = "incremental.exact.delete.fallback"
 LOG_MARKER_EXACT_SKIP = "incremental.exact.skip"
 LOG_MARKER_DEP_AUTO_INDEX = "sub=dep_auto_index"
+LOG_MARKER_RANK_REFRESH = "phase=index_repository sub=rank_refresh"
+LOG_MARKER_INDEX_WORKER_TOTAL = "phase=index_repository sub=TOTAL"
 
 
 class BenchmarkCommandError(RuntimeError):
@@ -284,6 +286,53 @@ def create_rank_quality_repo(repo_dir: Path) -> dict[str, Any]:
         "relevant_symbol": "zz_order_core",
         "lexical_decoys": decoy_names,
         "ranking_signal": "eight distinct callers target the relevant symbol",
+    }
+
+
+def create_dependency_quality_repo(repo_dir: Path) -> dict[str, Any]:
+    """Create a local npm dependency whose source can be auto-indexed without I/O."""
+    package_name = "cbmbenchdep"
+    symbol = "canonicalDependencyAPI"
+    write_text(
+        repo_dir / "package.json",
+        json.dumps(
+            {
+                "name": "cbm-dependency-quality-fixture",
+                "version": "1.0.0",
+                "dependencies": {package_name: "1.0.0"},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    write_text(
+        repo_dir / "src" / "app.js",
+        f"import {{ {symbol} }} from '{package_name}';\n\n"
+        f"export function useDependency(value) {{ return {symbol}(value); }}\n",
+    )
+    write_text(
+        repo_dir / "node_modules" / package_name / "package.json",
+        json.dumps(
+            {"name": package_name, "version": "1.0.0", "main": "index.js"},
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    write_text(
+        repo_dir / "node_modules" / package_name / "index.js",
+        f"export function {symbol}(value) {{ return {{ accepted: Boolean(value) }}; }}\n",
+    )
+    return {
+        "fixture_version": 1,
+        "capability": "dependencies",
+        "language": "javascript",
+        "package_manager": "npm",
+        "package": package_name,
+        "relevant_symbol": symbol,
+        "source_resolution": f"node_modules/{package_name}",
+        "network_required": False,
     }
 
 
@@ -1140,7 +1189,7 @@ def run_mcp_surface_parity(
             report["cleanup"]["removed"] = not work_root.exists()
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.out:
-            write_text(Path(args.out).expanduser(), rendered)
+            atomic_write_text(Path(args.out).expanduser(), rendered)
         print(rendered, end="")
     return report, exit_code
 
@@ -1735,6 +1784,8 @@ def build_index_result(
                             "msg=pipeline.done",
                             "msg=incremental.done",
                             LOG_MARKER_DEP_AUTO_INDEX,
+                            LOG_MARKER_RANK_REFRESH,
+                            LOG_MARKER_INDEX_WORKER_TOTAL,
                         )
                     ):
                         measurement_log_markers.append(line.rstrip("\n"))
@@ -1766,6 +1817,23 @@ def build_index_result(
     dependency_phase_ms = parse_log_int_field(
         measurement_text, LOG_MARKER_DEP_AUTO_INDEX, "ms"
     )
+    rank_refresh_ms = parse_log_int_field(measurement_text, LOG_MARKER_RANK_REFRESH, "ms")
+    worker_elapsed_ms = parse_log_int_field(
+        measurement_text, LOG_MARKER_INDEX_WORKER_TOTAL, "ms"
+    )
+    known_elapsed_ms = worker_elapsed_ms
+    if known_elapsed_ms is None:
+        known_components = [
+            value
+            for value in (indexed_ms, dependency_phase_ms, rank_refresh_ms)
+            if value is not None
+        ]
+        known_elapsed_ms = sum(known_components) if known_components else None
+    process_overhead_ms = (
+        max(0, elapsed_ms_int - known_elapsed_ms)
+        if known_elapsed_ms is not None
+        else None
+    )
     dependencies_indexed = data.get("dependencies_indexed")
     dependency_packages = (
         dependencies_indexed
@@ -1777,7 +1845,18 @@ def build_index_result(
         "peak_rss_mb": peak_rss_mb,
         "measurement_log_markers": measurement_log_markers,
         "indexed_work_elapsed_ms": indexed_ms,
-        "unlogged_overhead_ms": (elapsed_ms_int - indexed_ms) if indexed_ms is not None else None,
+        "worker_elapsed_ms": worker_elapsed_ms,
+        "process_overhead_ms": process_overhead_ms,
+        # Backwards-compatible field: now excludes every measured worker phase,
+        # not just the main pipeline. Prefer process_overhead_ms in new reports.
+        "unlogged_overhead_ms": process_overhead_ms,
+        "timing_components_ms": {
+            "main_index": indexed_ms,
+            "dependency_index": dependency_phase_ms,
+            "rank_refresh": rank_refresh_ms,
+            "worker_total": worker_elapsed_ms,
+            "cold_process_and_supervisor": process_overhead_ms,
+        },
         "response": data,
         "publish_kind": publish_kind or None,
         "freshness_state": freshness_state or None,
@@ -2784,7 +2863,15 @@ def score_ranked_relevance(
     if cutoff <= 0:
         raise ValueError("relevance cutoff must be positive")
     valid_judgments = [
-        (str(item["expected_substring"]), float(item["relevance"]))
+        {
+            "expected": str(item["expected_substring"]),
+            "required": [
+                str(value)
+                for value in item.get("required_substrings", [])
+                if isinstance(value, str) and value
+            ],
+            "grade": float(item["relevance"]),
+        }
         for item in judgments
         if isinstance(item, dict)
         and isinstance(item.get("expected_substring"), str)
@@ -2796,7 +2883,12 @@ def score_ranked_relevance(
     for ranked_item in ranked_items:
         serialized = json.dumps(ranked_item, separators=(",", ":"), sort_keys=True)
         relevance = max(
-            (grade for expected, grade in valid_judgments if expected in serialized),
+            (
+                item["grade"]
+                for item in valid_judgments
+                if item["expected"] in serialized
+                and all(required in serialized for required in item["required"])
+            ),
             default=0.0,
         )
         all_relevance.append(
@@ -2815,7 +2907,9 @@ def score_ranked_relevance(
         )
 
     dcg = discounted_gain(matched_relevance)
-    ideal_relevance = sorted((grade for _, grade in valid_judgments), reverse=True)[:cutoff]
+    ideal_relevance = sorted(
+        (item["grade"] for item in valid_judgments), reverse=True
+    )[:cutoff]
     idcg = discounted_gain(ideal_relevance)
     ndcg = dcg / idcg if idcg > 0 else None
     result = {
@@ -2874,10 +2968,21 @@ def score_quality_oracles(
                 if positive_judgments
                 else None
             )
+            required_substrings = (
+                list(
+                    max(
+                        positive_judgments,
+                        key=lambda item: float(item["relevance"]),
+                    ).get("required_substrings", [])
+                )
+                if positive_judgments
+                else []
+            )
         else:
             expected, criterion = expectation
             judgments = []
             cutoff = 5
+            required_substrings = []
         applicable = bool(judgments) if graded else expected is not None
         passed = False
         rank: int | None = None
@@ -2922,6 +3027,7 @@ def score_quality_oracles(
             "passed": passed if applicable else None,
             "criterion": criterion,
             "expected_substring": expected,
+            "required_substrings": required_substrings,
             "rank": rank,
             "returned_count": returned_count,
             "reciprocal_rank": reciprocal_rank,
@@ -3098,6 +3204,60 @@ def run_rank_quality_oracles(
     return oracles
 
 
+def run_dependency_quality_oracles(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    project: str,
+    args: argparse.Namespace,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    symbol = "canonicalDependencyAPI"
+    package_name = "cbmbenchdep"
+    oracles = {
+        "dependency_api_search": run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "search_graph",
+            {
+                "project": project,
+                "label": "Function",
+                "name_pattern": symbol,
+                "include_dependencies": True,
+                "limit": 10,
+            },
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+    }
+    expectations = {
+        "dependency_api_search": {
+            "criterion": (
+                "retrieve the imported dependency API with dependency, package, and read-only "
+                "provenance on the same result"
+            ),
+            "cutoff": 5,
+            "judgments": [
+                {
+                    "expected_substring": symbol,
+                    "required_substrings": [
+                        '\"source\":\"dependency\"',
+                        f'\"package\":\"{package_name}\"',
+                        '\"read_only\":true',
+                    ],
+                    "relevance": 3,
+                }
+            ],
+        }
+    }
+    quality = score_quality_oracles(oracles, expectations)
+    oracles["quality"] = quality
+    oracles["passed"] = quality["passed"]
+    return oracles
+
+
 def run_index_for_transport(
     transport: str,
     binary: Path,
@@ -3150,7 +3310,11 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
     }
     exit_code = 1
     try:
-        fixture = create_rank_quality_repo(repo_dir)
+        fixture = (
+            create_rank_quality_repo(repo_dir)
+            if capability == "rank"
+            else create_dependency_quality_repo(repo_dir)
+        )
         apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
@@ -3165,9 +3329,12 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                     index_mode=args.index_mode,
                 )
                 project = str(indexed.get("response", {}).get("project") or "repo")
-                oracles = run_rank_quality_oracles(
-                    args.transport, binary, case_env, project, args, client
+                oracle_runner = (
+                    run_rank_quality_oracles
+                    if capability == "rank"
+                    else run_dependency_quality_oracles
                 )
+                oracles = oracle_runner(args.transport, binary, case_env, project, args, client)
         else:
             indexed = run_index_for_transport(
                 args.transport,
@@ -3179,11 +3346,14 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                 index_mode=args.index_mode,
             )
             project = str(indexed.get("response", {}).get("project") or "repo")
-            oracles = run_rank_quality_oracles(
-                args.transport, binary, case_env, project, args
+            oracle_runner = (
+                run_rank_quality_oracles
+                if capability == "rank"
+                else run_dependency_quality_oracles
             )
+            oracles = oracle_runner(args.transport, binary, case_env, project, args)
         case = {
-            "scenario": "rank_quality",
+            "scenario": f"{capability}_quality",
             "project": project,
             "fixture": fixture,
             "initial_fast_full": indexed,
@@ -3207,7 +3377,7 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
             report["cleanup"]["removed"] = not work_root.exists()
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.out:
-            write_text(Path(args.out).expanduser(), rendered)
+            atomic_write_text(Path(args.out).expanduser(), rendered)
         print(rendered, end="")
     return report, exit_code
 
@@ -3362,9 +3532,10 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
         if args.out:
-            out_path = Path(args.out).expanduser()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            atomic_write_text(
+                Path(args.out).expanduser(),
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+            )
         print(json.dumps(report, indent=2, sort_keys=True))
     return report, exit_code
 
@@ -3531,9 +3702,10 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
         if args.out:
-            out_path = Path(args.out).expanduser()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            atomic_write_text(
+                Path(args.out).expanduser(),
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+            )
         print(json.dumps(report, indent=2, sort_keys=True))
     return report, exit_code
 
@@ -3631,8 +3803,9 @@ def parse_args() -> argparse.Namespace:
         choices=CAPABILITY_QUALITY_CASES,
         default="",
         help=(
-            "Run one isolated, deterministic capability-quality fixture. The rank case "
-            "measures whether structural ranking lifts the central result above lexical decoys."
+            "Run one isolated, deterministic capability-quality fixture. rank measures whether "
+            "structural ranking lifts the central result above lexical decoys; dependencies "
+            "measures local npm API retrieval with source/package/read-only provenance."
         ),
     )
     parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
@@ -3857,9 +4030,10 @@ def main() -> int:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
         if args.out:
-            out_path = Path(args.out).expanduser()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            atomic_write_text(
+                Path(args.out).expanduser(),
+                json.dumps(report, indent=2, sort_keys=True) + "\n",
+            )
         print(json.dumps(report, indent=2, sort_keys=True))
 
     return exit_code
