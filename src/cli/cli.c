@@ -1264,6 +1264,18 @@ static bool cbm_resolve_hook_command(const char *script_name, char *out, size_t 
     return false;
 }
 
+static bool cbm_claude_desktop_config_path(const char *home, char *out, size_t out_sz) {
+#ifdef __APPLE__
+    return cbm_format_fits(
+        out, out_sz, "%s/Library/Application Support/Claude/claude_desktop_config.json", home);
+#elif defined(_WIN32)
+    return cbm_format_fits(out, out_sz, "%s/AppData/Roaming/Claude/claude_desktop_config.json",
+                           home);
+#else
+    return cbm_format_fits(out, out_sz, "%s/.config/Claude/claude_desktop_config.json", home);
+#endif
+}
+
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
     cbm_detected_agents_t agents;
     memset(&agents, 0, sizeof(agents));
@@ -1275,6 +1287,14 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     cbm_claude_config_dir(home_dir, path, sizeof(path));
     agents.claude_code = path[0] != '\0' && dir_exists(path);
+
+    if (cbm_claude_desktop_config_path(home_dir, path, sizeof(path))) {
+        char *filename = strrchr(path, '/');
+        if (filename) {
+            *filename = '\0';
+            agents.claude_desktop = dir_exists(path);
+        }
+    }
 
     snprintf(path, sizeof(path), "%s/.codex", home_dir);
     agents.codex = dir_exists(path);
@@ -4130,6 +4150,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         const char *name;
     } agents[] = {
         {a->claude_code, "Claude-Code"},
+        {a->claude_desktop, "Claude-Desktop"},
         {a->codex, "Codex"},
         {a->gemini, "Gemini-CLI"},
         {a->zed, "Zed"},
@@ -4480,6 +4501,13 @@ static void install_vscode_profile_configs(const char *code_user, const char *bi
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
 static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
                                          const char *binary_path, bool dry_run) {
+    if (agents->claude_desktop) {
+        char cp[CLI_BUF_1K];
+        if (cbm_claude_desktop_config_path(home, cp, sizeof(cp))) {
+            install_generic_agent_config("Claude Desktop", binary_path, cp, NULL, dry_run,
+                                         cbm_install_editor_mcp);
+        }
+    }
     if (agents->zed) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__
@@ -4705,6 +4733,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         const char *name;
     } names[] = {
         {det.claude_code, "claude-code"},
+        {det.claude_desktop, "claude-desktop"},
         {det.codex, "codex"},
         {det.gemini, "gemini"},
         {det.zed, "zed"},
@@ -5200,6 +5229,13 @@ static void uninstall_vscode_profile_configs(const char *code_user, bool dry_run
 /* Remove editor agent configs (Zed, KiloCode, VS Code, OpenClaw). */
 static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const char *home,
                                     bool dry_run) {
+    if (agents->claude_desktop) {
+        char cp[CLI_BUF_1K];
+        if (cbm_claude_desktop_config_path(home, cp, sizeof(cp))) {
+            uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Claude Desktop", cp, NULL}, dry_run,
+                                      cbm_remove_editor_mcp);
+        }
+    }
     if (agents->zed) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__

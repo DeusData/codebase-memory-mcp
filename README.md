@@ -34,7 +34,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
 - **156 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **One command across supported agents** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, OpenClaw, Kiro, and Junie, then adds only the MCP entries, owned instruction blocks, skills, and hooks each client supports.
+- **One command across supported agents** — `install` auto-detects Claude Code, Claude Desktop, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, OpenClaw, Kiro, and Junie, then adds only the MCP entries, owned instruction blocks, skills, and hooks each client supports.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **15 MCP tools** (classic mode; a streamlined subset is the default) — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
@@ -388,6 +388,7 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | Agent | MCP Config | Instructions | Hooks |
 |-------|-----------|-------------|-------|
 | Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob graph augment, non-blocking) |
+| Claude Desktop | `claude_desktop_config.json` | — | — |
 | Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | SessionStart reminder |
 | Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) + SessionStart reminder |
 | Qwen Code | `.qwen/settings.json` | `.qwen/QWEN.md` | — |
