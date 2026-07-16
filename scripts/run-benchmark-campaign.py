@@ -912,6 +912,11 @@ def materialize_report_input(
     support = cell.get("capability_support")
     if isinstance(support, dict):
         parameters["capability_support"] = dict(sorted(support.items()))
+    cell_parameters = cell.get("parameters")
+    if isinstance(cell_parameters, dict):
+        for key in ("execution_order", "execution_block", "execution_position"):
+            if key in cell_parameters:
+                parameters[key] = cell_parameters[key]
     source_sha = file_sha256(result_path)
     identity = cell_identity(cell)
     document["campaign_provenance"] = {
