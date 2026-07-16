@@ -112,6 +112,26 @@ kind; bounded pair equality; and whole canonical-graph equality. This prevents a
 no-op reindex or a stale expected edge from being reported as successful changed-file
 quality.
 
+For a realistic background, add this top-level compact-spec object:
+
+```json
+{
+  "quality_background": {
+    "repo": "/absolute/path/to/source-checkout",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "tree": "89abcdef0123456789abcdef0123456789abcdef"
+  }
+}
+```
+
+This is supported by `similarity` and `semantic_edges` quality cases. The harness
+streams tracked files from that exact commit through `git archive`, excluding the
+source checkout's dirty and untracked state, then overlays the versioned canaries in
+the isolated per-cell repository. It removes its transient tar archive after safe
+extraction. The cell identity binds the resolved source path, commit, and tree;
+result acceptance rejects a missing or mismatched retained commit/tree identity.
+Neither the source checkout nor its worktree registry is modified.
+
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
 remain available and take priority over the selected profile. The default profile

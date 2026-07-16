@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,44 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_copy_git_revision_to_dir_excludes_dirty_and_untracked_source_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.email", "benchmark@example.invalid"], cwd=source, check=True)
+            subprocess.run(["git", "config", "user.name", "Benchmark Fixture"], cwd=source, check=True)
+            (source / "tracked.py").write_text("VERSION = 1\n", encoding="utf-8")
+            task_source = source / "benchmarks" / "semantic-pairs-v1" / "canary.py"
+            task_source.parent.mkdir(parents=True)
+            task_source.write_text("DUPLICATE = True\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.py", str(task_source.relative_to(source))], cwd=source, check=True)
+            subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=source, check=True)
+            revision = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True
+            ).stdout.strip()
+            (source / "tracked.py").write_text("VERSION = 2\n", encoding="utf-8")
+            (source / "untracked.py").write_text("UNTRACKED = True\n", encoding="utf-8")
+
+            metadata = BENCHMARK.copy_git_revision_to_dir(
+                source,
+                destination,
+                revision,
+                timeout=30,
+                excluded_prefixes=("benchmarks/semantic-pairs-v1/",),
+            )
+
+            self.assertEqual((destination / "tracked.py").read_text(), "VERSION = 1\n")
+            self.assertFalse((destination / "untracked.py").exists())
+            self.assertFalse((destination / "benchmarks" / "semantic-pairs-v1").exists())
+            self.assertEqual(metadata["revision"], revision)
+            self.assertRegex(metadata["tree"], r"^[0-9a-f]{40}$")
+            self.assertIn("tracked.py", metadata["source_dirty_status_short"])
+            self.assertFalse((destination / ".git").exists())
+            self.assertEqual(metadata["excluded_prefixes"], ["benchmarks/semantic-pairs-v1/"])
+
     def test_pair_classification_scores_explicit_positive_and_negative_judgments(self) -> None:
         judgments = [
             {

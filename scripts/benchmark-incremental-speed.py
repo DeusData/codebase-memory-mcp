@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -2843,6 +2844,71 @@ def copy_git_head_to_dir(source_repo: Path, dest: Path, timeout: int) -> None:
         target.write_bytes(blob)
 
 
+def copy_git_revision_to_dir(
+    source_repo: Path,
+    dest: Path,
+    revision: str,
+    timeout: int,
+    *,
+    excluded_prefixes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Materialize tracked files from one exact commit without source dirty state."""
+    source_root = resolve_git_repo_root(source_repo, timeout)
+    exact_revision = command_stdout(
+        ["git", "rev-parse", f"{revision}^{{commit}}"], timeout, source_root
+    )
+    tree = command_stdout(
+        ["git", "rev-parse", f"{exact_revision}^{{tree}}"], timeout, source_root
+    )
+    dirty_status = command_stdout(["git", "status", "--short"], timeout, source_root)
+    if dest.exists() and any(dest.iterdir()):
+        raise RuntimeError(f"destination is not empty: {dest}")
+    dest.mkdir(parents=True, exist_ok=True)
+    archive_path = dest.parent / f".cbm-background-{os.getpid()}-{time.time_ns()}.tar"
+    try:
+        proc, _ = command_result(
+            [
+                "git",
+                "archive",
+                "--format=tar",
+                f"--output={archive_path}",
+                exact_revision,
+            ],
+            dict(os.environ),
+            timeout,
+            cwd=source_root,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"git archive failed: {proc.stderr.strip()}")
+        destination_root = dest.resolve()
+        with tarfile.open(archive_path, mode="r:") as archive:
+            excluded_roots = tuple(prefix.rstrip("/") for prefix in excluded_prefixes)
+            members = [
+                member
+                for member in archive.getmembers()
+                if not any(
+                    member.name == root or member.name.startswith(f"{root}/")
+                    for root in excluded_roots
+                )
+            ]
+            for member in members:
+                target = (dest / member.name).resolve()
+                if target != destination_root and destination_root not in target.parents:
+                    raise RuntimeError(f"git archive member escapes destination: {member.name}")
+            archive.extractall(dest, members=members, filter="data")
+    finally:
+        if archive_path.exists():
+            archive_path.unlink()
+    return {
+        "source_repo": str(source_root),
+        "revision": exact_revision,
+        "tree": tree,
+        "source_dirty_status_short": dirty_status,
+        "excluded_prefixes": list(excluded_prefixes),
+        "copy_policy": "git_archive_tracked_files_from_exact_commit",
+    }
+
+
 def copy_fastapi_head_to_case(
     args: argparse.Namespace, repo_dir: Path, case_root: Path
 ) -> dict[str, Any]:
@@ -3859,12 +3925,35 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
             "config_overrides": args.config_overrides,
             "transport": args.transport,
             "timeout": args.timeout,
+            "quality_background_repo": args.quality_background_repo or None,
+            "quality_background_revision": (
+                (args.quality_background_revision or "HEAD")
+                if args.quality_background_repo
+                else None
+            ),
         },
         "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
         "cases": [],
     }
     exit_code = 1
     try:
+        background = None
+        if args.quality_background_revision and not args.quality_background_repo:
+            raise ValueError(
+                "--quality-background-revision requires --quality-background-repo"
+            )
+        if args.quality_background_repo:
+            if capability not in {"similarity", "semantic_edges"}:
+                raise ValueError(
+                    "quality background repository is supported only for similarity and semantic_edges"
+                )
+            background = copy_git_revision_to_dir(
+                Path(args.quality_background_repo).expanduser(),
+                repo_dir,
+                args.quality_background_revision or "HEAD",
+                args.timeout,
+                excluded_prefixes=("benchmarks/semantic-pairs-v1/",),
+            )
         fixture_factory = {
             "rank": create_rank_quality_repo,
             "dependencies": create_dependency_quality_repo,
@@ -3921,6 +4010,7 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
             "scenario": f"{capability}_quality",
             "project": project,
             "fixture": fixture,
+            "background_repository": background,
             "initial_fast_full": indexed,
             "oracles": oracles,
             "pair_lifecycle": lifecycle,
@@ -4379,6 +4469,20 @@ def parse_args() -> argparse.Namespace:
             "scores SIMILAR_TO structural-clone pairs and semantic_edges scores "
             "SEMANTICALLY_RELATED control-flow variants against explicit hard negatives."
         ),
+    )
+    parser.add_argument(
+        "--quality-background-repo",
+        default="",
+        help=(
+            "Optional Git repository whose tracked files at an exact revision form the realistic "
+            "background for similarity or semantic_edges canaries. Dirty and untracked source "
+            "state is excluded."
+        ),
+    )
+    parser.add_argument(
+        "--quality-background-revision",
+        default="",
+        help="Commit-ish copied by git archive for --quality-background-repo; campaigns should use a full hash.",
     )
     parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
     parser.add_argument(
