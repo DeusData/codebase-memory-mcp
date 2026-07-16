@@ -162,3 +162,17 @@ worker logs are cleaned.
 Use `--audit-only` to scan and regenerate the report without running missing cells.
 Use `--minimum-free-gb` and `--stale-lock-hours` only when the recorded defaults are
 inappropriate for the host.
+
+## Cross-campaign composition
+
+Use `scripts/summarize-benchmark-results.py --composition-spec SPEC --out REPORT`
+to combine incremental correctness, rank quality, and dependency quality into one
+configuration row. A composition spec names exact matrix specs, durable campaign
+roots, and cell labels for each output group. The generator re-expands every matrix,
+requires every selected cell to have a hash-validated completion, and consumes the
+derived report inputs without altering immutable raw results.
+
+The generated Markdown records the composition-spec SHA-256. A sibling
+`REPORT.manifest.json` records every materialized input path and SHA-256, making the
+uncommitted report reproducible and auditable without committing experiment logs or
+results.
