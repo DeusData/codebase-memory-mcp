@@ -857,9 +857,76 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     PASS();
 }
 
+TEST(resolve_qualified_receiver_awareness) {
+    cbm_registry_t *r = cbm_registry_new();
+    
+    /* 1. Register a Method candidate under Class Service: proj.pkg.Service.get */
+    cbm_registry_add(r, "Service", "proj.pkg.Service", "Class");
+    cbm_registry_add(r, "get", "proj.pkg.Service.get", "Method");
+
+    /* 2. Register a Module axios */
+    cbm_registry_add(r, "axios", "proj.axios", "Module");
+
+    /* Test Case A: Unrelated receiver that is a known module/type -> should NOT resolve */
+    /* axios.get called, axios is a known Module */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "axios.get", "proj.app", NULL, NULL, 0);
+        ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    }
+
+    /* Test Case B: Unrelated receiver that is an imported receiver -> should NOT resolve */
+    /* other_service.get called, other_service is an imported alias/key mapping to OtherService */
+    {
+        const char *keys[] = {"other_service"};
+        const char *vals[] = {"proj.pkg.OtherService"};
+        cbm_resolution_t res = cbm_registry_resolve(r, "other_service.get", "proj.app", keys, vals, 1);
+        ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    }
+
+    /* Test Case B2: Related receiver that is an imported receiver -> should resolve */
+    /* my_service.get called, my_service is an imported alias/key mapping to Service */
+    {
+        const char *keys[] = {"my_service"};
+        const char *vals[] = {"proj.pkg.Service"};
+        cbm_resolution_t res = cbm_registry_resolve(r, "my_service.get", "proj.app", keys, vals, 1);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+    }
+
+    /* Test Case C: Receiver that is an unregistered/instance variable (e.g. "d.get") */
+    /* should resolve to Method, matching the Java enum case where receiver is just an instance */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "d.get", "proj.app", NULL, NULL, 0);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+    }
+
+    /* Test Case D: Fully qualified receiver matching the candidate's parent path -> should resolve */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "Service.get", "proj.app", NULL, NULL, 0);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+    }
+
+    /* Test Case E: Double colon C++/Perl style qualification (e.g. Service::get) -> should resolve */
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "Service::get", "proj.app", NULL, NULL, 0);
+        ASSERT_STR_EQ(res.qualified_name, "proj.pkg.Service.get");
+    }
+
+    /* Test Case F: If the candidate is a Function (not a Method), we always enforce qualified suffix match */
+    /* Register unique Function helper.compute */
+    cbm_registry_add(r, "compute", "proj.pkg.helper.compute", "Function");
+    {
+        cbm_resolution_t res = cbm_registry_resolve(r, "unrelated.compute", "proj.app", NULL, NULL, 0);
+        ASSERT_TRUE(res.qualified_name == NULL || res.qualified_name[0] == '\0');
+    }
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 SUITE(registry) {
     /* FQN */
     RUN_TEST(fqn_simple);
+
     RUN_TEST(fqn_no_name);
     RUN_TEST(fqn_python_init);
     RUN_TEST(fqn_js_index);
@@ -893,6 +960,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
+    RUN_TEST(resolve_qualified_receiver_awareness);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */

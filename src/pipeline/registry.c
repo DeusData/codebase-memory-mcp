@@ -832,13 +832,61 @@ static bool qn_ends_with_qualified(const char *qn, const char *callee_name) {
     }
     return true;
 }
-static bool is_type_like_label(const char *label) {
+static bool is_type_or_module_label(const char *label) {
     if (!label) {
         return false;
     }
-    return strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
-           strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
-           strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
+    return cbm_label_is_type_like(label) || strcmp(label, "Module") == 0 || strcmp(label, "Package") == 0;
+}
+
+static bool is_known_type_or_namespace(const cbm_registry_t *r, const char *prefix) {
+    if (!prefix || !prefix[0]) {
+        return false;
+    }
+    /* 1. Check known self-receivers */
+    static const char *const self_receivers[] = {"self", "this", "cls", "@self", NULL};
+    for (int i = 0; self_receivers[i]; i++) {
+        if (strcmp(prefix, self_receivers[i]) == 0) {
+            return false;
+        }
+    }
+
+    /* 2. Check if prefix exists as a qualified name with a type-like or module/package label */
+    const char *label = cbm_registry_label_of(r, prefix);
+    if (label && is_type_or_module_label(label)) {
+        return true;
+    }
+
+    /* 3. If it's a simple name, check if any registered definition with this simple name has a type-like/module label */
+    const char **items = NULL;
+    int count = 0;
+    if (cbm_registry_find_by_name(r, prefix, &items, &count) == 0 && count > 0) {
+        for (int i = 0; i < count; i++) {
+            const char *item_label = cbm_registry_label_of(r, items[i]);
+            if (item_label && is_type_or_module_label(item_label)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool is_imported_receiver(const char *prefix, const char **import_keys, int import_count) {
+    if (!prefix || !prefix[0] || !import_keys || import_count <= 0) {
+        return false;
+    }
+    if (_import_map_cache) {
+        if (cbm_ht_get(_import_map_cache, prefix)) {
+            return true;
+        }
+    } else {
+        for (int i = 0; i < import_count; i++) {
+            if (import_keys[i] && strcmp(import_keys[i], prefix) == 0) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 static bool is_candidate_method(const cbm_registry_t *r, const char *qn) {
@@ -860,7 +908,7 @@ static bool is_candidate_method(const cbm_registry_t *r, const char *qn) {
     *last_dot = '\0';
 
     const char *parent_label = cbm_registry_label_of(r, parent_qn);
-    return is_type_like_label(parent_label);
+    return cbm_label_is_type_like(parent_label);
 }
 
 static bool is_qualified_callee(const char *callee_name) {
@@ -869,8 +917,8 @@ static bool is_qualified_callee(const char *callee_name) {
 
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
-                                            const char *module_qn, const char **import_vals,
-                                            int import_count) {
+                                            const char *module_qn, const char **import_keys,
+                                            const char **import_vals, int import_count) {
     const char *lookup = simple_name(callee_name);
     qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
     if (!arr || arr->count == 0) {
@@ -919,7 +967,32 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
 
     if (res.qualified_name && is_qualified_callee(callee_name)) {
-        if (!is_candidate_method(r, res.qualified_name)) {
+        char prefix[CBM_SZ_256] = {0};
+        const char *dot = strchr(callee_name, '.');
+        const char *colons = strstr(callee_name, "::");
+        const char *sep = dot;
+        if (colons && (!sep || colons < sep)) {
+            sep = colons;
+        }
+        if (sep) {
+            size_t plen = sep - callee_name;
+            if (plen >= sizeof(prefix)) {
+                plen = sizeof(prefix) - 1;
+            }
+            memcpy(prefix, callee_name, plen);
+            prefix[plen] = '\0';
+        }
+
+        bool is_method = is_candidate_method(r, res.qualified_name);
+        bool enforce_qualified = !is_method;
+
+        if (is_method) {
+            if (is_known_type_or_namespace(r, prefix) || is_imported_receiver(prefix, import_keys, import_count)) {
+                enforce_qualified = true;
+            }
+        }
+
+        if (enforce_qualified) {
             if (!qn_ends_with_qualified(res.qualified_name, callee_name)) {
                 return empty_result();
             }
@@ -983,7 +1056,7 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_keys, import_map_vals, import_map_count);
     }
 
     /* Cache the result (including empty — caching the negative answer
