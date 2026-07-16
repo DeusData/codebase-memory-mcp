@@ -436,8 +436,12 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
     }
     /* Java/Go: directory-based module so this enclosing-func QN matches the def
      * QN and the LSP caller_qn (the lsp_resolve join keys on exact equality). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                       ctx->language);
+    const char *qn =
+        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST) {
+        qn = cbm_rust_cfg_qualified_name(ctx->arena, node, ctx->source, qn);
+    }
+    return qn;
 }
 
 // Compute class QN for scope tracking.

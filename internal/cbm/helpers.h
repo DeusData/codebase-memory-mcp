@@ -80,6 +80,12 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 // def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
 char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
 
+// Rust cfg-gated definitions retain distinct graph identities by appending a
+// normalized predicate suffix. Shared by definition extraction and call-scope
+// tracking so CALLS source QNs exactly match their Function node QNs.
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode node, const char *source,
+                                        const char *base_qn);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 

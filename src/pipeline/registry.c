@@ -494,7 +494,6 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
-    (void)name;
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -529,7 +528,11 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 
     /* Index by simple name.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
-    const char *simple = simple_name(qualified_name);
+    /* `qualified_name` can carry an identity-only suffix (for example the
+     * predicate on mutually exclusive Rust cfg definitions).  Calls still use
+     * the source-level symbol name, so prefer the caller-supplied name for the
+     * lookup index and retain the QN tail only as a defensive fallback. */
+    const char *simple = name && name[0] ? name : simple_name(qualified_name);
     qn_array_t *arr = cbm_ht_get(r->by_name, simple);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));

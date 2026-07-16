@@ -1909,21 +1909,40 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
-static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
-                                           const char *const *decorators) {
-    if (!decorators) {
+const char *cbm_rust_cfg_qualified_name(CBMArena *a, TSNode node, const char *source,
+                                        const char *base_qn) {
+    if (!a || !source || !base_qn) {
         return base_qn;
     }
-    for (int i = 0; decorators[i]; i++) {
-        const char *cfg = strstr(decorators[i], "cfg(");
+    const CBMLangSpec *spec = cbm_lang_spec(CBM_LANG_RUST);
+    TSNode prev = ts_node_prev_sibling(node);
+    while (!ts_node_is_null(prev)) {
+        if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
+            if (ts_node_is_named(prev)) {
+                break;
+            }
+            prev = ts_node_prev_sibling(prev);
+            continue;
+        }
+        uint32_t start = ts_node_start_byte(prev);
+        uint32_t end = ts_node_end_byte(prev);
+        if (end <= start) {
+            prev = ts_node_prev_sibling(prev);
+            continue;
+        }
+        const char *cfg = cbm_memmem(source + start, (size_t)(end - start), "cfg(", 4);
         if (!cfg) {
+            prev = ts_node_prev_sibling(prev);
             continue;
         }
         /* Build a compact predicate suffix from the cfg(...) text, dropping
-         * whitespace and quotes so the QN stays readable and stable. */
+         * whitespace and quotes so the QN stays readable and stable. Read the
+         * source span directly: call-scope tracking must not allocate a second
+         * decorator array for every Rust function. */
         char buf[CBM_SZ_256];
         size_t bi = 0;
-        for (const char *p = cfg; *p && bi + 1 < sizeof(buf); p++) {
+        const char *limit = source + end;
+        for (const char *p = cfg; p < limit && bi + 1 < sizeof(buf); p++) {
             if (*p == ' ' || *p == '\t' || *p == '"' || *p == '\'') {
                 continue;
             }
@@ -3251,7 +3270,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
     if (ctx->language == CBM_LANG_RUST) {
-        def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
+        def.qualified_name = cbm_rust_cfg_qualified_name(a, node, ctx->source, def.qualified_name);
         def.is_test = rust_def_is_test(def.decorators);
     }
 

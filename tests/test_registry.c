@@ -884,6 +884,30 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     PASS();
 }
 
+/* A cfg predicate is part of a Rust definition's graph identity, but not its
+ * source-level call name.  Index both cfg-gated twins under the supplied name
+ * so a local call cannot make an unrelated cross-module definition appear to
+ * be the sole candidate. */
+TEST(resolve_cfg_gated_twins_by_source_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    ASSERT_NOT_NULL(r);
+    cbm_registry_add(r, "has_permission",
+                     "proj.scripts.helpers.has_permission#cfg(target_os=macos)]", "Function");
+    cbm_registry_add(r, "has_permission",
+                     "proj.scripts.helpers.has_permission#cfg(not(target_os=macos))]", "Function");
+    cbm_registry_add(r, "has_permission", "proj.engine.permissions.has_permission", "Function");
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "has_permission", "proj.scripts.helpers", NULL, NULL, 0);
+    ASSERT_NOT_NULL(res.qualified_name);
+    ASSERT_NOT_NULL(strstr(res.qualified_name, "proj.scripts.helpers.has_permission#cfg("));
+    ASSERT_STR_EQ(res.strategy, "suffix_match");
+    ASSERT_EQ(res.candidate_count, 3);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 SUITE(registry) {
     /* FQN */
     RUN_TEST(fqn_simple);
@@ -920,6 +944,7 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
+    RUN_TEST(resolve_cfg_gated_twins_by_source_name);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
