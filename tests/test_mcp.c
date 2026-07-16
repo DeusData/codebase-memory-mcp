@@ -1221,8 +1221,8 @@ static char *extract_text_content(const char *mcp_result);
 TEST(tool_search_graph_includes_node_properties) {
     /* Node properties are OPT-IN columns in the default TOON output: the
      * default row is qn/label/file/lines/degrees only, `fields` adds the
-     * requested property columns, and format:"json" restores the legacy
-     * verbose objects with the full property blob. The setup_snippet_server
+     * requested property columns, and format:"json" with compact:false restores
+     * legacy verbose objects with non-internal properties. The setup_snippet_server
      * inserts HandleRequest with a signature/return_type/is_exported blob. */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -1259,12 +1259,13 @@ TEST(tool_search_graph_includes_node_properties) {
     free(inner);
     free(resp);
 
-    /* format:"json" keeps the legacy verbose objects intact. */
+    /* format:"json", compact:false keeps useful legacy metadata intact. */
     resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\","
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
-             "\"name_pattern\":\"HandleRequest\",\"format\":\"json\",\"limit\":5}}}");
+             "\"name_pattern\":\"HandleRequest\",\"format\":\"json\",\"compact\":false,"
+             "\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -2041,7 +2042,7 @@ TEST(tool_output_byte_budgets) {
     PASS();
 }
 
-TEST(tool_search_graph_toon_never_leaks_internal_fields) {
+TEST(tool_search_graph_blocks_internal_fields_and_compacts_json_properties) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -2071,6 +2072,45 @@ TEST(tool_search_graph_toon_never_leaks_internal_fields) {
     ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
     ASSERT_NULL(strstr(inner, "SPSENTINEL00"));
     ASSERT_NULL(strstr(inner, "BTSENTINEL00"));
+    ASSERT_NOT_NULL(strstr(inner, "complexity"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{\"project\":\"test-project\","
+             "\"name_pattern\":\"fpCarrier\",\"format\":\"json\",\"compact\":true,\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "SPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "BTSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "complexity"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":47,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{\"project\":\"test-project\","
+             "\"name_pattern\":\"fpCarrier\",\"format\":\"json\",\"compact\":true,"
+             "\"fields\":[\"fp\",\"complexity\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
+    ASSERT_NOT_NULL(strstr(inner, "complexity"));
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{\"project\":\"test-project\","
+             "\"name_pattern\":\"fpCarrier\",\"format\":\"json\",\"compact\":false,\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
     ASSERT_NOT_NULL(strstr(inner, "complexity"));
     free(inner);
     free(resp);
@@ -9763,7 +9803,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
     RUN_TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view);
-    RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
+    RUN_TEST(tool_search_graph_blocks_internal_fields_and_compacts_json_properties);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(mcp_discovery_methods_return_supported_lists);
     RUN_TEST(tool_query_graph_basic);
