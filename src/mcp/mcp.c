@@ -47,6 +47,7 @@ enum {
 #include "pagerank/pagerank.h"
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
+#include "git/git_snapshot.h"
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
@@ -1258,7 +1259,8 @@ static const tool_def_t TOOLS[] = {
 
     {"index_status", "Index status",
      "Report project index freshness, graph counts, overlay read-view counts, and background "
-     "overlay compaction state.",
+     "overlay compaction state. Git metadata labels HEAD as committed-only and reports whether "
+     "the current working tree is dirty.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
      "\"Indexed project name to inspect.\"}},\"required\":["
      "\"project\"]}"},
@@ -3101,6 +3103,27 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     add_git_context_string(doc, git, "branch_slug", ctx.branch_slug);
     add_git_context_string(doc, git, "head_sha", ctx.head_sha);
     add_git_context_string(doc, git, "base_sha", ctx.base_sha);
+    if (ctx.is_git) {
+        yyjson_mut_obj_add_str(doc, git, "head_scope", "committed_revision_only");
+        cbm_git_snapshot_t snapshot = {0};
+        bool snapshot_available =
+            cbm_git_snapshot_read(root_path, CBM_GIT_SNAPSHOT_DIRTY, &snapshot) == 0 &&
+            snapshot.is_git;
+        if (snapshot_available) {
+            bool worktree_dirty = snapshot.dirty_bytes > 0;
+            yyjson_mut_obj_add_bool(doc, git, "worktree_dirty", worktree_dirty);
+            yyjson_mut_obj_add_bool(doc, git, "head_matches_worktree", !worktree_dirty);
+            yyjson_mut_obj_add_str(doc, git, "worktree_state",
+                                   worktree_dirty ? "dirty" : "clean");
+            if (worktree_dirty) {
+                yyjson_mut_obj_add_strcpy(doc, git, "dirty_hash", snapshot.dirty_hash);
+            }
+        } else {
+            yyjson_mut_obj_add_null(doc, git, "worktree_dirty");
+            yyjson_mut_obj_add_null(doc, git, "head_matches_worktree");
+            yyjson_mut_obj_add_str(doc, git, "worktree_state", "unknown");
+        }
+    }
     yyjson_mut_obj_add_val(doc, obj, "git", git);
 
     cbm_git_context_free(&ctx);
