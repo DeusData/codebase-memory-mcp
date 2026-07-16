@@ -24,6 +24,64 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_list_projects_scaling_report_separates_size_latency_and_lifecycle(self) -> None:
+        document = {
+            "mode": "list_projects_scaling",
+            "run_id": "list-projects-example",
+            "binary_metadata": {"sha256": "a" * 64},
+            "cleanup": {"requested": True, "removed": True},
+            "completion": {"status": "complete", "exit_code": 0},
+            "parameters": {
+                "token_estimator": "utf8_bytes_div_4_ceil",
+                "rss_measurement": "post_call_resident_kb_not_peak",
+            },
+            "observations": [
+                {
+                    "requested_projects": 1,
+                    "returned_projects": 1,
+                    "response_bytes": 284,
+                    "response_token_estimate": 71,
+                    "elapsed_ms": 15.149,
+                    "post_call_rss_kb": 16576,
+                    "transport_survived": True,
+                    "server_reaped": True,
+                    "fixture_db_bytes": 6160384,
+                    "passed": True,
+                },
+                {
+                    "requested_projects": 64,
+                    "returned_projects": 64,
+                    "response_bytes": 12695,
+                    "response_token_estimate": 3174,
+                    "elapsed_ms": 82.118,
+                    "post_call_rss_kb": 12784,
+                    "transport_survived": True,
+                    "server_reaped": True,
+                    "fixture_db_bytes": 394264576,
+                    "passed": True,
+                },
+            ],
+            "derived": {
+                "passed": True,
+                "incremental_response_bytes_per_project": 197.0,
+                "claim_boundary": "Measures list_projects alone; not combined calls.",
+            },
+        }
+
+        markdown = SUMMARY.render_list_projects_scaling(document)
+
+        self.assertIn("Outcome: complete", markdown)
+        self.assertIn("64 | 64 | 12,695 | 3,174 | 82.118", markdown)
+        self.assertIn("Survived | Reaped", markdown)
+        self.assertIn("197.0 bytes per added project", markdown)
+        self.assertIn("one observation per project count", markdown)
+        self.assertIn("not peak RSS", markdown)
+        self.assertNotIn("FAIL", markdown)
+
+    def test_list_projects_scaling_rejects_wrong_document(self) -> None:
+        with self.assertRaisesRegex(ValueError, "expected a list_projects_scaling"):
+            SUMMARY.render_list_projects_scaling({"mode": "incremental"})
+
     def test_mcp_surface_report_keeps_discovery_dispatch_and_behavior_distinct(self) -> None:
         def surface(count: int, size: int, tokens: int, elapsed: float) -> dict:
             return {
