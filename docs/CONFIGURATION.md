@@ -83,7 +83,18 @@ Current keys:
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
-| `watcher_enabled` | `true` | Run the background watcher thread that auto-reindexes projects when they change. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+| `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
+
+> **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
+> watcher *subsystem* starts at all (the background poll thread). `auto_watch` is
+> narrower: it only controls whether a connecting session registers *its own*
+> project with an already-running watcher. When `watcher_enabled=false`,
+> `auto_watch` has no effect — there is no watcher to register with.
+>
+> Both keys are read **once at process startup**. Changing either takes effect on
+> the next server start: restart the `codebase-memory-mcp` process or reconnect
+> your MCP client. It does not affect an already-running server. Use
+> `index_repository` to reindex manually while the watcher is disabled.
 
 ## 3. UI Settings
 

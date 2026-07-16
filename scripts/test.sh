@@ -81,6 +81,13 @@ bash "$ROOT/tests/test_parent_watchdog.sh"
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
 bash "$ROOT/tests/test_worker_watchdog.sh"
 
+# Step 5c: watcher_enabled kill-switch process regression (#335). Reuses the
+# prod binary built in Step 5; drives the real MCP server with an isolated
+# cache and proves watcher_enabled=false stops the watcher thread from starting
+# and registering, while manual index_repository stays available.
+echo "=== Step 5c: watcher_enabled kill-switch regression (#335) ==="
+bash "$ROOT/tests/test_watcher_disabled.sh"
+
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
 # audit must allow-list it (Windows-only — Linux smoke never saw it).

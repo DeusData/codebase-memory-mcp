@@ -131,6 +131,8 @@ When enabled, new projects are indexed automatically on first connection. Previo
 
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
 
+To turn the watcher off entirely, set `config set watcher_enabled false` (default `true`): the background poll thread never starts and no project is registered, while `index_repository` stays available for manual reindexing. Both `watcher_enabled` and `auto_watch` are read at process startup, so a change takes effect the next time the server starts (restart or reconnect your MCP client).
+
 ### Keeping Up to Date
 
 ```bash
