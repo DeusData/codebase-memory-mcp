@@ -5,8 +5,10 @@ attempt under a content-addressed cell directory. It is intended for release-bui
 comparisons where correctness and query-result quality are gates, not optional
 context around a speed claim.
 
-Use an external campaign root such as `/tmp/cbm-campaign`. Do not put generated
-results or the generated Markdown report in the repository.
+Use a durable ignored campaign root such as `.worktrees/benchmark-campaign`.
+The runner rejects the operating-system temporary tree by default because a crash
+or reboot can otherwise erase manifests, results, and logs. Do not track generated
+results or the generated Markdown report in Git.
 
 ## Cell identity
 
@@ -97,8 +99,8 @@ same configuration.
 
 ```sh
 uv run python scripts/run-benchmark-campaign.py \
-  --plan /tmp/cbm-campaign-plan.json \
-  --campaign-root /tmp/cbm-campaign
+  --plan .worktrees/benchmark-campaign/plan.json \
+  --campaign-root .worktrees/benchmark-campaign/results
 ```
 
 Rerunning the same command resumes validated cells. The runner executes cells

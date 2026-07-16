@@ -26,6 +26,34 @@ def ratio(passed: int, applicable: int) -> str:
     return f"{passed}/{applicable}" if applicable else "n/a"
 
 
+def evidence_lifecycle(reports: list[dict[str, Any]]) -> str:
+    """Describe retained evidence separately from requested cleanup outcomes."""
+    disposed = 0
+    retained = 0
+    failed = 0
+    unknown = 0
+    for report in reports:
+        cleanup = report.get("cleanup")
+        if not isinstance(cleanup, dict) or not isinstance(cleanup.get("requested"), bool):
+            unknown += 1
+        elif cleanup["requested"] is False:
+            retained += 1
+        elif cleanup.get("removed") is True:
+            disposed += 1
+        else:
+            failed += 1
+    if failed:
+        requested = disposed + failed
+        return f"CLEANUP FAILED {failed}/{requested}"
+    if unknown:
+        return f"unknown {unknown}/{len(reports)}"
+    if disposed and retained:
+        return f"disposed {disposed}/{len(reports)}; retained by request {retained}/{len(reports)}"
+    if disposed:
+        return f"disposed {disposed}/{len(reports)}"
+    return f"retained by request {retained}/{len(reports)}"
+
+
 def cases_from_report(report: dict[str, Any]) -> list[dict[str, Any]]:
     cases = report.get("cases")
     if isinstance(cases, list):
@@ -482,11 +510,6 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     else:
         decision = "PASS"
 
-    cleanup_passes = sum(
-        bool(report.get("cleanup", {}).get("removed"))
-        for report in reports
-        if isinstance(report.get("cleanup"), dict)
-    )
     hashes = sorted(
         {
             str(report.get("binary_metadata", {}).get("sha256", ""))
@@ -579,7 +602,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "dependency_fresh_p50_ms": percentile(dependency_fresh_ms, 0.50),
         "index_modes": ", ".join(sorted(index_modes)) if index_modes else "unknown",
         "capability_applicability": summarize_capability_applicability(reports),
-        "cleanup": ratio(cleanup_passes, len(reports)),
+        "lifecycle": evidence_lifecycle(reports),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": correctness_findings(cases, capability_quality=capability_quality),
         "quality_details": quality_oracle_details(cases),
@@ -1325,7 +1348,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "## Performance and provenance",
             "",
             "| Candidate | Cases meeting gate/target | Capabilities | Observations (incremental/full) | Incremental p95 ms | Full p50 ms | "
-            "Speedup p50 | Cleanup | Binary SHA-256 |",
+            "Speedup p50 | Evidence lifecycle | Binary SHA-256 |",
             "|---|---:|---|---:|---:|---:|---:|---:|---|",
         )
     )
@@ -1341,7 +1364,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["incremental_p95_ms"]),
                     display(row["full_p50_ms"]),
                     display(row["speedup_p50"], 2),
-                    display(row["cleanup"]),
+                    display(row["lifecycle"]),
                     display(row["binary_sha256"]),
                 )
             )
@@ -1425,9 +1448,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "Graded probes additionally report nDCG@5, which rewards placing more-relevant "
             "evidence earlier while normalizing against the ideal judged ordering. MRR and Hit@k "
             "remain visible because they answer the distinct first-useful-result question. This "
-            "follows the graded-ranking measures used in the "
-            "[NIST TREC Complex Answer Retrieval overview]"
-            "(https://trec.nist.gov/pubs/trec27/papers/Overview-CAR.pdf).",
+            "follows Järvelin and Kekäläinen's primary definition in "
+            "[Cumulated Gain-based Evaluation of IR Techniques]"
+            "(https://doi.org/10.1145/582415.582418).",
             "",
             "Graph fidelity is the fraction of mutation cases whose incremental canonical graph equals "
             "a fresh FAST rebuild. Task success is the fraction of applicable probes that find their "
@@ -1453,7 +1476,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "Pareto status considers only candidates that meet the declared quality target, pass "
             "correctness, and have every axis measured. It maximizes overall quality while minimizing "
-            "incremental and query latency, response-token estimate, and peak RSS.",
+            "incremental and query latency, response-token estimate, and peak RSS. This is exact "
+            "pairwise nondominance over the measured candidates, using the Pareto relation described "
+            "by [Deb et al.](https://doi.org/10.1109/4235.996017); it does not run NSGA-II.",
             "",
             "A speedup is accepted only when the case gate and every applicable canonical-graph "
             "and task-oracle check pass. `n/a` means the input artifact did not measure that axis.",

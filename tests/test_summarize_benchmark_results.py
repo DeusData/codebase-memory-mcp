@@ -298,7 +298,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("nDCG@5", markdown)
         self.assertIn("0.800", markdown)
         self.assertIn("3 judgments", markdown)
-        self.assertIn("trec.nist.gov/pubs/trec27/papers/Overview-CAR.pdf", markdown)
+        self.assertIn("doi.org/10.1145/582415.582418", markdown)
 
     def test_fast_mode_report_marks_similarity_and_semantic_quality_not_applicable(self) -> None:
         case = {
@@ -426,7 +426,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("## Dependency-indexing capability and cost", markdown)
         self.assertIn("enabled (explicit)", markdown)
         self.assertIn("trec.nist.gov/data/qa.html", markdown)
+        self.assertIn("doi.org/10.1145/582415.582418", markdown)
         self.assertIn("arxiv.org/abs/2007.10899", markdown)
+        self.assertIn("doi.org/10.1109/4235.996017", markdown)
         self.assertIn("confidence interval", markdown)
 
     def test_quality_failure_blocks_acceptance_even_with_high_speedup(self) -> None:
@@ -482,8 +484,24 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["incremental_p50_ms"], 20.0)
         self.assertEqual(row["incremental_p95_ms"], 30.0)
         self.assertEqual(row["peak_rss_mb"], 120)
-        self.assertEqual(row["cleanup"], "3/3")
+        self.assertEqual(row["lifecycle"], "disposed 3/3")
         self.assertEqual(row["decision"], "PASS")
+
+    def test_lifecycle_distinguishes_retained_evidence_from_cleanup_failure(self) -> None:
+        case = {"passed": True}
+        retained = report(case)
+        retained["cleanup"] = {"requested": False, "removed": False}
+        failed = report(case)
+        failed["cleanup"] = {"requested": True, "removed": False}
+
+        retained_row = SUMMARY.summarize_group("retained", [retained])
+        failed_row = SUMMARY.summarize_group("failed", [failed])
+
+        self.assertEqual(retained_row["lifecycle"], "retained by request 1/1")
+        self.assertEqual(failed_row["lifecycle"], "CLEANUP FAILED 1/1")
+        markdown = SUMMARY.render_markdown([retained_row, failed_row])
+        self.assertIn("Evidence lifecycle", markdown)
+        self.assertNotIn("Cleanup |", markdown)
 
     def test_markdown_places_quality_before_performance(self) -> None:
         case = {
