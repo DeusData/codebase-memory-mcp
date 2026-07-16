@@ -1152,8 +1152,36 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         ]
         markdown = SUMMARY.render_markdown(rows)
 
-        self.assertIn("## Historical performance deltas", markdown)
+        self.assertIn("## Quality-constrained cross-version timing", markdown)
         self.assertIn("| latest-rank-off | baseline-rank-off | 2.00× | 2.00× | 2.00× |", markdown)
+        self.assertIn("descriptive only", markdown)
+
+    def test_cross_version_ratios_are_suppressed_when_quality_decisions_differ(self) -> None:
+        case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "passed": True,
+                "quality": {"passed": True, "passed_count": 1, "applicable_count": 1},
+                "probe": {"elapsed_ms": 4, "response_token_estimate": 10},
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 100},
+            "fresh_fast_full_after_change": {"elapsed_ms": 50},
+        }
+        baseline = SUMMARY.summarize_group("baseline-rank-off", [report(case)])
+        latest = SUMMARY.summarize_group("latest-rank-off", [report(case)])
+        baseline["decision"] = "PASS"
+        latest["decision"] = "PASS: DEFERRED FRESHNESS"
+
+        comparison = SUMMARY.historical_delta_rows([baseline, latest])[0]
+
+        self.assertIsNone(comparison["incremental_speedup"])
+        self.assertIsNone(comparison["full_speedup"])
+        self.assertIsNone(comparison["query_speedup"])
+        self.assertEqual(
+            comparison["comparison_status"],
+            "not comparable: freshness/quality decision differs",
+        )
 
     def test_failed_quality_is_not_pareto_eligible(self) -> None:
         case = {
