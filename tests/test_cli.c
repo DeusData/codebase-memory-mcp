@@ -1219,6 +1219,49 @@ TEST(cli_ensure_path_dry_run) {
     PASS();
 }
 
+TEST(cli_remove_owned_path_block_preserves_user_content) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-remove-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/.zshrc", tmpdir);
+    write_test_file(rcfile, "# user prefix\nexport KEEP_ME=1\n");
+    ASSERT_EQ(cbm_ensure_path("/usr/local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_remove_owned_path("/usr/local/bin", rcfile, false), 0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "export KEEP_ME=1") != NULL);
+    ASSERT(strstr(data, "Added by codebase-memory-mcp install") == NULL);
+    ASSERT(strstr(data, "export PATH=\"/usr/local/bin:$PATH\"") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_remove_owned_path_dry_run_preserves_block) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-path-remove-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char rcfile[512];
+    snprintf(rcfile, sizeof(rcfile), "%s/config.fish", tmpdir);
+    write_test_file(rcfile, "# user prefix\n");
+    ASSERT_EQ(cbm_ensure_path("/usr/local/bin", rcfile, false), 0);
+    ASSERT_EQ(cbm_remove_owned_path("/usr/local/bin", rcfile, true), 0);
+
+    const char *data = read_test_file(rcfile);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "Added by codebase-memory-mcp install") != NULL);
+    ASSERT(strstr(data, "fish_add_path /usr/local/bin") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* issue #319: a fish config must get fish-native syntax, never `export PATH=`
  * (which is a syntax error in fish and breaks config.fish). */
 TEST(cli_ensure_path_fish_syntax_issue319) {
@@ -2039,6 +2082,50 @@ TEST(cli_detect_agents_finds_codex) {
 
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     ASSERT_TRUE(agents.codex);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-kilo-standalone-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char config_path[768];
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/kilo", tmpdir);
+    ASSERT_EQ(test_mkdirp(config_dir), 0);
+    snprintf(config_path, sizeof(config_path), "%s/kilo.jsonc", config_dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.kilo_cli);
+
+    char *plan = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(plan);
+    ASSERT(strstr(plan, "\"kilo-cli\"") != NULL);
+    ASSERT(strstr(plan, ".config/kilo/kilo.jsonc") != NULL);
+    free(plan);
+
+    ASSERT_EQ(write_test_file(
+                  config_path,
+                  "{\n  // user-owned server\n  \"mcp\": {\n    \"foreign\": {\"type\": \"local\", "
+                  "\"command\": [\"keep-me\"]},\n  },\n}\n"),
+              0);
+    ASSERT_EQ(cbm_upsert_opencode_mcp("/usr/local/bin/codebase-memory-mcp", config_path), 0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    cli_env_restore(&home);
+
+    const char *contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "keep-me") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -4149,6 +4236,8 @@ SUITE(cli) {
     RUN_TEST(cli_ensure_path_append);
     RUN_TEST(cli_ensure_path_already_present);
     RUN_TEST(cli_ensure_path_dry_run);
+    RUN_TEST(cli_remove_owned_path_block_preserves_user_content);
+    RUN_TEST(cli_remove_owned_path_dry_run_preserves_block);
     RUN_TEST(cli_ensure_path_fish_syntax_issue319);
 
     /* File copy (2 tests — update_test.go) */
@@ -4197,6 +4286,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
+    RUN_TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_reference_harnesses_are_planned_without_mutation);
