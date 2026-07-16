@@ -1371,6 +1371,57 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIn('cbm_http_path_match(path, "/api/pan4-oracle")', mutated)
         self.assertNotIn("route oracle literal", mutated)
 
+    def test_c_new_leaf_mutation_adds_hashed_indexed_source_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            source = repo / "src" / "cbm_benchmark_leaf.c"
+            mutation = BENCHMARK.mutate_self_dogfood_scenario("c_new_leaf", repo)
+            mutated = source.read_text(encoding="utf-8")
+            source_sha256 = BENCHMARK.file_sha256(source)
+
+        self.assertEqual(mutation["changed_paths"], ["src/cbm_benchmark_leaf.c"])
+        self.assertEqual(mutation["description"], "new isolated C source file")
+        self.assertIn("static int cbm_pan4_oracle_c_new_leaf(void)", mutated)
+        self.assertEqual(
+            mutation["source_hashes"],
+            [
+                {
+                    "path": "src/cbm_benchmark_leaf.c",
+                    "before_sha256": None,
+                    "after_sha256": source_sha256,
+                }
+            ],
+        )
+
+    def test_self_dogfood_worktree_uses_the_declared_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            source_repo = Path(tmpdir) / "source" / "repo"
+            case_root = Path(tmpdir) / "campaign" / "cell"
+            completed = subprocess.CompletedProcess([], 0, "", "")
+
+            with mock.patch.object(
+                BENCHMARK, "command_result", return_value=(completed, 1)
+            ) as run:
+                repo_dir = BENCHMARK.create_self_dogfood_worktree(
+                    source_repo,
+                    case_root,
+                    30,
+                    "a" * 40,
+                )
+
+            self.assertEqual(repo_dir, case_root / BENCHMARK.SELF_DOGFOOD_REPO_SUBDIR)
+            self.assertEqual(
+                run.call_args.args[0],
+                [
+                    "git",
+                    "worktree",
+                    "add",
+                    "--detach",
+                    str(repo_dir),
+                    "a" * 40,
+                ],
+            )
+
     def test_build_index_result_uses_none_without_memory_markers(self) -> None:
         result = BENCHMARK.build_index_result(
             {"publish_kind": "full"}, "level=info msg=pipeline.done elapsed_ms=80", 10,

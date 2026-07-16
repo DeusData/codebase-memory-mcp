@@ -228,6 +228,107 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertNotIn("--matrix", first["command"])
             self.assertEqual(first["accepted_exit_codes"], [0, 1])
 
+    def test_matrix_spec_scopes_branch_only_profiles_to_named_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            benchmark = root / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            candidates = []
+            for label in ("upstream-main", "latest"):
+                binary = root / f"cbm-{label}"
+                binary.write_bytes(label.encode())
+                candidates.append(
+                    {
+                        "label": label,
+                        "revision": ("a" if label == "upstream-main" else "b") * 40,
+                        "binary": str(binary),
+                        "build": {"cflags": "-O2"},
+                    }
+                )
+            spec = {
+                "schema_version": 1,
+                "harness_version": "candidate-profile-scope-v1",
+                "benchmark_script": str(benchmark),
+                "cwd": str(root),
+                "repetitions": 1,
+                "transports": ["cli"],
+                "candidates": candidates,
+                "profiles": [
+                    {"label": "default", "config_profile": "default", "capabilities": {}},
+                    {
+                        "label": "rank-disabled",
+                        "config_profile": "rank_disabled",
+                        "capabilities": {"rank_enabled": "false"},
+                        "candidate_labels": ["latest"],
+                    },
+                ],
+                "scenarios": [
+                    {"name": "go_modify_1", "frontier_files": [4], "exact_caps": [None]}
+                ],
+            }
+
+            plan = CAMPAIGN.expand_matrix_spec(spec)
+
+            self.assertEqual(
+                [item["label"] for item in plan["cells"]],
+                [
+                    "upstream-main.default.cli.go_modify_1.f4.capdefault",
+                    "latest.default.cli.go_modify_1.f4.capdefault",
+                    "latest.rank-disabled.cli.go_modify_1.f4.capdefault",
+                ],
+            )
+
+    def test_matrix_spec_expands_pinned_self_dogfood_repository_workload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            binary = root / "cbm"
+            binary.write_bytes(b"optimized-binary")
+            benchmark = root / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "large-repository-v1",
+                "benchmark_script": str(benchmark),
+                "workload": "self_dogfood",
+                "repository_background": {
+                    "repo": str(root),
+                    "revision": "c" * 40,
+                    "tree": "d" * 40,
+                },
+                "index_mode": "moderate",
+                "cwd": str(root),
+                "repetitions": 2,
+                "transports": ["mcp"],
+                "candidates": [
+                    {
+                        "label": "latest",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "build": {"cflags": "-O2"},
+                    }
+                ],
+                "profiles": [
+                    {"label": "default", "config_profile": "default", "capabilities": {}}
+                ],
+                "scenarios": [{"name": "route_handler"}],
+            }
+
+            plan = CAMPAIGN.expand_matrix_spec(spec)
+
+            self.assertEqual(len(plan["cells"]), 2)
+            first = plan["cells"][0]
+            self.assertEqual(first["label"], "latest.default.mcp.route_handler")
+            self.assertEqual(first["scenario"], "route_handler")
+            self.assertIn("--self-dogfood", first["command"])
+            self.assertIn("--repo-root", first["command"])
+            self.assertIn("--repo-revision", first["command"])
+            self.assertIn("--self-dogfood-scenarios", first["command"])
+            self.assertEqual(
+                first["parameters"]["repository_background"],
+                {"repo": str(root.resolve()), "revision": "c" * 40, "tree": "d" * 40},
+            )
+            self.assertNotIn("--matrix", first["command"])
+
     def test_paired_interleaved_order_runs_one_repetition_block_at_a_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -462,6 +563,36 @@ class BenchmarkCampaignTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "background repository revision mismatch"):
+                CAMPAIGN.validate_result(result, planned)
+
+    def test_result_rejects_self_dogfood_repository_tree_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            planned = cell(["benchmark", "{result_path}"])
+            planned["parameters"] = {
+                "repository_background": {
+                    "repo": str(root),
+                    "revision": "a" * 40,
+                    "tree": "b" * 40,
+                }
+            }
+            result = root / "result.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "binary_metadata": {"sha256": "b" * 64},
+                        "derived": {"passed": True},
+                        "cases": [{"passed": True}],
+                        "repository_background": {
+                            "revision": "a" * 40,
+                            "tree": "c" * 40,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "repository background tree mismatch"):
                 CAMPAIGN.validate_result(result, planned)
 
     def test_failed_attempt_retains_logs_without_completion_marker(self) -> None:
