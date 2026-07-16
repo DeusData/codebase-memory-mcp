@@ -24,6 +24,54 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_mcp_surface_report_keeps_discovery_dispatch_and_behavior_distinct(self) -> None:
+        def surface(count: int, size: int, tokens: int, elapsed: float) -> dict:
+            return {
+                "tool_count": count,
+                "response_bytes": size,
+                "response_token_estimate": tokens,
+                "list_elapsed_ms": elapsed,
+            }
+
+        document = {
+            "mode": "mcp_surface_parity",
+            "surfaces": {
+                "classic": surface(15, 21000, 5250, 0.4),
+                "streamlined_pre_reveal": surface(6, 13000, 3250, 0.3),
+                "streamlined_post_reveal": surface(17, 24000, 6000, 0.2),
+            },
+            "comparison": {
+                "pre_reveal": {
+                    "advertised_classic_tools": "4/15",
+                    "dispatch_recognized_classic_tools": "15/15",
+                    "intentionally_hidden_classic_tools": ["index_repository"],
+                    "get_code_alias": {
+                        "property_names_equal": True,
+                        "required_names_equal": True,
+                        "schema_equal": False,
+                    },
+                },
+                "post_reveal": {
+                    "classic_name_parity": True,
+                    "classic_schema_parity": True,
+                    "tools_list_changed_observed": True,
+                },
+            },
+        }
+
+        markdown = SUMMARY.render_mcp_surface_parity(document)
+
+        self.assertIn("Pure classic | 15 | 15/15", markdown)
+        self.assertIn("Streamlined before reveal | 6 | 4/15 | 15/15", markdown)
+        self.assertIn("Same streamlined process after reveal | 17 | 15/15", markdown)
+        self.assertIn("does not prove successful execution", markdown)
+        self.assertIn("Behavioral parity requires capability fixtures", markdown)
+        self.assertIn("full schema equal=false", markdown)
+
+    def test_mcp_surface_report_rejects_regular_benchmark_document(self) -> None:
+        with self.assertRaisesRegex(ValueError, "expected an mcp_surface_parity"):
+            SUMMARY.render_mcp_surface_parity({"mode": "incremental"})
+
     def test_report_aggregates_graded_ndcg_without_hiding_mrr(self) -> None:
         case = {
             "scenario": "rank_quality",

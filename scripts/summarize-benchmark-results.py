@@ -769,6 +769,115 @@ def atomic_write_text(path: Path, content: str) -> None:
             temporary.unlink()
 
 
+def render_mcp_surface_parity(document: dict[str, Any]) -> str:
+    if document.get("mode") != "mcp_surface_parity":
+        raise ValueError("expected an mcp_surface_parity result document")
+    surfaces = document.get("surfaces")
+    comparison = document.get("comparison")
+    if not isinstance(surfaces, dict) or not isinstance(comparison, dict):
+        raise ValueError("MCP surface result is missing surfaces or comparison")
+
+    classic = surfaces.get("classic")
+    pre = surfaces.get("streamlined_pre_reveal")
+    post = surfaces.get("streamlined_post_reveal")
+    pre_comparison = comparison.get("pre_reveal")
+    post_comparison = comparison.get("post_reveal")
+    if not all(isinstance(value, dict) for value in (classic, pre, post, pre_comparison, post_comparison)):
+        raise ValueError("MCP surface result is missing one or more parity states")
+
+    assert isinstance(classic, dict)
+    assert isinstance(pre, dict)
+    assert isinstance(post, dict)
+    assert isinstance(pre_comparison, dict)
+    assert isinstance(post_comparison, dict)
+    classic_count = classic.get("tool_count")
+    post_classic = (
+        f"{classic_count}/{classic_count}"
+        if post_comparison.get("classic_name_parity") and isinstance(classic_count, int)
+        else "incomplete"
+    )
+    rows = (
+        (
+            "Pure classic",
+            classic,
+            f"{classic_count}/{classic_count}" if isinstance(classic_count, int) else "n/a",
+            "n/a (advertised directly)",
+        ),
+        (
+            "Streamlined before reveal",
+            pre,
+            pre_comparison.get("advertised_classic_tools"),
+            pre_comparison.get("dispatch_recognized_classic_tools"),
+        ),
+        (
+            "Same streamlined process after reveal",
+            post,
+            post_classic,
+            "n/a (advertised after reveal)",
+        ),
+    )
+    lines = [
+        "## MCP tool-surface parity",
+        "",
+        "These are three separate discovery states. The post-reveal row comes from the same "
+        "streamlined server process as the pre-reveal row.",
+        "",
+        "| State | Advertised tools | Advertised classic names | Classic handlers recognized* | "
+        "tools/list bytes | Estimated tokens† | tools/list ms‡ |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for label, surface, advertised_classic, dispatch in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    label,
+                    display(surface.get("tool_count")),
+                    display(advertised_classic),
+                    display(dispatch),
+                    display(surface.get("response_bytes")),
+                    display(surface.get("response_token_estimate")),
+                    display(surface.get("list_elapsed_ms"), 3),
+                )
+            )
+            + " |"
+        )
+
+    hidden = pre_comparison.get("intentionally_hidden_classic_tools")
+    alias = pre_comparison.get("get_code_alias")
+    hidden_count = len(hidden) if isinstance(hidden, list) else "unknown"
+    alias_text = "not measured"
+    if isinstance(alias, dict):
+        alias_text = (
+            f"property names equal={str(bool(alias.get('property_names_equal'))).lower()}, "
+            f"required names equal={str(bool(alias.get('required_names_equal'))).lower()}, "
+            f"full schema equal={str(bool(alias.get('schema_equal'))).lower()}"
+        )
+    lines.extend(
+        (
+            "",
+            "### Parity checks",
+            "",
+            f"- Pre-reveal intentionally hidden classic names: {hidden_count}.",
+            f"- Post-reveal classic name parity: {str(bool(post_comparison.get('classic_name_parity'))).lower()}.",
+            f"- Post-reveal classic input-schema parity: {str(bool(post_comparison.get('classic_schema_parity'))).lower()}.",
+            f"- `notifications/tools/list_changed` observed after reveal: "
+            f"{str(bool(post_comparison.get('tools_list_changed_observed'))).lower()}.",
+            f"- `get_code` versus classic `get_code_snippet`: {alias_text}.",
+            "",
+            "\\* Handler recognition uses bounded empty-argument `tools/call` requests and only proves "
+            "that dispatch did not return `unknown tool`; it does not prove successful execution or "
+            "end-to-end behavioral parity. Behavioral parity requires capability fixtures.",
+            "",
+            "† Estimated as `ceil(UTF-8 response bytes / 4)`; this is not a model-tokenizer count.",
+            "",
+            "‡ Each state currently has one `tools/list` observation, so latency is descriptive only "
+            "and has no confidence interval.",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
 def render_markdown(rows: list[dict[str, Any]]) -> str:
     mark_pareto_frontier(rows)
     lines = [
@@ -1149,9 +1258,18 @@ def parse_input(value: str) -> tuple[str, Path]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", action="append", required=True, type=parse_input)
+    parser.add_argument("--input", action="append", default=[], type=parse_input)
+    parser.add_argument(
+        "--mcp-surface-parity",
+        action="append",
+        default=[],
+        type=Path,
+        help="Append a three-state MCP surface section from a retained parity JSON result.",
+    )
     parser.add_argument("--out", default="")
     args = parser.parse_args()
+    if not args.input and not args.mcp_surface_parity:
+        parser.error("at least one --input or --mcp-surface-parity is required")
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for label, path in args.input:
         with path.open(encoding="utf-8") as stream:
@@ -1159,7 +1277,21 @@ def main() -> int:
         if not isinstance(document, dict):
             raise SystemExit(f"error: expected JSON object in {path}")
         grouped[label].append(document)
-    markdown = render_markdown([summarize_group(label, reports) for label, reports in grouped.items()])
+    sections: list[str] = []
+    if grouped:
+        sections.append(
+            render_markdown(
+                [summarize_group(label, reports) for label, reports in grouped.items()]
+            ).rstrip()
+        )
+    for raw_path in args.mcp_surface_parity:
+        path = raw_path.expanduser()
+        with path.open(encoding="utf-8") as stream:
+            document = json.load(stream)
+        if not isinstance(document, dict):
+            raise SystemExit(f"error: expected JSON object in {path}")
+        sections.append(render_mcp_surface_parity(document).rstrip())
+    markdown = "\n\n".join(sections) + "\n"
     if args.out:
         output = Path(args.out).expanduser()
         atomic_write_text(output, markdown)
