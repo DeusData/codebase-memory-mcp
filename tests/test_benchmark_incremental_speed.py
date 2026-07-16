@@ -1,4 +1,5 @@
 import importlib.util
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,68 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_parse_list_project_counts_requires_strictly_increasing_positive_values(self) -> None:
+        self.assertEqual(BENCHMARK.parse_list_project_counts("1,16,64"), [1, 16, 64])
+        for invalid in ("", "0,1", "1,1", "16,1", "1,two"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                BENCHMARK.parse_list_project_counts(invalid)
+
+    def test_clone_list_project_db_rekeys_rows_without_mutating_seed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            seed = Path(tmpdir) / "seed.db"
+            clone = Path(tmpdir) / "clone.db"
+            with sqlite3.connect(seed) as con:
+                con.executescript(
+                    "CREATE TABLE projects(name TEXT PRIMARY KEY, root_path TEXT);"
+                    "CREATE TABLE nodes(id INTEGER PRIMARY KEY, project TEXT);"
+                    "CREATE TABLE edges(id INTEGER PRIMARY KEY, project TEXT);"
+                    "INSERT INTO projects VALUES('seed','/seed');"
+                    "INSERT INTO nodes VALUES(1,'seed');"
+                    "INSERT INTO edges VALUES(1,'seed');"
+                )
+
+            BENCHMARK.clone_list_project_db(seed, clone, "clone", "/clone")
+
+            with sqlite3.connect(seed) as con:
+                self.assertEqual(con.execute("SELECT name FROM projects").fetchone()[0], "seed")
+            with sqlite3.connect(clone) as con:
+                self.assertEqual(
+                    con.execute("SELECT name, root_path FROM projects").fetchone(),
+                    ("clone", "/clone"),
+                )
+                self.assertEqual(con.execute("SELECT project FROM nodes").fetchone()[0], "clone")
+                self.assertEqual(con.execute("SELECT project FROM edges").fetchone()[0], "clone")
+
+    def test_list_project_fixture_budget_enforces_cap_and_free_space_reserve(self) -> None:
+        mib = 1024 * 1024
+        budget = BENCHMARK.list_project_fixture_budget(
+            seed_bytes=mib,
+            maximum_projects=64,
+            maximum_fixture_mb=64,
+            disk_free_bytes=4 * 1024 * mib,
+        )
+        self.assertTrue(budget["passed"])
+        self.assertEqual(budget["projected_fixture_bytes"], 64 * mib)
+        self.assertEqual(budget["reserved_free_bytes"], 2 * 1024 * mib)
+
+        capped = BENCHMARK.list_project_fixture_budget(
+            seed_bytes=mib,
+            maximum_projects=64,
+            maximum_fixture_mb=63,
+            disk_free_bytes=4 * 1024 * mib,
+        )
+        self.assertFalse(capped["passed"])
+        self.assertEqual(capped["reason"], "projected fixture exceeds configured cap")
+
+        reserve = BENCHMARK.list_project_fixture_budget(
+            seed_bytes=3 * 1024 * mib,
+            maximum_projects=1,
+            maximum_fixture_mb=4096,
+            disk_free_bytes=4 * 1024 * mib,
+        )
+        self.assertFalse(reserve["passed"])
+        self.assertEqual(reserve["reason"], "projected fixture violates free-space reserve")
+
     def test_mcp_client_exit_reaps_process_streams_and_reader_threads(self) -> None:
         class FakeStream:
             def __init__(self) -> None:
