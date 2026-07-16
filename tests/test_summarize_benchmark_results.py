@@ -796,6 +796,38 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
 
+    def test_observation_ranges_report_dispersion_without_claiming_confidence(self) -> None:
+        reports = []
+        for incremental_ms, query_ms, full_ms in ((8, 2, 80), (10, 3, 100), (20, 7, 140)):
+            reports.append(
+                report(
+                    {
+                        "passed": True,
+                        "canonical_graph": {"equal": True},
+                        "oracles": {
+                            "passed": True,
+                            "probe": {
+                                "elapsed_ms": query_ms,
+                                "response_bytes": 40,
+                                "response_token_estimate": 10,
+                            },
+                        },
+                        "incremental": {"elapsed_ms": incremental_ms, "peak_rss_mb": 80},
+                        "fresh_fast_full_after_change": {"elapsed_ms": full_ms},
+                    }
+                )
+            )
+
+        row = SUMMARY.summarize_group("latest", reports)
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["incremental_range_ms"], (8.0, 20.0))
+        self.assertEqual(row["query_range_ms"], (2.0, 7.0))
+        self.assertEqual(row["full_range_ms"], (80.0, 140.0))
+        self.assertIn("## Observation ranges", markdown)
+        self.assertIn("[8.0, 20.0]", markdown)
+        self.assertIn("descriptive min–max ranges, not confidence intervals", markdown)
+
     def test_pareto_reason_lists_missing_axes_for_ineligible_row(self) -> None:
         row = SUMMARY.summarize_group(
             "incomplete",

@@ -620,6 +620,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             exact_caps.add(int(raw_cap))
         except (TypeError, ValueError):
             pass
+    full_values = full_ms or initial_full_ms
     return {
         "candidate": label,
         "decision": decision,
@@ -637,15 +638,23 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
         "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
+        "query_observations": len(query_latency_ms),
+        "query_range_ms": (min(query_latency_ms), max(query_latency_ms))
+        if query_latency_ms
+        else None,
         "incremental_observations": len(incremental_ms),
-        "full_observations": len(full_ms or initial_full_ms),
+        "incremental_range_ms": (min(incremental_ms), max(incremental_ms))
+        if incremental_ms
+        else None,
+        "full_observations": len(full_values),
+        "full_range_ms": (min(full_values), max(full_values)) if full_values else None,
         "capabilities": config_label(reports),
         "capability_signature": config_signature(reports),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
         "incremental_work_p50_ms": percentile(incremental_work_ms, 0.50),
         "incremental_peak_p50_mb": percentile(incremental_peak_rss, 0.50),
         "incremental_p95_ms": percentile(incremental_ms, 0.95),
-        "full_p50_ms": percentile(full_ms or initial_full_ms, 0.50),
+        "full_p50_ms": percentile(full_values, 0.50),
         "speedup_p50": float(statistics.median(speedups)) if speedups else None,
         "peak_rss_mb": max(peak_rss) if peak_rss else None,
         "dependency_mode": dependency_mode(reports, dependency_packages),
@@ -852,6 +861,12 @@ def display(value: Any, digits: int = 1) -> str:
     if isinstance(value, float):
         return f"{value:.{digits}f}"
     return str(value).replace("|", "\\|")
+
+
+def display_range(value: Any) -> str:
+    if not isinstance(value, tuple) or len(value) != 2:
+        return "n/a"
+    return f"[{display(value[0])}, {display(value[1])}]"
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -1304,6 +1319,44 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             )
             + " |"
         )
+    lines.extend(
+        (
+            "",
+            "## Observation ranges",
+            "",
+            "| Candidate | Incremental n | Incremental p50 ms | Incremental min–max ms | "
+            "Query n | Query p50 ms | Query min–max ms | Full n | Full p50 ms | Full min–max ms |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        )
+    )
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    display(row["candidate"]),
+                    display(row["incremental_observations"]),
+                    display(row["incremental_p50_ms"]),
+                    display_range(row["incremental_range_ms"]),
+                    display(row["query_observations"]),
+                    display(row["query_latency_p50_ms"]),
+                    display_range(row["query_range_ms"]),
+                    display(row["full_observations"]),
+                    display(row["full_p50_ms"]),
+                    display_range(row["full_range_ms"]),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        (
+            "",
+            "These are descriptive min–max ranges, not confidence intervals. Campaigns run "
+            "sequentially to avoid resource contention, and the grouped execution order does not "
+            "support a paired or randomized effect-size interval. Medians and ratios remain "
+            "descriptive until an interleaved design is measured.",
+        )
+    )
     lines.extend(
         (
             "",
