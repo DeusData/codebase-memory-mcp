@@ -400,6 +400,21 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["dependency_incremental_p50_ms"], 4.0)
         self.assertEqual(row["dependency_fresh_p50_ms"], 80.0)
 
+    def test_capability_quality_reports_initial_full_time_and_peak_rss(self) -> None:
+        case = {
+            "passed": True,
+            "quality_target_met": True,
+            "initial_fast_full": {"elapsed_ms": 125, "peak_rss_mb": 42},
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+
+        row = SUMMARY.summarize_group("quality", [item])
+
+        self.assertEqual(row["full_p50_ms"], 125.0)
+        self.assertEqual(row["full_observations"], 1)
+        self.assertEqual(row["peak_rss_mb"], 42)
+
     def test_dependency_mode_distinguishes_disabled_unsupported_and_unknown(self) -> None:
         case = {
             "passed": True,
