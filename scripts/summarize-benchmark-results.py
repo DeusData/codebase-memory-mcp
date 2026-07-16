@@ -239,6 +239,24 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
                 group["changed_paths"].update(
                     str(path) for path in changed_paths if isinstance(path, str) and path
                 )
+        # Matrix artifacts predate the self-dogfood mutation object and retain
+        # their changed paths at the case root. Consume both schemas so an
+        # auditable path is never rendered as "not reported".
+        case_changed_paths = case.get("changed_paths")
+        if isinstance(case_changed_paths, list):
+            group["changed_paths"].update(
+                str(path) for path in case_changed_paths if isinstance(path, str) and path
+            )
+        scenario_metadata = case.get("scenario_metadata")
+        if not group["descriptions"] and isinstance(scenario_metadata, dict):
+            if scenario_metadata.get("source") == "synthetic_inbound_frontier":
+                language = scenario_metadata.get("cross_file_resolver_language")
+                if not isinstance(language, str) or not language:
+                    language = scenario_metadata.get("language")
+                if isinstance(language, str) and language:
+                    group["descriptions"].add(
+                        f"synthetic {language} inbound-frontier definition edit"
+                    )
         incremental = case.get("incremental")
         if isinstance(incremental, dict):
             if isinstance(incremental.get("elapsed_ms"), (int, float)):

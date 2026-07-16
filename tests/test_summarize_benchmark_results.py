@@ -907,6 +907,32 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("end-to-end", markdown)
         self.assertIn("isolates indexing work", markdown)
 
+    def test_markdown_reports_matrix_changed_paths_from_case_root(self) -> None:
+        case = {
+            "scenario": "go_inbound_frontier",
+            "changed_paths": ["leaf.go"],
+            "scenario_metadata": {
+                "source": "synthetic_inbound_frontier",
+                "language": "go",
+                "incremental_contract": "exact_frontier",
+            },
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "incremental": {
+                "elapsed_ms": 59,
+                "indexed_work_elapsed_ms": 26,
+                "publish_kind": "incremental_exact",
+            },
+            "fresh_fast_full_after_change": {"elapsed_ms": 63},
+            "speedup_full_rebuild_over_incremental": 63 / 59,
+        }
+
+        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
+
+        self.assertIn("synthetic go inbound-frontier definition edit", markdown)
+        self.assertIn("leaf.go", markdown)
+        self.assertNotIn("| not reported | not reported | incremental_exact |", markdown)
+
     def test_markdown_computes_latest_speedups_for_matching_capabilities(self) -> None:
         def measured_case(incremental_ms: int, full_ms: int, query_ms: int) -> dict:
             return {
