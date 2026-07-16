@@ -10,6 +10,7 @@
 #include "foundation/constants.h"
 #include "foundation/str_util.h"
 #include "foundation/sha256.h"
+#include "depindex/depindex.h"
 #include "pagerank/pagerank.h"
 #include "pipeline/pipeline.h"
 #include "mcp/mcp.h" // cbm_mcp_tool_input_schema — CLI flag parser + per-tool --help
@@ -3179,6 +3180,132 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
     return rc;
 }
 
+typedef struct {
+    const char *key;
+    const char *value;
+} cbm_config_preset_value_t;
+
+typedef struct {
+    const char *name;
+    const char *description;
+    const cbm_config_preset_value_t *values;
+    size_t value_count;
+    bool quality_tradeoff;
+} cbm_config_preset_t;
+
+#define PRESET_VALUE(key_, value_) {key_, value_}
+#define PRESET_COUNT(values_) (sizeof(values_) / sizeof((values_)[0]))
+
+static const cbm_config_preset_value_t PRESET_STREAMLINED_QUALITY[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, "streamlined"),
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_CLASSIC_QUALITY[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, "classic"),
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_RANK_DISABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_DEPENDENCY_DISABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "false"),
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_OPTIONAL_GRAPH_DISABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "false"),
+};
+
+static const cbm_config_preset_value_t PRESET_MINIMAL_INDEXING[] = {
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "false"),
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "false"),
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "false"),
+};
+
+static const cbm_config_preset_t CBM_CONFIG_PRESETS[] = {
+    {"streamlined-quality", "recommended streamlined API with all measured quality capabilities",
+     PRESET_STREAMLINED_QUALITY, PRESET_COUNT(PRESET_STREAMLINED_QUALITY), false},
+    {"classic-quality", "classic API with the same full-quality graph capabilities",
+     PRESET_CLASSIC_QUALITY, PRESET_COUNT(PRESET_CLASSIC_QUALITY), false},
+    {"rank-disabled", "exact PageRank/LinkRank ablation; lowers measured ranking quality",
+     PRESET_RANK_DISABLED, PRESET_COUNT(PRESET_RANK_DISABLED), true},
+    {"dependency-disabled", "exact dependency-indexing ablation; removes dependency API results",
+     PRESET_DEPENDENCY_DISABLED, PRESET_COUNT(PRESET_DEPENDENCY_DISABLED), true},
+    {"optional-graph-disabled", "disable optional graph passes but retain dependency indexing",
+     PRESET_OPTIONAL_GRAPH_DISABLED, PRESET_COUNT(PRESET_OPTIONAL_GRAPH_DISABLED), true},
+    {"minimal-indexing", "lowest measured indexing cost; disables rank and dependency results",
+     PRESET_MINIMAL_INDEXING, PRESET_COUNT(PRESET_MINIMAL_INDEXING), true},
+    {NULL, NULL, NULL, 0, false},
+};
+
+static const cbm_config_preset_t *cbm_config_find_preset(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    for (size_t i = 0; CBM_CONFIG_PRESETS[i].name; i++) {
+        if (strcmp(CBM_CONFIG_PRESETS[i].name, name) == 0) {
+            return &CBM_CONFIG_PRESETS[i];
+        }
+    }
+    return NULL;
+}
+
+int cbm_config_apply_preset(cbm_config_t *cfg, const char *name) {
+    const cbm_config_preset_t *preset = cbm_config_find_preset(name);
+    if (!cfg || !preset || sqlite3_exec(cfg->db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        return CLI_ERR;
+    }
+    for (size_t i = 0; i < preset->value_count; i++) {
+        if (cbm_config_set(cfg, preset->values[i].key, preset->values[i].value) != 0) {
+            (void)sqlite3_exec(cfg->db, "ROLLBACK", NULL, NULL, NULL);
+            return CLI_ERR;
+        }
+    }
+    if (sqlite3_exec(cfg->db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        (void)sqlite3_exec(cfg->db, "ROLLBACK", NULL, NULL, NULL);
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+static void cbm_config_print_presets(void) {
+    printf("Named presets (applied atomically):\n");
+    for (size_t i = 0; CBM_CONFIG_PRESETS[i].name; i++) {
+        printf("  %-24s %s%s\n", CBM_CONFIG_PRESETS[i].name, CBM_CONFIG_PRESETS[i].description,
+               CBM_CONFIG_PRESETS[i].quality_tradeoff ? " [quality tradeoff]" : "");
+    }
+}
+
 /* ── Config registry ──────────────────────────────────────────── */
 
 /* Hand-wrapped for readable help text; automatic formatting makes this table
@@ -3307,7 +3434,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "auto-pushed summary that closes the codebase://architecture pull-only gap. Kept small (10) "
      "to keep first-response token cost modest; raise to 20-25 if you want richer upfront context."},
     /* ── Tools ── */
-    {"tool_mode", "streamlined", "CBM_TOOL_MODE", "Tools",
+    {CBM_CONFIG_TOOL_MODE, "streamlined", "CBM_TOOL_MODE", "Tools",
      "Which tool surface the MCP server lists by default",
      "streamlined|classic",
      "'streamlined' (default): lists core tools plus _hidden_tools discovery: "
@@ -3648,6 +3775,8 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  get <key>        Get effective value (env > db > default)\n");
         printf("  set <key> <val>  Set a config value\n");
         printf("  reset <key>      Reset a key to default\n\n");
+        printf("  preset list      List exact named capability/API configurations\n");
+        printf("  preset apply <name>  Atomically apply a named preset\n\n");
         printf("Storage: ~/.cache/codebase-memory-mcp/_config.db\n");
         printf("Priority: environment variable > config set > default\n\n");
         printf("Examples:\n");
@@ -3726,6 +3855,43 @@ int cbm_cmd_config(int argc, char **argv) {
                        e->description ? e->description : "");
             if (e->guidance)
                 printf("      %s\n\n", e->guidance);
+        }
+    } else if (strcmp(argv[0], "preset") == 0) {
+        if (argc < MIN_ARGC_GET || strcmp(argv[CLI_IDX_1], "list") == 0) {
+            cbm_config_print_presets();
+            printf("\nApply with: codebase-memory-mcp config preset apply <name>\n");
+        } else if (argc < MIN_ARGC_CMD || strcmp(argv[CLI_IDX_1], "apply") != 0) {
+            (void)fprintf(stderr, "Usage: config preset list | config preset apply <name>\n");
+            rc = CLI_TRUE;
+        } else {
+            const cbm_config_preset_t *preset = cbm_config_find_preset(argv[CLI_IDX_2]);
+            if (!preset) {
+                (void)fprintf(stderr, "error: unknown config preset: %s\n", argv[CLI_IDX_2]);
+                cbm_config_print_presets();
+                rc = CLI_TRUE;
+            } else if (cbm_config_apply_preset(cfg, preset->name) != 0) {
+                (void)fprintf(stderr, "error: failed to apply config preset atomically: %s\n",
+                              preset->name);
+                rc = CLI_TRUE;
+            } else {
+                printf("Applied preset %s atomically:\n", preset->name);
+                for (size_t i = 0; i < preset->value_count; i++) {
+                    const char *effective = cbm_config_get_effective(
+                        cfg, preset->values[i].key, preset->values[i].value);
+                    printf("  %s = %s\n", preset->values[i].key, preset->values[i].value);
+                    if (strcmp(effective, preset->values[i].value) != 0) {
+                        (void)fprintf(stderr,
+                                      "warning: %s is effectively %s because a higher-priority "
+                                      "environment override is active\n",
+                                      preset->values[i].key, effective);
+                        rc = CLI_TRUE;
+                    }
+                }
+                if (preset->quality_tradeoff) {
+                    printf("Warning: this preset intentionally lowers one or more measured quality "
+                           "capabilities.\n");
+                }
+            }
         }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
