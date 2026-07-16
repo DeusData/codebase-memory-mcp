@@ -850,6 +850,19 @@ static bool is_candidate_method(const cbm_registry_t *r, const char *qn) {
     *last_dot = '\0';
 
     const char *parent_label = cbm_registry_label_of(r, parent_qn);
+    if (!parent_label) {
+        const char *p_name = simple_name(parent_qn);
+        qn_array_t *arr = cbm_ht_get(r->by_name, p_name);
+        if (arr) {
+            for (int i = 0; i < arr->count; i++) {
+                const char *cand_label = cbm_registry_label_of(r, arr->items[i]);
+                if (cand_label && strcmp(cand_label, "Enum") == 0) {
+                    parent_label = "Enum";
+                    break;
+                }
+            }
+        }
+    }
     return is_type_like_label(parent_label);
 }
 
