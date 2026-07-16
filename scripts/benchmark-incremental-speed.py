@@ -602,12 +602,140 @@ def estimate_response_tokens(payload: bytes) -> int:
     return (len(payload) + 3) // 4
 
 
+def tool_schema_sha256(tool: dict[str, Any]) -> str:
+    schema = tool.get("inputSchema")
+    payload = json.dumps(schema, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def tool_schema_properties(tool: dict[str, Any] | None) -> set[str]:
+    if not isinstance(tool, dict):
+        return set()
+    schema = tool.get("inputSchema")
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    return set(map(str, properties)) if isinstance(properties, dict) else set()
+
+
+def tool_schema_required(tool: dict[str, Any] | None) -> set[str]:
+    if not isinstance(tool, dict):
+        return set()
+    schema = tool.get("inputSchema")
+    required = schema.get("required") if isinstance(schema, dict) else None
+    return set(map(str, required)) if isinstance(required, list) else set()
+
+
+def compare_mcp_tool_surfaces(
+    pre_reveal: list[dict[str, Any]],
+    post_reveal: list[dict[str, Any]],
+    classic: list[dict[str, Any]],
+    *,
+    pre_dispatch: dict[str, bool],
+    list_changed_observed: bool,
+) -> dict[str, Any]:
+    """Compare discovery and callable coverage without conflating hidden with absent."""
+    pre_by_name = {str(tool.get("name")): tool for tool in pre_reveal if tool.get("name")}
+    post_by_name = {str(tool.get("name")): tool for tool in post_reveal if tool.get("name")}
+    classic_by_name = {str(tool.get("name")): tool for tool in classic if tool.get("name")}
+    classic_names = set(classic_by_name)
+    advertised_pre = sorted(classic_names & set(pre_by_name))
+    hidden_pre = sorted(classic_names - set(pre_by_name))
+    dispatch_recognized_pre = sorted(
+        name for name in classic_names if pre_dispatch.get(name) is True
+    )
+    missing_post = sorted(classic_names - set(post_by_name))
+    schema_mismatches = sorted(
+        name
+        for name in classic_names & set(post_by_name)
+        if tool_schema_sha256(classic_by_name[name]) != tool_schema_sha256(post_by_name[name])
+    )
+    name_parity = not missing_post
+    schema_parity = name_parity and not schema_mismatches
+    dispatch_parity = len(dispatch_recognized_pre) == len(classic_names) and bool(classic_names)
+    alias_streamlined = pre_by_name.get("get_code")
+    alias_classic = classic_by_name.get("get_code_snippet")
+    streamlined_properties = tool_schema_properties(alias_streamlined)
+    classic_properties = tool_schema_properties(alias_classic)
+    streamlined_required = tool_schema_required(alias_streamlined)
+    classic_required = tool_schema_required(alias_classic)
+    alias = {
+        "streamlined_name": "get_code",
+        "classic_name": "get_code_snippet",
+        "both_advertised_in_compared_surfaces": bool(alias_streamlined and alias_classic),
+        "schema_equal": bool(alias_streamlined and alias_classic)
+        and tool_schema_sha256(alias_streamlined) == tool_schema_sha256(alias_classic),
+        "property_names_equal": streamlined_properties == classic_properties,
+        "shared_properties": sorted(streamlined_properties & classic_properties),
+        "streamlined_only_properties": sorted(streamlined_properties - classic_properties),
+        "classic_only_properties": sorted(classic_properties - streamlined_properties),
+        "streamlined_required": sorted(streamlined_required),
+        "classic_required": sorted(classic_required),
+        "required_names_equal": streamlined_required == classic_required,
+    }
+    return {
+        "comparison_scope": {
+            "advertised_parity": "tool names and input-schema hashes",
+            "dispatch_parity": (
+                "handler recognition from bounded empty-argument calls; this does not claim "
+                "end-to-end behavioral equality"
+            ),
+        },
+        "pre_reveal": {
+            "advertised_classic_tools": f"{len(advertised_pre)}/{len(classic_names)}",
+            "advertised_classic_tool_names": advertised_pre,
+            "intentionally_hidden_classic_tools": hidden_pre,
+            "dispatch_recognized_classic_tools": (
+                f"{len(dispatch_recognized_pre)}/{len(classic_names)}"
+            ),
+            "dispatch_recognized_classic_tool_names": dispatch_recognized_pre,
+            "classic_dispatch_parity": dispatch_parity,
+            "get_code_alias": alias,
+        },
+        "post_reveal": {
+            "classic_name_parity": name_parity,
+            "missing_classic_tools": missing_post,
+            "classic_schema_parity": schema_parity,
+            "schema_mismatches": schema_mismatches,
+            "tools_list_changed_observed": list_changed_observed,
+        },
+        "passed": dispatch_parity and name_parity and schema_parity and list_changed_observed,
+    }
+
+
+def capture_tool_surface(client: "McpClient") -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    start = now_ms()
+    response = client._request("tools/list", {})
+    elapsed_ms = now_ms() - start
+    result = response.get("result")
+    tools = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
+        raise RuntimeError("MCP tools/list did not return an object array")
+    typed_tools = list(tools)
+    payload = json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return (
+        {
+            "tool_count": len(typed_tools),
+            "tool_names": [str(tool.get("name")) for tool in typed_tools],
+            "input_schema_sha256": {
+                str(tool.get("name")): tool_schema_sha256(tool)
+                for tool in typed_tools
+                if tool.get("name")
+            },
+            "list_elapsed_ms": round(elapsed_ms, 3),
+            "response_bytes": len(payload),
+            "response_token_estimate": estimate_response_tokens(payload),
+            "token_estimator": TOKEN_ESTIMATOR,
+        },
+        typed_tools,
+    )
+
+
 class McpClient:
     def __init__(self, binary: Path, env: dict[str, str], timeout: int) -> None:
         self.binary = binary
         self.env = env
         self.timeout = timeout
         self.next_id = 1
+        self.notifications: list[dict[str, Any]] = []
         self.stderr_lines: list[str] = []
         self.stderr_lock = threading.Lock()
         self.stdout_queue: queue.Queue[str | None] = queue.Queue()
@@ -693,6 +821,9 @@ class McpClient:
                 response = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise RuntimeError(f"non-JSON MCP stdout line: {line[:200]!r}") from exc
+            if "id" not in response and isinstance(response.get("method"), str):
+                self.notifications.append(response)
+                continue
             if response.get("id") == req_id:
                 if "error" in response:
                     raise RuntimeError(f"MCP request failed: {response['error']}")
@@ -731,6 +862,89 @@ class McpClient:
         stderr = self._stderr_since(mark)
         stdout_bytes = len(json.dumps(response, separators=(",", ":")).encode("utf-8"))
         return mcp_result_text(response), stderr, stdout_bytes, elapsed_ms
+
+
+def run_mcp_surface_parity(
+    args: argparse.Namespace, binary: Path
+) -> tuple[dict[str, Any], int]:
+    auto_root = not bool(args.work_root)
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="cbm-mcp-surface-"))
+    )
+    work_root.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "binary": str(binary),
+        "binary_metadata": binary_metadata(binary),
+        "mode": "mcp_surface_parity",
+        "protocol_version": MCP_INIT_PROTOCOL_VERSION,
+        "work_root": str(work_root),
+        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+    }
+    exit_code = 1
+    try:
+        base_env = build_env(work_root / "cache")
+        base_env["CBM_AUTO_INDEX"] = "false"
+
+        classic_env = dict(base_env)
+        classic_env["CBM_TOOL_MODE"] = "classic"
+        with McpClient(binary, classic_env, args.timeout) as classic_client:
+            classic_summary, classic_tools = capture_tool_surface(classic_client)
+
+        streamlined_env = dict(base_env)
+        streamlined_env["CBM_TOOL_MODE"] = "streamlined"
+        with McpClient(binary, streamlined_env, args.timeout) as streamlined_client:
+            pre_summary, pre_tools = capture_tool_surface(streamlined_client)
+            pre_dispatch: dict[str, bool] = {}
+            dispatch_bytes: dict[str, int] = {}
+            for tool in classic_tools:
+                name = str(tool.get("name") or "")
+                if not name:
+                    continue
+                text, _, response_bytes, _ = streamlined_client.call_tool_text(name, {})
+                pre_dispatch[name] = "unknown tool" not in text.lower()
+                dispatch_bytes[name] = response_bytes
+            streamlined_client.call_tool_text("_hidden_tools", {})
+            post_summary, post_tools = capture_tool_surface(streamlined_client)
+            list_changed_observed = any(
+                item.get("method") == "notifications/tools/list_changed"
+                for item in streamlined_client.notifications
+            )
+
+        comparison = compare_mcp_tool_surfaces(
+            pre_tools,
+            post_tools,
+            classic_tools,
+            pre_dispatch=pre_dispatch,
+            list_changed_observed=list_changed_observed,
+        )
+        pre_summary["classic_dispatch_recognized"] = pre_dispatch
+        pre_summary["dispatch_response_bytes"] = dispatch_bytes
+        report.update(
+            {
+                "surfaces": {
+                    "streamlined_pre_reveal": pre_summary,
+                    "streamlined_post_reveal": post_summary,
+                    "classic": classic_summary,
+                },
+                "comparison": comparison,
+                "derived": {"passed": comparison["passed"]},
+            }
+        )
+        exit_code = 0 if comparison["passed"] else 1
+    except Exception as exc:
+        record_report_error(report, exc)
+    finally:
+        if auto_root and not args.keep_work_root:
+            shutil.rmtree(work_root, ignore_errors=True)
+            report["cleanup"]["removed"] = not work_root.exists()
+        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        if args.out:
+            write_text(Path(args.out).expanduser(), rendered)
+        print(rendered, end="")
+    return report, exit_code
 
 
 def log_tail(stderr: str) -> list[str]:
@@ -2513,6 +2727,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--keep-work-root", action="store_true")
     parser.add_argument("--include-logs", action="store_true")
+    parser.add_argument(
+        "--mcp-surface-parity",
+        action="store_true",
+        help=(
+            "Measure classic startup, streamlined pre-reveal, and streamlined post-reveal "
+            "tool discovery without indexing a repository."
+        ),
+    )
     parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
     parser.add_argument(
         "--self-dogfood",
@@ -2598,6 +2820,9 @@ def main() -> int:
     if not binary.is_file():
         print(f"error: binary not found: {binary}", file=sys.stderr)
         return 2
+    if args.mcp_surface_parity:
+        _, surface_exit_code = run_mcp_surface_parity(args, binary)
+        return surface_exit_code
     if args.matrix:
         _, matrix_exit_code = run_matrix(args, binary)
         return matrix_exit_code

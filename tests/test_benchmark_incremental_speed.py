@@ -143,6 +143,90 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {"auto_index_deps": "false"},
         )
 
+    def test_surface_parity_separates_pre_reveal_discovery_from_dispatch(self) -> None:
+        schema_a = {"type": "object", "properties": {"query": {"type": "string"}}}
+        schema_b = {"type": "object", "properties": {"path": {"type": "string"}}}
+        classic = [
+            {"name": "search_graph", "inputSchema": schema_a},
+            {"name": "index_repository", "inputSchema": schema_b},
+            {"name": "get_code_snippet", "inputSchema": schema_b},
+        ]
+        pre = [
+            {"name": "search_graph", "inputSchema": schema_a},
+            {
+                "name": "get_code",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"qualified_name": {"type": "string"}},
+                },
+            },
+            {"name": "_hidden_tools", "inputSchema": {"type": "object"}},
+        ]
+        post = [
+            *pre,
+            {"name": "index_repository", "inputSchema": schema_b},
+            {"name": "get_code_snippet", "inputSchema": schema_b},
+        ]
+
+        comparison = BENCHMARK.compare_mcp_tool_surfaces(
+            pre,
+            post,
+            classic,
+            pre_dispatch={
+                "search_graph": True,
+                "index_repository": True,
+                "get_code_snippet": True,
+            },
+            list_changed_observed=True,
+        )
+
+        self.assertEqual(comparison["pre_reveal"]["advertised_classic_tools"], "1/3")
+        self.assertEqual(
+            comparison["pre_reveal"]["dispatch_recognized_classic_tools"], "3/3"
+        )
+        self.assertEqual(
+            comparison["pre_reveal"]["intentionally_hidden_classic_tools"],
+            ["get_code_snippet", "index_repository"],
+        )
+        self.assertTrue(comparison["pre_reveal"]["classic_dispatch_parity"])
+        self.assertFalse(comparison["pre_reveal"]["get_code_alias"]["schema_equal"])
+        self.assertFalse(
+            comparison["pre_reveal"]["get_code_alias"]["property_names_equal"]
+        )
+        self.assertEqual(
+            comparison["pre_reveal"]["get_code_alias"]["classic_only_properties"],
+            ["path"],
+        )
+        self.assertTrue(comparison["post_reveal"]["classic_name_parity"])
+        self.assertTrue(comparison["post_reveal"]["classic_schema_parity"])
+        self.assertTrue(comparison["post_reveal"]["tools_list_changed_observed"])
+        self.assertTrue(comparison["passed"])
+
+    def test_surface_parity_rejects_post_reveal_schema_drift(self) -> None:
+        classic = [
+            {"name": "search_graph", "inputSchema": {"type": "object"}},
+        ]
+        post = [
+            {
+                "name": "search_graph",
+                "inputSchema": {"type": "object", "required": ["query"]},
+            },
+        ]
+
+        comparison = BENCHMARK.compare_mcp_tool_surfaces(
+            classic,
+            post,
+            classic,
+            pre_dispatch={"search_graph": True},
+            list_changed_observed=True,
+        )
+
+        self.assertFalse(comparison["post_reveal"]["classic_schema_parity"])
+        self.assertEqual(
+            comparison["post_reveal"]["schema_mismatches"], ["search_graph"]
+        )
+        self.assertFalse(comparison["passed"])
+
     def test_explicit_config_override_takes_priority_over_profile(self) -> None:
         overrides = BENCHMARK.resolve_config_overrides(
             "minimal_indexing", ["rank_enabled=true", "auto_index_deps=true"]
