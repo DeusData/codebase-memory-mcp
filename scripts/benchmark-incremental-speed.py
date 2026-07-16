@@ -80,6 +80,7 @@ FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
+CAPABILITY_QUALITY_CASES = ("rank",)
 CROSS_FILE_RESOLVER_LANGUAGES = (
     "go",
     "c",
@@ -217,6 +218,39 @@ def create_route_repo(repo_dir: Path, route_path: str) -> None:
         "def orders():\n"
         "    return {'ok': True}\n",
     )
+
+
+def create_rank_quality_repo(repo_dir: Path) -> dict[str, Any]:
+    """Create a lexical-decoy graph where structural rank identifies the useful result."""
+    write_text(
+        repo_dir / "order_core.py",
+        "def zz_order_core(order):\n"
+        "    \"\"\"Validate and persist the canonical order workflow.\"\"\"\n"
+        "    return {'accepted': bool(order)}\n",
+    )
+    decoy_names = [f"a{letter}_order_stub" for letter in "abcdefgh"]
+    write_text(
+        repo_dir / "order_stubs.py",
+        "\n\n".join(
+            f"def {name}(order):\n    return order" for name in decoy_names
+        )
+        + "\n",
+    )
+    for index in range(8):
+        write_text(
+            repo_dir / f"caller_{index}.py",
+            "from order_core import zz_order_core\n\n"
+            f"def workflow_{index}(order):\n"
+            "    return zz_order_core(order)\n",
+        )
+    return {
+        "fixture_version": 1,
+        "capability": "rank",
+        "language": "python",
+        "relevant_symbol": "zz_order_core",
+        "lexical_decoys": decoy_names,
+        "ranking_signal": "eight distinct callers target the relevant symbol",
+    }
 
 
 def create_inbound_frontier_repo(
@@ -2261,20 +2295,21 @@ def score_ranked_relevance(
         and isinstance(item.get("relevance"), (int, float))
         and float(item["relevance"]) > 0
     ]
-    matched_relevance: list[float | int] = []
-    for ranked_item in ranked_items[:cutoff]:
+    all_relevance: list[float | int] = []
+    for ranked_item in ranked_items:
         serialized = json.dumps(ranked_item, separators=(",", ":"), sort_keys=True)
         relevance = max(
             (grade for expected, grade in valid_judgments if expected in serialized),
             default=0.0,
         )
-        matched_relevance.append(
+        all_relevance.append(
             int(relevance) if relevance.is_integer() else relevance
         )
     first_relevant_rank = next(
-        (index for index, relevance in enumerate(matched_relevance, start=1) if relevance > 0),
+        (index for index, relevance in enumerate(all_relevance, start=1) if relevance > 0),
         None,
     )
+    matched_relevance = all_relevance[:cutoff]
 
     def discounted_gain(grades: list[float | int]) -> float:
         return sum(
@@ -2524,6 +2559,48 @@ def run_self_dogfood_oracles(
     return oracles
 
 
+def run_rank_quality_oracles(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    project: str,
+    args: argparse.Namespace,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    oracles = {
+        "central_order_search": run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "search_graph",
+            {
+                "project": project,
+                "label": "Function",
+                "name_pattern": "order",
+                "limit": 10,
+            },
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+    }
+    expectations = {
+        "central_order_search": {
+            "criterion": (
+                "rank the structurally central order workflow ahead of lexical-only decoys"
+            ),
+            "cutoff": 5,
+            "judgments": [
+                {"expected_substring": "zz_order_core", "relevance": 3},
+            ],
+        }
+    }
+    quality = score_quality_oracles(oracles, expectations)
+    oracles["quality"] = quality
+    oracles["passed"] = quality["passed"]
+    return oracles
+
+
 def run_index_for_transport(
     transport: str,
     binary: Path,
@@ -2539,6 +2616,103 @@ def run_index_for_transport(
             raise RuntimeError("MCP transport requires an active client")
         return run_index_mcp(client, repo_dir, include_logs, index_mode)
     return run_index(binary, env, repo_dir, timeout, include_logs, index_mode)
+
+
+def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+    capability = args.capability_quality
+    if capability not in CAPABILITY_QUALITY_CASES:
+        raise ValueError(f"unsupported capability quality case: {capability}")
+    auto_root = not bool(args.work_root)
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix=f"cbm-quality-{capability}-"))
+    )
+    repo_dir = work_root / "repo"
+    cache_dir = work_root / "cache"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    case_env = build_env(cache_dir)
+    report: dict[str, Any] = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "binary": str(binary),
+        "binary_metadata": binary_metadata(binary),
+        "work_root": str(work_root),
+        "mode": "capability_quality",
+        "parameters": {
+            "capability": capability,
+            "index_mode": args.index_mode,
+            "capability_applicability": index_mode_capability_applicability(args.index_mode),
+            "config_profile": args.config_profile,
+            "config_overrides": args.config_overrides,
+            "transport": args.transport,
+            "timeout": args.timeout,
+        },
+        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cases": [],
+    }
+    exit_code = 1
+    try:
+        fixture = create_rank_quality_repo(repo_dir)
+        apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
+        if args.transport == "mcp":
+            with McpClient(binary, case_env, args.timeout) as client:
+                indexed = run_index_for_transport(
+                    args.transport,
+                    binary,
+                    case_env,
+                    repo_dir,
+                    args.timeout,
+                    args.include_logs,
+                    client,
+                    index_mode=args.index_mode,
+                )
+                project = str(indexed.get("response", {}).get("project") or "repo")
+                oracles = run_rank_quality_oracles(
+                    args.transport, binary, case_env, project, args, client
+                )
+        else:
+            indexed = run_index_for_transport(
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                index_mode=args.index_mode,
+            )
+            project = str(indexed.get("response", {}).get("project") or "repo")
+            oracles = run_rank_quality_oracles(
+                args.transport, binary, case_env, project, args
+            )
+        case = {
+            "scenario": "rank_quality",
+            "project": project,
+            "fixture": fixture,
+            "initial_fast_full": indexed,
+            "oracles": oracles,
+            "execution_passed": True,
+            "quality_target_met": bool(oracles.get("passed")),
+            "passed": True,
+        }
+        report["cases"].append(case)
+        report["derived"] = {
+            "passed": True,
+            "quality_target_met": case["quality_target_met"],
+            "case_count": 1,
+        }
+        exit_code = 0
+    except Exception as exc:
+        record_report_error(report, exc)
+    finally:
+        if auto_root and not args.keep_work_root:
+            shutil.rmtree(work_root, ignore_errors=True)
+            report["cleanup"]["removed"] = not work_root.exists()
+        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        if args.out:
+            write_text(Path(args.out).expanduser(), rendered)
+        print(rendered, end="")
+    return report, exit_code
 
 
 def run_matrix_case(
@@ -2922,6 +3096,15 @@ def parse_args() -> argparse.Namespace:
             "tool discovery without indexing a repository."
         ),
     )
+    parser.add_argument(
+        "--capability-quality",
+        choices=CAPABILITY_QUALITY_CASES,
+        default="",
+        help=(
+            "Run one isolated, deterministic capability-quality fixture. The rank case "
+            "measures whether structural ranking lifts the central result above lexical decoys."
+        ),
+    )
     parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
     parser.add_argument(
         "--self-dogfood",
@@ -3010,6 +3193,9 @@ def main() -> int:
     if args.mcp_surface_parity:
         _, surface_exit_code = run_mcp_surface_parity(args, binary)
         return surface_exit_code
+    if args.capability_quality:
+        _, quality_exit_code = run_capability_quality(args, binary)
+        return quality_exit_code
     if args.matrix:
         _, matrix_exit_code = run_matrix(args, binary)
         return matrix_exit_code

@@ -102,6 +102,8 @@ def quality_oracle_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 result = f"PASS (rank {rank} of {returned})"
             elif passed is True:
                 result = "PASS"
+            elif isinstance(rank, int) and isinstance(returned, int):
+                result = f"BELOW CUTOFF (rank {rank} of {returned})"
             elif isinstance(returned, int):
                 result = f"FAIL (not found in {returned})"
             else:
@@ -134,7 +136,9 @@ def compact_witness(value: Any, limit: int = 96) -> str:
     return single_line if len(single_line) <= limit else single_line[: limit - 1] + "…"
 
 
-def correctness_findings(cases: list[dict[str, Any]]) -> list[str]:
+def correctness_findings(
+    cases: list[dict[str, Any]], *, capability_quality: bool = False
+) -> list[str]:
     findings: list[str] = []
     for case in cases:
         canonical = case.get("canonical_graph")
@@ -162,7 +166,14 @@ def correctness_findings(cases: list[dict[str, Any]]) -> list[str]:
             quality = oracle.get("quality")
             if isinstance(quality, dict) and quality.get("passed") is False:
                 expected = compact_witness(quality.get("expected_substring"))
-                finding = f"{name} failed"
+                rank = quality.get("rank")
+                cutoff = quality.get("relevance_cutoff")
+                if capability_quality and isinstance(rank, int) and isinstance(cutoff, int):
+                    finding = f"{name} below quality cutoff (rank {rank}, cutoff {cutoff})"
+                elif capability_quality:
+                    finding = f"{name} did not meet the quality target"
+                else:
+                    finding = f"{name} failed"
                 if expected:
                     finding += f" (expected {expected})"
                 findings.append(finding)
@@ -351,6 +362,8 @@ def summarize_capability_applicability(
 
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
+    report_modes = {str(report.get("mode") or "") for report in reports}
+    capability_quality = report_modes == {"capability_quality"}
     canonical = [
         bool(case["canonical_graph"].get("equal"))
         for case in cases
@@ -367,7 +380,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             verdict = quality.get("passed") if isinstance(quality, dict) else None
         if isinstance(verdict, bool):
             oracles.append(verdict)
-    case_passes = [bool(case.get("passed")) for case in cases]
+    case_passes = [
+        bool(case.get("quality_target_met"))
+        if capability_quality and isinstance(case.get("quality_target_met"), bool)
+        else bool(case.get("passed"))
+        for case in cases
+    ]
     incremental_ms: list[float] = []
     incremental_work_ms: list[float] = []
     incremental_peak_rss: list[float] = []
@@ -449,10 +467,15 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 if isinstance(oracle.get("response_token_estimate"), (int, float)):
                     query_response_tokens.append(float(oracle["response_token_estimate"]))
 
-    quality_failed = any(not value for value in canonical) or any(not value for value in oracles)
-    if quality_failed:
-        decision = "REJECT: quality/correctness"
-    elif case_passes and not all(case_passes):
+    canonical_failed = any(not value for value in canonical)
+    oracle_target_missed = any(not value for value in oracles)
+    if canonical_failed:
+        decision = "REJECT: graph correctness"
+    elif oracle_target_missed and capability_quality:
+        decision = "BELOW QUALITY TARGET"
+    elif oracle_target_missed:
+        decision = "REJECT: task correctness"
+    elif case_passes and not all(case_passes) and not capability_quality:
         decision = "REJECT: benchmark gate"
     elif not cases:
         decision = "REJECT: no cases"
@@ -558,7 +581,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "capability_applicability": summarize_capability_applicability(reports),
         "cleanup": ratio(cleanup_passes, len(reports)),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
-        "findings": correctness_findings(cases),
+        "findings": correctness_findings(cases, capability_quality=capability_quality),
         "quality_details": quality_oracle_details(cases),
         "mutation_details": mutation_reindex_details(cases),
         "scenario": next(iter(scenarios)) if len(scenarios) == 1 else None,
@@ -1112,7 +1135,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "## Performance and provenance",
             "",
-            "| Candidate | Cases | Capabilities | Observations (incremental/full) | Incremental p95 ms | Full p50 ms | "
+            "| Candidate | Cases meeting gate/target | Capabilities | Observations (incremental/full) | Incremental p95 ms | Full p50 ms | "
             "Speedup p50 | Cleanup | Binary SHA-256 |",
             "|---|---:|---|---:|---:|---:|---:|---:|---|",
         )
@@ -1225,9 +1248,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "† Overall quality is a custom descriptive score: the equal-weight geometric mean of "
             "Retrieval MRR, graph fidelity, and task success. It is N/A unless all three categories are "
-            "measured. It never overrides the correctness gate: any canonical or task-oracle failure "
-            "still makes Decision=REJECT. Category values remain visible so the aggregate cannot hide "
-            "which capability changed.",
+            "measured. It never overrides a graph-correctness gate. A required mutation oracle can "
+            "reject a correctness benchmark; an algorithm-ablation oracle that misses its declared "
+            "cutoff is labelled BELOW QUALITY TARGET instead of being called broken. Category values "
+            "remain visible so the aggregate cannot hide which capability changed.",
             "",
             "Query p50 aggregates the recorded default-response oracle calls. Indexing p50/p95 use only "
             "the recorded indexing observations; consult Cases and the immutable campaign manifest before "
@@ -1238,9 +1262,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "follows [Kalibera and Jones, Quantifying Performance Changes with Effect Size Confidence "
             "Intervals](https://arxiv.org/abs/2007.10899).",
             "",
-            "Pareto status considers only candidates that pass correctness/quality and have every "
-            "axis measured. It maximizes overall quality while minimizing incremental and query latency, "
-            "response-token estimate, and peak RSS.",
+            "Pareto status considers only candidates that meet the declared quality target, pass "
+            "correctness, and have every axis measured. It maximizes overall quality while minimizing "
+            "incremental and query latency, response-token estimate, and peak RSS.",
             "",
             "A speedup is accepted only when the case gate and every applicable canonical-graph "
             "and task-oracle check pass. `n/a` means the input artifact did not measure that axis.",
