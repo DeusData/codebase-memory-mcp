@@ -29,6 +29,20 @@
  * 0xC000001D (illegal instruction), 0xC0000094 (integer divide by zero), … */
 #define CBM_WIN_CRASH_CODE_MIN 0xC0000000u
 
+enum {
+    CBM_PROC_FAST_REAP_WINDOW_MS = 250,
+    CBM_PROC_FAST_REAP_POLL_MS = 5,
+    CBM_PROC_POSIX_STEADY_POLL_MS = 100,
+    CBM_PROC_WIN_STEADY_POLL_MS = 200,
+};
+
+int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms) {
+    if (elapsed_ms < CBM_PROC_FAST_REAP_WINDOW_MS) {
+        return CBM_PROC_FAST_REAP_POLL_MS;
+    }
+    return steady_interval_ms > 0 ? steady_interval_ms : CBM_PROC_POSIX_STEADY_POLL_MS;
+}
+
 #ifndef _WIN32
 static bool cbm_is_fault_signal(int sig) {
     switch (sig) {
@@ -308,10 +322,13 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
+    uint64_t poll_started = last_activity;
     bool timed_out = false;
     bool cancelled = false;
     for (;;) {
-        DWORD w = WaitForSingleObject(pi.hProcess, 200);
+        DWORD poll_ms = (DWORD)cbm_subprocess_poll_interval_ms(cbm_now_ms() - poll_started,
+                                                               CBM_PROC_WIN_STEADY_POLL_MS);
+        DWORD w = WaitForSingleObject(pi.hProcess, poll_ms);
         if (cbm_tail_log(opts->log_file, &tail_pos, opts->on_log_line, opts->log_ud)) {
             last_activity = cbm_now_ms();
         }
@@ -409,6 +426,7 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
 
     long tail_pos = 0;
     uint64_t last_activity = cbm_now_ms();
+    uint64_t poll_started = last_activity;
     bool timed_out = false;
     bool cancelled = false;
     int wstatus = 0;
@@ -446,7 +464,12 @@ static int cbm_run_posix(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
             timed_out = true;
             break;
         }
-        struct timespec ts = {0, 100000000L}; /* 100 ms poll */
+        int poll_ms = cbm_subprocess_poll_interval_ms(cbm_now_ms() - poll_started,
+                                                      CBM_PROC_POSIX_STEADY_POLL_MS);
+        struct timespec ts = {
+            .tv_sec = poll_ms / 1000,
+            .tv_nsec = (long)(poll_ms % 1000) * 1000000L,
+        };
         cbm_nanosleep(&ts, NULL);
     }
     if (opts->child_pid_out) {

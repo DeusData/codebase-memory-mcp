@@ -23,6 +23,7 @@
 #include <stdatomic.h> /* _Atomic long child_pid_out publication */
 #include <stdbool.h>
 #include <stddef.h> /* size_t (cbm_build_win_cmdline) */
+#include <stdint.h> /* uint64_t (cbm_subprocess_poll_interval_ms) */
 
 /* How a supervised child ended. */
 typedef enum {
@@ -82,6 +83,12 @@ cbm_proc_outcome_t cbm_proc_classify(bool exited_normally, int exit_code, int te
 
 /* Stable lowercase name for an outcome (for structured logs / skip reasons). */
 const char *cbm_proc_outcome_str(cbm_proc_outcome_t o);
+
+/* Select the child-reap polling interval. Short-lived workers are polled more
+ * frequently during a bounded startup window; after that window the caller's
+ * platform-specific steady interval is preserved. Exposed as a pure function
+ * so both policies are testable without claiming cross-platform execution. */
+int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms);
 
 /* Build a Windows CreateProcess command line from a NULL-terminated argv, applying
  * the Microsoft C runtime quoting rules (quote-wrap + escape embedded quotes and

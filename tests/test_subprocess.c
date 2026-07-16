@@ -9,6 +9,7 @@
  *      (SKIP_PLATFORM on Windows, which lacks it).
  */
 #include "test_framework.h"
+#include "../src/foundation/platform.h"
 #include "../src/foundation/subprocess.h"
 
 #include <string.h>
@@ -97,6 +98,27 @@ TEST(subprocess_run_clean) {
     cbm_proc_result_t r = run_sh("exit 0", 0);
     ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
     ASSERT_EQ(r.exit_code, 0);
+    PASS();
+#endif
+}
+
+TEST(subprocess_short_child_uses_fast_reap_window) {
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(0, 100), 5);
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(249, 100), 5);
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 100), 100);
+    ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 200), 200);
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh latency canary; poll policy assertions ran")
+#else
+    uint64_t started_ms = cbm_now_ms();
+    cbm_proc_result_t r = run_sh("sleep 0.02", 0);
+    uint64_t elapsed_ms = cbm_now_ms() - started_ms;
+    ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
+    /* The sanitizer runner adds measurable fork/exec overhead on macOS. Keep
+     * this only as a coarse regression canary: the old path unconditionally
+     * slept 100 ms after observing a still-running child. Exact policy is
+     * covered by the pure assertions above. */
+    ASSERT_LT(elapsed_ms, 100);
     PASS();
 #endif
 }
@@ -346,6 +368,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_classify_timeout_dominates);
     RUN_TEST(subprocess_outcome_str);
     RUN_TEST(subprocess_run_clean);
+    RUN_TEST(subprocess_short_child_uses_fast_reap_window);
     RUN_TEST(subprocess_run_exit_nonzero);
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
