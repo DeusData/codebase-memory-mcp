@@ -24,6 +24,42 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_fast_mode_report_marks_similarity_and_semantic_quality_not_applicable(self) -> None:
+        case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "incremental": {"elapsed_ms": 10},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100},
+        }
+        item = report(case)
+        item["parameters"].update(
+            {
+                "index_mode": "fast",
+                "capability_applicability": {
+                    "rank": {"applicable": True, "reason": "available in fast mode"},
+                    "similarity": {
+                        "applicable": False,
+                        "reason": "SIMILAR_TO generation requires full or moderate mode",
+                    },
+                    "semantic_edges": {
+                        "applicable": False,
+                        "reason": "SEMANTICALLY_RELATED generation requires full or moderate mode",
+                    },
+                },
+            }
+        )
+
+        row = SUMMARY.summarize_group("fast", [item])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["index_modes"], "fast")
+        self.assertEqual(
+            row["capability_applicability"]["similarity"],
+            "N/A: SIMILAR_TO generation requires full or moderate mode",
+        )
+        self.assertIn("## Algorithm-quality applicability", markdown)
+        self.assertIn("N/A: SIMILAR_TO generation requires full or moderate mode", markdown)
+
     def test_dependency_breakdown_reads_new_and_retained_result_shapes(self) -> None:
         new_case = {
             "passed": True,
