@@ -252,6 +252,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "capability_quality": "similarity",
                 "index_mode": "moderate",
                 "execution_order": "paired_interleaved",
+                "quality_background": {
+                    "repo": str(root),
+                    "revision": "c" * 40,
+                    "tree": "d" * 40,
+                },
                 "cwd": str(root),
                 "repetitions": 2,
                 "transports": ["cli"],
@@ -277,6 +282,12 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(
                 [cell["parameters"]["execution_block"] for cell in plan["cells"]],
                 [1, 1, 1, 1, 2, 2, 2, 2],
+            )
+            self.assertIn("--quality-background-repo", plan["cells"][0]["command"])
+            self.assertIn("--quality-background-revision", plan["cells"][0]["command"])
+            self.assertEqual(
+                plan["cells"][0]["parameters"]["quality_background"],
+                {"repo": str(root.resolve()), "revision": "c" * 40, "tree": "d" * 40},
             )
 
     def test_resource_snapshot_records_load_disk_and_host_memory(self) -> None:
@@ -381,6 +392,40 @@ class BenchmarkCampaignTest(unittest.TestCase):
                              CAMPAIGN.file_sha256(raw))
             self.assertEqual(document["campaign_provenance"]["cell_identity"],
                              CAMPAIGN.cell_identity(planned))
+
+    def test_result_rejects_background_revision_or_tree_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            planned = cell(["benchmark", "{result_path}"])
+            planned["parameters"] = {
+                "quality_background": {
+                    "repo": str(root),
+                    "revision": "a" * 40,
+                    "tree": "b" * 40,
+                }
+            }
+            result = root / "result.json"
+            result.write_text(
+                json.dumps(
+                    {
+                        "binary_metadata": {"sha256": "b" * 64},
+                        "derived": {"passed": True},
+                        "cases": [
+                            {
+                                "passed": True,
+                                "background_repository": {
+                                    "revision": "c" * 40,
+                                    "tree": "b" * 40,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "background repository revision mismatch"):
+                CAMPAIGN.validate_result(result, planned)
 
     def test_failed_attempt_retains_logs_without_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

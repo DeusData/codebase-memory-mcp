@@ -200,6 +200,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     accepted_exit_codes = spec.get("accepted_exit_codes", [0])
     capability_quality = spec.get("capability_quality")
     execution_order = spec.get("execution_order")
+    quality_background = spec.get("quality_background")
     if not isinstance(harness_version, str) or not harness_version:
         raise ValueError("harness_version must be a non-empty string")
     if not isinstance(benchmark_script, str) or not benchmark_script:
@@ -220,6 +221,27 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         or "=" in capability_quality
     ):
         raise ValueError("capability_quality must be a non-empty argument value")
+    if quality_background is not None:
+        if capability_quality not in {"similarity", "semantic_edges"}:
+            raise ValueError(
+                "quality_background requires capability_quality similarity or semantic_edges"
+            )
+        if not isinstance(quality_background, dict):
+            raise ValueError("quality_background must be an object")
+        background_repo = quality_background.get("repo")
+        background_revision = quality_background.get("revision")
+        background_tree = quality_background.get("tree")
+        if not isinstance(background_repo, str) or not Path(background_repo).is_dir():
+            raise ValueError("quality_background.repo must be an existing directory")
+        if not isinstance(background_revision, str) or len(background_revision) != 40:
+            raise ValueError("quality_background.revision must be a full commit hash")
+        if not isinstance(background_tree, str) or len(background_tree) != 40:
+            raise ValueError("quality_background.tree must be a full tree hash")
+        quality_background = {
+            "repo": str(Path(background_repo).expanduser().resolve()),
+            "revision": background_revision,
+            "tree": background_tree,
+        }
     if (
         not isinstance(accepted_exit_codes, list)
         or not accepted_exit_codes
@@ -358,6 +380,15 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                     "--index-mode",
                                     index_mode,
                                 ]
+                                if quality_background is not None:
+                                    command.extend(
+                                        (
+                                            "--quality-background-repo",
+                                            quality_background["repo"],
+                                            "--quality-background-revision",
+                                            quality_background["revision"],
+                                        )
+                                    )
                             else:
                                 command = [
                                     str(benchmark_path),
@@ -400,6 +431,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                             }
                             if capability_quality is not None:
                                 parameters["capability_quality"] = capability_quality
+                                if quality_background is not None:
+                                    parameters["quality_background"] = quality_background
                                 label = (
                                     f"{candidate_label}.{profile_label}.{transport}."
                                     f"{scenario_name}"
@@ -605,6 +638,22 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
     measurements = result.get("measurements")
     if not (isinstance(cases, list) and cases) and not isinstance(measurements, dict):
         raise ValueError("benchmark result must contain non-empty cases or measurements")
+    expected_background = cell.get("parameters", {}).get("quality_background")
+    if expected_background is not None:
+        first_case = cases[0] if isinstance(cases, list) and cases else None
+        actual_background = (
+            first_case.get("background_repository")
+            if isinstance(first_case, dict)
+            else None
+        )
+        if not isinstance(actual_background, dict):
+            raise ValueError("benchmark result is missing background_repository identity")
+        for key in ("revision", "tree"):
+            if actual_background.get(key) != expected_background.get(key):
+                raise ValueError(
+                    f"background repository {key} mismatch: "
+                    f"expected={expected_background.get(key)} actual={actual_background.get(key)}"
+                )
     return result
 
 
