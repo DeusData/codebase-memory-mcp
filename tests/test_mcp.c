@@ -9,6 +9,7 @@
 #include "../src/foundation/constants.h"
 #include "../src/foundation/platform.h"
 #include <depindex/depindex.h>
+#include "../src/git/git_command.h"
 #include "../src/foundation/log.h"
 #include "test_framework.h"
 #include "test_helpers.h"
@@ -3168,31 +3169,20 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
-#ifndef _WIN32
-static int mcp_test_git_run(const char *dir, const char *args) {
-    char cmd[1024];
-    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s >/dev/null 2>&1", dir, args);
-    return system(cmd);
-}
-#endif
-
 TEST(tool_index_status_distinguishes_dirty_worktree_from_head) {
-#ifdef _WIN32
-    SKIP_PLATFORM("git dirty-worktree status test is not supported on Windows CI");
-#else
     char *tmp = th_mktempdir("cbm-status-git");
     ASSERT_NOT_NULL(tmp);
-    if (mcp_test_git_run(tmp, "init -q") != 0 ||
-        mcp_test_git_run(tmp, "config user.email test@example.com") != 0 ||
-        mcp_test_git_run(tmp, "config user.name Test") != 0) {
+    if (cbm_git_drain_command(tmp, "init -q") != 0 ||
+        cbm_git_drain_command(tmp, "config user.email test@example.com") != 0 ||
+        cbm_git_drain_command(tmp, "config user.name Test") != 0) {
         th_rmtree(tmp);
         SKIP_PLATFORM("git is unavailable");
     }
     char source_path[CBM_SZ_1K];
     snprintf(source_path, sizeof(source_path), "%s/main.c", tmp);
     ASSERT_EQ(th_write_file(source_path, "int main(void) { return 0; }\n"), 0);
-    ASSERT_EQ(mcp_test_git_run(tmp, "add main.c"), 0);
-    ASSERT_EQ(mcp_test_git_run(tmp, "commit -q -m initial"), 0);
+    ASSERT_EQ(cbm_git_drain_command(tmp, "add main.c"), 0);
+    ASSERT_EQ(cbm_git_drain_command(tmp, "commit -q -m initial"), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -3238,7 +3228,6 @@ TEST(tool_index_status_distinguishes_dirty_worktree_from_head) {
     cbm_mcp_server_free(srv);
     th_rmtree(tmp);
     PASS();
-#endif
 }
 
 TEST(tool_index_status_reports_dirty_metadata) {
