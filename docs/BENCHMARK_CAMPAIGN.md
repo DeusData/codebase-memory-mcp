@@ -65,6 +65,12 @@ still requires a parseable result whose `binary_metadata.sha256` matches the pla
 Crashes, timeouts, other exit codes, missing results, and mismatched binaries remain
 failed attempts and never receive `complete.json`.
 
+For compact `--matrix-spec` grids, each scenario requires `frontier_files` and
+`exact_caps` arrays. Use a positive integer cap for an explicit cap sweep. Use
+`null` to preserve each candidate's configured/default
+`incremental_exact_max_affected_paths`; the generated cell is labelled
+`capdefault` and does not inject a config override.
+
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
 remain available and take priority over the selected profile. The default profile
