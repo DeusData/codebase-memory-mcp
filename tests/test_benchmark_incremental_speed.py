@@ -12,6 +12,53 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_mcp_client_exit_reaps_process_streams_and_reader_threads(self) -> None:
+        class FakeStream:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close(self) -> None:
+                self.closed = True
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdin = FakeStream()
+                self.stdout = FakeStream()
+                self.stderr = FakeStream()
+                self.wait_calls = 0
+
+            def wait(self, timeout: int) -> int:
+                self.wait_calls += 1
+                return 0
+
+        class FakeThread:
+            def __init__(self) -> None:
+                self.join_calls = 0
+
+            def join(self, timeout: int) -> None:
+                self.join_calls += 1
+
+            def is_alive(self) -> bool:
+                return False
+
+        client = BENCHMARK.McpClient(Path("cbm"), {}, 10)
+        process = FakeProcess()
+        stdout_thread = FakeThread()
+        stderr_thread = FakeThread()
+        client.proc = process
+        client.stdout_thread = stdout_thread
+        client.stderr_thread = stderr_thread
+
+        client.__exit__(None, None, None)
+
+        self.assertTrue(process.stdin.closed)
+        self.assertTrue(process.stdout.closed)
+        self.assertTrue(process.stderr.closed)
+        self.assertEqual(process.wait_calls, 1)
+        self.assertEqual(stdout_thread.join_calls, 1)
+        self.assertEqual(stderr_thread.join_calls, 1)
+        self.assertIsNone(client.proc)
+
     def test_rank_quality_fixture_separates_graph_signal_from_lexical_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             metadata = BENCHMARK.create_rank_quality_repo(Path(tmpdir))
