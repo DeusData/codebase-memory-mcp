@@ -431,6 +431,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     incremental_ms: list[float] = []
     incremental_work_ms: list[float] = []
     incremental_peak_rss: list[float] = []
+    initial_full_ms: list[float] = []
     full_ms: list[float] = []
     speedups: list[float] = []
     peak_rss: list[int] = []
@@ -450,8 +451,14 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     dependency_fresh_ms: list[float] = []
     dependency_packages: list[float] = []
     for case in cases:
+        initial = case.get("initial_fast_full", {})
         incremental = case.get("incremental", {})
         full = case.get("fresh_fast_full_after_change", {})
+        if isinstance(initial, dict):
+            if isinstance(initial.get("elapsed_ms"), (int, float)):
+                initial_full_ms.append(float(initial["elapsed_ms"]))
+            if isinstance(initial.get("peak_rss_mb"), (int, float)):
+                peak_rss.append(int(initial["peak_rss_mb"]))
         if isinstance(incremental, dict):
             if isinstance(incremental.get("elapsed_ms"), (int, float)):
                 incremental_ms.append(float(incremental["elapsed_ms"]))
@@ -599,14 +606,14 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
         "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
         "incremental_observations": len(incremental_ms),
-        "full_observations": len(full_ms),
+        "full_observations": len(full_ms or initial_full_ms),
         "capabilities": config_label(reports),
         "capability_signature": config_signature(reports),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
         "incremental_work_p50_ms": percentile(incremental_work_ms, 0.50),
         "incremental_peak_p50_mb": percentile(incremental_peak_rss, 0.50),
         "incremental_p95_ms": percentile(incremental_ms, 0.95),
-        "full_p50_ms": percentile(full_ms, 0.50),
+        "full_p50_ms": percentile(full_ms or initial_full_ms, 0.50),
         "speedup_p50": float(statistics.median(speedups)) if speedups else None,
         "peak_rss_mb": max(peak_rss) if peak_rss else None,
         "dependency_mode": dependency_mode(reports, dependency_packages),
