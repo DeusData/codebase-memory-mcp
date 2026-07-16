@@ -3891,12 +3891,11 @@ static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
      * null for non-git roots — cost ~10KB across a full cache and is one
      * index_status call away for the project you actually care about. */
     if (root_path_buf[0]) {
-        cbm_git_context_t gctx = {0};
-        (void)cbm_git_context_resolve(root_path_buf, &gctx);
-        if (gctx.is_git && gctx.branch) {
-            yyjson_mut_obj_add_strcpy(doc, p, "branch", gctx.branch);
+        char *branch = NULL;
+        if (cbm_git_current_branch(root_path_buf, &branch) == 0) {
+            yyjson_mut_obj_add_strcpy(doc, p, "branch", branch);
         }
-        cbm_git_context_free(&gctx);
+        free(branch);
     }
     yyjson_mut_obj_add_int(doc, p, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, p, "edges", edges);

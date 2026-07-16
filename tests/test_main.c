@@ -383,6 +383,7 @@ int main(int argc, char **argv) {
         if (strstr("language", only_suite)) RUN_SUITE(language);
         if (strstr("userconfig", only_suite)) RUN_SUITE(userconfig);
         if (strstr("gitignore", only_suite)) RUN_SUITE(gitignore);
+        if (strstr("git_context", only_suite)) RUN_SUITE(git_context);
         if (strstr("discover", only_suite)) RUN_SUITE(discover);
         if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
         if (strstr("registry", only_suite)) RUN_SUITE(registry);

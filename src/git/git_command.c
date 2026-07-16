@@ -110,6 +110,47 @@ int cbm_git_capture_first_line(const char *repo_path, const char *git_args, char
     return *out ? 0 : CBM_NOT_FOUND;
 }
 
+int cbm_git_run_first_line_buf(const char *repo_path, const char *git_args,
+                               char *out, size_t out_size, int *out_exit_code) {
+    if (!out || out_size == 0 || !out_exit_code) {
+        return CBM_NOT_FOUND;
+    }
+    out[0] = '\0';
+    *out_exit_code = CBM_NOT_FOUND;
+    char cmd[CBM_GIT_CMD_BUFSZ];
+    if (!cbm_git_format_command(cmd, sizeof(cmd), repo_path, git_args)) {
+        return CBM_NOT_FOUND;
+    }
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return CBM_NOT_FOUND;
+    }
+
+    char line[CBM_GIT_OUTPUT_BUFSZ];
+    bool got_line = fgets(line, (int)sizeof(line), fp) != NULL;
+    size_t line_len = got_line ? strlen(line) : 0;
+    bool truncated = got_line && line_len > 0 && line[line_len - 1] != '\n' && !feof(fp);
+    bool output_fits = true;
+    if (got_line) {
+        git_trim_newlines(line);
+        size_t value_len = strlen(line);
+        if (value_len >= out_size) {
+            output_fits = false;
+        } else {
+            memcpy(out, line, value_len + 1);
+        }
+    }
+    char drain[CBM_SZ_128];
+    while (fgets(drain, (int)sizeof(drain), fp)) {
+    }
+    *out_exit_code = cbm_pclose_exit_code(fp);
+    if (truncated || !output_fits) {
+        out[0] = '\0';
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
 int cbm_git_drain_command(const char *repo_path, const char *git_args) {
     char cmd[CBM_GIT_CMD_BUFSZ];
     if (!cbm_git_format_command(cmd, sizeof(cmd), repo_path, git_args)) {

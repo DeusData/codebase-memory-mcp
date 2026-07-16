@@ -618,6 +618,13 @@ TEST(popen_isolates_listening_socket) {
 
 #endif /* _WIN32 */
 
+TEST(pclose_exit_code_normalizes_platform_status) {
+    FILE *fp = cbm_popen("exit 7", "r");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(cbm_pclose_exit_code(fp), 7);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  PORTABLE FILE REPLACEMENT
  * ══════════════════════════════════════════════════════════════════ */
@@ -873,6 +880,7 @@ SUITE(security) {
     RUN_TEST(popen_isolates_listening_socket);
 #endif
 
+    RUN_TEST(pclose_exit_code_normalizes_platform_status);
     RUN_TEST(compat_replace_file_replaces_destination);
     RUN_TEST(compat_move_file_no_replace_preserves_existing_destination);
     RUN_TEST(compat_move_file_no_replace_moves_when_destination_missing);

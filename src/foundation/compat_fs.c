@@ -841,6 +841,18 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #endif /* _WIN32 */
 
+int cbm_pclose_exit_code(FILE *f) {
+    int status = cbm_pclose(f);
+#ifdef _WIN32
+    return status;
+#else
+    if (status >= 0 && WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return CBM_NOT_FOUND;
+#endif
+}
+
 static void set_file_error(cbm_atomic_file_error_t *out, const char *stage, int code) {
     if (out) {
         out->stage = stage;

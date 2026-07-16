@@ -112,6 +112,28 @@ static char *derive_canonical_root(const char *input_path, const char *worktree_
     return root;
 }
 
+static int resolve_current_branch(const char *path, char **out_branch) {
+    if (!out_branch) {
+        return CBM_NOT_FOUND;
+    }
+    *out_branch = NULL;
+    if (!path || !path[0]) {
+        return CBM_NOT_FOUND;
+    }
+    char branch[CBM_GIT_OUTPUT_BUFSZ];
+    int exit_code = CBM_NOT_FOUND;
+    if (cbm_git_run_first_line_buf(path, "symbolic-ref --quiet --short HEAD", branch,
+                                   sizeof(branch), &exit_code) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    const char *resolved = exit_code == 0 && branch[0] ? branch : exit_code == 1 ? "DETACHED" : NULL;
+    if (!resolved) {
+        return CBM_NOT_FOUND;
+    }
+    *out_branch = cbm_strdup(resolved);
+    return *out_branch ? 0 : CBM_NOT_FOUND;
+}
+
 static char *slug_from_branch(const char *branch, bool detached) {
     const char *fallback = detached ? "detached" : "working-tree";
     const char *src = detached ? fallback : (branch && branch[0] ? branch : fallback);
@@ -203,9 +225,10 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         out->head_sha = cbm_strdup("");
     }
 
-    if (cbm_git_capture_first_line(path, "symbolic-ref --quiet --short HEAD", &out->branch) !=
-        0) {
-        out->branch = cbm_strdup("DETACHED");
+    if (resolve_current_branch(path, &out->branch) != 0) {
+        out->branch = NULL;
+    }
+    if (out->branch && strcmp(out->branch, "DETACHED") == 0) {
         out->is_detached = true;
     }
 
@@ -231,6 +254,10 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     }
 
     return 0;
+}
+
+int cbm_git_current_branch(const char *path, char **out_branch) {
+    return resolve_current_branch(path, out_branch);
 }
 
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx) {
