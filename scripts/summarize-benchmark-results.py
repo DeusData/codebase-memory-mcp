@@ -229,7 +229,9 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
                 "canonical": [],
             },
         )
-        mutation = case.get("mutation")
+        lifecycle = case.get("pair_lifecycle")
+        lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+        mutation = lifecycle.get("mutation", case.get("mutation"))
         if isinstance(mutation, dict):
             description = mutation.get("description")
             if isinstance(description, str) and description:
@@ -257,7 +259,7 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
                     group["descriptions"].add(
                         f"synthetic {language} inbound-frontier definition edit"
                     )
-        incremental = case.get("incremental")
+        incremental = lifecycle.get("incremental_index", case.get("incremental"))
         if isinstance(incremental, dict):
             if isinstance(incremental.get("elapsed_ms"), (int, float)):
                 group["incremental_ms"].append(float(incremental["elapsed_ms"]))
@@ -269,15 +271,23 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
             reason = incremental.get("exact_reason")
             if isinstance(reason, str) and reason:
                 group["reasons"].add(reason)
-        full = case.get("fresh_fast_full_after_change")
+        full = lifecycle.get("fresh_index", case.get("fresh_fast_full_after_change"))
         if isinstance(full, dict) and isinstance(full.get("elapsed_ms"), (int, float)):
             group["full_ms"].append(float(full["elapsed_ms"]))
         speedup = case.get("speedup_full_rebuild_over_incremental")
         if isinstance(speedup, (int, float)):
             group["speedups"].append(float(speedup))
-        canonical = case.get("canonical_graph")
+        canonical = lifecycle.get("canonical_graph", case.get("canonical_graph"))
         if isinstance(canonical, dict) and isinstance(canonical.get("equal"), bool):
             group["canonical"].append(canonical["equal"])
+        policy = lifecycle.get("incremental_policy")
+        if (
+            isinstance(policy, dict)
+            and policy.get("immediate_freshness_expected") is False
+            and policy.get("policy_conformance_met") is True
+            and policy.get("stale_warning_present") is True
+        ):
+            group["canonical_policy"] = "deferred with warning"
 
     details: list[dict[str, Any]] = []
     for scenario, group in grouped.items():
@@ -301,7 +311,8 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
                     if group["speedups"]
                     else None
                 ),
-                "canonical": ratio(sum(canonical), len(canonical)),
+                "canonical": group.get("canonical_policy")
+                or ratio(sum(canonical), len(canonical)),
             }
         )
     return details
@@ -440,6 +451,68 @@ def quality_miss_is_explicit_ablation(
     return value is False or (isinstance(value, str) and value.lower() == "false")
 
 
+def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for case in cases:
+        lifecycle = case.get("pair_lifecycle")
+        fixture = case.get("fixture")
+        if not isinstance(lifecycle, dict) or not isinstance(fixture, dict):
+            continue
+        policy = lifecycle.get("incremental_policy")
+        policy = policy if isinstance(policy, dict) else {}
+
+        def classification(stage: str) -> tuple[dict[str, int] | None, float | None]:
+            oracles = lifecycle.get(f"{stage}_oracles")
+            pair = oracles.get("pair_classification") if isinstance(oracles, dict) else None
+            confusion = pair.get("confusion") if isinstance(pair, dict) else None
+            f1 = pair.get("f1") if isinstance(pair, dict) else None
+            return (
+                confusion if isinstance(confusion, dict) else None,
+                float(f1) if isinstance(f1, (int, float)) else None,
+            )
+
+        initial_confusion, initial_f1 = classification("initial")
+        incremental_confusion, incremental_f1 = classification("incremental")
+        fresh_confusion, fresh_f1 = classification("fresh")
+        if policy.get("immediate_freshness_met") is True:
+            freshness = "fresh and canonical"
+        elif (
+            policy.get("immediate_freshness_expected") is False
+            and policy.get("stale_warning_present") is True
+        ):
+            freshness = "deferred with warning"
+        else:
+            freshness = "unexpected stale or non-canonical"
+        background = case.get("background_repository")
+        details.append(
+            {
+                "capability": fixture.get("capability"),
+                "relationship": fixture.get("relationship"),
+                "task_sha256": fixture.get("task_set_sha256"),
+                "background_revision": (
+                    background.get("revision") if isinstance(background, dict) else None
+                ),
+                "background_tree": (
+                    background.get("tree") if isinstance(background, dict) else None
+                ),
+                "initial_confusion": initial_confusion,
+                "initial_f1": initial_f1,
+                "incremental_confusion": incremental_confusion,
+                "incremental_f1": incremental_f1,
+                "fresh_confusion": fresh_confusion,
+                "fresh_f1": fresh_f1,
+                "freshness_policy": policy.get("policy"),
+                "freshness": freshness,
+                "policy_conformance_met": policy.get("policy_conformance_met"),
+                "immediate_freshness_expected": policy.get(
+                    "immediate_freshness_expected"
+                ),
+                "immediate_freshness_met": policy.get("immediate_freshness_met"),
+            }
+        )
+    return details
+
+
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
     report_modes = {str(report.get("mode") or "") for report in reports}
@@ -466,12 +539,47 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                     quality_miss_ablation_states.append(
                         quality_miss_is_explicit_ablation(report, case)
                     )
-    case_passes = [
-        bool(case.get("quality_target_met"))
-        if capability_quality and isinstance(case.get("quality_target_met"), bool)
-        else bool(case.get("passed"))
-        for case in cases
-    ]
+    pair_quality_details = semantic_pair_quality_details(cases)
+    signature = config_signature(reports)
+    override_map = dict(signature) if signature is not None else {}
+    capability_config_keys = {
+        "similarity": "similarity_enabled",
+        "semantic_edges": "semantic_edges_enabled",
+    }
+    for detail in pair_quality_details:
+        config_key = capability_config_keys.get(str(detail.get("capability")))
+        configured = override_map.get(config_key) if config_key else None
+        if isinstance(configured, str) and configured.lower() == "false":
+            detail["capability_state"] = "disabled"
+            detail["freshness"] = "capability disabled"
+        else:
+            detail["capability_state"] = "enabled or default"
+    case_passes: list[bool] = []
+    for case in cases:
+        lifecycle = case.get("pair_lifecycle")
+        if isinstance(lifecycle, dict):
+            policy = lifecycle.get("incremental_policy")
+            policy = policy if isinstance(policy, dict) else {}
+            initial_oracles = lifecycle.get("initial_oracles")
+            incremental_oracles = lifecycle.get("incremental_oracles")
+            fresh_oracles = lifecycle.get("fresh_oracles")
+            passed = bool(
+                isinstance(initial_oracles, dict)
+                and initial_oracles.get("passed")
+                and isinstance(fresh_oracles, dict)
+                and fresh_oracles.get("passed")
+                and policy.get("policy_conformance_met")
+            )
+            if policy.get("immediate_freshness_expected") is True:
+                passed = passed and bool(
+                    isinstance(incremental_oracles, dict)
+                    and incremental_oracles.get("passed")
+                )
+            case_passes.append(passed)
+        elif capability_quality and isinstance(case.get("quality_target_met"), bool):
+            case_passes.append(bool(case.get("quality_target_met")))
+        else:
+            case_passes.append(bool(case.get("passed")))
     incremental_ms: list[float] = []
     incremental_work_ms: list[float] = []
     incremental_peak_rss: list[float] = []
@@ -495,9 +603,21 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     dependency_fresh_ms: list[float] = []
     dependency_packages: list[float] = []
     for case in cases:
-        initial = case.get("initial_fast_full", {})
-        incremental = case.get("incremental", {})
-        full = case.get("fresh_fast_full_after_change", {})
+        lifecycle = case.get("pair_lifecycle")
+        if isinstance(lifecycle, dict):
+            initial = lifecycle.get("initial_index", {})
+            incremental = lifecycle.get("incremental_index", {})
+            full = lifecycle.get("fresh_index", {})
+            relation_oracles = [
+                lifecycle.get("initial_oracles"),
+                lifecycle.get("incremental_oracles"),
+                lifecycle.get("fresh_oracles"),
+            ]
+        else:
+            initial = case.get("initial_fast_full", {})
+            incremental = case.get("incremental", {})
+            full = case.get("fresh_fast_full_after_change", {})
+            relation_oracles = []
         if isinstance(initial, dict):
             if isinstance(initial.get("elapsed_ms"), (int, float)):
                 initial_full_ms.append(float(initial["elapsed_ms"]))
@@ -518,18 +638,31 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 peak_rss.append(full["peak_rss_mb"])
         if isinstance(case.get("speedup_full_rebuild_over_incremental"), (int, float)):
             speedups.append(float(case["speedup_full_rebuild_over_incremental"]))
-        for field, timings in (
-            ("initial_fast_full", dependency_initial_ms),
-            ("incremental", dependency_incremental_ms),
-            ("fresh_fast_full_after_change", dependency_fresh_ms),
+        elif (
+            (
+                not isinstance(lifecycle, dict)
+                or isinstance(lifecycle.get("incremental_policy"), dict)
+                and lifecycle["incremental_policy"].get("immediate_freshness_met") is True
+            )
+            and isinstance(full, dict)
+            and isinstance(full.get("elapsed_ms"), (int, float))
+            and isinstance(incremental, dict)
+            and isinstance(incremental.get("elapsed_ms"), (int, float))
+            and float(incremental["elapsed_ms"]) > 0
         ):
-            phase_ms, packages = dependency_observation(case.get(field))
+            speedups.append(float(full["elapsed_ms"]) / float(incremental["elapsed_ms"]))
+        for index_result, timings in (
+            (initial, dependency_initial_ms),
+            (incremental, dependency_incremental_ms),
+            (full, dependency_fresh_ms),
+        ):
+            phase_ms, packages = dependency_observation(index_result)
             if phase_ms is not None:
                 timings.append(float(phase_ms))
             if packages is not None:
                 dependency_packages.append(float(packages))
         case_oracles = case.get("oracles", {})
-        if isinstance(case_oracles, dict):
+        if isinstance(case_oracles, dict) and not isinstance(lifecycle, dict):
             quality = case_oracles.get("quality", {})
             if isinstance(quality, dict):
                 applicable = int(quality.get("applicable_count") or 0)
@@ -559,6 +692,18 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                     query_response_bytes.append(float(oracle["response_bytes"]))
                 if isinstance(oracle.get("response_token_estimate"), (int, float)):
                     query_response_tokens.append(float(oracle["response_token_estimate"]))
+        for relation in relation_oracles:
+            response_quality = (
+                relation.get("response_quality") if isinstance(relation, dict) else None
+            )
+            if not isinstance(response_quality, dict):
+                continue
+            if isinstance(response_quality.get("elapsed_ms"), (int, float)):
+                query_latency_ms.append(float(response_quality["elapsed_ms"]))
+            if isinstance(response_quality.get("response_bytes"), (int, float)):
+                query_response_bytes.append(float(response_quality["response_bytes"]))
+            if isinstance(response_quality.get("response_token_estimate"), (int, float)):
+                query_response_tokens.append(float(response_quality["response_token_estimate"]))
 
     canonical_failed = any(not value for value in canonical)
     oracle_target_missed = any(not value for value in oracles)
@@ -567,6 +712,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         bool(quality_miss_ablation_states)
         and len(quality_miss_ablation_states) == missed_oracle_count
         and all(quality_miss_ablation_states)
+    )
+    deferred_freshness = any(
+        detail["freshness"] == "deferred with warning"
+        for detail in pair_quality_details
     )
     if canonical_failed:
         decision = "REJECT: graph correctness"
@@ -578,6 +727,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         decision = "REJECT: benchmark gate"
     elif not cases:
         decision = "REJECT: no cases"
+    elif deferred_freshness:
+        decision = "PASS: DEFERRED FRESHNESS"
     else:
         decision = "PASS"
 
@@ -589,11 +740,20 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             and report.get("binary_metadata", {}).get("sha256")
         }
     )
+    pair_f1_values = [
+        value
+        for detail in pair_quality_details
+        for value in (detail.get("initial_f1"), detail.get("fresh_f1"))
+        if isinstance(value, (int, float))
+    ]
     retrieval_score = (
         quality_score_weighted / quality_score_count
         if quality_score_count
-        else quality_passed / quality_applicable if quality_applicable else None
+        else quality_passed / quality_applicable
+        if quality_applicable
+        else None
     )
+    pair_f1_score = statistics.mean(pair_f1_values) if pair_f1_values else None
     graph_fidelity_score = sum(canonical) / len(canonical) if canonical else None
     task_success_score = (
         quality_passed / quality_applicable
@@ -626,6 +786,11 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if isinstance((parameters := report.get("parameters")), dict)
         and parameters.get("index_mode")
     }
+    execution_orders = {
+        str(parameters.get("execution_order") or "grouped")
+        for report in reports
+        if isinstance((parameters := report.get("parameters")), dict)
+    }
     for report in reports:
         parameters = report.get("parameters")
         if not isinstance(parameters, dict):
@@ -639,6 +804,23 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         except (TypeError, ValueError):
             pass
     full_values = full_ms or initial_full_ms
+    findings = correctness_findings(cases, capability_quality=capability_quality)
+    disabled_pair_controls = [
+        detail
+        for detail in pair_quality_details
+        if detail.get("capability_state") == "disabled"
+    ]
+    if disabled_pair_controls:
+        findings.append(
+            "The explicit capability-off control omitted the judged positive in initial, "
+            "post-edit, and fresh results; this is the expected ablation contrast, not a "
+            "freshness deferral or execution failure."
+        )
+    if deferred_freshness:
+        findings.append(
+            "Immediate semantic freshness was intentionally deferred under the recorded policy; "
+            "the structured stale warning was present and initial/fresh pair tasks passed."
+        )
     return {
         "candidate": label,
         "decision": decision,
@@ -646,6 +828,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "canonical": ratio(sum(canonical), len(canonical)),
         "oracles": ratio(sum(oracles), len(oracles)),
         "quality_score": retrieval_score,
+        "pair_f1_score": pair_f1_score,
         "overall_quality_score": overall_quality_score,
         "graph_fidelity_score": graph_fidelity_score,
         "task_success_score": task_success_score,
@@ -681,11 +864,13 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "dependency_incremental_p50_ms": percentile(dependency_incremental_ms, 0.50),
         "dependency_fresh_p50_ms": percentile(dependency_fresh_ms, 0.50),
         "index_modes": ", ".join(sorted(index_modes)) if index_modes else "unknown",
+        "execution_orders": ", ".join(sorted(execution_orders)) if execution_orders else "unknown",
         "capability_applicability": summarize_capability_applicability(reports),
         "lifecycle": evidence_lifecycle(reports),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
-        "findings": correctness_findings(cases, capability_quality=capability_quality),
+        "findings": findings,
         "quality_details": quality_oracle_details(cases),
+        "pair_quality_details": pair_quality_details,
         "mutation_details": mutation_reindex_details(cases),
         "scenario": next(iter(scenarios)) if len(scenarios) == 1 else None,
         "frontier_files": next(iter(frontier_files)) if len(frontier_files) == 1 else None,
@@ -885,6 +1070,12 @@ def display_range(value: Any) -> str:
     if not isinstance(value, tuple) or len(value) != 2:
         return "n/a"
     return f"[{display(value[0])}, {display(value[1])}]"
+
+
+def display_confusion(value: Any) -> str:
+    if not isinstance(value, dict):
+        return "n/a"
+    return "/".join(str(value.get(key, "n/a")) for key in ("tp", "tn", "fp", "fn"))
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -1204,11 +1395,11 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Codebase Memory performance and quality summary",
         "",
-        "| Candidate | Decision | Overall quality† | Retrieval MRR | Hit@1 | Hit@5 | nDCG@5 | "
+        "| Candidate | Decision | Overall quality† | Retrieval MRR | Pair F1 | Hit@1 | Hit@5 | nDCG@5 | "
         "Graph fidelity | Task success | Evidence counts (R/G/S) | "
         "Response p50 bytes | Response p50 tokens* | Query p50 ms | Incremental p50 ms | "
         "Peak RSS MB | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -1219,6 +1410,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["decision"]),
                     display(row["overall_quality_score"], 3),
                     display(row["quality_score"], 3),
+                    display(row["pair_f1_score"], 3),
                     display(row["hit_at_1"], 3),
                     display(row["hit_at_5"], 3),
                     display(row["ndcg_at_5"], 3),
@@ -1237,6 +1429,53 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             )
             + " |"
         )
+    pair_detail_count = sum(len(row["pair_quality_details"]) for row in rows)
+    if pair_detail_count:
+        lines.extend(
+            (
+                "",
+                "## Semantic pair quality and freshness",
+                "",
+                "Confusion columns are TP/TN/FP/FN over the explicit bounded judgments. "
+                "Natural background pairs outside the judgment set remain unjudged.",
+                "",
+                "| Candidate | Capability | Relationship | Initial TP/TN/FP/FN | Initial F1 | "
+                "Post-edit TP/TN/FP/FN | Post-edit F1 | Fresh TP/TN/FP/FN | Fresh F1 | "
+                "Freshness policy | Freshness result | Policy conforming | Task SHA | Background commit/tree |",
+                "|---|---|---|---:|---:|---:|---:|---:|---:|---|---|---|---|---|",
+            )
+        )
+        for row in rows:
+            for detail in row["pair_quality_details"]:
+                revision = detail.get("background_revision")
+                tree = detail.get("background_tree")
+                background = (
+                    f"{str(revision)[:12]}/{str(tree)[:12]}"
+                    if revision and tree
+                    else "synthetic fixture"
+                )
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        (
+                            display(row["candidate"]),
+                            display(detail["capability"]),
+                            display(detail["relationship"]),
+                            display_confusion(detail["initial_confusion"]),
+                            display(detail["initial_f1"], 3),
+                            display_confusion(detail["incremental_confusion"]),
+                            display(detail["incremental_f1"], 3),
+                            display_confusion(detail["fresh_confusion"]),
+                            display(detail["fresh_f1"], 3),
+                            display(detail["freshness_policy"]),
+                            display(detail["freshness"]),
+                            display(detail["policy_conformance_met"]),
+                            display(str(detail.get("task_sha256") or "")[:12]),
+                            display(background),
+                        )
+                    )
+                    + " |"
+                )
     comparisons = historical_delta_rows(rows)
     if comparisons:
         lines.extend(
@@ -1370,9 +1609,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         (
             "",
             "These are descriptive min–max ranges, not confidence intervals. Campaigns run "
-            "sequentially to avoid resource contention, and the grouped execution order does not "
-            "support a paired or randomized effect-size interval. Medians and ratios remain "
-            "descriptive until an interleaved design is measured.",
+            "sequentially to avoid resource contention. Rows record grouped or paired-interleaved "
+            "execution explicitly; interleaving reduces configuration-aligned drift but does not "
+            "by itself create an effect-size confidence interval. Medians and ratios remain "
+            "descriptive until sufficient paired repetitions are measured.",
         )
     )
     lines.extend(
@@ -1471,9 +1711,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "## Performance and provenance",
             "",
-            "| Candidate | Cases meeting gate/target | Capabilities | Observations (incremental/full) | Incremental p95 ms | Full p50 ms | "
+            "| Candidate | Cases meeting gate/target | Capabilities | Execution order | Observations (incremental/full) | Incremental p95 ms | Full p50 ms | "
             "Speedup p50 | Evidence lifecycle | Binary SHA-256 |",
-            "|---|---:|---|---:|---:|---:|---:|---:|---|",
+            "|---|---:|---|---|---:|---:|---:|---:|---:|---|",
         )
     )
     for row in rows:
@@ -1484,6 +1724,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["candidate"]),
                     display(row["cases"]),
                     display(row["capabilities"]),
+                    display(row["execution_orders"]),
                     display(f"{row['incremental_observations']}/{row['full_observations']}"),
                     display(row["incremental_p95_ms"]),
                     display(row["full_p50_ms"]),
@@ -1577,8 +1818,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "(https://doi.org/10.1145/582415.582418).",
             "",
             "Graph fidelity is the fraction of mutation cases whose incremental canonical graph equals "
-            "a fresh FAST rebuild. Task success is the fraction of applicable probes that find their "
-            "required evidence. Evidence counts show retrieval probes / graph comparisons / strict "
+            "a matching-mode fresh rebuild. Task success is the fraction of applicable probes that find "
+            "their required evidence. Pair F1 is the mean of the explicit initial and fresh semantic-"
+            "pair classification tasks; an expected deferred post-edit view remains visible separately "
+            "and does not masquerade as retrieval MRR. Evidence counts show retrieval probes / graph comparisons / strict "
             "whole-scenario passes. The named breakdown above shows why a result is, for example, 4/5 "
             "rather than hiding the failed task.",
             "",
