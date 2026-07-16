@@ -43,6 +43,8 @@ void cbm_closedir(cbm_dir_t *d);
 
 FILE *cbm_popen(const char *cmd, const char *mode);
 int cbm_pclose(FILE *f);
+/* Close/reap a popen stream and return a platform-independent child exit code. */
+int cbm_pclose_exit_code(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
 

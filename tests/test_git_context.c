@@ -25,6 +25,7 @@
  */
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "git/git_command.h"
 #include "git/git_context.h"
 
 #include <stdio.h>
@@ -60,6 +61,22 @@ static int make_git_repo(const char *dir) {
     return 0;
 }
 #endif /* _WIN32 */
+
+/* Cross-platform setup for branch-only tests. Unlike git_run(), this uses the
+ * production command formatter and cbm_popen/cbm_pclose lifecycle on Windows
+ * as well as POSIX. */
+static int make_git_repo_portable(const char *dir) {
+    if (th_mkdir_p(dir) != 0) return -1;
+    if (cbm_git_drain_command(dir, "init -q") != 0) return -1;
+    if (cbm_git_drain_command(dir, "config user.email test@example.com") != 0) return -1;
+    if (cbm_git_drain_command(dir, "config user.name Test") != 0) return -1;
+    char path[CBM_SZ_1K];
+    int n = snprintf(path, sizeof(path), "%s/.keep", dir);
+    if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
+    th_write_file(path, "");
+    if (cbm_git_drain_command(dir, "add .keep") != 0) return -1;
+    return cbm_git_drain_command(dir, "commit -q -m init");
+}
 
 /* ── canonical_root: normal repo indexed from its root ──────────── */
 
@@ -232,10 +249,76 @@ TEST(canonical_root_linked_worktree) {
 #endif /* _WIN32 */
 }
 
+TEST(current_branch_resolves_attached_detached_unborn_and_non_git) {
+    char repo[256];
+    char *raw = th_mktempdir("cbm_branch_repo");
+    if (!raw) FAIL("th_mktempdir returned NULL");
+    snprintf(repo, sizeof(repo), "%s", raw);
+
+    char non_git[256];
+    raw = th_mktempdir("cbm_branch_plain");
+    if (!raw) {
+        th_rmtree(repo);
+        FAIL("th_mktempdir returned NULL");
+    }
+    snprintf(non_git, sizeof(non_git), "%s", raw);
+
+    bool setup_ok = make_git_repo_portable(repo) == 0 &&
+                    cbm_git_drain_command(repo, "checkout -q -b branch-probe") == 0;
+    char *attached = NULL;
+    char *detached = NULL;
+    char *unborn = NULL;
+    char *plain = NULL;
+    int attached_rc = setup_ok ? cbm_git_current_branch(repo, &attached) : CBM_NOT_FOUND;
+    bool detach_ok = setup_ok && cbm_git_drain_command(repo, "checkout -q --detach") == 0;
+    int detached_rc = detach_ok ? cbm_git_current_branch(repo, &detached) : CBM_NOT_FOUND;
+    cbm_git_context_t detached_context = {0};
+    int detached_context_rc =
+        detach_ok ? cbm_git_context_resolve(repo, &detached_context) : CBM_NOT_FOUND;
+    bool unborn_setup_ok = cbm_git_drain_command(non_git, "init -q") == 0 &&
+                           cbm_git_drain_command(
+                               non_git, "symbolic-ref HEAD refs/heads/unborn-probe") == 0;
+    int unborn_rc =
+        unborn_setup_ok ? cbm_git_current_branch(non_git, &unborn) : CBM_NOT_FOUND;
+    char plain_dir[256];
+    raw = th_mktempdir("cbm_branch_plain_after_unborn");
+    bool plain_setup_ok = raw != NULL;
+    snprintf(plain_dir, sizeof(plain_dir), "%s", raw ? raw : "");
+    int plain_rc = plain_setup_ok ? cbm_git_current_branch(plain_dir, &plain) : CBM_NOT_FOUND;
+
+    bool attached_ok = attached_rc == 0 && attached && strcmp(attached, "branch-probe") == 0;
+    bool detached_ok = detached_rc == 0 && detached && strcmp(detached, "DETACHED") == 0;
+    bool detached_context_ok = detached_context_rc == 0 && detached_context.is_detached &&
+                               detached_context.branch &&
+                               strcmp(detached_context.branch, "DETACHED") == 0;
+    bool unborn_ok = unborn_rc == 0 && unborn && strcmp(unborn, "unborn-probe") == 0;
+    bool plain_ok = plain_rc == CBM_NOT_FOUND && plain == NULL;
+    free(attached);
+    free(detached);
+    free(unborn);
+    free(plain);
+    cbm_git_context_free(&detached_context);
+    if (plain_setup_ok) th_rmtree(plain_dir);
+    th_rmtree(non_git);
+    th_rmtree(repo);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(detach_ok);
+    ASSERT_TRUE(unborn_setup_ok);
+    ASSERT_TRUE(plain_setup_ok);
+    ASSERT_TRUE(attached_ok);
+    ASSERT_TRUE(detached_ok);
+    ASSERT_TRUE(detached_context_ok);
+    ASSERT_TRUE(unborn_ok);
+    ASSERT_TRUE(plain_ok);
+    PASS();
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
     RUN_TEST(canonical_root_repo_root);
     RUN_TEST(canonical_root_subdir);
     RUN_TEST(canonical_root_linked_worktree);
+    RUN_TEST(current_branch_resolves_attached_detached_unborn_and_non_git);
 }

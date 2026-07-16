@@ -20,6 +20,8 @@ bool cbm_git_format_status_command(char *cmd, size_t cmd_size, const char *repo_
 int cbm_git_capture_first_line_buf(const char *repo_path, const char *git_args,
                                    char *out, size_t out_size);
 int cbm_git_capture_first_line(const char *repo_path, const char *git_args, char **out);
+int cbm_git_run_first_line_buf(const char *repo_path, const char *git_args,
+                               char *out, size_t out_size, int *out_exit_code);
 int cbm_git_drain_command(const char *repo_path, const char *git_args);
 
 #endif
