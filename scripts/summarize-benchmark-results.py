@@ -792,6 +792,92 @@ def atomic_write_text(path: Path, content: str) -> None:
             temporary.unlink()
 
 
+def render_list_projects_scaling(document: dict[str, Any]) -> str:
+    if document.get("mode") != "list_projects_scaling":
+        raise ValueError("expected a list_projects_scaling result document")
+    observations = document.get("observations")
+    derived = document.get("derived")
+    if not isinstance(observations, list) or not isinstance(derived, dict):
+        raise ValueError("list-project scaling result is missing observations or derived data")
+    completion = document.get("completion")
+    completion_status = (
+        str(completion.get("status")) if isinstance(completion, dict) else "unknown"
+    )
+    all_valid = bool(derived.get("passed"))
+    outcome_detail = (
+        "all requested inventories returned, follow-up MCP requests succeeded, and server "
+        "resources were reaped"
+        if all_valid
+        else "one or more inventory, transport, or teardown checks were incomplete"
+    )
+    lines = [
+        "## `list_projects` response scaling",
+        "",
+        f"Outcome: {completion_status} — {outcome_detail}.",
+        "",
+        "| Requested projects | Returned projects | Payload bytes | Estimated tokens* | "
+        "Call ms† | Post-call RSS MiB‡ | Transport | Server cleanup | Fixture DB MiB |",
+        "|---:|---:|---:|---:|---:|---:|---|---|---:|",
+    ]
+    for item in observations:
+        if not isinstance(item, dict):
+            continue
+        rss_kb = item.get("post_call_rss_kb")
+        fixture_bytes = item.get("fixture_db_bytes")
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    f"{int(item['requested_projects']):,}",
+                    f"{int(item['returned_projects']):,}",
+                    f"{int(item['response_bytes']):,}",
+                    f"{int(item['response_token_estimate']):,}",
+                    f"{float(item['elapsed_ms']):.3f}",
+                    f"{float(rss_kb) / 1024:.1f}" if isinstance(rss_kb, (int, float)) else "n/a",
+                    "Survived" if item.get("transport_survived") else "Interrupted",
+                    "Reaped" if item.get("server_reaped") else "Incomplete",
+                    (
+                        f"{float(fixture_bytes) / (1024 * 1024):.1f}"
+                        if isinstance(fixture_bytes, (int, float))
+                        else "n/a"
+                    ),
+                )
+            )
+            + " |"
+        )
+    growth = derived.get("incremental_response_bytes_per_project")
+    claim_boundary = derived.get("claim_boundary")
+    binary = document.get("binary_metadata")
+    sha = binary.get("sha256") if isinstance(binary, dict) else None
+    cleanup = document.get("cleanup")
+    cleanup_removed = cleanup.get("removed") if isinstance(cleanup, dict) else None
+    lines.extend(
+        (
+            "",
+            "### Interpretation and audit boundary",
+            "",
+            f"- Observed payload growth: {float(growth):.1f} bytes per added project."
+            if isinstance(growth, (int, float))
+            else "- Observed payload growth: not measured.",
+            f"- Claim boundary: {claim_boundary}"
+            if isinstance(claim_boundary, str)
+            else "- Claim boundary: this measures `list_projects` alone.",
+            f"- Run ID: `{document.get('run_id', 'n/a')}`; binary SHA-256: `{sha or 'n/a'}`.",
+            f"- Auto-created fixture cleanup confirmed: {str(cleanup_removed).lower()}.",
+            "",
+            "* Tokens are the deterministic `ceil(UTF-8 payload bytes / 4)` estimate, not a "
+            "model-tokenizer count.",
+            "",
+            "† This pilot has one observation per project count. Latency is descriptive and must "
+            "not be presented as a population estimate or regression threshold.",
+            "",
+            "‡ RSS is sampled after each call and is not peak RSS. Fixture DB size is transient "
+            "isolated-test storage, not response memory or a recommended cache size.",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
 def render_mcp_surface_parity(document: dict[str, Any]) -> str:
     if document.get("mode") != "mcp_surface_parity":
         raise ValueError("expected an mcp_surface_parity result document")
@@ -1290,10 +1376,19 @@ def main() -> int:
         type=Path,
         help="Append a three-state MCP surface section from a retained parity JSON result.",
     )
+    parser.add_argument(
+        "--list-projects-scaling",
+        action="append",
+        default=[],
+        type=Path,
+        help="Append a list_projects response-scaling section from retained JSON.",
+    )
     parser.add_argument("--out", default="")
     args = parser.parse_args()
-    if not args.input and not args.mcp_surface_parity:
-        parser.error("at least one --input or --mcp-surface-parity is required")
+    if not args.input and not args.mcp_surface_parity and not args.list_projects_scaling:
+        parser.error(
+            "at least one --input, --mcp-surface-parity, or --list-projects-scaling is required"
+        )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for label, path in args.input:
         with path.open(encoding="utf-8") as stream:
@@ -1315,6 +1410,13 @@ def main() -> int:
         if not isinstance(document, dict):
             raise SystemExit(f"error: expected JSON object in {path}")
         sections.append(render_mcp_surface_parity(document).rstrip())
+    for raw_path in args.list_projects_scaling:
+        path = raw_path.expanduser()
+        with path.open(encoding="utf-8") as stream:
+            document = json.load(stream)
+        if not isinstance(document, dict):
+            raise SystemExit(f"error: expected JSON object in {path}")
+        sections.append(render_list_projects_scaling(document).rstrip())
     markdown = "\n\n".join(sections) + "\n"
     if args.out:
         output = Path(args.out).expanduser()
