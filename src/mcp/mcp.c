@@ -1484,7 +1484,6 @@ char *cbm_mcp_initialize_response(const char *params_json) {
     /* Advertise MCP resources capability — clients can read codebase://schema etc. */
     yyjson_mut_val *res_cap = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_bool(doc, res_cap, "subscribe", false);
-    yyjson_mut_obj_add_bool(doc, res_cap, "listChanged", true);
     yyjson_mut_obj_add_val(doc, caps, "resources", res_cap);
     yyjson_mut_obj_add_val(doc, root, "capabilities", caps);
 
@@ -1913,7 +1912,6 @@ static void free_counted_string_array(char **arr, int count) {
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Forward declarations for functions defined after first use */
-static void notify_resources_updated(cbm_mcp_server_t *srv);
 static void send_notification(cbm_mcp_server_t *srv, const char *method);
 static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit,
                                      bool path_scoped);
@@ -1942,7 +1940,6 @@ struct cbm_mcp_server {
     bool autoindex_failed; /* IX-1: true if last auto-index attempt failed */
     bool just_autoindexed; /* IX-3: true after auto-index completes, reset on next search */
     bool context_injected; /* true after first _context header sent (Phase 9) */
-    bool client_has_resources; /* true if client advertised resources capability */
     bool hidden_tools_revealed; /* true after _hidden_tools requests real tools/list exposure */
     FILE *out_stream;          /* protocol output stream for notifications (set in server_run) */
     bool out_content_length_framed; /* true while handling Content-Length-framed requests */
@@ -9279,11 +9276,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
     CBM_PROF_END("index_repository", "response_fields", prof_index_response_fields);
 
-    /* Notify resource-capable clients that graph data changed */
-    CBM_PROF_START(prof_index_notify);
-    if (rc == 0) notify_resources_updated(srv);
-    CBM_PROF_END("index_repository", "notify_resources", prof_index_notify);
-
     CBM_PROF_START(prof_index_serialize);
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -12013,9 +12005,6 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
      * PageRank/LinkRank/node-degree capability is disabled. */
     (void)cbm_pagerank_compute_with_config(store, project, srv->config);
 
-    /* Notify resource-capable clients that graph data changed */
-    notify_resources_updated(srv);
-
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     yyjson_doc_free(doc_args);
@@ -12327,7 +12316,6 @@ static void *autoindex_thread(void *arg) {
         }
 
         cbm_log_info("autoindex.done", "project", srv->session_project);
-        notify_resources_updated(srv);
         register_watcher_if_enabled(srv);
         if (srv->watcher && auto_watch_enabled(srv)) {
             cbm_watcher_mark_indexed(srv->watcher, srv->session_project, srv->session_root);
@@ -12646,15 +12634,6 @@ static void send_notification(cbm_mcp_server_t *srv, const char *method) {
         write_protocol_json(srv->out_stream, json, srv->out_content_length_framed);
         free(json);
     }
-}
-
-/* Send notifications/resources/list_changed after index operations.
- * Per MCP spec: list_changed is for when the server's resource data changes
- * (we declared listChanged:true in capabilities). notifications/resources/updated
- * is only for per-resource subscriptions (we don't support subscribe). */
-static void notify_resources_updated(cbm_mcp_server_t *srv) {
-    if (srv->client_has_resources)
-        send_notification(srv, "notifications/resources/list_changed");
 }
 
 /* Handle resources/list — return 3 resource URIs. */
