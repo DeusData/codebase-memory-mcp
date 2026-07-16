@@ -365,6 +365,35 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertIn("resource_before", command_record)
             self.assertIn("resource_after", attempt_record)
 
+    def test_successful_cell_hashes_durable_artifacts_created_by_child(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json,os,pathlib,sys; "
+                    "artifact=pathlib.Path(os.environ['CBM_BENCHMARK_ARTIFACT_DIR'])/'worker.log.gz'; "
+                    "artifact.parent.mkdir(parents=True); artifact.write_bytes(b'audit-log'); "
+                    "json.dump({'binary_metadata':{'sha256':'" + "b" * 64 +
+                    "'},'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
+                ),
+                "{result_path}",
+            ]
+
+            planned = cell(command)
+            result = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            attempt = next((cell_root / "attempts").iterdir())
+            record = json.loads((attempt / "attempt.json").read_text())
+
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(record["artifacts"]["file_count"], 1)
+            item = record["artifacts"]["files"][0]
+            self.assertEqual(item["path"], "worker.log.gz")
+            self.assertEqual(item["size_bytes"], 9)
+            self.assertEqual(len(item["sha256"]), 64)
+
     def test_report_input_adds_candidate_support_without_mutating_raw_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

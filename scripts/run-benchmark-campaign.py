@@ -55,6 +55,23 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def artifact_manifest(root: Path) -> dict[str, Any]:
+    files = []
+    total_bytes = 0
+    if root.is_dir():
+        for path in sorted(item for item in root.rglob("*") if item.is_file()):
+            size = path.stat().st_size
+            total_bytes += size
+            files.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "size_bytes": size,
+                    "sha256": file_sha256(path),
+                }
+            )
+    return {"file_count": len(files), "total_bytes": total_bytes, "files": files}
+
+
 def canonical_json(value: Any) -> bytes:
     return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
 
@@ -743,6 +760,7 @@ def run_cell(
         attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{uuid.uuid4().hex[:8]}"
         attempt_root = cell_root / "attempts" / attempt_id
         attempt_root.mkdir(parents=True)
+        artifact_root = attempt_root / "artifacts"
         result_path = attempt_root / "result.json"
         command = expanded_command(cell["command"], attempt_root, result_path)
         cwd = Path(cell.get("cwd") or Path.cwd()).expanduser().resolve()
@@ -753,6 +771,7 @@ def run_cell(
         ):
             raise ValueError("cell environment must be a string-to-string object")
         environment.update(overrides)
+        environment["CBM_BENCHMARK_ARTIFACT_DIR"] = str(artifact_root)
         command_record = {
             "cell_identity": identity,
             "identity": identity_document(cell),
@@ -760,6 +779,7 @@ def run_cell(
             "command": command,
             "cwd": str(cwd),
             "environment_overrides": overrides,
+            "artifact_directory": "artifacts",
             "started_at_utc": utc_now(),
             "stale_lock_recovered": stale_record is not None,
             "resource_before": resource_snapshot(campaign_root),
@@ -811,6 +831,7 @@ def run_cell(
             "status": "completed" if error is None else "failed",
             "error": error,
             "resource_after": resource_snapshot(campaign_root),
+            "artifacts": artifact_manifest(artifact_root),
         }
         atomic_write_json(attempt_root / "attempt.json", attempt_record)
         if interrupted:
