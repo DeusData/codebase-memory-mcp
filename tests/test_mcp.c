@@ -877,6 +877,8 @@ TEST(server_handle_unknown_method) {
  *  TOOL HANDLERS (via server_handle)
  * ══════════════════════════════════════════════════════════════════ */
 
+static char *extract_text_content(const char *mcp_result);
+
 /* Helper: create a server with an in-memory store populated with test data */
 static cbm_mcp_server_t *setup_mcp_with_data(void) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL); /* NULL = in-memory */
@@ -955,6 +957,107 @@ TEST(tool_list_projects_includes_tmp_prefixed_project) {
         cbm_unlink(shm);
     }
     cbm_rmdir(cache);
+    PASS();
+}
+
+TEST(tool_list_projects_paginates_with_explicit_full_compatibility) {
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-list-page-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *names[] = {"charlie-page", "alpha-page", "bravo-page"};
+    bool setup_ok = true;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[CBM_SZ_512];
+        int n = snprintf(path, sizeof(path), "%s/%s.db", cache, names[i]);
+        cbm_store_t *store = n > 0 && (size_t)n < sizeof(path) ? cbm_store_open_path(path) : NULL;
+        if (!store || cbm_store_upsert_project(store, names[i], cache) != CBM_STORE_OK) {
+            setup_ok = false;
+        }
+        cbm_store_close(store);
+    }
+
+    bool first_page_ok = false;
+    bool second_page_ok = false;
+    bool full_compat_ok = false;
+    bool schema_ok = false;
+    if (setup_ok) {
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            char *first = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":2}");
+            char *first_text = first ? extract_text_content(first) : NULL;
+            yyjson_doc *first_doc =
+                first_text ? yyjson_read(first_text, strlen(first_text), 0) : NULL;
+            if (first_doc) {
+                yyjson_val *root = yyjson_doc_get_root(first_doc);
+                yyjson_val *projects = yyjson_obj_get(root, "projects");
+                yyjson_val *p0 = projects ? yyjson_arr_get(projects, 0) : NULL;
+                yyjson_val *p1 = projects ? yyjson_arr_get(projects, 1) : NULL;
+                first_page_ok =
+                    projects && yyjson_arr_size(projects) == 2 &&
+                    strcmp(yyjson_get_str(yyjson_obj_get(p0, "name")), "alpha-page") == 0 &&
+                    strcmp(yyjson_get_str(yyjson_obj_get(p1, "name")), "bravo-page") == 0 &&
+                    yyjson_get_bool(yyjson_obj_get(root, "has_more")) &&
+                    yyjson_get_int(yyjson_obj_get(root, "next_offset")) == 2;
+                yyjson_doc_free(first_doc);
+            }
+            free(first_text);
+            free(first);
+
+            char *second = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":2,\"offset\":2}");
+            char *second_text = second ? extract_text_content(second) : NULL;
+            yyjson_doc *second_doc =
+                second_text ? yyjson_read(second_text, strlen(second_text), 0) : NULL;
+            if (second_doc) {
+                yyjson_val *root = yyjson_doc_get_root(second_doc);
+                yyjson_val *projects = yyjson_obj_get(root, "projects");
+                yyjson_val *p0 = projects ? yyjson_arr_get(projects, 0) : NULL;
+                second_page_ok =
+                    projects && yyjson_arr_size(projects) == 1 &&
+                    strcmp(yyjson_get_str(yyjson_obj_get(p0, "name")), "charlie-page") == 0 &&
+                    !yyjson_get_bool(yyjson_obj_get(root, "has_more"));
+                yyjson_doc_free(second_doc);
+            }
+            free(second_text);
+            free(second);
+
+            char *full = cbm_mcp_handle_tool(srv, "list_projects", "{\"limit\":1,\"all\":true}");
+            char *full_text = full ? extract_text_content(full) : NULL;
+            yyjson_doc *full_doc = full_text ? yyjson_read(full_text, strlen(full_text), 0) : NULL;
+            if (full_doc) {
+                yyjson_val *projects = yyjson_obj_get(yyjson_doc_get_root(full_doc), "projects");
+                full_compat_ok = projects && yyjson_arr_size(projects) == 3;
+                yyjson_doc_free(full_doc);
+            }
+            free(full_text);
+            free(full);
+            cbm_mcp_server_free(srv);
+        }
+
+        const char *schema = cbm_mcp_tool_input_schema("list_projects");
+        schema_ok = schema && strstr(schema, "\"limit\"") && strstr(schema, "\"offset\"") &&
+                    strstr(schema, "\"all\"");
+    }
+
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(cache);
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_TRUE(first_page_ok);
+    ASSERT_TRUE(second_page_ok);
+    ASSERT_TRUE(full_compat_ok);
+    ASSERT_TRUE(schema_ok);
     PASS();
 }
 
@@ -9854,6 +9957,7 @@ SUITE(mcp) {
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
     RUN_TEST(tool_list_projects_includes_tmp_prefixed_project);
+    RUN_TEST(tool_list_projects_paginates_with_explicit_full_compatibility);
     RUN_TEST(resolve_store_quarantines_structurally_corrupt_db);
     RUN_TEST(resolve_store_leaves_foreign_sqlite_db_untouched);
     RUN_TEST(tool_get_graph_schema_empty);
