@@ -3554,8 +3554,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     }
 
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
-    // ObjC: class name is first identifier child
-    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_OBJC) {
+    // ObjC/Java: class name is first identifier child (Java fallback for enum_declaration)
+    if (ts_node_is_null(name_node) &&
+        (ctx->language == CBM_LANG_OBJC || ctx->language == CBM_LANG_JAVA)) {
         name_node = cbm_find_child_by_kind(node, "identifier");
     }
     // ObjectScript UDL: class name is a `class_name` child (no "name" field).
@@ -3974,6 +3975,12 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     for (const char **f = body_fields; *f; f++) {
         TSNode body = ts_node_child_by_field_name(class_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(body)) {
+            if (strcmp(ts_node_type(body), "enum_body") == 0) {
+                TSNode decls = cbm_find_child_by_kind(body, "enum_body_declarations");
+                if (!ts_node_is_null(decls)) {
+                    return decls;
+                }
+            }
             return body;
         }
     }
@@ -4029,17 +4036,31 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
                                        "implementation_definition",
                                        NULL};
     uint32_t count = ts_node_child_count(class_node);
+    TSNode result = {0};
     for (uint32_t i = 0; i < count; i++) {
         TSNode child = ts_node_child(class_node, i);
         const char *ck = ts_node_type(child);
         for (const char **t = body_types; *t; t++) {
             if (strcmp(ck, *t) == 0) {
-                return child;
+                result = child;
+                break;
             }
         }
+        if (!ts_node_is_null(result)) {
+            break;
+        }
     }
-    TSNode null_node = {0};
-    return null_node;
+    if (!ts_node_is_null(result) && strcmp(ts_node_type(result), "enum_body") == 0) {
+        TSNode decls = cbm_find_child_by_kind(result, "enum_body_declarations");
+        if (!ts_node_is_null(decls)) {
+            return decls;
+        }
+    }
+    if (ts_node_is_null(result)) {
+        TSNode null_node = {0};
+        return null_node;
+    }
+    return result;
 }
 
 // Dart: resolve method name from method_signature/function_signature.
@@ -6200,7 +6221,8 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
         const char *ck = ts_node_type(child);
         if (strcmp(ck, "field_declaration_list") == 0 || strcmp(ck, "class_body") == 0 ||
             strcmp(ck, "declaration_list") == 0 || strcmp(ck, "body") == 0 ||
-            strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0 ||
+            strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0 || strcmp(ck, "enum_body") == 0 ||
+            strcmp(ck, "enum_body_declarations") == 0 ||
             // Groovy class bodies are a `closure` node; routing through the
             // nested-class path keeps methods from being re-walked (and thus
             // double-extracted) as top-level functions. Gated to Groovy so other
