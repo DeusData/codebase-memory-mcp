@@ -609,8 +609,9 @@ static void print_help(void) {
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("\nSupported agents (auto-detected):\n");
-    printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
-    printf("  Antigravity, Aider, KiloCode, Kiro\n");
+    printf("  Claude Code, Claude Desktop, Codex CLI, Gemini CLI, Qwen Code,\n");
+    printf("  ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode,\n");
+    printf("  VS Code, Cursor, Windsurf, OpenClaw, Kiro, Junie\n");
     printf("\nDefault MCP tools: search_graph, query_graph, trace_path,\n");
     printf("  search_code, get_code, _hidden_tools\n");
     printf("\nAdvanced and CLI-callable tools: index_repository, get_code_snippet,\n");

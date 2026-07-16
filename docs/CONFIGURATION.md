@@ -119,7 +119,7 @@ These environment variables affect runtime behavior:
 
 ## 5. Agent and Editor Integration Files
 
-The `install` command can also write MCP entries and owned instruction blocks into detected agent/editor config files. Supported targets include Claude Code, Codex, Gemini, Qwen Code, ForgeCode, Antigravity, OpenCode, Zed, VS Code and its profiles, Cursor, Windsurf, KiloCode, OpenClaw, Kiro, and Junie; Aider receives CLI-form instructions because it does not expose MCP.
+The `install` command can also write MCP entries and owned instruction blocks into detected agent/editor config files. Supported targets include Claude Code, Claude Desktop, Codex, Gemini, Qwen Code, ForgeCode, Antigravity, OpenCode, Zed, VS Code and its profiles, Cursor, Windsurf, KiloCode, OpenClaw, Kiro, and Junie; Aider receives CLI-form instructions because it does not expose MCP.
 
 Those target paths vary by tool and platform, so the easiest way to inspect the exact files for your machine is:
 

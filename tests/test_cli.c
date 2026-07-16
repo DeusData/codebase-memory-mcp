@@ -2154,6 +2154,53 @@ TEST(cli_reference_harnesses_are_planned_without_mutation) {
     PASS();
 }
 
+TEST(cli_claude_desktop_plan_and_uninstall_preserve_foreign_entries) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-claude-desktop-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char config_path[768];
+#ifdef __APPLE__
+    snprintf(config_dir, sizeof(config_dir), "%s/Library/Application Support/Claude", tmpdir);
+#elif defined(_WIN32)
+    snprintf(config_dir, sizeof(config_dir), "%s/AppData/Roaming/Claude", tmpdir);
+#else
+    snprintf(config_dir, sizeof(config_dir), "%s/.config/Claude", tmpdir);
+#endif
+    ASSERT_EQ(test_mkdirp(config_dir), 0);
+    snprintf(config_path, sizeof(config_path), "%s/claude_desktop_config.json", config_dir);
+
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"claude-desktop\"") != NULL);
+    ASSERT(strstr(json, "claude_desktop_config.json") != NULL);
+    struct stat st;
+    ASSERT_NEQ(stat(config_path, &st), 0);
+    free(json);
+
+    ASSERT_EQ(
+        write_test_file(config_path, "{\"mcpServers\":{\"foreign\":{\"command\":\"keep-me\"}}}"),
+        0);
+    ASSERT_EQ(cbm_install_editor_mcp("/usr/local/bin/codebase-memory-mcp", config_path), 0);
+
+    cli_env_snapshot_t home = {0};
+    ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
+    cbm_setenv("HOME", tmpdir, 1);
+    char *args[] = {"-n"};
+    ASSERT_EQ(cbm_cmd_uninstall(1, args), 0);
+    cli_env_restore(&home);
+
+    const char *contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "keep-me") != NULL);
+    ASSERT(strstr(contents, "codebase-memory-mcp") == NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_reference_harnesses_uninstall_owned_entries_only) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-reference-uninstall-XXXXXX");
@@ -2429,6 +2476,29 @@ TEST(cli_detect_agents_finds_gemini) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_claude_desktop) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+#ifdef __APPLE__
+    snprintf(dir, sizeof(dir), "%s/Library/Application Support/Claude", tmpdir);
+#elif defined(_WIN32)
+    snprintf(dir, sizeof(dir), "%s/AppData/Roaming/Claude", tmpdir);
+#else
+    snprintf(dir, sizeof(dir), "%s/.config/Claude", tmpdir);
+#endif
+    test_mkdirp(dir);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.claude_desktop);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_detect_agents_finds_zed) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
@@ -2545,6 +2615,7 @@ TEST(cli_detect_agents_none_found) {
 
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     ASSERT_FALSE(agents.claude_code);
+    ASSERT_FALSE(agents.claude_desktop);
     ASSERT_FALSE(agents.codex);
     ASSERT_FALSE(agents.gemini);
     ASSERT_FALSE(agents.zed);
@@ -4094,6 +4165,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_reference_harnesses_are_planned_without_mutation);
+    RUN_TEST(cli_claude_desktop_plan_and_uninstall_preserve_foreign_entries);
     RUN_TEST(cli_reference_harnesses_uninstall_owned_entries_only);
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_codex_mcp_and_hook_upserts_are_idempotent);
@@ -4102,6 +4174,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_subagent_hook);
     RUN_TEST(cli_claude_subagent_hook_preserves_user_entry);
     RUN_TEST(cli_detect_agents_finds_gemini);
+    RUN_TEST(cli_detect_agents_finds_claude_desktop);
     RUN_TEST(cli_detect_agents_finds_zed);
     RUN_TEST(cli_detect_agents_finds_antigravity);
     RUN_TEST(cli_detect_agents_finds_kilocode);

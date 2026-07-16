@@ -143,22 +143,23 @@ int cbm_remove_zed_mcp(const char *config_path);
 
 /* Detected coding agents on the system. */
 typedef struct {
-    bool claude_code; /* ~/.claude/ exists */
-    bool codex;       /* ~/.codex/ exists */
-    bool gemini;      /* ~/.gemini/ exists */
-    bool zed;         /* platform-specific Zed config dir exists */
-    bool opencode;    /* opencode on PATH or config exists */
-    bool antigravity; /* ~/.gemini/antigravity/ exists */
-    bool aider;       /* aider on PATH */
-    bool kilocode;    /* KiloCode globalStorage dir exists */
-    bool vscode;      /* VS Code User config dir exists */
-    bool cursor;      /* ~/.cursor/ exists */
-    bool windsurf;    /* ~/.codeium/windsurf/ exists */
-    bool openclaw;    /* ~/.openclaw/ exists */
-    bool kiro;        /* ~/.kiro/ exists */
-    bool junie;       /* ~/.junie/ exists */
-    bool qwen;        /* ~/.qwen/ exists */
-    bool forgecode;   /* ~/forge/ exists */
+    bool claude_code;    /* ~/.claude/ exists */
+    bool claude_desktop; /* platform Claude Desktop config dir exists */
+    bool codex;          /* ~/.codex/ exists */
+    bool gemini;         /* ~/.gemini/ exists */
+    bool zed;            /* platform-specific Zed config dir exists */
+    bool opencode;       /* opencode on PATH or config exists */
+    bool antigravity;    /* ~/.gemini/antigravity/ exists */
+    bool aider;          /* aider on PATH */
+    bool kilocode;       /* KiloCode globalStorage dir exists */
+    bool vscode;         /* VS Code User config dir exists */
+    bool cursor;         /* ~/.cursor/ exists */
+    bool windsurf;       /* ~/.codeium/windsurf/ exists */
+    bool openclaw;       /* ~/.openclaw/ exists */
+    bool kiro;           /* ~/.kiro/ exists */
+    bool junie;          /* ~/.junie/ exists */
+    bool qwen;           /* ~/.qwen/ exists */
+    bool forgecode;      /* ~/forge/ exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
