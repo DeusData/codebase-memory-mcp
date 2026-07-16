@@ -431,6 +431,8 @@ int main(int argc, char **argv) {
         if (strstr("httpd", only_suite)) RUN_SUITE(httpd);
         if (strstr("security", only_suite)) RUN_SUITE(security);
         if (strstr("yaml", only_suite)) RUN_SUITE(yaml);
+        if (strstr("semantic", only_suite)) RUN_SUITE(semantic);
+        if (strstr("ast_profile", only_suite)) RUN_SUITE(ast_profile);
         if (strstr("simhash", only_suite)) RUN_SUITE(simhash);
         if (strstr("stack_overflow", only_suite)) RUN_SUITE(stack_overflow);
         if (strstr("integration", only_suite)) RUN_SUITE(integration);

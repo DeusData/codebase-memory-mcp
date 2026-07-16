@@ -145,6 +145,17 @@ char *cbm_pipeline_fqn_module(const char *project, const char *rel_path) {
     return cbm_pipeline_fqn_compute(project, rel_path, NULL);
 }
 
+const char *cbm_pipeline_fqn_without_project(const char *project, const char *qn) {
+    if (!project || !project[0] || !qn) {
+        return qn;
+    }
+    size_t project_len = strlen(project);
+    if (strncmp(qn, project, project_len) == 0 && qn[project_len] == '.') {
+        return qn + project_len + SKIP_ONE;
+    }
+    return qn;
+}
+
 char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, bool module_is_dir) {
     if (!module_is_dir) {
         /* Filename-stem module (default for all but Java/Go). */

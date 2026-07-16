@@ -53,6 +53,11 @@
 /* Smallest real corpus on which the flicker was directly observed. */
 #define RPD_CORPUS "/Users/martinvogel/perf-bench/linux/fs/xfs"
 
+static const char *rpd_corpus_path(void) {
+    const char *override = getenv("CBM_REPRO_DETERMINISM_CORPUS");
+    return override && override[0] ? override : RPD_CORPUS;
+}
+
 /* Sorted (source_qn|type|target_qn) fingerprint of the whole project graph.
  * Heap string (caller frees) or NULL on error. */
 static char *rpd_edge_fingerprint(cbm_store_t *s, const char *project) {
@@ -138,23 +143,23 @@ static char *rpd_index_and_fingerprint(const char *repo, const char *dbpath) {
  * subsets, and the QN-collision last-wins overwrite in gbuf upsert AND merge
  * (a C struct/function/macro sharing one name flipped label by merge order). */
 TEST(repro_parallel_edge_determinism) {
+    const char *corpus = rpd_corpus_path();
     struct stat st;
-    if (stat(RPD_CORPUS, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        SKIP("real-repo tier: corpus " RPD_CORPUS
-             " absent (synthetic C could not trigger the parallel edge race — see header)");
+    if (stat(corpus, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        SKIP("real-repo determinism corpus absent (set CBM_REPRO_DETERMINISM_CORPUS)");
     }
 
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/cbm_rpd_par_det.db", cbm_tmpdir());
 
     /* First multi-threaded run = reference; every further MT run must match. */
-    char *fp_ref = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+    char *fp_ref = rpd_index_and_fingerprint(corpus, dbpath);
     ASSERT_NOT_NULL(fp_ref);
     ASSERT_TRUE(strlen(fp_ref) > 0);
 
     int diverged = 0;
     for (int k = 1; k < RPD_MT_RUNS && !diverged; k++) {
-        char *fp_mt = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+        char *fp_mt = rpd_index_and_fingerprint(corpus, dbpath);
         ASSERT_NOT_NULL(fp_mt);
         if (strcmp(fp_mt, fp_ref) != 0)
             diverged = 1;
@@ -175,20 +180,21 @@ TEST(repro_parallel_edge_determinism) {
  * deterministic after the race fixes above; the modes just don't agree).
  * GREEN when both pipelines emit the same graph for the same corpus. */
 TEST(repro_seq_parallel_equivalence) {
+    const char *corpus = rpd_corpus_path();
     struct stat st;
-    if (stat(RPD_CORPUS, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        SKIP("real-repo tier: corpus " RPD_CORPUS " absent");
+    if (stat(corpus, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        SKIP("real-repo determinism corpus absent (set CBM_REPRO_DETERMINISM_CORPUS)");
     }
 
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/cbm_rpd_seq_par.db", cbm_tmpdir());
 
     setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
-    char *fp_st = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+    char *fp_st = rpd_index_and_fingerprint(corpus, dbpath);
     unsetenv("CBM_INDEX_SINGLE_THREAD");
     ASSERT_NOT_NULL(fp_st);
 
-    char *fp_mt = rpd_index_and_fingerprint(RPD_CORPUS, dbpath);
+    char *fp_mt = rpd_index_and_fingerprint(corpus, dbpath);
     ASSERT_NOT_NULL(fp_mt);
 
     int equal = strcmp(fp_st, fp_mt) == 0;

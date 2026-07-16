@@ -495,12 +495,14 @@ static int tokenize_call_neighbors(const cbm_gbuf_node_t *n, const cbm_gbuf_t *g
     return count;
 }
 
-static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf, char **tokens,
-                         int max_tokens) {
+static int tokenize_node(const cbm_gbuf_node_t *n, const cbm_gbuf_t *gbuf,
+                         const char *project_name, char **tokens, int max_tokens) {
     int count = 0;
     count += cbm_sem_tokenize(n->name, tokens + count, max_tokens - count);
     if (n->qualified_name && count < max_tokens) {
-        count += cbm_sem_tokenize(n->qualified_name, tokens + count, max_tokens - count);
+        const char *stable_qn =
+            cbm_pipeline_fqn_without_project(project_name, n->qualified_name);
+        count += cbm_sem_tokenize(stable_qn, tokens + count, max_tokens - count);
     }
     if (n->file_path && count < max_tokens) {
         count += cbm_sem_tokenize(n->file_path, tokens + count, max_tokens - count);
@@ -627,6 +629,7 @@ typedef struct {
     char **all_tokens;                 /* output: all_tokens[f * MAX + t] */
     int *token_counts;                 /* output: token count per function */
     int func_count;
+    const char *project_name; /* borrowed; strips volatile QN root prefix */
     _Atomic int next_idx;
     /* Per-worker token intern pools (key==value==the one owned strdup):
      * identical tokens ("xfs", "error", ...) recur across hundreds of
@@ -649,7 +652,7 @@ static void tokenize_worker(int worker_id, void *ctx_ptr) {
          * in this slot, which avoids a spurious analyzer "leak" diagnostic on
          * the previous stack-local relay pattern. */
         char **dst = &tc->all_tokens[(ptrdiff_t)f * CBM_SEM_MAX_TOKENS];
-        int count = tokenize_node(n, tc->gbuf, dst, CBM_SEM_MAX_TOKENS);
+        int count = tokenize_node(n, tc->gbuf, tc->project_name, dst, CBM_SEM_MAX_TOKENS);
         count = inject_pattern_tokens(n, tc->gbuf, dst, count, CBM_SEM_MAX_TOKENS);
         if (tc->pools && tc->pools[worker_id]) {
             CBMHashTable *pool = tc->pools[worker_id];
@@ -1231,13 +1234,14 @@ static void phase1b_decode_and_build(cbm_sem_func_t *funcs, const cbm_gbuf_node_
  * all_tokens[] and token_counts[].  Caller allocates the arrays. */
 static void phase2_tokenize(const cbm_gbuf_node_t **node_ptrs, cbm_gbuf_t *gbuf, char **all_tokens,
                             int *token_counts, int func_count, int worker_count,
-                            CBMHashTable **pools) {
+                            CBMHashTable **pools, const char *project_name) {
     tokenize_ctx_t tc = {
         .node_ptrs = node_ptrs,
         .gbuf = gbuf,
         .all_tokens = all_tokens,
         .token_counts = token_counts,
         .func_count = func_count,
+        .project_name = project_name,
         .pools = pools,
     };
     atomic_init(&tc.next_idx, 0);
@@ -1534,7 +1538,7 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx) {
         }
     }
     phase2_tokenize(node_ptrs, gbuf, all_tokens, token_counts, func_count, worker_count,
-                    token_pools);
+                    token_pools, ctx->project_name);
     CBM_PROF_END_N("semantic_edges", "2_tokenize_deterministic", t_phase2, func_count);
     free(node_ptrs);
 
