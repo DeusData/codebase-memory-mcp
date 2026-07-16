@@ -584,8 +584,9 @@ static const tool_def_t TOOLS[] = {
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"update replaces "
-     "the entire ADR document; sections only lists existing headings\"},\"content\":{\"type\":\"string\","
-     "\"description\":\"Complete replacement document required by update\"}},\"additionalProperties\":false,"
+     "the entire ADR document; sections only lists existing "
+     "headings\"},\"content\":{\"type\":\"string\",\"description\":\"Complete replacement document "
+     "required by update\"}},\"additionalProperties\":false,"
      "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
@@ -7698,8 +7699,8 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
     if (args_doc) {
         yyjson_val *args_root = yyjson_doc_get_root(args_doc);
-        has_sections_arg = args_root && yyjson_is_obj(args_root) &&
-                           yyjson_obj_get(args_root, "sections") != NULL;
+        has_sections_arg =
+            args_root && yyjson_is_obj(args_root) && yyjson_obj_get(args_root, "sections") != NULL;
         yyjson_doc_free(args_doc);
     }
     if (has_sections_arg) {
