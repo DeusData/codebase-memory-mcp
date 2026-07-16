@@ -8,6 +8,7 @@
  * until the corresponding feature is implemented (GREEN).
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/constants.h"
 #include "test_framework.h"
 #include <cli/cli.h>
@@ -710,6 +711,54 @@ TEST(test_resolve_npm_node_modules) {
     PASS();
 }
 
+TEST(test_auto_index_npm_reads_actual_package_json_shape) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_npm_auto_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char dep_dir[CBM_SZ_1K];
+    snprintf(dep_dir, sizeof(dep_dir), "%s/node_modules/cbmbenchdep", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(dep_dir, 0700));
+
+    char path[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/package.json", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fprintf(fp, "{\"name\":\"fixture\",\"dependencies\":{\"cbmbenchdep\":"
+                          "\"1.0.0\"}}\n"),
+              0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    snprintf(path, sizeof(path), "%s/index.js", dep_dir);
+    fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fprintf(fp, "export function canonicalDependencyAPI(value) { return value; }\n"), 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "npm-auto-fixture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    /* This is the qualified-name shape emitted by the JSON extractor: the
+     * package name is not nested below a `.dependencies.` QN segment. */
+    cbm_node_t package_node = {0};
+    package_node.project = project;
+    package_node.label = "Variable";
+    package_node.name = "cbmbenchdep";
+    package_node.qualified_name = "npm-auto-fixture.package.cbmbenchdep";
+    package_node.file_path = "package.json";
+    package_node.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(store, &package_node), 0);
+
+    ASSERT_EQ(cbm_dep_auto_index(project, tmp, store, 1, NULL), 1);
+    ASSERT_GT(cbm_store_count_nodes(store, "npm-auto-fixture.dep.cbmbenchdep"), 0);
+
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
 TEST(test_pipeline_set_project_name) {
     cbm_pipeline_t *p = cbm_pipeline_new("/tmp", NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -1087,6 +1136,7 @@ SUITE(depindex) {
     RUN_TEST(test_detect_ecosystem_none);
     RUN_TEST(test_is_manifest_path);
     RUN_TEST(test_resolve_npm_node_modules);
+    RUN_TEST(test_auto_index_npm_reads_actual_package_json_shape);
     RUN_TEST(test_pipeline_set_project_name);
     RUN_TEST(test_dep_reindex_replaces);
     RUN_TEST(test_auto_index_deps_refreshes_nodes_fts);

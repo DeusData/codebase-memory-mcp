@@ -552,6 +552,7 @@ static int run_cli(int argc, char **argv) {
     if (result) {
         /* Supervised worker: hand the full result string to the parent via the
          * response file before printing (parent reads it back on a clean exit). */
+        CBM_PROF_START(prof_cli_response_file);
         const char *ro = cbm_index_worker_response_out();
         if (ro) {
             FILE *rf = cbm_fopen(ro, "wb");
@@ -560,11 +561,14 @@ static int run_cli(int argc, char **argv) {
                 (void)fclose(rf);
             }
         }
+        CBM_PROF_END("cli_worker", "response_file", prof_cli_response_file);
+        CBM_PROF_START(prof_cli_response_print);
         if (raw_json) {
             printf("%s\n", result);
         } else {
             exit_code = cli_print_mcp_result(result);
         }
+        CBM_PROF_END("cli_worker", "response_print", prof_cli_response_print);
         if (cbm_index_worker_active()) {
             /* Supervised worker: the response is delivered (file + stdout).
              * Skip the multi-GB teardown (server/store frees) — the process
@@ -572,21 +576,34 @@ static int run_cli(int argc, char **argv) {
              * free() of a kernel-scale graph costs minutes. _Exit skips
              * atexit/LSan by design for this prod worker path. */
             cbm_log_info("index.worker.fast_exit", "action", "_Exit");
+            if (cbm_profile_active) {
+                CBM_PROF_START(prof_cli_flush);
+                fflush(NULL);
+                CBM_PROF_END("cli_worker", "flush", prof_cli_flush);
+            }
             fflush(NULL);
             _Exit(exit_code);
         }
+        CBM_PROF_START(prof_cli_result_free);
         free(result);
+        CBM_PROF_END("cli_cleanup", "result_free", prof_cli_result_free);
     }
 
+    CBM_PROF_START(prof_cli_server_free);
     cbm_mcp_server_free(srv);
+    CBM_PROF_END("cli_cleanup", "server_free", prof_cli_server_free);
+    CBM_PROF_START(prof_cli_config_close);
     cbm_config_close(runtime_config);
+    CBM_PROF_END("cli_cleanup", "config_close", prof_cli_config_close);
     /* Union: fork's global pipeline cleanup (CLI mode: no background threads, safe
      * to release process-lifetime state now) + upstream's progress-sink teardown and
      * correct exit_code propagation. */
     if (progress) {
         cbm_progress_sink_fini();
     }
+    CBM_PROF_START(prof_cli_pipeline_cleanup);
     cbm_pipeline_global_cleanup();
+    CBM_PROF_END("cli_cleanup", "pipeline_global", prof_cli_pipeline_cleanup);
     free(heap_args);
     return exit_code;
 }

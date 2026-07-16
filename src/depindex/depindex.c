@@ -14,10 +14,17 @@
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
 
+#include <yyjson/yyjson.h>
+
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+enum {
+    CBM_DEP_MANIFEST_MAX_BYTES = 1024 * 1024,
+    CBM_DEP_DISCOVERY_INITIAL_CAPACITY = 16,
+};
 
 /* ── Package Manager Parse/String ──────────────────────────────── */
 
@@ -354,6 +361,134 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count) {
     free(deps);
 }
 
+static char *read_dependency_manifest(const char *path, size_t *out_len) {
+    if (out_len)
+        *out_len = 0;
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp)
+        return NULL;
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long size = ftell(fp);
+    if (size <= 0 || size > CBM_DEP_MANIFEST_MAX_BYTES || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    char *contents = malloc((size_t)size + 1);
+    if (!contents) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t read_len = fread(contents, 1, (size_t)size, fp);
+    fclose(fp);
+    if (read_len != (size_t)size) {
+        free(contents);
+        return NULL;
+    }
+    contents[read_len] = '\0';
+    if (out_len)
+        *out_len = read_len;
+    return contents;
+}
+
+/* package.json extraction does not preserve the `dependencies` object in each
+ * child's qualified name, so querying graph QNs for "dependencies" misses real
+ * package names. Parse the bounded manifest directly and resolve only packages
+ * that actually exist under node_modules. Runtime is O(manifest bytes + declared
+ * packages); retained memory is O(min(installed packages, max_results)). */
+static int discover_npm_deps(cbm_pkg_manager_t mgr, const char *project_root,
+                             cbm_dep_discovered_t **out, int *count, int max_results) {
+    *out = NULL;
+    *count = 0;
+    char manifest_path[CBM_DEP_PATH_MAX];
+    int path_len = snprintf(manifest_path, sizeof(manifest_path), "%s/package.json", project_root);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(manifest_path))
+        return 0;
+
+    size_t source_len = 0;
+    char *source = read_dependency_manifest(manifest_path, &source_len);
+    if (!source)
+        return 0;
+    yyjson_doc *doc = yyjson_read(source, source_len, 0);
+    free(source);
+    if (!doc)
+        return 0;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    if (!yyjson_is_obj(root)) {
+        yyjson_doc_free(doc);
+        return 0;
+    }
+
+    int capacity = max_results < CBM_DEP_DISCOVERY_INITIAL_CAPACITY
+                       ? max_results
+                       : CBM_DEP_DISCOVERY_INITIAL_CAPACITY;
+    cbm_dep_discovered_t *results = calloc((size_t)capacity, sizeof(*results));
+    CBMHashTable *seen = cbm_ht_create((uint32_t)capacity);
+    if (!results || !seen) {
+        free(results);
+        cbm_ht_free(seen);
+        yyjson_doc_free(doc);
+        return -1;
+    }
+
+    static const char *const sections[] = {
+        "dependencies", "devDependencies", "optionalDependencies", "peerDependencies", NULL,
+    };
+    int result_count = 0;
+    for (int section_index = 0; sections[section_index] && result_count < max_results;
+         section_index++) {
+        yyjson_val *section = yyjson_obj_get(root, sections[section_index]);
+        if (!yyjson_is_obj(section))
+            continue;
+        yyjson_obj_iter iter = yyjson_obj_iter_with(section);
+        yyjson_val *key = NULL;
+        while ((key = yyjson_obj_iter_next(&iter)) != NULL && result_count < max_results) {
+            const char *package = yyjson_get_str(key);
+            if (!package || !package[0] || cbm_ht_has(seen, package))
+                continue;
+            cbm_ht_set(seen, package, (void *)(uintptr_t)1);
+
+            cbm_dep_resolved_t resolved = {0};
+            if (cbm_resolve_pkg_source(mgr, package, project_root, &resolved) != 0)
+                continue;
+            if (result_count == capacity) {
+                int next_capacity = capacity > max_results / 2 ? max_results : capacity * 2;
+                cbm_dep_discovered_t *grown =
+                    realloc(results, (size_t)next_capacity * sizeof(*results));
+                if (!grown) {
+                    cbm_dep_resolved_free(&resolved);
+                    cbm_dep_discovered_free(results, result_count);
+                    cbm_ht_free(seen);
+                    yyjson_doc_free(doc);
+                    return -1;
+                }
+                memset(grown + capacity, 0, (size_t)(next_capacity - capacity) * sizeof(*results));
+                results = grown;
+                capacity = next_capacity;
+            }
+            results[result_count].package = cbm_strdup(package);
+            if (!results[result_count].package) {
+                cbm_dep_resolved_free(&resolved);
+                cbm_dep_discovered_free(results, result_count);
+                cbm_ht_free(seen);
+                yyjson_doc_free(doc);
+                return -1;
+            }
+            results[result_count].path = resolved.path;
+            results[result_count].version = resolved.version;
+            result_count++;
+        }
+    }
+
+    cbm_ht_free(seen);
+    yyjson_doc_free(doc);
+    *out = results;
+    *count = result_count;
+    return 0;
+}
+
 /* Discover vendored dependencies by scanning conventional vendor directories.
  * Used for C/C++ build systems (Make, CMake, Meson, Conan) and generic CBM_PKG_CUSTOM.
  * Each named subdirectory in vendor/ vendored/ third_party/ etc. becomes a dep entry. */
@@ -401,6 +536,10 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
     *out = NULL;
     *count = 0;
     if (max_results <= 0) max_results = CBM_DEFAULT_AUTO_DEP_LIMIT;
+
+    if (mgr == CBM_PKG_NPM || mgr == CBM_PKG_BUN) {
+        return discover_npm_deps(mgr, project_root, out, count, max_results);
+    }
 
     /* C/C++ build systems and generic vendored deps: scan vendor directories directly.
      * These don't have a registry/lockfile to parse; deps live in the source tree. */
