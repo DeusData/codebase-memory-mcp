@@ -211,6 +211,58 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("did not conform", " ".join(row["findings"]))
         self.assertNotIn("All applicable", " ".join(row["findings"]))
 
+    def test_initial_semantic_pair_miss_names_stage_and_confusion_counts(self) -> None:
+        case = {
+            "scenario": "semantic_edges_quality",
+            "passed": True,
+            "quality_target_met": False,
+            "fixture": {"capability": "semantic_edges"},
+            "pair_lifecycle": {
+                "initial_oracles": {
+                    "passed": False,
+                    "pair_classification": {
+                        "confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1},
+                        "f1": None,
+                    },
+                },
+                "incremental_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                },
+                "fresh_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                },
+                "incremental_policy": {
+                    "immediate_freshness_expected": True,
+                    "policy_conformance_met": True,
+                },
+            },
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+        item["parameters"] = {
+            "config_profile": "incremental_semantic_freshness_eager",
+            "config_overrides": {"incremental_derived_refresh": "eager"},
+            "index_mode": "moderate",
+        }
+
+        row = SUMMARY.summarize_group("latest-semantic-eager", [item])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
+        finding = " ".join(row["findings"])
+        self.assertIn("Initial semantic-pair quality missed", finding)
+        self.assertIn("TP=0, TN=2, FP=0, FN=1", finding)
+        self.assertIn("1 expected positive absent", finding)
+        self.assertNotIn("All applicable", markdown)
+
     def test_composition_spec_groups_validated_campaign_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
