@@ -197,6 +197,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     repetitions = spec.get("repetitions")
     benchmark_timeout = spec.get("timeout_seconds", 240)
     accepted_exit_codes = spec.get("accepted_exit_codes", [0])
+    capability_quality = spec.get("capability_quality")
     if not isinstance(harness_version, str) or not harness_version:
         raise ValueError("harness_version must be a non-empty string")
     if not isinstance(benchmark_script, str) or not benchmark_script:
@@ -207,6 +208,12 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("repetitions must be a positive integer")
     if not isinstance(benchmark_timeout, int) or benchmark_timeout <= 0:
         raise ValueError("timeout_seconds must be a positive integer")
+    if capability_quality is not None and (
+        not isinstance(capability_quality, str)
+        or not capability_quality
+        or "=" in capability_quality
+    ):
+        raise ValueError("capability_quality must be a non-empty argument value")
     if (
         not isinstance(accepted_exit_codes, list)
         or not accepted_exit_codes
@@ -226,7 +233,11 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
 
     candidates = _nonempty_list(spec.get("candidates"), "candidates")
     profiles = _nonempty_list(spec.get("profiles"), "profiles")
-    scenarios = _nonempty_list(spec.get("scenarios"), "scenarios")
+    scenarios = (
+        [{"name": f"{capability_quality}_quality"}]
+        if capability_quality is not None
+        else _nonempty_list(spec.get("scenarios"), "scenarios")
+    )
     transports = _nonempty_list(spec.get("transports"), "transports")
     if not all(isinstance(item, str) and item for item in transports):
         raise ValueError("transports must contain non-empty strings")
@@ -299,43 +310,61 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(scenario, dict):
                     raise ValueError(f"scenarios[{scenario_index}] must be an object")
                 scenario_name = scenario.get("name")
-                frontier_values = _nonempty_list(
-                    scenario.get("frontier_files"),
-                    f"scenarios[{scenario_index}].frontier_files",
-                )
-                cap_values = _nonempty_list(
-                    scenario.get("exact_caps"), f"scenarios[{scenario_index}].exact_caps"
-                )
                 if not isinstance(scenario_name, str) or not scenario_name:
                     raise ValueError(f"scenarios[{scenario_index}].name is invalid")
-                if not all(isinstance(item, int) and item > 0 for item in frontier_values):
-                    raise ValueError("frontier_files must contain positive integers")
-                if not all(
-                    item is None
-                    or (isinstance(item, int) and not isinstance(item, bool) and item > 0)
-                    for item in cap_values
-                ):
-                    raise ValueError("exact_caps must contain positive integers or null")
+                if capability_quality is not None:
+                    frontier_values: list[int | None] = [None]
+                    cap_values: list[int | None] = [None]
+                else:
+                    frontier_values = _nonempty_list(
+                        scenario.get("frontier_files"),
+                        f"scenarios[{scenario_index}].frontier_files",
+                    )
+                    cap_values = _nonempty_list(
+                        scenario.get("exact_caps"),
+                        f"scenarios[{scenario_index}].exact_caps",
+                    )
+                    if not all(isinstance(item, int) and item > 0 for item in frontier_values):
+                        raise ValueError("frontier_files must contain positive integers")
+                    if not all(
+                        item is None
+                        or (isinstance(item, int) and not isinstance(item, bool) and item > 0)
+                        for item in cap_values
+                    ):
+                        raise ValueError("exact_caps must contain positive integers or null")
 
                 for transport in transports:
                     for frontier_files in frontier_values:
                         for exact_cap in cap_values:
                             effective_capabilities = dict(capabilities)
                             effective_capabilities.update(overrides)
-                            command = [
-                                str(benchmark_path),
-                                "--binary",
-                                str(binary),
-                                "--matrix",
-                                "--matrix-scenarios",
-                                scenario_name,
-                                "--frontier-files",
-                                str(frontier_files),
-                                "--transport",
-                                transport,
-                                "--config-profile",
-                                config_profile,
-                            ]
+                            if capability_quality is not None:
+                                command = [
+                                    str(benchmark_path),
+                                    "--binary",
+                                    str(binary),
+                                    "--capability-quality",
+                                    capability_quality,
+                                    "--transport",
+                                    transport,
+                                    "--config-profile",
+                                    config_profile,
+                                ]
+                            else:
+                                command = [
+                                    str(benchmark_path),
+                                    "--binary",
+                                    str(binary),
+                                    "--matrix",
+                                    "--matrix-scenarios",
+                                    scenario_name,
+                                    "--frontier-files",
+                                    str(frontier_files),
+                                    "--transport",
+                                    transport,
+                                    "--config-profile",
+                                    config_profile,
+                                ]
                             cap_label = "default"
                             if isinstance(exact_cap, int):
                                 effective_capabilities[
@@ -350,18 +379,27 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 cap_label = str(exact_cap)
                             for key, value in sorted(overrides.items()):
                                 command.extend(("--config", f"{key}={value}"))
+                            if capability_quality is not None:
+                                command.append("--include-logs")
                             command.extend(("--timeout", str(benchmark_timeout), "--out", "{result_path}"))
                             parameters = {
-                                "frontier_files": frontier_files,
-                                "exact_cap": exact_cap,
                                 "config_profile": config_profile,
                                 "config_overrides": dict(sorted(overrides.items())),
                                 "benchmark_script_sha256": benchmark_sha256,
                             }
-                            label = (
-                                f"{candidate_label}.{profile_label}.{transport}.{scenario_name}."
-                                f"f{frontier_files}.cap{cap_label}"
-                            )
+                            if capability_quality is not None:
+                                parameters["capability_quality"] = capability_quality
+                                label = (
+                                    f"{candidate_label}.{profile_label}.{transport}."
+                                    f"{scenario_name}"
+                                )
+                            else:
+                                parameters["frontier_files"] = frontier_files
+                                parameters["exact_cap"] = exact_cap
+                                label = (
+                                    f"{candidate_label}.{profile_label}.{transport}."
+                                    f"{scenario_name}.f{frontier_files}.cap{cap_label}"
+                                )
                             environment = {
                                 **common_environment,
                                 **candidate_environment,

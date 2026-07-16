@@ -77,6 +77,13 @@ expanded cells retain that policy in their identities. Result parsing, binary-ha
 validation, and the structured `error` check still prevent crashes or harness
 errors from becoming completed evidence.
 
+For isolated ranking or dependency retrieval fixtures, set top-level
+`"capability_quality": "rank"` or `"dependencies"` and omit `scenarios`. The
+runner expands candidate, profile, transport, and repetition axes without adding
+incremental frontier arguments. Each command records the capability fixture and
+uses `--include-logs`, while named config profiles provide matched enabled/disabled
+ablations.
+
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
 remain available and take priority over the selected profile. The default profile

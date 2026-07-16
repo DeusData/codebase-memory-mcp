@@ -177,6 +177,53 @@ class BenchmarkCampaignTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "binary_sha256 does not match"):
                 CAMPAIGN.expand_matrix_spec(spec)
 
+    def test_matrix_spec_expands_capability_quality_without_frontier_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            binary = root / "cbm"
+            binary.write_bytes(b"optimized-binary")
+            benchmark = root / "benchmark-incremental-speed.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "quality-v2",
+                "benchmark_script": str(benchmark),
+                "capability_quality": "rank",
+                "cwd": str(root),
+                "timeout_seconds": 300,
+                "accepted_exit_codes": [0, 1],
+                "repetitions": 2,
+                "transports": ["cli", "mcp"],
+                "candidates": [
+                    {
+                        "label": "latest",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "build": {"target": "cbm", "cflags": "-O2"},
+                        "capability_support": {"rank": True},
+                    }
+                ],
+                "profiles": [
+                    {
+                        "label": "rank-disabled",
+                        "config_profile": "rank_disabled",
+                        "capabilities": {"rank_enabled": "false"},
+                    }
+                ],
+            }
+
+            plan = CAMPAIGN.expand_matrix_spec(spec)
+
+            self.assertEqual(len(plan["cells"]), 4)
+            first = plan["cells"][0]
+            self.assertEqual(first["scenario"], "rank_quality")
+            self.assertEqual(first["label"], "latest.rank-disabled.cli.rank_quality")
+            self.assertEqual(first["parameters"]["capability_quality"], "rank")
+            self.assertNotIn("frontier_files", first["parameters"])
+            self.assertIn("--capability-quality", first["command"])
+            self.assertNotIn("--matrix", first["command"])
+            self.assertEqual(first["accepted_exit_codes"], [0, 1])
+
     def test_matrix_spec_null_cap_preserves_candidate_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
