@@ -5,6 +5,8 @@
 #include "../src/watcher/svn_state.h"
 #include "test_helpers.h"
 
+#include <ctype.h>
+
 typedef struct {
     char root[CBM_SZ_4K];
     char repository[CBM_SZ_4K];
@@ -61,11 +63,29 @@ static inline int th_svn_fixture_init(th_svn_fixture_t *fixture, const char *pre
     snprintf(normalized_repository, sizeof(normalized_repository), "%s", fixture->repository);
     cbm_normalize_path_sep(normalized_repository);
     char repository_url[CBM_SZ_8K];
+    int url_length;
 #ifdef _WIN32
-    snprintf(repository_url, sizeof(repository_url), "file:///%s", normalized_repository);
+    /* The Windows CI installs MSYS2's POSIX Subversion build. It deliberately
+     * treats file:///D:/... as the literal POSIX path /D:/..., so translate a
+     * drive path to its MSYS mount. Native Windows Subversion keeps DOS URIs. */
+    bool msys_client = strstr(fixture->client.executable, "/usr/bin/svn.exe") != NULL;
+    if (msys_client && isalpha((unsigned char)normalized_repository[0]) &&
+        normalized_repository[1] == ':' && normalized_repository[2] == '/') {
+        url_length =
+            snprintf(repository_url, sizeof(repository_url), "file:///%c%s",
+                     tolower((unsigned char)normalized_repository[0]), normalized_repository + 2);
+    } else {
+        url_length =
+            snprintf(repository_url, sizeof(repository_url), "file:///%s", normalized_repository);
+    }
 #else
-    snprintf(repository_url, sizeof(repository_url), "file://%s", normalized_repository);
+    url_length =
+        snprintf(repository_url, sizeof(repository_url), "file://%s", normalized_repository);
 #endif
+    if (url_length < 0 || (size_t)url_length >= sizeof(repository_url)) {
+        th_svn_fixture_cleanup(fixture);
+        return -1;
+    }
     const char *checkout_args[] = {fixture->client.executable, "checkout", "--non-interactive",
                                    repository_url, fixture->working_copy, NULL};
     if (cbm_exec_no_shell(checkout_args) != 0) {

@@ -375,6 +375,9 @@ TEST(integ_mcp_query_graph_calls) {
 }
 
 TEST(integ_mcp_reopens_cached_store_after_full_route) {
+#ifdef _WIN32
+    SKIP_PLATFORM("Windows cached SQLite readers block atomic replacement (#1117)");
+#endif
     char args[256];
     snprintf(args, sizeof(args),
              "{\"name_pattern\":\"greet\",\"project\":\"%s\"}", g_project);
