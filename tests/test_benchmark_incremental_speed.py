@@ -123,6 +123,33 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIn("cbmq_normalize_account_record", source)
         self.assertIn("cbmq_archive_record_decoy", source)
 
+    def test_pair_quality_mutation_replaces_exact_source_and_changes_judgments(self) -> None:
+        for factory, expected_added, expected_removed in (
+            (
+                BENCHMARK.create_similarity_quality_repo,
+                ("cbmqValidateProfileDecoy", "cbmqValidateUser"),
+                ("cbmqValidateOrder", "cbmqValidateUser"),
+            ),
+            (
+                BENCHMARK.create_semantic_edges_quality_repo,
+                ("cbmq_archive_record_decoy", "cbmq_normalize_user_record"),
+                ("cbmq_normalize_account_record", "cbmq_normalize_user_record"),
+            ),
+        ):
+            with self.subTest(factory=factory.__name__), tempfile.TemporaryDirectory() as tmpdir:
+                repo = Path(tmpdir)
+                fixture = factory(repo)
+                mutation = BENCHMARK.apply_pair_quality_mutation(repo, fixture)
+
+                self.assertEqual(mutation["changed_paths"], [fixture["source_paths"][0]])
+                self.assertNotEqual(mutation["before_sha256"], mutation["after_sha256"])
+                post_expected = {
+                    BENCHMARK.canonical_pair(item["source"], item["target"]): item["expected"]
+                    for item in mutation["post_judgments"]
+                }
+                self.assertTrue(post_expected[BENCHMARK.canonical_pair(*expected_added)])
+                self.assertFalse(post_expected[BENCHMARK.canonical_pair(*expected_removed)])
+
     def test_relation_quality_oracle_scores_raw_query_rows_and_response_cost(self) -> None:
         calls = []
         original = BENCHMARK.run_tool_call_for_transport
@@ -190,6 +217,59 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["response_quality"]["response_bytes"], 211)
         self.assertEqual(result["observed_pairs"][0]["score"], 0.984)
+
+    def test_pair_oracle_equality_is_order_independent_but_score_sensitive(self) -> None:
+        incremental = {
+            "observed_pairs": [
+                {"source": "b", "target": "a", "score": 0.87},
+                {"source": "c", "target": "a", "score": 0.91},
+            ]
+        }
+        fresh = {
+            "observed_pairs": [
+                {"source": "a", "target": "c", "score": 0.91},
+                {"source": "a", "target": "b", "score": 0.87},
+            ]
+        }
+
+        equal = BENCHMARK.compare_pair_oracle_outputs(incremental, fresh)
+        self.assertTrue(equal["passed"])
+
+        fresh["observed_pairs"][0]["score"] = 0.90
+        unequal = BENCHMARK.compare_pair_oracle_outputs(incremental, fresh)
+        self.assertFalse(unequal["passed"])
+        self.assertEqual(len(unequal["incremental_only"]), 1)
+        self.assertEqual(len(unequal["fresh_only"]), 1)
+
+    def test_pair_incremental_policy_distinguishes_default_stale_from_eager_freshness(self) -> None:
+        stale_index = {"publish_kind": "incremental_exact"}
+        stale_oracles = {
+            "passed": False,
+            "edge_query": {
+                "response": {
+                    "warnings": [
+                        "semantic_edges derived view is stale; query_graph semantic edges may be stale."
+                    ]
+                }
+            },
+        }
+        stale = BENCHMARK.evaluate_pair_incremental_policy(
+            {}, stale_index, stale_oracles, {"equal": False}, {"passed": False}
+        )
+        self.assertEqual(stale["policy"], "stale_on_incremental")
+        self.assertFalse(stale["immediate_freshness_expected"])
+        self.assertTrue(stale["policy_conformance_met"])
+
+        eager = BENCHMARK.evaluate_pair_incremental_policy(
+            {"incremental_derived_refresh": "eager"},
+            stale_index,
+            {"passed": True, "edge_query": {"response": {}}},
+            {"equal": True},
+            {"passed": True},
+        )
+        self.assertTrue(eager["immediate_freshness_expected"])
+        self.assertTrue(eager["immediate_freshness_met"])
+        self.assertTrue(eager["policy_conformance_met"])
 
     def test_search_projection_observation_separates_identity_and_property_fields(self) -> None:
         data = {
@@ -581,6 +661,12 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(
             BENCHMARK.resolve_config_overrides("dependency_disabled", []),
             {"auto_index_deps": "false"},
+        )
+
+    def test_incremental_semantic_freshness_eager_profile_changes_only_refresh_policy(self) -> None:
+        self.assertEqual(
+            BENCHMARK.resolve_config_overrides("incremental_semantic_freshness_eager", []),
+            {"incremental_derived_refresh": "eager"},
         )
 
     def test_single_capability_ablation_profiles_change_exactly_one_group(self) -> None:

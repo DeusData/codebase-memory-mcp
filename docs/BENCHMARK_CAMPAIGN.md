@@ -95,6 +95,14 @@ latency, bytes, and estimated tokens. Natural-repository pairs outside the expli
 judgment set are retained as `unjudged`; incomplete natural ground truth never turns
 an unknown result into a false positive.
 
+Each semantic pair case also supplies a content-addressed replacement source. A real
+one-file mutation removes one judged positive and adds another, retaining pre/post
+source hashes and changed paths. The harness records initial, incremental, and fresh
+index measurements; pre/post confusion witnesses; freshness warnings; exact publish
+kind; bounded pair equality; and whole canonical-graph equality. This prevents a
+no-op reindex or a stale expected edge from being reported as successful changed-file
+quality.
+
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
 remain available and take priority over the selected profile. The default profile
@@ -109,6 +117,22 @@ The optional graph-pass ablation keeps dependency indexing enabled and is:
 ```text
 --config-profile optional_graph_disabled
 ```
+
+The immediate semantic/similarity freshness profile is:
+
+```text
+--config-profile incremental_semantic_freshness_eager
+```
+
+It changes only `incremental_derived_refresh=eager`. The default
+`stale_on_incremental` policy may publish an exact or containment delta after
+marking global `SIMILAR_TO`/`SEMANTICALLY_RELATED` views stale; graph queries must
+then retain an explicit freshness warning until an eager or full rebuild. Reports
+score this warning as policy conformance, not an unexplained execution failure, but
+they keep immediate semantic task quality false. The eager profile must produce the
+post-mutation judged pair set and edge scores identically to a fresh rebuild without
+a stale warning. Compare both profiles when selecting a latency/freshness Pareto
+point.
 
 The lowest-cost indexing baseline also disables installed-package indexing and is:
 
