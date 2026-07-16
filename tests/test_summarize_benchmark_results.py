@@ -25,6 +25,136 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_semantic_pair_lifecycle_reports_expected_deferred_freshness_without_failure(self) -> None:
+        case = {
+            "scenario": "similarity_quality",
+            "passed": True,
+            "quality_target_met": False,
+            "fixture": {
+                "capability": "similarity",
+                "relationship": "SIMILAR_TO",
+                "task_set_sha256": "c" * 64,
+            },
+            "background_repository": {"revision": "d" * 40, "tree": "e" * 40},
+            "pair_lifecycle": {
+                "initial_index": {"elapsed_ms": 31000, "peak_rss_mb": 1400},
+                "initial_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                    "response_quality": {"elapsed_ms": 600, "response_bytes": 181},
+                },
+                "mutation": {"description": "swap clone", "changed_paths": ["fixture.go"]},
+                "incremental_index": {
+                    "elapsed_ms": 588,
+                    "indexed_work_elapsed_ms": 382,
+                    "peak_rss_mb": 75,
+                    "publish_kind": "incremental_exact",
+                },
+                "incremental_oracles": {
+                    "passed": False,
+                    "pair_classification": {
+                        "confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1},
+                        "f1": None,
+                    },
+                    "response_quality": {"elapsed_ms": 540, "response_bytes": 190},
+                },
+                "fresh_index": {"elapsed_ms": 29600, "peak_rss_mb": 1584},
+                "fresh_oracles": {
+                    "passed": True,
+                    "pair_classification": {
+                        "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                        "f1": 1.0,
+                    },
+                    "response_quality": {"elapsed_ms": 580, "response_bytes": 181},
+                },
+                "canonical_graph": {"equal": False},
+                "pair_equality": {"passed": False},
+                "incremental_policy": {
+                    "policy": "stale_on_incremental",
+                    "immediate_freshness_expected": False,
+                    "immediate_freshness_met": False,
+                    "stale_warning_present": True,
+                    "policy_conformance_met": True,
+                },
+                "policy_conformance_met": True,
+            },
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+        item["parameters"] = {
+            "config_profile": "default",
+            "config_overrides": {},
+            "index_mode": "moderate",
+        }
+
+        row = SUMMARY.summarize_group("latest-default", [item])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["decision"], "PASS: DEFERRED FRESHNESS")
+        self.assertEqual(row["incremental_p50_ms"], 588.0)
+        self.assertEqual(row["full_p50_ms"], 29600.0)
+        self.assertEqual(row["pair_quality_details"][0]["initial_f1"], 1.0)
+        self.assertEqual(row["pair_quality_details"][0]["fresh_f1"], 1.0)
+        self.assertEqual(row["pair_quality_details"][0]["freshness"], "deferred with warning")
+        self.assertEqual(row["pair_f1_score"], 1.0)
+        self.assertIsNone(row["quality_score"])
+        self.assertEqual(row["query_observations"], 3)
+        self.assertIsNone(row["speedup_p50"])
+        self.assertIn("intentionally deferred", row["findings"][0])
+        self.assertIn("## Semantic pair quality and freshness", markdown)
+        self.assertIn("deferred with warning", markdown)
+
+    def test_disabled_semantic_pair_control_is_not_described_as_freshness_deferral(self) -> None:
+        case = {
+            "scenario": "similarity_quality",
+            "passed": True,
+            "quality_target_met": False,
+            "fixture": {
+                "capability": "similarity",
+                "relationship": "SIMILAR_TO",
+                "task_set_sha256": "c" * 64,
+            },
+            "oracles": {"passed": False},
+            "pair_lifecycle": {
+                "initial_oracles": {
+                    "passed": False,
+                    "pair_classification": {"confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1}, "f1": None},
+                },
+                "incremental_oracles": {
+                    "passed": False,
+                    "pair_classification": {"confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1}, "f1": None},
+                },
+                "fresh_oracles": {
+                    "passed": False,
+                    "pair_classification": {"confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1}, "f1": None},
+                },
+                "incremental_policy": {
+                    "policy": "stale_on_incremental",
+                    "immediate_freshness_expected": False,
+                    "immediate_freshness_met": False,
+                    "stale_warning_present": True,
+                    "policy_conformance_met": True,
+                },
+            },
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+        item["parameters"] = {
+            "config_profile": "similarity_disabled",
+            "config_overrides": {"similarity_enabled": "false"},
+            "index_mode": "moderate",
+        }
+
+        row = SUMMARY.summarize_group("similarity-disabled", [item])
+
+        self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
+        self.assertEqual(row["pair_quality_details"][0]["freshness"], "capability disabled")
+        self.assertIn("capability-off control", row["findings"][0])
+        self.assertNotIn("initial/fresh pair tasks passed", " ".join(row["findings"]))
+
     def test_composition_spec_groups_validated_campaign_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
