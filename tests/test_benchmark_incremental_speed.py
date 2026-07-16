@@ -1,9 +1,12 @@
 import importlib.util
+import gzip
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -15,6 +18,79 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_stream_query_fingerprint_is_ordered_bounded_and_change_sensitive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "graph.db"
+            with sqlite3.connect(database) as con:
+                con.execute("CREATE TABLE rows(value TEXT NOT NULL)")
+                con.executemany("INSERT INTO rows VALUES (?)", [("beta",), ("alpha",)])
+
+            first = BENCHMARK.stream_query_fingerprint(
+                database, "SELECT value FROM rows ORDER BY value", ()
+            )
+            second = BENCHMARK.stream_query_fingerprint(
+                database, "SELECT value FROM rows ORDER BY value", ()
+            )
+            with sqlite3.connect(database) as con:
+                con.execute("INSERT INTO rows VALUES ('gamma')")
+            changed = BENCHMARK.stream_query_fingerprint(
+                database, "SELECT value FROM rows ORDER BY value", ()
+            )
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["row_count"], 2)
+        self.assertEqual(len(first["sha256"]), 64)
+        self.assertEqual(changed["row_count"], 3)
+        self.assertNotEqual(changed["sha256"], first["sha256"])
+
+    def test_content_fingerprint_excludes_volatile_file_mtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fingerprints = []
+            canonical_hashes = []
+            for index, mtime_ns in enumerate((100, 900)):
+                database = Path(tmpdir) / f"graph-{index}.db"
+                with sqlite3.connect(database) as con:
+                    con.execute(
+                        "CREATE TABLE file_hashes("
+                        "project TEXT, rel_path TEXT, sha256 TEXT, mtime_ns INTEGER, size INTEGER)"
+                    )
+                    con.execute(
+                        "INSERT INTO file_hashes VALUES ('repo','src/a.c','abc',?,12)",
+                        (mtime_ns,),
+                    )
+                fingerprints.append(
+                    BENCHMARK.stream_query_fingerprint(
+                        database, BENCHMARK.CONTENT_HASHES_SQL, ("repo",)
+                    )
+                )
+                canonical_hashes.append(
+                    BENCHMARK.stream_query_fingerprint(
+                        database, BENCHMARK.CANONICAL_HASHES_SQL, ("repo",)
+                    )
+                )
+
+        self.assertEqual(fingerprints[0], fingerprints[1])
+        self.assertNotEqual(canonical_hashes[0], canonical_hashes[1])
+
+    def test_archive_measurement_log_streams_reproducible_gzip_with_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "worker.log"
+            artifacts = root / "artifacts"
+            payload = ("level=info msg=mem.phase peak_mb=64\n" * 100).encode()
+            source.write_bytes(payload)
+
+            first = BENCHMARK.archive_measurement_log(source, artifacts)
+            second = BENCHMARK.archive_measurement_log(source, artifacts)
+            archive = artifacts / first["artifact_name"]
+
+            self.assertEqual(first, second)
+            self.assertEqual(gzip.decompress(archive.read_bytes()), payload)
+            self.assertEqual(first["source_bytes"], len(payload))
+            self.assertEqual(len(first["source_sha256"]), 64)
+            self.assertEqual(len(first["artifact_sha256"]), 64)
+            self.assertEqual(len(list(artifacts.glob("*.log.gz"))), 1)
+
     def test_copy_git_revision_to_dir_excludes_dirty_and_untracked_source_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1112,6 +1188,34 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(result["logged_elapsed_ms"]["pipeline_done"], 81)
         self.assertEqual(len(result["measurement_log_markers"]), 2)
         self.assertNotIn("ignored detail", "\n".join(result["measurement_log_markers"]))
+
+    def test_build_index_result_archives_worker_log_before_worktree_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            logfile = root / "index.log"
+            artifact_dir = root / "durable-artifacts"
+            logfile.write_text(
+                "level=info msg=mem.phase phase=parallel_resolve rss_mb=192 peak_mb=320\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, {BENCHMARK.BENCHMARK_ARTIFACT_DIR_ENV: str(artifact_dir)}
+            ):
+                result = BENCHMARK.build_index_result(
+                    {"publish_kind": "full"},
+                    f"level=info msg=index.supervisor.profile_log log={logfile}",
+                    stdout_bytes=10,
+                    elapsed_ms=100.0,
+                    include_logs=False,
+                )
+
+            artifact = result["measurement_log_artifacts"][0]
+            archived_path = artifact_dir / artifact["artifact_name"]
+            logfile.unlink()
+
+            self.assertTrue(archived_path.is_file())
+            self.assertIn("msg=mem.phase", gzip.decompress(archived_path.read_bytes()).decode())
+            self.assertEqual(artifact["source_name"], "index.log")
 
     def test_build_index_result_records_dependency_phase_and_package_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

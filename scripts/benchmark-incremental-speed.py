@@ -8,6 +8,7 @@ indexing only for that cache, and removes only paths it created.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import math
@@ -25,6 +26,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+
+BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
 
 
 DEFAULT_FILE_COUNT = 240
@@ -202,6 +206,50 @@ def atomic_write_text(path: Path, text: str) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def archive_measurement_log(source: Path, artifact_dir: Path) -> dict[str, Any]:
+    """Stream one worker log into a content-addressed reproducible gzip artifact."""
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    temporary = artifact_dir / f".worker-log-{os.getpid()}-{time.time_ns()}.tmp"
+    source_digest = hashlib.sha256()
+    source_bytes = 0
+    try:
+        with source.open("rb") as input_stream, temporary.open("wb") as output_stream:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=output_stream, mtime=0) as compressed:
+                for chunk in iter(lambda: input_stream.read(1024 * 1024), b""):
+                    source_digest.update(chunk)
+                    source_bytes += len(chunk)
+                    compressed.write(chunk)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        source_sha256 = source_digest.hexdigest()
+        artifact_name = f"{source_sha256}.log.gz"
+        destination = artifact_dir / artifact_name
+        if destination.exists():
+            temporary.unlink()
+        else:
+            os.replace(temporary, destination)
+        return {
+            "artifact_name": artifact_name,
+            "source_name": source.name,
+            "source_bytes": source_bytes,
+            "source_sha256": source_sha256,
+            "artifact_bytes": destination.stat().st_size,
+            "artifact_sha256": file_sha256(destination),
+            "compression": "gzip-mtime-0",
+        }
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -1874,6 +1922,7 @@ def build_index_result(
     include_logs: bool,
 ) -> dict[str, Any]:
     measurement_log_markers: list[str] = []
+    measurement_log_artifacts: list[dict[str, Any]] = []
     logfiles: list[str] = []
     supervisor_log = parse_log_text_field(stderr, "index.supervisor.profile_log", "log")
     if supervisor_log:
@@ -1882,8 +1931,14 @@ def build_index_result(
     if isinstance(response_log, str) and response_log and response_log not in logfiles:
         logfiles.append(response_log)
     for logfile in logfiles:
+        log_path = Path(logfile)
+        artifact_dir_value = os.environ.get(BENCHMARK_ARTIFACT_DIR_ENV)
+        if artifact_dir_value and log_path.is_file():
+            measurement_log_artifacts.append(
+                archive_measurement_log(log_path, Path(artifact_dir_value))
+            )
         try:
-            with Path(logfile).open(encoding="utf-8", errors="replace") as stream:
+            with log_path.open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     if any(
                         marker in line
@@ -1952,6 +2007,7 @@ def build_index_result(
         "elapsed_ms": elapsed_ms_int,
         "peak_rss_mb": peak_rss_mb,
         "measurement_log_markers": measurement_log_markers,
+        "measurement_log_artifacts": measurement_log_artifacts,
         "indexed_work_elapsed_ms": indexed_ms,
         "worker_elapsed_ms": worker_elapsed_ms,
         "process_overhead_ms": process_overhead_ms,
@@ -2307,6 +2363,69 @@ def canonical_query_rows(db_path: Path, project: str, sql: str) -> list[str]:
     return query_rows(db_path, sql, (project,))
 
 
+def stream_query_fingerprint(
+    db_path: Path, sql: str, params: tuple[Any, ...]
+) -> dict[str, Any]:
+    """Hash an ordered single-column query with O(1) Python memory."""
+    digest = hashlib.sha256()
+    row_count = 0
+    con = sqlite3.connect(str(db_path))
+    con.text_factory = decode_sqlite_text
+    con.create_function("cbm_source_span_label", 1, sqlite_cbm_source_span_label)
+    try:
+        for row in con.execute(sql, params):
+            value = row[0]
+            payload = (
+                value
+                if isinstance(value, bytes)
+                else str(value).encode("utf-8", "surrogateescape")
+            )
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+            row_count += 1
+    finally:
+        con.close()
+    return {"row_count": row_count, "sha256": digest.hexdigest()}
+
+
+def first_sorted_query_difference(
+    left_db: Path,
+    right_db: Path,
+    left_sql: str,
+    left_params: tuple[Any, ...],
+    right_sql: str,
+    right_params: tuple[Any, ...],
+) -> tuple[str | None, str | None]:
+    """Return the first merge difference from two ordered queries in O(1) memory."""
+    left_con = sqlite3.connect(str(left_db))
+    right_con = sqlite3.connect(str(right_db))
+    for con in (left_con, right_con):
+        con.text_factory = decode_sqlite_text
+        con.create_function("cbm_source_span_label", 1, sqlite_cbm_source_span_label)
+    try:
+        left_rows = iter(left_con.execute(left_sql, left_params))
+        right_rows = iter(right_con.execute(right_sql, right_params))
+        left = next(left_rows, None)
+        right = next(right_rows, None)
+        while left is not None and right is not None:
+            left_value = str(left[0])
+            right_value = str(right[0])
+            if left_value == right_value:
+                left = next(left_rows, None)
+                right = next(right_rows, None)
+            elif left_value < right_value:
+                return left_value, None
+            else:
+                return None, right_value
+        return (
+            str(left[0]) if left is not None else None,
+            str(right[0]) if right is not None else None,
+        )
+    finally:
+        left_con.close()
+        right_con.close()
+
+
 def compare_query_rows(
     left_db: Path,
     right_db: Path,
@@ -2316,22 +2435,23 @@ def compare_query_rows(
     right_sql: str,
     right_params: tuple[Any, ...],
 ) -> dict[str, Any]:
-    left = query_rows(left_db, left_sql, left_params)
-    right = query_rows(right_db, right_sql, right_params)
+    left = stream_query_fingerprint(left_db, left_sql, left_params)
+    right = stream_query_fingerprint(right_db, right_sql, right_params)
     if left != right:
-        left_set = set(left)
-        right_set = set(right)
-        left_only = next((row for row in left if row not in right_set), None)
-        right_only = next((row for row in right if row not in left_set), None)
+        left_only, right_only = first_sorted_query_difference(
+            left_db, right_db, left_sql, left_params, right_sql, right_params
+        )
         return {
             "equal": False,
             "kind": kind,
-            "left_count": len(left),
-            "right_count": len(right),
+            "left_count": left["row_count"],
+            "right_count": right["row_count"],
+            "left_sha256": left["sha256"],
+            "right_sha256": right["sha256"],
             "left_only": left_only,
             "right_only": right_only,
         }
-    return {"equal": True}
+    return {"equal": True, "row_count": left["row_count"], "sha256": left["sha256"]}
 
 
 CANONICAL_NODES_SQL = (
@@ -2383,6 +2503,11 @@ CANONICAL_EDGES_SQL = (
 CANONICAL_HASHES_SQL = (
     "SELECT quote(rel_path) || char(9) || quote(sha256) || char(9) || mtime_ns || char(9) || "
     "size FROM file_hashes WHERE project = ?1 ORDER BY rel_path"
+)
+
+CONTENT_HASHES_SQL = (
+    "SELECT quote(rel_path) || char(9) || quote(sha256) || char(9) || size "
+    "FROM file_hashes WHERE project = ?1 ORDER BY rel_path"
 )
 
 ACTIVE_OVERLAY_CTE_SQL = (
@@ -2520,12 +2645,57 @@ ACTIVE_OVERLAY_EDGES_SQL = (
 )
 
 
-def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
-    for kind, sql in (
-        ("canonical nodes", CANONICAL_NODES_SQL),
-        ("canonical edges", CANONICAL_EDGES_SQL),
-        ("file hashes", CANONICAL_HASHES_SQL),
+def canonical_graph_fingerprint(db_path: Path, project: str) -> dict[str, Any]:
+    """Return content identity for all canonical graph tables with O(1) Python memory."""
+    components: dict[str, dict[str, Any]] = {}
+    aggregate = hashlib.sha256()
+    for name, sql in (
+        ("nodes", CANONICAL_NODES_SQL),
+        ("edges", CANONICAL_EDGES_SQL),
+        ("source_files", CONTENT_HASHES_SQL),
     ):
+        fingerprint = stream_query_fingerprint(db_path, sql, (project,))
+        components[name] = fingerprint
+        name_payload = name.encode("ascii")
+        aggregate.update(len(name_payload).to_bytes(8, "big"))
+        aggregate.update(name_payload)
+        aggregate.update(fingerprint["row_count"].to_bytes(8, "big"))
+        aggregate.update(bytes.fromhex(fingerprint["sha256"]))
+    return {"sha256": aggregate.hexdigest(), "components": components}
+
+
+def compare_canonical_graph(
+    left_db: Path,
+    right_db: Path,
+    project: str,
+    left_fingerprint: dict[str, Any] | None = None,
+    right_fingerprint: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    left_components = (left_fingerprint or {}).get("components", {})
+    right_components = (right_fingerprint or {}).get("components", {})
+    for component, kind, sql in (
+        ("nodes", "canonical nodes", CANONICAL_NODES_SQL),
+        ("edges", "canonical edges", CANONICAL_EDGES_SQL),
+        (None, "file hashes", CANONICAL_HASHES_SQL),
+    ):
+        if component and component in left_components and component in right_components:
+            left = left_components[component]
+            right = right_components[component]
+            if left == right:
+                continue
+            left_only, right_only = first_sorted_query_difference(
+                left_db, right_db, sql, (project,), sql, (project,)
+            )
+            return {
+                "equal": False,
+                "kind": kind,
+                "left_count": left["row_count"],
+                "right_count": right["row_count"],
+                "left_sha256": left["sha256"],
+                "right_sha256": right["sha256"],
+                "left_only": left_only,
+                "right_only": right_only,
+            }
         result = compare_query_rows(left_db, right_db, kind, sql, (project,), sql, (project,))
         if not result["equal"]:
             return result
@@ -3781,6 +3951,9 @@ def run_pair_quality_lifecycle(
             initial_oracles = run_relation_quality_oracles(
                 args.transport, binary, case_env, project, fixture, args, client
             )
+            initial_graph_fingerprint = canonical_graph_fingerprint(
+                find_project_db(cache_dir), project
+            )
             mutation = apply_pair_quality_mutation(repo_dir, fixture)
             incremental_index = run_index_for_transport(
                 args.transport,
@@ -3809,6 +3982,9 @@ def run_pair_quality_lifecycle(
         project = str(initial_index.get("response", {}).get("project") or "repo")
         initial_oracles = run_relation_quality_oracles(
             args.transport, binary, case_env, project, fixture, args
+        )
+        initial_graph_fingerprint = canonical_graph_fingerprint(
+            find_project_db(cache_dir), project
         )
         mutation = apply_pair_quality_mutation(repo_dir, fixture)
         incremental_index = run_index_for_transport(
@@ -3864,7 +4040,15 @@ def run_pair_quality_lifecycle(
             args.transport, binary, fresh_env, fresh_project, post_fixture, args
         )
     fresh_db = find_project_db(fresh_cache)
-    canonical_graph = compare_canonical_graph(incremental_snapshot, fresh_db, project)
+    incremental_graph_fingerprint = canonical_graph_fingerprint(incremental_snapshot, project)
+    fresh_graph_fingerprint = canonical_graph_fingerprint(fresh_db, fresh_project)
+    canonical_graph = compare_canonical_graph(
+        incremental_snapshot,
+        fresh_db,
+        project,
+        incremental_graph_fingerprint,
+        fresh_graph_fingerprint,
+    )
     pair_equality = compare_pair_oracle_outputs(incremental_oracles, fresh_oracles)
     incremental_policy = evaluate_pair_incremental_policy(
         args.config_overrides,
@@ -3882,6 +4066,11 @@ def run_pair_quality_lifecycle(
         "incremental_oracles": incremental_oracles,
         "fresh_index": fresh_index,
         "fresh_oracles": fresh_oracles,
+        "graph_fingerprints": {
+            "initial": initial_graph_fingerprint,
+            "incremental": incremental_graph_fingerprint,
+            "fresh": fresh_graph_fingerprint,
+        },
         "canonical_graph": canonical_graph,
         "pair_equality": pair_equality,
         "incremental_policy": incremental_policy,
