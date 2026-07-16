@@ -206,7 +206,45 @@ TEST(repro_issue495_cfg_gated_twins_distinct) {
     PASS();
 }
 
+/* The call walker must use the same cfg-qualified identity as the definition
+ * walker.  Otherwise pipeline resolution cannot find the source Function and
+ * falls back to the File node, creating a spurious file-sourced CALLS edge. */
+TEST(repro_issue495_cfg_gated_call_uses_definition_qn) {
+    static const char *src = "fn target() {}\n"
+                             "#[cfg(target_os = \"macos\")]\n"
+                             "fn caller() { target(); }\n";
+
+    CBMFileResult *r = rx(src, "t", "src.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    const char *caller_def_qn = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "caller") == 0) {
+            caller_def_qn = d->qualified_name;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(caller_def_qn);
+    ASSERT_NOT_NULL(strstr(caller_def_qn, "#cfg("));
+
+    const CBMCall *target_call = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, "target") == 0) {
+            target_call = &r->calls.items[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(target_call);
+    ASSERT_STR_EQ(target_call->enclosing_func_qn, caller_def_qn);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ────────────────────────────────────────────────────────── */
 SUITE(repro_issue495) {
     RUN_TEST(repro_issue495_cfg_gated_twins_distinct);
+    RUN_TEST(repro_issue495_cfg_gated_call_uses_definition_qn);
 }
