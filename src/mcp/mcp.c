@@ -1900,7 +1900,8 @@ static void free_counted_string_array(char **arr, int count) {
 /* Forward declarations for functions defined after first use */
 static void notify_resources_updated(cbm_mcp_server_t *srv);
 static void send_notification(cbm_mcp_server_t *srv, const char *method);
-static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit);
+static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit,
+                                     bool path_scoped);
 static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms);
 static void *overlay_compaction_thread(void *arg);
 
@@ -3342,7 +3343,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
         if (kf_cfg_limit <= 0) {
             kf_cfg_limit = CBM_CONTEXT_KEY_FUNCTIONS_LIMIT;
         }
-        char *kf_sql = build_key_functions_sql(kf_exclude, NULL, kf_cfg_limit);
+        char *kf_sql = build_key_functions_sql(kf_exclude, NULL, kf_cfg_limit, false);
         if (kf_sql) {
             sqlite3_stmt *kf_stmt = NULL;
             if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
@@ -6969,8 +6970,8 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                 int kf_limit = srv->config
                     ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
                     : 25;
-                char *kf_sql_heap =
-                    build_key_functions_sql(excl_csv, (const char **)excl_arr, kf_limit);
+                char *kf_sql_heap = build_key_functions_sql(excl_csv, (const char **)excl_arr,
+                                                            kf_limit, path_scoped);
                 if (!kf_sql_heap) {
                     add_response_warning(doc, root,
                                          "key_functions omitted: out of memory building SQL");
@@ -6979,6 +6980,12 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                     sqlite3_stmt *kf_stmt = NULL;
                     if (sqlite3_prepare_v2(db, kf_sql, -1, &kf_stmt, NULL) == SQLITE_OK) {
                         if (project) sqlite3_bind_text(kf_stmt, 1, project, -1, SQLITE_TRANSIENT);
+                        if (path_scoped) {
+                            char scope_like[CBM_SZ_512 + 3];
+                            snprintf(scope_like, sizeof(scope_like), "%s/%%", norm_path);
+                            sqlite3_bind_text(kf_stmt, 2, norm_path, -1, SQLITE_TRANSIENT);
+                            sqlite3_bind_text(kf_stmt, 3, scope_like, -1, SQLITE_TRANSIENT);
+                        }
                         yyjson_mut_val *kf_arr = yyjson_mut_arr(doc);
                         while (sqlite3_step(kf_stmt) == SQLITE_ROW) {
                             yyjson_mut_val *kf = yyjson_mut_obj(doc);
@@ -12676,8 +12683,8 @@ static char *sql_escape_quotes(const char *s) {
     return out;
 }
 
-static char *build_key_functions_sql(const char *exclude_csv,
-                                     const char **exclude_arr, int limit) {
+static char *build_key_functions_sql(const char *exclude_csv, const char **exclude_arr, int limit,
+                                     bool path_scoped) {
     char sql[4096];
     int pos = 0;
     pos += snprintf(sql + pos, sizeof(sql) - pos,
@@ -12685,6 +12692,10 @@ static char *build_key_functions_sql(const char *exclude_csv,
         "FROM pagerank pr JOIN nodes n ON n.id = pr.node_id "
         "WHERE pr.project = ?1 "
         "AND n.label IN ('Function','Class','Method','Interface') ");
+    if (path_scoped) {
+        pos += snprintf(sql + pos, sizeof(sql) - pos,
+                        "AND (n.file_path = ?2 OR n.file_path LIKE ?3) ");
+    }
 
     /* Apply config-based excludes (comma-separated globs) */
     if (exclude_csv && exclude_csv[0]) {
@@ -12799,7 +12810,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         int kf_limit = srv->config
             ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
             : 25;
-        char *sql = build_key_functions_sql(excl_csv, NULL, kf_limit);
+        char *sql = build_key_functions_sql(excl_csv, NULL, kf_limit, false);
         sqlite3_stmt *stmt = NULL;
         if (!sql) {
             add_response_warning(doc, root, "key_functions omitted: out of memory building SQL");

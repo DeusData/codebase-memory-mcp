@@ -4418,6 +4418,28 @@ TEST(tool_get_architecture_path_scoping) {
                           .file_path = "lib/other.go"};
     cbm_store_upsert_node(st, &f_other);
 
+    cbm_node_t local_key = {.project = proj,
+                            .label = "Function",
+                            .name = "LocalKeyFunction",
+                            .qualified_name = "arch-path.apps.hoa.LocalKeyFunction",
+                            .file_path = "apps/hoa/main.go"};
+    int64_t local_key_id = cbm_store_upsert_node(st, &local_key);
+    ASSERT_GT(local_key_id, 0);
+    cbm_node_t global_key = {.project = proj,
+                             .label = "Function",
+                             .name = "GlobalKeyFunction",
+                             .qualified_name = "arch-path.scripts.GlobalKeyFunction",
+                             .file_path = "scripts/helpers.py"};
+    int64_t global_key_id = cbm_store_upsert_node(st, &global_key);
+    ASSERT_GT(global_key_id, 0);
+    char rank_sql[512];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) VALUES "
+             "('arch-path',%lld,0.8,'2026-07-15T00:00:00Z'),"
+             "('arch-path',%lld,0.9,'2026-07-15T00:00:00Z')",
+             (long long)local_key_id, (long long)global_key_id);
+    ASSERT_EQ(cbm_store_exec(st, rank_sql), CBM_STORE_OK);
+
     char *resp_root = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"get_architecture\","
@@ -4460,6 +4482,19 @@ TEST(tool_get_architecture_path_scoping) {
     ASSERT_TRUE(root_nodes > scoped_nodes);
     ASSERT_TRUE(scoped_nodes > 0);
 
+    char *resp_scoped_json =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":94,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"get_architecture\","
+                                   "\"arguments\":{\"project\":\"arch-path\",\"path\":\"apps/hoa\","
+                                   "\"aspects\":[\"packages\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp_scoped_json);
+    char *inner_scoped_json = extract_text_content(resp_scoped_json);
+    ASSERT_NOT_NULL(inner_scoped_json);
+    ASSERT_NOT_NULL(strstr(inner_scoped_json, "LocalKeyFunction"));
+    ASSERT_NULL(strstr(inner_scoped_json, "GlobalKeyFunction"));
+
+    free(inner_scoped_json);
+    free(resp_scoped_json);
     free(inner_scoped);
     free(resp_scoped);
     free(inner_root);
