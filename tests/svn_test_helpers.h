@@ -5,8 +5,6 @@
 #include "../src/watcher/svn_state.h"
 #include "test_helpers.h"
 
-#include <ctype.h>
-
 typedef struct {
     char root[CBM_SZ_4K];
     char repository[CBM_SZ_4K];
@@ -39,6 +37,15 @@ static inline int th_svn_fixture_init(th_svn_fixture_t *fixture, const char *pre
         th_svn_fixture_cleanup(fixture);
         return -1;
     }
+    char repository_arg[CBM_SZ_4K];
+    char working_copy_arg[CBM_SZ_4K];
+    if (!cbm_svn_format_path_arg(&fixture->client, fixture->repository, repository_arg,
+                                 sizeof(repository_arg)) ||
+        !cbm_svn_format_path_arg(&fixture->client, fixture->working_copy, working_copy_arg,
+                                 sizeof(working_copy_arg))) {
+        th_svn_fixture_cleanup(fixture);
+        return -1;
+    }
 
     char svnadmin[CBM_SZ_4K];
     snprintf(svnadmin, sizeof(svnadmin), "%s", fixture->client.executable);
@@ -53,41 +60,27 @@ static inline int th_svn_fixture_init(th_svn_fixture_t *fixture, const char *pre
 #else
     snprintf(slash + 1, (size_t)(svnadmin + sizeof(svnadmin) - slash - 1), "svnadmin");
 #endif
-    const char *create_args[] = {svnadmin, "create", fixture->repository, NULL};
+    const char *create_args[] = {svnadmin, "create", repository_arg, NULL};
     if (cbm_exec_no_shell(create_args) != 0) {
         th_svn_fixture_cleanup(fixture);
         return -1;
     }
 
-    char normalized_repository[CBM_SZ_4K];
-    snprintf(normalized_repository, sizeof(normalized_repository), "%s", fixture->repository);
-    cbm_normalize_path_sep(normalized_repository);
     char repository_url[CBM_SZ_8K];
-    int url_length;
 #ifdef _WIN32
-    /* The Windows CI installs MSYS2's POSIX Subversion build. It deliberately
-     * treats file:///D:/... as the literal POSIX path /D:/..., so translate a
-     * drive path to its MSYS mount. Native Windows Subversion keeps DOS URIs. */
-    bool msys_client = strstr(fixture->client.executable, "/usr/bin/svn.exe") != NULL;
-    if (msys_client && isalpha((unsigned char)normalized_repository[0]) &&
-        normalized_repository[1] == ':' && normalized_repository[2] == '/') {
-        url_length =
-            snprintf(repository_url, sizeof(repository_url), "file:///%c%s",
-                     tolower((unsigned char)normalized_repository[0]), normalized_repository + 2);
-    } else {
-        url_length =
-            snprintf(repository_url, sizeof(repository_url), "file:///%s", normalized_repository);
-    }
+    const char *file_prefix = fixture->client.uses_posix_paths ? "file://" : "file:///";
 #else
-    url_length =
-        snprintf(repository_url, sizeof(repository_url), "file://%s", normalized_repository);
+    const char *file_prefix = "file://";
 #endif
+    int url_length =
+        snprintf(repository_url, sizeof(repository_url), "%s%s", file_prefix, repository_arg);
     if (url_length < 0 || (size_t)url_length >= sizeof(repository_url)) {
         th_svn_fixture_cleanup(fixture);
         return -1;
     }
-    const char *checkout_args[] = {fixture->client.executable, "checkout", "--non-interactive",
-                                   repository_url, fixture->working_copy, NULL};
+    const char *checkout_args[] = {fixture->client.executable, "checkout",
+                                   "--non-interactive",        repository_url,
+                                   working_copy_arg,           NULL};
     if (cbm_exec_no_shell(checkout_args) != 0) {
         th_svn_fixture_cleanup(fixture);
         return -1;
@@ -102,10 +95,17 @@ static inline int th_svn_fixture_init(th_svn_fixture_t *fixture, const char *pre
         th_svn_fixture_cleanup(fixture);
         return -1;
     }
-    const char *add_args[] = {fixture->client.executable, "add", "--non-interactive",
-                              fixture->source, NULL};
-    const char *commit_args[] = {fixture->client.executable, "commit", "--non-interactive", "-m",
-                                 "initial", fixture->working_copy, NULL};
+    char source_arg[CBM_SZ_4K];
+    if (!cbm_svn_format_path_arg(&fixture->client, fixture->source, source_arg,
+                                 sizeof(source_arg))) {
+        th_svn_fixture_cleanup(fixture);
+        return -1;
+    }
+    const char *add_args[] = {fixture->client.executable, "add", "--non-interactive", source_arg,
+                              NULL};
+    const char *commit_args[] = {
+        fixture->client.executable, "commit", "--non-interactive", "-m", "initial",
+        working_copy_arg,           NULL};
     if (cbm_exec_no_shell(add_args) != 0 || cbm_exec_no_shell(commit_args) != 0) {
         th_svn_fixture_cleanup(fixture);
         return -1;

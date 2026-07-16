@@ -812,13 +812,10 @@ static int fingerprint_candidates(parser_t *parser, cbm_svn_observation_t *obser
     return 0;
 }
 
-#ifndef CBM_SVN_STATE_ENABLE_TEST_API
-static
-#endif
-    cbm_svn_probe_result_t
-    cbm_svn_parse_status_stream(FILE *stream, const char *root_path,
-                                cbm_svn_observation_t *observation) {
-    if (!stream || !root_path || !observation) {
+static cbm_svn_probe_result_t parse_status_stream(FILE *stream, const char *root_path,
+                                                  const char *input_root,
+                                                  cbm_svn_observation_t *observation) {
+    if (!stream || !root_path || !input_root || !observation) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
     parser_t parser = {0};
@@ -829,7 +826,8 @@ static
         return CBM_SVN_PROBE_UNCERTAIN;
     }
     normalize_separators(parser.root);
-    int input_root_length = snprintf(parser.input_root, sizeof(parser.input_root), "%s", root_path);
+    int input_root_length =
+        snprintf(parser.input_root, sizeof(parser.input_root), "%s", input_root);
     if (input_root_length < 0 || (size_t)input_root_length >= sizeof(parser.input_root)) {
         candidates_free(&parser.candidates);
         return CBM_SVN_PROBE_UNCERTAIN;
@@ -899,6 +897,13 @@ static
     return result;
 }
 
+#ifdef CBM_SVN_STATE_ENABLE_TEST_API
+cbm_svn_probe_result_t cbm_svn_parse_status_stream(FILE *stream, const char *root_path,
+                                                   cbm_svn_observation_t *observation) {
+    return parse_status_stream(stream, root_path, root_path, observation);
+}
+#endif
+
 static bool executable_is_regular(const char *path) {
 #ifdef _WIN32
     wchar_t *wide = cbm_utf8_to_wide(path);
@@ -913,6 +918,54 @@ static bool executable_is_regular(const char *path) {
     struct stat state;
     return stat(path, &state) == 0 && S_ISREG(state.st_mode) && access(path, X_OK) == 0;
 #endif
+}
+
+#if defined(_WIN32) || defined(CBM_SVN_STATE_ENABLE_TEST_API)
+static bool executable_uses_posix_paths(const char *path) {
+    static const char suffix[] = "/usr/bin/svn.exe";
+    if (!path) {
+        return false;
+    }
+    size_t path_length = strlen(path);
+    size_t suffix_length = sizeof(suffix) - SKIP_ONE;
+    if (path_length < suffix_length) {
+        return false;
+    }
+    const char *tail = path + path_length - suffix_length;
+    return cbm_strcasestr(tail, suffix) == tail;
+}
+#endif
+
+#ifdef CBM_SVN_STATE_ENABLE_TEST_API
+bool cbm_svn_test_executable_uses_posix_paths(const char *executable) {
+    return executable_uses_posix_paths(executable);
+}
+#endif
+
+bool cbm_svn_format_path_arg(const cbm_svn_client_t *client, const char *path, char *out,
+                             size_t out_size) {
+    if (!client || !path || !out || out_size == 0) {
+        return false;
+    }
+#ifdef _WIN32
+    char normalized[CBM_SZ_4K];
+    int normalized_length = snprintf(normalized, sizeof(normalized), "%s", path);
+    if (normalized_length < 0 || (size_t)normalized_length >= sizeof(normalized)) {
+        return false;
+    }
+    cbm_normalize_path_sep(normalized);
+    if (client->uses_posix_paths && isalpha((unsigned char)normalized[0]) && normalized[1] == ':' &&
+        normalized[2] == '/') {
+        int written =
+            snprintf(out, out_size, "/%c%s", tolower((unsigned char)normalized[0]), normalized + 2);
+        return written >= 0 && (size_t)written < out_size;
+    }
+    const char *formatted = normalized;
+#else
+    const char *formatted = path;
+#endif
+    int written = snprintf(out, out_size, "%s", formatted);
+    return written >= 0 && (size_t)written < out_size;
 }
 
 cbm_svn_probe_result_t cbm_svn_client_init(const char *root_path, cbm_svn_client_t *client) {
@@ -951,6 +1004,9 @@ cbm_svn_probe_result_t cbm_svn_client_init(const char *root_path, cbm_svn_client
                     if (!path_has_prefix(resolved, root) && !path_has_prefix(resolved, cwd) &&
                         executable_is_regular(resolved)) {
                         snprintf(client->executable, sizeof(client->executable), "%s", resolved);
+#ifdef _WIN32
+                        client->uses_posix_paths = executable_uses_posix_paths(resolved);
+#endif
                         return CBM_SVN_PROBE_OK;
                     }
                 }
@@ -967,10 +1023,15 @@ cbm_svn_probe_result_t cbm_svn_probe(const cbm_svn_client_t *client, const char 
         !cbm_validate_shell_arg(client->executable) || !cbm_validate_shell_arg(root_path)) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
+    char status_root[CBM_SZ_4K];
+    if (!cbm_svn_format_path_arg(client, root_path, status_root, sizeof(status_root)) ||
+        !cbm_validate_shell_arg(status_root)) {
+        return CBM_SVN_PROBE_UNCERTAIN;
+    }
 #ifdef _WIN32
     /* cbm_popen routes through cmd.exe, where percent expansion occurs even
      * inside double quotes. Fail closed until this leaf can use argv capture. */
-    if (strchr(client->executable, '%') || strchr(root_path, '%')) {
+    if (strchr(client->executable, '%') || strchr(status_root, '%')) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
 #endif
@@ -978,7 +1039,7 @@ cbm_svn_probe_result_t cbm_svn_probe(const cbm_svn_client_t *client, const char 
     int written = snprintf(command, sizeof(command),
                            "\"%s\" status --xml --verbose --no-ignore --depth infinity "
                            "--non-interactive -- \"%s@\" 2>%s",
-                           client->executable, root_path, SVN_NULDEV);
+                           client->executable, status_root, SVN_NULDEV);
     if (written < 0 || (size_t)written >= sizeof(command)) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
@@ -988,7 +1049,7 @@ cbm_svn_probe_result_t cbm_svn_probe(const cbm_svn_client_t *client, const char 
         return CBM_SVN_PROBE_UNCERTAIN;
     }
     cbm_svn_observation_t parsed = {0};
-    cbm_svn_probe_result_t result = cbm_svn_parse_status_stream(process, root_path, &parsed);
+    cbm_svn_probe_result_t result = parse_status_stream(process, root_path, status_root, &parsed);
     int exit_code = cbm_pclose(process);
     if (exit_code != 0 || result == CBM_SVN_PROBE_UNCERTAIN) {
         return CBM_SVN_PROBE_UNCERTAIN;

@@ -2,6 +2,7 @@
 #define CBM_WATCHER_SVN_STATE_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #ifdef CBM_SVN_STATE_ENABLE_TEST_API
 #include <stdio.h>
@@ -17,6 +18,7 @@ typedef enum {
 
 typedef struct {
     char executable[CBM_SZ_4K];
+    bool uses_posix_paths;
 } cbm_svn_client_t;
 
 typedef struct {
@@ -31,10 +33,15 @@ typedef struct {
 /* Resolve and pin a system SVN client without executing project-local code. */
 cbm_svn_probe_result_t cbm_svn_client_init(const char *root_path, cbm_svn_client_t *client);
 
+/* Format a local path for the pinned SVN client's runtime. */
+bool cbm_svn_format_path_arg(const cbm_svn_client_t *client, const char *path, char *out,
+                             size_t out_size);
+
 /* Parse one local `svn status --xml --verbose` stream. */
 #ifdef CBM_SVN_STATE_ENABLE_TEST_API
 cbm_svn_probe_result_t cbm_svn_parse_status_stream(FILE *stream, const char *root_path,
                                                    cbm_svn_observation_t *observation);
+bool cbm_svn_test_executable_uses_posix_paths(const char *executable);
 #endif
 
 /* Observe a working copy with one local, non-interactive SVN process. */

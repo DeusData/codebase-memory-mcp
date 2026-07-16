@@ -198,6 +198,26 @@ TEST(client_init_skips_executable_in_current_directory) {
     PASS();
 }
 
+TEST(path_arg_matches_client_runtime) {
+    cbm_svn_client_t client = {0};
+    char path[128];
+#ifdef _WIN32
+    client.uses_posix_paths = true;
+    ASSERT_TRUE(cbm_svn_format_path_arg(&client, "D:\\workspace\\project", path, sizeof(path)));
+    ASSERT_STR_EQ(path, "/d/workspace/project");
+#else
+    ASSERT_TRUE(cbm_svn_format_path_arg(&client, "/workspace/project", path, sizeof(path)));
+    ASSERT_STR_EQ(path, "/workspace/project");
+#endif
+    PASS();
+}
+
+TEST(client_runtime_detection_is_case_insensitive) {
+    ASSERT_TRUE(cbm_svn_test_executable_uses_posix_paths("C:/MSYS64/USR/BIN/SVN.EXE"));
+    ASSERT_FALSE(cbm_svn_test_executable_uses_posix_paths("C:/MSYS64/mingw64/bin/svn.exe"));
+    PASS();
+}
+
 TEST(real_probe_tracks_repeated_working_copy_edits) {
     th_svn_fixture_t fixture;
     ASSERT_EQ(th_svn_fixture_init(&fixture, "cbm_svn_probe", "source.c", "int value = 1;\n"),
@@ -233,5 +253,7 @@ SUITE(svn_state) {
     RUN_TEST(clean_properties_and_externals_are_not_local_changes);
     RUN_TEST(discovery_excluded_candidate_directory_is_not_hashed);
     RUN_TEST(client_init_skips_executable_in_current_directory);
+    RUN_TEST(path_arg_matches_client_runtime);
+    RUN_TEST(client_runtime_detection_is_case_insensitive);
     RUN_TEST(real_probe_tracks_repeated_working_copy_edits);
 }
