@@ -1324,6 +1324,12 @@ cbm_detected_agents_t cbm_detect_agents(const char *home_dir) {
 
     agents.aider = cbm_find_cli("aider", home_dir)[0] != '\0';
 
+    /* Standalone Kilo stores its global JSONC config here. Keep this distinct
+     * from the legacy VS Code extension adapter below because their schemas
+     * and ownership paths differ. */
+    snprintf(path, sizeof(path), "%s/.config/kilo", home_dir);
+    agents.kilo_cli = dir_exists(path);
+
 #ifdef __APPLE__
     snprintf(path, sizeof(path),
              "%s/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code", home_dir);
@@ -2611,23 +2617,26 @@ int cbm_remove_gemini_session_hooks(const char *settings_path) {
 
 /* ── PATH management ──────────────────────────────────────────── */
 
+static const char CBM_PATH_MARKER[] = "# Added by codebase-memory-mcp install";
+
+static bool cbm_format_path_line(char *line, size_t line_size, const char *bin_dir,
+                                 const char *rc_file) {
+    size_t rc_len = strlen(rc_file);
+    bool is_fish = rc_len >= CBM_SZ_5 && strcmp(rc_file + rc_len - CBM_SZ_5, ".fish") == 0;
+    if (is_fish) {
+        return cbm_format_fits(line, line_size, "fish_add_path %s", bin_dir);
+    }
+    return cbm_format_fits(line, line_size, "export PATH=\"%s:$PATH\"", bin_dir);
+}
+
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
     if (!bin_dir || !rc_file) {
         return CLI_ERR;
     }
 
-    /* fish uses a different syntax than POSIX shells: `export PATH="...:$PATH"`
-     * is a syntax error in fish and breaks config.fish (#319). When the target
-     * is a fish config, emit the fish-native `fish_add_path` (idempotent,
-     * prepends only if absent) instead. */
-    size_t rc_len = strlen(rc_file);
-    bool is_fish = rc_len >= CBM_SZ_5 && strcmp(rc_file + rc_len - CBM_SZ_5, ".fish") == 0;
-
     char line[CLI_BUF_1K];
-    if (is_fish) {
-        snprintf(line, sizeof(line), "fish_add_path %s", bin_dir);
-    } else {
-        snprintf(line, sizeof(line), "export PATH=\"%s:$PATH\"", bin_dir);
+    if (!cbm_format_path_line(line, sizeof(line), bin_dir, rc_file)) {
+        return CLI_ERR;
     }
 
     /* Check if already present in rc file */
@@ -2652,9 +2661,58 @@ int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run) {
         return CLI_ERR;
     }
 
-    (void)fprintf(f, "\n# Added by codebase-memory-mcp install\n%s\n", line);
+    (void)fprintf(f, "\n%s\n%s\n", CBM_PATH_MARKER, line);
     (void)fclose(f);
     return 0;
+}
+
+int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run) {
+    if (!bin_dir || !rc_file) {
+        return CLI_ERR;
+    }
+    char line[CLI_BUF_1K];
+    char block[CLI_BUF_2K];
+    if (!cbm_format_path_line(line, sizeof(line), bin_dir, rc_file) ||
+        !cbm_format_fits(block, sizeof(block), "\n%s\n%s\n", CBM_PATH_MARKER, line)) {
+        return CLI_ERR;
+    }
+
+    size_t content_len = 0;
+    char *content = read_file_str(rc_file, &content_len);
+    if (!content) {
+        return CLI_OK;
+    }
+    size_t block_len = strlen(block);
+    if (!strstr(content, block)) {
+        free(content);
+        return CLI_OK;
+    }
+    if (dry_run) {
+        free(content);
+        return CLI_OK;
+    }
+
+    char *updated = malloc(content_len + CLI_SKIP_ONE);
+    if (!updated) {
+        free(content);
+        return CLI_ERR;
+    }
+    const char *cursor = content;
+    char *out = updated;
+    const char *match;
+    while ((match = strstr(cursor, block)) != NULL) {
+        size_t prefix_len = (size_t)(match - cursor);
+        memcpy(out, cursor, prefix_len);
+        out += prefix_len;
+        cursor = match + block_len;
+    }
+    size_t suffix_len = strlen(cursor);
+    memcpy(out, cursor, suffix_len + CLI_SKIP_ONE);
+
+    int rc = write_file_str(rc_file, updated);
+    free(updated);
+    free(content);
+    return rc;
 }
 
 /* ── Tar.gz extraction ────────────────────────────────────────── */
@@ -4323,7 +4381,8 @@ static void print_detected_agents(const cbm_detected_agents_t *a) {
         {a->opencode, "OpenCode"},
         {a->antigravity, "Antigravity"},
         {a->aider, "Aider"},
-        {a->kilocode, "KiloCode"},
+        {a->kilo_cli, "Kilo-CLI"},
+        {a->kilocode, "KiloCode-Legacy-Extension"},
         {a->vscode, "VS-Code"},
         {a->cursor, "Cursor"},
         {a->windsurf, "Windsurf"},
@@ -4685,6 +4744,12 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
 #endif
         install_generic_agent_config("Zed", binary_path, cp, NULL, dry_run, cbm_install_zed_mcp);
     }
+    if (agents->kilo_cli) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.config/kilo/kilo.jsonc", home);
+        install_generic_agent_config("Kilo CLI", binary_path, cp, NULL, dry_run,
+                                     cbm_upsert_opencode_mcp);
+    }
     if (agents->kilocode) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
@@ -4906,6 +4971,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
         {det.opencode, "opencode"},
         {det.antigravity, "antigravity"},
         {det.aider, "aider"},
+        {det.kilo_cli, "kilo-cli"},
         {det.kilocode, "kilocode"},
         {det.vscode, "vscode"},
         {det.cursor, "cursor"},
@@ -5414,6 +5480,12 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Zed", cp, NULL}, dry_run,
                                   cbm_remove_zed_mcp);
     }
+    if (agents->kilo_cli) {
+        char cp[CLI_BUF_1K];
+        snprintf(cp, sizeof(cp), "%s/.config/kilo/kilo.jsonc", home);
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Kilo CLI", cp, NULL}, dry_run,
+                                  cbm_remove_opencode_mcp);
+    }
     if (agents->kilocode) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
@@ -5476,6 +5548,26 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
     }
 }
 
+static void uninstall_owned_path_blocks(const char *home, bool dry_run) {
+    static const char *const rc_paths[] = {
+        ".zshrc", ".bashrc", ".bash_profile", ".profile", ".config/fish/config.fish",
+    };
+    char bin_dir[CLI_BUF_1K];
+    if (!cbm_format_fits(bin_dir, sizeof(bin_dir), "%s/.local/bin", home)) {
+        return;
+    }
+    for (size_t i = 0; i < sizeof(rc_paths) / sizeof(rc_paths[0]); i++) {
+        char rc_path[CLI_BUF_1K];
+        if (!cbm_format_fits(rc_path, sizeof(rc_path), "%s/%s", home, rc_paths[i])) {
+            continue;
+        }
+        struct stat st;
+        if (stat(rc_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            (void)cbm_remove_owned_path(bin_dir, rc_path, dry_run);
+        }
+    }
+}
+
 int cbm_cmd_uninstall(int argc, char **argv) {
     if (cli_args_have_help(argc, argv)) {
         print_uninstall_help();
@@ -5503,6 +5595,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     }
     uninstall_cli_agents(&agents, home, dry_run);
     uninstall_editor_agents(&agents, home, dry_run);
+    uninstall_owned_path_blocks(home, dry_run);
 
     /* Step 2: Remove indexes */
     int index_count = count_db_indexes(home);

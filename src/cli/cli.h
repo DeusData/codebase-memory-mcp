@@ -151,7 +151,8 @@ typedef struct {
     bool opencode;       /* opencode on PATH or config exists */
     bool antigravity;    /* ~/.gemini/antigravity/ exists */
     bool aider;          /* aider on PATH */
-    bool kilocode;       /* KiloCode globalStorage dir exists */
+    bool kilo_cli;       /* standalone Kilo ~/.config/kilo/ exists */
+    bool kilocode;       /* legacy Kilo VS Code globalStorage dir exists */
     bool vscode;         /* VS Code User config dir exists */
     bool cursor;         /* ~/.cursor/ exists */
     bool windsurf;       /* ~/.codeium/windsurf/ exists */
@@ -261,6 +262,10 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path);
 /* Append an export PATH line to the given rc file.
  * Checks if already present. Returns 0 on success, 1 if already present. */
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
+
+/* Remove only the exact PATH block written by cbm_ensure_path(). User-owned
+ * PATH entries and all other shell content are preserved. */
+int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run);
 
 /* ── Codex instructions (legacy, wraps cbm_get_agent_instructions) ── */
 
