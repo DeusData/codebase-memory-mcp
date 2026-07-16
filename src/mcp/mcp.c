@@ -1099,7 +1099,8 @@ static const tool_def_t TOOLS[] = {
      "(true by default). Omit fields at their "
      "default: name when it equals qualified_name's last segment (e.g. \\\"main\\\" in "
      "\\\"pkg.main\\\"), empty label/file_path, and zero degrees. Absent fields assume defaults: "
-     "label/file_path='', degree=0. Saves tokens.\"},"
+     "label/file_path='', degree=0. Node properties are omitted unless selected with fields; "
+     "compact=false includes non-internal properties. Saves tokens.\"},"
      "\"include_dependencies\":{\"type\":\"boolean\",\"default\":true,\"description\":\"Include "
      "symbols from dependency sub-projects (marked source=dependency in results). Set false to "
      "scope to project code only. When true, project symbols rank above dependency symbols by "
@@ -1109,7 +1110,8 @@ static const tool_def_t TOOLS[] = {
      "\"},\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
      "\"description\":\"Compact TOON tables by default; json returns legacy objects.\"},"
      "\"fields\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":"
-     "\"Extra node-property columns for TOON output, e.g. complexity or signature.\"}}}"},
+     "\"Selected node-property fields for compact TOON or JSON output, e.g. complexity or "
+     "signature. Internal fp/sp/bt indexing fields are never returned.\"}}}"},
 
     {"query_graph", "Query graph",
      "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
@@ -4847,12 +4849,21 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     return json;
 }
 
-/* Forward declaration — defined later. enrich_node_properties parses the
+/* Forward declarations — definitions live with the compact TOON helpers and
+ * search property enrichment below. */
+enum { SG_MAX_EXTRA_FIELDS = 12 };
+static bool sg_field_blocked(const char *field);
+static int sg_parse_fields(const char *args, const char *out[], int max_out,
+                           yyjson_doc **out_owner);
+static bool sg_field_selected(const char *field, const char *const fields[], int field_count);
+
+/* enrich_node_properties parses the
  * node's properties_json and grafts the parsed values onto the result item.
  * It returns the parsed yyjson_doc which must outlive the serialization
  * because yyjson_mut_obj_add_val uses zero-copy strings into that doc. */
 static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                          const char *properties_json);
+                                          const char *properties_json, bool compact,
+                                          const char *const fields[], int field_count);
 
 /* Emit the cbm_store_search results as a JSON "results" array on the doc.
  * Property docs created via enrich_node_properties are collected in
@@ -4863,10 +4874,14 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                                 const cbm_search_output_t *out, cbm_store_t *store,
                                 const char *relationship, bool include_connected,
                                 bool connected_names_authoritative, int offset, int limit,
-                                bool compact, const char *session_project,
+                                bool compact, const char *session_project, const char *args,
                                 yyjson_doc ***out_pdocs, int *out_pdoc_count) {
     yyjson_doc **pdocs = out->count > 0 ? malloc((size_t)out->count * sizeof(yyjson_doc *)) : NULL;
     int pdoc_count = 0;
+    bool properties_omitted_oom = out->count > 0 && !pdocs;
+    const char *fields[SG_MAX_EXTRA_FIELDS];
+    yyjson_doc *fields_owner = NULL;
+    int field_count = sg_parse_fields(args, fields, SG_MAX_EXTRA_FIELDS, &fields_owner);
     yyjson_mut_obj_add_int(doc, root, "total", out->total);
     yyjson_mut_val *results = yyjson_mut_arr(doc);
     for (int i = 0; i < out->count; i++) {
@@ -4916,13 +4931,20 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
         } else if (include_connected && !connected_names_authoritative && sr->node.id > 0) {
             enrich_connected(doc, item, store, sr->node.id, relationship);
         }
-        yyjson_doc *pdoc = enrich_node_properties(doc, item, sr->node.properties_json);
+        yyjson_doc *pdoc =
+            pdocs ? enrich_node_properties(doc, item, sr->node.properties_json, compact, fields,
+                                           field_count)
+                  : NULL;
         if (pdoc && pdocs) {
             pdocs[pdoc_count++] = pdoc;
         }
         yyjson_mut_arr_add_val(results, item);
     }
     yyjson_mut_obj_add_val(doc, root, "results", results);
+    if (properties_omitted_oom) {
+        add_response_warning(doc, root,
+                             "node properties omitted: out of memory tracking property documents");
+    }
     /* Pagination: tell the caller how to get the next page */
     bool more = out->total > offset + out->count;
     yyjson_mut_obj_add_bool(doc, root, "has_more", more);
@@ -4932,6 +4954,9 @@ static void emit_search_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
                  "Use offset:%d and limit:%d for next page (%d total)",
                  offset + out->count, limit, (int)out->total);
         yyjson_mut_obj_add_strcpy(doc, root, "pagination_hint", hint);
+    }
+    if (fields_owner) {
+        yyjson_doc_free(fields_owner);
     }
     *out_pdocs = pdocs;
     *out_pdoc_count = pdoc_count;
@@ -5041,11 +5066,19 @@ static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const 
 }
 
 /* Compact TOON helpers retained alongside the JSON/overlay path. */
-enum { SG_MAX_EXTRA_FIELDS = 12 };
 
 static bool sg_field_blocked(const char *field) {
     return strcmp(field, "fp") == 0 || strcmp(field, "sp") == 0 ||
            strcmp(field, "bt") == 0;
+}
+
+static bool sg_field_selected(const char *field, const char *const fields[], int field_count) {
+    for (int i = 0; i < field_count; i++) {
+        if (strcmp(field, fields[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static int sg_parse_fields(const char *args, const char *out[], int max_out,
@@ -5669,8 +5702,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (!is_summary) {
         emit_search_results(doc, root, &out, store, relationship, include_connected,
                             overlay_search_used && include_connected, offset, limit, compact,
-                            srv->session_project,
-                            &props_docs, &props_doc_count);
+                            srv->session_project, args, &props_docs, &props_doc_count);
     }
 
     /* Auto-context: first response gets full architecture/schema/_context header.
@@ -9213,8 +9245,9 @@ static char *snippet_suggestions(const char *input, cbm_node_t *nodes, int count
 /* Enrich a mutable JSON object with key-value pairs from a node's properties_json.
  * Returns the parsed yyjson_doc (caller frees AFTER serialization — zero-copy). */
 static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *obj,
-                                          const char *properties_json) {
-    if (!properties_json || properties_json[0] == '\0') {
+                                          const char *properties_json, bool compact,
+                                          const char *const fields[], int field_count) {
+    if (!properties_json || properties_json[0] == '\0' || (compact && field_count == 0)) {
         return NULL;
     }
     yyjson_doc *props_doc = yyjson_read(properties_json, strlen(properties_json), 0);
@@ -9228,11 +9261,15 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
     }
     yyjson_obj_iter iter;
     yyjson_obj_iter_init(props_root, &iter);
+    bool added = false;
     yyjson_val *key;
     while ((key = yyjson_obj_iter_next(&iter))) {
         yyjson_val *val = yyjson_obj_iter_get_val(key);
         const char *k = yyjson_get_str(key);
         if (!k) {
+            continue;
+        }
+        if (sg_field_blocked(k) || (compact && !sg_field_selected(k, fields, field_count))) {
             continue;
         }
         /* Search results flatten node properties into the result object for
@@ -9243,13 +9280,21 @@ static yyjson_doc *enrich_node_properties(yyjson_mut_doc *doc, yyjson_mut_val *o
         }
         if (yyjson_is_str(val)) {
             yyjson_mut_obj_add_str(doc, obj, k, yyjson_get_str(val));
+            added = true;
         } else if (yyjson_is_bool(val)) {
             yyjson_mut_obj_add_bool(doc, obj, k, yyjson_get_bool(val));
+            added = true;
         } else if (yyjson_is_int(val)) {
             yyjson_mut_obj_add_int(doc, obj, k, yyjson_get_int(val));
+            added = true;
         } else if (yyjson_is_real(val)) {
             yyjson_mut_obj_add_real(doc, obj, k, yyjson_get_real(val));
+            added = true;
         }
+    }
+    if (!added) {
+        yyjson_doc_free(props_doc);
+        return NULL;
     }
     return props_doc; /* caller frees after serialization */
 }
