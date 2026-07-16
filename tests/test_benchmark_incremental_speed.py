@@ -72,6 +72,67 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(fingerprints[0], fingerprints[1])
         self.assertNotEqual(canonical_hashes[0], canonical_hashes[1])
 
+    def test_graph_fingerprint_normalizes_project_root_but_retains_semantic_score(self) -> None:
+        def create_graph(database: Path, project: str, score: float) -> None:
+            with sqlite3.connect(database) as con:
+                con.execute(
+                    "CREATE TABLE nodes("
+                    "id INTEGER PRIMARY KEY, project TEXT, label TEXT, name TEXT, "
+                    "qualified_name TEXT, file_path TEXT, start_line INTEGER, end_line INTEGER, "
+                    "properties TEXT)"
+                )
+                con.execute(
+                    "CREATE TABLE edges("
+                    "project TEXT, source_id INTEGER, target_id INTEGER, type TEXT, properties TEXT)"
+                )
+                con.execute(
+                    "CREATE TABLE file_hashes("
+                    "project TEXT, rel_path TEXT, sha256 TEXT, mtime_ns INTEGER, size INTEGER)"
+                )
+                con.executemany(
+                    "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?)",
+                    [
+                        (1, project, "Function", "left", f"{project}.pkg.left", "src/a.py", 1, 2,
+                         json.dumps({"checkout": f"/tmp/{project}"})),
+                        (2, project, "Function", "right", f"{project}.pkg.right", "src/a.py", 4, 5,
+                         json.dumps({"checkout": f"/tmp/{project}"})),
+                        (3, project, "Project", project, project, "", 0, 0,
+                         json.dumps({"root": f"/tmp/{project}"})),
+                    ],
+                )
+                con.execute(
+                    "INSERT INTO edges VALUES (?,?,?,?,?)",
+                    (project, 1, 2, "SEMANTICALLY_RELATED", json.dumps({"score": score})),
+                )
+                con.execute(
+                    "INSERT INTO file_hashes VALUES (?,?,?,?,?)",
+                    (project, "src/a.py", "content-sha", 123, 42),
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            left_db = Path(tmpdir) / "left.db"
+            right_db = Path(tmpdir) / "right.db"
+            create_graph(left_db, "random-root-a", 0.873)
+            create_graph(right_db, "random-root-b", 0.873)
+
+            left = BENCHMARK.stable_graph_fingerprint(left_db, "random-root-a")
+            right = BENCHMARK.stable_graph_fingerprint(right_db, "random-root-b")
+            self.assertEqual(left, right)
+
+            with sqlite3.connect(right_db) as con:
+                con.execute(
+                    "UPDATE edges SET properties = ?",
+                    (json.dumps({"score": 0.811}),),
+                )
+            changed = BENCHMARK.stable_graph_fingerprint(right_db, "random-root-b")
+
+        self.assertEqual(left["components"]["nodes"], changed["components"]["nodes"])
+        self.assertEqual(left["components"]["edges"], changed["components"]["edges"])
+        self.assertNotEqual(
+            left["components"]["semantic_scores"],
+            changed["components"]["semantic_scores"],
+        )
+
     def test_archive_measurement_log_streams_reproducible_gzip_with_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
