@@ -556,7 +556,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(len(unequal["incremental_only"]), 1)
         self.assertEqual(len(unequal["fresh_only"]), 1)
 
-    def test_pair_incremental_policy_distinguishes_default_stale_from_eager_freshness(self) -> None:
+    def test_pair_incremental_policy_observes_candidate_default_without_assuming_policy(self) -> None:
         stale_index = {"publish_kind": "incremental_exact"}
         stale_oracles = {
             "passed": False,
@@ -571,9 +571,35 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         stale = BENCHMARK.evaluate_pair_incremental_policy(
             {}, stale_index, stale_oracles, {"equal": False}, {"passed": False}
         )
-        self.assertEqual(stale["policy"], "stale_on_incremental")
+        self.assertEqual(stale["policy"], "candidate_default")
+        self.assertEqual(stale["policy_source"], "candidate_default")
+        self.assertEqual(stale["observed_behavior"], "deferred_with_warning")
         self.assertFalse(stale["immediate_freshness_expected"])
         self.assertTrue(stale["policy_conformance_met"])
+
+        observed_eager = BENCHMARK.evaluate_pair_incremental_policy(
+            {},
+            stale_index,
+            {"passed": True, "edge_query": {"response": {}}},
+            {"equal": False},
+            {"passed": True},
+        )
+        self.assertEqual(observed_eager["policy"], "candidate_default")
+        self.assertEqual(observed_eager["observed_behavior"], "immediate_pair_freshness")
+        self.assertTrue(observed_eager["immediate_freshness_expected"])
+        self.assertTrue(observed_eager["pair_freshness_met"])
+        self.assertFalse(observed_eager["immediate_freshness_met"])
+        self.assertTrue(observed_eager["policy_conformance_met"])
+
+        unreported_stale = BENCHMARK.evaluate_pair_incremental_policy(
+            {},
+            stale_index,
+            {"passed": False, "edge_query": {"response": {}}},
+            {"equal": False},
+            {"passed": False},
+        )
+        self.assertEqual(unreported_stale["observed_behavior"], "unreported_stale")
+        self.assertFalse(unreported_stale["policy_conformance_met"])
 
         eager = BENCHMARK.evaluate_pair_incremental_policy(
             {"incremental_derived_refresh": "eager"},
@@ -582,6 +608,8 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {"equal": True},
             {"passed": True},
         )
+        self.assertEqual(eager["policy_source"], "explicit_override")
+        self.assertEqual(eager["observed_behavior"], "immediate_full_freshness")
         self.assertTrue(eager["immediate_freshness_expected"])
         self.assertTrue(eager["immediate_freshness_met"])
         self.assertTrue(eager["policy_conformance_met"])

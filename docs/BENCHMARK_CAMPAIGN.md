@@ -196,6 +196,14 @@ post-mutation judged pair set and edge scores identically to a fresh rebuild wit
 a stale warning. Compare both profiles when selecting a latency/freshness Pareto
 point.
 
+Cross-version candidate-default cells do not assume that older binaries share the
+latest binary's derived-refresh default. With no explicit
+`incremental_derived_refresh` override, the retained policy is
+`candidate_default` and the harness classifies observed behavior as immediate pair
+freshness, deferred with a structured warning, or unreported stale output. Explicit
+eager/deferred profiles continue to validate against the requested policy. This
+keeps an older eager default from being judged against a newer deferred default.
+
 Large mutation reports keep Core graph and Full graph freshness separate. A
 `PASS: DECLARED STALE VIEWS` decision requires structured `stale_with_warning`
 metadata and a second canonical comparison that excludes only the declared
