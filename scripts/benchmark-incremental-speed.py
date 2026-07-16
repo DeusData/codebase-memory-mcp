@@ -3102,12 +3102,17 @@ def copy_fastapi_head_to_case(
     }
 
 
-def create_self_dogfood_worktree(source_repo: Path, case_root: Path, timeout: int) -> Path:
+def create_self_dogfood_worktree(
+    source_repo: Path,
+    case_root: Path,
+    timeout: int,
+    revision: str,
+) -> Path:
     repo_dir = case_root / SELF_DOGFOOD_REPO_SUBDIR
     if repo_dir.exists():
         raise RuntimeError(f"self-dogfood worktree already exists: {repo_dir}")
     proc, _ = command_result(
-        ["git", "worktree", "add", "--detach", str(repo_dir), "HEAD"],
+        ["git", "worktree", "add", "--detach", str(repo_dir), revision],
         dict(os.environ),
         timeout,
         source_repo,
@@ -3149,16 +3154,61 @@ def append_c_marker_function(repo_dir: Path, rel_path: str, marker: str, value: 
     return rel_path
 
 
+def create_c_marker_file(repo_dir: Path, rel_path: str, marker: str, value: int) -> str:
+    path = repo_dir / rel_path
+    if path.exists():
+        raise RuntimeError(f"benchmark new-file mutation target already exists: {rel_path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"static int {marker}(void) {{\n    return {value};\n}}\n",
+        encoding="utf-8",
+    )
+    return rel_path
+
+
 def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
     marker = self_dogfood_marker(name)
     changed: list[str] = []
+    scenario_paths = {
+        "noop": [],
+        "one_source_file": ["src/pipeline/pipeline_internal.h"],
+        "route_handler": ["src/ui/http_server.c"],
+        "c_new_leaf": ["src/cbm_benchmark_leaf.c"],
+        "store_pipeline_batch": ["src/store/store.h", "src/pipeline/pipeline_internal.h"],
+        "multi_file_small": ["src/mcp/mcp.c", "tests/test_mcp.c"],
+    }
+    paths = scenario_paths.get(name)
+    if paths is None:
+        raise ValueError(f"unknown self-dogfood scenario: {name}")
+    before_hashes = {
+        path: file_sha256(repo_dir / path) if (repo_dir / path).is_file() else None
+        for path in paths
+    }
+
+    def finish(document: dict[str, Any]) -> dict[str, Any]:
+        document["source_hashes"] = [
+            {
+                "path": path,
+                "before_sha256": before_hashes[path],
+                "after_sha256": (
+                    file_sha256(repo_dir / path) if (repo_dir / path).is_file() else None
+                ),
+            }
+            for path in paths
+        ]
+        return document
+
     if name == "noop":
-        return {"marker": None, "changed_paths": changed, "description": "no source mutation"}
+        return finish(
+            {"marker": None, "changed_paths": changed, "description": "no source mutation"}
+        )
     if name == "one_source_file":
         changed.append(
             append_c_marker_function(repo_dir, "src/pipeline/pipeline_internal.h", marker, 4101)
         )
-        return {"marker": marker, "changed_paths": changed, "description": "single C header edit"}
+        return finish(
+            {"marker": marker, "changed_paths": changed, "description": "single C header edit"}
+        )
     if name == "route_handler":
         append_text(
             repo_dir / "src/ui/http_server.c",
@@ -3170,34 +3220,55 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
             ),
         )
         changed.append("src/ui/http_server.c")
-        return {
-            "marker": marker,
-            "changed_paths": changed,
-            "description": "HTTP UI handler source edit with route literal oracle",
-        }
+        return finish(
+            {
+                "marker": marker,
+                "changed_paths": changed,
+                "description": "HTTP UI handler source edit with route literal oracle",
+            }
+        )
+    if name == "c_new_leaf":
+        changed.append(
+            create_c_marker_file(
+                repo_dir,
+                "src/cbm_benchmark_leaf.c",
+                marker,
+                4102,
+            )
+        )
+        return finish(
+            {
+                "marker": marker,
+                "changed_paths": changed,
+                "description": "new isolated C source file",
+            }
+        )
     if name == "store_pipeline_batch":
         changed.append(append_c_marker_function(repo_dir, "src/store/store.h", marker, 4103))
         second_marker = f"{marker}_pipeline"
         changed.append(
             append_c_marker_function(repo_dir, "src/pipeline/pipeline_internal.h", second_marker, 4104)
         )
-        return {
-            "marker": marker,
-            "secondary_marker": second_marker,
-            "changed_paths": changed,
-            "description": "small store plus pipeline header batch",
-        }
+        return finish(
+            {
+                "marker": marker,
+                "secondary_marker": second_marker,
+                "changed_paths": changed,
+                "description": "small store plus pipeline header batch",
+            }
+        )
     if name == "multi_file_small":
         changed.append(append_c_marker_function(repo_dir, "src/mcp/mcp.c", marker, 4105))
         second_marker = f"{marker}_test"
         changed.append(append_c_marker_function(repo_dir, "tests/test_mcp.c", second_marker, 4106))
-        return {
-            "marker": marker,
-            "secondary_marker": second_marker,
-            "changed_paths": changed,
-            "description": "small production plus test source batch",
-        }
-    raise ValueError(f"unknown self-dogfood scenario: {name}")
+        return finish(
+            {
+                "marker": marker,
+                "secondary_marker": second_marker,
+                "changed_paths": changed,
+                "description": "small production plus test source batch",
+            }
+        )
 
 
 def oracle_passed(tool_result: dict[str, Any], marker: str | None) -> bool:
@@ -4400,10 +4471,13 @@ def run_self_dogfood_case(
     binary: Path,
     case_root: Path,
     args: argparse.Namespace,
+    revision: str,
 ) -> dict[str, Any]:
     cache_dir = case_root / SELF_DOGFOOD_CACHE_SUBDIR
     cache_dir.mkdir(parents=True, exist_ok=True)
-    repo_dir = create_self_dogfood_worktree(source_repo, case_root, args.timeout)
+    repo_dir = create_self_dogfood_worktree(
+        source_repo, case_root, args.timeout, revision
+    )
     case_env = build_env(cache_dir)
     cleanup: dict[str, Any] = {"requested": not args.keep_work_root, "removed": False}
     result: dict[str, Any] | None = None
@@ -4514,6 +4588,16 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
     )
     work_root.mkdir(parents=True, exist_ok=True)
     source_repo = resolve_git_repo_root(Path(args.repo_root), args.timeout)
+    source_revision = command_stdout(
+        ["git", "rev-parse", f"{args.repo_revision}^{{commit}}"],
+        args.timeout,
+        source_repo,
+    )
+    source_tree = command_stdout(
+        ["git", "rev-parse", f"{source_revision}^{{tree}}"],
+        args.timeout,
+        source_repo,
+    )
     scenarios = [item.strip() for item in args.self_dogfood_scenarios.split(",") if item.strip()]
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
@@ -4522,6 +4606,15 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         "work_root": str(work_root),
         "source_repo": str(source_repo),
         "source_git": git_metadata(source_repo, args.timeout),
+        "repository_background": {
+            "repo": str(source_repo),
+            "revision": source_revision,
+            "tree": source_tree,
+            "source_dirty_status_short": command_stdout(
+                ["git", "status", "--short"], args.timeout, source_repo
+            ),
+            "copy_policy": "detached_worktree_from_exact_commit",
+        },
         "mode": "self_dogfood",
         "parameters": {
             "rank_refresh": args.rank_refresh,
@@ -4532,6 +4625,7 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
+            "repo_revision": source_revision,
         },
         "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
         "cases": [],
@@ -4540,7 +4634,12 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
     try:
         for scenario in scenarios:
             case = run_self_dogfood_case(
-                scenario, source_repo, binary, work_root / scenario, args
+                scenario,
+                source_repo,
+                binary,
+                work_root / scenario,
+                args,
+                source_revision,
             )
             report["cases"].append(case)
         report["derived"] = {
@@ -4683,6 +4782,14 @@ def parse_args() -> argparse.Namespace:
         "--self-dogfood",
         action="store_true",
         help="Run isolated edit-loop scenarios against a detached worktree of --repo-root.",
+    )
+    parser.add_argument(
+        "--repo-revision",
+        default="HEAD",
+        help=(
+            "Exact commit used for --self-dogfood detached worktrees. Campaigns should pass "
+            "a full hash so mutable source HEAD cannot change the measured corpus."
+        ),
     )
     parser.add_argument(
         "--matrix-scenarios",

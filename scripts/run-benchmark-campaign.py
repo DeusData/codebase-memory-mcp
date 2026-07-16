@@ -216,8 +216,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     index_mode = spec.get("index_mode", "fast")
     accepted_exit_codes = spec.get("accepted_exit_codes", [0])
     capability_quality = spec.get("capability_quality")
+    workload = spec.get("workload", "matrix")
     execution_order = spec.get("execution_order")
     quality_background = spec.get("quality_background")
+    repository_background = spec.get("repository_background")
     if not isinstance(harness_version, str) or not harness_version:
         raise ValueError("harness_version must be a non-empty string")
     if not isinstance(benchmark_script, str) or not benchmark_script:
@@ -238,6 +240,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         or "=" in capability_quality
     ):
         raise ValueError("capability_quality must be a non-empty argument value")
+    if workload not in {"matrix", "self_dogfood"}:
+        raise ValueError("workload must be matrix or self_dogfood")
+    if capability_quality is not None and workload != "matrix":
+        raise ValueError("capability_quality cannot be combined with a self_dogfood workload")
     if quality_background is not None:
         if capability_quality not in {"similarity", "semantic_edges"}:
             raise ValueError(
@@ -259,6 +265,27 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             "revision": background_revision,
             "tree": background_tree,
         }
+    if repository_background is not None:
+        if workload != "self_dogfood":
+            raise ValueError("repository_background requires workload self_dogfood")
+        if not isinstance(repository_background, dict):
+            raise ValueError("repository_background must be an object")
+        background_repo = repository_background.get("repo")
+        background_revision = repository_background.get("revision")
+        background_tree = repository_background.get("tree")
+        if not isinstance(background_repo, str) or not Path(background_repo).is_dir():
+            raise ValueError("repository_background.repo must be an existing directory")
+        if not isinstance(background_revision, str) or len(background_revision) != 40:
+            raise ValueError("repository_background.revision must be a full commit hash")
+        if not isinstance(background_tree, str) or len(background_tree) != 40:
+            raise ValueError("repository_background.tree must be a full tree hash")
+        repository_background = {
+            "repo": str(Path(background_repo).expanduser().resolve()),
+            "revision": background_revision,
+            "tree": background_tree,
+        }
+    elif workload == "self_dogfood":
+        raise ValueError("workload self_dogfood requires repository_background")
     if (
         not isinstance(accepted_exit_codes, list)
         or not accepted_exit_codes
@@ -277,6 +304,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     benchmark_sha256 = file_sha256(benchmark_path)
 
     candidates = _nonempty_list(spec.get("candidates"), "candidates")
+    candidate_labels = {
+        item.get("label") for item in candidates if isinstance(item, dict)
+    }
     profiles = _nonempty_list(spec.get("profiles"), "profiles")
     scenarios = (
         [{"name": f"{capability_quality}_quality"}]
@@ -341,6 +371,24 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"profiles[{profile_index}].config_profile is invalid")
             if not isinstance(capabilities, dict):
                 raise ValueError(f"profiles[{profile_index}].capabilities must be an object")
+            scoped_candidates = profile.get("candidate_labels")
+            if scoped_candidates is not None:
+                if (
+                    not isinstance(scoped_candidates, list)
+                    or not scoped_candidates
+                    or not all(isinstance(item, str) and item for item in scoped_candidates)
+                ):
+                    raise ValueError(
+                        f"profiles[{profile_index}].candidate_labels must be a non-empty string array"
+                    )
+                unknown_candidates = set(scoped_candidates) - candidate_labels
+                if unknown_candidates:
+                    raise ValueError(
+                        f"profiles[{profile_index}].candidate_labels contains unknown candidates: "
+                        f"{', '.join(sorted(unknown_candidates))}"
+                    )
+                if candidate_label not in scoped_candidates:
+                    continue
             overrides = _string_map(
                 profile.get("config_overrides"),
                 f"profiles[{profile_index}].config_overrides",
@@ -357,7 +405,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 scenario_name = scenario.get("name")
                 if not isinstance(scenario_name, str) or not scenario_name:
                     raise ValueError(f"scenarios[{scenario_index}].name is invalid")
-                if capability_quality is not None:
+                if capability_quality is not None or workload == "self_dogfood":
                     frontier_values: list[int | None] = [None]
                     cap_values: list[int | None] = [None]
                 else:
@@ -406,6 +454,26 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                             quality_background["revision"],
                                         )
                                     )
+                            elif workload == "self_dogfood":
+                                assert repository_background is not None
+                                command = [
+                                    str(benchmark_path),
+                                    "--binary",
+                                    str(binary),
+                                    "--self-dogfood",
+                                    "--repo-root",
+                                    repository_background["repo"],
+                                    "--repo-revision",
+                                    repository_background["revision"],
+                                    "--self-dogfood-scenarios",
+                                    scenario_name,
+                                    "--transport",
+                                    transport,
+                                    "--config-profile",
+                                    config_profile,
+                                    "--index-mode",
+                                    index_mode,
+                                ]
                             else:
                                 command = [
                                     str(benchmark_path),
@@ -437,7 +505,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 cap_label = str(exact_cap)
                             for key, value in sorted(overrides.items()):
                                 command.extend(("--config", f"{key}={value}"))
-                            if capability_quality is not None:
+                            if capability_quality is not None or workload == "self_dogfood":
                                 command.append("--include-logs")
                             command.extend(("--timeout", str(benchmark_timeout), "--out", "{result_path}"))
                             parameters = {
@@ -450,6 +518,13 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 parameters["capability_quality"] = capability_quality
                                 if quality_background is not None:
                                     parameters["quality_background"] = quality_background
+                                label = (
+                                    f"{candidate_label}.{profile_label}.{transport}."
+                                    f"{scenario_name}"
+                                )
+                            elif workload == "self_dogfood":
+                                assert repository_background is not None
+                                parameters["repository_background"] = repository_background
                                 label = (
                                     f"{candidate_label}.{profile_label}.{transport}."
                                     f"{scenario_name}"
@@ -670,6 +745,18 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(
                     f"background repository {key} mismatch: "
                     f"expected={expected_background.get(key)} actual={actual_background.get(key)}"
+                )
+    expected_repository = cell.get("parameters", {}).get("repository_background")
+    if expected_repository is not None:
+        actual_repository = result.get("repository_background")
+        if not isinstance(actual_repository, dict):
+            raise ValueError("benchmark result is missing repository_background identity")
+        for key in ("revision", "tree"):
+            if actual_repository.get(key) != expected_repository.get(key):
+                raise ValueError(
+                    f"repository background {key} mismatch: "
+                    f"expected={expected_repository.get(key)} "
+                    f"actual={actual_repository.get(key)}"
                 )
     return result
 

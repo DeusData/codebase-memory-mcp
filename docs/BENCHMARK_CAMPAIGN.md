@@ -104,6 +104,33 @@ latency, bytes, and estimated tokens. Natural-repository pairs outside the expli
 judgment set are retained as `unjudged`; incomplete natural ground truth never turns
 an unknown result into a false positive.
 
+For full-index, real-edit incremental, fresh-rebuild, query, response-size, and peak-RSS
+measurements on one pinned repository, use `"workload": "self_dogfood"` with an exact
+repository identity:
+
+```json
+{
+  "workload": "self_dogfood",
+  "repository_background": {
+    "repo": "/absolute/path/to/source-checkout",
+    "revision": "0123456789abcdef0123456789abcdef01234567",
+    "tree": "89abcdef0123456789abcdef0123456789abcdef"
+  },
+  "scenarios": [{"name": "route_handler"}]
+}
+```
+
+Each cell creates a detached worktree from the declared commit rather than mutable
+`HEAD`. The plan identity retains the repository revision and tree, and result
+validation rejects either mismatch. Use a scenario with an actual source edit when
+making incremental-index claims; `noop` measures invocation overhead only.
+
+Older candidates may not expose configuration flags added by a newer branch. A profile
+can therefore declare `"candidate_labels": ["latest"]` to restrict an ablation to
+candidates that accept it. Keep an unrestricted default profile for every candidate,
+and record fixed-default or unsupported capabilities in `capability_support`; do not
+pass an unknown flag to an old binary or pretend that its default is an ablation.
+
 Each semantic pair case also supplies a content-addressed replacement source. A real
 one-file mutation removes one judged positive and adds another, retaining pre/post
 source hashes and changed paths. The harness records initial, incremental, and fresh
