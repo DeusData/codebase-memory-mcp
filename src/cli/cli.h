@@ -319,11 +319,16 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
+/* Atomically apply a named, exact capability preset. Returns 0 on success and
+ * nonzero for an unknown preset or any transaction failure. */
+int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
+
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 #define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
+#define CBM_CONFIG_TOOL_MODE "tool_mode"
 #define CBM_DEFAULT_QUERY_MAX_ROWS 100000
 #define CBM_DEFAULT_QUERY_MAX_ROWS_STR "100000"
 

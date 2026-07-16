@@ -15,7 +15,10 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <depindex/depindex.h>
 #include <foundation/yaml.h>
+#include <pagerank/pagerank.h>
+#include <pipeline/pipeline.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -3782,6 +3785,38 @@ TEST(cli_config_persists) {
     PASS();
 }
 
+TEST(cli_config_presets_apply_exact_capability_sets) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "streamlined-quality"), 0);
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_TOOL_MODE, ""), "streamlined");
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, false));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, false));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, false));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, false));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, false));
+    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, false));
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "minimal-indexing"), 0);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, true));
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "unknown"), 0);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -4243,6 +4278,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
+    RUN_TEST(cli_config_presets_apply_exact_capability_sets);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32

@@ -75,12 +75,38 @@ codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config reset auto_index
 ```
 
-Current keys:
+Important keys (run `config list` for the complete registry):
 
 | Key | Default | Meaning |
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
+| `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
+| `auto_index_deps` | `true` | Index installed dependency APIs for cross-package search and tracing. |
+| `similarity_enabled` | `true` | Create MinHash similarity edges in applicable index modes. |
+| `semantic_edges_enabled` | `true` | Create semantic-related edges in applicable index modes. |
+| `githistory_enabled` | `true` | Create Git co-change coupling edges. |
+| `httplinks_enabled` | `true` | Link HTTP clients to discovered routes. |
+
+### Named presets
+
+Presets atomically apply exact capability sets, so a prior manual setting cannot
+silently leak into a comparison:
+
+```bash
+codebase-memory-mcp config preset list
+codebase-memory-mcp config preset apply streamlined-quality
+codebase-memory-mcp config preset apply classic-quality
+```
+
+`streamlined-quality` is the recommended default surface with all measured quality
+capabilities enabled. `classic-quality` changes only the API discovery surface while
+retaining those capabilities. The `rank-disabled`, `dependency-disabled`,
+`optional-graph-disabled`, and `minimal-indexing` presets are explicit ablations;
+the CLI labels them as quality tradeoffs when applied. Environment variables remain
+higher priority than stored preset values, and the command returns nonzero with a
+warning when an active override prevents the requested effective configuration.
 
 ## 3. UI Settings
 
