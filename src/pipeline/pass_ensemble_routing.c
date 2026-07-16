@@ -176,7 +176,7 @@ static ens_prod_def_t *parse_production_xml(const char *xml, const char *class_q
 }
 
 static char *read_file(const char *full_path) {
-    FILE *f = fopen(full_path, "rb");
+    FILE *f = cbm_fopen(full_path, "rb");
     if (!f)
         return NULL;
     fseek(f, 0, SEEK_END);
@@ -234,7 +234,7 @@ static int64_t find_entry_point(cbm_pipeline_ctx_t *ctx, const char *class_name)
         cbm_gbuf_find_by_name(ctx->gbuf, ENTRY_POINTS[ei], (const cbm_gbuf_node_t ***)&nodes,
                               &count);
         for (int ni = 0; ni < count; ni++) {
-            if (nodes[ni]->qualified_name && strstr(nodes[ni]->qualified_name, suffix))
+            if (nodes[ni]->qualified_name && strcmp(nodes[ni]->qualified_name, suffix) == 0)
                 return nodes[ni]->id;
         }
     }
@@ -422,6 +422,22 @@ static void collect_prod_defs(cbm_pipeline_ctx_t *ctx, ens_prod_def_t ***defs_ou
     *count_out = n;
 }
 
+/* True when haystack equals needle exactly, or ends with ".needle"
+ * (segment-anchored). Prevents "Ens" from matching "Ens.BusinessService". */
+static bool class_name_matches(const char *haystack, const char *needle) {
+    if (!haystack || !needle)
+        return false;
+    size_t hlen = strlen(haystack);
+    size_t nlen = strlen(needle);
+    if (nlen == 0)
+        return false;
+    if (hlen == nlen)
+        return strcmp(haystack, needle) == 0;
+    if (hlen > nlen && haystack[hlen - nlen - 1] == '.')
+        return strcmp(haystack + hlen - nlen, needle) == 0;
+    return false;
+}
+
 static bool method_belongs_to_production(const cbm_gbuf_node_t *method, const ens_prod_def_t *def) {
     if (!method->properties_json)
         return false;
@@ -429,7 +445,7 @@ static bool method_belongs_to_production(const cbm_gbuf_node_t *method, const en
     if (!jstr(method->properties_json, "parent_class", parent_class, sizeof(parent_class)))
         return false;
     for (int i = 0; i < def->n_items; i++) {
-        if (strstr(parent_class, def->items[i].class_name))
+        if (class_name_matches(parent_class, def->items[i].class_name))
             return true;
     }
     return false;
