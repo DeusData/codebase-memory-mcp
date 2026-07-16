@@ -418,6 +418,23 @@ TEST(java_class_extends_and_implements) {
     PASS();
 }
 
+TEST(java_enum_method) {
+    CBMFileResult *r = extract(
+        "enum Day {\n"
+        "    MON, TUE, WED, THU, FRI, SAT, SUN;\n\n"
+        "    public boolean isWeekend() { return this == SAT || this == SUN; }\n"
+        "    public String label() { return name().toLowerCase(); }\n"
+        "}\n",
+        CBM_LANG_JAVA, "t", "Day.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Enum", "Day"));
+    ASSERT(has_def(r, "Method", "isWeekend"));
+    ASSERT(has_def(r, "Method", "label"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* REPRODUCTION (RED until fixed) — Python `class Animal(Base):` must extract the
  * BARE base name "Base", but extract_base_classes captures the whole
  * `superclasses` argument_list text "(Base)" instead: collect_bases_from_field
@@ -4429,6 +4446,7 @@ SUITE(extraction) {
     RUN_TEST(java_method);
     RUN_TEST(java_interface);
     RUN_TEST(java_class_extends_and_implements);
+    RUN_TEST(java_enum_method);
     RUN_TEST(python_class_base_extracted_bare);
     RUN_TEST(php_class);
     RUN_TEST(php_function);
