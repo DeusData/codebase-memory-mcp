@@ -583,9 +583,10 @@ static const tool_def_t TOOLS[] = {
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
-     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
-     "}"},
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"],\"description\":\"update replaces "
+     "the entire ADR document; sections only lists existing headings\"},\"content\":{\"type\":\"string\","
+     "\"description\":\"Complete replacement document required by update\"}},\"additionalProperties\":false,"
+     "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
@@ -7689,6 +7690,28 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
         mode_str = heap_strdup("get");
     }
 
+    /* `sections` used to be advertised as an input argument, but it was never
+     * consumed: mode=update still replaced the whole document. Reject the old
+     * shape explicitly before opening a store so a stale client cannot mistake
+     * a whole-document replacement for a section-scoped update. */
+    bool has_sections_arg = false;
+    yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
+    if (args_doc) {
+        yyjson_val *args_root = yyjson_doc_get_root(args_doc);
+        has_sections_arg = args_root && yyjson_is_obj(args_root) &&
+                           yyjson_obj_get(args_root, "sections") != NULL;
+        yyjson_doc_free(args_doc);
+    }
+    if (has_sections_arg) {
+        free(project);
+        free(mode_str);
+        free(content);
+        return cbm_mcp_text_result(
+            "{\"status\":\"invalid_arguments\",\"error\":\"The sections argument is not an "
+            "update primitive and has been removed. No ADR write was performed.\"}",
+            true);
+    }
+
     /* ADRs are stored in the SQLite store (project_summaries), the SAME
      * backend the UI /api/adr endpoints use — so writes via the MCP tool and
      * the UI are visible to each other (#256). */
@@ -7753,6 +7776,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
         if (cbm_store_adr_store(store, project, content) == CBM_STORE_OK) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
+            yyjson_mut_obj_add_str(doc, root_obj, "semantics", "whole_document_replaced");
         } else {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
             is_error = true;
