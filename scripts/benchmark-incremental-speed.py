@@ -1708,6 +1708,21 @@ def response_freshness_state(data: dict[str, Any]) -> str:
     return state if isinstance(state, str) else ""
 
 
+def declared_stale_views(oracles: dict[str, Any]) -> list[str]:
+    """Return the sorted union of derived views explicitly reported stale."""
+    views: set[str] = set()
+    for oracle in oracles.values():
+        if not isinstance(oracle, dict):
+            continue
+        freshness = oracle.get("freshness")
+        if not isinstance(freshness, dict) or freshness.get("state") != "stale_with_warning":
+            continue
+        stale = freshness.get("stale_views")
+        if isinstance(stale, list):
+            views.update(item for item in stale if isinstance(item, str) and item)
+    return sorted(views)
+
+
 def is_incremental_publish_kind(publish_kind: str) -> bool:
     return publish_kind in {
         PUBLISH_INCREMENTAL_NOOP,
@@ -2485,30 +2500,37 @@ CANONICAL_NODES_SQL = (
     ")), '')"
 )
 
-CANONICAL_EDGES_SQL = (
-    "SELECT quote(s.label) || char(9) || quote(s.qualified_name) || char(9) || "
-    "quote(coalesce(s.file_path,'')) || char(9) || s.start_line || char(9) || "
-    "s.end_line || char(9) || quote(t.label) || char(9) || quote(t.qualified_name) || "
-    "char(9) || quote(coalesce(t.file_path,'')) || char(9) || t.start_line || char(9) || "
-    "t.end_line || char(9) || quote(e.type) || char(9) || "
-    "COALESCE((SELECT group_concat(item, char(30)) FROM ("
-    "SELECT quote(je.key) || '=' || je.type || '=' || "
-    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
-    "FROM json_each(e.properties) AS je "
-    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
-    ")), '') "
-    "FROM edges e "
-    "JOIN nodes s ON s.id = e.source_id "
-    "JOIN nodes t ON t.id = e.target_id "
-    "WHERE e.project = ?1 "
-    "ORDER BY s.label, s.qualified_name, coalesce(s.file_path,''), s.start_line, s.end_line, "
-    "t.label, t.qualified_name, coalesce(t.file_path,''), t.start_line, t.end_line, "
-    "e.type, COALESCE((SELECT group_concat(item, char(30)) FROM ("
-    "SELECT quote(je.key) || '=' || je.type || '=' || "
-    "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
-    "FROM json_each(e.properties) AS je "
-    "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
-    ")), '')"
+def build_canonical_edges_sql(edge_predicate: str = "") -> str:
+    return (
+        "SELECT quote(s.label) || char(9) || quote(s.qualified_name) || char(9) || "
+        "quote(coalesce(s.file_path,'')) || char(9) || s.start_line || char(9) || "
+        "s.end_line || char(9) || quote(t.label) || char(9) || quote(t.qualified_name) || "
+        "char(9) || quote(coalesce(t.file_path,'')) || char(9) || t.start_line || char(9) || "
+        "t.end_line || char(9) || quote(e.type) || char(9) || "
+        "COALESCE((SELECT group_concat(item, char(30)) FROM ("
+        "SELECT quote(je.key) || '=' || je.type || '=' || "
+        "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+        "FROM json_each(e.properties) AS je "
+        "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+        ")), '') "
+        "FROM edges e "
+        "JOIN nodes s ON s.id = e.source_id "
+        "JOIN nodes t ON t.id = e.target_id "
+        f"WHERE e.project = ?1 {edge_predicate}"
+        "ORDER BY s.label, s.qualified_name, coalesce(s.file_path,''), s.start_line, s.end_line, "
+        "t.label, t.qualified_name, coalesce(t.file_path,''), t.start_line, t.end_line, "
+        "e.type, COALESCE((SELECT group_concat(item, char(30)) FROM ("
+        "SELECT quote(je.key) || '=' || je.type || '=' || "
+        "COALESCE(quote(CAST(je.value AS TEXT)), 'NULL') AS item "
+        "FROM json_each(e.properties) AS je "
+        "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
+        ")), '')"
+    )
+
+
+CANONICAL_EDGES_SQL = build_canonical_edges_sql()
+CANONICAL_EDGES_WITHOUT_SEMANTIC_SQL = build_canonical_edges_sql(
+    "AND e.type <> 'SEMANTICALLY_RELATED' "
 )
 
 CANONICAL_HASHES_SQL = (
@@ -2724,6 +2746,40 @@ def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict
     return {"equal": True}
 
 
+def compare_graph_excluding_declared_stale_views(
+    left_db: Path,
+    right_db: Path,
+    project: str,
+    stale_views: list[str],
+) -> dict[str, Any] | None:
+    """Verify strict graph equality after excluding only explicitly stale derived rows."""
+    if "semantic_edges" not in stale_views:
+        return None
+    excluded_edge_types = ["SEMANTICALLY_RELATED"]
+    for kind, sql in (
+        ("canonical nodes excluding declared stale views", CANONICAL_NODES_SQL),
+        (
+            "canonical edges excluding declared stale views",
+            CANONICAL_EDGES_WITHOUT_SEMANTIC_SQL,
+        ),
+        ("file hashes excluding declared stale views", CANONICAL_HASHES_SQL),
+    ):
+        result = compare_query_rows(
+            left_db, right_db, kind, sql, (project,), sql, (project,)
+        )
+        if not result["equal"]:
+            return {
+                **result,
+                "declared_stale_views": stale_views,
+                "excluded_edge_types": excluded_edge_types,
+            }
+    return {
+        "equal": True,
+        "declared_stale_views": stale_views,
+        "excluded_edge_types": excluded_edge_types,
+    }
+
+
 def compare_active_overlay_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
     left_params = (
         OVERLAY_STATUS_READY,
@@ -2749,6 +2805,7 @@ def graph_gate_for_publish_kind(
     publish_kind: str | None,
     oracle_passed: bool | None = None,
     active_overlay: dict[str, Any] | None = None,
+    freshness_scoped: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     canonical_equal = bool(canonical.get("equal"))
     active_overlay_equal = bool(active_overlay and active_overlay.get("equal"))
@@ -2771,6 +2828,19 @@ def graph_gate_for_publish_kind(
             "reason": (
                 "overlay publish leaves canonical rows unchanged; self-dogfood gates "
                 "on active read oracles and freshness metadata"
+            ),
+        }
+    if freshness_scoped is not None and freshness_scoped.get("equal") is True:
+        return {
+            "passed": True,
+            "policy": "declared_stale_derived_views",
+            "canonical_equal": canonical_equal,
+            "freshness_scoped_equal": True,
+            "declared_stale_views": freshness_scoped.get("declared_stale_views", []),
+            "excluded_edge_types": freshness_scoped.get("excluded_edge_types", []),
+            "reason": (
+                "the full graph intentionally retains declared-stale derived rows; "
+                "all non-stale canonical rows equal the fresh graph"
             ),
         }
     return {
@@ -4553,6 +4623,10 @@ def run_self_dogfood_case(
             )
         full_db = find_project_db(cache_dir)
         canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
+        stale_views = declared_stale_views(oracles)
+        freshness_scoped = compare_graph_excluding_declared_stale_views(
+            incremental_snapshot, full_db, project, stale_views
+        )
         publish_kind = incremental.get("publish_kind")
         incremental_reason = incremental.get("exact_reason")
         active_overlay = None
@@ -4565,6 +4639,7 @@ def run_self_dogfood_case(
             str(publish_kind or ""),
             bool(oracles.get("passed")),
             active_overlay=active_overlay,
+            freshness_scoped=freshness_scoped,
         )
         passed = bool(graph_gate.get("passed")) and explicit_route and bool(oracles.get("passed"))
         result = {
@@ -4577,6 +4652,7 @@ def run_self_dogfood_case(
             "incremental": incremental,
             "fresh_fast_full_after_change": full_rebuild,
             "canonical_graph": canonical,
+            "freshness_scoped_graph": freshness_scoped,
             "active_overlay_graph": active_overlay,
             "graph_gate": graph_gate,
             "oracles": oracles,

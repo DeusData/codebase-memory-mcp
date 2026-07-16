@@ -196,6 +196,15 @@ post-mutation judged pair set and edge scores identically to a fresh rebuild wit
 a stale warning. Compare both profiles when selecting a latency/freshness Pareto
 point.
 
+Large mutation reports keep Core graph and Full graph freshness separate. A
+`PASS: DECLARED STALE VIEWS` decision requires structured `stale_with_warning`
+metadata and a second canonical comparison that excludes only the declared
+`SEMANTICALLY_RELATED` rows. Every remaining node, edge, property, and file hash
+must still equal the matching fresh rebuild. An undeclared difference—or any
+non-semantic difference—remains a core correctness failure. Full graph freshness
+stays zero until the unfiltered graphs match, so the latency/freshness tradeoff is
+visible rather than relabeled as full equality.
+
 The lowest-cost indexing baseline also disables installed-package indexing and is:
 
 ```text
