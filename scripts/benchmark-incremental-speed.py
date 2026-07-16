@@ -39,6 +39,22 @@ DEFAULT_LIST_PROJECT_COUNTS = "1,16,64"
 DEFAULT_LIST_PROJECT_FIXTURE_MAX_MB = 512
 LIST_PROJECT_DISK_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 LIST_PROJECT_DISK_RESERVE_FRACTION = 0.05
+SEARCH_PROJECTION_INTERNAL_FIELDS = frozenset({"fp", "sp", "bt"})
+SEARCH_PROJECTION_CORE_FIELDS = frozenset(
+    {
+        "name",
+        "qualified_name",
+        "label",
+        "file_path",
+        "pagerank",
+        "in_degree",
+        "out_degree",
+        "source",
+        "package",
+        "read_only",
+        "connected",
+    }
+)
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
 CONFIG_PROFILE_DEFAULT = "default"
 CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
@@ -168,6 +184,20 @@ def now_ms() -> float:
 def write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def go_file_content(index: int, revision: int, funcs_per_file: int) -> str:
@@ -698,6 +728,39 @@ def canonical_response_bytes(data: dict[str, Any]) -> bytes:
 def estimate_response_tokens(payload: bytes) -> int:
     """Return a deterministic, dependency-free byte/4 token estimate."""
     return (len(payload) + 3) // 4
+
+
+def build_search_projection_observation(
+    variant: str,
+    data: dict[str, Any],
+    mcp_envelope_bytes: int,
+    elapsed_ms: float,
+    transport_survived: bool,
+) -> dict[str, Any]:
+    results = data.get("results")
+    typed_results = [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
+    result_keys = {str(key) for item in typed_results for key in item}
+    property_fields = sorted(result_keys - SEARCH_PROJECTION_CORE_FIELDS)
+    internal_fields = sorted(result_keys & SEARCH_PROJECTION_INTERNAL_FIELDS)
+    qualified_names = [
+        str(item["qualified_name"])
+        for item in typed_results
+        if isinstance(item.get("qualified_name"), str)
+    ]
+    payload = canonical_response_bytes(data)
+    return {
+        "variant": variant,
+        "returned_count": len(typed_results),
+        "qualified_names": qualified_names,
+        "property_fields": property_fields,
+        "internal_fields": internal_fields,
+        "response_bytes": len(payload),
+        "response_token_estimate": estimate_response_tokens(payload),
+        "mcp_envelope_bytes": mcp_envelope_bytes,
+        "elapsed_ms": round(elapsed_ms, 3),
+        "transport_survived": transport_survived,
+        "passed": isinstance(results, list) and not internal_fields and transport_survived,
+    }
 
 
 def process_rss_kb(pid: int) -> int | None:
@@ -1238,13 +1301,167 @@ def run_list_projects_scaling(
         if args.out:
             out_path = Path(args.out).expanduser()
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            temporary_out = out_path.with_name(f".{out_path.name}.{os.getpid()}.tmp")
-            try:
-                write_text(temporary_out, rendered)
-                os.replace(temporary_out, out_path)
-            finally:
-                if temporary_out.exists():
-                    temporary_out.unlink()
+            atomic_write_text(out_path, rendered)
+        print(rendered, end="")
+    return report, exit_code
+
+
+def run_search_projection(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+    if args.search_projection_results <= 0:
+        raise ValueError("search projection results must be positive")
+    auto_root = not bool(args.work_root)
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="cbm-search-projection-"))
+    )
+    cache_dir = work_root / "cache"
+    repo_dir = work_root / "repo"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    generated_at = datetime.now(timezone.utc)
+    metadata = binary_metadata(binary)
+    report: dict[str, Any] = {
+        "schema_version": 1,
+        "run_id": (
+            f"search-projection-{generated_at.strftime('%Y%m%dT%H%M%SZ')}-"
+            f"{metadata['sha256'][:12]}-{os.getpid()}"
+        ),
+        "generated_at_utc": generated_at.isoformat(),
+        "binary_metadata": metadata,
+        "source_revision": git_metadata(Path(__file__).resolve().parents[1], args.timeout),
+        "mode": "search_projection",
+        "parameters": {
+            "requested_results": args.search_projection_results,
+            "format": "json",
+            "index_mode": "fast",
+            "config_profile": CONFIG_PROFILE_MINIMAL_INDEXING,
+            "process_isolation": "fresh_mcp_server_per_variant",
+            "token_estimator": TOKEN_ESTIMATOR,
+            "rss_measurement": "post_call_resident_kb_not_peak",
+        },
+        "work_root": str(work_root),
+        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "observations": [],
+        "completion": {"status": "running"},
+    }
+    variants: tuple[tuple[str, dict[str, Any]], ...] = (
+        ("compact_default", {}),
+        ("compact_true", {"compact": True}),
+        (
+            "compact_selected_fields",
+            {"compact": True, "fields": ["complexity", "signature"]},
+        ),
+        ("compact_false", {"compact": False}),
+    )
+    exit_code = 1
+    try:
+        file_count = min(4, args.search_projection_results)
+        funcs_per_file = math.ceil(args.search_projection_results / file_count)
+        create_repo(repo_dir, file_count, funcs_per_file)
+        env = build_env(cache_dir)
+        env.pop("CBM_PROFILE", None)
+        apply_config_overrides(
+            binary, env, CONFIG_PROFILES[CONFIG_PROFILE_MINIMAL_INDEXING], args.timeout
+        )
+        with McpClient(binary, env, args.timeout) as client:
+            index_result, _, _, _ = client.call_tool(
+                "index_repository",
+                {**index_tool_arguments(repo_dir, "fast"), "auto_index_deps": False},
+            )
+        project = str(index_result.get("project") or "")
+        if not project:
+            raise RuntimeError("projection fixture index response omitted project")
+
+        for variant, overrides in variants:
+            arguments: dict[str, Any] = {
+                "project": project,
+                "name_pattern": "Func",
+                "limit": args.search_projection_results,
+                "sort_by": "name",
+                "include_dependencies": False,
+                "format": "json",
+                **overrides,
+            }
+            client = McpClient(binary, env, args.timeout)
+            with client:
+                data, _, envelope_bytes, elapsed_ms = client.call_tool(
+                    "search_graph", arguments
+                )
+                tools_response = client._request("tools/list", {})
+                transport_survived = isinstance(tools_response.get("result"), dict)
+                rss_kb = process_rss_kb(client.proc.pid) if client.proc else None
+            server_reaped = (
+                client.proc is None
+                and client.stdout_thread is None
+                and client.stderr_thread is None
+            )
+            observation = build_search_projection_observation(
+                variant, data, envelope_bytes, elapsed_ms, transport_survived
+            )
+            observation["post_call_rss_kb"] = rss_kb
+            observation["server_reaped"] = server_reaped
+            observation["passed"] = bool(observation["passed"] and server_reaped)
+            report["observations"].append(observation)
+
+        observations = report["observations"]
+        baseline_names = observations[0]["qualified_names"]
+        by_variant = {item["variant"]: item for item in observations}
+        for observation in observations:
+            observation["identity_equal_to_default"] = (
+                observation["qualified_names"] == baseline_names
+            )
+            fields = set(observation["property_fields"])
+            variant = observation["variant"]
+            if variant in {"compact_default", "compact_true"}:
+                projection_met = not fields
+            elif variant == "compact_selected_fields":
+                projection_met = bool(fields) and fields <= {"complexity", "signature"}
+            else:
+                projection_met = bool(fields)
+            observation["projection_contract_met"] = projection_met
+            observation["passed"] = bool(
+                observation["passed"]
+                and observation["identity_equal_to_default"]
+                and projection_met
+            )
+        compact_bytes = int(by_variant["compact_true"]["response_bytes"])
+        selected_bytes = int(by_variant["compact_selected_fields"]["response_bytes"])
+        verbose_bytes = int(by_variant["compact_false"]["response_bytes"])
+        report["derived"] = {
+            "passed": all(bool(item["passed"]) for item in observations),
+            "identity_parity": all(
+                bool(item["identity_equal_to_default"]) for item in observations
+            ),
+            "internal_fields_absent": all(not item["internal_fields"] for item in observations),
+            "compact_bytes": compact_bytes,
+            "selected_fields_bytes": selected_bytes,
+            "non_compact_bytes": verbose_bytes,
+            "non_compact_over_compact_ratio": (
+                round(verbose_bytes / compact_bytes, 3) if compact_bytes else None
+            ),
+            "projection_order_expected": compact_bytes <= selected_bytes <= verbose_bytes,
+            "claim_boundary": (
+                "Measures response projection for identical ranked results after one small FAST "
+                "index; one latency observation per variant is descriptive only."
+            ),
+        }
+        report["derived"]["passed"] = bool(
+            report["derived"]["passed"] and report["derived"]["projection_order_expected"]
+        )
+        exit_code = 0 if report["derived"]["passed"] else 1
+        report["completion"] = {"status": "complete", "exit_code": exit_code}
+    except Exception as exc:
+        record_report_error(report, exc)
+        report["completion"] = {"status": "failed", "exit_code": 1}
+        exit_code = 1
+    finally:
+        if auto_root and not args.keep_work_root:
+            shutil.rmtree(work_root, ignore_errors=True)
+            report["cleanup"]["removed"] = not work_root.exists()
+        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
+        if args.out:
+            atomic_write_text(Path(args.out).expanduser(), rendered)
         print(rendered, end="")
     return report, exit_code
 
@@ -3392,6 +3609,20 @@ def parse_args() -> argparse.Namespace:
         help="Hard disk cap for cloned list-project fixtures before any clone is created.",
     )
     parser.add_argument(
+        "--search-projection",
+        action="store_true",
+        help=(
+            "Compare compact default/true, selected fields, and compact=false JSON projection "
+            "for identical ranked results."
+        ),
+    )
+    parser.add_argument(
+        "--search-projection-results",
+        type=int,
+        default=30,
+        help="Bounded matching result count for --search-projection.",
+    )
+    parser.add_argument(
         "--capability-quality",
         choices=CAPABILITY_QUALITY_CASES,
         default="",
@@ -3488,6 +3719,9 @@ def main() -> int:
     if args.list_projects_scaling:
         _, list_exit_code = run_list_projects_scaling(args, binary)
         return list_exit_code
+    if args.search_projection:
+        _, projection_exit_code = run_search_projection(args, binary)
+        return projection_exit_code
     if args.mcp_surface_parity:
         _, surface_exit_code = run_mcp_surface_parity(args, binary)
         return surface_exit_code

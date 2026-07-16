@@ -13,6 +13,30 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_search_projection_observation_separates_identity_and_property_fields(self) -> None:
+        data = {
+            "results": [
+                {
+                    "qualified_name": "fixture.Func0000_00",
+                    "label": "Function",
+                    "file_path": "pkg/file_0000.go",
+                    "source": "project",
+                    "complexity": 1,
+                    "fp": "opaque",
+                }
+            ]
+        }
+
+        observation = BENCHMARK.build_search_projection_observation(
+            "compact_fields", data, 400, 2.5, True
+        )
+
+        self.assertEqual(observation["qualified_names"], ["fixture.Func0000_00"])
+        self.assertEqual(observation["property_fields"], ["complexity", "fp"])
+        self.assertEqual(observation["internal_fields"], ["fp"])
+        self.assertFalse(observation["passed"])
+        self.assertEqual(observation["response_bytes"], len(BENCHMARK.canonical_response_bytes(data)))
+
     def test_parse_list_project_counts_requires_strictly_increasing_positive_values(self) -> None:
         self.assertEqual(BENCHMARK.parse_list_project_counts("1,16,64"), [1, 16, 64])
         for invalid in ("", "0,1", "1,1", "16,1", "1,two"):
