@@ -72,6 +72,7 @@ CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
 CONFIG_PROFILE_DEPENDENCY_DISABLED = "dependency_disabled"
 CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER = "incremental_semantic_freshness_eager"
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
+DERIVED_REFRESH_CANDIDATE_DEFAULT = "candidate_default"
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_DEFAULT: {},
     CONFIG_PROFILE_RANK_DISABLED: {"rank_enabled": "false"},
@@ -3951,9 +3952,9 @@ def evaluate_pair_incremental_policy(
     canonical_graph: dict[str, Any],
     pair_equality: dict[str, Any],
 ) -> dict[str, Any]:
-    policy = config_overrides.get(
-        "incremental_derived_refresh", "stale_on_incremental"
-    )
+    explicit_policy = config_overrides.get("incremental_derived_refresh")
+    policy = explicit_policy or DERIVED_REFRESH_CANDIDATE_DEFAULT
+    policy_source = "explicit_override" if explicit_policy else "candidate_default"
     warnings = incremental_oracles.get("edge_query", {}).get("response", {}).get(
         "warnings", []
     )
@@ -3963,28 +3964,56 @@ def evaluate_pair_incremental_policy(
         and "semantic_edges derived view is stale" in warning
         for warning in warnings
     )
-    immediate_freshness_met = bool(
-        incremental_oracles.get("passed")
-        and canonical_graph.get("equal")
-        and pair_equality.get("passed")
+    pair_freshness_met = bool(
+        incremental_oracles.get("passed") and pair_equality.get("passed")
     )
-    immediate_freshness_expected = policy == "eager"
-    policy_conformance_met = (
-        immediate_freshness_met and not stale_warning_present
-        if immediate_freshness_expected
-        else immediate_freshness_met or stale_warning_present
-    )
+    immediate_freshness_met = bool(pair_freshness_met and canonical_graph.get("equal"))
+    if explicit_policy:
+        immediate_freshness_expected: bool | None = policy == "eager"
+        policy_conformance_met = (
+            immediate_freshness_met and not stale_warning_present
+            if immediate_freshness_expected
+            else immediate_freshness_met or stale_warning_present
+        )
+        observed_behavior = (
+            "immediate_full_freshness"
+            if immediate_freshness_met and not stale_warning_present
+            else "deferred_with_warning"
+            if stale_warning_present
+            else "unreported_stale"
+        )
+    elif stale_warning_present:
+        immediate_freshness_expected = False
+        policy_conformance_met = True
+        observed_behavior = "deferred_with_warning"
+    elif pair_freshness_met:
+        immediate_freshness_expected = True
+        policy_conformance_met = True
+        observed_behavior = (
+            "immediate_full_freshness"
+            if immediate_freshness_met
+            else "immediate_pair_freshness"
+        )
+    else:
+        immediate_freshness_expected = None
+        policy_conformance_met = False
+        observed_behavior = "unreported_stale"
     return {
         "policy": policy,
+        "policy_source": policy_source,
+        "observed_behavior": observed_behavior,
         "publish_kind": incremental_index.get("publish_kind"),
         "immediate_freshness_expected": immediate_freshness_expected,
+        "pair_freshness_met": pair_freshness_met,
         "immediate_freshness_met": immediate_freshness_met,
         "stale_warning_present": stale_warning_present,
         "policy_conformance_met": policy_conformance_met,
         "interpretation": (
             "eager policy requires canonical fresh semantic/similarity results"
-            if immediate_freshness_expected
-            else "deferred policy may publish a stale derived view only with an explicit warning"
+            if explicit_policy == "eager"
+            else "explicit deferred policy requires a stale warning or canonical freshness"
+            if explicit_policy
+            else "candidate default is classified from observed pair freshness and warnings"
         ),
     }
 
