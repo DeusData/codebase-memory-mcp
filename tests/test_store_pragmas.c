@@ -86,6 +86,33 @@ TEST(store_open_with_mmap_disabled) {
     PASS();
 }
 
+/* #1083: on-disk write connections must bound the WAL via journal_size_limit
+ * so a checkpoint-starved log is physically reclaimed once a checkpoint can
+ * reset it. On main this is UNSET (-1 = unlimited), so the -wal file only ever
+ * grows (all our checkpoints are PASSIVE and never ftruncate). Read the pragma
+ * back on the SAME connection — it's per-connection and not persisted. */
+TEST(journal_size_limit_bounds_wal_issue1083) {
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_test_jsl_%d.db", cbm_tmpdir(), (int)getpid());
+    unlink(tmp_path);
+
+    cbm_store_t *s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    /* 256 MiB — far above the healthy WAL (~4 MiB), so no truncate/regrow churn
+     * in normal operation; it only fires after abnormal (starved) growth. */
+    ASSERT(cbm_store_journal_size_limit(s) == (int64_t)268435456);
+    cbm_store_close(s);
+
+    unlink(tmp_path);
+    char tmp_wal[300];
+    char tmp_shm[300];
+    snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+    snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+    unlink(tmp_wal);
+    unlink(tmp_shm);
+    PASS();
+}
+
 
 /* #896: a row-scan that dies mid-stream (SQLITE_CORRUPT) must surface a
  * loud store error, not masquerade as a clean end of results. Counts are
@@ -179,6 +206,7 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
 }
 
 SUITE(store_pragmas) {
+    RUN_TEST(journal_size_limit_bounds_wal_issue1083);
     RUN_TEST(corrupt_page_scan_returns_error_not_truncation);
     RUN_TEST(mmap_size_default_when_unset);
     RUN_TEST(mmap_size_zero_disables_mmap);
