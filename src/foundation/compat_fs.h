@@ -38,6 +38,11 @@ void cbm_closedir(cbm_dir_t *d);
 
 FILE *cbm_popen(const char *cmd, const char *mode);
 int cbm_pclose(FILE *f);
+#ifdef _WIN32
+/* Spawn an argv vector directly while capturing stdout through the same
+ * isolated handle-inheritance path as cbm_popen. */
+FILE *cbm_popen_argv(const char *const *argv);
+#endif
 
 /* ── File operations ──────────────────────────────────────────── */
 

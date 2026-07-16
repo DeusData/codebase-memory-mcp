@@ -203,8 +203,9 @@ TEST(path_arg_matches_client_runtime) {
     char path[128];
 #ifdef _WIN32
     client.uses_posix_paths = true;
-    ASSERT_TRUE(cbm_svn_format_path_arg(&client, "D:\\workspace\\project", path, sizeof(path)));
-    ASSERT_STR_EQ(path, "/d/workspace/project");
+    ASSERT_TRUE(
+        cbm_svn_format_path_arg(&client, "D:\\R&D\\%project%", path, sizeof(path)));
+    ASSERT_STR_EQ(path, "/d/R&D/%project%");
 #else
     ASSERT_TRUE(cbm_svn_format_path_arg(&client, "/workspace/project", path, sizeof(path)));
     ASSERT_STR_EQ(path, "/workspace/project");
@@ -220,8 +221,12 @@ TEST(client_runtime_detection_is_case_insensitive) {
 
 TEST(real_probe_tracks_repeated_working_copy_edits) {
     th_svn_fixture_t fixture;
-    ASSERT_EQ(th_svn_fixture_init(&fixture, "cbm_svn_probe", "source.c", "int value = 1;\n"),
-              0);
+#ifdef _WIN32
+    const char *prefix = "cbm_svn_probe_%_and&";
+#else
+    const char *prefix = "cbm_svn_probe";
+#endif
+    ASSERT_EQ(th_svn_fixture_init(&fixture, prefix, "source.c", "int value = 1;\n"), 0);
     cbm_svn_observation_t non_working_copy = {0};
     ASSERT_EQ(cbm_svn_probe(&fixture.client, fixture.root, &non_working_copy),
               CBM_SVN_PROBE_NOT_WORKING_COPY);

@@ -192,7 +192,8 @@ static wchar_t *cbm_resolve_comspec(void) {
 
 /* On failure returns NULL with *stage naming the failing step and *gle the
  * GetLastError value captured at that step (0 when errno is the signal). */
-static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle) {
+static FILE *cbm_popen_isolated(const char *cmd, const char *const *argv, const char **stage,
+                                DWORD *gle) {
     *stage = "";
     *gle = 0;
     InitOnceExecuteOnce(&g_popen_once, cbm_popen_init, NULL, NULL);
@@ -246,12 +247,19 @@ static FILE *cbm_popen_isolated(const char *cmd, const char **stage, DWORD *gle)
     si.StartupInfo.hStdError = nul;
     si.lpAttributeList = attr;
 
-    /* Run through cmd.exe /c so command quoting and `2>NUL` behave as under
-     * _popen. The command line is heap-composed (no fixed-size truncation)
-     * and widened via UTF-8 so non-ASCII repo paths survive intact. */
-    wchar_t *app = cbm_resolve_comspec();
+    /* Shell commands run through cmd.exe /c for _popen compatibility. Argv
+     * callers bypass the shell and pin the requested executable directly.
+     * Both paths use heap-composed UTF-8 command lines so non-ASCII paths
+     * survive intact. */
+    wchar_t *app = NULL;
     wchar_t *wcmdline = NULL;
-    if (app) {
+    if (argv) {
+        app = cbm_utf8_to_wide(argv[0]);
+        wcmdline = cbm_build_cmdline(argv);
+    } else {
+        app = cbm_resolve_comspec();
+    }
+    if (app && !argv) {
         size_t u8len = strlen(cmd) + sizeof("cmd.exe /c ");
         char *u8 = (char *)malloc(u8len);
         if (u8) {
@@ -334,7 +342,7 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
     if (mode && mode[0] == 'r' && mode[1] == '\0') {
         const char *stage = "";
         DWORD gle = 0;
-        FILE *fp = cbm_popen_isolated(cmd, &stage, &gle);
+        FILE *fp = cbm_popen_isolated(cmd, NULL, &stage, &gle);
         g_popen_last_isolated = (fp != NULL);
         if (!fp) {
             char glebuf[CBM_SZ_16];
@@ -348,6 +356,24 @@ FILE *cbm_popen(const char *cmd, const char *mode) {
     }
     g_popen_last_isolated = 0;
     return _popen(cmd, mode);
+}
+
+FILE *cbm_popen_argv(const char *const *argv) {
+    if (!argv || !argv[0] || !argv[0][0]) {
+        return NULL;
+    }
+    const char *stage = "";
+    DWORD gle = 0;
+    FILE *fp = cbm_popen_isolated(NULL, argv, &stage, &gle);
+    g_popen_last_isolated = (fp != NULL);
+    if (!fp) {
+        char glebuf[CBM_SZ_16];
+        char errnobuf[CBM_SZ_16];
+        snprintf(glebuf, sizeof(glebuf), "%lu", (unsigned long)gle);
+        snprintf(errnobuf, sizeof(errnobuf), "%d", errno);
+        cbm_log_warn("compat.popen_argv_failed", "stage", stage, "gle", glebuf, "errno", errnobuf);
+    }
+    return fp;
 }
 
 int cbm_pclose(FILE *f) {

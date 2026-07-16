@@ -1019,22 +1019,27 @@ cbm_svn_probe_result_t cbm_svn_client_init(const char *root_path, cbm_svn_client
 
 cbm_svn_probe_result_t cbm_svn_probe(const cbm_svn_client_t *client, const char *root_path,
                                      cbm_svn_observation_t *observation) {
-    if (!client || !client->executable[0] || !root_path || !observation ||
-        !cbm_validate_shell_arg(client->executable) || !cbm_validate_shell_arg(root_path)) {
+    if (!client || !client->executable[0] || !root_path || !observation) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
     char status_root[CBM_SZ_4K];
-    if (!cbm_svn_format_path_arg(client, root_path, status_root, sizeof(status_root)) ||
-        !cbm_validate_shell_arg(status_root)) {
+    if (!cbm_svn_format_path_arg(client, root_path, status_root, sizeof(status_root))) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
 #ifdef _WIN32
-    /* cbm_popen routes through cmd.exe, where percent expansion occurs even
-     * inside double quotes. Fail closed until this leaf can use argv capture. */
-    if (strchr(client->executable, '%') || strchr(status_root, '%')) {
+    char peg_root[CBM_SZ_8K];
+    int peg_length = snprintf(peg_root, sizeof(peg_root), "%s@", status_root);
+    if (peg_length < 0 || (size_t)peg_length >= sizeof(peg_root)) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
-#endif
+    const char *argv[] = {
+        client->executable,  "status", "--xml",  "--verbose", "--no-ignore", "--depth", "infinity",
+        "--non-interactive", "--",     peg_root, NULL};
+    FILE *process = cbm_popen_argv(argv);
+#else
+    if (!cbm_validate_shell_arg(client->executable) || !cbm_validate_shell_arg(status_root)) {
+        return CBM_SVN_PROBE_UNCERTAIN;
+    }
     char command[CBM_SZ_16K];
     int written = snprintf(command, sizeof(command),
                            "\"%s\" status --xml --verbose --no-ignore --depth infinity "
@@ -1043,8 +1048,8 @@ cbm_svn_probe_result_t cbm_svn_probe(const cbm_svn_client_t *client, const char 
     if (written < 0 || (size_t)written >= sizeof(command)) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
-
     FILE *process = cbm_popen(command, "r");
+#endif
     if (!process) {
         return CBM_SVN_PROBE_UNCERTAIN;
     }
