@@ -33,6 +33,8 @@ enum {
     MCP_CONTENT_PREFIX = SLEN(MCP_CONTENT_HEADER),
     MCP_RETURN_2 = 2,
     MCP_TOOLS_PAGE_SIZE = 8,
+    MCP_PROJECTS_PAGE_SIZE = 50,
+    MCP_PROJECTS_PAGE_MAX = 200,
 };
 #define MCP_MS_TO_US 1000LL
 #define MCP_S_TO_US 1000000LL
@@ -1249,8 +1251,17 @@ static const tool_def_t TOOLS[] = {
      "\"},\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\"}},\"required\":["
      "\"pattern\"]}"},
 
-    {"list_projects", "List projects", "List all indexed projects",
-     "{\"type\":\"object\",\"properties\":{}}"},
+    {"list_projects", "List projects",
+     "List indexed projects in stable bounded pages. Follow next_offset while has_more=true; "
+     "all=true restores the legacy unbounded inventory only when explicitly needed.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"limit\":{\"type\":\"integer\",\"default\":50,\"minimum\":1,\"maximum\":200,"
+     "\"description\":\"Projects per page (default 50, maximum 200).\"},"
+     "\"offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0,"
+     "\"description\":\"Skip this many valid projects; use next_offset from the prior page.\"},"
+     "\"all\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Explicit compatibility path returning the full inventory; ignores "
+     "limit/offset and may be slow or large.\"}}}"},
 
     {"delete_project", "Delete project", "Delete a project from the index",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
@@ -3832,16 +3843,17 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project) {
     return found;
 }
 
-/* Open a .db file briefly, collect node/edge counts and root_path,
- * then append a JSON entry to arr. */
-static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
-                                     const char *name, size_t name_len, int64_t size_bytes) {
+/* Open a .db file briefly and return whether it has one resolvable internal
+ * project. When emit is true, append its bounded summary to arr. */
+static bool build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, const char *dir_path,
+                                     const char *name, size_t name_len, int64_t size_bytes,
+                                     bool emit) {
     (void)name_len;
 
     char full_path[CBM_SZ_2K];
     int full_path_len = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
     if (full_path_len <= 0 || (size_t)full_path_len >= sizeof(full_path)) {
-        return;
+        return false;
     }
 
     /* #704: key on the db's INTERNAL project name, not its filename. Node/edge
@@ -3852,7 +3864,11 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     char project_name[CBM_SZ_1K];
     cbm_store_t *pstore = NULL;
     if (!db_internal_project_name(full_path, project_name, sizeof(project_name), &pstore)) {
-        return; /* ghost / unreadable — not a resolvable project */
+        return false; /* ghost / unreadable — not a resolvable project */
+    }
+    if (!emit) {
+        cbm_store_close(pstore);
+        return true;
     }
 
     int nodes = cbm_store_count_nodes(pstore, project_name);
@@ -3886,76 +3902,157 @@ static void build_project_json_entry(yyjson_mut_doc *doc, yyjson_mut_val *arr, c
     yyjson_mut_obj_add_int(doc, p, "edges", edges);
     yyjson_mut_obj_add_int(doc, p, "size_bytes", size_bytes);
     yyjson_mut_arr_add_val(arr, p);
+    return true;
 }
 
-/* list_projects: scan cache directory for .db files.
+static int compare_project_db_names(const void *left, const void *right) {
+    const char *const *a = left;
+    const char *const *b = right;
+    return strcmp(*a, *b);
+}
+
+/* Collect only syntactically eligible filenames, then sort them so offsets are
+ * stable for an unchanged cache. Database validation remains lazy in the page
+ * loop: first-page work opens at most limit+1 valid databases. */
+static bool collect_project_db_names(const char *dir_path, char ***out_names, int *out_count) {
+    *out_names = NULL;
+    *out_count = 0;
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return true;
+    }
+
+    char **names = NULL;
+    int count = 0;
+    int capacity = 0;
+    bool ok = true;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        size_t len = strlen(entry->name);
+        if (!is_project_db_file(entry->name, len)) {
+            continue;
+        }
+        if (count == capacity) {
+            int next_capacity = capacity ? capacity * 2 : CBM_SZ_16;
+            char **grown = realloc(names, (size_t)next_capacity * sizeof(*grown));
+            if (!grown) {
+                ok = false;
+                break;
+            }
+            names = grown;
+            capacity = next_capacity;
+        }
+        names[count] = heap_strdup(entry->name);
+        if (!names[count]) {
+            ok = false;
+            break;
+        }
+        count++;
+    }
+    cbm_closedir(dir);
+    if (!ok) {
+        free_counted_string_array(names, count);
+        return false;
+    }
+    qsort(names, (size_t)count, sizeof(*names), compare_project_db_names);
+    *out_names = names;
+    *out_count = count;
+    return true;
+}
+
+/* list_projects: scan cache directory for .db files in a stable, bounded page.
  * Each project is a single .db file — no central registry needed. */
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
-    (void)args;
-
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
     int validate_busy_timeout_ms = cbm_mcp_db_validate_busy_timeout_ms(srv);
+    bool all = cbm_mcp_get_bool_arg(args, "all");
+    int offset = all ? 0 : cbm_mcp_get_int_arg(args, "offset", 0);
+    if (offset < 0) {
+        offset = 0;
+    }
+    int limit =
+        cbm_mcp_get_positive_int_arg(args, "limit", MCP_PROJECTS_PAGE_SIZE, MCP_PROJECTS_PAGE_SIZE);
+    if (limit > MCP_PROJECTS_PAGE_MAX) {
+        limit = MCP_PROJECTS_PAGE_MAX;
+    }
 
-    cbm_dir_t *d = cbm_opendir(dir_path);
+    char **db_names = NULL;
+    int db_name_count = 0;
+    if (!collect_project_db_names(dir_path, &db_names, &db_name_count)) {
+        return cbm_mcp_text_result("{\"error\":\"out of memory listing projects\","
+                                   "\"hint\":\"Retry with a smaller cache inventory.\"}",
+                                   true);
+    }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_val *arr = yyjson_mut_arr(doc);
 
-    if (d) {
-        cbm_dirent_t *entry;
-        while ((entry = cbm_readdir(d)) != NULL) {
-            const char *name = entry->name;
-            size_t len = strlen(name);
+    int valid_seen = 0;
+    int emitted = 0;
+    bool has_more = false;
+    for (int i = 0; i < db_name_count; i++) {
+        const char *name = db_names[i];
+        size_t len = strlen(name);
 
-            if (!is_project_db_file(name, len)) {
-                continue;
-            }
-
-            /* Extract project name = filename without .db suffix */
-            char project_name[CBM_SZ_1K];
-            int project_len =
-                snprintf(project_name, sizeof(project_name), "%.*s", (int)(len - MCP_DB_EXT),
-                         name);
-            if (project_len <= 0 || (size_t)project_len >= sizeof(project_name)) {
-                continue;
-            }
-
-            /* Skip invalid project names (corrupt entries like ..db) */
-            if (project_name[0] == '\0' || strcmp(project_name, ".") == 0 ||
-                strcmp(project_name, "..") == 0) {
-                continue;
-            }
-
-            /* Get file metadata */
-            char full_path[CBM_SZ_2K];
-            int full_path_len = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
-            if (full_path_len <= 0 || (size_t)full_path_len >= sizeof(full_path)) {
-                continue;
-            }
-            struct stat st;
-            if (stat(full_path, &st) != 0) {
-                continue;
-            }
-
-            /* Validate db structure before opening — skip corrupt/non-cbm files */
-            if (!validate_cbm_db_with_timeout(full_path, validate_busy_timeout_ms)) {
-                continue;
-            }
-
-            build_project_json_entry(doc, arr, dir_path, name, len, (int64_t)st.st_size);
+        /* Get file metadata */
+        char full_path[CBM_SZ_2K];
+        int full_path_len = snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, name);
+        if (full_path_len <= 0 || (size_t)full_path_len >= sizeof(full_path)) {
+            continue;
         }
-        cbm_closedir(d);
+        struct stat st;
+        if (stat(full_path, &st) != 0) {
+            continue;
+        }
+
+        /* Validate db structure before opening — skip corrupt/non-cbm files */
+        if (!validate_cbm_db_with_timeout(full_path, validate_busy_timeout_ms)) {
+            continue;
+        }
+
+        bool should_emit = all || (valid_seen >= offset && emitted < limit);
+        bool valid = build_project_json_entry(doc, arr, dir_path, name, len, (int64_t)st.st_size,
+                                              should_emit);
+        if (!valid) {
+            continue;
+        }
+        if (all) {
+            emitted++;
+        } else if (valid_seen >= offset) {
+            if (emitted >= limit) {
+                has_more = true;
+                break;
+            }
+            emitted++;
+        }
+        valid_seen++;
     }
+    free_counted_string_array(db_names, db_name_count);
 
     yyjson_mut_obj_add_val(doc, root, "projects", arr);
+    yyjson_mut_obj_add_int(doc, root, "offset", offset);
+    yyjson_mut_obj_add_int(doc, root, "returned_count", emitted);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", has_more);
+    if (!all) {
+        yyjson_mut_obj_add_int(doc, root, "limit", limit);
+    }
+    if (has_more) {
+        yyjson_mut_obj_add_int(doc, root, "next_offset", offset + emitted);
+        yyjson_mut_obj_add_str(doc, root, "pagination_hint",
+                               "Call list_projects with offset=next_offset; use all=true only for "
+                               "an explicit full inventory.");
+    }
 
-    /* Guide user when no projects are indexed */
+    /* Distinguish an empty cache from an exhausted page. */
     if (yyjson_mut_arr_size(arr) == 0) {
-        yyjson_mut_obj_add_str(doc, root, "hint",
-                               "No projects indexed. Call index_repository(repo_path=...) first.");
+        yyjson_mut_obj_add_str(
+            doc, root, "hint",
+            valid_seen == 0 && offset == 0
+                ? "No projects indexed. Call index_repository(repo_path=...) first."
+                : "No projects at this offset. Restart pagination with offset=0.");
     }
 
     char *json = yy_doc_to_str(doc);

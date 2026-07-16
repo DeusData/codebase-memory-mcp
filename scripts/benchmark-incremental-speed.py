@@ -1180,6 +1180,8 @@ def run_list_projects_scaling(
             "process_isolation": "fresh_mcp_server_per_count",
             "seed_index_mode": "fast",
             "seed_config_profile": CONFIG_PROFILE_MINIMAL_INDEXING,
+            "list_projects_arguments": {"all": True},
+            "inventory_mode": "explicit_full_compatibility",
             "token_estimator": TOKEN_ESTIMATOR,
             "rss_measurement": "post_call_resident_kb_not_peak",
         },
@@ -1229,7 +1231,9 @@ def run_list_projects_scaling(
 
             client = McpClient(binary, env, args.timeout)
             with client:
-                data, stderr, stdout_bytes, elapsed_ms = client.call_tool("list_projects", {})
+                data, stderr, stdout_bytes, elapsed_ms = client.call_tool(
+                    "list_projects", {"all": True}
+                )
                 projects = data.get("projects")
                 returned_count = len(projects) if isinstance(projects, list) else None
                 transport_start = now_ms()
