@@ -194,6 +194,69 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unsupported index mode"):
             BENCHMARK.index_tool_arguments(Path("/tmp/repo"), "turbo")
 
+    def test_graded_relevance_scores_mrr_hits_and_ndcg(self) -> None:
+        ranked = [
+            {"name": "related_helper"},
+            {"name": "canonical_entry_point"},
+            {"name": "unrelated"},
+        ]
+        judgments = [
+            {"expected_substring": "canonical_entry_point", "relevance": 3},
+            {"expected_substring": "related_helper", "relevance": 1},
+        ]
+
+        score = BENCHMARK.score_ranked_relevance(ranked, judgments, cutoff=5)
+
+        expected_dcg = 1.0 + 7.0 / BENCHMARK.math.log2(3)
+        expected_idcg = 7.0 + 1.0 / BENCHMARK.math.log2(3)
+        self.assertEqual(score["first_relevant_rank"], 1)
+        self.assertEqual(score["reciprocal_rank"], 1.0)
+        self.assertTrue(score["hit_at_1"])
+        self.assertTrue(score["hit_at_5"])
+        self.assertAlmostEqual(score["ndcg_at_5"], expected_dcg / expected_idcg)
+        self.assertEqual(score["matched_relevance"], [1, 3, 0])
+
+    def test_graded_relevance_missing_evidence_scores_zero(self) -> None:
+        score = BENCHMARK.score_ranked_relevance(
+            [{"name": "unrelated"}],
+            [{"expected_substring": "required", "relevance": 3}],
+            cutoff=5,
+        )
+
+        self.assertIsNone(score["first_relevant_rank"])
+        self.assertEqual(score["reciprocal_rank"], 0.0)
+        self.assertEqual(score["ndcg_at_5"], 0.0)
+
+    def test_quality_oracle_accepts_graded_relevance_judgments(self) -> None:
+        oracles = {
+            "ranked": {
+                "response": {
+                    "results": [
+                        {"name": "related_helper"},
+                        {"name": "canonical_entry_point"},
+                    ]
+                }
+            }
+        }
+        expectations = {
+            "ranked": {
+                "criterion": "architectural entry points rank ahead of unrelated symbols",
+                "judgments": [
+                    {"expected_substring": "canonical_entry_point", "relevance": 3},
+                    {"expected_substring": "related_helper", "relevance": 1},
+                ],
+                "cutoff": 5,
+            }
+        }
+
+        summary = BENCHMARK.score_quality_oracles(oracles, expectations)
+
+        self.assertTrue(summary["passed"])
+        self.assertIsNotNone(summary["mean_ndcg_at_5"])
+        self.assertEqual(oracles["ranked"]["quality"]["relevance_judgments"], 2)
+        self.assertEqual(oracles["ranked"]["quality"]["rank"], 1)
+        self.assertIn("ndcg_at_5", oracles["ranked"]["quality"])
+
     def test_surface_parity_separates_pre_reveal_discovery_from_dispatch(self) -> None:
         schema_a = {"type": "object", "properties": {"query": {"type": "string"}}}
         schema_b = {"type": "object", "properties": {"path": {"type": "string"}}}

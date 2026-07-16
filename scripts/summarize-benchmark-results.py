@@ -116,6 +116,12 @@ def quality_oracle_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "reciprocal_rank": quality.get("reciprocal_rank"),
                     "hit_at_1": quality.get("hit_at_1"),
                     "hit_at_5": quality.get("hit_at_5"),
+                    "ndcg_at_5": quality.get("ndcg_at_5"),
+                    "judgments": (
+                        f"{quality['relevance_judgments']} judgments"
+                        if isinstance(quality.get("relevance_judgments"), int)
+                        else "n/a"
+                    ),
                 }
             )
     return details
@@ -377,6 +383,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     quality_score_count = 0
     hit_at_1_weighted = 0.0
     hit_at_5_weighted = 0.0
+    ndcg_weighted = 0.0
+    ndcg_count = 0
     dependency_initial_ms: list[float] = []
     dependency_incremental_ms: list[float] = []
     dependency_fresh_ms: list[float] = []
@@ -419,6 +427,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 score = quality.get("score")
                 hit_at_1 = quality.get("hit_at_1")
                 hit_at_5 = quality.get("hit_at_5")
+                mean_ndcg_at_5 = quality.get("mean_ndcg_at_5")
+                ndcg_applicable = int(quality.get("ndcg_applicable_count") or 0)
                 if applicable and isinstance(score, (int, float)):
                     quality_score_weighted += float(score) * applicable
                     quality_score_count += applicable
@@ -426,6 +436,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                     hit_at_1_weighted += float(hit_at_1) * applicable
                 if applicable and isinstance(hit_at_5, (int, float)):
                     hit_at_5_weighted += float(hit_at_5) * applicable
+                if ndcg_applicable and isinstance(mean_ndcg_at_5, (int, float)):
+                    ndcg_weighted += float(mean_ndcg_at_5) * ndcg_applicable
+                    ndcg_count += ndcg_applicable
             for oracle in case_oracles.values():
                 if not isinstance(oracle, dict):
                     continue
@@ -520,6 +533,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "task_success_score": task_success_score,
         "hit_at_1": hit_at_1_weighted / quality_score_count if quality_score_count else None,
         "hit_at_5": hit_at_5_weighted / quality_score_count if quality_score_count else None,
+        "ndcg_at_5": ndcg_weighted / ndcg_count if ndcg_count else None,
         "quality_checks": ratio(quality_passed, quality_applicable),
         "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
@@ -760,11 +774,11 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
     lines = [
         "# Codebase Memory performance and quality summary",
         "",
-        "| Candidate | Decision | Overall quality† | Retrieval MRR | Hit@1 | Hit@5 | "
+        "| Candidate | Decision | Overall quality† | Retrieval MRR | Hit@1 | Hit@5 | nDCG@5 | "
         "Graph fidelity | Task success | Evidence counts (R/G/S) | "
         "Response p50 bytes | Response p50 tokens* | Query p50 ms | Incremental p50 ms | "
         "Peak RSS MB | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -777,6 +791,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["quality_score"], 3),
                     display(row["hit_at_1"], 3),
                     display(row["hit_at_5"], 3),
+                    display(row["ndcg_at_5"], 3),
                     display(row["graph_fidelity_score"], 3),
                     display(row["task_success_score"], 3),
                     display(
@@ -1016,8 +1031,8 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "## Named quality-oracle breakdown",
             "",
-            "| Candidate | Scenario | Oracle | Criterion | Expected evidence | Result | RR | Hit@1 | Hit@5 |",
-            "|---|---|---|---|---|---|---:|---:|---:|",
+            "| Candidate | Scenario | Oracle | Criterion | Expected evidence | Judgments | Result | RR | Hit@1 | Hit@5 | nDCG@5 |",
+            "|---|---|---|---|---|---|---|---:|---:|---:|---:|",
         )
     )
     detail_count = 0
@@ -1033,18 +1048,20 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                         display(detail["oracle"]),
                         display(detail["criterion"]),
                         display(detail["expected"]),
+                        display(detail["judgments"]),
                         display(detail["result"]),
                         display(detail["reciprocal_rank"], 3),
                         display(detail["hit_at_1"]),
                         display(detail["hit_at_5"]),
+                        display(detail["ndcg_at_5"], 3),
                     )
                 )
                 + " |"
             )
     if not detail_count:
         lines.append(
-            "| all | n/a | n/a | No per-oracle quality evidence recorded | n/a | "
-            "N/A | n/a | n/a | n/a |"
+            "| all | n/a | n/a | No per-oracle quality evidence recorded | n/a | n/a | "
+            "N/A | n/a | n/a | n/a | n/a |"
         )
     lines.extend(
         (
@@ -1084,6 +1101,12 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "stated cutoff. N/A probes are excluded from every retrieval denominator. These definitions "
             "follow NIST's official TREC QA definition: "
             "[TREC QA evaluation data](https://trec.nist.gov/data/qa.html).",
+            "Graded probes additionally report nDCG@5, which rewards placing more-relevant "
+            "evidence earlier while normalizing against the ideal judged ordering. MRR and Hit@k "
+            "remain visible because they answer the distinct first-useful-result question. This "
+            "follows the graded-ranking measures used in the "
+            "[NIST TREC Complex Answer Retrieval overview]"
+            "(https://trec.nist.gov/pubs/trec27/papers/Overview-CAR.pdf).",
             "",
             "Graph fidelity is the fraction of mutation cases whose incremental canonical graph equals "
             "a fresh FAST rebuild. Task success is the fraction of applicable probes that find their "
