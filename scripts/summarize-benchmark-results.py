@@ -307,6 +307,42 @@ def dependency_mode(reports: list[dict[str, Any]], observed_packages: list[float
     return "unknown"
 
 
+ALGORITHM_CAPABILITIES = (
+    "rank",
+    "similarity",
+    "semantic_edges",
+    "git_history",
+    "http_links",
+    "dependencies",
+)
+
+
+def summarize_capability_applicability(
+    reports: list[dict[str, Any]],
+) -> dict[str, str]:
+    summarized: dict[str, str] = {}
+    for capability in ALGORITHM_CAPABILITIES:
+        states: set[tuple[bool, str]] = set()
+        for report in reports:
+            parameters = report.get("parameters")
+            applicability = (
+                parameters.get("capability_applicability")
+                if isinstance(parameters, dict)
+                else None
+            )
+            state = applicability.get(capability) if isinstance(applicability, dict) else None
+            if isinstance(state, dict) and isinstance(state.get("applicable"), bool):
+                states.add((state["applicable"], str(state.get("reason") or "unspecified")))
+        if not states:
+            summarized[capability] = "unknown"
+        elif len(states) > 1:
+            summarized[capability] = "mixed"
+        else:
+            applicable, reason = next(iter(states))
+            summarized[capability] = "applicable" if applicable else f"N/A: {reason}"
+    return summarized
+
+
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
     canonical = [
@@ -454,6 +490,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         and isinstance(parameters.get("frontier_files"), int)
     }
     exact_caps: set[int] = set()
+    index_modes = {
+        str(parameters.get("index_mode"))
+        for report in reports
+        if isinstance((parameters := report.get("parameters")), dict)
+        and parameters.get("index_mode")
+    }
     for report in reports:
         parameters = report.get("parameters")
         if not isinstance(parameters, dict):
@@ -498,6 +540,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "dependency_initial_p50_ms": percentile(dependency_initial_ms, 0.50),
         "dependency_incremental_p50_ms": percentile(dependency_incremental_ms, 0.50),
         "dependency_fresh_p50_ms": percentile(dependency_fresh_ms, 0.50),
+        "index_modes": ", ".join(sorted(index_modes)) if index_modes else "unknown",
+        "capability_applicability": summarize_capability_applicability(reports),
         "cleanup": ratio(cleanup_passes, len(reports)),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": correctness_findings(cases),
@@ -855,6 +899,37 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "(explicit)` and `enabled (explicit)` come from exact config overrides; `unsupported` "
             "requires explicit capability-support metadata. `unknown` is intentionally not guessed "
             "from an old artifact that lacks those signals.",
+        )
+    )
+    lines.extend(
+        (
+            "",
+            "## Algorithm-quality applicability",
+            "",
+            "| Candidate | Index mode | Rank | Similarity | Semantic edges | Git history | HTTP links | Dependencies |",
+            "|---|---|---|---|---|---|---|---|",
+        )
+    )
+    for row in rows:
+        applicability = row["capability_applicability"]
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    display(row["candidate"]),
+                    display(row["index_modes"]),
+                    *(display(applicability[name]) for name in ALGORITHM_CAPABILITIES),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        (
+            "",
+            "Applicability is separate from enabled/disabled state. In particular, FAST mode "
+            "does not generate `SIMILAR_TO` or `SEMANTICALLY_RELATED`, so those quality effects "
+            "must be N/A rather than zero, pass, or failure. Retained artifacts without explicit "
+            "mode metadata remain `unknown`.",
         )
     )
     crossovers = frontier_crossover_rows(rows)

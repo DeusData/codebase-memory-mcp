@@ -37,12 +37,20 @@ DEFAULT_FRONTIER_FILES = 16
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
 CONFIG_PROFILE_DEFAULT = "default"
 CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
+CONFIG_PROFILE_SIMILARITY_DISABLED = "similarity_disabled"
+CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED = "semantic_edges_disabled"
+CONFIG_PROFILE_GIT_HISTORY_DISABLED = "git_history_disabled"
+CONFIG_PROFILE_HTTP_LINKS_DISABLED = "http_links_disabled"
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
 CONFIG_PROFILE_DEPENDENCY_DISABLED = "dependency_disabled"
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_DEFAULT: {},
     CONFIG_PROFILE_RANK_DISABLED: {"rank_enabled": "false"},
+    CONFIG_PROFILE_SIMILARITY_DISABLED: {"similarity_enabled": "false"},
+    CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED: {"semantic_edges_enabled": "false"},
+    CONFIG_PROFILE_GIT_HISTORY_DISABLED: {"githistory_enabled": "false"},
+    CONFIG_PROFILE_HTTP_LINKS_DISABLED: {"httplinks_enabled": "false"},
     CONFIG_PROFILE_DEPENDENCY_DISABLED: {"auto_index_deps": "false"},
     CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: {
         "githistory_enabled": "false",
@@ -60,6 +68,7 @@ CONFIG_PROFILES: dict[str, dict[str, str]] = {
         "similarity_enabled": "false",
     },
 }
+INDEX_MODES = ("fast", "moderate", "full")
 PROJECT_DB_SUFFIX = ".db"
 CONFIG_DB_NAME = "_config.db"
 LOG_TAIL_LINES = 24
@@ -1146,6 +1155,39 @@ def resolve_config_overrides(profile: str, items: list[str]) -> dict[str, str]:
     return overrides
 
 
+def index_tool_arguments(repo_dir: Path, index_mode: str) -> dict[str, str]:
+    if index_mode not in INDEX_MODES:
+        raise ValueError(f"unsupported index mode: {index_mode}")
+    return {"repo_path": str(repo_dir), "mode": index_mode}
+
+
+def index_mode_capability_applicability(index_mode: str) -> dict[str, dict[str, Any]]:
+    if index_mode not in INDEX_MODES:
+        raise ValueError(f"unsupported index mode: {index_mode}")
+    available = {"applicable": True, "reason": f"available in {index_mode} mode"}
+    result = {
+        name: dict(available)
+        for name in (
+            "rank",
+            "similarity",
+            "semantic_edges",
+            "git_history",
+            "http_links",
+            "dependencies",
+        )
+    }
+    if index_mode == "fast":
+        result["similarity"] = {
+            "applicable": False,
+            "reason": "SIMILAR_TO generation requires full or moderate mode",
+        }
+        result["semantic_edges"] = {
+            "applicable": False,
+            "reason": "SEMANTICALLY_RELATED generation requires full or moderate mode",
+        }
+    return result
+
+
 def apply_config_overrides(
     binary: Path, env: dict[str, str], overrides: dict[str, str], timeout: int
 ) -> None:
@@ -1264,8 +1306,9 @@ def run_index(
     repo_dir: Path,
     timeout: int,
     include_logs: bool,
+    index_mode: str = "fast",
 ) -> dict[str, Any]:
-    args = json.dumps({"repo_path": str(repo_dir), "mode": "fast"})
+    args = json.dumps(index_tool_arguments(repo_dir, index_mode))
     cmd = [str(binary), "cli", "--json", "index_repository", args]
     proc, elapsed_ms = command_result(
         cmd,
@@ -1280,9 +1323,14 @@ def run_index(
     )
 
 
-def run_index_mcp(client: McpClient, repo_dir: Path, include_logs: bool) -> dict[str, Any]:
+def run_index_mcp(
+    client: McpClient,
+    repo_dir: Path,
+    include_logs: bool,
+    index_mode: str = "fast",
+) -> dict[str, Any]:
     data, stderr, stdout_bytes, elapsed_ms = client.call_tool(
-        "index_repository", {"repo_path": str(repo_dir), "mode": "fast"}
+        "index_repository", index_tool_arguments(repo_dir, index_mode)
     )
     return build_index_result(data, stderr, stdout_bytes, elapsed_ms, include_logs)
 
@@ -2371,12 +2419,13 @@ def run_index_for_transport(
     timeout: int,
     include_logs: bool,
     client: McpClient | None = None,
+    index_mode: str = "fast",
 ) -> dict[str, Any]:
     if transport == "mcp":
         if client is None:
             raise RuntimeError("MCP transport requires an active client")
-        return run_index_mcp(client, repo_dir, include_logs)
-    return run_index(binary, env, repo_dir, timeout, include_logs)
+        return run_index_mcp(client, repo_dir, include_logs, index_mode)
+    return run_index(binary, env, repo_dir, timeout, include_logs, index_mode)
 
 
 def run_matrix_case(
@@ -2404,19 +2453,23 @@ def run_matrix_case(
     if args.transport == "mcp":
         with McpClient(binary, case_env, args.timeout) as client:
             initial = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                index_mode=args.index_mode,
             )
             changed_paths = mutate_matrix_scenario(scenario, repo_dir, args.functions_per_file)
             incremental = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                index_mode=args.index_mode,
             )
     else:
         initial = run_index_for_transport(
-            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+            index_mode=args.index_mode,
         )
         changed_paths = mutate_matrix_scenario(scenario, repo_dir, args.functions_per_file)
         incremental = run_index_for_transport(
-            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+            index_mode=args.index_mode,
         )
 
     project_db = find_project_db(cache_dir)
@@ -2428,11 +2481,13 @@ def run_matrix_case(
     if args.transport == "mcp":
         with McpClient(binary, case_env, args.timeout) as client:
             full_rebuild = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                index_mode=args.index_mode,
             )
     else:
         full_rebuild = run_index_for_transport(
-            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+            index_mode=args.index_mode,
         )
 
     full_db = find_project_db(cache_dir)
@@ -2493,6 +2548,8 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             "functions_per_file": args.functions_per_file,
             "frontier_files": args.frontier_files,
             "rank_refresh": args.rank_refresh,
+            "index_mode": args.index_mode,
+            "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
@@ -2548,11 +2605,13 @@ def run_self_dogfood_case(
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
                 initial = run_index_for_transport(
-                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                    index_mode=args.index_mode,
                 )
                 mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
                 incremental = run_index_for_transport(
-                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                    index_mode=args.index_mode,
                 )
                 project_db = find_project_db(cache_dir)
                 project = str(incremental.get("response", {}).get("project") or project_db.stem)
@@ -2561,11 +2620,13 @@ def run_self_dogfood_case(
                 )
         else:
             initial = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+                index_mode=args.index_mode,
             )
             mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
             incremental = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+                index_mode=args.index_mode,
             )
             project_db = find_project_db(cache_dir)
             project = str(incremental.get("response", {}).get("project") or project_db.stem)
@@ -2579,11 +2640,13 @@ def run_self_dogfood_case(
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
                 full_rebuild = run_index_for_transport(
-                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client
+                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                    index_mode=args.index_mode,
                 )
         else:
             full_rebuild = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs
+                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+                index_mode=args.index_mode,
             )
         full_db = find_project_db(cache_dir)
         canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
@@ -2653,6 +2716,8 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         "mode": "self_dogfood",
         "parameters": {
             "rank_refresh": args.rank_refresh,
+            "index_mode": args.index_mode,
+            "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
@@ -2701,6 +2766,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--functions-per-file", type=int, default=DEFAULT_FUNCTIONS_PER_FILE)
     parser.add_argument("--changed-files", type=int, default=DEFAULT_CHANGED_FILES)
     parser.add_argument("--min-speedup", type=float, default=DEFAULT_MIN_SPEEDUP)
+    parser.add_argument(
+        "--index-mode",
+        choices=INDEX_MODES,
+        default="fast",
+        help=(
+            "Indexing mode for every compared run. Use full or moderate when measuring "
+            "SIMILAR_TO or SEMANTICALLY_RELATED quality; fast intentionally skips both."
+        ),
+    )
     parser.add_argument(
         "--rank-refresh",
         choices=("eager", "stale_on_exact", "stale_on_incremental"),
@@ -2851,6 +2925,8 @@ def main() -> int:
             "changed_files": args.changed_files,
             "min_speedup": args.min_speedup,
             "rank_refresh": args.rank_refresh,
+            "index_mode": args.index_mode,
+            "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
@@ -2874,14 +2950,16 @@ def main() -> int:
                 overhead_probe = measure_mcp_overhead_probes(
                     client, args.overhead_tool, args.overhead_probes, args.include_logs
                 )
-                initial = run_index_mcp(client, repo_dir, args.include_logs)
+                initial = run_index_mcp(client, repo_dir, args.include_logs, args.index_mode)
                 changed_paths = modify_existing_files(
                     repo_dir, args.changed_files, args.functions_per_file
                 )
-                incremental = run_index_mcp(client, repo_dir, args.include_logs)
+                incremental = run_index_mcp(client, repo_dir, args.include_logs, args.index_mode)
             removed_dbs = remove_project_dbs(cache_dir)
             with McpClient(binary, env, args.timeout) as client:
-                full_rebuild = run_index_mcp(client, repo_dir, args.include_logs)
+                full_rebuild = run_index_mcp(
+                    client, repo_dir, args.include_logs, args.index_mode
+                )
         else:
             overhead_probe = measure_cli_overhead_probes(
                 binary,
@@ -2891,13 +2969,19 @@ def main() -> int:
                 args.timeout,
                 args.include_logs,
             )
-            initial = run_index(binary, env, repo_dir, args.timeout, args.include_logs)
+            initial = run_index(
+                binary, env, repo_dir, args.timeout, args.include_logs, args.index_mode
+            )
             changed_paths = modify_existing_files(
                 repo_dir, args.changed_files, args.functions_per_file
             )
-            incremental = run_index(binary, env, repo_dir, args.timeout, args.include_logs)
+            incremental = run_index(
+                binary, env, repo_dir, args.timeout, args.include_logs, args.index_mode
+            )
             removed_dbs = remove_project_dbs(cache_dir)
-            full_rebuild = run_index(binary, env, repo_dir, args.timeout, args.include_logs)
+            full_rebuild = run_index(
+                binary, env, repo_dir, args.timeout, args.include_logs, args.index_mode
+            )
 
         incr_ms = max(1, int(incremental["elapsed_ms"]))
         full_ms = max(1, int(full_rebuild["elapsed_ms"]))

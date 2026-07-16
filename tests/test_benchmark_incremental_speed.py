@@ -143,6 +143,57 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {"auto_index_deps": "false"},
         )
 
+    def test_single_capability_ablation_profiles_change_exactly_one_group(self) -> None:
+        expected = {
+            "rank_disabled": {"rank_enabled": "false"},
+            "similarity_disabled": {"similarity_enabled": "false"},
+            "semantic_edges_disabled": {"semantic_edges_enabled": "false"},
+            "git_history_disabled": {"githistory_enabled": "false"},
+            "http_links_disabled": {"httplinks_enabled": "false"},
+            "dependency_disabled": {"auto_index_deps": "false"},
+        }
+
+        self.assertEqual(
+            {
+                profile: BENCHMARK.resolve_config_overrides(profile, [])
+                for profile in expected
+            },
+            expected,
+        )
+
+    def test_index_mode_metadata_marks_fast_only_capability_gaps(self) -> None:
+        self.assertEqual(
+            BENCHMARK.index_mode_capability_applicability("fast"),
+            {
+                "rank": {"applicable": True, "reason": "available in fast mode"},
+                "similarity": {
+                    "applicable": False,
+                    "reason": "SIMILAR_TO generation requires full or moderate mode",
+                },
+                "semantic_edges": {
+                    "applicable": False,
+                    "reason": "SEMANTICALLY_RELATED generation requires full or moderate mode",
+                },
+                "git_history": {"applicable": True, "reason": "available in fast mode"},
+                "http_links": {"applicable": True, "reason": "available in fast mode"},
+                "dependencies": {"applicable": True, "reason": "available in fast mode"},
+            },
+        )
+        self.assertTrue(
+            all(
+                value["applicable"]
+                for value in BENCHMARK.index_mode_capability_applicability("full").values()
+            )
+        )
+
+    def test_index_tool_arguments_preserve_requested_mode(self) -> None:
+        self.assertEqual(
+            BENCHMARK.index_tool_arguments(Path("/tmp/repo"), "moderate"),
+            {"repo_path": "/tmp/repo", "mode": "moderate"},
+        )
+        with self.assertRaisesRegex(ValueError, "unsupported index mode"):
+            BENCHMARK.index_tool_arguments(Path("/tmp/repo"), "turbo")
+
     def test_surface_parity_separates_pre_reveal_discovery_from_dispatch(self) -> None:
         schema_a = {"type": "object", "properties": {"query": {"type": "string"}}}
         schema_b = {"type": "object", "properties": {"path": {"type": "string"}}}
