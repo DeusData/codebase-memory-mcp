@@ -100,7 +100,7 @@ FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
-CAPABILITY_QUALITY_CASES = ("rank", "dependencies")
+CAPABILITY_QUALITY_CASES = ("rank", "dependencies", "similarity", "semantic_edges")
 CROSS_FILE_RESOLVER_LANGUAGES = (
     "go",
     "c",
@@ -334,6 +334,54 @@ def create_dependency_quality_repo(repo_dir: Path) -> dict[str, Any]:
         "source_resolution": f"node_modules/{package_name}",
         "network_required": False,
     }
+
+
+def canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def create_pair_quality_repo(repo_dir: Path, capability: str) -> dict[str, Any]:
+    task_root = Path(__file__).resolve().parents[1] / "benchmarks" / "semantic-pairs-v1"
+    manifest_path = task_root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("schema_version") != 1:
+        raise ValueError("semantic pair manifest schema_version must be 1")
+    cases = manifest.get("cases")
+    case = cases.get(capability) if isinstance(cases, dict) else None
+    if not isinstance(case, dict):
+        raise ValueError(f"semantic pair manifest has no case for {capability}")
+    source_paths = case.get("source_paths")
+    if not isinstance(source_paths, list) or not source_paths:
+        raise ValueError(f"semantic pair case {capability} requires source_paths")
+    source_sha256: dict[str, str] = {}
+    for relative in source_paths:
+        if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+            raise ValueError("semantic pair source path must be relative")
+        source = task_root / relative
+        payload = source.read_bytes()
+        target = repo_dir / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+        source_sha256[relative] = hashlib.sha256(payload).hexdigest()
+    task_set = {
+        "schema_version": manifest["schema_version"],
+        "task_set_version": manifest["task_set_version"],
+        "ground_truth_scope": manifest["ground_truth_scope"],
+        "query_name_marker": manifest["query_name_marker"],
+        **case,
+        "source_sha256": source_sha256,
+        "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    }
+    return {**task_set, "task_set_sha256": canonical_json_sha256(task_set)}
+
+
+def create_similarity_quality_repo(repo_dir: Path) -> dict[str, Any]:
+    return create_pair_quality_repo(repo_dir, "similarity")
+
+
+def create_semantic_edges_quality_repo(repo_dir: Path) -> dict[str, Any]:
+    return create_pair_quality_repo(repo_dir, "semantic_edges")
 
 
 def create_inbound_frontier_repo(
@@ -2853,6 +2901,121 @@ def oracle_passed(tool_result: dict[str, Any], marker: str | None) -> bool:
     return marker in json.dumps(response, sort_keys=True)
 
 
+def canonical_pair(source: str, target: str) -> tuple[str, str]:
+    """Return an order-independent pair identity without losing endpoint names."""
+    if not isinstance(source, str) or not source or not isinstance(target, str) or not target:
+        raise ValueError("pair endpoints must be non-empty strings")
+    if source == target:
+        raise ValueError("pair endpoints must be distinct")
+    return (source, target) if source < target else (target, source)
+
+
+def score_pair_classification(
+    observed_pairs: list[dict[str, Any]],
+    judgments: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Score unordered observed pairs against explicit positive/negative judgments.
+
+    Natural large-repository results outside the bounded judgment set are retained as
+    unjudged observations. They are intentionally excluded from the confusion matrix:
+    incomplete ground truth cannot turn an unknown pair into a false positive.
+    """
+    judgment_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for judgment in judgments:
+        if not isinstance(judgment, dict):
+            raise ValueError("pair judgment must be an object")
+        pair = canonical_pair(judgment.get("source"), judgment.get("target"))
+        if pair in judgment_by_pair:
+            raise ValueError(f"duplicate pair judgment: {pair[0]} <-> {pair[1]}")
+        expected = judgment.get("expected")
+        if not isinstance(expected, bool):
+            raise ValueError("pair judgment expected must be boolean")
+        category = judgment.get("category", "uncategorized")
+        if not isinstance(category, str) or not category:
+            raise ValueError("pair judgment category must be a non-empty string")
+        judgment_by_pair[pair] = {
+            **judgment,
+            "source": pair[0],
+            "target": pair[1],
+            "expected": expected,
+            "category": category,
+        }
+
+    observed_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    for observed in observed_pairs:
+        if not isinstance(observed, dict):
+            raise ValueError("observed pair must be an object")
+        pair = canonical_pair(observed.get("source"), observed.get("target"))
+        observed_by_pair.setdefault(
+            pair,
+            {**observed, "source": pair[0], "target": pair[1]},
+        )
+
+    confusion = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    witnesses: dict[str, list[dict[str, Any]]] = {key: [] for key in confusion}
+    categories: dict[str, dict[str, int]] = {}
+    for pair, judgment in judgment_by_pair.items():
+        observed = observed_by_pair.get(pair)
+        if judgment["expected"]:
+            outcome = "tp" if observed is not None else "fn"
+        else:
+            outcome = "fp" if observed is not None else "tn"
+        confusion[outcome] += 1
+        category = judgment["category"]
+        category_counts = categories.setdefault(
+            category,
+            {"tp": 0, "fp": 0, "fn": 0, "tn": 0},
+        )
+        category_counts[outcome] += 1
+        witnesses[outcome].append(
+            {
+                "source": pair[0],
+                "target": pair[1],
+                "category": category,
+                "observed": observed,
+            }
+        )
+
+    unjudged_observed = [
+        observed
+        for pair, observed in sorted(observed_by_pair.items())
+        if pair not in judgment_by_pair
+    ]
+    precision_denominator = confusion["tp"] + confusion["fp"]
+    recall_denominator = confusion["tp"] + confusion["fn"]
+    negative_denominator = confusion["fp"] + confusion["tn"]
+    precision = (
+        confusion["tp"] / precision_denominator if precision_denominator else None
+    )
+    recall = confusion["tp"] / recall_denominator if recall_denominator else None
+    f1 = (
+        2.0 * precision * recall / (precision + recall)
+        if precision is not None and recall is not None and precision + recall > 0
+        else None
+    )
+    false_positive_rate = (
+        confusion["fp"] / negative_denominator if negative_denominator else None
+    )
+    return {
+        "judgment_count": len(judgment_by_pair),
+        "observed_pair_count": len(observed_by_pair),
+        "confusion": confusion,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "false_positive_rate": false_positive_rate,
+        "categories": categories,
+        "witnesses": witnesses,
+        "unjudged_observed_count": len(unjudged_observed),
+        "unjudged_observed": unjudged_observed,
+        "passed": recall_denominator > 0 and confusion["fp"] == 0 and confusion["fn"] == 0,
+        "ground_truth_boundary": (
+            "Only explicit judgments enter TP/FP/FN/TN; unjudged observed pairs are retained "
+            "but excluded because natural-repository ground truth is incomplete."
+        ),
+    }
+
+
 def score_ranked_relevance(
     ranked_items: list[Any],
     judgments: list[dict[str, Any]],
@@ -3258,6 +3421,125 @@ def run_dependency_quality_oracles(
     return oracles
 
 
+def observed_pairs_from_query_response(tool_result: dict[str, Any]) -> list[dict[str, Any]]:
+    response = tool_result.get("response")
+    if not isinstance(response, dict):
+        return []
+    columns = response.get("columns")
+    rows = response.get("rows")
+    if not isinstance(columns, list) or not isinstance(rows, list):
+        return []
+    column_names = [str(value) for value in columns]
+    observed: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 2:
+            continue
+        score = row[2] if len(row) > 2 else None
+        if isinstance(score, str):
+            try:
+                score = float(score)
+            except ValueError:
+                pass
+        values = {
+            column_names[index]: value
+            for index, value in enumerate(row)
+            if index < len(column_names)
+        }
+        observed.append(
+            {
+                "source": str(row[0]),
+                "target": str(row[1]),
+                "score": score,
+                "source_path": row[3] if len(row) > 3 else None,
+                "target_path": row[4] if len(row) > 4 else None,
+                "row": values,
+            }
+        )
+    return observed
+
+
+def run_relation_quality_oracles(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    project: str,
+    fixture: dict[str, Any],
+    args: argparse.Namespace,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    relationship = str(fixture["relationship"])
+    score_property = str(fixture["score_property"])
+    marker = str(fixture["query_name_marker"])
+    query = (
+        f"MATCH (a)-[r:{relationship}]->(b) "
+        f"WHERE a.name CONTAINS '{marker}' OR b.name CONTAINS '{marker}' "
+        f"RETURN a.name, b.name, r.{score_property}, a.file_path, b.file_path LIMIT 1000"
+    )
+    edge_query = run_tool_call_for_transport(
+        transport,
+        binary,
+        env,
+        "query_graph",
+        {
+            "project": project,
+            "query": query,
+            "format": "json",
+            "max_output_bytes": 1024 * 1024,
+        },
+        args.timeout,
+        args.include_logs,
+        client,
+    )
+    observed_pairs = observed_pairs_from_query_response(edge_query)
+    pair_classification = score_pair_classification(
+        observed_pairs,
+        list(fixture["judgments"]),
+    )
+    true_positive_witnesses = pair_classification["witnesses"]["tp"]
+    score_witness_count = sum(
+        1
+        for witness in true_positive_witnesses
+        if isinstance(witness.get("observed"), dict)
+        and isinstance(witness["observed"].get("score"), (int, float))
+    )
+    score_coverage = (
+        score_witness_count / len(true_positive_witnesses)
+        if true_positive_witnesses
+        else None
+    )
+    response = edge_query.get("response")
+    response_quality = {
+        "correctness": pair_classification["passed"],
+        "relevance": pair_classification["precision"],
+        "completeness": pair_classification["recall"],
+        "actionable_witness_score_coverage": score_coverage,
+        "protocol_shape_valid": (
+            isinstance(response, dict)
+            and isinstance(response.get("columns"), list)
+            and isinstance(response.get("rows"), list)
+        ),
+        "truncated": response.get("truncated") if isinstance(response, dict) else None,
+        "elapsed_ms": edge_query.get("elapsed_ms"),
+        "response_bytes": edge_query.get("response_bytes"),
+        "response_token_estimate": edge_query.get("response_token_estimate"),
+        "hard_gate": (
+            pair_classification["passed"]
+            and score_coverage == 1.0
+            and isinstance(response, dict)
+            and isinstance(response.get("rows"), list)
+            and not bool(response.get("truncated"))
+        ),
+    }
+    return {
+        "relationship": relationship,
+        "edge_query": edge_query,
+        "observed_pairs": observed_pairs,
+        "pair_classification": pair_classification,
+        "response_quality": response_quality,
+        "passed": response_quality["hard_gate"],
+    }
+
+
 def run_index_for_transport(
     transport: str,
     binary: Path,
@@ -3310,11 +3592,13 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
     }
     exit_code = 1
     try:
-        fixture = (
-            create_rank_quality_repo(repo_dir)
-            if capability == "rank"
-            else create_dependency_quality_repo(repo_dir)
-        )
+        fixture_factory = {
+            "rank": create_rank_quality_repo,
+            "dependencies": create_dependency_quality_repo,
+            "similarity": create_similarity_quality_repo,
+            "semantic_edges": create_semantic_edges_quality_repo,
+        }[capability]
+        fixture = fixture_factory(repo_dir)
         apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
@@ -3329,12 +3613,18 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                     index_mode=args.index_mode,
                 )
                 project = str(indexed.get("response", {}).get("project") or "repo")
-                oracle_runner = (
-                    run_rank_quality_oracles
-                    if capability == "rank"
-                    else run_dependency_quality_oracles
-                )
-                oracles = oracle_runner(args.transport, binary, case_env, project, args, client)
+                if capability in {"similarity", "semantic_edges"}:
+                    oracles = run_relation_quality_oracles(
+                        args.transport, binary, case_env, project, fixture, args, client
+                    )
+                else:
+                    oracle_runner = {
+                        "rank": run_rank_quality_oracles,
+                        "dependencies": run_dependency_quality_oracles,
+                    }[capability]
+                    oracles = oracle_runner(
+                        args.transport, binary, case_env, project, args, client
+                    )
         else:
             indexed = run_index_for_transport(
                 args.transport,
@@ -3346,12 +3636,16 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                 index_mode=args.index_mode,
             )
             project = str(indexed.get("response", {}).get("project") or "repo")
-            oracle_runner = (
-                run_rank_quality_oracles
-                if capability == "rank"
-                else run_dependency_quality_oracles
-            )
-            oracles = oracle_runner(args.transport, binary, case_env, project, args)
+            if capability in {"similarity", "semantic_edges"}:
+                oracles = run_relation_quality_oracles(
+                    args.transport, binary, case_env, project, fixture, args
+                )
+            else:
+                oracle_runner = {
+                    "rank": run_rank_quality_oracles,
+                    "dependencies": run_dependency_quality_oracles,
+                }[capability]
+                oracles = oracle_runner(args.transport, binary, case_env, project, args)
         case = {
             "scenario": f"{capability}_quality",
             "project": project,
@@ -3805,7 +4099,9 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Run one isolated, deterministic capability-quality fixture. rank measures whether "
             "structural ranking lifts the central result above lexical decoys; dependencies "
-            "measures local npm API retrieval with source/package/read-only provenance."
+            "measures local npm API retrieval with source/package/read-only provenance; similarity "
+            "scores SIMILAR_TO structural-clone pairs and semantic_edges scores "
+            "SEMANTICALLY_RELATED control-flow variants against explicit hard negatives."
         ),
     )
     parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")

@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "task_set_version": "semantic-pairs-v1",
+  "ground_truth_scope": "explicit generated canary pairs only",
+  "query_name_marker": "cbmq",
+  "cases": {
+    "similarity": {
+      "capability": "similarity",
+      "relationship": "SIMILAR_TO",
+      "score_property": "jaccard",
+      "languages": ["go"],
+      "source_paths": ["cbmq_similarity.go"],
+      "judgments": [
+        {
+          "source": "cbmqValidateUser",
+          "target": "cbmqValidateOrder",
+          "expected": true,
+          "category": "structural_near_clone"
+        },
+        {
+          "source": "cbmqValidateUser",
+          "target": "cbmqValidateProfileDecoy",
+          "expected": false,
+          "category": "lexical_hard_negative"
+        },
+        {
+          "source": "cbmqValidateOrder",
+          "target": "cbmqValidateProfileDecoy",
+          "expected": false,
+          "category": "lexical_hard_negative"
+        }
+      ]
+    },
+    "semantic_edges": {
+      "capability": "semantic_edges",
+      "relationship": "SEMANTICALLY_RELATED",
+      "score_property": "score",
+      "languages": ["python"],
+      "source_paths": ["cbmq_records.py"],
+      "judgments": [
+        {
+          "source": "cbmq_normalize_user_record",
+          "target": "cbmq_normalize_account_record",
+          "expected": true,
+          "category": "semantic_control_flow_variant"
+        },
+        {
+          "source": "cbmq_normalize_user_record",
+          "target": "cbmq_archive_record_decoy",
+          "expected": false,
+          "category": "lexical_hard_negative"
+        },
+        {
+          "source": "cbmq_normalize_account_record",
+          "target": "cbmq_archive_record_decoy",
+          "expected": false,
+          "category": "lexical_hard_negative"
+        }
+      ]
+    }
+  }
+}

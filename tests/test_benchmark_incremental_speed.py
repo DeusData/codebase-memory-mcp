@@ -14,6 +14,183 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_pair_classification_scores_explicit_positive_and_negative_judgments(self) -> None:
+        judgments = [
+            {
+                "source": "fixture.alpha",
+                "target": "fixture.beta",
+                "expected": True,
+                "category": "near_clone",
+            },
+            {
+                "source": "fixture.alpha",
+                "target": "fixture.decoy",
+                "expected": False,
+                "category": "lexical_hard_negative",
+            },
+            {
+                "source": "fixture.gamma",
+                "target": "fixture.delta",
+                "expected": True,
+                "category": "near_clone",
+            },
+            {
+                "source": "fixture.gamma",
+                "target": "fixture.decoy",
+                "expected": False,
+                "category": "unrelated_negative",
+            },
+        ]
+        observed = [
+            {"source": "fixture.beta", "target": "fixture.alpha", "score": 0.98},
+            {"source": "fixture.alpha", "target": "fixture.decoy", "score": 0.96},
+            {"source": "background.one", "target": "background.two", "score": 0.97},
+        ]
+
+        result = BENCHMARK.score_pair_classification(observed, judgments)
+
+        self.assertEqual(result["confusion"], {"tp": 1, "fp": 1, "fn": 1, "tn": 1})
+        self.assertEqual(result["precision"], 0.5)
+        self.assertEqual(result["recall"], 0.5)
+        self.assertEqual(result["f1"], 0.5)
+        self.assertEqual(result["false_positive_rate"], 0.5)
+        self.assertEqual(result["unjudged_observed_count"], 1)
+        self.assertEqual(result["unjudged_observed"][0]["source"], "background.one")
+        self.assertEqual(result["categories"]["near_clone"]["tp"], 1)
+        self.assertEqual(result["categories"]["near_clone"]["fn"], 1)
+        self.assertEqual(result["categories"]["lexical_hard_negative"]["fp"], 1)
+
+    def test_pair_classification_rejects_duplicate_or_conflicting_judgments(self) -> None:
+        duplicate = [
+            {"source": "fixture.a", "target": "fixture.b", "expected": True},
+            {"source": "fixture.b", "target": "fixture.a", "expected": True},
+        ]
+        conflicting = [
+            {"source": "fixture.a", "target": "fixture.b", "expected": True},
+            {"source": "fixture.b", "target": "fixture.a", "expected": False},
+        ]
+
+        with self.assertRaisesRegex(ValueError, "duplicate pair judgment"):
+            BENCHMARK.score_pair_classification([], duplicate)
+        with self.assertRaisesRegex(ValueError, "duplicate pair judgment"):
+            BENCHMARK.score_pair_classification([], conflicting)
+
+    def test_pair_classification_reports_undefined_denominators_as_null(self) -> None:
+        result = BENCHMARK.score_pair_classification(
+            [],
+            [
+                {
+                    "source": "fixture.a",
+                    "target": "fixture.b",
+                    "expected": False,
+                    "category": "negative",
+                }
+            ],
+        )
+
+        self.assertIsNone(result["precision"])
+        self.assertIsNone(result["recall"])
+        self.assertIsNone(result["f1"])
+        self.assertEqual(result["false_positive_rate"], 0.0)
+
+    def test_similarity_quality_fixture_has_versioned_pair_judgments_and_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixture = BENCHMARK.create_similarity_quality_repo(Path(tmpdir))
+            source = (Path(tmpdir) / "cbmq_similarity.go").read_text()
+
+        self.assertEqual(fixture["capability"], "similarity")
+        self.assertEqual(fixture["relationship"], "SIMILAR_TO")
+        self.assertEqual(fixture["task_set_version"], "semantic-pairs-v1")
+        self.assertRegex(fixture["task_set_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(len(fixture["source_sha256"]), 1)
+        self.assertTrue(any(item["expected"] for item in fixture["judgments"]))
+        self.assertTrue(any(not item["expected"] for item in fixture["judgments"]))
+        self.assertIn("cbmqValidateUser", source)
+        self.assertIn("cbmqValidateOrder", source)
+        self.assertIn("cbmqValidateProfileDecoy", source)
+
+    def test_semantic_edges_quality_fixture_is_distinct_from_similarity_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fixture = BENCHMARK.create_semantic_edges_quality_repo(Path(tmpdir))
+            source = (Path(tmpdir) / "cbmq_records.py").read_text()
+
+        self.assertEqual(fixture["capability"], "semantic_edges")
+        self.assertEqual(fixture["relationship"], "SEMANTICALLY_RELATED")
+        self.assertEqual(fixture["task_set_version"], "semantic-pairs-v1")
+        self.assertTrue(any(item["expected"] for item in fixture["judgments"]))
+        self.assertTrue(any(not item["expected"] for item in fixture["judgments"]))
+        self.assertIn("cbmq_normalize_user_record", source)
+        self.assertIn("cbmq_normalize_account_record", source)
+        self.assertIn("cbmq_archive_record_decoy", source)
+
+    def test_relation_quality_oracle_scores_raw_query_rows_and_response_cost(self) -> None:
+        calls = []
+        original = BENCHMARK.run_tool_call_for_transport
+
+        def fake_call(*args, **kwargs):
+            calls.append((args[3], args[4]))
+            return {
+                "elapsed_ms": 4.25,
+                "response_bytes": 211,
+                "response_token_estimate": 53,
+                "response": {
+                    "columns": ["a.name", "b.name", "r.jaccard", "a.file_path", "b.file_path"],
+                    "rows": [
+                        [
+                            "cbmqValidateOrder",
+                            "cbmqValidateUser",
+                            "0.984",
+                            "cbmq_similarity.go",
+                            "cbmq_similarity.go",
+                        ]
+                    ],
+                },
+            }
+
+        class Args:
+            timeout = 10
+            include_logs = False
+
+        fixture = {
+            "relationship": "SIMILAR_TO",
+            "score_property": "jaccard",
+            "query_name_marker": "cbmq",
+            "judgments": [
+                {
+                    "source": "cbmqValidateUser",
+                    "target": "cbmqValidateOrder",
+                    "expected": True,
+                    "category": "structural_near_clone",
+                },
+                {
+                    "source": "cbmqValidateUser",
+                    "target": "cbmqValidateProfileDecoy",
+                    "expected": False,
+                    "category": "lexical_hard_negative",
+                },
+            ],
+        }
+        BENCHMARK.run_tool_call_for_transport = fake_call
+        try:
+            result = BENCHMARK.run_relation_quality_oracles(
+                "cli", Path("cbm"), {}, "fixture", fixture, Args()
+            )
+        finally:
+            BENCHMARK.run_tool_call_for_transport = original
+
+        self.assertEqual(calls[0][0], "query_graph")
+        self.assertIn("SIMILAR_TO", calls[0][1]["query"])
+        self.assertEqual(calls[0][1]["format"], "json")
+        self.assertEqual(result["pair_classification"]["confusion"], {
+            "tp": 1,
+            "fp": 0,
+            "fn": 0,
+            "tn": 1,
+        })
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["response_quality"]["response_bytes"], 211)
+        self.assertEqual(result["observed_pairs"][0]["score"], 0.984)
+
     def test_search_projection_observation_separates_identity_and_property_fields(self) -> None:
         data = {
             "results": [
