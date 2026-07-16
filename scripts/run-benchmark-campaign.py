@@ -29,6 +29,7 @@ IDENTITY_FIELDS = (
     "binary_sha256",
     "build",
     "capabilities",
+    "capability_support",
     "transport",
     "scenario",
     "repetition",
@@ -142,6 +143,12 @@ def validate_cell(cell: dict[str, Any], index: int) -> None:
         isinstance(code, int) for code in accepted
     ):
         raise ValueError(f"cells[{index}].accepted_exit_codes must be a non-empty integer array")
+    support = cell.get("capability_support")
+    if support is not None and (
+        not isinstance(support, dict)
+        or not all(isinstance(key, str) and isinstance(value, bool) for key, value in support.items())
+    ):
+        raise ValueError(f"cells[{index}].capability_support must be a string-to-boolean object")
 
 
 def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -690,8 +697,35 @@ def completed_report_inputs(
         cell_root = campaign_root / "runs" / cell_identity(cell)
         completion = valid_completion(cell_root, cell)
         if completion is not None:
-            inputs.append((cell["label"], resolve_result_path(cell_root, completion)))
+            result_path = resolve_result_path(cell_root, completion)
+            inputs.append(
+                (cell["label"], materialize_report_input(campaign_root, cell, result_path))
+            )
     return inputs
+
+
+def materialize_report_input(
+    campaign_root: Path, cell: dict[str, Any], result_path: Path
+) -> Path:
+    """Create a deterministic derived input with candidate metadata beside immutable raw results."""
+    document = read_json_object(result_path)
+    parameters = document.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {}
+        document["parameters"] = parameters
+    support = cell.get("capability_support")
+    if isinstance(support, dict):
+        parameters["capability_support"] = dict(sorted(support.items()))
+    source_sha = file_sha256(result_path)
+    identity = cell_identity(cell)
+    document["campaign_provenance"] = {
+        "cell_identity": identity,
+        "source_result": str(result_path),
+        "source_result_sha256": source_sha,
+    }
+    output = campaign_root / "reports" / "inputs" / f"{identity}-{source_sha[:12]}.json"
+    atomic_write_json(output, document)
+    return output
 
 
 def generate_report(campaign_root: Path, cells: list[dict[str, Any]], output: Path) -> dict[str, Any]:

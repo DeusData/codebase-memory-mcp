@@ -334,10 +334,12 @@ def dependency_mode(reports: list[dict[str, Any]], observed_packages: list[float
         if not isinstance(parameters, dict):
             continue
         capability_support = parameters.get("capability_support")
-        if isinstance(capability_support, dict) and isinstance(
-            capability_support.get("auto_index_deps"), bool
-        ):
-            support.add(capability_support["auto_index_deps"])
+        if isinstance(capability_support, dict):
+            raw_support = capability_support.get(
+                "dependencies", capability_support.get("auto_index_deps")
+            )
+            if isinstance(raw_support, bool):
+                support.add(raw_support)
         config = parameters.get("config_overrides")
         if isinstance(config, dict) and "auto_index_deps" in config:
             overrides.add(str(config["auto_index_deps"]).lower())
@@ -368,8 +370,16 @@ def summarize_capability_applicability(
     summarized: dict[str, str] = {}
     for capability in ALGORITHM_CAPABILITIES:
         states: set[tuple[bool, str]] = set()
+        support: set[bool] = set()
         for report in reports:
             parameters = report.get("parameters")
+            capability_support = (
+                parameters.get("capability_support") if isinstance(parameters, dict) else None
+            )
+            if isinstance(capability_support, dict) and isinstance(
+                capability_support.get(capability), bool
+            ):
+                support.add(capability_support[capability])
             applicability = (
                 parameters.get("capability_applicability")
                 if isinstance(parameters, dict)
@@ -378,7 +388,11 @@ def summarize_capability_applicability(
             state = applicability.get(capability) if isinstance(applicability, dict) else None
             if isinstance(state, dict) and isinstance(state.get("applicable"), bool):
                 states.add((state["applicable"], str(state.get("reason") or "unspecified")))
-        if not states:
+        if support == {False}:
+            summarized[capability] = "unsupported by candidate"
+        elif len(support) > 1:
+            summarized[capability] = "mixed support"
+        elif not states:
             summarized[capability] = "unknown"
         elif len(states) > 1:
             summarized[capability] = "mixed"

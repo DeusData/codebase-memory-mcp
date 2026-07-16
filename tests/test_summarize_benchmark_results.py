@@ -336,6 +336,30 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("## Algorithm-quality applicability", markdown)
         self.assertIn("N/A: SIMILAR_TO generation requires full or moderate mode", markdown)
 
+    def test_candidate_support_overrides_mode_based_applicability(self) -> None:
+        item = report({"passed": True})
+        item["parameters"].update(
+            {
+                "index_mode": "fast",
+                "capability_applicability": {
+                    "rank": {"applicable": True, "reason": "available in fast mode"},
+                    "dependencies": {
+                        "applicable": True,
+                        "reason": "available in fast mode",
+                    },
+                },
+                "capability_support": {"rank": False, "dependencies": False},
+            }
+        )
+
+        row = SUMMARY.summarize_group("upstream", [item])
+
+        self.assertEqual(row["capability_applicability"]["rank"], "unsupported by candidate")
+        self.assertEqual(
+            row["capability_applicability"]["dependencies"], "unsupported by candidate"
+        )
+        self.assertEqual(row["dependency_mode"], "unsupported")
+
     def test_dependency_breakdown_reads_new_and_retained_result_shapes(self) -> None:
         new_case = {
             "passed": True,

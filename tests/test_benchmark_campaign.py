@@ -73,6 +73,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
             ("repetition", 2),
             ("environment", {"CBM_TEST_SEED": "2"}),
             ("parameters", {"frontier_files": 64, "exact_cap": 128}),
+            ("capability_support", {"rank": False}),
         ):
             variant = dict(base)
             variant[key] = changed
@@ -192,6 +193,34 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertTrue((cell_root / "complete.json").is_file())
             self.assertEqual(len(list((cell_root / "attempts").iterdir())), 1)
 
+    def test_report_input_adds_candidate_support_without_mutating_raw_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw = root / "raw.json"
+            raw_document = {
+                "parameters": {"config_profile": "default"},
+                "binary_metadata": {"sha256": "b" * 64},
+                "cases": [{"passed": True}],
+            }
+            raw.write_text(json.dumps(raw_document), encoding="utf-8")
+            planned = cell(
+                ["benchmark", "{result_path}"],
+                capability_support={"rank": False, "dependencies": False},
+            )
+
+            derived = CAMPAIGN.materialize_report_input(root, planned, raw)
+
+            self.assertEqual(json.loads(raw.read_text()), raw_document)
+            document = json.loads(derived.read_text())
+            self.assertEqual(
+                document["parameters"]["capability_support"],
+                {"dependencies": False, "rank": False},
+            )
+            self.assertEqual(document["campaign_provenance"]["source_result_sha256"],
+                             CAMPAIGN.file_sha256(raw))
+            self.assertEqual(document["campaign_provenance"]["cell_identity"],
+                             CAMPAIGN.cell_identity(planned))
+
     def test_failed_attempt_retains_logs_without_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -300,7 +329,12 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 },
             )
             inputs = CAMPAIGN.completed_report_inputs(root, [planned])
-            self.assertEqual(inputs, [("latest-rank-off-r1", result.resolve())])
+            self.assertEqual(inputs[0][0], "latest-rank-off-r1")
+            self.assertNotEqual(inputs[0][1], result.resolve())
+            self.assertEqual(
+                json.loads(inputs[0][1].read_text())["campaign_provenance"]["source_result_sha256"],
+                CAMPAIGN.file_sha256(result),
+            )
             report = CAMPAIGN.generate_report(root, [planned], root / "reports" / "summary.md")
             self.assertEqual(report["input_count"], 1)
             self.assertTrue((root / "reports" / "summary.md").is_file())
