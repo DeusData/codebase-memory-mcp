@@ -250,6 +250,18 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         candidate_environment = _string_map(
             candidate.get("environment"), f"candidates[{candidate_index}].environment"
         )
+        candidate_support = candidate.get("capability_support")
+        if candidate_support is not None and (
+            not isinstance(candidate_support, dict)
+            or not all(
+                isinstance(key, str) and isinstance(value, bool)
+                for key, value in candidate_support.items()
+            )
+        ):
+            raise ValueError(
+                f"candidates[{candidate_index}].capability_support must be a "
+                "string-to-boolean object"
+            )
 
         for profile_index, profile in enumerate(profiles):
             if not isinstance(profile, dict):
@@ -353,6 +365,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 }
                                 if environment:
                                     cell["environment"] = environment
+                                if isinstance(candidate_support, dict):
+                                    cell["capability_support"] = dict(
+                                        sorted(candidate_support.items())
+                                    )
                                 cells.append(cell)
     plan = {"schema_version": SCHEMA_VERSION, "cells": cells}
     validate_plan(plan)

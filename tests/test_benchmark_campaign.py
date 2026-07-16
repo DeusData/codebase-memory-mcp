@@ -100,6 +100,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                         "revision": "a" * 40,
                         "binary": str(binary),
                         "build": {"target": "cbm", "cflags": "-O2"},
+                        "capability_support": {"rank": True, "dependencies": True},
                     }
                 ],
                 "profiles": [
@@ -128,6 +129,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(first["binary_sha256"], CAMPAIGN.file_sha256(binary))
             self.assertEqual(first["parameters"]["frontier_files"], 4)
             self.assertEqual(first["parameters"]["exact_cap"], 4)
+            self.assertEqual(
+                first["capability_support"], {"dependencies": True, "rank": True}
+            )
             self.assertEqual(
                 first["parameters"]["benchmark_script_sha256"], CAMPAIGN.file_sha256(benchmark)
             )
