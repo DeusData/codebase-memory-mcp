@@ -130,6 +130,12 @@ can therefore declare `"candidate_labels": ["latest"]` to restrict an ablation t
 candidates that accept it. Keep an unrestricted default profile for every candidate,
 and record fixed-default or unsupported capabilities in `capability_support`; do not
 pass an unknown flag to an old binary or pretend that its default is an ablation.
+The harness likewise leaves `rank_refresh` untouched by default, records
+`"rank_refresh": "candidate_default"` and
+`"rank_refresh_override_applied": false`, and therefore measures each candidate's
+real compiled/configured policy. Use `--rank-refresh eager`, `stale_on_exact`, or
+`stale_on_incremental` only for an explicit policy experiment on candidates known to
+support that value.
 
 Each semantic pair case also supplies a content-addressed replacement source. A real
 one-file mutation removes one judged positive and adds another, retaining pre/post

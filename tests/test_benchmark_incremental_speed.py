@@ -4,6 +4,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -18,6 +19,32 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_cli_default_preserves_candidate_rank_refresh_policy(self) -> None:
+        with mock.patch.object(sys, "argv", [str(SCRIPT)]):
+            args = BENCHMARK.parse_args()
+
+        self.assertEqual(args.rank_refresh, BENCHMARK.RANK_REFRESH_CANDIDATE_DEFAULT)
+
+    def test_candidate_default_rank_refresh_does_not_write_config_override(self) -> None:
+        with mock.patch.object(BENCHMARK, "run_config_set") as run:
+            applied = BENCHMARK.apply_rank_refresh_override(
+                Path("/tmp/cbm"), {}, BENCHMARK.RANK_REFRESH_CANDIDATE_DEFAULT, 30
+            )
+
+        self.assertFalse(applied)
+        run.assert_not_called()
+
+    def test_explicit_rank_refresh_writes_config_override(self) -> None:
+        with mock.patch.object(BENCHMARK, "run_config_set") as run:
+            applied = BENCHMARK.apply_rank_refresh_override(
+                Path("/tmp/cbm"), {}, "stale_on_exact", 30
+            )
+
+        self.assertTrue(applied)
+        run.assert_called_once_with(
+            Path("/tmp/cbm"), {}, "rank_refresh", "stale_on_exact", 30
+        )
+
     def test_stream_query_fingerprint_is_ordered_bounded_and_change_sensitive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Path(tmpdir) / "graph.db"
