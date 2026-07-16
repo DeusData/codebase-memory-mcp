@@ -2510,6 +2510,42 @@ CONTENT_HASHES_SQL = (
     "FROM file_hashes WHERE project = ?1 ORDER BY rel_path"
 )
 
+STABLE_NODES_SQL = (
+    "SELECT quote(label) || char(9) || "
+    "quote(CASE WHEN label = 'Project' AND name = ?1 THEN '<project>' ELSE name END) || char(9) || "
+    "quote(CASE WHEN qualified_name = ?1 THEN '<project>' "
+    "WHEN substr(qualified_name, 1, length(?1) + 1) = ?1 || '.' "
+    "THEN substr(qualified_name, length(?1) + 2) ELSE qualified_name END) || char(9) || "
+    "quote(coalesce(file_path,'')) || char(9) || start_line || char(9) || end_line "
+    "FROM nodes WHERE project = ?1 ORDER BY 1"
+)
+
+STABLE_EDGES_SQL = (
+    "SELECT quote(CASE WHEN s.qualified_name = ?1 THEN '<project>' "
+    "WHEN substr(s.qualified_name, 1, length(?1) + 1) = ?1 || '.' "
+    "THEN substr(s.qualified_name, length(?1) + 2) ELSE s.qualified_name END) || char(9) || "
+    "quote(CASE WHEN t.qualified_name = ?1 THEN '<project>' "
+    "WHEN substr(t.qualified_name, 1, length(?1) + 1) = ?1 || '.' "
+    "THEN substr(t.qualified_name, length(?1) + 2) ELSE t.qualified_name END) || char(9) || "
+    "quote(e.type) FROM edges e "
+    "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+    "WHERE e.project = ?1 ORDER BY 1"
+)
+
+STABLE_SEMANTIC_SCORES_SQL = (
+    "SELECT quote(CASE WHEN s.qualified_name = ?1 THEN '<project>' "
+    "WHEN substr(s.qualified_name, 1, length(?1) + 1) = ?1 || '.' "
+    "THEN substr(s.qualified_name, length(?1) + 2) ELSE s.qualified_name END) || char(9) || "
+    "quote(CASE WHEN t.qualified_name = ?1 THEN '<project>' "
+    "WHEN substr(t.qualified_name, 1, length(?1) + 1) = ?1 || '.' "
+    "THEN substr(t.qualified_name, length(?1) + 2) ELSE t.qualified_name END) || char(9) || "
+    "quote(e.type) || char(9) || "
+    "coalesce(quote(CAST(json_extract(e.properties, '$.score') AS TEXT)), 'NULL') || char(9) || "
+    "coalesce(quote(CAST(json_extract(e.properties, '$.jaccard') AS TEXT)), 'NULL') "
+    "FROM edges e JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+    "WHERE e.project = ?1 AND e.type IN ('SIMILAR_TO','SEMANTICALLY_RELATED') ORDER BY 1"
+)
+
 ACTIVE_OVERLAY_CTE_SQL = (
     "WITH active_overlay_files AS ("
     "  SELECT project, rel_path, MAX(overlay_generation) AS overlay_generation"
@@ -2645,13 +2681,14 @@ ACTIVE_OVERLAY_EDGES_SQL = (
 )
 
 
-def canonical_graph_fingerprint(db_path: Path, project: str) -> dict[str, Any]:
-    """Return content identity for all canonical graph tables with O(1) Python memory."""
+def stable_graph_fingerprint(db_path: Path, project: str) -> dict[str, Any]:
+    """Return path-normalized experiment identity with O(1) Python memory."""
     components: dict[str, dict[str, Any]] = {}
     aggregate = hashlib.sha256()
     for name, sql in (
-        ("nodes", CANONICAL_NODES_SQL),
-        ("edges", CANONICAL_EDGES_SQL),
+        ("nodes", STABLE_NODES_SQL),
+        ("edges", STABLE_EDGES_SQL),
+        ("semantic_scores", STABLE_SEMANTIC_SCORES_SQL),
         ("source_files", CONTENT_HASHES_SQL),
     ):
         fingerprint = stream_query_fingerprint(db_path, sql, (project,))
@@ -2664,38 +2701,12 @@ def canonical_graph_fingerprint(db_path: Path, project: str) -> dict[str, Any]:
     return {"sha256": aggregate.hexdigest(), "components": components}
 
 
-def compare_canonical_graph(
-    left_db: Path,
-    right_db: Path,
-    project: str,
-    left_fingerprint: dict[str, Any] | None = None,
-    right_fingerprint: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    left_components = (left_fingerprint or {}).get("components", {})
-    right_components = (right_fingerprint or {}).get("components", {})
-    for component, kind, sql in (
-        ("nodes", "canonical nodes", CANONICAL_NODES_SQL),
-        ("edges", "canonical edges", CANONICAL_EDGES_SQL),
-        (None, "file hashes", CANONICAL_HASHES_SQL),
+def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
+    for kind, sql in (
+        ("canonical nodes", CANONICAL_NODES_SQL),
+        ("canonical edges", CANONICAL_EDGES_SQL),
+        ("file hashes", CANONICAL_HASHES_SQL),
     ):
-        if component and component in left_components and component in right_components:
-            left = left_components[component]
-            right = right_components[component]
-            if left == right:
-                continue
-            left_only, right_only = first_sorted_query_difference(
-                left_db, right_db, sql, (project,), sql, (project,)
-            )
-            return {
-                "equal": False,
-                "kind": kind,
-                "left_count": left["row_count"],
-                "right_count": right["row_count"],
-                "left_sha256": left["sha256"],
-                "right_sha256": right["sha256"],
-                "left_only": left_only,
-                "right_only": right_only,
-            }
         result = compare_query_rows(left_db, right_db, kind, sql, (project,), sql, (project,))
         if not result["equal"]:
             return result
@@ -3951,7 +3962,7 @@ def run_pair_quality_lifecycle(
             initial_oracles = run_relation_quality_oracles(
                 args.transport, binary, case_env, project, fixture, args, client
             )
-            initial_graph_fingerprint = canonical_graph_fingerprint(
+            initial_graph_fingerprint = stable_graph_fingerprint(
                 find_project_db(cache_dir), project
             )
             mutation = apply_pair_quality_mutation(repo_dir, fixture)
@@ -3983,7 +3994,7 @@ def run_pair_quality_lifecycle(
         initial_oracles = run_relation_quality_oracles(
             args.transport, binary, case_env, project, fixture, args
         )
-        initial_graph_fingerprint = canonical_graph_fingerprint(
+        initial_graph_fingerprint = stable_graph_fingerprint(
             find_project_db(cache_dir), project
         )
         mutation = apply_pair_quality_mutation(repo_dir, fixture)
@@ -4040,15 +4051,9 @@ def run_pair_quality_lifecycle(
             args.transport, binary, fresh_env, fresh_project, post_fixture, args
         )
     fresh_db = find_project_db(fresh_cache)
-    incremental_graph_fingerprint = canonical_graph_fingerprint(incremental_snapshot, project)
-    fresh_graph_fingerprint = canonical_graph_fingerprint(fresh_db, fresh_project)
-    canonical_graph = compare_canonical_graph(
-        incremental_snapshot,
-        fresh_db,
-        project,
-        incremental_graph_fingerprint,
-        fresh_graph_fingerprint,
-    )
+    incremental_graph_fingerprint = stable_graph_fingerprint(incremental_snapshot, project)
+    fresh_graph_fingerprint = stable_graph_fingerprint(fresh_db, fresh_project)
+    canonical_graph = compare_canonical_graph(incremental_snapshot, fresh_db, project)
     pair_equality = compare_pair_oracle_outputs(incremental_oracles, fresh_oracles)
     incremental_policy = evaluate_pair_incremental_policy(
         args.config_overrides,
