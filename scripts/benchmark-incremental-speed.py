@@ -36,7 +36,8 @@ DEFAULT_FUNCTIONS_PER_FILE = 12
 DEFAULT_CHANGED_FILES = 2
 DEFAULT_MIN_SPEEDUP = 10.0
 DEFAULT_TIMEOUT_SECONDS = 240
-DEFAULT_RANK_REFRESH = "stale_on_exact"
+RANK_REFRESH_CANDIDATE_DEFAULT = "candidate_default"
+DEFAULT_RANK_REFRESH = RANK_REFRESH_CANDIDATE_DEFAULT
 DEFAULT_OVERHEAD_PROBES = 0
 DEFAULT_OVERHEAD_TOOL = "index_status"
 DEFAULT_FRONTIER_FILES = 16
@@ -1912,6 +1913,16 @@ def apply_config_overrides(
 ) -> None:
     for key, value in overrides.items():
         run_config_set(binary, env, key, value, timeout)
+
+
+def apply_rank_refresh_override(
+    binary: Path, env: dict[str, str], policy: str, timeout: int
+) -> bool:
+    """Apply an explicit rank policy while preserving each candidate's default."""
+    if policy == RANK_REFRESH_CANDIDATE_DEFAULT:
+        return False
+    run_config_set(binary, env, "rank_refresh", policy, timeout)
+    return True
 
 
 def build_index_result(
@@ -4090,6 +4101,7 @@ def run_pair_quality_lifecycle(
     fresh_cache = work_root / "fresh-cache"
     fresh_cache.mkdir(parents=True, exist_ok=True)
     fresh_env = build_env(fresh_cache)
+    apply_rank_refresh_override(binary, fresh_env, args.rank_refresh, args.timeout)
     apply_config_overrides(binary, fresh_env, args.config_overrides, args.timeout)
     if args.transport == "mcp":
         with McpClient(binary, fresh_env, args.timeout) as client:
@@ -4184,6 +4196,10 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
         "mode": "capability_quality",
         "parameters": {
             "capability": capability,
+            "rank_refresh": args.rank_refresh,
+            "rank_refresh_override_applied": (
+                args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
+            ),
             "index_mode": args.index_mode,
             "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
@@ -4226,6 +4242,7 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
             "semantic_edges": create_semantic_edges_quality_repo,
         }[capability]
         fixture = fixture_factory(repo_dir)
+        apply_rank_refresh_override(binary, case_env, args.rank_refresh, args.timeout)
         apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
         lifecycle = None
         if capability in {"similarity", "semantic_edges"}:
@@ -4323,7 +4340,7 @@ def run_matrix_case(
     case_env = dict(env)
     case_env["CBM_CACHE_DIR"] = str(cache_dir)
     run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
-    run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
+    apply_rank_refresh_override(binary, case_env, args.rank_refresh, args.timeout)
     apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
 
     scenario_metadata = prepare_matrix_scenario(
@@ -4427,6 +4444,9 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             "functions_per_file": args.functions_per_file,
             "frontier_files": args.frontier_files,
             "rank_refresh": args.rank_refresh,
+            "rank_refresh_override_applied": (
+                args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
+            ),
             "index_mode": args.index_mode,
             "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
@@ -4483,7 +4503,7 @@ def run_self_dogfood_case(
     result: dict[str, Any] | None = None
     try:
         run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
-        run_config_set(binary, case_env, "rank_refresh", args.rank_refresh, args.timeout)
+        apply_rank_refresh_override(binary, case_env, args.rank_refresh, args.timeout)
         apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
@@ -4618,6 +4638,9 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         "mode": "self_dogfood",
         "parameters": {
             "rank_refresh": args.rank_refresh,
+            "rank_refresh_override_applied": (
+                args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
+            ),
             "index_mode": args.index_mode,
             "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
@@ -4686,8 +4709,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rank-refresh",
-        choices=("eager", "stale_on_exact", "stale_on_incremental"),
+        choices=(
+            RANK_REFRESH_CANDIDATE_DEFAULT,
+            "eager",
+            "stale_on_exact",
+            "stale_on_incremental",
+        ),
         default=DEFAULT_RANK_REFRESH,
+        help=(
+            "Preserve the candidate's compiled/configured default unless an explicit policy "
+            "is selected. This is independent of --config-profile."
+        ),
     )
     parser.add_argument(
         "--config-profile",
@@ -4910,6 +4942,9 @@ def main() -> int:
             "changed_files": args.changed_files,
             "min_speedup": args.min_speedup,
             "rank_refresh": args.rank_refresh,
+            "rank_refresh_override_applied": (
+                args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
+            ),
             "index_mode": args.index_mode,
             "capability_applicability": index_mode_capability_applicability(args.index_mode),
             "config_profile": args.config_profile,
@@ -4927,7 +4962,7 @@ def main() -> int:
         create_repo(repo_dir, args.files, args.functions_per_file)
         env = build_env(cache_dir)
         run_config_set(binary, env, "incremental_reindex", "always", args.timeout)
-        run_config_set(binary, env, "rank_refresh", args.rank_refresh, args.timeout)
+        apply_rank_refresh_override(binary, env, args.rank_refresh, args.timeout)
         apply_config_overrides(binary, env, args.config_overrides, args.timeout)
 
         if args.transport == "mcp":
