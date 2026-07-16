@@ -3065,6 +3065,79 @@ TEST(tool_index_status_includes_git_metadata) {
     PASS();
 }
 
+#ifndef _WIN32
+static int mcp_test_git_run(const char *dir, const char *args) {
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s >/dev/null 2>&1", dir, args);
+    return system(cmd);
+}
+#endif
+
+TEST(tool_index_status_distinguishes_dirty_worktree_from_head) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git dirty-worktree status test is not supported on Windows CI");
+#else
+    char *tmp = th_mktempdir("cbm-status-git");
+    ASSERT_NOT_NULL(tmp);
+    if (mcp_test_git_run(tmp, "init -q") != 0 ||
+        mcp_test_git_run(tmp, "config user.email test@example.com") != 0 ||
+        mcp_test_git_run(tmp, "config user.name Test") != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git is unavailable");
+    }
+    char source_path[CBM_SZ_1K];
+    snprintf(source_path, sizeof(source_path), "%s/main.c", tmp);
+    ASSERT_EQ(th_write_file(source_path, "int main(void) { return 0; }\n"), 0);
+    ASSERT_EQ(mcp_test_git_run(tmp, "add main.c"), 0);
+    ASSERT_EQ(mcp_test_git_run(tmp, "commit -q -m initial"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "status-git-identity";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "main",
+                       .qualified_name = "status-git-identity.main",
+                       .file_path = "main.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":161,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\","
+             "\"arguments\":{\"project\":\"status-git-identity\"}}}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"worktree_dirty\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"head_matches_worktree\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"head_scope\":\"committed_revision_only\""));
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(th_write_file(source_path, "int main(void) { return 1; }\n"), 0);
+    response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":162,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\","
+             "\"arguments\":{\"project\":\"status-git-identity\"}}}");
+    ASSERT_NOT_NULL(response);
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"worktree_dirty\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"head_matches_worktree\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"head_scope\":\"committed_revision_only\""));
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+#endif
+}
+
 TEST(tool_index_status_reports_dirty_metadata) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -9821,6 +9894,7 @@ SUITE(mcp) {
     RUN_TEST(tool_query_graph_warns_on_stale_similarity_edges);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_index_status_includes_git_metadata);
+    RUN_TEST(tool_index_status_distinguishes_dirty_worktree_from_head);
     RUN_TEST(tool_index_status_reports_dirty_metadata);
     RUN_TEST(tool_index_status_reports_overlay_read_view_counts);
 
