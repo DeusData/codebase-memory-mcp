@@ -167,9 +167,13 @@ def compact_witness(value: Any, limit: int = 96) -> str:
 
 
 def correctness_findings(
-    cases: list[dict[str, Any]], *, capability_quality: bool = False
+    cases: list[dict[str, Any]],
+    *,
+    capability_quality: bool = False,
+    disabled_pair_capabilities: set[str] | None = None,
 ) -> list[str]:
     findings: list[str] = []
+    disabled_pair_capabilities = disabled_pair_capabilities or set()
     for case in cases:
         canonical = case.get("canonical_graph")
         if isinstance(canonical, dict) and canonical.get("equal") is False:
@@ -188,25 +192,61 @@ def correctness_findings(
             findings.append(detail)
 
         case_oracles = case.get("oracles")
-        if not isinstance(case_oracles, dict):
+        if isinstance(case_oracles, dict):
+            for name, oracle in case_oracles.items():
+                if not isinstance(oracle, dict) or name == "quality":
+                    continue
+                quality = oracle.get("quality")
+                if isinstance(quality, dict) and quality.get("passed") is False:
+                    expected = compact_witness(quality.get("expected_substring"))
+                    rank = quality.get("rank")
+                    cutoff = quality.get("relevance_cutoff")
+                    if capability_quality and isinstance(rank, int) and isinstance(cutoff, int):
+                        finding = f"{name} below quality cutoff (rank {rank}, cutoff {cutoff})"
+                    elif capability_quality:
+                        finding = f"{name} did not meet the quality target"
+                    else:
+                        finding = f"{name} failed"
+                    if expected:
+                        finding += f" (expected {expected})"
+                    findings.append(finding)
+
+        lifecycle = case.get("pair_lifecycle")
+        fixture = case.get("fixture")
+        capability = str(fixture.get("capability") or "") if isinstance(fixture, dict) else ""
+        if not isinstance(lifecycle, dict) or capability in disabled_pair_capabilities:
             continue
-        for name, oracle in case_oracles.items():
-            if not isinstance(oracle, dict) or name == "quality":
+        policy = lifecycle.get("incremental_policy")
+        immediate_expected = (
+            isinstance(policy, dict) and policy.get("immediate_freshness_expected") is True
+        )
+        for stage, key, required in (
+            ("Initial", "initial_oracles", True),
+            ("Post-edit", "incremental_oracles", immediate_expected),
+            ("Fresh", "fresh_oracles", True),
+        ):
+            oracle = lifecycle.get(key)
+            if not required or not isinstance(oracle, dict) or oracle.get("passed") is not False:
                 continue
-            quality = oracle.get("quality")
-            if isinstance(quality, dict) and quality.get("passed") is False:
-                expected = compact_witness(quality.get("expected_substring"))
-                rank = quality.get("rank")
-                cutoff = quality.get("relevance_cutoff")
-                if capability_quality and isinstance(rank, int) and isinstance(cutoff, int):
-                    finding = f"{name} below quality cutoff (rank {rank}, cutoff {cutoff})"
-                elif capability_quality:
-                    finding = f"{name} did not meet the quality target"
-                else:
-                    finding = f"{name} failed"
-                if expected:
-                    finding += f" (expected {expected})"
-                findings.append(finding)
+            classification = oracle.get("pair_classification")
+            confusion = (
+                classification.get("confusion") if isinstance(classification, dict) else None
+            )
+            finding = f"{stage} semantic-pair quality missed the declared target"
+            if isinstance(confusion, dict):
+                tp = int(confusion.get("tp") or 0)
+                tn = int(confusion.get("tn") or 0)
+                fp = int(confusion.get("fp") or 0)
+                fn = int(confusion.get("fn") or 0)
+                finding += f": TP={tp}, TN={tn}, FP={fp}, FN={fn}"
+                consequences = []
+                if fn:
+                    consequences.append(f"{fn} expected positive absent")
+                if fp:
+                    consequences.append(f"{fp} unexpected positive present")
+                if consequences:
+                    finding += " (" + ", ".join(consequences) + ")"
+            findings.append(finding)
     return list(dict.fromkeys(findings))
 
 
@@ -707,6 +747,22 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
 
     canonical_failed = any(not value for value in canonical)
     oracle_target_missed = any(not value for value in oracles)
+    required_pair_stage_missed = False
+    for case in cases:
+        lifecycle = case.get("pair_lifecycle")
+        if not isinstance(lifecycle, dict):
+            continue
+        policy = lifecycle.get("incremental_policy")
+        immediate_expected = (
+            isinstance(policy, dict) and policy.get("immediate_freshness_expected") is True
+        )
+        required = [lifecycle.get("initial_oracles"), lifecycle.get("fresh_oracles")]
+        if immediate_expected:
+            required.append(lifecycle.get("incremental_oracles"))
+        if any(isinstance(oracle, dict) and oracle.get("passed") is False for oracle in required):
+            required_pair_stage_missed = True
+            break
+    quality_target_missed = oracle_target_missed or required_pair_stage_missed
     missed_oracle_count = sum(1 for value in oracles if not value)
     explicit_ablation_miss = (
         bool(quality_miss_ablation_states)
@@ -726,9 +782,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         decision = "REJECT: graph correctness"
     elif freshness_policy_failed:
         decision = "REJECT: freshness policy"
-    elif oracle_target_missed and (capability_quality or explicit_ablation_miss):
+    elif quality_target_missed and (capability_quality or explicit_ablation_miss):
         decision = "BELOW QUALITY TARGET"
-    elif oracle_target_missed:
+    elif quality_target_missed:
         decision = "REJECT: task correctness"
     elif case_passes and not all(case_passes) and not capability_quality:
         decision = "REJECT: benchmark gate"
@@ -811,7 +867,16 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         except (TypeError, ValueError):
             pass
     full_values = full_ms or initial_full_ms
-    findings = correctness_findings(cases, capability_quality=capability_quality)
+    disabled_pair_capabilities = {
+        str(detail.get("capability"))
+        for detail in pair_quality_details
+        if detail.get("capability_state") == "disabled"
+    }
+    findings = correctness_findings(
+        cases,
+        capability_quality=capability_quality,
+        disabled_pair_capabilities=disabled_pair_capabilities,
+    )
     if freshness_policy_failed:
         findings.append(
             "The incremental semantic result did not conform to the recorded freshness policy; "
@@ -1852,7 +1917,15 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         )
     )
     for row in rows:
-        evidence = row["findings"] or ["All applicable canonical-graph and task-oracle checks passed."]
+        if row["findings"]:
+            evidence = row["findings"]
+        elif str(row["decision"]).startswith("PASS"):
+            evidence = ["All applicable canonical-graph and task-oracle checks passed."]
+        else:
+            evidence = [
+                f"{row['decision']}: no stage-level witness was recorded; inspect the retained "
+                "raw result before drawing a causal conclusion."
+            ]
         lines.append(f"| {display(row['candidate'])} | {display('; '.join(evidence))} |")
     lines.extend(
         (
