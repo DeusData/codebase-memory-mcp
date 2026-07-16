@@ -175,6 +175,45 @@ class BenchmarkCampaignTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "binary_sha256 does not match"):
                 CAMPAIGN.expand_matrix_spec(spec)
 
+    def test_matrix_spec_null_cap_preserves_candidate_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            binary = root / "cbm"
+            binary.write_bytes(b"binary")
+            benchmark = root / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "default-v1",
+                "benchmark_script": str(benchmark),
+                "cwd": str(root),
+                "repetitions": 1,
+                "transports": ["mcp"],
+                "candidates": [
+                    {
+                        "label": "candidate",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "build": {"cflags": "-O2"},
+                    }
+                ],
+                "profiles": [
+                    {"label": "default", "config_profile": "default", "capabilities": {}}
+                ],
+                "scenarios": [
+                    {"name": "go_modify_1", "frontier_files": [16], "exact_caps": [None]}
+                ],
+            }
+
+            cell = CAMPAIGN.expand_matrix_spec(spec)["cells"][0]
+
+            self.assertEqual(cell["label"], "candidate.default.mcp.go_modify_1.f16.capdefault")
+            self.assertIsNone(cell["parameters"]["exact_cap"])
+            self.assertNotIn("incremental_exact_max_affected_paths", cell["capabilities"])
+            self.assertFalse(
+                any("incremental_exact_max_affected_paths=" in item for item in cell["command"])
+            )
+
     def test_successful_cell_resumes_without_second_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

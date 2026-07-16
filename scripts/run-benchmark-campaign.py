@@ -300,17 +300,18 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError(f"scenarios[{scenario_index}].name is invalid")
                 if not all(isinstance(item, int) and item > 0 for item in frontier_values):
                     raise ValueError("frontier_files must contain positive integers")
-                if not all(isinstance(item, int) and item > 0 for item in cap_values):
-                    raise ValueError("exact_caps must contain positive integers")
+                if not all(
+                    item is None
+                    or (isinstance(item, int) and not isinstance(item, bool) and item > 0)
+                    for item in cap_values
+                ):
+                    raise ValueError("exact_caps must contain positive integers or null")
 
                 for transport in transports:
                     for frontier_files in frontier_values:
                         for exact_cap in cap_values:
                             effective_capabilities = dict(capabilities)
                             effective_capabilities.update(overrides)
-                            effective_capabilities["incremental_exact_max_affected_paths"] = str(
-                                exact_cap
-                            )
                             command = [
                                 str(benchmark_path),
                                 "--binary",
@@ -324,9 +325,19 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 transport,
                                 "--config-profile",
                                 config_profile,
-                                "--config",
-                                f"incremental_exact_max_affected_paths={exact_cap}",
                             ]
+                            cap_label = "default"
+                            if isinstance(exact_cap, int):
+                                effective_capabilities[
+                                    "incremental_exact_max_affected_paths"
+                                ] = str(exact_cap)
+                                command.extend(
+                                    (
+                                        "--config",
+                                        f"incremental_exact_max_affected_paths={exact_cap}",
+                                    )
+                                )
+                                cap_label = str(exact_cap)
                             for key, value in sorted(overrides.items()):
                                 command.extend(("--config", f"{key}={value}"))
                             command.extend(("--timeout", str(benchmark_timeout), "--out", "{result_path}"))
@@ -339,7 +350,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                             }
                             label = (
                                 f"{candidate_label}.{profile_label}.{transport}.{scenario_name}."
-                                f"f{frontier_files}.cap{exact_cap}"
+                                f"f{frontier_files}.cap{cap_label}"
                             )
                             environment = {
                                 **common_environment,
