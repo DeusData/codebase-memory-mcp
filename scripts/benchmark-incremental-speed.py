@@ -38,10 +38,12 @@ DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
 CONFIG_PROFILE_DEFAULT = "default"
 CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
+CONFIG_PROFILE_DEPENDENCY_DISABLED = "dependency_disabled"
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_DEFAULT: {},
     CONFIG_PROFILE_RANK_DISABLED: {"rank_enabled": "false"},
+    CONFIG_PROFILE_DEPENDENCY_DISABLED: {"auto_index_deps": "false"},
     CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: {
         "githistory_enabled": "false",
         "httplinks_enabled": "false",
@@ -135,6 +137,7 @@ LOG_MARKER_EXACT_FRONTIER = "incremental.exact.frontier"
 LOG_MARKER_EXACT_FALLBACK = "incremental.exact.fallback"
 LOG_MARKER_EXACT_DELETE_FALLBACK = "incremental.exact.delete.fallback"
 LOG_MARKER_EXACT_SKIP = "incremental.exact.skip"
+LOG_MARKER_DEP_AUTO_INDEX = "sub=dep_auto_index"
 
 
 class BenchmarkCommandError(RuntimeError):
@@ -961,6 +964,7 @@ def build_index_result(
                             "msg=mem.phase",
                             "msg=pipeline.done",
                             "msg=incremental.done",
+                            LOG_MARKER_DEP_AUTO_INDEX,
                         )
                     ):
                         measurement_log_markers.append(line.rstrip("\n"))
@@ -989,6 +993,15 @@ def build_index_result(
         for marker in ("mem.phase", LOG_MARKER_PIPELINE_DONE, LOG_MARKER_INCREMENTAL_DONE)
     ]
     peak_rss_mb = max((value for value in peak_candidates if value is not None), default=None)
+    dependency_phase_ms = parse_log_int_field(
+        measurement_text, LOG_MARKER_DEP_AUTO_INDEX, "ms"
+    )
+    dependencies_indexed = data.get("dependencies_indexed")
+    dependency_packages = (
+        dependencies_indexed
+        if isinstance(dependencies_indexed, int) and dependencies_indexed >= 0
+        else None
+    )
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_int,
         "peak_rss_mb": peak_rss_mb,
@@ -1000,6 +1013,15 @@ def build_index_result(
         "freshness_state": freshness_state or None,
         "freshness": freshness,
         "stdout_bytes": stdout_bytes,
+        "dependency_indexing": {
+            "measurement_status": (
+                "measured"
+                if dependency_phase_ms is not None or dependency_packages is not None
+                else "unknown"
+            ),
+            "phase_elapsed_ms": dependency_phase_ms,
+            "packages_indexed": dependency_packages,
+        },
         "markers": {
             "incremental_exact_done": log_has(stderr, LOG_MARKER_EXACT_DONE)
             or publish_kind == PUBLISH_INCREMENTAL_EXACT,
@@ -2475,9 +2497,10 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(CONFIG_PROFILES),
         default=CONFIG_PROFILE_DEFAULT,
         help=(
-            "Named, auditable capability profile. minimal_indexing disables dependency "
-            "indexing plus every optional graph/rank pass; repeated --config KEY=VALUE "
-            "arguments take priority over the profile."
+            "Named, auditable capability profile. dependency_disabled changes only "
+            "auto_index_deps for a controlled ablation; minimal_indexing disables dependency "
+            "indexing plus every optional graph/rank pass. Repeated --config KEY=VALUE "
+            "arguments take priority over the selected profile."
         ),
     )
     parser.add_argument(

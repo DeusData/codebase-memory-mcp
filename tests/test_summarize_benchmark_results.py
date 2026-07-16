@@ -24,6 +24,99 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_dependency_breakdown_reads_new_and_retained_result_shapes(self) -> None:
+        new_case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "initial_fast_full": {
+                "dependency_indexing": {
+                    "measurement_status": "measured",
+                    "phase_elapsed_ms": 120,
+                    "packages_indexed": 6,
+                }
+            },
+            "incremental": {
+                "elapsed_ms": 10,
+                "measurement_log_markers": [
+                    "level=info msg=prof phase=index_repository "
+                    "sub=dep_auto_index ms=4 us=4000"
+                ],
+                "response": {"dependencies_indexed": 2},
+            },
+            "fresh_fast_full_after_change": {
+                "elapsed_ms": 100,
+                "measurement_log_markers": [
+                    "level=info msg=prof phase=index_repository "
+                    "sub=dep_auto_index ms=80 us=80000"
+                ],
+                "response": {"dependencies_indexed": 6},
+            },
+        }
+        item = report(new_case)
+        item["parameters"]["config_profile"] = "default"
+        item["parameters"]["config_overrides"] = {}
+
+        row = SUMMARY.summarize_group("latest-default", [item])
+
+        self.assertEqual(row["dependency_mode"], "enabled (observed)")
+        self.assertEqual(row["dependency_packages_p50"], 6.0)
+        self.assertEqual(row["dependency_initial_p50_ms"], 120.0)
+        self.assertEqual(row["dependency_incremental_p50_ms"], 4.0)
+        self.assertEqual(row["dependency_fresh_p50_ms"], 80.0)
+
+    def test_dependency_mode_distinguishes_disabled_unsupported_and_unknown(self) -> None:
+        case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "incremental": {"elapsed_ms": 10},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100},
+        }
+        disabled = report(case)
+        disabled["parameters"]["config_profile"] = "dependency_disabled"
+        disabled["parameters"]["config_overrides"] = {"auto_index_deps": "false"}
+        unsupported = report(case)
+        unsupported["parameters"]["capability_support"] = {"auto_index_deps": False}
+        unknown = report(case)
+        unknown["parameters"]["config_overrides"] = {}
+
+        self.assertEqual(
+            SUMMARY.summarize_group("disabled", [disabled])["dependency_mode"],
+            "disabled (explicit)",
+        )
+        self.assertEqual(
+            SUMMARY.summarize_group("upstream", [unsupported])["dependency_mode"],
+            "unsupported",
+        )
+        self.assertEqual(
+            SUMMARY.summarize_group("historical", [unknown])["dependency_mode"],
+            "unknown",
+        )
+
+    def test_markdown_reports_dependency_cost_and_methodology_sources(self) -> None:
+        case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "incremental": {
+                "elapsed_ms": 10,
+                "dependency_indexing": {
+                    "measurement_status": "measured",
+                    "phase_elapsed_ms": 3,
+                    "packages_indexed": 1,
+                },
+            },
+            "fresh_fast_full_after_change": {"elapsed_ms": 100},
+        }
+        item = report(case)
+        item["parameters"]["config_overrides"] = {"auto_index_deps": "true"}
+
+        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("deps-on", [item])])
+
+        self.assertIn("## Dependency-indexing capability and cost", markdown)
+        self.assertIn("enabled (explicit)", markdown)
+        self.assertIn("trec.nist.gov/data/qa.html", markdown)
+        self.assertIn("arxiv.org/abs/2007.10899", markdown)
+        self.assertIn("confidence interval", markdown)
+
     def test_quality_failure_blocks_acceptance_even_with_high_speedup(self) -> None:
         case = {
             "passed": False,

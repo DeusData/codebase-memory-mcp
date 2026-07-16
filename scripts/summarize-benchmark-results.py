@@ -242,6 +242,71 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
     return details
 
 
+def marker_int(lines: Any, marker: str, field: str) -> int | None:
+    if not isinstance(lines, list):
+        return None
+    prefix = f"{field}="
+    for line in lines:
+        if not isinstance(line, str) or marker not in line:
+            continue
+        for item in line.split():
+            if item.startswith(prefix):
+                try:
+                    return int(item.split("=", 1)[1])
+                except ValueError:
+                    return None
+    return None
+
+
+def dependency_observation(index_result: Any) -> tuple[int | None, int | None]:
+    """Read dependency cost/count from current and retained benchmark result shapes."""
+    if not isinstance(index_result, dict):
+        return None, None
+    dependency = index_result.get("dependency_indexing")
+    phase_ms = None
+    packages = None
+    if isinstance(dependency, dict):
+        raw_phase = dependency.get("phase_elapsed_ms")
+        raw_packages = dependency.get("packages_indexed")
+        phase_ms = int(raw_phase) if isinstance(raw_phase, (int, float)) else None
+        packages = int(raw_packages) if isinstance(raw_packages, (int, float)) else None
+    if phase_ms is None:
+        phase_ms = marker_int(
+            index_result.get("measurement_log_markers"), "sub=dep_auto_index", "ms"
+        )
+    response = index_result.get("response")
+    if packages is None and isinstance(response, dict):
+        raw_packages = response.get("dependencies_indexed")
+        packages = int(raw_packages) if isinstance(raw_packages, (int, float)) else None
+    return phase_ms, packages
+
+
+def dependency_mode(reports: list[dict[str, Any]], observed_packages: list[float]) -> str:
+    support: set[bool] = set()
+    overrides: set[str] = set()
+    for report in reports:
+        parameters = report.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        capability_support = parameters.get("capability_support")
+        if isinstance(capability_support, dict) and isinstance(
+            capability_support.get("auto_index_deps"), bool
+        ):
+            support.add(capability_support["auto_index_deps"])
+        config = parameters.get("config_overrides")
+        if isinstance(config, dict) and "auto_index_deps" in config:
+            overrides.add(str(config["auto_index_deps"]).lower())
+    if support == {False}:
+        return "unsupported"
+    if overrides and overrides <= {"false", "0", "off"}:
+        return "disabled (explicit)"
+    if overrides and overrides <= {"true", "1", "on"}:
+        return "enabled (explicit)"
+    if observed_packages and max(observed_packages) > 0:
+        return "enabled (observed)"
+    return "unknown"
+
+
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
     cases = [case for report in reports for case in cases_from_report(report)]
     canonical = [
@@ -276,6 +341,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     quality_score_count = 0
     hit_at_1_weighted = 0.0
     hit_at_5_weighted = 0.0
+    dependency_initial_ms: list[float] = []
+    dependency_incremental_ms: list[float] = []
+    dependency_fresh_ms: list[float] = []
+    dependency_packages: list[float] = []
     for case in cases:
         incremental = case.get("incremental", {})
         full = case.get("fresh_fast_full_after_change", {})
@@ -294,6 +363,16 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 peak_rss.append(full["peak_rss_mb"])
         if isinstance(case.get("speedup_full_rebuild_over_incremental"), (int, float)):
             speedups.append(float(case["speedup_full_rebuild_over_incremental"]))
+        for field, timings in (
+            ("initial_fast_full", dependency_initial_ms),
+            ("incremental", dependency_incremental_ms),
+            ("fresh_fast_full_after_change", dependency_fresh_ms),
+        ):
+            phase_ms, packages = dependency_observation(case.get(field))
+            if phase_ms is not None:
+                timings.append(float(phase_ms))
+            if packages is not None:
+                dependency_packages.append(float(packages))
         case_oracles = case.get("oracles", {})
         if isinstance(case_oracles, dict):
             quality = case_oracles.get("quality", {})
@@ -403,6 +482,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
         "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
+        "incremental_observations": len(incremental_ms),
+        "full_observations": len(full_ms),
         "capabilities": config_label(reports),
         "capability_signature": config_signature(reports),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
@@ -412,6 +493,11 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "full_p50_ms": percentile(full_ms, 0.50),
         "speedup_p50": float(statistics.median(speedups)) if speedups else None,
         "peak_rss_mb": max(peak_rss) if peak_rss else None,
+        "dependency_mode": dependency_mode(reports, dependency_packages),
+        "dependency_packages_p50": percentile(dependency_packages, 0.50),
+        "dependency_initial_p50_ms": percentile(dependency_initial_ms, 0.50),
+        "dependency_incremental_p50_ms": percentile(dependency_incremental_ms, 0.50),
+        "dependency_fresh_p50_ms": percentile(dependency_fresh_ms, 0.50),
         "cleanup": ratio(cleanup_passes, len(reports)),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
         "findings": correctness_findings(cases),
@@ -737,6 +823,40 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "equality compares the incremental graph with that fresh reference graph.",
         )
     )
+    lines.extend(
+        (
+            "",
+            "## Dependency-indexing capability and cost",
+            "",
+            "| Candidate | Dependency mode | Packages indexed p50 | Initial dependency p50 ms | "
+            "Incremental dependency p50 ms | Fresh-after-mutation dependency p50 ms |",
+            "|---|---|---:|---:|---:|---:|",
+        )
+    )
+    for row in rows:
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    display(row["candidate"]),
+                    display(row["dependency_mode"]),
+                    display(row["dependency_packages_p50"]),
+                    display(row["dependency_initial_p50_ms"]),
+                    display(row["dependency_incremental_p50_ms"]),
+                    display(row["dependency_fresh_p50_ms"]),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        (
+            "",
+            "`enabled (observed)` requires a positive recorded package count. `disabled "
+            "(explicit)` and `enabled (explicit)` come from exact config overrides; `unsupported` "
+            "requires explicit capability-support metadata. `unknown` is intentionally not guessed "
+            "from an old artifact that lacks those signals.",
+        )
+    )
     crossovers = frontier_crossover_rows(rows)
     if crossovers:
         lines.extend(
@@ -793,9 +913,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "## Performance and provenance",
             "",
-            "| Candidate | Cases | Capabilities | Incremental p95 ms | Full p50 ms | "
+            "| Candidate | Cases | Capabilities | Observations (incremental/full) | Incremental p95 ms | Full p50 ms | "
             "Speedup p50 | Cleanup | Binary SHA-256 |",
-            "|---|---:|---|---:|---:|---:|---:|---|",
+            "|---|---:|---|---:|---:|---:|---:|---:|---|",
         )
     )
     for row in rows:
@@ -806,6 +926,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["candidate"]),
                     display(row["cases"]),
                     display(row["capabilities"]),
+                    display(f"{row['incremental_observations']}/{row['full_observations']}"),
                     display(row["incremental_p95_ms"]),
                     display(row["full_p50_ms"]),
                     display(row["speedup_p50"], 2),
@@ -886,8 +1007,8 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "ranked probes; a missing expected result contributes zero. Hit@1 and Hit@5 are the "
             "fractions of those same applicable probes whose first expected result appears by the "
             "stated cutoff. N/A probes are excluded from every retrieval denominator. These definitions "
-            "follow the official TREC treatment of reciprocal rank and Success@n: "
-            "[TREC 2005 Enterprise/QA overview](https://trec.nist.gov/pubs/trec14/papers/hummingbird.qa.robust.tera.pdf).",
+            "follow NIST's official TREC QA definition: "
+            "[TREC QA evaluation data](https://trec.nist.gov/data/qa.html).",
             "",
             "Graph fidelity is the fraction of mutation cases whose incremental canonical graph equals "
             "a fresh FAST rebuild. Task success is the fraction of applicable probes that find their "
@@ -904,6 +1025,11 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "Query p50 aggregates the recorded default-response oracle calls. Indexing p50/p95 use only "
             "the recorded indexing observations; consult Cases and the immutable campaign manifest before "
             "treating a small pilot as a population estimate.",
+            "Performance ratios require matched experiment identities and enough independent repetitions "
+            "for an effect-size confidence interval. This report shows observation counts and does not "
+            "invent an interval for one- or three-observation pilots. The experiment-design rationale "
+            "follows [Kalibera and Jones, Quantifying Performance Changes with Effect Size Confidence "
+            "Intervals](https://arxiv.org/abs/2007.10899).",
             "",
             "Pareto status considers only candidates that pass correctness/quality and have every "
             "axis measured. It maximizes overall quality while minimizing incremental and query latency, "
