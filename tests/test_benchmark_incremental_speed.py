@@ -137,6 +137,12 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             },
         )
 
+    def test_dependency_disabled_profile_changes_only_dependency_indexing(self) -> None:
+        self.assertEqual(
+            BENCHMARK.resolve_config_overrides("dependency_disabled", []),
+            {"auto_index_deps": "false"},
+        )
+
     def test_explicit_config_override_takes_priority_over_profile(self) -> None:
         overrides = BENCHMARK.resolve_config_overrides(
             "minimal_indexing", ["rank_enabled=true", "auto_index_deps=true"]
@@ -311,6 +317,50 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(result["logged_elapsed_ms"]["pipeline_done"], 81)
         self.assertEqual(len(result["measurement_log_markers"]), 2)
         self.assertNotIn("ignored detail", "\n".join(result["measurement_log_markers"]))
+
+    def test_build_index_result_records_dependency_phase_and_package_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            logfile = Path(tmpdir) / "index.log"
+            logfile.write_text(
+                "level=info msg=prof phase=index_repository "
+                "sub=dep_auto_index ms=52347 us=52347915\n",
+                encoding="utf-8",
+            )
+            result = BENCHMARK.build_index_result(
+                {"publish_kind": "full", "dependencies_indexed": 6},
+                f"level=info msg=index.supervisor.profile_log log={logfile}",
+                stdout_bytes=10,
+                elapsed_ms=60000.0,
+                include_logs=False,
+            )
+
+        self.assertEqual(
+            result["dependency_indexing"],
+            {
+                "measurement_status": "measured",
+                "phase_elapsed_ms": 52347,
+                "packages_indexed": 6,
+            },
+        )
+        self.assertIn("sub=dep_auto_index", "\n".join(result["measurement_log_markers"]))
+
+    def test_build_index_result_marks_uninstrumented_dependency_phase_unknown(self) -> None:
+        result = BENCHMARK.build_index_result(
+            {"publish_kind": "full"},
+            "",
+            stdout_bytes=10,
+            elapsed_ms=20.0,
+            include_logs=False,
+        )
+
+        self.assertEqual(
+            result["dependency_indexing"],
+            {
+                "measurement_status": "unknown",
+                "phase_elapsed_ms": None,
+                "packages_indexed": None,
+            },
+        )
 
     def test_route_handler_mutation_adds_executable_route_registration(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
