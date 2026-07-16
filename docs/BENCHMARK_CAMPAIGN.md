@@ -176,3 +176,8 @@ The generated Markdown records the composition-spec SHA-256. A sibling
 `REPORT.manifest.json` records every materialized input path and SHA-256, making the
 uncommitted report reproducible and auditable without committing experiment logs or
 results.
+
+Reports show observation counts, medians, and min–max ranges for incremental, query,
+and full-index latency. The ranges are descriptive, not confidence intervals: the
+default sequential grouped order avoids concurrent contention but is not a paired or
+randomized design suitable for an effect-size interval.
