@@ -127,9 +127,11 @@ Enable automatic indexing on MCP session start:
 codebase-memory-mcp config set auto_index true
 ```
 
-When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing git-based change detection. Configurable file limit: `config set auto_index_limit 50000`.
+When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for ongoing Git or SVN working-copy change detection. Configurable file limit: `config set auto_index_limit 50000`.
 
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
+
+SVN auto-watch requires a trusted system `svn` executable available on `PATH`; project-local clients are not used. Observation runs locally against the working copy and does not query SVN history or add an SVN-specific interval. Git and SVN projects share the watcher's existing adaptive polling cadence and the same indexing pipeline: ordinary changes take the incremental route, while the pipeline may perform a full rebuild when its existing safety threshold requires one. If SVN observation is unavailable or temporarily fails, the current graph remains available and the watcher retries on a later poll.
 
 ### Keeping Up to Date
 
@@ -191,7 +193,7 @@ Removes owned agent config entries, skills, hooks, instructions, and the install
 
 ### Distribution & operation
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
-- **Auto-sync**: Background watcher detects file changes and re-indexes automatically
+- **Auto-sync**: Background watcher detects Git and SVN working-copy changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
 - **Available on**: npm, PyPI, Homebrew, Scoop, Winget, Chocolatey, AUR, `go install`
@@ -598,7 +600,7 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
-codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set auto_watch false          # don't register background Git/SVN watcher (default: true)
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
@@ -712,7 +714,7 @@ src/
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor
   discover/           File discovery (.gitignore, .cbmignore, symlink handling)
-  watcher/            Background auto-sync (git polling, adaptive intervals)
+  watcher/            Background auto-sync (Git/SVN polling, adaptive intervals)
   traces/             Runtime trace ingestion
   ui/                 Embedded HTTP server + 3D graph visualization
   foundation/         Platform abstractions (threads, filesystem, logging, memory)

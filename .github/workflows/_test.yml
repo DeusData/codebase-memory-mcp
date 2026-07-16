@@ -81,7 +81,11 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y subversion zlib1g-dev
+
+      - name: Install deps (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: brew install subversion
 
       - name: Test
         run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
@@ -95,7 +99,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
-        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y clang subversion zlib1g-dev
 
       - name: ThreadSanitizer tests
         run: make -f Makefile.cbm test-tsan CC=clang CXX=clang++
@@ -121,6 +125,7 @@ jobs:
             mingw-w64-clang-${{ matrix.pkg }}-zlib
             make
             git
+            subversion
 
       - name: Test
         shell: msys2 {0}

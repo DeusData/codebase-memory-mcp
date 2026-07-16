@@ -60,7 +60,7 @@ src/
     pass_*.c        Individual pipeline passes (definitions, calls, usages, etc.)
     httplink.c      HTTP route extraction (Go/Express/Laravel/Ktor/Python)
   discover/         File discovery with gitignore support
-  watcher/          Git-based background auto-sync
+  watcher/          Git/SVN working-copy background auto-sync
   cli/              CLI subcommands (install, update, uninstall, config)
   ui/               Graph visualization HTTP server (first-party httpd)
 internal/cbm/       Tree-sitter AST extraction (64 languages, vendored C grammars)

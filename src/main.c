@@ -158,7 +158,7 @@ static void *http_thread(void *arg) {
 /* ── Index callback for watcher ─────────────────────────────────── */
 
 static int watcher_index_fn(const char *project_name, const char *root_path, void *user_data) {
-    (void)user_data;
+    cbm_mcp_server_t *server = (cbm_mcp_server_t *)user_data;
 
     /* Skip indexing if shutdown is in progress (skipped, not indexed) */
     if (atomic_load(&g_shutdown)) {
@@ -186,8 +186,13 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = cbm_mcp_index_run_supervised_path(root_path);
         if (resp) {
+            bool succeeded = cbm_mcp_result_succeeded(resp);
             free(resp);
             cbm_pipeline_unlock();
+            if (!succeeded) {
+                return CBM_NOT_FOUND;
+            }
+            cbm_mcp_server_mark_store_stale(server);
             return 0;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
@@ -202,6 +207,9 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
     cbm_pipeline_unlock();
+    if (rc == 0) {
+        cbm_mcp_server_mark_store_stale(server);
+    }
     return rc;
 }
 
@@ -794,7 +802,7 @@ int main(int argc, char **argv) {
     cbm_store_t *watch_store = NULL;
     if (!restricted_tool_profile) {
         watch_store = cbm_store_open_memory();
-        g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
+        g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, g_server);
         /* Wire watcher + config into MCP server for session auto-index. */
         cbm_mcp_server_set_watcher(g_server, g_watcher);
         cbm_mcp_server_set_config(g_server, runtime_config);

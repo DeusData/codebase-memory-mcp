@@ -8,12 +8,16 @@
  * buffer → SQLite dump → query. No mocking — real files, real parsing.
  */
 #include "../src/foundation/compat.h"
+#include "svn_test_helpers.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <foundation/platform.h>
+#include <watcher/svn_state.h>
+#include <watcher/watcher.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -27,6 +31,34 @@ static char g_tmpdir[256];
 static char g_dbpath[512];
 static cbm_mcp_server_t *g_srv = NULL;
 static char *g_project = NULL;
+
+typedef struct {
+    cbm_mcp_server_t *server;
+    int calls;
+} svn_watch_context_t;
+
+static int svn_watch_index(const char *project_name, const char *root_path, void *user_data) {
+    (void)project_name;
+    svn_watch_context_t *context = (svn_watch_context_t *)user_data;
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
+    if (!pipeline) {
+        return -1;
+    }
+    int result = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+    if (result == 0) {
+        context->calls++;
+        cbm_mcp_server_mark_store_stale(context->server);
+    }
+    return result;
+}
+
+static void remove_project_db(const char *project) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_unlink(path);
+    cbm_remove_db_sidecars(path);
+}
 
 /* Create source files in temp directory */
 static int create_test_project(void) {
@@ -339,6 +371,116 @@ TEST(integ_mcp_query_graph_calls) {
     /* Should have some call relationships */
     ASSERT_NOT_NULL(strstr(resp, "name"));
     free(resp);
+    PASS();
+}
+
+TEST(integ_mcp_reopens_cached_store_after_full_route) {
+    char args[256];
+    snprintf(args, sizeof(args),
+             "{\"name_pattern\":\"greet\",\"project\":\"%s\"}", g_project);
+
+    /* Pre-warm the server's read-only query handle before the pipeline replaces
+     * or rewrites the project database. */
+    char *resp = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "greet"));
+    free(resp);
+
+    /* The initial fixture has three indexed files. Four additions exceed the
+     * pipeline's existing incremental safety threshold and select its full route. */
+    for (int i = 0; i < 4; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/full_refresh_%d.py", g_tmpdir, i);
+        FILE *f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def FullRefresh%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    cbm_pipeline_free(pipeline);
+
+    /* This is the event published by the successful watcher callback. The
+     * following query consumes it, closes the pre-warmed handle on this thread,
+     * and reopens the latest generation in the same server lifecycle. */
+    cbm_mcp_server_mark_store_stale(g_srv);
+    snprintf(args, sizeof(args),
+             "{\"name_pattern\":\"FullRefresh0\",\"project\":\"%s\"}", g_project);
+    resp = call_tool("search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "FullRefresh0"));
+    free(resp);
+    PASS();
+}
+
+TEST(integ_svn_watcher_updates_graph_in_same_session) {
+    th_svn_fixture_t fixture;
+    ASSERT_EQ(th_svn_fixture_init(&fixture, "cbm_integ_svn", "service.py",
+                                  "def BeforeSvnWatch():\n    return 1\n"),
+              0);
+    const char *working_copy = fixture.working_copy;
+    char tracked_source[768];
+    char added_source[768];
+    snprintf(tracked_source, sizeof(tracked_source), "%s/service.py", working_copy);
+
+    char *project = cbm_project_name_from_path(working_copy);
+    ASSERT_NOT_NULL(project);
+    remove_project_db(project);
+    cbm_mcp_server_t *server = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(server);
+    char args[1024];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", working_copy);
+    char *response = cbm_mcp_handle_tool(server, "index_repository", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "indexed"));
+    free(response);
+
+    snprintf(args, sizeof(args),
+             "{\"name_pattern\":\"BeforeSvnWatch\",\"project\":\"%s\"}", project);
+    response = cbm_mcp_handle_tool(server, "search_graph", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "BeforeSvnWatch"));
+    free(response);
+
+    cbm_store_t *watch_store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(watch_store);
+    svn_watch_context_t context = {.server = server, .calls = 0};
+    cbm_watcher_t *watcher = cbm_watcher_new(watch_store, svn_watch_index, &context);
+    ASSERT_NOT_NULL(watcher);
+    cbm_watcher_watch(watcher, project, working_copy);
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 0);
+
+    ASSERT_EQ(th_write_file(tracked_source, "def AfterSvnWatch():\n    return 2\n"), 0);
+    cbm_watcher_touch(watcher, project);
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 1);
+    ASSERT_EQ(context.calls, 1);
+    snprintf(args, sizeof(args),
+             "{\"name_pattern\":\"AfterSvnWatch\",\"project\":\"%s\"}", project);
+    response = cbm_mcp_handle_tool(server, "search_graph", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "AfterSvnWatch"));
+    free(response);
+
+    snprintf(added_source, sizeof(added_source), "%s/unversioned.py", working_copy);
+    ASSERT_EQ(th_write_file(added_source, "def UnversionedSvnWatch():\n    return 3\n"), 0);
+    cbm_watcher_touch(watcher, project);
+    ASSERT_EQ(cbm_watcher_poll_once(watcher), 1);
+    ASSERT_EQ(context.calls, 2);
+    snprintf(args, sizeof(args),
+             "{\"name_pattern\":\"UnversionedSvnWatch\",\"project\":\"%s\"}", project);
+    response = cbm_mcp_handle_tool(server, "search_graph", args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "UnversionedSvnWatch"));
+    free(response);
+
+    cbm_watcher_free(watcher);
+    cbm_store_close(watch_store);
+    cbm_mcp_server_free(server);
+    remove_project_db(project);
+    free(project);
+    th_svn_fixture_cleanup(&fixture);
     PASS();
 }
 
@@ -657,6 +799,8 @@ SUITE(integration) {
     RUN_TEST(integ_mcp_search_graph_by_name);
     RUN_TEST(integ_mcp_query_graph_functions);
     RUN_TEST(integ_mcp_query_graph_calls);
+    RUN_TEST(integ_mcp_reopens_cached_store_after_full_route);
+    RUN_TEST(integ_svn_watcher_updates_graph_in_same_session);
     RUN_TEST(integ_mcp_get_graph_schema);
     RUN_TEST(integ_mcp_get_architecture);
     RUN_TEST(integ_mcp_trace_path);

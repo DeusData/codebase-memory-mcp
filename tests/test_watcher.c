@@ -8,6 +8,7 @@
 #include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include "svn_test_helpers.h"
 #include <watcher/watcher.h>
 #include <store/store.h>
 #include <errno.h>
@@ -32,6 +33,17 @@ static int wt_git(const char *dir, const char *args) {
 static const char *wt_path(char *buf, size_t n, const char *dir, const char *rel) {
     snprintf(buf, n, "%s/%s", dir, rel);
     return buf;
+}
+
+typedef th_svn_fixture_t wt_svn_fixture_t;
+
+static bool wt_svn_setup(wt_svn_fixture_t *fixture) {
+    return th_svn_fixture_init(fixture, "cbm_watcher_svn", "source.c", "int value = 1;\n") ==
+           0;
+}
+
+static void wt_svn_teardown(wt_svn_fixture_t *fixture) {
+    th_svn_fixture_cleanup(fixture);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -801,6 +813,150 @@ TEST(watcher_failed_reindex_retries_issue937) {
     cbm_watcher_free(w);
     cbm_store_close(store);
     th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_svn_clean_and_dirty_registration_baselines) {
+    wt_svn_fixture_t fixture;
+    if (!wt_svn_setup(&fixture)) {
+        FAIL("SVN fixture setup failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "svn-clean", fixture.working_copy);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+    cbm_watcher_touch(w, "svn-clean");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+    cbm_watcher_free(w);
+
+    ASSERT_EQ(th_write_file(fixture.source, "int value = 2;\n"), 0);
+    w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "svn-dirty", fixture.working_copy);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+    cbm_watcher_touch(w, "svn-dirty");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+    cbm_watcher_touch(w, "svn-dirty");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    wt_svn_teardown(&fixture);
+    PASS();
+}
+
+TEST(watcher_svn_repeated_edits_are_distinct) {
+    wt_svn_fixture_t fixture;
+    if (!wt_svn_setup(&fixture)) {
+        FAIL("SVN fixture setup failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "svn-edits", fixture.working_copy);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);
+
+    ASSERT_EQ(th_write_file(fixture.source, "int value = 2;\n"), 0);
+    cbm_watcher_touch(w, "svn-edits");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_touch(w, "svn-edits");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    ASSERT_EQ(th_write_file(fixture.source, "int value = 3;\n"), 0);
+    cbm_watcher_touch(w, "svn-edits");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    wt_svn_teardown(&fixture);
+    PASS();
+}
+
+static int svn_retry_calls = 0;
+static int svn_retry_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    static const int results[] = {1, -1, 0};
+    int index = svn_retry_calls++;
+    return index < (int)(sizeof(results) / sizeof(results[0])) ? results[index] : 0;
+}
+
+TEST(watcher_svn_callback_failures_preserve_pending_observation) {
+    wt_svn_fixture_t fixture;
+    if (!wt_svn_setup(&fixture)) {
+        FAIL("SVN fixture setup failed");
+    }
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, svn_retry_callback, NULL);
+    cbm_watcher_watch(w, "svn-retry", fixture.working_copy);
+    svn_retry_calls = 0;
+    cbm_watcher_poll_once(w);
+
+    ASSERT_EQ(th_write_file(fixture.source, "int value = 2;\n"), 0);
+    cbm_watcher_touch(w, "svn-retry");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(svn_retry_calls, 1);
+    cbm_watcher_touch(w, "svn-retry");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(svn_retry_calls, 2);
+    cbm_watcher_touch(w, "svn-retry");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(svn_retry_calls, 3);
+    cbm_watcher_touch(w, "svn-retry");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(svn_retry_calls, 3);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    wt_svn_teardown(&fixture);
+    PASS();
+}
+
+TEST(watcher_svn_root_wins_over_inherited_parent_git) {
+    wt_svn_fixture_t fixture;
+    if (!wt_svn_setup(&fixture)) {
+        FAIL("SVN fixture setup failed");
+    }
+    if (wt_git(fixture.root, "init -q") != 0) {
+        wt_svn_teardown(&fixture);
+        FAIL("parent Git setup failed");
+    }
+    char gitignore[CBM_SZ_2K];
+    snprintf(gitignore, sizeof(gitignore), "%s/.gitignore", fixture.root);
+    ASSERT_EQ(th_write_file(gitignore, "repository/\nworking-copy/\n"), 0);
+    ASSERT_EQ(wt_git(fixture.root, "add .gitignore"), 0);
+    ASSERT_EQ(wt_git(fixture.root, "commit -q -m parent"), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "nested-svn", fixture.working_copy);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);
+
+    ASSERT_EQ(th_write_file(fixture.source, "int value = 2;\n"), 0);
+    cbm_watcher_touch(w, "nested-svn");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    wt_svn_teardown(&fixture);
     PASS();
 }
 
@@ -2091,6 +2247,10 @@ SUITE(watcher) {
     RUN_TEST(watcher_no_change_no_reindex);
     RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
     RUN_TEST(watcher_failed_reindex_retries_issue937);
+    RUN_TEST(watcher_svn_clean_and_dirty_registration_baselines);
+    RUN_TEST(watcher_svn_repeated_edits_are_distinct);
+    RUN_TEST(watcher_svn_callback_failures_preserve_pending_observation);
+    RUN_TEST(watcher_svn_root_wins_over_inherited_parent_git);
     RUN_TEST(watcher_multiple_projects);
 
     /* Non-git project */

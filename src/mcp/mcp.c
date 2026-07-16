@@ -74,6 +74,7 @@ enum {
 #include <yyjson/yyjson.h>
 #include <ctype.h>
 #include <stdint.h> // int64_t
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -290,6 +291,23 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
+}
+
+bool cbm_mcp_result_succeeded(const char *result_json) {
+    if (!result_json) {
+        return false;
+    }
+
+    yyjson_doc *doc = yyjson_read(result_json, strlen(result_json), 0);
+    if (!doc) {
+        return false;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *is_error = yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    bool succeeded = yyjson_is_bool(is_error) && !yyjson_get_bool(is_error);
+    yyjson_doc_free(doc);
+    return succeeded;
 }
 
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
@@ -1362,6 +1380,7 @@ struct cbm_mcp_server {
     bool owns_store;                /* true if we opened the store */
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last time resolve_store was called for a named project */
+    atomic_bool store_stale;        /* background index completed; event thread must reopen */
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1399,6 +1418,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     }
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
+    atomic_init(&srv->store_stale, false);
 
     return srv;
 }
@@ -1433,6 +1453,12 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
+void cbm_mcp_server_mark_store_stale(cbm_mcp_server_t *srv) {
+    if (srv) {
+        atomic_store_explicit(&srv->store_stale, true, memory_order_release);
+    }
+}
+
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
@@ -1449,6 +1475,27 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     free(srv->current_project);
     free(srv->active_request_id_str);
     free(srv);
+}
+
+/* Cached stores are owned by the MCP request/event-loop thread. Background
+ * threads may only publish store_stale and must never call this helper. */
+static void invalidate_cached_store(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    if (srv->owns_store && srv->store) {
+        cbm_store_close(srv->store);
+    }
+    srv->store = NULL;
+    free(srv->current_project);
+    srv->current_project = NULL;
+    srv->store_last_used = 0;
+}
+
+static void consume_stale_store(cbm_mcp_server_t *srv) {
+    if (atomic_exchange_explicit(&srv->store_stale, false, memory_order_acq_rel)) {
+        invalidate_cached_store(srv);
+    }
 }
 
 /* ── Idle store eviction ──────────────────────────────────────── */
@@ -1468,13 +1515,7 @@ void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
         return;
     }
 
-    if (srv->owns_store) {
-        cbm_store_close(srv->store);
-    }
-    srv->store = NULL;
-    free(srv->current_project);
-    srv->current_project = NULL;
-    srv->store_last_used = 0;
+    invalidate_cached_store(srv);
 }
 
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
@@ -1531,6 +1572,8 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project);
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+    consume_stale_store(srv);
+
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
@@ -5371,15 +5414,7 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
  * writes the DB and the parent only needs the return code, so there is nothing
  * to invalidate. */
 static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
-    if (!srv) {
-        return;
-    }
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
-    }
-    free(srv->current_project);
-    srv->current_project = NULL;
+    invalidate_cached_store(srv);
 }
 
 /* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
@@ -7953,9 +7988,17 @@ static void *autoindex_thread(void *arg) {
      * 100% of that memory back to the OS every cycle. Degrade to the in-process
      * pipeline below when the supervisor is off (kill switch) or the spawn fails. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *resp = index_run_supervised_path(srv, srv->session_root);
+        /* This is a background thread: use the srv-less runner so the
+         * supervisor cannot close the event loop's cached query handle. */
+        char *resp = index_run_supervised_path(NULL, srv->session_root);
         if (resp) {
+            bool succeeded = cbm_mcp_result_succeeded(resp);
             free(resp);
+            if (!succeeded) {
+                cbm_log_warn("autoindex.err", "msg", "supervised_index_failed");
+                return NULL;
+            }
+            cbm_mcp_server_mark_store_stale(srv);
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
@@ -7982,6 +8025,7 @@ static void *autoindex_thread(void *arg) {
     cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
+        cbm_mcp_server_mark_store_stale(srv);
         cbm_log_info("autoindex.done", "project", srv->session_project);
         register_watcher_if_enabled(srv);
     } else {
