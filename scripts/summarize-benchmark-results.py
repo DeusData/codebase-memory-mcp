@@ -909,7 +909,60 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if latest is None:
             continue
 
+        accepted_decisions = {"PASS", "PASS: DEFERRED FRESHNESS"}
+        baseline_decision = baseline.get("decision")
+        latest_decision = latest.get("decision")
+        if baseline_decision not in accepted_decisions or latest_decision not in accepted_decisions:
+            comparison_status = "not comparable: correctness/quality gate"
+        elif baseline_decision != latest_decision:
+            comparison_status = "not comparable: freshness/quality decision differs"
+        else:
+            quality_axes = (
+                "overall_quality_score",
+                "pair_f1_score",
+                "graph_fidelity_score",
+                "task_success_score",
+            )
+            quality_matches = all(
+                (baseline.get(axis) is None and latest.get(axis) is None)
+                or (
+                    isinstance(baseline.get(axis), (int, float))
+                    and isinstance(latest.get(axis), (int, float))
+                    and math.isclose(
+                        float(baseline[axis]), float(latest[axis]), rel_tol=1e-9, abs_tol=1e-12
+                    )
+                )
+                for axis in quality_axes
+            )
+            if not quality_matches:
+                comparison_status = "not comparable: measured quality differs"
+            else:
+                minimum_observations = min(
+                    int(baseline.get(key) or 0)
+                    for key in (
+                        "incremental_observations",
+                        "full_observations",
+                        "query_observations",
+                    )
+                )
+                minimum_observations = min(
+                    minimum_observations,
+                    *(int(latest.get(key) or 0) for key in (
+                        "incremental_observations",
+                        "full_observations",
+                        "query_observations",
+                    )),
+                )
+                comparison_status = (
+                    "quality-matched repeated evidence"
+                    if minimum_observations >= 3
+                    else f"descriptive only: minimum matched observation count {minimum_observations}"
+                )
+        comparable = not comparison_status.startswith("not comparable")
+
         def speedup(metric: str) -> float | None:
+            if not comparable:
+                return None
             old = baseline.get(metric)
             new = latest.get(metric)
             return (
@@ -930,6 +983,7 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "latest_quality": latest.get("overall_quality_score"),
                 "baseline_quality": baseline.get("overall_quality_score"),
                 "baseline_decision": baseline.get("decision"),
+                "comparison_status": comparison_status,
             }
         )
     return comparisons
@@ -1494,14 +1548,16 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         lines.extend(
             (
                 "",
-                "## Historical performance deltas",
+                "## Quality-constrained cross-version timing",
                 "",
-                "Rows compare only matching capability overrides. Speedup is baseline latency "
-                "divided by latest latency, so values above 1× favor latest.",
+                "Rows first require matching capability overrides, accepted and identical lifecycle "
+                "decisions, and equal measured quality categories. Ratios are suppressed when those "
+                "conditions differ. Speedup is baseline latency divided by latest latency, so values "
+                "above 1× favor latest; fewer than three matched observations remain descriptive.",
                 "",
                 "| Latest | Baseline | Incremental speedup | Fresh rebuild speedup | "
-                "Query speedup | Latest quality | Baseline quality | Baseline gate |",
-                "|---|---|---:|---:|---:|---:|---:|---|",
+                "Query speedup | Latest quality | Baseline quality | Baseline gate | Evidence status |",
+                "|---|---|---:|---:|---:|---:|---:|---|---|",
             )
         )
         for comparison in comparisons:
@@ -1520,6 +1576,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                         display(comparison["latest_quality"], 3),
                         display(comparison["baseline_quality"], 3),
                         display(comparison["baseline_decision"]),
+                        display(comparison["comparison_status"]),
                     )
                 )
                 + " |"
