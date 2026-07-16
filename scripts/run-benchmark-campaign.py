@@ -199,6 +199,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     index_mode = spec.get("index_mode", "fast")
     accepted_exit_codes = spec.get("accepted_exit_codes", [0])
     capability_quality = spec.get("capability_quality")
+    execution_order = spec.get("execution_order")
     if not isinstance(harness_version, str) or not harness_version:
         raise ValueError("harness_version must be a non-empty string")
     if not isinstance(benchmark_script, str) or not benchmark_script:
@@ -211,6 +212,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("timeout_seconds must be a positive integer")
     if index_mode not in {"fast", "moderate", "full"}:
         raise ValueError("index_mode must be fast, moderate, or full")
+    if execution_order not in {None, "grouped", "paired_interleaved"}:
+        raise ValueError("execution_order must be grouped or paired_interleaved")
     if capability_quality is not None and (
         not isinstance(capability_quality, str)
         or not capability_quality
@@ -336,7 +339,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     ):
                         raise ValueError("exact_caps must contain positive integers or null")
 
-                for transport in transports:
+                for transport_index, transport in enumerate(transports):
                     for frontier_files in frontier_values:
                         for exact_cap in cap_values:
                             effective_capabilities = dict(capabilities)
@@ -436,8 +439,37 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                     cell["capability_support"] = dict(
                                         sorted(candidate_support.items())
                                     )
+                                cell["_design"] = {
+                                    "candidate_index": candidate_index,
+                                    "profile_index": profile_index,
+                                    "scenario_index": scenario_index,
+                                    "transport_index": transport_index,
+                                    "grouped_position": len(cells),
+                                }
                                 cells.append(cell)
+    if execution_order == "paired_interleaved":
+        cells.sort(
+            key=lambda cell: (
+                cell["repetition"],
+                cell["_design"]["scenario_index"],
+                cell["_design"]["transport_index"],
+                cell["_design"]["candidate_index"],
+                cell["_design"]["profile_index"],
+                cell["_design"]["grouped_position"],
+            )
+        )
+        for position, cell in enumerate(cells, start=1):
+            cell["parameters"] = {
+                **cell["parameters"],
+                "execution_order": execution_order,
+                "execution_block": cell["repetition"],
+                "execution_position": position,
+            }
+    for cell in cells:
+        cell.pop("_design", None)
     plan = {"schema_version": SCHEMA_VERSION, "cells": cells}
+    if execution_order is not None:
+        plan["execution_order"] = execution_order
     validate_plan(plan)
     return plan
 
@@ -449,6 +481,35 @@ def ensure_disk_space(root: Path, minimum_free_bytes: int) -> None:
         raise RuntimeError(
             f"insufficient campaign disk space: free={free} required={minimum_free_bytes} root={root}"
         )
+
+
+def resource_snapshot(path: Path) -> dict[str, Any]:
+    disk = shutil.disk_usage(path)
+    try:
+        load_average: list[float] | None = [round(value, 6) for value in os.getloadavg()]
+    except (AttributeError, OSError):
+        load_average = None
+    physical_memory_bytes: int | None = None
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        if pages > 0 and page_size > 0:
+            physical_memory_bytes = pages * page_size
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
+    return {
+        "captured_at_utc": utc_now(),
+        "hostname": socket.gethostname(),
+        "load_average": load_average,
+        "cpu_count": os.cpu_count(),
+        "physical_memory_bytes": physical_memory_bytes,
+        "disk": {
+            "path": str(path.resolve()),
+            "total_bytes": disk.total,
+            "used_bytes": disk.used,
+            "free_bytes": disk.free,
+        },
+    }
 
 
 def validate_campaign_root(
@@ -652,6 +713,7 @@ def run_cell(
             "environment_overrides": overrides,
             "started_at_utc": utc_now(),
             "stale_lock_recovered": stale_record is not None,
+            "resource_before": resource_snapshot(campaign_root),
         }
         atomic_write_json(attempt_root / "command.json", command_record)
         started = time.monotonic()
@@ -699,6 +761,7 @@ def run_cell(
             "returncode": returncode,
             "status": "completed" if error is None else "failed",
             "error": error,
+            "resource_after": resource_snapshot(campaign_root),
         }
         atomic_write_json(attempt_root / "attempt.json", attempt_record)
         if interrupted:
@@ -769,6 +832,7 @@ def environment_snapshot(plan_path: Path) -> dict[str, Any]:
         "platform": platform.platform(),
         "python": sys.version,
         "cpu_count": os.cpu_count(),
+        "resources": resource_snapshot(plan_path.parent),
     }
 
 

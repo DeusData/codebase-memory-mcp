@@ -228,6 +228,66 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertNotIn("--matrix", first["command"])
             self.assertEqual(first["accepted_exit_codes"], [0, 1])
 
+    def test_paired_interleaved_order_runs_one_repetition_block_at_a_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            benchmark = root / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            candidates = []
+            for index in range(2):
+                binary = root / f"cbm-{index}"
+                binary.write_bytes(f"binary-{index}".encode())
+                candidates.append(
+                    {
+                        "label": f"candidate-{index}",
+                        "revision": str(index) * 40,
+                        "binary": str(binary),
+                        "build": {"cflags": "-O2"},
+                    }
+                )
+            spec = {
+                "schema_version": 1,
+                "harness_version": "paired-v1",
+                "benchmark_script": str(benchmark),
+                "capability_quality": "similarity",
+                "index_mode": "moderate",
+                "execution_order": "paired_interleaved",
+                "cwd": str(root),
+                "repetitions": 2,
+                "transports": ["cli"],
+                "candidates": candidates,
+                "profiles": [
+                    {"label": "default", "config_profile": "default", "capabilities": {}},
+                    {
+                        "label": "eager",
+                        "config_profile": "incremental_semantic_freshness_eager",
+                        "capabilities": {"incremental_derived_refresh": "eager"},
+                    },
+                ],
+            }
+
+            plan = CAMPAIGN.expand_matrix_spec(spec)
+
+            self.assertEqual(plan["execution_order"], "paired_interleaved")
+            self.assertEqual([cell["repetition"] for cell in plan["cells"]], [1, 1, 1, 1, 2, 2, 2, 2])
+            self.assertEqual(
+                [cell["parameters"]["execution_position"] for cell in plan["cells"]],
+                list(range(1, 9)),
+            )
+            self.assertEqual(
+                [cell["parameters"]["execution_block"] for cell in plan["cells"]],
+                [1, 1, 1, 1, 2, 2, 2, 2],
+            )
+
+    def test_resource_snapshot_records_load_disk_and_host_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            snapshot = CAMPAIGN.resource_snapshot(Path(tmpdir))
+
+        self.assertIn("load_average", snapshot)
+        self.assertGreater(snapshot["disk"]["total_bytes"], 0)
+        self.assertGreaterEqual(snapshot["disk"]["free_bytes"], 0)
+        self.assertIn("physical_memory_bytes", snapshot)
+
     def test_matrix_spec_null_cap_preserves_candidate_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -288,6 +348,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(second["status"], "resumed")
             self.assertTrue((cell_root / "complete.json").is_file())
             self.assertEqual(len(list((cell_root / "attempts").iterdir())), 1)
+            attempt = next((cell_root / "attempts").iterdir())
+            command_record = json.loads((attempt / "command.json").read_text())
+            attempt_record = json.loads((attempt / "attempt.json").read_text())
+            self.assertIn("resource_before", command_record)
+            self.assertIn("resource_after", attempt_record)
 
     def test_report_input_adds_candidate_support_without_mutating_raw_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

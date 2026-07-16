@@ -77,6 +77,15 @@ expanded cells retain that policy in their identities. Result parsing, binary-ha
 validation, and the structured `error` check still prevent crashes or harness
 errors from becoming completed evidence.
 
+Legacy compact specs retain their original grouped cell order and plan hashes. New
+performance campaigns should set top-level
+`"execution_order": "paired_interleaved"`. That opt-in order executes every
+candidate/profile cell for repetition 1 before repetition 2, and records the
+repetition block plus absolute execution position in each cell identity. This reduces
+alignment between one configuration and slow host drift while keeping heavy cells
+strictly sequential. It is deterministic rather than randomly shuffled, so the plan
+is exactly reproducible; reports must still retain raw order and variation.
+
 For isolated capability fixtures, set top-level `"capability_quality"` to `"rank"`,
 `"dependencies"`, `"similarity"`, or `"semantic_edges"` and omit `scenarios`.
 The runner expands candidate, profile, transport, and repetition axes without adding
@@ -167,6 +176,13 @@ Each benchmark command runs in an isolated process group. Timeout or user interr
 signals the whole group, waits up to 30 seconds for the harness to remove its cache
 and detached worktrees, then force-stops any remaining descendants. The immutable
 attempt record is written before an interrupt is re-raised.
+
+`command.json` records a pre-run resource snapshot and `attempt.json` records a
+post-run snapshot: UTC time, hostname, CPU count, physical memory when the platform
+exposes it, 1/5/15-minute load average when available, and campaign-filesystem total,
+used, and free bytes. The campaign-level environment snapshot retains the same host
+data. These observations diagnose load or disk drift; they are not substitutes for
+per-process peak RSS recorded by the benchmark itself.
 
 Every invocation also writes:
 
