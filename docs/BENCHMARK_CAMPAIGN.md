@@ -77,12 +77,23 @@ expanded cells retain that policy in their identities. Result parsing, binary-ha
 validation, and the structured `error` check still prevent crashes or harness
 errors from becoming completed evidence.
 
-For isolated ranking or dependency retrieval fixtures, set top-level
-`"capability_quality": "rank"` or `"dependencies"` and omit `scenarios`. The
-runner expands candidate, profile, transport, and repetition axes without adding
-incremental frontier arguments. Each command records the capability fixture and
-uses `--include-logs`, while named config profiles provide matched enabled/disabled
-ablations.
+For isolated capability fixtures, set top-level `"capability_quality"` to `"rank"`,
+`"dependencies"`, `"similarity"`, or `"semantic_edges"` and omit `scenarios`.
+The runner expands candidate, profile, transport, and repetition axes without adding
+incremental frontier arguments. Each command records the capability fixture and uses
+`--include-logs`, while named config profiles provide matched enabled/disabled
+ablations. Set top-level `"index_mode": "moderate"` or `"full"` for `similarity`
+and `semantic_edges`; FAST mode intentionally does not generate either relationship.
+
+The semantic pair task set is content-addressed from its version, source hashes,
+relationship, score property, and explicit positive/negative pair judgments.
+`SIMILAR_TO` structural clones and `SEMANTICALLY_RELATED` control-flow variants are
+separate cases because the semantic pass intentionally excludes pairs already above
+the structural MinHash threshold. Pair reports retain TP/FP/FN/TN and witnesses,
+precision, recall, F1, false-positive rate, per-category counts, raw query rows,
+latency, bytes, and estimated tokens. Natural-repository pairs outside the explicit
+judgment set are retained as `unjudged`; incomplete natural ground truth never turns
+an unknown result into a false positive.
 
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
@@ -166,11 +177,13 @@ inappropriate for the host.
 ## Cross-campaign composition
 
 Use `scripts/summarize-benchmark-results.py --composition-spec SPEC --out REPORT`
-to combine incremental correctness, rank quality, and dependency quality into one
-configuration row. A composition spec names exact matrix specs, durable campaign
-roots, and cell labels for each output group. The generator re-expands every matrix,
-requires every selected cell to have a hash-validated completion, and consumes the
-derived report inputs without altering immutable raw results.
+to combine incremental correctness and capability-quality evidence into one
+configuration row. A composition input may name an exact matrix spec or the immutable
+expanded plan already archived in its durable campaign root. The generator validates
+the selected plan, requires every selected cell to have a hash-validated completion,
+and consumes the derived report inputs without altering immutable raw results. Using
+an archived plan permits historical report regeneration without requiring the old
+candidate executable path to still exist.
 
 The generated Markdown records the composition-spec SHA-256. A sibling
 `REPORT.manifest.json` records every materialized input path and SHA-256, making the

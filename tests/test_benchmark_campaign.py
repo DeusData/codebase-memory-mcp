@@ -189,6 +189,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "harness_version": "quality-v2",
                 "benchmark_script": str(benchmark),
                 "capability_quality": "rank",
+                "index_mode": "moderate",
                 "cwd": str(root),
                 "timeout_seconds": 300,
                 "accepted_exit_codes": [0, 1],
@@ -219,8 +220,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(first["scenario"], "rank_quality")
             self.assertEqual(first["label"], "latest.rank-disabled.cli.rank_quality")
             self.assertEqual(first["parameters"]["capability_quality"], "rank")
+            self.assertEqual(first["parameters"]["index_mode"], "moderate")
             self.assertNotIn("frontier_files", first["parameters"])
             self.assertIn("--capability-quality", first["command"])
+            self.assertIn("--index-mode", first["command"])
+            self.assertIn("moderate", first["command"])
             self.assertNotIn("--matrix", first["command"])
             self.assertEqual(first["accepted_exit_codes"], [0, 1])
 

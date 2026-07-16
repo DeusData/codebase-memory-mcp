@@ -196,6 +196,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     cwd = spec.get("cwd")
     repetitions = spec.get("repetitions")
     benchmark_timeout = spec.get("timeout_seconds", 240)
+    index_mode = spec.get("index_mode", "fast")
     accepted_exit_codes = spec.get("accepted_exit_codes", [0])
     capability_quality = spec.get("capability_quality")
     if not isinstance(harness_version, str) or not harness_version:
@@ -208,6 +209,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("repetitions must be a positive integer")
     if not isinstance(benchmark_timeout, int) or benchmark_timeout <= 0:
         raise ValueError("timeout_seconds must be a positive integer")
+    if index_mode not in {"fast", "moderate", "full"}:
+        raise ValueError("index_mode must be fast, moderate, or full")
     if capability_quality is not None and (
         not isinstance(capability_quality, str)
         or not capability_quality
@@ -349,6 +352,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                     transport,
                                     "--config-profile",
                                     config_profile,
+                                    "--index-mode",
+                                    index_mode,
                                 ]
                             else:
                                 command = [
@@ -364,6 +369,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                     transport,
                                     "--config-profile",
                                     config_profile,
+                                    "--index-mode",
+                                    index_mode,
                                 ]
                             cap_label = "default"
                             if isinstance(exact_cap, int):
@@ -386,6 +393,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 "config_profile": config_profile,
                                 "config_overrides": dict(sorted(overrides.items())),
                                 "benchmark_script_sha256": benchmark_sha256,
+                                "index_mode": index_mode,
                             }
                             if capability_quality is not None:
                                 parameters["capability_quality"] = capability_quality
