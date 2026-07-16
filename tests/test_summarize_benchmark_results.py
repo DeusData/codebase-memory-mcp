@@ -24,6 +24,53 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_report_aggregates_graded_ndcg_without_hiding_mrr(self) -> None:
+        case = {
+            "scenario": "rank_quality",
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "passed": True,
+                "quality": {
+                    "passed": True,
+                    "passed_count": 1,
+                    "applicable_count": 1,
+                    "score": 0.5,
+                    "hit_at_1": 0.0,
+                    "hit_at_5": 1.0,
+                    "mean_ndcg_at_5": 0.8,
+                    "ndcg_applicable_count": 1,
+                },
+                "ranked_probe": {
+                    "quality": {
+                        "applicable": True,
+                        "passed": True,
+                        "criterion": "graded architectural relevance",
+                        "expected_substring": "entry_point",
+                        "rank": 2,
+                        "returned_count": 5,
+                        "reciprocal_rank": 0.5,
+                        "hit_at_1": False,
+                        "hit_at_5": True,
+                        "relevance_judgments": 3,
+                        "ndcg_at_5": 0.8,
+                    }
+                },
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100},
+        }
+
+        row = SUMMARY.summarize_group("rank-on", [report(case)])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["quality_score"], 0.5)
+        self.assertEqual(row["ndcg_at_5"], 0.8)
+        self.assertIn("nDCG@5", markdown)
+        self.assertIn("0.800", markdown)
+        self.assertIn("3 judgments", markdown)
+        self.assertIn("trec.nist.gov/pubs/trec27/papers/Overview-CAR.pdf", markdown)
+
     def test_fast_mode_report_marks_similarity_and_semantic_quality_not_applicable(self) -> None:
         case = {
             "passed": True,

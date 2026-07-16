@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import queue
 import re
@@ -2242,9 +2243,70 @@ def oracle_passed(tool_result: dict[str, Any], marker: str | None) -> bool:
     return marker in json.dumps(response, sort_keys=True)
 
 
+def score_ranked_relevance(
+    ranked_items: list[Any],
+    judgments: list[dict[str, Any]],
+    *,
+    cutoff: int = 5,
+) -> dict[str, Any]:
+    """Score a bounded ranking against explicit graded substring judgments."""
+    if cutoff <= 0:
+        raise ValueError("relevance cutoff must be positive")
+    valid_judgments = [
+        (str(item["expected_substring"]), float(item["relevance"]))
+        for item in judgments
+        if isinstance(item, dict)
+        and isinstance(item.get("expected_substring"), str)
+        and item["expected_substring"]
+        and isinstance(item.get("relevance"), (int, float))
+        and float(item["relevance"]) > 0
+    ]
+    matched_relevance: list[float | int] = []
+    for ranked_item in ranked_items[:cutoff]:
+        serialized = json.dumps(ranked_item, separators=(",", ":"), sort_keys=True)
+        relevance = max(
+            (grade for expected, grade in valid_judgments if expected in serialized),
+            default=0.0,
+        )
+        matched_relevance.append(
+            int(relevance) if relevance.is_integer() else relevance
+        )
+    first_relevant_rank = next(
+        (index for index, relevance in enumerate(matched_relevance, start=1) if relevance > 0),
+        None,
+    )
+
+    def discounted_gain(grades: list[float | int]) -> float:
+        return sum(
+            (2.0 ** float(relevance) - 1.0) / math.log2(position + 1)
+            for position, relevance in enumerate(grades, start=1)
+        )
+
+    dcg = discounted_gain(matched_relevance)
+    ideal_relevance = sorted((grade for _, grade in valid_judgments), reverse=True)[:cutoff]
+    idcg = discounted_gain(ideal_relevance)
+    ndcg = dcg / idcg if idcg > 0 else None
+    result = {
+        "cutoff": cutoff,
+        "judgment_count": len(valid_judgments),
+        "first_relevant_rank": first_relevant_rank,
+        "reciprocal_rank": 1.0 / first_relevant_rank if first_relevant_rank else 0.0,
+        "hit_at_1": first_relevant_rank == 1,
+        "hit_at_5": first_relevant_rank is not None and first_relevant_rank <= 5,
+        "dcg": dcg,
+        "ideal_dcg": idcg,
+        "ndcg": ndcg,
+        "matched_relevance": matched_relevance,
+    }
+    result[f"dcg_at_{cutoff}"] = dcg
+    result[f"ideal_dcg_at_{cutoff}"] = idcg
+    result[f"ndcg_at_{cutoff}"] = ndcg
+    return result
+
+
 def score_quality_oracles(
     oracles: dict[str, Any],
-    expectations: dict[str, tuple[str | None, str]],
+    expectations: dict[str, Any],
 ) -> dict[str, Any]:
     """Attach auditable per-oracle verdicts and summarize applicable checks."""
     applicable_count = 0
@@ -2252,30 +2314,72 @@ def score_quality_oracles(
     reciprocal_rank_total = 0.0
     hit_at_1_count = 0
     hit_at_5_count = 0
+    ndcg_total = 0.0
+    ndcg_applicable_count = 0
     for name, result in oracles.items():
         if not isinstance(result, dict):
             continue
-        expected, criterion = expectations.get(name, (None, "no quality criterion"))
-        applicable = expected is not None
+        expectation = expectations.get(name, (None, "no quality criterion"))
+        graded = isinstance(expectation, dict)
+        if graded:
+            criterion = str(expectation.get("criterion") or "no quality criterion")
+            judgments = expectation.get("judgments")
+            judgments = judgments if isinstance(judgments, list) else []
+            cutoff = expectation.get("cutoff", 5)
+            cutoff = int(cutoff) if isinstance(cutoff, int) else 5
+            positive_judgments = [
+                item
+                for item in judgments
+                if isinstance(item, dict)
+                and isinstance(item.get("expected_substring"), str)
+                and isinstance(item.get("relevance"), (int, float))
+                and float(item["relevance"]) > 0
+            ]
+            expected = (
+                str(max(positive_judgments, key=lambda item: float(item["relevance"]))[
+                    "expected_substring"
+                ])
+                if positive_judgments
+                else None
+            )
+        else:
+            expected, criterion = expectation
+            judgments = []
+            cutoff = 5
+        applicable = bool(judgments) if graded else expected is not None
         passed = False
         rank: int | None = None
         returned_count: int | None = None
+        ndcg: float | None = None
         if applicable:
             applicable_count += 1
             response = result.get("response")
-            passed = expected in json.dumps(response, separators=(",", ":"), sort_keys=True)
-            passed_count += int(passed)
             ranked_items = (
                 response.get("results")
                 if isinstance(response, dict) and isinstance(response.get("results"), list)
                 else response if isinstance(response, list) else [response]
             )
             returned_count = len(ranked_items)
-            for position, item in enumerate(ranked_items, start=1):
-                if expected in json.dumps(item, separators=(",", ":"), sort_keys=True):
-                    rank = position
-                    break
-            reciprocal_rank = 1.0 / rank if rank is not None else 0.0
+            if graded:
+                ranking = score_ranked_relevance(ranked_items, judgments, cutoff=cutoff)
+                rank = ranking["first_relevant_rank"]
+                reciprocal_rank = float(ranking["reciprocal_rank"])
+                ndcg_value = ranking["ndcg"]
+                ndcg = float(ndcg_value) if isinstance(ndcg_value, (int, float)) else None
+                passed = bool(ranking["hit_at_5"])
+                if ndcg is not None:
+                    ndcg_total += ndcg
+                    ndcg_applicable_count += 1
+            else:
+                passed = expected in json.dumps(
+                    response, separators=(",", ":"), sort_keys=True
+                )
+                for position, item in enumerate(ranked_items, start=1):
+                    if expected in json.dumps(item, separators=(",", ":"), sort_keys=True):
+                        rank = position
+                        break
+                reciprocal_rank = 1.0 / rank if rank is not None else 0.0
+            passed_count += int(passed)
             reciprocal_rank_total += reciprocal_rank
             hit_at_1_count += int(rank == 1)
             hit_at_5_count += int(rank is not None and rank <= 5)
@@ -2291,6 +2395,9 @@ def score_quality_oracles(
             "reciprocal_rank": reciprocal_rank,
             "hit_at_1": rank == 1 if applicable else None,
             "hit_at_5": rank is not None and rank <= 5 if applicable else None,
+            "relevance_judgments": len(judgments) if graded else None,
+            "relevance_cutoff": cutoff if graded else None,
+            "ndcg_at_5": ndcg if graded and cutoff == 5 else None,
         }
     mean_reciprocal_rank = (
         reciprocal_rank_total / applicable_count if applicable_count else None
@@ -2305,6 +2412,12 @@ def score_quality_oracles(
         ),
         "hit_at_1": round(hit_at_1_count / applicable_count, 6) if applicable_count else None,
         "hit_at_5": round(hit_at_5_count / applicable_count, 6) if applicable_count else None,
+        "mean_ndcg_at_5": (
+            round(ndcg_total / ndcg_applicable_count, 6)
+            if ndcg_applicable_count
+            else None
+        ),
+        "ndcg_applicable_count": ndcg_applicable_count,
         "score": round(mean_reciprocal_rank, 6) if mean_reciprocal_rank is not None else None,
     }
 
