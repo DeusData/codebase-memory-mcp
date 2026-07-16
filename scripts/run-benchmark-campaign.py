@@ -196,6 +196,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     cwd = spec.get("cwd")
     repetitions = spec.get("repetitions")
     benchmark_timeout = spec.get("timeout_seconds", 240)
+    accepted_exit_codes = spec.get("accepted_exit_codes", [0])
     if not isinstance(harness_version, str) or not harness_version:
         raise ValueError("harness_version must be a non-empty string")
     if not isinstance(benchmark_script, str) or not benchmark_script:
@@ -206,6 +207,15 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("repetitions must be a positive integer")
     if not isinstance(benchmark_timeout, int) or benchmark_timeout <= 0:
         raise ValueError("timeout_seconds must be a positive integer")
+    if (
+        not isinstance(accepted_exit_codes, list)
+        or not accepted_exit_codes
+        or not all(
+            isinstance(code, int) and not isinstance(code, bool)
+            for code in accepted_exit_codes
+        )
+    ):
+        raise ValueError("accepted_exit_codes must be a non-empty integer array")
     cell_timeout = spec.get("cell_timeout_seconds", benchmark_timeout * 4)
     if not isinstance(cell_timeout, int) or cell_timeout <= 0:
         raise ValueError("cell_timeout_seconds must be a positive integer")
@@ -372,7 +382,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                     "cwd": str(Path(cwd).expanduser().resolve()),
                                     "parameters": parameters,
                                     "timeout_seconds": cell_timeout,
-                                    "accepted_exit_codes": [0],
+                                    "accepted_exit_codes": list(accepted_exit_codes),
                                 }
                                 if environment:
                                     cell["environment"] = environment
