@@ -24,6 +24,66 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_search_projection_report_keeps_identity_quality_beside_size(self) -> None:
+        document = {
+            "mode": "search_projection",
+            "run_id": "projection-example",
+            "binary_metadata": {"sha256": "b" * 64},
+            "cleanup": {"removed": True},
+            "completion": {"status": "complete", "exit_code": 0},
+            "observations": [
+                {
+                    "variant": "compact_true",
+                    "returned_count": 30,
+                    "identity_equal_to_default": True,
+                    "property_fields": [],
+                    "internal_fields": [],
+                    "response_bytes": 6824,
+                    "response_token_estimate": 1706,
+                    "elapsed_ms": 10.0,
+                    "post_call_rss_kb": 13696,
+                    "transport_survived": True,
+                    "server_reaped": True,
+                },
+                {
+                    "variant": "compact_false",
+                    "returned_count": 30,
+                    "identity_equal_to_default": True,
+                    "property_fields": ["complexity", "signature"],
+                    "internal_fields": [],
+                    "response_bytes": 18374,
+                    "response_token_estimate": 4594,
+                    "elapsed_ms": 8.0,
+                    "post_call_rss_kb": 14000,
+                    "transport_survived": True,
+                    "server_reaped": True,
+                },
+            ],
+            "derived": {
+                "passed": True,
+                "identity_parity": True,
+                "internal_fields_absent": True,
+                "compact_bytes": 6824,
+                "non_compact_bytes": 18374,
+                "non_compact_over_compact_ratio": 2.693,
+                "claim_boundary": "One observation per variant.",
+            },
+        }
+
+        markdown = SUMMARY.render_search_projection(document)
+
+        self.assertIn("Outcome: complete", markdown)
+        self.assertIn("compact true | 30 | Equal | none | 6,824 | 1,706", markdown)
+        self.assertIn("non-compact | 30 | Equal | complexity, signature | 18,374", markdown)
+        self.assertIn("62.9% fewer payload bytes", markdown)
+        self.assertIn("No fp, sp, or bt", markdown)
+        self.assertIn("not a latency comparison", markdown)
+        self.assertNotIn("FAIL", markdown)
+
+    def test_search_projection_rejects_wrong_document(self) -> None:
+        with self.assertRaisesRegex(ValueError, "expected a search_projection"):
+            SUMMARY.render_search_projection({"mode": "incremental"})
+
     def test_list_projects_scaling_report_separates_size_latency_and_lifecycle(self) -> None:
         document = {
             "mode": "list_projects_scaling",

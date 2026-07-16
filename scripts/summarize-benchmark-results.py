@@ -792,6 +792,109 @@ def atomic_write_text(path: Path, content: str) -> None:
             temporary.unlink()
 
 
+def render_search_projection(document: dict[str, Any]) -> str:
+    if document.get("mode") != "search_projection":
+        raise ValueError("expected a search_projection result document")
+    observations = document.get("observations")
+    derived = document.get("derived")
+    if not isinstance(observations, list) or not isinstance(derived, dict):
+        raise ValueError("search-projection result is missing observations or derived data")
+    completion = document.get("completion")
+    status = str(completion.get("status")) if isinstance(completion, dict) else "unknown"
+    labels = {
+        "compact_default": "compact default",
+        "compact_true": "compact true",
+        "compact_selected_fields": "compact + selected fields",
+        "compact_false": "non-compact",
+    }
+    lines = [
+        "## search_graph JSON projection",
+        "",
+        f"Outcome: {status} — ranked-result identity parity="
+        f"{str(bool(derived.get('identity_parity'))).lower()}, internal fields absent="
+        f"{str(bool(derived.get('internal_fields_absent'))).lower()}.",
+        "",
+        "| Variant | Results | Ranked identities | Property fields | Payload bytes | "
+        "Estimated tokens* | Call ms† | Post-call RSS MiB‡ | Transport | Cleanup |",
+        "|---|---:|---|---|---:|---:|---:|---:|---|---|",
+    ]
+    non_compact_fields: list[str] = []
+    for item in observations:
+        if not isinstance(item, dict):
+            continue
+        fields = item.get("property_fields")
+        typed_fields = list(map(str, fields)) if isinstance(fields, list) else []
+        fields_text = (
+            f"{len(typed_fields)} fields"
+            if len(typed_fields) > 4
+            else (", ".join(typed_fields) if typed_fields else "none")
+        )
+        if item.get("variant") == "compact_false":
+            non_compact_fields = typed_fields
+        rss_kb = item.get("post_call_rss_kb")
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    labels.get(str(item.get("variant")), str(item.get("variant"))),
+                    f"{int(item['returned_count']):,}",
+                    "Equal" if item.get("identity_equal_to_default") else "Different",
+                    fields_text,
+                    f"{int(item['response_bytes']):,}",
+                    f"{int(item['response_token_estimate']):,}",
+                    f"{float(item['elapsed_ms']):.3f}",
+                    f"{float(rss_kb) / 1024:.1f}" if isinstance(rss_kb, (int, float)) else "n/a",
+                    "Survived" if item.get("transport_survived") else "Interrupted",
+                    "Reaped" if item.get("server_reaped") else "Incomplete",
+                )
+            )
+            + " |"
+        )
+    compact_bytes = derived.get("compact_bytes")
+    verbose_bytes = derived.get("non_compact_bytes")
+    savings = (
+        100.0 * (1.0 - float(compact_bytes) / float(verbose_bytes))
+        if isinstance(compact_bytes, (int, float))
+        and isinstance(verbose_bytes, (int, float))
+        and verbose_bytes
+        else None
+    )
+    binary = document.get("binary_metadata")
+    sha = binary.get("sha256") if isinstance(binary, dict) else None
+    cleanup = document.get("cleanup")
+    cleanup_removed = cleanup.get("removed") if isinstance(cleanup, dict) else None
+    lines.extend(
+        (
+            "",
+            "### Interpretation and audit boundary",
+            "",
+            (
+                "- Non-compact property fields: " + ", ".join(non_compact_fields) + "."
+                if non_compact_fields
+                else "- Non-compact property fields: none."
+            ),
+            f"- Compact output uses {savings:.1f}% fewer payload bytes than non-compact output."
+            if savings is not None
+            else "- Compact versus non-compact byte savings were not measured.",
+            "- No fp, sp, or bt indexing fields appear in any variant."
+            if derived.get("internal_fields_absent")
+            else "- One or more internal indexing fields were observed.",
+            f"- Claim boundary: {derived.get('claim_boundary', 'projection-only comparison')}",
+            f"- Run ID: {document.get('run_id', 'n/a')}; binary SHA-256: {sha or 'n/a'}.",
+            f"- Auto-created fixture cleanup confirmed: {str(cleanup_removed).lower()}.",
+            "",
+            "* Tokens are the deterministic ceil(UTF-8 payload bytes / 4) estimate, not a "
+            "model-tokenizer count.",
+            "",
+            "† There is one observation per variant. The table is a response-projection and "
+            "ranked-identity check, not a latency comparison.",
+            "",
+            "‡ RSS is sampled after each call and is not peak RSS.",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
 def render_list_projects_scaling(document: dict[str, Any]) -> str:
     if document.get("mode") != "list_projects_scaling":
         raise ValueError("expected a list_projects_scaling result document")
@@ -1383,11 +1486,24 @@ def main() -> int:
         type=Path,
         help="Append a list_projects response-scaling section from retained JSON.",
     )
+    parser.add_argument(
+        "--search-projection",
+        action="append",
+        default=[],
+        type=Path,
+        help="Append a search_graph compact-projection section from retained JSON.",
+    )
     parser.add_argument("--out", default="")
     args = parser.parse_args()
-    if not args.input and not args.mcp_surface_parity and not args.list_projects_scaling:
+    if (
+        not args.input
+        and not args.mcp_surface_parity
+        and not args.list_projects_scaling
+        and not args.search_projection
+    ):
         parser.error(
-            "at least one --input, --mcp-surface-parity, or --list-projects-scaling is required"
+            "at least one --input, --mcp-surface-parity, --list-projects-scaling, or "
+            "--search-projection is required"
         )
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for label, path in args.input:
@@ -1417,6 +1533,13 @@ def main() -> int:
         if not isinstance(document, dict):
             raise SystemExit(f"error: expected JSON object in {path}")
         sections.append(render_list_projects_scaling(document).rstrip())
+    for raw_path in args.search_projection:
+        path = raw_path.expanduser()
+        with path.open(encoding="utf-8") as stream:
+            document = json.load(stream)
+        if not isinstance(document, dict):
+            raise SystemExit(f"error: expected JSON object in {path}")
+        sections.append(render_search_projection(document).rstrip())
     markdown = "\n\n".join(sections) + "\n"
     if args.out:
         output = Path(args.out).expanduser()
