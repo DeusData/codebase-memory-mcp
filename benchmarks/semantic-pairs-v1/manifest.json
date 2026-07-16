@@ -29,7 +29,32 @@
           "expected": false,
           "category": "lexical_hard_negative"
         }
-      ]
+      ],
+      "mutation": {
+        "target_path": "cbmq_similarity.go",
+        "replacement_source_path": "variants/cbmq_similarity_after.go",
+        "description": "move the structural-clone relationship from order to profile",
+        "post_judgments": [
+          {
+            "source": "cbmqValidateUser",
+            "target": "cbmqValidateOrder",
+            "expected": false,
+            "category": "removed_structural_near_clone"
+          },
+          {
+            "source": "cbmqValidateUser",
+            "target": "cbmqValidateProfileDecoy",
+            "expected": true,
+            "category": "added_structural_near_clone"
+          },
+          {
+            "source": "cbmqValidateOrder",
+            "target": "cbmqValidateProfileDecoy",
+            "expected": false,
+            "category": "lexical_hard_negative"
+          }
+        ]
+      }
     },
     "semantic_edges": {
       "capability": "semantic_edges",
@@ -56,7 +81,32 @@
           "expected": false,
           "category": "lexical_hard_negative"
         }
-      ]
+      ],
+      "mutation": {
+        "target_path": "cbmq_records.py",
+        "replacement_source_path": "variants/cbmq_records_after.py",
+        "description": "move semantic relatedness from account normalization to archive normalization",
+        "post_judgments": [
+          {
+            "source": "cbmq_normalize_user_record",
+            "target": "cbmq_normalize_account_record",
+            "expected": false,
+            "category": "removed_semantic_control_flow_variant"
+          },
+          {
+            "source": "cbmq_normalize_user_record",
+            "target": "cbmq_archive_record_decoy",
+            "expected": true,
+            "category": "added_semantic_control_flow_variant"
+          },
+          {
+            "source": "cbmq_normalize_account_record",
+            "target": "cbmq_archive_record_decoy",
+            "expected": false,
+            "category": "lexical_hard_negative"
+          }
+        ]
+      }
     }
   }
 }

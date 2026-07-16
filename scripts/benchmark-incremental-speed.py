@@ -64,6 +64,7 @@ CONFIG_PROFILE_GIT_HISTORY_DISABLED = "git_history_disabled"
 CONFIG_PROFILE_HTTP_LINKS_DISABLED = "http_links_disabled"
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
 CONFIG_PROFILE_DEPENDENCY_DISABLED = "dependency_disabled"
+CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER = "incremental_semantic_freshness_eager"
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_DEFAULT: {},
@@ -73,6 +74,9 @@ CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_GIT_HISTORY_DISABLED: {"githistory_enabled": "false"},
     CONFIG_PROFILE_HTTP_LINKS_DISABLED: {"httplinks_enabled": "false"},
     CONFIG_PROFILE_DEPENDENCY_DISABLED: {"auto_index_deps": "false"},
+    CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER: {
+        "incremental_derived_refresh": "eager"
+    },
     CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: {
         "githistory_enabled": "false",
         "httplinks_enabled": "false",
@@ -356,7 +360,12 @@ def create_pair_quality_repo(repo_dir: Path, capability: str) -> dict[str, Any]:
         raise ValueError(f"semantic pair case {capability} requires source_paths")
     source_sha256: dict[str, str] = {}
     for relative in source_paths:
-        if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        if (
+            not isinstance(relative, str)
+            or not relative
+            or Path(relative).is_absolute()
+            or ".." in Path(relative).parts
+        ):
             raise ValueError("semantic pair source path must be relative")
         source = task_root / relative
         payload = source.read_bytes()
@@ -364,12 +373,31 @@ def create_pair_quality_repo(repo_dir: Path, capability: str) -> dict[str, Any]:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(payload)
         source_sha256[relative] = hashlib.sha256(payload).hexdigest()
+    mutation = case.get("mutation")
+    if not isinstance(mutation, dict):
+        raise ValueError(f"semantic pair case {capability} requires mutation")
+    replacement_relative = mutation.get("replacement_source_path")
+    target_relative = mutation.get("target_path")
+    if (
+        not isinstance(replacement_relative, str)
+        or not replacement_relative
+        or Path(replacement_relative).is_absolute()
+        or ".." in Path(replacement_relative).parts
+        or target_relative not in source_paths
+    ):
+        raise ValueError(f"semantic pair case {capability} has invalid mutation paths")
+    replacement_payload = (task_root / replacement_relative).read_bytes()
+    mutation = {
+        **mutation,
+        "replacement_source_sha256": hashlib.sha256(replacement_payload).hexdigest(),
+    }
     task_set = {
         "schema_version": manifest["schema_version"],
         "task_set_version": manifest["task_set_version"],
         "ground_truth_scope": manifest["ground_truth_scope"],
         "query_name_marker": manifest["query_name_marker"],
         **case,
+        "mutation": mutation,
         "source_sha256": source_sha256,
         "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     }
@@ -382,6 +410,37 @@ def create_similarity_quality_repo(repo_dir: Path) -> dict[str, Any]:
 
 def create_semantic_edges_quality_repo(repo_dir: Path) -> dict[str, Any]:
     return create_pair_quality_repo(repo_dir, "semantic_edges")
+
+
+def apply_pair_quality_mutation(
+    repo_dir: Path, fixture: dict[str, Any]
+) -> dict[str, Any]:
+    mutation = fixture.get("mutation")
+    if not isinstance(mutation, dict):
+        raise ValueError("pair quality fixture has no mutation")
+    target_relative = str(mutation["target_path"])
+    replacement_relative = str(mutation["replacement_source_path"])
+    target = repo_dir / target_relative
+    before_payload = target.read_bytes()
+    before_sha256 = hashlib.sha256(before_payload).hexdigest()
+    expected_before = fixture.get("source_sha256", {}).get(target_relative)
+    if before_sha256 != expected_before:
+        raise ValueError(
+            f"pair quality mutation source hash mismatch for {target_relative}"
+        )
+    task_root = Path(__file__).resolve().parents[1] / "benchmarks" / "semantic-pairs-v1"
+    replacement_payload = (task_root / replacement_relative).read_bytes()
+    after_sha256 = hashlib.sha256(replacement_payload).hexdigest()
+    if after_sha256 != mutation.get("replacement_source_sha256"):
+        raise ValueError("pair quality replacement source hash mismatch")
+    atomic_write_text(target, replacement_payload.decode("utf-8"))
+    return {
+        "description": mutation["description"],
+        "changed_paths": [target_relative],
+        "before_sha256": before_sha256,
+        "after_sha256": after_sha256,
+        "post_judgments": list(mutation["post_judgments"]),
+    }
 
 
 def create_inbound_frontier_repo(
@@ -3458,6 +3517,79 @@ def observed_pairs_from_query_response(tool_result: dict[str, Any]) -> list[dict
     return observed
 
 
+def compare_pair_oracle_outputs(
+    incremental: dict[str, Any], fresh: dict[str, Any]
+) -> dict[str, Any]:
+    def canonical(output: dict[str, Any]) -> set[tuple[str, str, float | str | None]]:
+        result: set[tuple[str, str, float | str | None]] = set()
+        for item in output.get("observed_pairs", []):
+            source, target = canonical_pair(item.get("source"), item.get("target"))
+            result.add((source, target, item.get("score")))
+        return result
+
+    incremental_pairs = canonical(incremental)
+    fresh_pairs = canonical(fresh)
+
+    def render(values: set[tuple[str, str, float | str | None]]) -> list[dict[str, Any]]:
+        return [
+            {"source": source, "target": target, "score": score}
+            for source, target, score in sorted(values)
+        ]
+
+    return {
+        "passed": incremental_pairs == fresh_pairs,
+        "incremental_only": render(incremental_pairs - fresh_pairs),
+        "fresh_only": render(fresh_pairs - incremental_pairs),
+        "incremental_pair_count": len(incremental_pairs),
+        "fresh_pair_count": len(fresh_pairs),
+    }
+
+
+def evaluate_pair_incremental_policy(
+    config_overrides: dict[str, str],
+    incremental_index: dict[str, Any],
+    incremental_oracles: dict[str, Any],
+    canonical_graph: dict[str, Any],
+    pair_equality: dict[str, Any],
+) -> dict[str, Any]:
+    policy = config_overrides.get(
+        "incremental_derived_refresh", "stale_on_incremental"
+    )
+    warnings = incremental_oracles.get("edge_query", {}).get("response", {}).get(
+        "warnings", []
+    )
+    warnings = warnings if isinstance(warnings, list) else []
+    stale_warning_present = any(
+        isinstance(warning, str)
+        and "semantic_edges derived view is stale" in warning
+        for warning in warnings
+    )
+    immediate_freshness_met = bool(
+        incremental_oracles.get("passed")
+        and canonical_graph.get("equal")
+        and pair_equality.get("passed")
+    )
+    immediate_freshness_expected = policy == "eager"
+    policy_conformance_met = (
+        immediate_freshness_met and not stale_warning_present
+        if immediate_freshness_expected
+        else immediate_freshness_met or stale_warning_present
+    )
+    return {
+        "policy": policy,
+        "publish_kind": incremental_index.get("publish_kind"),
+        "immediate_freshness_expected": immediate_freshness_expected,
+        "immediate_freshness_met": immediate_freshness_met,
+        "stale_warning_present": stale_warning_present,
+        "policy_conformance_met": policy_conformance_met,
+        "interpretation": (
+            "eager policy requires canonical fresh semantic/similarity results"
+            if immediate_freshness_expected
+            else "deferred policy may publish a stale derived view only with an explicit warning"
+        ),
+    }
+
+
 def run_relation_quality_oracles(
     transport: str,
     binary: Path,
@@ -3557,6 +3689,147 @@ def run_index_for_transport(
     return run_index(binary, env, repo_dir, timeout, include_logs, index_mode)
 
 
+def run_pair_quality_lifecycle(
+    args: argparse.Namespace,
+    binary: Path,
+    case_env: dict[str, str],
+    repo_dir: Path,
+    cache_dir: Path,
+    work_root: Path,
+    fixture: dict[str, Any],
+) -> dict[str, Any]:
+    run_config_set(binary, case_env, "incremental_reindex", "always", args.timeout)
+    if args.transport == "mcp":
+        with McpClient(binary, case_env, args.timeout) as client:
+            initial_index = run_index_for_transport(
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                client,
+                index_mode=args.index_mode,
+            )
+            project = str(initial_index.get("response", {}).get("project") or "repo")
+            initial_oracles = run_relation_quality_oracles(
+                args.transport, binary, case_env, project, fixture, args, client
+            )
+            mutation = apply_pair_quality_mutation(repo_dir, fixture)
+            incremental_index = run_index_for_transport(
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                client,
+                index_mode=args.index_mode,
+            )
+            post_fixture = {**fixture, "judgments": mutation["post_judgments"]}
+            incremental_oracles = run_relation_quality_oracles(
+                args.transport, binary, case_env, project, post_fixture, args, client
+            )
+    else:
+        initial_index = run_index_for_transport(
+            args.transport,
+            binary,
+            case_env,
+            repo_dir,
+            args.timeout,
+            args.include_logs,
+            index_mode=args.index_mode,
+        )
+        project = str(initial_index.get("response", {}).get("project") or "repo")
+        initial_oracles = run_relation_quality_oracles(
+            args.transport, binary, case_env, project, fixture, args
+        )
+        mutation = apply_pair_quality_mutation(repo_dir, fixture)
+        incremental_index = run_index_for_transport(
+            args.transport,
+            binary,
+            case_env,
+            repo_dir,
+            args.timeout,
+            args.include_logs,
+            index_mode=args.index_mode,
+        )
+        post_fixture = {**fixture, "judgments": mutation["post_judgments"]}
+        incremental_oracles = run_relation_quality_oracles(
+            args.transport, binary, case_env, project, post_fixture, args
+        )
+
+    incremental_db = find_project_db(cache_dir)
+    incremental_snapshot = work_root / "incremental.db"
+    copy_sqlite_snapshot(incremental_db, incremental_snapshot)
+
+    fresh_cache = work_root / "fresh-cache"
+    fresh_cache.mkdir(parents=True, exist_ok=True)
+    fresh_env = build_env(fresh_cache)
+    apply_config_overrides(binary, fresh_env, args.config_overrides, args.timeout)
+    if args.transport == "mcp":
+        with McpClient(binary, fresh_env, args.timeout) as client:
+            fresh_index = run_index_for_transport(
+                args.transport,
+                binary,
+                fresh_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                client,
+                index_mode=args.index_mode,
+            )
+            fresh_project = str(fresh_index.get("response", {}).get("project") or project)
+            fresh_oracles = run_relation_quality_oracles(
+                args.transport, binary, fresh_env, fresh_project, post_fixture, args, client
+            )
+    else:
+        fresh_index = run_index_for_transport(
+            args.transport,
+            binary,
+            fresh_env,
+            repo_dir,
+            args.timeout,
+            args.include_logs,
+            index_mode=args.index_mode,
+        )
+        fresh_project = str(fresh_index.get("response", {}).get("project") or project)
+        fresh_oracles = run_relation_quality_oracles(
+            args.transport, binary, fresh_env, fresh_project, post_fixture, args
+        )
+    fresh_db = find_project_db(fresh_cache)
+    canonical_graph = compare_canonical_graph(incremental_snapshot, fresh_db, project)
+    pair_equality = compare_pair_oracle_outputs(incremental_oracles, fresh_oracles)
+    incremental_policy = evaluate_pair_incremental_policy(
+        args.config_overrides,
+        incremental_index,
+        incremental_oracles,
+        canonical_graph,
+        pair_equality,
+    )
+    return {
+        "project": project,
+        "initial_index": initial_index,
+        "initial_oracles": initial_oracles,
+        "mutation": mutation,
+        "incremental_index": incremental_index,
+        "incremental_oracles": incremental_oracles,
+        "fresh_index": fresh_index,
+        "fresh_oracles": fresh_oracles,
+        "canonical_graph": canonical_graph,
+        "pair_equality": pair_equality,
+        "incremental_policy": incremental_policy,
+        "policy_conformance_met": incremental_policy["policy_conformance_met"],
+        "quality_target_met": bool(
+            initial_oracles.get("passed")
+            and incremental_oracles.get("passed")
+            and fresh_oracles.get("passed")
+            and canonical_graph.get("equal")
+            and pair_equality.get("passed")
+        ),
+    }
+
+
 def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
     capability = args.capability_quality
     if capability not in CAPABILITY_QUALITY_CASES:
@@ -3600,7 +3873,15 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
         }[capability]
         fixture = fixture_factory(repo_dir)
         apply_config_overrides(binary, case_env, args.config_overrides, args.timeout)
-        if args.transport == "mcp":
+        lifecycle = None
+        if capability in {"similarity", "semantic_edges"}:
+            lifecycle = run_pair_quality_lifecycle(
+                args, binary, case_env, repo_dir, cache_dir, work_root, fixture
+            )
+            indexed = lifecycle["initial_index"]
+            project = lifecycle["project"]
+            oracles = lifecycle["initial_oracles"]
+        elif args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
                 indexed = run_index_for_transport(
                     args.transport,
@@ -3613,18 +3894,13 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                     index_mode=args.index_mode,
                 )
                 project = str(indexed.get("response", {}).get("project") or "repo")
-                if capability in {"similarity", "semantic_edges"}:
-                    oracles = run_relation_quality_oracles(
-                        args.transport, binary, case_env, project, fixture, args, client
-                    )
-                else:
-                    oracle_runner = {
-                        "rank": run_rank_quality_oracles,
-                        "dependencies": run_dependency_quality_oracles,
-                    }[capability]
-                    oracles = oracle_runner(
-                        args.transport, binary, case_env, project, args, client
-                    )
+                oracle_runner = {
+                    "rank": run_rank_quality_oracles,
+                    "dependencies": run_dependency_quality_oracles,
+                }[capability]
+                oracles = oracle_runner(
+                    args.transport, binary, case_env, project, args, client
+                )
         else:
             indexed = run_index_for_transport(
                 args.transport,
@@ -3636,24 +3912,24 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                 index_mode=args.index_mode,
             )
             project = str(indexed.get("response", {}).get("project") or "repo")
-            if capability in {"similarity", "semantic_edges"}:
-                oracles = run_relation_quality_oracles(
-                    args.transport, binary, case_env, project, fixture, args
-                )
-            else:
-                oracle_runner = {
-                    "rank": run_rank_quality_oracles,
-                    "dependencies": run_dependency_quality_oracles,
-                }[capability]
-                oracles = oracle_runner(args.transport, binary, case_env, project, args)
+            oracle_runner = {
+                "rank": run_rank_quality_oracles,
+                "dependencies": run_dependency_quality_oracles,
+            }[capability]
+            oracles = oracle_runner(args.transport, binary, case_env, project, args)
         case = {
             "scenario": f"{capability}_quality",
             "project": project,
             "fixture": fixture,
             "initial_fast_full": indexed,
             "oracles": oracles,
+            "pair_lifecycle": lifecycle,
             "execution_passed": True,
-            "quality_target_met": bool(oracles.get("passed")),
+            "quality_target_met": (
+                bool(lifecycle["quality_target_met"])
+                if lifecycle is not None
+                else bool(oracles.get("passed"))
+            ),
             "passed": True,
         }
         report["cases"].append(case)
