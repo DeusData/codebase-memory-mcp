@@ -807,17 +807,37 @@ class McpClient:
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
         if not self.proc:
             return
-        if self.proc.stdin:
-            self.proc.stdin.close()
+        proc = self.proc
         try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.terminate()
             try:
-                self.proc.wait(timeout=5)
+                if proc.stdin:
+                    proc.stdin.close()
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=5)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=5)
+        finally:
+            reader_threads = tuple(
+                thread for thread in (self.stdout_thread, self.stderr_thread) if thread
+            )
+            for thread in reader_threads:
+                thread.join(timeout=5)
+            alive_threads = [thread for thread in reader_threads if thread.is_alive()]
+            for stream in (proc.stdout, proc.stderr):
+                if stream:
+                    stream.close()
+            for thread in alive_threads:
+                thread.join(timeout=1)
+            readers_still_alive = any(thread.is_alive() for thread in alive_threads)
+            self.proc = None
+            self.stdout_thread = None
+            self.stderr_thread = None
+            if readers_still_alive and exc_type is None:
+                raise RuntimeError("MCP reader thread did not stop after process exit")
 
     def _read_stdout(self) -> None:
         assert self.proc and self.proc.stdout
