@@ -291,6 +291,54 @@ TEST(api_surface_classic_regression_gate) {
     PASS();
 }
 
+TEST(tool_mode_config_switches_live_server_surface) {
+    char *saved_mode = save_tool_mode();
+    cbm_unsetenv("CBM_TOOL_MODE");
+
+    char *tmp = th_mktempdir("cbm_tool_mode_live");
+    ASSERT_NOT_NULL(tmp);
+    cbm_config_t *server_cfg = cbm_config_open(tmp);
+    cbm_config_t *writer_cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(server_cfg);
+    ASSERT_NOT_NULL(writer_cfg);
+    ASSERT_EQ(cbm_config_set(writer_cfg, "tool_mode", "streamlined"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, server_cfg);
+
+    char *streamlined = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(streamlined);
+    ASSERT_EQ(6, tool_list_exact_count(streamlined));
+    ASSERT(tool_list_has_exact_name(streamlined, "get_code"));
+    ASSERT(!tool_list_has_exact_name(streamlined, "index_repository"));
+    free(streamlined);
+
+    /* A separate config connection models `config set tool_mode classic`
+     * while the MCP process remains alive. The next tools/list must read the
+     * persisted value rather than a startup-only cache. */
+    ASSERT_EQ(cbm_config_set(writer_cfg, "tool_mode", "classic"), 0);
+    char *classic = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(classic);
+    ASSERT_EQ(15, tool_list_exact_count(classic));
+    ASSERT(tool_list_has_exact_name(classic, "index_repository"));
+    ASSERT(!tool_list_has_exact_name(classic, "get_code"));
+    free(classic);
+
+    ASSERT_EQ(cbm_config_set(writer_cfg, "tool_mode", "streamlined"), 0);
+    streamlined = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(streamlined);
+    ASSERT_EQ(6, tool_list_exact_count(streamlined));
+    free(streamlined);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(writer_cfg);
+    cbm_config_close(server_cfg);
+    th_rmtree(tmp);
+    restore_tool_mode(saved_mode);
+    PASS();
+}
+
 TEST(hidden_tools_reveal_discoverable_tools) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -2785,6 +2833,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(server_default_mode_shows_streamlined_tools);
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);
+    RUN_TEST(tool_mode_config_switches_live_server_surface);
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
     RUN_TEST(hidden_tools_payload_excludes_already_visible_configured_tools);
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
