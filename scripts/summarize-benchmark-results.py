@@ -281,8 +281,13 @@ def correctness_findings(
     return list(dict.fromkeys(findings))
 
 
-def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def mutation_reindex_details(
+    cases: list[dict[str, Any]],
+    *,
+    disabled_pair_capabilities: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Aggregate repeated measurements without hiding the mutated source or publish route."""
+    disabled_pair_capabilities = disabled_pair_capabilities or set()
     grouped: dict[str, dict[str, Any]] = {}
     for case_index, case in enumerate(cases, start=1):
         scenario = str(case.get("scenario") or f"case {case_index}")
@@ -351,8 +356,14 @@ def mutation_reindex_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]
         canonical = lifecycle.get("canonical_graph", case.get("canonical_graph"))
         if isinstance(canonical, dict) and isinstance(canonical.get("equal"), bool):
             group["canonical"].append(canonical["equal"])
+        fixture = case.get("fixture")
+        capability = (
+            str(fixture.get("capability") or "") if isinstance(fixture, dict) else ""
+        )
         policy = lifecycle.get("incremental_policy")
-        if (
+        if capability in disabled_pair_capabilities:
+            group["canonical_policy"] = "capability disabled"
+        elif (
             isinstance(policy, dict)
             and policy.get("immediate_freshness_expected") is False
             and policy.get("policy_conformance_met") is True
@@ -1024,7 +1035,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "findings": findings,
         "quality_details": quality_oracle_details(cases),
         "pair_quality_details": pair_quality_details,
-        "mutation_details": mutation_reindex_details(cases),
+        "mutation_details": mutation_reindex_details(
+            cases,
+            disabled_pair_capabilities=disabled_pair_capabilities,
+        ),
         "scenario": next(iter(scenarios)) if len(scenarios) == 1 else None,
         "frontier_files": next(iter(frontier_files)) if len(frontier_files) == 1 else None,
         "exact_cap": next(iter(exact_caps)) if len(exact_caps) == 1 else None,
