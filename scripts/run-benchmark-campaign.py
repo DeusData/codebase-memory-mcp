@@ -761,6 +761,36 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def validate_attempt_artifacts(cell_root: Path, completion: dict[str, Any]) -> None:
+    """Re-hash a completed attempt's archived evidence before trusting its audit status."""
+    attempt_id = completion.get("attempt")
+    if attempt_id is None:
+        # Historical hand-authored plans may predate per-attempt evidence. Their
+        # result hash remains validated, but there is no artifact claim to check.
+        return
+    if (
+        not isinstance(attempt_id, str)
+        or not attempt_id
+        or Path(attempt_id).name != attempt_id
+        or attempt_id in {".", ".."}
+    ):
+        raise ValueError("completion attempt identifier is invalid")
+    attempt_root = cell_root / "attempts" / attempt_id
+    attempt = read_json_object(attempt_root / "attempt.json")
+    if attempt.get("cell_identity") != completion.get("cell_identity"):
+        raise ValueError("attempt cell identity does not match the completion")
+    if attempt.get("status") != "completed":
+        raise ValueError("completed cell references a non-completed attempt")
+    expected = attempt.get("artifacts")
+    if not isinstance(expected, dict):
+        raise ValueError("completed attempt artifact manifest is missing")
+    actual = artifact_manifest(attempt_root / "artifacts")
+    if actual != expected:
+        raise ValueError(
+            "completed attempt artifact manifest does not match retained files"
+        )
+
+
 def valid_completion(cell_root: Path, cell: dict[str, Any]) -> dict[str, Any] | None:
     completion_path = cell_root / "complete.json"
     if not completion_path.is_file():
@@ -772,6 +802,7 @@ def valid_completion(cell_root: Path, cell: dict[str, Any]) -> dict[str, Any] | 
     validate_result(result_path, cell)
     if file_sha256(result_path) != completion.get("result_sha256"):
         raise ValueError("completion result SHA-256 does not match the retained result")
+    validate_attempt_artifacts(cell_root, completion)
     return completion
 
 

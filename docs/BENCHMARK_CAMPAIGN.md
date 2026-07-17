@@ -23,7 +23,7 @@ JSON fields:
 
 Changing any of those inputs creates a different cell. A completed cell is resumed
 only when its completion marker, retained result, result SHA-256, binary SHA-256,
-and current plan identity all agree.
+current plan identity, and every archived artifact path, size, and SHA-256 agree.
 
 ## Plan format
 
@@ -281,6 +281,8 @@ the result, keeping memory bounded while preserving the evidence after transient
 worker logs are cleaned.
 
 Use `--audit-only` to scan and regenerate the report without running missing cells.
+The audit re-inventories every completed attempt's artifact directory and rejects
+changed, missing, or unlisted worker logs rather than trusting `attempt.json` alone.
 Use `--minimum-free-gb` and `--stale-lock-hours` only when the recorded defaults are
 inappropriate for the host.
 
