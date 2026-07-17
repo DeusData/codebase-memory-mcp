@@ -305,6 +305,54 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["task_success_score"], 1.0)
         self.assertEqual(row["overall_quality_score"], 1.0)
 
+    def test_pair_lifecycle_canonical_rejection_reports_exact_graph_witness(self) -> None:
+        perfect = {
+            "passed": True,
+            "pair_classification": {
+                "confusion": {"tp": 1, "tn": 2, "fp": 0, "fn": 0},
+                "f1": 1.0,
+            },
+        }
+        case = {
+            "scenario": "semantic_edges_quality",
+            "passed": False,
+            "fixture": {"capability": "semantic_edges"},
+            "oracles": {"passed": True},
+            "pair_lifecycle": {
+                "initial_oracles": perfect,
+                "incremental_oracles": perfect,
+                "fresh_oracles": perfect,
+                "canonical_graph": {
+                    "equal": False,
+                    "kind": "canonical nodes",
+                    "left_count": 15641,
+                    "right_count": 15641,
+                    "left_only": "'File' 'cbmq_records.py' 'temporary-root.cbmq_records.__file__'",
+                    "right_only": None,
+                },
+                "incremental_policy": {
+                    "immediate_freshness_expected": True,
+                    "policy_conformance_met": True,
+                },
+            },
+        }
+        item = report(case)
+        item["mode"] = "capability_quality"
+        item["parameters"] = {
+            "config_profile": "incremental_semantic_freshness_eager",
+            "config_overrides": {"incremental_derived_refresh": "eager"},
+            "index_mode": "moderate",
+        }
+
+        row = SUMMARY.summarize_group("upstream-semantic-eager", [item])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["decision"], "REJECT: graph correctness")
+        finding = " ".join(row["findings"])
+        self.assertIn("canonical nodes mismatch (incremental=15641, fresh=15641)", finding)
+        self.assertIn("cbmq_records.py", finding)
+        self.assertNotIn("no stage-level witness was recorded", markdown)
+
     def test_composition_spec_groups_validated_campaign_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
