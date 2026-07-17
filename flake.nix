@@ -12,7 +12,7 @@
       packages = forAllSystems (pkgs: {
         default = pkgs.stdenv.mkDerivation {
           pname = "codebase-memory-mcp";
-          version = "0.6.0";
+          version = "0.9.0";
 
           src = ./.;
 

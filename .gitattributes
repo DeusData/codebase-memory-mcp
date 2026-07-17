@@ -1,3 +1,9 @@
 # Vendored tree-sitter grammars — machine-generated, hide from stats and diffs
 internal/cbm/vendored/grammars/**/parser.c  linguist-generated=true diff=false
 internal/cbm/vendored/grammars/**/scanner.c linguist-generated=true diff=false
+
+# Keep repository text deterministic on every platform. Binary assets are
+# detected by Git and remain binary.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

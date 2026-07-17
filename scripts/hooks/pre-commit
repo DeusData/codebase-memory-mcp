@@ -4,10 +4,10 @@ set -euo pipefail
 # Pre-commit hook: linters + security audit + build + tests.
 #
 # Activated automatically via scripts/setup.sh or manually:
-#   git config core.hooksPath scripts/hooks
+#   scripts/install-git-hooks.sh
 
 echo "pre-commit: running all linters in parallel..."
-make -j3 -f Makefile.cbm lint
+make -j3 lint
 
 echo "pre-commit: security audit (source-level)..."
 scripts/security-audit.sh

@@ -17,6 +17,30 @@ permissions:
   contents: read
 
 jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: graph-ui
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: graph-ui/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Test frontend with coverage
+        run: npm run test:coverage
+
   # Emit the platform matrices as JSON. The CORE set is the default (fast,
   # unchanged); the BROAD set adds extra free runners (older glibc /
   # additional OS versions) for a wider "does it build everywhere" picture.
@@ -72,9 +96,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.unix) }}
     runs-on: ${{ matrix.os }}
-    # Broad-only legs (extra OS versions) are informational: visible but
-    # non-blocking, so a flaky/less-common runner can't block a release.
-    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -106,7 +127,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup-matrix.outputs.windows) }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0

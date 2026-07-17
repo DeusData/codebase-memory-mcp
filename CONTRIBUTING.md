@@ -6,13 +6,13 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 
 ## Build from Source
 
-**Prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).
+**Prerequisites**: C compiler (gcc or clang), make, zlib, Git, and Python 3. Optional: Node.js 22+ (for graph UI).
 
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
-git config core.hooksPath scripts/hooks  # activates pre-commit security checks
-scripts/build.sh
+scripts/install-git-hooks.sh  # activates pre-commit and commit-msg checks
+make build
 ```
 
 macOS: `xcode-select --install` provides clang.
@@ -23,10 +23,10 @@ The binary is output to `build/c/codebase-memory-mcp`.
 ## Run Tests
 
 ```bash
-scripts/test.sh
+make test
 ```
 
-This builds with ASan + UBSan and runs all tests (~2040 cases). Key test files:
+This builds with ASan + UBSan and runs the complete registered suite. Key test files:
 - `tests/test_pipeline.c` — pipeline integration tests
 - `tests/test_httplink.c` — HTTP route extraction and linking
 - `tests/test_mcp.c` — MCP protocol and tool handler tests
@@ -35,7 +35,7 @@ This builds with ASan + UBSan and runs all tests (~2040 cases). Key test files:
 ## Run Linter
 
 ```bash
-scripts/lint.sh
+make lint
 ```
 
 Runs clang-tidy, cppcheck, and clang-format. All must pass before committing (also enforced by pre-commit hook).
@@ -55,7 +55,7 @@ src/
   foundation/       Arena allocator, hash table, string utils, platform compat
   store/            SQLite graph storage (WAL mode, FTS5)
   cypher/           Cypher query → SQL translation
-  mcp/              MCP server (JSON-RPC 2.0 over stdio, 14 tools)
+  mcp/              MCP server (JSON-RPC 2.0 over stdio, 15 tools)
   pipeline/         Multi-pass indexing pipeline
     pass_*.c        Individual pipeline passes (definitions, calls, usages, etc.)
     httplink.c      HTTP route extraction (Go/Express/Laravel/Ktor/Python)
@@ -63,12 +63,19 @@ src/
   watcher/          Git-based background auto-sync
   cli/              CLI subcommands (install, update, uninstall, config)
   ui/               Graph visualization HTTP server (first-party httpd)
-internal/cbm/       Tree-sitter AST extraction (64 languages, vendored C grammars)
+internal/cbm/       Tree-sitter AST extraction (159 languages, vendored C grammars)
 vendored/           sqlite3, yyjson, mimalloc, xxhash, tre, nomic
 graph-ui/           React/Three.js frontend for graph visualization
 scripts/            Build, test, lint, security audit scripts
 tests/              All C test files
+docs/               Architecture, configuration, and repository catalogs
 ```
+
+Run `make help` for the stable command list. Use
+`docs/REPOSITORY_INDEX.md` to choose a module or package shelf before adding a
+new file. Stage an intended new file before running `make repository-index` so
+the deterministic catalog reads it from Git's index rather than from local
+filesystem noise.
 
 ## Adding or Fixing Language Support
 
@@ -191,7 +198,8 @@ Enforcement is strict and automated:
 
 - CI rejects every push and pull request containing an unsigned commit
   (`scripts/check-dco.sh`).
-- Install the local hook so unsigned commits are rejected at commit time:
+- Install both local hooks so quality checks run before commits and unsigned
+  commits are rejected at commit time:
 
 ```bash
 scripts/install-git-hooks.sh

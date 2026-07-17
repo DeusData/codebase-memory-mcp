@@ -5,7 +5,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: 'Version string (e.g. v0.8.0)'
+        description: 'Version string (e.g. v0.9.0)'
         type: string
         default: ''
       attest:

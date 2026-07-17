@@ -1,0 +1,22 @@
+{
+  "version": "0.9.0",
+  "source": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.9.0/checksums.txt",
+  "assets": {
+    "codebase-memory-mcp-darwin-amd64.tar.gz": "6af3d02a27f589901fa763d3971089337bc8c9838bbed5d0cf543ca9f1a9e543",
+    "codebase-memory-mcp-darwin-arm64.tar.gz": "faa02f0404230c451a9812230394481948f80183801fa5bf67044b41c2f25ed4",
+    "codebase-memory-mcp-linux-amd64-portable.tar.gz": "8459d5c9d1457f2c82de3de307ffc7641ecbba2dde893427be1e62eca8ef9b25",
+    "codebase-memory-mcp-linux-amd64.tar.gz": "e2832a8d207c26beaa30efa6222ed4a37cb3f526ca4bee060bfbf336ed6fc679",
+    "codebase-memory-mcp-linux-arm64-portable.tar.gz": "b0a43fdaf534073c16707d72726b73b149d4c1212034b281ee8b7b2dac755107",
+    "codebase-memory-mcp-linux-arm64.tar.gz": "68a345d9a6842f02a3cb07e187b28bc38c4f3a22967f47fadbcd0757ba93a680",
+    "codebase-memory-mcp-ui-darwin-amd64.tar.gz": "1fddbebbc4442b423e967fa730856e8f49c023fcdf8622cebe5b3c99f12219fc",
+    "codebase-memory-mcp-ui-darwin-arm64.tar.gz": "592f84e44d5e8eab9ae7134e99b1540ce3c28e84b684204f8f39cde51620d0ee",
+    "codebase-memory-mcp-ui-linux-amd64-portable.tar.gz": "bb836df7cc84536bd501d1ff98d49f566cfbbaba421ea54780149e0b83c121fd",
+    "codebase-memory-mcp-ui-linux-amd64.tar.gz": "c30901921ba02738e759d9a463bf205a2fe31fd8feed41fb84ed364f18015dea",
+    "codebase-memory-mcp-ui-linux-arm64-portable.tar.gz": "67ef134e3fb490093b64156a88437c7ed1424c16e45440670d972346ea25271b",
+    "codebase-memory-mcp-ui-linux-arm64.tar.gz": "0e988489f30335773bf6a6002dadd685401d7b596bc83e5f1a19dd8d7a2153fe",
+    "codebase-memory-mcp-ui-windows-amd64.zip": "9b53ebb86698776c4134747a2285643ce075268df3858f2f4dbb392eede2de17",
+    "codebase-memory-mcp-ui-windows-arm64.zip": "1de2aa3928368d1278ca51dc8d2661a778a038ffc4dced40874213e782d0cc07",
+    "codebase-memory-mcp-windows-amd64.zip": "92f96896f952e539f0d6cb34d7892a25064b677ccbf808b8f8310ad897e86f2c",
+    "codebase-memory-mcp-windows-arm64.zip": "63994fcfd15bf5e3f03cbf368cce86261713c7d7802e31469ae81a3939e4fae6"
+  }
+}

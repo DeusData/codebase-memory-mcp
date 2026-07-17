@@ -322,7 +322,7 @@ check_path
 # --- Git hooks ---
 # If run from inside the repo, activate tracked hooks
 if [ -d "scripts/hooks" ] && git rev-parse --git-dir &>/dev/null; then
-    git config core.hooksPath scripts/hooks
+    scripts/install-git-hooks.sh
     ok "Git hooks activated (scripts/hooks/)"
 fi
 

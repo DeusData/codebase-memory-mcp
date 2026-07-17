@@ -4,7 +4,7 @@
 # Usage:
 #   scripts/build.sh                              # Standard binary
 #   scripts/build.sh --with-ui                    # Binary with embedded UI
-#   scripts/build.sh --version v0.8.0             # With version stamp
+#   scripts/build.sh --version v0.9.0             # With version stamp
 #   scripts/build.sh --arch x86_64                # Force x86_64 build
 #   scripts/build.sh CC=gcc-14 CXX=g++-14        # Override compiler
 #

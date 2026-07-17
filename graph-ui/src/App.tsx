@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
-import { GraphTab } from "./components/GraphTab";
+import { lazy, Suspense, useCallback, useEffect, useState } from "react";
 import { StatsTab } from "./components/StatsTab";
 import { ControlTab } from "./components/ControlTab";
 import type { TabId } from "./lib/types";
 import { useUiMessages } from "./lib/i18n";
 
 const TAB_IDS: TabId[] = ["graph", "stats", "control"];
+const GraphTab = lazy(() => import("./components/GraphTab").then((module) => ({ default: module.GraphTab })));
 
 interface RouteState {
   tab: TabId;
@@ -121,7 +121,9 @@ export function App() {
       {/* Content */}
       <main className="flex-1 min-h-0">
         {activeTab === "graph" ? (
-          <GraphTab project={selectedProject} />
+          <Suspense fallback={<div role="status">Loading graph...</div>}>
+            <GraphTab project={selectedProject} />
+          </Suspense>
         ) : activeTab === "control" ? (
           <ControlTab />
         ) : (

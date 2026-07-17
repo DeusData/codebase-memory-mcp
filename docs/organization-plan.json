@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "planDate": "2026-07-17",
+  "baselineCommit": "e678b2b6acb02bc1ab84a854f2df0e1d092f2cc0",
+  "branch": "codex/reorganize-repository",
+  "planQualityScore": 100,
+  "targetOrganizationScore": 100,
+  "executionStatus": "complete",
+  "scoreBasis": "All tasks complete, the independent re-audit counterexamples are locked in as negative tests, and every live organization, build, test, and metadata guard passes",
+  "historicalMcpAudit": {
+    "status": "historical",
+    "ephemeral": true,
+    "recordedAt": "2026-07-17",
+    "purpose": "One-time graph evidence for module-boundary scope; not a live CI fact",
+    "nodes": 17179,
+    "edges": 91714,
+    "files": 676,
+    "skippedFiles": 0,
+    "adrPresent": true
+  },
+  "tasks": [
+    {"id": "ORG-000", "status": "complete", "dependsOn": []},
+    {"id": "ORG-001", "status": "complete", "dependsOn": ["ORG-000"]},
+    {"id": "ORG-002", "status": "complete", "dependsOn": ["ORG-000"]},
+    {"id": "ORG-003", "status": "complete", "dependsOn": ["ORG-000"]},
+    {"id": "ORG-004", "status": "complete", "dependsOn": ["ORG-003"]},
+    {"id": "ORG-005", "status": "complete", "dependsOn": ["ORG-000"]},
+    {"id": "ORG-006", "status": "complete", "dependsOn": []},
+    {"id": "ORG-007", "status": "complete", "dependsOn": ["ORG-006"]},
+    {"id": "ORG-008", "status": "complete", "dependsOn": ["ORG-002", "ORG-006"]},
+    {"id": "ORG-009", "status": "complete", "dependsOn": ["ORG-004", "ORG-007", "ORG-008"]},
+    {"id": "ORG-010", "status": "complete", "dependsOn": ["ORG-002", "ORG-003", "ORG-004", "ORG-005", "ORG-006", "ORG-007", "ORG-008", "ORG-009"]},
+    {"id": "ORG-011", "status": "complete", "dependsOn": ["ORG-001"]},
+    {"id": "ORG-012", "status": "complete", "dependsOn": ["ORG-002", "ORG-003", "ORG-004", "ORG-005", "ORG-006", "ORG-007", "ORG-008", "ORG-009", "ORG-010", "ORG-011"]},
+    {"id": "ORG-013", "status": "complete", "dependsOn": ["ORG-009", "ORG-010"]},
+    {"id": "ORG-014", "status": "complete", "dependsOn": ["ORG-003", "ORG-010"]},
+    {"id": "ORG-015", "status": "complete", "dependsOn": ["ORG-005", "ORG-010"]},
+    {"id": "ORG-016", "status": "complete", "dependsOn": ["ORG-006", "ORG-007"]},
+    {"id": "ORG-017", "status": "complete", "dependsOn": ["ORG-012", "ORG-013", "ORG-014", "ORG-015", "ORG-016"]},
+    {"id": "ORG-018", "status": "complete", "dependsOn": ["ORG-017"]}
+  ],
+  "alreadyShipped": [
+    "Nine frontend tests at baseline",
+    ".github/CODEOWNERS",
+    "MAINTAINERS.md",
+    "Cohesive CLI and MCP satellite modules"
+  ]
+}

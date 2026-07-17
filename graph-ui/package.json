@@ -32,6 +32,7 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@types/three": "~0.183.0",
+    "@vitest/coverage-v8": "^4.1.0",
     "@vitejs/plugin-react": "^4.3.0",
     "jsdom": "^25.0.0",
     "tailwindcss": "^4.1.0",

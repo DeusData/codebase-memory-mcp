@@ -20,6 +20,12 @@ jobs:
       - name: No-skips policy (tests pass or fail)
         run: bash scripts/check-no-test-skips.sh
 
+      - name: Git hook behavioral self-test
+        run: bash scripts/install-git-hooks.sh --self-test
+
+      - name: Repository organization invariants
+        run: make organization
+
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
 

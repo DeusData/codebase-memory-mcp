@@ -14,7 +14,10 @@
 # Security-sensitive and authority-sensitive surfaces.
 /.github/ @DeusData
 /scripts/ @DeusData
+/Makefile @DeusData
 /Makefile.cbm @DeusData
+/VERSION @DeusData
+/.editorconfig @DeusData
 /SECURITY.md @DeusData
 /docs/SECURITY-DISCLOSURE.md @DeusData
 /CONTRIBUTING.md @DeusData
@@ -22,6 +25,7 @@
 /DCO @DeusData
 /LICENSE @DeusData
 /MAINTAINERS.md @DeusData
+/docs/ @DeusData
 
 # Release and distribution surfaces.
 /pkg/ @DeusData

@@ -1,12 +1,12 @@
 {
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "Fast code intelligence engine for AI coding agents — single static binary MCP server",
   "homepage": "https://github.com/DeusData/codebase-memory-mcp",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-windows-amd64.zip",
-      "hash": "a602ad090ed3f49d86c55472f73f27ad7055222806a82358f2e08513e027f00f",
+      "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.9.0/codebase-memory-mcp-windows-amd64.zip",
+      "hash": "92f96896f952e539f0d6cb34d7892a25064b677ccbf808b8f8310ad897e86f2c",
       "bin": "codebase-memory-mcp.exe"
     }
   },

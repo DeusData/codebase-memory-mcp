@@ -21,13 +21,13 @@ const POINT_MODE_THRESHOLD = 75000;
 
 /* Sphere tessellation by node count: nobody can tell a 12-segment sphere from
  * a 32-segment one at 25k nodes, but the GPU can. */
-function sphereDetail(count: number): [number, number, number] {
+export function sphereDetail(count: number): [number, number, number] {
   if (count <= 8000) return [1, 32, 24];
   if (count <= 25000) return [1, 16, 12];
   return [1, 10, 7];
 }
 
-function nodeColor(
+export function nodeColor(
   node: GraphNode,
   highlightedIds: Set<number> | null,
   opacity: number,

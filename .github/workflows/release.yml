@@ -1,15 +1,15 @@
 # Release pipeline: lint → test → build → smoke/soak → draft → verify → publish
 #
-# Security (security-static + codeql-gate) starts immediately and runs in
-# parallel with lint/test/build/smoke/soak. It only blocks the final verify
-# step — everything else proceeds independently.
+# Version parity gates every release path first. Security and lint then run in
+# parallel; security blocks final verification while the product pipeline
+# proceeds through test, build, smoke, and soak.
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release version (e.g. v0.8.0)"
+        description: "Release version (e.g. v0.9.0)"
         required: true
         type: string
       release_notes:
@@ -36,13 +36,32 @@ permissions:
   contents: read
 
 jobs:
-  # ── Security (starts immediately, blocks only verify) ───────────
+  validate-version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Match release input to VERSION
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          expected="v$(tr -d '\r\n' < VERSION)"
+          if [ "$RELEASE_VERSION" != "$expected" ]; then
+            echo "release input $RELEASE_VERSION does not match VERSION $expected" >&2
+            exit 1
+          fi
+          python3 scripts/sync-version.py
+
+  # ── Security (starts after version parity, blocks verify) ───────
   security:
+    needs: [validate-version]
     uses: ./.github/workflows/_security.yml
     secrets: inherit
 
   # ── 1. Lint (cppcheck + clang-format) ───────────────────────────
   lint:
+    needs: [validate-version]
     uses: ./.github/workflows/_lint.yml
 
   # ── 2. Tests (all platforms, full suite for release) ────────────
@@ -302,23 +321,17 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      # The packaged versions MUST match the dispatched release version —
-      # the 0.8.0 release failed here because pkg/npm still carried the
-      # previous release's hand-pinned version and npm refuses to publish
-      # over an existing version. Inject the dispatch input so a forgotten
-      # manual bump can never fail the pipeline again. (server.json needs
-      # no injection: publish-mcp-registry syncs it from pkg/npm.)
-      - name: Sync packaging versions to the release version
+      # The validate-version job has already established VERSION as the release
+      # authority. Recheck the registry package rows here without mutating the
+      # checkout so a stale wrapper cannot be hidden during publication.
+      - name: Verify registry package versions
         env:
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           V="${RELEASE_VERSION#v}"
-          jq --arg v "$V" '.version = $v' pkg/npm/package.json > pkg/npm/package.tmp
-          mv pkg/npm/package.tmp pkg/npm/package.json
-          sed -i "s/^version = \".*\"/version = \"$V\"/" pkg/pypi/pyproject.toml
-          grep -q "\"version\": \"$V\"" pkg/npm/package.json
+          test "$(jq -r '.version' pkg/npm/package.json)" = "$V"
           grep -q "^version = \"$V\"" pkg/pypi/pyproject.toml
-          echo "packaging synced to $V"
+          echo "registry packages match VERSION $V"
 
       # ── npm ──────────────────────────────────────────────────
       - name: Setup Node
@@ -376,16 +389,14 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Sync server.json version to the released package
+      - name: Verify server.json version
         env:
-          # The dispatch input is the authoritative release version —
-          # pkg/npm/package.json can lag behind it in the dispatched commit.
           RELEASE_VERSION: ${{ inputs.version }}
         run: |
           VERSION="${RELEASE_VERSION#v}"
-          jq --arg v "$VERSION" '.version = $v | (.packages[].version) = $v' \
-            server.json > server.tmp && mv server.tmp server.json
-          echo "server.json pinned to $VERSION"
+          jq -e --arg v "$VERSION" \
+            '.version == $v and all(.packages[]; .version == $v)' server.json >/dev/null
+          echo "server.json matches VERSION $VERSION"
           cat server.json
 
       - name: Install mcp-publisher

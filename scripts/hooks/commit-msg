@@ -1,0 +1,22 @@
+#!/bin/sh
+# commit-msg hook: strict DCO enforcement at commit time.
+# Every commit must carry a Signed-off-by trailer matching the author email.
+# Install with: scripts/install-git-hooks.sh
+
+author_ident=$(git var GIT_AUTHOR_IDENT)
+author_email=$(printf '%s\n' "$author_ident" | sed -n 's/.*<\([^>]*\)>.*/\1/p')
+
+if [ -n "$author_email" ] && \
+   git interpret-trailers --parse "$1" | grep '^Signed-off-by:' | grep -qiF "<$author_email>"; then
+    exit 0
+fi
+
+echo "" >&2
+echo "COMMIT REJECTED: missing Signed-off-by trailer matching the commit author." >&2
+echo "" >&2
+echo "  Sign your commit:        git commit -s" >&2
+echo "  Fix the last commit:     git commit --amend -s" >&2
+echo "" >&2
+echo "The sign-off certifies you have the right to submit this code under the" >&2
+echo "project's MIT license. See the DCO file and CONTRIBUTING.md." >&2
+exit 1

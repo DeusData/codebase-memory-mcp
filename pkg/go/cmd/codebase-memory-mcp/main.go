@@ -28,7 +28,7 @@ import (
 
 const (
 	repo    = "DeusData/codebase-memory-mcp"
-	version = "0.8.1"
+	version = "0.9.0"
 )
 
 func main() {
