@@ -165,12 +165,18 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
         return 1;
     }
 
+    /* Windows readers prevent atomic database replacement. Acquire the MCP
+     * store gate before the pipeline lock so tool-driven and watcher-driven
+     * indexing use one deadlock-free lock order. */
+    cbm_mcp_server_begin_store_update(server);
+
     /* Non-blocking: skip if another pipeline is already running. The
      * positive return keeps the watcher's baselines uncommitted so the
      * change is retried on the next poll cycle (5-60s) instead of being
      * recorded as seen and lost (#937). */
     if (!cbm_pipeline_try_lock()) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
+        cbm_mcp_server_end_store_update(server, false);
         return 1;
     }
 
@@ -189,10 +195,10 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
             bool succeeded = cbm_mcp_result_succeeded(resp);
             free(resp);
             cbm_pipeline_unlock();
+            cbm_mcp_server_end_store_update(server, succeeded);
             if (!succeeded) {
                 return CBM_NOT_FOUND;
             }
-            cbm_mcp_server_mark_store_stale(server);
             return 0;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
@@ -201,15 +207,14 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
         cbm_pipeline_unlock();
+        cbm_mcp_server_end_store_update(server, false);
         return CBM_NOT_FOUND;
     }
 
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
     cbm_pipeline_unlock();
-    if (rc == 0) {
-        cbm_mcp_server_mark_store_stale(server);
-    }
+    cbm_mcp_server_end_store_update(server, rc == 0);
     return rc;
 }
 

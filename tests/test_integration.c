@@ -40,16 +40,18 @@ typedef struct {
 static int svn_watch_index(const char *project_name, const char *root_path, void *user_data) {
     (void)project_name;
     svn_watch_context_t *context = (svn_watch_context_t *)user_data;
+    cbm_mcp_server_begin_store_update(context->server);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!pipeline) {
+        cbm_mcp_server_end_store_update(context->server, false);
         return -1;
     }
     int result = cbm_pipeline_run(pipeline);
     cbm_pipeline_free(pipeline);
     if (result == 0) {
         context->calls++;
-        cbm_mcp_server_mark_store_stale(context->server);
     }
+    cbm_mcp_server_end_store_update(context->server, result == 0);
     return result;
 }
 
@@ -375,12 +377,8 @@ TEST(integ_mcp_query_graph_calls) {
 }
 
 TEST(integ_mcp_reopens_cached_store_after_full_route) {
-#ifdef _WIN32
-    SKIP_PLATFORM("Windows cached SQLite readers block atomic replacement (#1117)");
-#endif
     char args[256];
-    snprintf(args, sizeof(args),
-             "{\"name_pattern\":\"greet\",\"project\":\"%s\"}", g_project);
+    snprintf(args, sizeof(args), "{\"name_pattern\":\"greet\",\"project\":\"%s\"}", g_project);
 
     /* Pre-warm the server's read-only query handle before the pipeline replaces
      * or rewrites the project database. */
@@ -400,17 +398,21 @@ TEST(integ_mcp_reopens_cached_store_after_full_route) {
         fclose(f);
     }
 
+    cbm_mcp_server_begin_store_update(g_srv);
     cbm_pipeline_t *pipeline = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    if (!pipeline) {
+        cbm_mcp_server_end_store_update(g_srv, false);
+    }
     ASSERT_NOT_NULL(pipeline);
-    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
+    int pipeline_result = cbm_pipeline_run(pipeline);
     cbm_pipeline_free(pipeline);
+    cbm_mcp_server_end_store_update(g_srv, pipeline_result == 0);
+    ASSERT_EQ(pipeline_result, 0);
 
-    /* This is the event published by the successful watcher callback. The
-     * following query consumes it, closes the pre-warmed handle on this thread,
-     * and reopens the latest generation in the same server lifecycle. */
-    cbm_mcp_server_mark_store_stale(g_srv);
-    snprintf(args, sizeof(args),
-             "{\"name_pattern\":\"FullRefresh0\",\"project\":\"%s\"}", g_project);
+    /* The following query consumes the successful publication event and
+     * reopens the latest generation in the same server lifecycle. */
+    snprintf(args, sizeof(args), "{\"name_pattern\":\"FullRefresh0\",\"project\":\"%s\"}",
+             g_project);
     resp = call_tool("search_graph", args);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "FullRefresh0"));
@@ -440,8 +442,8 @@ TEST(integ_svn_watcher_updates_graph_in_same_session) {
     ASSERT_NOT_NULL(strstr(response, "indexed"));
     free(response);
 
-    snprintf(args, sizeof(args),
-             "{\"name_pattern\":\"BeforeSvnWatch\",\"project\":\"%s\"}", project);
+    snprintf(args, sizeof(args), "{\"name_pattern\":\"BeforeSvnWatch\",\"project\":\"%s\"}",
+             project);
     response = cbm_mcp_handle_tool(server, "search_graph", args);
     ASSERT_NOT_NULL(response);
     ASSERT_NOT_NULL(strstr(response, "BeforeSvnWatch"));
@@ -459,8 +461,8 @@ TEST(integ_svn_watcher_updates_graph_in_same_session) {
     cbm_watcher_touch(watcher, project);
     ASSERT_EQ(cbm_watcher_poll_once(watcher), 1);
     ASSERT_EQ(context.calls, 1);
-    snprintf(args, sizeof(args),
-             "{\"name_pattern\":\"AfterSvnWatch\",\"project\":\"%s\"}", project);
+    snprintf(args, sizeof(args), "{\"name_pattern\":\"AfterSvnWatch\",\"project\":\"%s\"}",
+             project);
     response = cbm_mcp_handle_tool(server, "search_graph", args);
     ASSERT_NOT_NULL(response);
     ASSERT_NOT_NULL(strstr(response, "AfterSvnWatch"));
@@ -471,8 +473,8 @@ TEST(integ_svn_watcher_updates_graph_in_same_session) {
     cbm_watcher_touch(watcher, project);
     ASSERT_EQ(cbm_watcher_poll_once(watcher), 1);
     ASSERT_EQ(context.calls, 2);
-    snprintf(args, sizeof(args),
-             "{\"name_pattern\":\"UnversionedSvnWatch\",\"project\":\"%s\"}", project);
+    snprintf(args, sizeof(args), "{\"name_pattern\":\"UnversionedSvnWatch\",\"project\":\"%s\"}",
+             project);
     response = cbm_mcp_handle_tool(server, "search_graph", args);
     ASSERT_NOT_NULL(response);
     ASSERT_NOT_NULL(strstr(response, "UnversionedSvnWatch"));

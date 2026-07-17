@@ -131,6 +131,13 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
  * The owning MCP request thread consumes it before its next store resolution. */
 void cbm_mcp_server_mark_store_stale(cbm_mcp_server_t *srv);
 
+/* Bracket a background graph publication. On Windows this waits for active
+ * MCP tools, closes the cached SQLite reader, and blocks new tools until end;
+ * on POSIX the existing generation remains queryable during publication.
+ * Every successful begin must be paired with end on every exit path. */
+void cbm_mcp_server_begin_store_update(cbm_mcp_server_t *srv);
+void cbm_mcp_server_end_store_update(cbm_mcp_server_t *srv, bool published);
+
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);

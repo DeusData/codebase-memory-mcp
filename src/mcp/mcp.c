@@ -1376,11 +1376,14 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  * ══════════════════════════════════════════════════════════════════ */
 
 struct cbm_mcp_server {
-    cbm_store_t *store;             /* currently open project store (or NULL) */
-    bool owns_store;                /* true if we opened the store */
-    char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
-    atomic_bool store_stale;        /* background index completed; event thread must reopen */
+    cbm_store_t *store;      /* currently open project store (or NULL) */
+    bool owns_store;         /* true if we opened the store */
+    char *current_project;   /* which project store is open for (heap) */
+    time_t store_last_used;  /* last time resolve_store was called for a named project */
+    atomic_bool store_stale; /* background index completed; event thread must reopen */
+#ifdef _WIN32
+    cbm_mutex_t store_update_gate; /* serialize cached readers with atomic DB replacement */
+#endif
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1419,6 +1422,9 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     atomic_init(&srv->store_stale, false);
+#ifdef _WIN32
+    cbm_mutex_init(&srv->store_update_gate);
+#endif
 
     return srv;
 }
@@ -1474,11 +1480,34 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     free(srv->active_request_id_str);
+#ifdef _WIN32
+    cbm_mutex_destroy(&srv->store_update_gate);
+#endif
     free(srv);
 }
 
-/* Cached stores are owned by the MCP request/event-loop thread. Background
- * threads may only publish store_stale and must never call this helper. */
+static void store_update_gate_lock(cbm_mcp_server_t *srv) {
+#ifdef _WIN32
+    if (srv) {
+        cbm_mutex_lock(&srv->store_update_gate);
+    }
+#else
+    (void)srv;
+#endif
+}
+
+static void store_update_gate_unlock(cbm_mcp_server_t *srv) {
+#ifdef _WIN32
+    if (srv) {
+        cbm_mutex_unlock(&srv->store_update_gate);
+    }
+#else
+    (void)srv;
+#endif
+}
+
+/* Callers must run on the request thread, or hold store_update_gate on
+ * Windows so no request can concurrently use the cached SQLite handle. */
 static void invalidate_cached_store(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
@@ -1492,6 +1521,29 @@ static void invalidate_cached_store(cbm_mcp_server_t *srv) {
     srv->store_last_used = 0;
 }
 
+void cbm_mcp_server_begin_store_update(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    store_update_gate_lock(srv);
+#ifdef _WIN32
+    /* Windows cannot atomically replace a SQLite file while this process has
+     * an open reader. The gate makes cross-thread close safe and keeps new
+     * query handles from opening until publication completes. */
+    invalidate_cached_store(srv);
+#endif
+}
+
+void cbm_mcp_server_end_store_update(cbm_mcp_server_t *srv, bool published) {
+    if (!srv) {
+        return;
+    }
+    if (published) {
+        cbm_mcp_server_mark_store_stale(srv);
+    }
+    store_update_gate_unlock(srv);
+}
+
 static void consume_stale_store(cbm_mcp_server_t *srv) {
     if (atomic_exchange_explicit(&srv->store_stale, false, memory_order_acq_rel)) {
         invalidate_cached_store(srv);
@@ -1501,21 +1553,17 @@ static void consume_stale_store(cbm_mcp_server_t *srv) {
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
-    if (!srv || !srv->store) {
+    if (!srv) {
         return;
     }
-    /* Protect initial in-memory stores that were never accessed via a named project.
-     * store_last_used stays 0 until resolve_store is called with a non-NULL project. */
-    if (srv->store_last_used == 0) {
-        return;
+    store_update_gate_lock(srv);
+    if (srv->store && srv->store_last_used != 0) {
+        time_t now = time(NULL);
+        if ((now - srv->store_last_used) >= timeout_s) {
+            invalidate_cached_store(srv);
+        }
     }
-
-    time_t now = time(NULL);
-    if ((now - srv->store_last_used) < timeout_s) {
-        return;
-    }
-
-    invalidate_cached_store(srv);
+    store_update_gate_unlock(srv);
 }
 
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
@@ -7857,7 +7905,8 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
-char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+static char *handle_tool_unlocked(cbm_mcp_server_t *srv, const char *tool_name,
+                                  const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
@@ -7918,6 +7967,13 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
     return cbm_mcp_text_result(msg, true);
+}
+
+char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    store_update_gate_lock(srv);
+    char *result = handle_tool_unlocked(srv, tool_name, args_json);
+    store_update_gate_unlock(srv);
+    return result;
 }
 
 /* ── Session detection + auto-index ────────────────────────────── */
@@ -7981,6 +8037,7 @@ static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
     cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
+    cbm_mcp_server_begin_store_update(srv);
 
     /* #832: prefer the supervised worker subprocess. Indexing the whole session in
      * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
@@ -7994,11 +8051,11 @@ static void *autoindex_thread(void *arg) {
         if (resp) {
             bool succeeded = cbm_mcp_result_succeeded(resp);
             free(resp);
+            cbm_mcp_server_end_store_update(srv, succeeded);
             if (!succeeded) {
                 cbm_log_warn("autoindex.err", "msg", "supervised_index_failed");
                 return NULL;
             }
-            cbm_mcp_server_mark_store_stale(srv);
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
@@ -8012,6 +8069,7 @@ static void *autoindex_thread(void *arg) {
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
+        cbm_mcp_server_end_store_update(srv, false);
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
@@ -8022,10 +8080,10 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
+    cbm_mcp_server_end_store_update(srv, rc == 0);
     cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
-        cbm_mcp_server_mark_store_stale(srv);
         cbm_log_info("autoindex.done", "project", srv->session_project);
         register_watcher_if_enabled(srv);
     } else {
