@@ -166,6 +166,40 @@ def compact_witness(value: Any, limit: int = 96) -> str:
     return single_line if len(single_line) <= limit else single_line[: limit - 1] + "…"
 
 
+def canonical_mismatch_finding(
+    canonical: Any,
+    *,
+    graph_gate: Any = None,
+) -> str | None:
+    if not isinstance(canonical, dict) or canonical.get("equal") is not False:
+        return None
+    kind = canonical.get("kind") or "canonical graph"
+    detail = (
+        f"{kind} mismatch (incremental={canonical.get('left_count', 'n/a')}, "
+        f"fresh={canonical.get('right_count', 'n/a')})"
+    )
+    witnesses = [
+        compact_witness(canonical.get("left_only")),
+        compact_witness(canonical.get("right_only")),
+    ]
+    witnesses = [value for value in witnesses if value]
+    if witnesses:
+        detail += "; witness: " + " vs ".join(witnesses)
+    if (
+        isinstance(graph_gate, dict)
+        and graph_gate.get("policy") == "declared_stale_derived_views"
+        and graph_gate.get("passed") is True
+    ):
+        views = graph_gate.get("declared_stale_views")
+        view_text = (
+            ", ".join(str(value) for value in views)
+            if isinstance(views, list)
+            else "unknown"
+        )
+        detail = f"declared stale derived views ({view_text}); " + detail
+    return detail
+
+
 def correctness_findings(
     cases: list[dict[str, Any]],
     *,
@@ -176,28 +210,11 @@ def correctness_findings(
     disabled_pair_capabilities = disabled_pair_capabilities or set()
     for case in cases:
         canonical = case.get("canonical_graph")
-        if isinstance(canonical, dict) and canonical.get("equal") is False:
-            kind = canonical.get("kind") or "canonical graph"
-            detail = (
-                f"{kind} mismatch (incremental={canonical.get('left_count', 'n/a')}, "
-                f"fresh={canonical.get('right_count', 'n/a')})"
-            )
-            witnesses = [
-                compact_witness(canonical.get("left_only")),
-                compact_witness(canonical.get("right_only")),
-            ]
-            witnesses = [value for value in witnesses if value]
-            if witnesses:
-                detail += "; witness: " + " vs ".join(witnesses)
-            graph_gate = case.get("graph_gate")
-            if (
-                isinstance(graph_gate, dict)
-                and graph_gate.get("policy") == "declared_stale_derived_views"
-                and graph_gate.get("passed") is True
-            ):
-                views = graph_gate.get("declared_stale_views")
-                view_text = ", ".join(str(value) for value in views) if isinstance(views, list) else "unknown"
-                detail = f"declared stale derived views ({view_text}); " + detail
+        detail = canonical_mismatch_finding(
+            canonical,
+            graph_gate=case.get("graph_gate"),
+        )
+        if detail:
             findings.append(detail)
 
         case_oracles = case.get("oracles")
@@ -225,6 +242,11 @@ def correctness_findings(
         capability = str(fixture.get("capability") or "") if isinstance(fixture, dict) else ""
         if not isinstance(lifecycle, dict) or capability in disabled_pair_capabilities:
             continue
+        lifecycle_canonical = lifecycle.get("canonical_graph")
+        if lifecycle_canonical is not canonical:
+            detail = canonical_mismatch_finding(lifecycle_canonical)
+            if detail:
+                findings.append(detail)
         policy = lifecycle.get("incremental_policy")
         immediate_expected = (
             isinstance(policy, dict) and policy.get("immediate_freshness_expected") is True
@@ -945,9 +967,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             "freshness deferral or execution failure."
         )
     if deferred_freshness:
-        findings.append(
+        findings.insert(
+            0,
             "Immediate semantic freshness was intentionally deferred under the recorded policy; "
-            "the structured stale warning was present and initial/fresh pair tasks passed."
+            "the structured stale warning was present and initial/fresh pair tasks passed"
         )
     return {
         "candidate": label,
