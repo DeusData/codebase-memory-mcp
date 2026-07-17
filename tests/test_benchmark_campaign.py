@@ -495,6 +495,43 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(item["size_bytes"], 9)
             self.assertEqual(len(item["sha256"]), 64)
 
+    def test_scan_rejects_changed_missing_or_unlisted_completed_artifacts(self) -> None:
+        for mutation in ("changed", "missing", "unlisted"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmpdir:
+                root = Path(tmpdir)
+                command = [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import json,os,pathlib,sys; "
+                        "artifact=pathlib.Path(os.environ['CBM_BENCHMARK_ARTIFACT_DIR'])/"
+                        "'worker.log.gz'; "
+                        "artifact.parent.mkdir(parents=True); artifact.write_bytes(b'audit-log'); "
+                        "json.dump({'binary_metadata':{'sha256':'" + "b" * 64 +
+                        "'},'derived':{'passed':True},'cases':[{'passed':True}]},"
+                        "open(sys.argv[1],'w'))"
+                    ),
+                    "{result_path}",
+                ]
+                planned = cell(command)
+                outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
+                cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+                attempt_root = next((cell_root / "attempts").iterdir())
+                artifact_root = attempt_root / "artifacts"
+                artifact = artifact_root / "worker.log.gz"
+
+                self.assertEqual(outcome["status"], "completed")
+                if mutation == "changed":
+                    artifact.write_bytes(b"tampered")
+                elif mutation == "missing":
+                    artifact.unlink()
+                else:
+                    (artifact_root / "unlisted.log.gz").write_bytes(b"extra")
+
+                audit = CAMPAIGN.scan_campaign(root, [planned])
+                self.assertEqual(audit["counts"]["corrupt"], 1)
+                self.assertIn("artifact manifest", audit["cells"][0]["error"])
+
     def test_report_input_adds_candidate_support_without_mutating_raw_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
