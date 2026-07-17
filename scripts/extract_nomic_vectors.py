@@ -332,9 +332,12 @@ static inline const int8_t *pretrained_vec_at(int i) {{
 
 
 def write_blob_s(path: str, incbin_path: str):
-    """Write assembler .incbin directive."""
+    """Write the cross-platform assembler .incbin wrapper."""
     with open(path, "w") as f:
-        f.write(f"""/* nomic-embed-code vector blob embedded via assembler. */
+        f.write(f"""/* nomic-embed-code vector blob embedded via assembler.
+ * Cross-platform: macOS (Mach-O) vs Linux (ELF) vs Windows (COFF). */
+
+#if defined(__APPLE__)
     .section __DATA,__const
     .globl _PRETRAINED_VECTOR_BLOB
     .globl _PRETRAINED_VECTOR_BLOB_LEN
@@ -347,6 +350,37 @@ _PRETRAINED_VECTOR_BLOB_END:
     .p2align 2
 _PRETRAINED_VECTOR_BLOB_LEN:
     .long _PRETRAINED_VECTOR_BLOB_END - _PRETRAINED_VECTOR_BLOB
+
+#elif defined(_WIN32) || defined(__CYGWIN__) || defined(__MINGW32__)
+    .section .rdata,"dr"
+    .globl PRETRAINED_VECTOR_BLOB
+    .globl PRETRAINED_VECTOR_BLOB_LEN
+    .p2align 4
+PRETRAINED_VECTOR_BLOB:
+    .incbin "{incbin_path}"
+PRETRAINED_VECTOR_BLOB_END:
+
+    .section .rdata,"dr"
+    .p2align 2
+PRETRAINED_VECTOR_BLOB_LEN:
+    .long PRETRAINED_VECTOR_BLOB_END - PRETRAINED_VECTOR_BLOB
+
+#else
+    .section .rodata,"a",@progbits
+    .globl PRETRAINED_VECTOR_BLOB
+    .globl PRETRAINED_VECTOR_BLOB_LEN
+    .p2align 4
+PRETRAINED_VECTOR_BLOB:
+    .incbin "{incbin_path}"
+PRETRAINED_VECTOR_BLOB_END:
+
+    .section .rodata,"a",@progbits
+    .p2align 2
+PRETRAINED_VECTOR_BLOB_LEN:
+    .long PRETRAINED_VECTOR_BLOB_END - PRETRAINED_VECTOR_BLOB
+
+    .section .note.GNU-stack,"",@progbits
+#endif
 """)
     print(f"  {path}: written")
 
