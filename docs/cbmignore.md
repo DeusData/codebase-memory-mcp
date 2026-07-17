@@ -63,8 +63,10 @@ snapshots/
 
 ## Precedence
 
-Discovery applies its filters in a fixed order — the first layer that rejects
-a path wins. For directories:
+Discovery applies its filters in a fixed order. In general, the first layer
+that rejects a path wins, except `.cbmignore` negations (layer 4) can un-skip
+ordinary built-in skip directories from layer 1 and rescue paths from layer 5.
+For directories:
 
 1. **Built-in skip list** — `.git`, `node_modules`, `dist`, `target`,
    `vendor`, tool caches, etc. (60+ names; the fast/moderate index modes add
