@@ -778,6 +778,36 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIn("canonicalDependencyAPI", dep_source)
         self.assertEqual(metadata["relevant_symbol"], "canonicalDependencyAPI")
 
+    def test_git_history_quality_fixture_has_four_coupled_commits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            metadata = BENCHMARK.create_git_history_quality_repo(root)
+            commit_count = subprocess.run(
+                ["git", "rev-list", "--count", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertEqual(metadata["capability"], "git_history")
+        self.assertEqual(metadata["expected_co_changes"], 4)
+        self.assertEqual(metadata["coupled_paths"], ["alpha.py", "beta.py"])
+        self.assertEqual(commit_count, "4")
+
+    def test_http_links_quality_fixture_has_client_and_route_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            metadata = BENCHMARK.create_http_links_quality_repo(root)
+            client = (root / "client" / "service.py").read_text()
+            routes = (root / "server" / "Routes.kt").read_text()
+
+        self.assertEqual(metadata["capability"], "http_links")
+        self.assertEqual(metadata["route_path"], "/api/cbmbench-orders/42")
+        self.assertIn("requests.get", client)
+        self.assertIn(metadata["route_path"], client)
+        self.assertIn('get("/api/cbmbench-orders/{order_id}")', routes)
+
     def test_rank_quality_oracle_uses_central_symbol_as_graded_judgment(self) -> None:
         calls = []
         original = BENCHMARK.run_tool_call_for_transport
@@ -857,6 +887,74 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 '\"package\":\"cbmbenchdep\"',
                 '\"read_only\":true',
             ],
+        )
+
+    def test_git_history_quality_oracle_queries_existing_edge_schema(self) -> None:
+        calls = []
+        original = BENCHMARK.run_tool_call_for_transport
+
+        def fake_call(*args, **kwargs):
+            calls.append((args[3], args[4]))
+            return {"response": {"rows": [["alpha.py", "beta.py", "4", "1.00"]]}}
+
+        class Args:
+            timeout = 10
+            include_logs = False
+
+        BENCHMARK.run_tool_call_for_transport = fake_call
+        try:
+            result = BENCHMARK.run_git_history_quality_oracles(
+                "cli", Path("cbm"), {}, "fixture", Args()
+            )
+        finally:
+            BENCHMARK.run_tool_call_for_transport = original
+
+        self.assertEqual(calls[0][0], "query_graph")
+        self.assertIn("FILE_CHANGES_WITH", calls[0][1]["query"])
+        self.assertTrue(result["file_change_coupling"]["quality"]["passed"])
+        self.assertEqual(
+            result["file_change_coupling"]["quality"]["required_substrings"],
+            ["beta.py", '"4"', '"1.00"'],
+        )
+
+    def test_http_links_quality_oracle_queries_existing_edge_schema(self) -> None:
+        calls = []
+        original = BENCHMARK.run_tool_call_for_transport
+
+        def fake_call(*args, **kwargs):
+            calls.append((args[3], args[4]))
+            return {
+                "response": {
+                    "rows": [
+                        [
+                            "fetch_order",
+                            "configureRouting",
+                            "/api/cbmbench-orders/42",
+                            "0.875",
+                        ]
+                    ]
+                }
+            }
+
+        class Args:
+            timeout = 10
+            include_logs = False
+
+        BENCHMARK.run_tool_call_for_transport = fake_call
+        try:
+            result = BENCHMARK.run_http_links_quality_oracles(
+                "cli", Path("cbm"), {}, "fixture", Args()
+            )
+        finally:
+            BENCHMARK.run_tool_call_for_transport = original
+
+        self.assertEqual(calls[0][0], "query_graph")
+        self.assertIn("HTTP_CALLS", calls[0][1]["query"])
+        self.assertIn("b.name = 'configureRouting'", calls[0][1]["query"])
+        self.assertTrue(result["http_call_link"]["quality"]["passed"])
+        self.assertEqual(
+            result["http_call_link"]["quality"]["required_substrings"],
+            ["fetch_order", "configureRouting"],
         )
 
     def test_reciprocal_rank_uses_full_bounded_result_beyond_ndcg_cutoff(self) -> None:
