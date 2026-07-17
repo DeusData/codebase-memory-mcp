@@ -111,7 +111,14 @@ FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
-CAPABILITY_QUALITY_CASES = ("rank", "dependencies", "similarity", "semantic_edges")
+CAPABILITY_QUALITY_CASES = (
+    "rank",
+    "dependencies",
+    "similarity",
+    "semantic_edges",
+    "git_history",
+    "http_links",
+)
 CROSS_FILE_RESOLVER_LANGUAGES = (
     "go",
     "c",
@@ -387,6 +394,101 @@ def create_dependency_quality_repo(repo_dir: Path) -> dict[str, Any]:
         "package": package_name,
         "relevant_symbol": symbol,
         "source_resolution": f"node_modules/{package_name}",
+        "network_required": False,
+    }
+
+
+def create_git_history_quality_repo(repo_dir: Path) -> dict[str, Any]:
+    """Create a deterministic four-commit co-change history for two source files."""
+    alpha = repo_dir / "alpha.py"
+    beta = repo_dir / "beta.py"
+    git_env = os.environ.copy()
+    git_env.update(
+        {
+            "GIT_AUTHOR_NAME": "CBM Benchmark",
+            "GIT_AUTHOR_EMAIL": "benchmark@example.invalid",
+            "GIT_COMMITTER_NAME": "CBM Benchmark",
+            "GIT_COMMITTER_EMAIL": "benchmark@example.invalid",
+        }
+    )
+
+    def git(*arguments: str, commit_index: int | None = None) -> None:
+        env = git_env
+        if commit_index is not None:
+            env = git_env.copy()
+            timestamp = f"2026-01-{commit_index:02d}T00:00:00+00:00"
+            env["GIT_AUTHOR_DATE"] = timestamp
+            env["GIT_COMMITTER_DATE"] = timestamp
+        subprocess.run(
+            ["git", *arguments],
+            cwd=repo_dir,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    for commit_index in range(1, 5):
+        write_text(
+            alpha,
+            alpha.read_text(encoding="utf-8")
+            + f"def alpha_{commit_index}():\n    return {commit_index}\n\n"
+            if alpha.exists()
+            else f"def alpha_{commit_index}():\n    return {commit_index}\n\n",
+        )
+        write_text(
+            beta,
+            beta.read_text(encoding="utf-8")
+            + f"def beta_{commit_index}():\n    return {commit_index}\n\n"
+            if beta.exists()
+            else f"def beta_{commit_index}():\n    return {commit_index}\n\n",
+        )
+        git("add", "--", "alpha.py", "beta.py")
+        git("commit", "-q", "-m", f"coupled change {commit_index}", commit_index=commit_index)
+    return {
+        "fixture_version": 1,
+        "capability": "git_history",
+        "language": "python",
+        "coupled_paths": ["alpha.py", "beta.py"],
+        "expected_co_changes": 4,
+        "relationship": "FILE_CHANGES_WITH",
+        "network_required": False,
+    }
+
+
+def create_http_links_quality_repo(repo_dir: Path) -> dict[str, Any]:
+    """Create a source-discovered Ktor route plus a cross-service HTTP client call."""
+    concrete_path = "/api/cbmbench-orders/42"
+    route_template = "/api/cbmbench-orders/{order_id}"
+    write_text(
+        repo_dir / "server" / "Routes.kt",
+        "import io.ktor.server.application.*\n"
+        "import io.ktor.server.response.*\n"
+        "import io.ktor.server.routing.*\n\n"
+        "fun Application.configureRouting() {\n"
+        "    routing {\n"
+        f"        get(\"{route_template}\") {{\n"
+        "            call.respondText(\"order\")\n"
+        "        }\n"
+        "    }\n"
+        "}\n",
+    )
+    write_text(
+        repo_dir / "client" / "service.py",
+        "import requests\n\n"
+        "def fetch_order():\n"
+        f"    return requests.get('http://orders.invalid{concrete_path}')\n",
+    )
+    return {
+        "fixture_version": 1,
+        "capability": "http_links",
+        "language": "python+kotlin",
+        "caller": "fetch_order",
+        "handler": "configureRouting",
+        "route_path": concrete_path,
+        "route_template": route_template,
+        "relationship": "HTTP_CALLS",
         "network_required": False,
     }
 
@@ -3880,6 +3982,105 @@ def run_dependency_quality_oracles(
     return oracles
 
 
+def run_git_history_quality_oracles(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    project: str,
+    args: argparse.Namespace,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    oracles = {
+        "file_change_coupling": run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "query_graph",
+            {
+                "project": project,
+                "query": (
+                    "MATCH (a)-[r:FILE_CHANGES_WITH]->(b) "
+                    "RETURN a.file_path, b.file_path, r.co_changes, r.coupling_score LIMIT 10"
+                ),
+            },
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+    }
+    quality = score_quality_oracles(
+        oracles,
+        {
+            "file_change_coupling": {
+                "criterion": (
+                    "retrieve the declared four-commit alpha.py/beta.py co-change relationship"
+                ),
+                "cutoff": 5,
+                "judgments": [
+                    {
+                        "expected_substring": "alpha.py",
+                        "required_substrings": ["beta.py", '"4"', '"1.00"'],
+                        "relevance": 3,
+                    }
+                ],
+            }
+        },
+    )
+    oracles["quality"] = quality
+    oracles["passed"] = quality["passed"]
+    return oracles
+
+
+def run_http_links_quality_oracles(
+    transport: str,
+    binary: Path,
+    env: dict[str, str],
+    project: str,
+    args: argparse.Namespace,
+    client: McpClient | None = None,
+) -> dict[str, Any]:
+    oracles = {
+        "http_call_link": run_tool_call_for_transport(
+            transport,
+            binary,
+            env,
+            "query_graph",
+            {
+                "project": project,
+                "query": (
+                    "MATCH (a)-[r:HTTP_CALLS]->(b) "
+                    "WHERE b.name = 'configureRouting' "
+                    "RETURN a.name, b.name, r.url_path, r.confidence LIMIT 10"
+                ),
+            },
+            args.timeout,
+            args.include_logs,
+            client,
+        )
+    }
+    quality = score_quality_oracles(
+        oracles,
+        {
+            "http_call_link": {
+                "criterion": (
+                    "retrieve the fetch_order HTTP client link to the declared order route"
+                ),
+                "cutoff": 5,
+                "judgments": [
+                    {
+                        "expected_substring": "/api/cbmbench-orders/42",
+                        "required_substrings": ["fetch_order", "configureRouting"],
+                        "relevance": 3,
+                    }
+                ],
+            }
+        },
+    )
+    oracles["quality"] = quality
+    oracles["passed"] = quality["passed"]
+    return oracles
+
+
 def observed_pairs_from_query_response(tool_result: dict[str, Any]) -> list[dict[str, Any]]:
     response = tool_result.get("response")
     if not isinstance(response, dict):
@@ -4339,6 +4540,8 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
             "dependencies": create_dependency_quality_repo,
             "similarity": create_similarity_quality_repo,
             "semantic_edges": create_semantic_edges_quality_repo,
+            "git_history": create_git_history_quality_repo,
+            "http_links": create_http_links_quality_repo,
         }[capability]
         fixture = fixture_factory(repo_dir)
         apply_rank_refresh_override(binary, case_env, args.rank_refresh, args.timeout)
@@ -4367,6 +4570,8 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                 oracle_runner = {
                     "rank": run_rank_quality_oracles,
                     "dependencies": run_dependency_quality_oracles,
+                    "git_history": run_git_history_quality_oracles,
+                    "http_links": run_http_links_quality_oracles,
                 }[capability]
                 oracles = oracle_runner(
                     args.transport, binary, case_env, project, args, client
@@ -4385,6 +4590,8 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
             oracle_runner = {
                 "rank": run_rank_quality_oracles,
                 "dependencies": run_dependency_quality_oracles,
+                "git_history": run_git_history_quality_oracles,
+                "http_links": run_http_links_quality_oracles,
             }[capability]
             oracles = oracle_runner(args.transport, binary, case_env, project, args)
         case = {
@@ -4897,7 +5104,10 @@ def parse_args() -> argparse.Namespace:
             "structural ranking lifts the central result above lexical decoys; dependencies "
             "measures local npm API retrieval with source/package/read-only provenance; similarity "
             "scores SIMILAR_TO structural-clone pairs and semantic_edges scores "
-            "SEMANTICALLY_RELATED control-flow variants against explicit hard negatives."
+            "SEMANTICALLY_RELATED control-flow variants against explicit hard negatives; "
+            "git_history measures FILE_CHANGES_WITH retrieval for a deterministic four-commit "
+            "co-change history; http_links measures HTTP_CALLS retrieval for a client-to-route "
+            "fixture."
         ),
     )
     parser.add_argument(
