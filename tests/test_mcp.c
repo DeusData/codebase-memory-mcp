@@ -1458,6 +1458,40 @@ TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
     PASS();
 }
 
+TEST(tool_check_index_coverage_preserves_multiple_scope_labels) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *coverage = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\","
+                                         "\"scopes\":[\"alpha/one\",\"bravo/two\",\"charl/tri\"]}");
+    ASSERT_NOT_NULL(coverage);
+    char *inner = extract_text_content(coverage);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *scopes = yyjson_obj_get(yyjson_doc_get_root(doc), "scopes");
+    ASSERT_NOT_NULL(scopes);
+    ASSERT_TRUE(yyjson_is_arr(scopes));
+    ASSERT_EQ(yyjson_arr_size(scopes), 3);
+
+    const char *expected[] = {"alpha/one", "bravo/two", "charl/tri"};
+    for (size_t i = 0; i < 3; i++) {
+        yyjson_val *scope = yyjson_obj_get(yyjson_arr_get(scopes, i), "scope");
+        ASSERT_NOT_NULL(scope);
+        ASSERT_TRUE(yyjson_is_str(scope));
+        ASSERT_STR_EQ(yyjson_get_str(scope), expected[i]);
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(coverage);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 static int write_coverage_meta(cbm_store_t *store, const char *generation,
                                const char *recording_status) {
     cbm_coverage_meta_t meta = {
@@ -6411,6 +6445,7 @@ SUITE(mcp) {
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
+    RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
