@@ -152,6 +152,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
         self.assertEqual(row["pair_quality_details"][0]["freshness"], "capability disabled")
+        self.assertEqual(row["mutation_details"][0]["canonical"], "capability disabled")
         self.assertIn("capability-off control", row["findings"][0])
         self.assertNotIn("initial/fresh pair tasks passed", " ".join(row["findings"]))
 
