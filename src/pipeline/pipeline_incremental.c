@@ -646,7 +646,8 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                              cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
+                             const char *repo_path, bool persistence,
+                             const cbm_coverage_row_t *cov, int cov_count,
                              const cbm_coverage_meta_t *meta_template) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
@@ -701,9 +702,11 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
         cbm_store_close(hash_store);
     }
 
-    /* Auto-update artifact if one already exists (persistence was enabled previously) */
-    if (repo_path && cbm_artifact_exists(repo_path)) {
-        cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
+    /* Create a requested artifact, or cheaply refresh one that already exists. */
+    bool artifact_exists = repo_path && cbm_artifact_exists(repo_path);
+    if (repo_path && (persistence || artifact_exists)) {
+        cbm_artifact_export(db_path, repo_path, project,
+                            artifact_exists ? CBM_ARTIFACT_FAST : CBM_ARTIFACT_BEST);
     }
 }
 
@@ -1011,7 +1014,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .coverage_version = 1,
     };
     dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, &coverage_meta);
+                     mode_skipped_count, cbm_pipeline_repo_path(p), cbm_pipeline_persistence(p),
+                     cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);

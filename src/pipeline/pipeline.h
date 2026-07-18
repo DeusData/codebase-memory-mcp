@@ -65,6 +65,9 @@ void cbm_pipeline_cancel(cbm_pipeline_t *p);
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
 
+/* Return whether persistent artifact export is enabled for this pipeline. */
+bool cbm_pipeline_persistence(const cbm_pipeline_t *p);
+
 /* Override the derived project name with a sanitized user-provided label. */
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
 

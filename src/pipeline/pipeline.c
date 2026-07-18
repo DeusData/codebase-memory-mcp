@@ -263,6 +263,10 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
     return p ? p->project_name : NULL;
 }
 
+bool cbm_pipeline_persistence(const cbm_pipeline_t *p) {
+    return p && p->persistence;
+}
+
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
 }
