@@ -1548,6 +1548,13 @@ static int parse_string_func_item(parser_t *p, cbm_return_item_t *item) {
     return 0;
 }
 
+static void set_unsupported_list_index_error(parser_t *p) {
+    snprintf(p->error, sizeof(p->error),
+             "unsupported expression: list indexing/slicing '[...]' is not supported; return "
+             "labels(n) AS labels directly, or group scalar node labels with RETURN n.label AS "
+             "label, count(*) AS node_count ORDER BY node_count DESC LIMIT 5");
+}
+
 static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
     memset(item, 0, sizeof(*item));
     int rc = 0;
@@ -1583,8 +1590,7 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
                      "trim, ltrim, rtrim, reverse, labels, type, id, keys, properties)",
                      item->variable ? item->variable : "?");
         } else {
-            snprintf(p->error, sizeof(p->error),
-                     "unsupported expression: list indexing/slicing '[...]' is not supported");
+            set_unsupported_list_index_error(p);
         }
         safe_str_free(&item->variable);
         safe_str_free(&item->property);
@@ -1880,6 +1886,8 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
         q->union_next = sub.query;
         sub.query = NULL;
         cbm_parse_free(&sub);
+        /* The recursive parser owns and validates the complete UNION tail. */
+        p->pos = p->count - SKIP_ONE;
     }
     return 0;
 }
@@ -1939,6 +1947,19 @@ int cbm_parse(const cbm_token_t *tokens, int token_count, // NOLINT(misc-no-recu
 
     if (parse_post_where(&p, q, &pat_cap) < 0) {
         out->error = heap_strdup(p.error[0] ? p.error : "failed to parse query");
+        cbm_query_free(q);
+        return CBM_NOT_FOUND;
+    }
+
+    if (!check(&p, TOK_EOF)) {
+        if (check(&p, TOK_LBRACKET)) {
+            set_unsupported_list_index_error(&p);
+            out->error = heap_strdup(p.error);
+        } else {
+            snprintf(p.error, sizeof(p.error), "unexpected trailing token '%s' at pos %d",
+                     peek(&p)->text, peek(&p)->pos);
+            out->error = heap_strdup(p.error);
+        }
         cbm_query_free(q);
         return CBM_NOT_FOUND;
     }

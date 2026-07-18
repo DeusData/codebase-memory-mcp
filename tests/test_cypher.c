@@ -2769,6 +2769,35 @@ TEST(cypher_issue240_labels_function) {
     PASS();
 }
 
+TEST(cypher_rejects_list_index_after_function_result) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (n) RETURN labels(n)[0] AS label, count(*) AS count "
+                              "ORDER BY count DESC LIMIT 5",
+                              &q, &err);
+    ASSERT(rc != 0);
+    ASSERT_NULL(q);
+    ASSERT_NOT_NULL(err);
+    ASSERT_NOT_NULL(strstr(err, "list indexing"));
+    ASSERT_NOT_NULL(strstr(err, "labels(n) AS labels"));
+    ASSERT_NOT_NULL(strstr(err, "n.label AS label"));
+    ASSERT_NOT_NULL(strstr(err, "count(*) AS node_count"));
+    free(err);
+    PASS();
+}
+
+TEST(cypher_rejects_unconsumed_trailing_tokens) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (n) RETURN n.name trailing", &q, &err);
+    ASSERT(rc != 0);
+    ASSERT_NULL(q);
+    ASSERT_NOT_NULL(err);
+    ASSERT_NOT_NULL(strstr(err, "unexpected trailing token"));
+    free(err);
+    PASS();
+}
+
 /* #237: DISTINCT applied before ORDER BY + LIMIT */
 TEST(cypher_issue237_distinct_order_limit) {
     cbm_store_t *s = setup_cypher_store();
@@ -2969,6 +2998,8 @@ SUITE(cypher) {
     /* Execution */
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_issue240_labels_function);
+    RUN_TEST(cypher_rejects_list_index_after_function_result);
+    RUN_TEST(cypher_rejects_unconsumed_trailing_tokens);
     RUN_TEST(cypher_issue237_distinct_order_limit);
     RUN_TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit);
     RUN_TEST(cypher_issue873_distinct_limit_dedupes_before_limit);
