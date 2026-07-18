@@ -2752,26 +2752,46 @@ TEST(usages_kotlin_no_duplicate_calls) {
 static char g_lang_tmpdir[256];
 
 static int setup_lang_repo(const char **filenames, const char **contents, int count) {
-    snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "/tmp/cbm_lang_XXXXXX");
-    if (!cbm_mkdtemp(g_lang_tmpdir))
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "%s/cbm-lang-XXXXXX", cache);
+    if (n < 0 || (size_t)n >= sizeof(g_lang_tmpdir) || !cbm_mkdtemp(g_lang_tmpdir)) {
+        g_lang_tmpdir[0] = '\0';
         return -1;
+    }
 
     for (int i = 0; i < count; i++) {
         char path[512];
-        snprintf(path, sizeof(path), "%s/%s", g_lang_tmpdir, filenames[i]);
+        n = snprintf(path, sizeof(path), "%s/%s", g_lang_tmpdir, filenames[i]);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            rm_rf(g_lang_tmpdir);
+            g_lang_tmpdir[0] = '\0';
+            return -1;
+        }
 
         /* Create parent directories */
         char dir[512];
-        snprintf(dir, sizeof(dir), "%s", path);
+        n = snprintf(dir, sizeof(dir), "%s", path);
+        if (n < 0 || (size_t)n >= sizeof(dir)) {
+            rm_rf(g_lang_tmpdir);
+            g_lang_tmpdir[0] = '\0';
+            return -1;
+        }
         char *slash = strrchr(dir, '/');
         if (slash) {
             *slash = '\0';
-            th_mkdir_p(dir);
+            if (th_mkdir_p(dir) != 0) {
+                rm_rf(g_lang_tmpdir);
+                g_lang_tmpdir[0] = '\0';
+                return -1;
+            }
         }
 
         FILE *f = fopen(path, "wb");
-        if (!f)
+        if (!f) {
+            rm_rf(g_lang_tmpdir);
+            g_lang_tmpdir[0] = '\0';
             return -1;
+        }
         fprintf(f, "%s", contents[i]);
         fclose(f);
     }
@@ -3052,6 +3072,41 @@ TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation) {
     ASSERT_NOT_NULL(s);
     ASSERT_TRUE(cross_file_call_exists(s, cbm_pipeline_project_name(p), "callerOperation",
                                        "targetOperation"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_python_pyo3_import_resolves_rust_function_calls) {
+    enum { FILE_COUNT = 2 };
+    const char *files[] = {"native_bridge/src/lib.rs", "python_package/entrypoint.py"};
+    const char *contents[] = {
+        "#[pyfunction]\nfn native_execute() -> i32 { 42 }\n\n"
+        "#[pyfunction]\nfn serve_protocol() {}\n",
+        "def cli_main():\n"
+        "    from python_package._native import native_execute, serve_protocol\n"
+        "    serve_protocol()\n"
+        "    return native_execute()\n"};
+
+    if (setup_lang_repo(files, contents, FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_TRUE(cross_file_call_exists(s, project, "cli_main", "native_execute"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "cli_main", "serve_protocol"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -10073,11 +10128,19 @@ static char g_incr_tmpdir[256];
 static char g_incr_dbpath[512];
 
 static int setup_incremental_repo(void) {
-    snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "/tmp/cbm_incr_XXXXXX");
-    if (!cbm_mkdtemp(g_incr_tmpdir)) {
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "%s/cbm-incr-XXXXXX", cache);
+    if (n < 0 || (size_t)n >= sizeof(g_incr_tmpdir) || !cbm_mkdtemp(g_incr_tmpdir)) {
+        g_incr_tmpdir[0] = '\0';
         return -1;
     }
-    snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+    n = snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(g_incr_dbpath)) {
+        rm_rf(g_incr_tmpdir);
+        g_incr_tmpdir[0] = '\0';
+        g_incr_dbpath[0] = '\0';
+        return -1;
+    }
 
     char path[512];
     FILE *f;
@@ -10086,6 +10149,9 @@ static int setup_incremental_repo(void) {
     snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
     f = fopen(path, "w");
     if (!f) {
+        rm_rf(g_incr_tmpdir);
+        g_incr_tmpdir[0] = '\0';
+        g_incr_dbpath[0] = '\0';
         return -1;
     }
     fprintf(f, "package main\n\nfunc main() {\n\tHelper()\n}\n");
@@ -10095,6 +10161,9 @@ static int setup_incremental_repo(void) {
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
     f = fopen(path, "w");
     if (!f) {
+        rm_rf(g_incr_tmpdir);
+        g_incr_tmpdir[0] = '\0';
+        g_incr_dbpath[0] = '\0';
         return -1;
     }
     fprintf(f, "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n");
@@ -14002,6 +14071,147 @@ TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild) {
     PASS();
 }
 
+TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char rust_path[CBM_PATH_MAX];
+    char python_path[CBM_PATH_MAX];
+    int n = snprintf(rust_path, sizeof(rust_path), "%s/native_bridge.rs", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(rust_path));
+    n = snprintf(python_path, sizeof(python_path), "%s/entrypoint.py", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(python_path));
+    ASSERT_EQ(th_write_file(rust_path, "#[pyfunction]\nfn native_execute() -> i32 { 1 }\n"), 0);
+    ASSERT_EQ(th_write_file(python_path, "def cli_main():\n"
+                                         "    from package._native import native_execute\n"
+                                         "    return native_execute()\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(python_path, "def python_helper():\n"
+                                         "    return 2\n\n"
+                                         "def cli_main():\n"
+                                         "    from package._native import native_execute\n"
+                                         "    return native_execute() + python_helper()\n"),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "mixed Python/Rust Python edit differed from fresh rebuild");
+    }
+
+    ASSERT_EQ(th_write_file(rust_path, "#[pyfunction]\nfn native_execute() -> i32 { 2 }\n"
+                                       "#[pyfunction]\nfn native_extra() -> i32 { 3 }\n"),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "scoped_lsp_gap");
+    cbm_pipeline_free(p);
+
+    diff_err[0] = '\0';
+    diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "mixed Python/Rust Rust edit differed from fresh rebuild");
+    }
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char rust_path[CBM_PATH_MAX];
+    char bridge_path[CBM_PATH_MAX];
+    char caller_path[CBM_PATH_MAX];
+    int n = snprintf(rust_path, sizeof(rust_path), "%s/native_core.rs", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(rust_path));
+    n = snprintf(bridge_path, sizeof(bridge_path), "%s/bridge.ts", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(bridge_path));
+    n = snprintf(caller_path, sizeof(caller_path), "%s/caller.js", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(caller_path));
+    ASSERT_EQ(th_write_file(rust_path, "pub fn native_score() -> i32 { 1 }\n"), 0);
+    ASSERT_EQ(
+        th_write_file(bridge_path, "export function bridgeOperation(): number { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(caller_path,
+                            "import { bridgeOperation } from './bridge';\n"
+                            "export function javascriptCaller() { return bridgeOperation(); }\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(cross_file_call_exists(store, project, "javascriptCaller", "bridgeOperation"));
+    cbm_store_close(store);
+
+    ASSERT_EQ(
+        th_write_file(bridge_path,
+                      "export function bridgeOperation(): number { return 2; }\n"
+                      "export function bridgeExtra(): number { return bridgeOperation(); }\n"),
+        0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "scoped_lsp_gap");
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "mixed Rust/TypeScript/JavaScript edit differed from fresh rebuild");
+    }
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild) {
     enum { PIPELINE_EXACT_ONE_PATH = 1 };
     if (setup_incremental_repo() != 0) {
@@ -17467,6 +17677,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation);
+    RUN_TEST(pipeline_python_pyo3_import_resolves_rust_function_calls);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
@@ -17664,6 +17875,8 @@ SUITE(pipeline) {
     RUN_TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild);
     RUN_TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow);
     RUN_TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild);
+    RUN_TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild);
+    RUN_TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild);
     RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
