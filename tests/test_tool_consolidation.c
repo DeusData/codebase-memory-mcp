@@ -865,6 +865,67 @@ TEST(search_graph_slug_project_sets_session_context) {
     PASS();
 }
 
+TEST(search_graph_explicit_project_context_uses_resolved_store_project) {
+    const char *session_proj = "_tc_ctx_session_";
+    const char *target_proj = "_tc_ctx_explicit_";
+    char *target_root = th_mktempdir("cbm_tc_ctx_explicit");
+    ASSERT_NOT_NULL(target_root);
+
+    char cargo_toml[CBM_SZ_1K];
+    int n = snprintf(cargo_toml, sizeof(cargo_toml), "%s/Cargo.toml", target_root);
+    ASSERT_GT(n, 0);
+    ASSERT((size_t)n < sizeof(cargo_toml));
+    ASSERT_EQ(th_write_file(cargo_toml, "[package]\nname = \"ctx-target\"\nversion = \"0.1.0\"\n"),
+              0);
+
+    char db_path[CBM_SZ_1K];
+    n = snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), target_proj);
+    ASSERT_GT(n, 0);
+    ASSERT((size_t)n < sizeof(db_path));
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, target_proj, target_root), CBM_STORE_OK);
+    cbm_node_t function = {.project = target_proj,
+                           .label = "Function",
+                           .name = "tc_ctx_explicit_fn",
+                           .qualified_name = "_tc_ctx_explicit_.tc_ctx_explicit_fn",
+                           .file_path = "src/lib.rs"};
+    cbm_node_t structure = {.project = target_proj,
+                            .label = "Struct",
+                            .name = "TcCtxExplicit",
+                            .qualified_name = "_tc_ctx_explicit_.TcCtxExplicit",
+                            .file_path = "src/lib.rs"};
+    ASSERT_GT(cbm_store_upsert_node(s, &function), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &structure), 0);
+    cbm_store_close(s);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, session_proj);
+    char *result = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"_tc_ctx_explicit_\","
+        "\"name_pattern\":\"tc_ctx_explicit_fn\",\"limit\":1,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(result);
+
+    /* session_project identifies the server CWD. The one-shot context must
+     * separately identify and summarize the explicit project whose store
+     * supplied the results. */
+    ASSERT_NOT_NULL(strstr(result, session_proj));
+    ASSERT_NOT_NULL(strstr(result, "\\\"project\\\":\\\"_tc_ctx_explicit_\\\""));
+    ASSERT_NOT_NULL(strstr(result, "\\\"nodes\\\":2"));
+    ASSERT_NOT_NULL(strstr(result, "\\\"label\\\":\\\"Function\\\""));
+    ASSERT_NOT_NULL(strstr(result, "\\\"label\\\":\\\"Struct\\\""));
+    ASSERT_NOT_NULL(strstr(result, "\\\"detected_ecosystem\\\":\\\"cargo\\\""));
+    free(result);
+
+    cbm_mcp_server_free(srv);
+    (void)cbm_unlink(db_path);
+    th_cleanup(target_root);
+    PASS();
+}
+
 TEST(index_status_has_session_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -2858,6 +2919,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(search_graph_has_session_project);
     RUN_TEST(cli_session_detection_uses_cwd_project_slug);
     RUN_TEST(search_graph_slug_project_sets_session_context);
+    RUN_TEST(search_graph_explicit_project_context_uses_resolved_store_project);
     RUN_TEST(index_status_has_session_project);
     /* Context injection */
     RUN_TEST(first_response_has_context_header);

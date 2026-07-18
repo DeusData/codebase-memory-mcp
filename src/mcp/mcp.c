@@ -3271,7 +3271,8 @@ static char *build_project_list_error(const char *reason) {
  * Resources remain available for explicit access (e.g. codebase://schema via
  * @-mention) — the two mechanisms are complementary, not mutually exclusive. */
 static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                cbm_mcp_server_t *srv, cbm_store_t *store) {
+                                cbm_mcp_server_t *srv, cbm_store_t *store,
+                                const char *context_project) {
     /* Always include session_project */
     if (srv->session_project[0])
         yyjson_mut_obj_add_str(doc, root, "session_project", srv->session_project);
@@ -3310,8 +3311,17 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
     yyjson_mut_obj_add_str(doc, ctx, "status", "ready");
 
+    /* The session project identifies the server CWD, while context_project
+     * identifies the graph that supplied this response.  They intentionally
+     * differ when a caller searches an explicit project from another CWD. */
+    const char *proj = context_project && context_project[0]
+                           ? context_project
+                           : (srv->session_project[0] ? srv->session_project : NULL);
+    if (proj) {
+        yyjson_mut_obj_add_str(doc, ctx, "project", proj);
+    }
+
     /* Node/edge counts */
-    const char *proj = srv->session_project[0] ? srv->session_project : NULL;
     int nodes = cbm_store_count_nodes(store, proj);
     int edges = cbm_store_count_edges(store, proj);
     yyjson_mut_obj_add_int(doc, ctx, "nodes", nodes);
@@ -3341,7 +3351,9 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
 
     /* PageRank stats */
     sqlite3 *db = cbm_store_get_db(store);
-    if (db && proj) {
+    bool pagerank_stale =
+        proj && cbm_store_derived_view_is_stale(store, proj, CBM_STORE_DERIVED_VIEW_PAGERANK);
+    if (db && proj && !pagerank_stale) {
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(db,
                 "SELECT COUNT(*), MAX(computed_at) FROM pagerank WHERE project = ?1",
@@ -3365,7 +3377,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
      * reliable delivery channel into the model is this _context header). Honors
      * key_functions_exclude (config). Bounded by CBM_CONTEXT_KEY_FUNCTIONS_LIMIT
      * to keep the first-response token cost modest. */
-    if (db && proj) {
+    if (db && proj && !pagerank_stale) {
         const char *kf_exclude = srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
             : "";
@@ -3398,14 +3410,24 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
         }
     }
 
-    /* Detected ecosystem */
-    if (srv->session_root[0]) {
-        cbm_pkg_manager_t eco = cbm_detect_ecosystem(srv->session_root);
+    /* Detected ecosystem. Resolve the queried project's registered root
+     * instead of reporting the session CWD's package manager. */
+    cbm_project_t context_info = {0};
+    const char *context_root = NULL;
+    if (proj && cbm_store_get_project(store, proj, &context_info) == CBM_STORE_OK) {
+        context_root = context_info.root_path;
+    } else if ((!proj || (srv->session_project[0] && strcmp(proj, srv->session_project) == 0)) &&
+               srv->session_root[0]) {
+        context_root = srv->session_root;
+    }
+    if (context_root && context_root[0]) {
+        cbm_pkg_manager_t eco = cbm_detect_ecosystem(context_root);
         if (eco != CBM_PKG_COUNT) {
             yyjson_mut_obj_add_str(doc, ctx, "detected_ecosystem",
                                    cbm_pkg_manager_str(eco));
         }
     }
+    cbm_project_free_fields(&context_info);
 
     yyjson_mut_obj_add_val(doc, root, "_context", ctx);
 }
@@ -3420,7 +3442,8 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
  * (not TOON-quoted) on purpose: it is machine-parseable, greppable as
  * "_context":, and read once by the model. Emits nothing when the context was
  * already delivered and no session_project is set. */
-static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_store_t *store) {
+static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_store_t *store,
+                                     const char *context_project) {
     if (!sb || !srv) {
         return;
     }
@@ -3430,7 +3453,7 @@ static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_st
     }
     yyjson_mut_val *croot = yyjson_mut_obj(cdoc);
     yyjson_mut_doc_set_root(cdoc, croot);
-    inject_context_once(cdoc, croot, srv, store);
+    inject_context_once(cdoc, croot, srv, store, context_project);
     if (yyjson_mut_obj_size(croot) > 0) {
         char *cjson = yyjson_mut_write(cdoc, 0, NULL);
         if (cjson) {
@@ -3448,13 +3471,13 @@ static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_st
  * a new heap string with the context line appended, or NULL when nothing needs
  * appending (caller keeps using the original). */
 static char *toon_payload_with_context_once(const char *payload, cbm_mcp_server_t *srv,
-                                            cbm_store_t *store) {
+                                            cbm_store_t *store, const char *context_project) {
     if (!payload) {
         return NULL;
     }
     cbm_sb_t sb;
     cbm_sb_init(&sb);
-    toon_append_context_once(&sb, srv, store);
+    toon_append_context_once(&sb, srv, store, context_project);
     if (sb.len == 0) {
         cbm_sb_free(&sb);
         return NULL;
@@ -5485,7 +5508,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
              * _context/session_project line (JSON responses get it via
              * inject_context_once in their own builder paths). */
             char *ctx_payload =
-                q_require_json ? NULL : toon_payload_with_context_once(payload_final, srv, store);
+                q_require_json
+                    ? NULL
+                    : toon_payload_with_context_once(payload_final, srv, store, project);
             char *result = cbm_mcp_text_result(ctx_payload ? ctx_payload : payload_final, false);
             free(ctx_payload);
             free(fresh_json);
@@ -5757,7 +5782,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             free_string_array(exclude);
             /* One-shot _context/session_project delivery on the TOON path —
              * the early return here previously skipped inject_context_once. */
-            toon_append_context_once(&sb, srv, store);
+            toon_append_context_once(&sb, srv, store, project);
             free(project);
             char *text = cbm_sb_finish(&sb);
             char *result = cbm_mcp_text_result(text ? text : "out of memory", text == NULL);
@@ -5823,7 +5848,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     /* Auto-context: first response gets full architecture/schema/_context header.
      * Subsequent responses just get session_project. */
-    inject_context_once(doc, root, srv, store);
+    inject_context_once(doc, root, srv, store, project);
     add_derived_freshness_warnings(doc, root, out.pagerank_stale, out.linkrank_stale,
                                    out.node_degree_stale);
     add_dirty_file_freshness(doc, root, store, project);
