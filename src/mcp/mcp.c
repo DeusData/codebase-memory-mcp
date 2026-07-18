@@ -3493,6 +3493,36 @@ static char *toon_payload_with_context_once(const char *payload, cbm_mcp_server_
     return cbm_sb_finish(&out);
 }
 
+/* BM25 builds JSON as a completed heap string and returns before the regular
+ * search_graph yyjson builder. Parse that bounded response once so JSON and
+ * TOON both deliver session_project and the one-shot queried-project context. */
+static char *json_payload_with_context_once(const char *payload, cbm_mcp_server_t *srv,
+                                            cbm_store_t *store, const char *context_project) {
+    if (!payload || !srv) {
+        return NULL;
+    }
+    yyjson_doc *source = yyjson_read(payload, strlen(payload), 0);
+    if (!source) {
+        return NULL;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        yyjson_doc_free(source);
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_val_mut_copy(doc, yyjson_doc_get_root(source));
+    yyjson_doc_free(source);
+    if (!root || !yyjson_mut_is_obj(root)) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    inject_context_once(doc, root, srv, store, context_project);
+    char *out = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    return out;
+}
+
 /* ── Smart project param expansion ─────────────────────────────── */
 
 typedef enum { MATCH_NONE, MATCH_EXACT, MATCH_PREFIX, MATCH_GLOB } match_mode_t;
@@ -5504,12 +5534,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             const char *payload_json = composed_json ? composed_json : bm25_json;
             char *fresh_json = add_dirty_file_freshness_to_json(payload_json, store, project);
             const char *payload_final = fresh_json ? fresh_json : payload_json;
-            /* TOON responses (q_require_json false) also carry the one-shot
-             * _context/session_project line (JSON responses get it via
-             * inject_context_once in their own builder paths). */
+            /* BM25 returns before the regular graph-mode response builder, so
+             * append context here for both output formats. */
             char *ctx_payload =
                 q_require_json
-                    ? NULL
+                    ? json_payload_with_context_once(payload_final, srv, store, project)
                     : toon_payload_with_context_once(payload_final, srv, store, project);
             char *result = cbm_mcp_text_result(ctx_payload ? ctx_payload : payload_final, false);
             free(ctx_payload);
