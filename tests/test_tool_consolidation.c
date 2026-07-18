@@ -921,6 +921,24 @@ TEST(search_graph_explicit_project_context_uses_resolved_store_project) {
     free(result);
 
     cbm_mcp_server_free(srv);
+
+    /* BM25 with an explicitly requested JSON format has its own early return.
+     * It must deliver the same first-response context as graph-mode JSON. */
+    srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, session_proj);
+    result = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"_tc_ctx_explicit_\","
+        "\"query\":\"tc_ctx_explicit_fn\",\"limit\":1,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(result);
+    ASSERT_NOT_NULL(strstr(result, session_proj));
+    ASSERT_NOT_NULL(strstr(result, "\\\"project\\\":\\\"_tc_ctx_explicit_\\\""));
+    ASSERT_NOT_NULL(strstr(result, "\\\"nodes\\\":2"));
+    ASSERT_NOT_NULL(strstr(result, "\\\"detected_ecosystem\\\":\\\"cargo\\\""));
+    free(result);
+
+    cbm_mcp_server_free(srv);
     (void)cbm_unlink(db_path);
     th_cleanup(target_root);
     PASS();
