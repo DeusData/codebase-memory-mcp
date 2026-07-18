@@ -460,10 +460,21 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
             char active_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
             char active_cache[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
             cbm_daemon_build_identity_t active;
-            if (cbm_private_file_lock_payload_read(lease->lifetime, record, sizeof(record),
-                                                   &record_length) != CBM_PRIVATE_FILE_LOCK_OK ||
-                !version_cohort_record_decode(record, record_length, &active, active_version,
-                                              active_build, active_cache)) {
+            cbm_private_file_lock_status_t payload_status = cbm_private_file_lock_payload_read(
+                lease->lifetime, record, sizeof(record), &record_length);
+            bool decoded = payload_status == CBM_PRIVATE_FILE_LOCK_OK &&
+                           version_cohort_record_decode(record, record_length, &active,
+                                                        active_version, active_build, active_cache);
+            if (!decoded) {
+                /* The active lifetime record could not be read/decoded from a
+                 * peer holder - names whether the cross-process payload was
+                 * unreadable vs present-but-malformed (a Windows lock-payload
+                 * visibility question the unix flock path does not hit). */
+                char len_text[16];
+                (void)snprintf(len_text, sizeof(len_text), "%zu", record_length);
+                cbm_log_warn("version_cohort.record_undecodable", "payload_status",
+                             payload_status == CBM_PRIVATE_FILE_LOCK_OK ? "read_ok" : "read_failed",
+                             "bytes", len_text);
                 status = CBM_VERSION_COHORT_UNSAFE;
             } else {
                 cbm_daemon_hello_status_t comparison =
