@@ -836,7 +836,8 @@ static bool is_type_or_module_label(const char *label) {
     if (!label) {
         return false;
     }
-    return cbm_label_is_type_like(label) || strcmp(label, "Module") == 0 || strcmp(label, "Package") == 0;
+    return cbm_label_is_type_like(label) || strcmp(label, "Module") == 0 ||
+           strcmp(label, "Package") == 0;
 }
 
 static bool is_known_type_or_namespace(const cbm_registry_t *r, const char *prefix) {
@@ -857,7 +858,8 @@ static bool is_known_type_or_namespace(const cbm_registry_t *r, const char *pref
         return true;
     }
 
-    /* 3. If it's a simple name, check if any registered definition with this simple name has a type-like/module label */
+    /* 3. If it's a simple name, check if any registered definition with this simple name has a
+     * type-like/module label */
     const char **items = NULL;
     int count = 0;
     if (cbm_registry_find_by_name(r, prefix, &items, &count) == 0 && count > 0) {
@@ -987,7 +989,8 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         bool enforce_qualified = !is_method;
 
         if (is_method) {
-            if (is_known_type_or_namespace(r, prefix) || is_imported_receiver(prefix, import_keys, import_count)) {
+            if (is_known_type_or_namespace(r, prefix) ||
+                is_imported_receiver(prefix, import_keys, import_count)) {
                 enforce_qualified = true;
             }
         }
@@ -1056,7 +1059,8 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_keys, import_map_vals, import_map_count);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_keys, import_map_vals,
+                                  import_map_count);
     }
 
     /* Cache the result (including empty — caching the negative answer
