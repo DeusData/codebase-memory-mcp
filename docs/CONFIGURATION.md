@@ -79,7 +79,7 @@ Important keys (run `config list` for the complete registry):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
+| `auto_index` | `true` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
 | `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
 | `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |

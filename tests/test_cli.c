@@ -3834,6 +3834,24 @@ TEST(cli_config_registry_reindex_startup_guidance_is_precise) {
     PASS();
 }
 
+TEST(cli_configuration_doc_auto_index_default_matches_registry) {
+    const cbm_config_entry_t *entry = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, "auto_index") == 0) {
+            entry = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+
+    const char *doc = read_test_file("docs/CONFIGURATION.md");
+    ASSERT_NOT_NULL(doc);
+    char expected[128];
+    snprintf(expected, sizeof(expected), "| `auto_index` | `%s` |", entry->default_val);
+    ASSERT_NOT_NULL(strstr(doc, expected));
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -4370,6 +4388,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_registry_includes_query_max_rows);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
+    RUN_TEST(cli_configuration_doc_auto_index_default_matches_registry);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_presets_apply_exact_capability_sets);
