@@ -1063,6 +1063,57 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(rows[0]["pareto"], "frontier")
         self.assertEqual(rows[1]["pareto"], "dominated by compact")
 
+    def test_pareto_does_not_compare_different_workloads(self) -> None:
+        repository_case = {
+            "scenario": "c_new_leaf",
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            "oracles": {
+                "quality": {
+                    "passed": True,
+                    "passed_count": 1,
+                    "applicable_count": 1,
+                    "score": 1.0,
+                },
+                "marker": {
+                    "elapsed_ms": 300,
+                    "response_bytes": 400,
+                    "response_token_estimate": 100,
+                },
+            },
+            "incremental": {"elapsed_ms": 700, "peak_rss_mb": 1500},
+            "fresh_fast_full_after_change": {"elapsed_ms": 30000, "peak_rss_mb": 1500},
+        }
+        canary_case = {
+            **repository_case,
+            "scenario": "semantic_edges_quality",
+            "oracles": {
+                "quality": {
+                    "passed": True,
+                    "passed_count": 1,
+                    "applicable_count": 1,
+                    "score": 1.0,
+                },
+                "marker": {
+                    "elapsed_ms": 10,
+                    "response_bytes": 200,
+                    "response_token_estimate": 50,
+                },
+            },
+            "incremental": {"elapsed_ms": 50, "peak_rss_mb": 75},
+            "fresh_fast_full_after_change": {"elapsed_ms": 200, "peak_rss_mb": 75},
+        }
+        rows = [
+            SUMMARY.summarize_group("repository", [report(repository_case)]),
+            SUMMARY.summarize_group("canary", [report(canary_case)]),
+        ]
+
+        SUMMARY.mark_pareto_frontier(rows)
+
+        self.assertEqual(rows[0]["pareto"], "frontier")
+        self.assertEqual(rows[1]["pareto"], "frontier")
+        self.assertIn("same workload", rows[0]["pareto_reason"])
+
     def test_markdown_names_oracles_and_explains_quality_categories(self) -> None:
         case = {
             "scenario": "route_handler",

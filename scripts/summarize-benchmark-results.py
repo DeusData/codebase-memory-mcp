@@ -913,6 +913,26 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         else None
     )
     scenarios = {str(case.get("scenario")) for case in cases if case.get("scenario")}
+    workload_backgrounds: set[str] = set()
+    workload_tasks: set[str] = set()
+    for report in reports:
+        parameters = report.get("parameters")
+        if isinstance(parameters, dict):
+            for key in ("repository_background", "quality_background"):
+                background = parameters.get(key)
+                if isinstance(background, dict):
+                    workload_backgrounds.add(
+                        json.dumps(background, separators=(",", ":"), sort_keys=True)
+                    )
+    for case in cases:
+        background = case.get("background_repository")
+        if isinstance(background, dict):
+            workload_backgrounds.add(
+                json.dumps(background, separators=(",", ":"), sort_keys=True)
+            )
+        fixture = case.get("fixture")
+        if isinstance(fixture, dict) and fixture.get("task_set_sha256"):
+            workload_tasks.add(str(fixture["task_set_sha256"]))
     contracts = {
         str(gate.get("contract"))
         for case in cases
@@ -1040,6 +1060,17 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             disabled_pair_capabilities=disabled_pair_capabilities,
         ),
         "scenario": next(iter(scenarios)) if len(scenarios) == 1 else None,
+        "pareto_workload": json.dumps(
+            {
+                "backgrounds": sorted(workload_backgrounds),
+                "index_modes": sorted(index_modes),
+                "report_modes": sorted(report_modes),
+                "scenarios": sorted(scenarios),
+                "task_sets": sorted(workload_tasks),
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
         "frontier_files": next(iter(frontier_files)) if len(frontier_files) == 1 else None,
         "exact_cap": next(iter(exact_caps)) if len(exact_caps) == 1 else None,
         "frontier_contract": next(iter(contracts)) if len(contracts) == 1 else None,
@@ -1265,7 +1296,11 @@ def mark_pareto_frontier(rows: list[dict[str, Any]]) -> None:
         row["pareto_reason"] = "; ".join(reasons) or "not eligible"
     for row in eligible:
         dominators = [
-            other for other in eligible if other is not row and dominates(other, row)
+            other
+            for other in eligible
+            if other is not row
+            and other.get("pareto_workload") == row.get("pareto_workload")
+            and dominates(other, row)
         ]
         if dominators:
             dominator = dominators[0]
@@ -1278,8 +1313,9 @@ def mark_pareto_frontier(rows: list[dict[str, Any]]) -> None:
         else:
             row["pareto"] = "frontier"
             row["pareto_reason"] = (
-                "no passing, fully measured candidate is at least as good on overall quality "
-                "and every cost axis while being strictly better on one or more axes"
+                "within the same workload, no passing, fully measured candidate is at least as "
+                "good on overall quality and every cost axis while being strictly better on one "
+                "or more axes"
             )
 
 
