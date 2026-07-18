@@ -640,6 +640,7 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                            const char *repo_path, bool persistence,
                             const cbm_coverage_row_t *cov, int cov_count,
                             const cbm_coverage_meta_t *meta_template) {
     struct timespec t;
@@ -701,6 +702,14 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
         }
     }
     cbm_store_close(hash_store);
+
+    /* Create a requested artifact, or cheaply refresh one that already exists.
+     * Runs after the store is closed so the export reads a settled DB file. */
+    bool artifact_exists = repo_path && cbm_artifact_exists(repo_path);
+    if (repo_path && (persistence || artifact_exists)) {
+        cbm_artifact_export(db_path, repo_path, project,
+                            artifact_exists ? CBM_ARTIFACT_FAST : CBM_ARTIFACT_BEST);
+    }
     return rc;
 }
 
@@ -1007,7 +1016,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .coverage_version = 1,
     };
     int persist_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                                      mode_skipped_count, cov, cov_n, &coverage_meta);
+                                      mode_skipped_count, cbm_pipeline_repo_path(p),
+                                      cbm_pipeline_persistence(p), cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
