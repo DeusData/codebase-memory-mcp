@@ -151,6 +151,7 @@ static void py_resolve_calls_in(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_eval_expr_type(PyLSPContext *ctx, TSNode node);
 static const CBMType *py_eval_expr_type_uncached(PyLSPContext *ctx, TSNode node);
 static void py_process_statement(PyLSPContext *ctx, TSNode node);
+static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth);
 static const CBMRegisteredFunc *py_lookup_attribute(PyLSPContext *ctx, const char *type_qn,
                                                     const char *member_name);
 static void py_emit_resolved_call(PyLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -183,15 +184,37 @@ static const char *py_lookup_dict_dispatch(PyLSPContext *ctx, const char *var, c
  * node is legitimately re-evaluated under different bindings — e.g. a
  * lambda body re-walked per call site with per-call argument types, or
  * isinstance-narrowed branches. */
+static void py_disable_callable_value_proof(PyLSPContext *ctx) {
+    if (ctx)
+        ctx->callable_value_proof_disabled = true;
+}
+
 static void py_scope_bind(PyLSPContext *ctx, const char *name, const CBMType *type) {
     ctx->type_cache_gen++;
     cbm_scope_bind(ctx->current_scope, name, type);
+    if (name && !cbm_scope_contains(ctx->current_scope, name))
+        py_disable_callable_value_proof(ctx);
 }
 
 static void py_scope_bind_callable(PyLSPContext *ctx, const char *name, const CBMType *type,
                                    const char *callable_qn) {
     ctx->type_cache_gen++;
     cbm_scope_bind_callable(ctx->current_scope, name, type, callable_qn);
+    const char *bound = name ? cbm_scope_lookup_callable(ctx->current_scope, name) : NULL;
+    if (name && (!cbm_scope_contains(ctx->current_scope, name) ||
+                 (callable_qn && (!bound || strcmp(bound, callable_qn) != 0)))) {
+        py_disable_callable_value_proof(ctx);
+    }
+}
+
+static CBMScope *py_scope_push_checked(PyLSPContext *ctx) {
+    if (!ctx)
+        return NULL;
+    CBMScope *parent = ctx->current_scope;
+    CBMScope *child = cbm_scope_push(ctx->arena, parent);
+    if (!child || child == parent)
+        py_disable_callable_value_proof(ctx);
+    return child;
 }
 
 static void py_scope_clear_callable(PyLSPContext *ctx, const char *name) {
@@ -217,7 +240,7 @@ void py_lsp_init(PyLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->registry = registry;
     ctx->module_qn = module_qn;
     ctx->resolved_calls = out;
-    ctx->current_scope = cbm_scope_push(arena, NULL);
+    ctx->current_scope = py_scope_push_checked(ctx);
     const char *dbg = getenv("CBM_LSP_DEBUG");
     ctx->debug = dbg && dbg[0] && dbg[0] != '0';
 }
@@ -404,6 +427,92 @@ static const char *py_canonical_from_import_qn(PyLSPContext *ctx, TSNode stateme
  * binding for the local name. Python permits later imports to rebind the same
  * local; selecting the first would turn conflicting runtime identities into
  * false semantic proof. */
+static void py_import_match_statement(PyLSPContext *ctx, TSNode stmt, const char *local,
+                                      const char *qn, PyImportSyntaxMatch *match) {
+    if (!ctx || ts_node_is_null(stmt) || !local || !qn || !match)
+        return;
+    const char *stmt_kind = ts_node_type(stmt);
+    if (strcmp(stmt_kind, "import_from_statement") == 0) {
+        TSNode module = py_from_import_module_node(stmt);
+        uint32_t import_count = ts_node_named_child_count(stmt);
+        for (uint32_t j = 0; j < import_count; j++) {
+            TSNode item = ts_node_named_child(stmt, j);
+            if (!ts_node_is_null(module) && ts_node_eq(item, module))
+                continue;
+            const char *kind = ts_node_type(item);
+            if (strcmp(kind, "aliased_import") == 0) {
+                TSNode name = ts_node_child_by_field_name(item, "name", 4);
+                TSNode alias = ts_node_child_by_field_name(item, "alias", 5);
+                if (py_import_node_text_equals(ctx, alias, local)) {
+                    const char *canonical = py_canonical_from_import_qn(ctx, stmt, name, qn);
+                    py_import_syntax_match_add(
+                        match, canonical ? PY_FROM_IMPORT : PY_IMPORT_UNCLASSIFIED,
+                        canonical ? canonical : qn);
+                }
+            } else if ((strcmp(kind, "identifier") == 0 ||
+                        strcmp(kind, "dotted_name") == 0) &&
+                       py_import_node_text_equals(ctx, item, local)) {
+                const char *canonical = py_canonical_from_import_qn(ctx, stmt, item, qn);
+                py_import_syntax_match_add(
+                    match, canonical ? PY_FROM_IMPORT : PY_IMPORT_UNCLASSIFIED,
+                    canonical ? canonical : qn);
+            }
+        }
+        return;
+    }
+    if (strcmp(stmt_kind, "import_statement") != 0)
+        return;
+    uint32_t import_count = ts_node_named_child_count(stmt);
+    for (uint32_t j = 0; j < import_count; j++) {
+        TSNode item = ts_node_named_child(stmt, j);
+        const char *kind = ts_node_type(item);
+        if (strcmp(kind, "aliased_import") == 0) {
+            TSNode name = ts_node_child_by_field_name(item, "name", 4);
+            TSNode alias = ts_node_child_by_field_name(item, "alias", 5);
+            if (py_import_node_text_equals(ctx, alias, local)) {
+                char *imported_path = py_import_node_text_dup(ctx, name);
+                PyDirectImportKind matched_kind =
+                    imported_path && py_qn_has_boundary_suffix(qn, imported_path)
+                        ? PY_DIRECT_IMPORT_ALIASED
+                        : PY_IMPORT_UNCLASSIFIED;
+                py_import_syntax_match_add(match, matched_kind, qn);
+            }
+        } else if ((strcmp(kind, "dotted_name") == 0 || strcmp(kind, "identifier") == 0) &&
+                   py_import_node_root_equals(ctx, item, local)) {
+            char *imported_path = py_import_node_text_dup(ctx, item);
+            PyDirectImportKind matched_kind =
+                imported_path && py_qn_has_boundary_suffix(qn, imported_path)
+                    ? PY_DIRECT_IMPORT_UNALIASED
+                    : PY_IMPORT_UNCLASSIFIED;
+            py_import_syntax_match_add(match, matched_kind, qn);
+        }
+    }
+}
+
+static PyDirectImportKind py_import_match_result(PyImportSyntaxMatch *match,
+                                                 const char **qn_io) {
+    if (!match || !qn_io)
+        return PY_DIRECT_IMPORT_UNKNOWN;
+    if (match->count == 0)
+        return PY_IMPORT_UNCLASSIFIED;
+    if (match->count > 1)
+        return PY_IMPORT_AMBIGUOUS;
+    if (match->kind == PY_FROM_IMPORT && match->canonical_qn)
+        *qn_io = match->canonical_qn;
+    return match->kind;
+}
+
+static PyDirectImportKind py_import_kind_from_statement(PyLSPContext *ctx, TSNode stmt,
+                                                        const char *local,
+                                                        const char **qn_io) {
+    const char *qn = qn_io ? *qn_io : NULL;
+    if (!ctx || !local || !qn || !qn_io || ts_node_is_null(stmt))
+        return PY_DIRECT_IMPORT_UNKNOWN;
+    PyImportSyntaxMatch match = {0};
+    py_import_match_statement(ctx, stmt, local, qn, &match);
+    return py_import_match_result(&match, qn_io);
+}
+
 static PyDirectImportKind py_import_kind_from_ast(PyLSPContext *ctx, TSNode root,
                                                   const char *local, const char **qn_io) {
     const char *qn = qn_io ? *qn_io : NULL;
@@ -413,65 +522,9 @@ static PyDirectImportKind py_import_kind_from_ast(PyLSPContext *ctx, TSNode root
     PyImportSyntaxMatch match = {0};
     uint32_t root_count = ts_node_named_child_count(root);
     for (uint32_t i = 0; i < root_count; i++) {
-        TSNode stmt = ts_node_named_child(root, i);
-        const char *stmt_kind = ts_node_type(stmt);
-        if (strcmp(stmt_kind, "import_from_statement") == 0) {
-            TSNode module = py_from_import_module_node(stmt);
-            uint32_t import_count = ts_node_named_child_count(stmt);
-            for (uint32_t j = 0; j < import_count; j++) {
-                TSNode item = ts_node_named_child(stmt, j);
-                if (!ts_node_is_null(module) && ts_node_eq(item, module))
-                    continue;
-                const char *kind = ts_node_type(item);
-                if (strcmp(kind, "aliased_import") == 0) {
-                    TSNode name = ts_node_child_by_field_name(item, "name", 4);
-                    TSNode alias = ts_node_child_by_field_name(item, "alias", 5);
-                    if (py_import_node_text_equals(ctx, alias, local)) {
-                        const char *canonical =
-                            py_canonical_from_import_qn(ctx, stmt, name, qn);
-                        py_import_syntax_match_add(
-                            &match, canonical ? PY_FROM_IMPORT : PY_IMPORT_UNCLASSIFIED,
-                            canonical ? canonical : qn);
-                    }
-                } else if ((strcmp(kind, "identifier") == 0 ||
-                            strcmp(kind, "dotted_name") == 0) &&
-                           py_import_node_text_equals(ctx, item, local)) {
-                    const char *canonical = py_canonical_from_import_qn(ctx, stmt, item, qn);
-                    py_import_syntax_match_add(
-                        &match, canonical ? PY_FROM_IMPORT : PY_IMPORT_UNCLASSIFIED,
-                        canonical ? canonical : qn);
-                }
-            }
-            continue;
-        }
-        if (strcmp(stmt_kind, "import_statement") != 0)
-            continue;
-        uint32_t import_count = ts_node_named_child_count(stmt);
-        for (uint32_t j = 0; j < import_count; j++) {
-            TSNode item = ts_node_named_child(stmt, j);
-            const char *kind = ts_node_type(item);
-            if (strcmp(kind, "aliased_import") == 0) {
-                TSNode alias = ts_node_child_by_field_name(item, "alias", 5);
-                if (py_import_node_text_equals(ctx, alias, local))
-                    py_import_syntax_match_add(&match, PY_DIRECT_IMPORT_ALIASED, qn);
-            } else if ((strcmp(kind, "dotted_name") == 0 || strcmp(kind, "identifier") == 0) &&
-                       py_import_node_root_equals(ctx, item, local)) {
-                char *imported_path = py_import_node_text_dup(ctx, item);
-                PyDirectImportKind matched_kind =
-                    imported_path && py_qn_has_boundary_suffix(qn, imported_path)
-                        ? PY_DIRECT_IMPORT_UNALIASED
-                        : PY_IMPORT_UNCLASSIFIED;
-                py_import_syntax_match_add(&match, matched_kind, qn);
-            }
-        }
+        py_import_match_statement(ctx, ts_node_named_child(root, i), local, qn, &match);
     }
-    if (match.count == 0)
-        return PY_IMPORT_UNCLASSIFIED;
-    if (match.count > 1)
-        return PY_IMPORT_AMBIGUOUS;
-    if (match.kind == PY_FROM_IMPORT && match.canonical_qn)
-        *qn_io = match.canonical_qn;
-    return match.kind;
+    return py_import_match_result(&match, qn_io);
 }
 
 static bool py_import_index_is_from_binding(const PyLSPContext *ctx, int index) {
@@ -513,40 +566,47 @@ static void py_bind_dotted_prefixes(PyLSPContext *ctx, const char *qn) {
     }
 }
 
-static void py_lsp_bind_imports_for_root(PyLSPContext *ctx, TSNode root) {
-    if (!ctx || !ctx->current_scope)
+static void py_classify_imports_for_root(PyLSPContext *ctx, TSNode root) {
+    if (!ctx)
         return;
     for (int i = 0; i < ctx->import_count; i++) {
         const char *local = ctx->import_local_names[i];
         const char *qn = ctx->import_module_qns[i];
         if (!local || !qn)
             continue;
-
-        // Wildcard imports are recorded for traceability but cannot bind a
-        // concrete name — skip the scope insertion. Phase 9 cross-file
-        // logic will use the import map directly to find re-exports.
-        if (strcmp(local, "*") == 0)
-            continue;
-
         PyDirectImportKind direct_kind = py_import_kind_from_ast(ctx, root, local, &qn);
         ctx->import_module_qns[i] = qn;
         if (ctx->import_kinds)
             ctx->import_kinds[i] = (unsigned char)direct_kind;
-        bool from_style = direct_kind == PY_FROM_IMPORT ||
-                          (direct_kind == PY_DIRECT_IMPORT_UNKNOWN &&
-                           import_is_from_style(local, qn));
-        const CBMType *t;
-        if (direct_kind == PY_DIRECT_IMPORT_UNALIASED) {
+    }
+}
+
+static void py_bind_import_index(PyLSPContext *ctx, int index, bool synthetic_fallback) {
+    if (!ctx || !ctx->current_scope || index < 0 || index >= ctx->import_count)
+        return;
+    const char *local = ctx->import_local_names[index];
+    const char *qn = ctx->import_module_qns[index];
+    if (!local || !qn || strcmp(local, "*") == 0)
+        return;
+
+    PyDirectImportKind direct_kind = ctx->import_kinds
+                                         ? (PyDirectImportKind)ctx->import_kinds[index]
+                                         : PY_DIRECT_IMPORT_UNKNOWN;
+    bool from_style = direct_kind == PY_FROM_IMPORT ||
+                      (direct_kind == PY_DIRECT_IMPORT_UNKNOWN &&
+                       import_is_from_style(local, qn));
+    const CBMType *t;
+    if (direct_kind == PY_DIRECT_IMPORT_UNALIASED) {
             // Python binds only the root of an unaliased dotted import.
-            t = cbm_type_module(ctx->arena, local);
-        } else if (direct_kind == PY_DIRECT_IMPORT_ALIASED) {
-            t = cbm_type_module(ctx->arena, qn);
-        } else if (from_style) {
+        t = cbm_type_module(ctx->arena, local);
+    } else if (direct_kind == PY_DIRECT_IMPORT_ALIASED) {
+        t = cbm_type_module(ctx->arena, qn);
+    } else if (from_style) {
             // `from X import Y` — bind Y to NAMED(X.Y). Phase 6 attribute
             // resolution checks the registry to upgrade to MODULE / class
             // / function as appropriate.
-            t = cbm_type_named(ctx->arena, qn);
-        } else if (strchr(qn, '.') != NULL) {
+        t = cbm_type_named(ctx->arena, qn);
+    } else if (strchr(qn, '.') != NULL) {
             // Dotted path whose tail does NOT match the local name: an
             // ALIASED binding — `from X import Y as Z` (Z names function/
             // class X.Y) or `import a.b as z` (z names module a.b). The
@@ -556,23 +616,28 @@ static void py_lsp_bind_imports_for_root(PyLSPContext *ctx, TSNode root) {
             // Binding MODULE here made `g()` calls on `from m import f as g`
             // resolve as calls on a module — lsp=MISS, and the whole CALLS
             // edge was lost (#988).
-            t = cbm_type_named(ctx->arena, qn);
-        } else {
+        t = cbm_type_named(ctx->arena, qn);
+    } else {
             // `import X` / `import X as Y` (single segment) — MODULE(X).
-            t = cbm_type_module(ctx->arena, qn);
-        }
-        const CBMRegisteredFunc *imported =
-            from_style && ctx->registry ? cbm_registry_lookup_func(ctx->registry, qn) : NULL;
-        if (py_func_is_exact_callable_value(imported)) {
-            py_scope_bind_callable(ctx, local, t, imported->qualified_name);
-        } else {
-            py_scope_bind(ctx, local, t);
-        }
-        // With a real AST, only an unaliased direct import introduces the
-        // dotted root. Keep the historical prefix fallback for synthetic
-        // unit-test contexts that call py_lsp_bind_imports without a tree.
-        if (direct_kind == PY_DIRECT_IMPORT_UNALIASED || ts_node_is_null(root))
-            py_bind_dotted_prefixes(ctx, qn);
+        t = cbm_type_module(ctx->arena, qn);
+    }
+    const CBMRegisteredFunc *imported =
+        from_style && ctx->registry ? cbm_registry_lookup_func(ctx->registry, qn) : NULL;
+    if (py_func_is_exact_callable_value(imported)) {
+        py_scope_bind_callable(ctx, local, t, imported->qualified_name);
+    } else {
+        py_scope_bind(ctx, local, t);
+    }
+    if (direct_kind == PY_DIRECT_IMPORT_UNALIASED || synthetic_fallback)
+        py_bind_dotted_prefixes(ctx, qn);
+}
+
+static void py_lsp_bind_imports_for_root(PyLSPContext *ctx, TSNode root) {
+    if (!ctx || !ctx->current_scope)
+        return;
+    py_classify_imports_for_root(ctx, root);
+    for (int i = 0; i < ctx->import_count; i++) {
+        py_bind_import_index(ctx, i, ts_node_is_null(root));
     }
 }
 
@@ -851,7 +916,7 @@ static const char *py_exact_imported_reference_candidate(PyLSPContext *ctx,
  * statically exact. Complex containers/conditionals deliberately return NULL
  * so their constituent function names stay ordinary USAGE. */
 static const char *py_exact_callable_target(PyLSPContext *ctx, TSNode node) {
-    if (!ctx || ts_node_is_null(node))
+    if (!ctx || ctx->callable_value_proof_disabled || ts_node_is_null(node))
         return NULL;
 
     /* Parentheses do not change callable identity. Unwrap them iteratively:
@@ -904,6 +969,8 @@ static const char *py_exact_callable_target(PyLSPContext *ctx, TSNode node) {
 }
 
 static void py_resolve_value_references_at(PyLSPContext *ctx, TSNode call) {
+    if (!ctx || ctx->callable_value_proof_disabled)
+        return;
     TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
     if (ts_node_is_null(args))
         return;
@@ -928,8 +995,15 @@ static void py_resolve_value_references_at(PyLSPContext *ctx, TSNode call) {
         const char *candidate = strcmp(kind, "identifier") == 0
                                     ? py_exact_imported_reference_candidate(ctx, source_name)
                                     : NULL;
-        if (candidate)
-            py_emit_unresolved_reference(ctx, candidate, arg);
+        if (candidate && cbm_scope_contains(ctx->current_scope, source_name)) {
+            const CBMType *binding =
+                cbm_type_resolve_alias(cbm_scope_lookup(ctx->current_scope, source_name));
+            if (binding && binding->kind == CBM_TYPE_NAMED &&
+                binding->data.named.qualified_name &&
+                strcmp(binding->data.named.qualified_name, candidate) == 0) {
+                py_emit_unresolved_reference(ctx, candidate, arg);
+            }
+        }
     }
 }
 
@@ -998,17 +1072,24 @@ static void py_overlay_register_field(PyLSPContext *ctx, const char *class_qn,
     if (ctx->field_overlay_count >= ctx->field_overlay_cap) {
         int new_cap = ctx->field_overlay_cap == 0 ? 16 : ctx->field_overlay_cap * 2;
         void *na = cbm_arena_alloc(ctx->arena, (size_t)new_cap * sizeof(*ctx->field_overlay));
-        if (!na)
-            return; /* OOM: drop this field (resolution degrades, never corrupts) */
+        if (!na) {
+            py_disable_callable_value_proof(ctx);
+            return;
+        }
         if (ctx->field_overlay && ctx->field_overlay_count > 0)
             memcpy(na, ctx->field_overlay,
                    (size_t)ctx->field_overlay_count * sizeof(*ctx->field_overlay));
         ctx->field_overlay = na;
         ctx->field_overlay_cap = new_cap;
     }
-    ctx->field_overlay[ctx->field_overlay_count].class_qn = cbm_arena_strdup(ctx->arena, class_qn);
-    ctx->field_overlay[ctx->field_overlay_count].field_name =
-        cbm_arena_strdup(ctx->arena, field_name);
+    const char *stored_class = cbm_arena_strdup(ctx->arena, class_qn);
+    const char *stored_field = cbm_arena_strdup(ctx->arena, field_name);
+    if (!stored_class || !stored_field) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    ctx->field_overlay[ctx->field_overlay_count].class_qn = stored_class;
+    ctx->field_overlay[ctx->field_overlay_count].field_name = stored_field;
     ctx->field_overlay[ctx->field_overlay_count].field_type = field_type;
     ctx->field_overlay_count++;
 }
@@ -2390,6 +2471,8 @@ static void py_process_statement(PyLSPContext *ctx, TSNode node) {
 /* ── Recursive walker: process statements + emit resolved_calls ── */
 
 static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
+    if (!ctx || ctx->callable_value_proof_disabled)
+        return;
     TSNode fn = ts_node_child_by_field_name(call_node, "function", 8);
     if (ts_node_is_null(fn))
         return;
@@ -2409,7 +2492,7 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             TSNode body = ts_node_child_by_field_name(lambda_node, "body", 4);
             TSNode args = ts_node_child_by_field_name(call_node, "arguments", 9);
             CBMScope *saved = ctx->current_scope;
-            ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+            ctx->current_scope = py_scope_push_checked(ctx);
             // Bind each lambda param to the call-site arg's type.
             if (!ts_node_is_null(params) && !ts_node_is_null(args)) {
                 uint32_t pn = ts_node_named_child_count(params);
@@ -2902,34 +2985,6 @@ static bool py_block_terminates(TSNode block) {
            strcmp(k, "break_statement") == 0 || strcmp(k, "continue_statement") == 0;
 }
 
-/* A write guarded by an if has more than one possible post-if value. Clear an
- * outer exact callable identity before walking the temporary branch scopes so
- * the initializer cannot leak through the control-flow join. */
-static void py_invalidate_conditional_aliases(PyLSPContext *ctx, TSNode node, int depth) {
-    if (!ctx || ts_node_is_null(node) || depth > 64)
-        return;
-    const char *kind = ts_node_type(node);
-    if (strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0 ||
-        strcmp(kind, "lambda") == 0 || strcmp(kind, "list_comprehension") == 0 ||
-        strcmp(kind, "set_comprehension") == 0 || strcmp(kind, "dictionary_comprehension") == 0 ||
-        strcmp(kind, "generator_expression") == 0) {
-        return;
-    }
-    if (strcmp(kind, "assignment") == 0) {
-        TSNode left = ts_node_child_by_field_name(node, "left", 4);
-        if (!ts_node_is_null(left) && strcmp(ts_node_type(left), "identifier") == 0) {
-            char *name = py_node_text(ctx, left);
-            if (name && cbm_scope_lookup_callable(ctx->current_scope, name))
-                py_scope_clear_callable(ctx, name);
-        }
-        return;
-    }
-    uint32_t count = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < count; i++) {
-        py_invalidate_conditional_aliases(ctx, ts_node_named_child(node, i), depth + 1);
-    }
-}
-
 /* Walk if_statement: push scope for consequence body when narrowing
  * applies, then recurse. If the consequence terminates (return/raise),
  * apply the negated narrow to the *enclosing* scope so subsequent
@@ -2939,8 +2994,8 @@ static void py_walk_if_statement(PyLSPContext *ctx, TSNode if_node) {
     TSNode body = ts_node_child_by_field_name(if_node, "consequence", 11);
     TSNode alt = ts_node_child_by_field_name(if_node, "alternative", 11);
 
-    py_invalidate_conditional_aliases(ctx, body, 0);
-    py_invalidate_conditional_aliases(ctx, alt, 0);
+    py_invalidate_possible_bindings(ctx, body, 0);
+    py_invalidate_possible_bindings(ctx, alt, 0);
 
     // Walrus bindings in the condition leak into the enclosing scope.
     py_bind_walrus_in(ctx, cond);
@@ -2983,7 +3038,7 @@ static void py_walk_if_statement(PyLSPContext *ctx, TSNode if_node) {
     // Consequence: maybe narrow.
     if (!ts_node_is_null(body)) {
         CBMScope *saved = ctx->current_scope;
-        ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+        ctx->current_scope = py_scope_push_checked(ctx);
 
         // Try isinstance narrowing.
         if (!ts_node_is_null(cond) && strcmp(ts_node_type(cond), "call") == 0) {
@@ -3181,7 +3236,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
                 if (strcmp(ts_node_type(case_clause), "case_clause") != 0)
                     continue;
                 CBMScope *saved = ctx->current_scope;
-                ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+                ctx->current_scope = py_scope_push_checked(ctx);
 
                 // Pattern is the first non-block named child; consequence
                 // is the block.
@@ -3326,7 +3381,7 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
     if (strcmp(k, "list_comprehension") == 0 || strcmp(k, "dictionary_comprehension") == 0 ||
         strcmp(k, "set_comprehension") == 0 || strcmp(k, "generator_expression") == 0) {
         CBMScope *saved = ctx->current_scope;
-        ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+        ctx->current_scope = py_scope_push_checked(ctx);
         uint32_t cnc = ts_node_named_child_count(node);
         // First pass: bind for-clause vars (process in source order so
         // chained comprehensions like `for x in xs for y in x.ys` see
@@ -3939,7 +3994,7 @@ static void py_process_function(PyLSPContext *ctx, TSNode func_node, const char 
     ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", base_qn, fname);
 
     CBMScope *saved = ctx->current_scope;
-    ctx->current_scope = cbm_scope_push(ctx->arena, ctx->current_scope);
+    ctx->current_scope = py_scope_push_checked(ctx);
 
     TSNode params = ts_node_child_by_field_name(func_node, "parameters", 10);
     py_bind_parameters(ctx, params);
@@ -4068,43 +4123,513 @@ static void py_process_class(PyLSPContext *ctx, TSNode class_node) {
     ctx->enclosing_class_qn = prev_class;
 }
 
-/* Bind every Class / Type definition from the registry into the root scope
- * as NAMED(qn). Lets bare references like `Foo()` and `c: Foo` resolve to
- * the registered class type. */
-static void py_bind_module_classes(PyLSPContext *ctx) {
+/* Module bindings are replayed in source order before deferred function bodies
+ * are analyzed. Class definitions always replace an earlier callable identity;
+ * the registry decides whether the resulting class type is known precisely. */
+static bool py_root_defines_class_named(PyLSPContext *ctx, TSNode root, const char *name) {
+    uint32_t count = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode node = ts_node_named_child(root, i);
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "decorated_definition") == 0) {
+            node = ts_node_child_by_field_name(node, "definition", 10);
+            kind = ts_node_is_null(node) ? "" : ts_node_type(node);
+        }
+        if (strcmp(kind, "class_definition") != 0)
+            continue;
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        if (py_import_node_text_equals(ctx, name_node, name))
+            return true;
+    }
+    return false;
+}
+
+/* A project registry can contain another file's class in the same logical
+ * Python module. Keep those cross-file globals available, but do not prebind
+ * classes declared by this source: their binding epoch belongs in the ordered
+ * replay below. */
+static void py_bind_external_module_classes(PyLSPContext *ctx, TSNode root) {
     if (!ctx || !ctx->registry || !ctx->module_qn)
         return;
-    const CBMRegisteredType *types = ctx->registry->types;
-    int n = ctx->registry->type_count;
     size_t prefix_len = strlen(ctx->module_qn);
-    for (int i = 0; i < n; i++) {
-        const char *qn = types[i].qualified_name;
-        const char *sname = types[i].short_name;
-        if (!qn || !sname)
+    for (int i = 0; i < ctx->registry->type_count; i++) {
+        const CBMRegisteredType *type = &ctx->registry->types[i];
+        const char *qn = type->qualified_name;
+        const char *name = type->short_name;
+        if (!qn || !name || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
+            qn[prefix_len] != '.' || py_root_defines_class_named(ctx, root, name)) {
             continue;
-        if (strncmp(qn, ctx->module_qn, prefix_len) != 0)
-            continue;
-        if (qn[prefix_len] != '.')
-            continue;
-        py_scope_bind(ctx, sname, cbm_type_named(ctx->arena, qn));
+        }
+        py_scope_bind(ctx, name, cbm_type_named(ctx->arena, qn));
     }
+}
+
+static void py_bind_module_class(PyLSPContext *ctx, TSNode class_node) {
+    if (!ctx || ts_node_is_null(class_node) || !ctx->module_qn)
+        return;
+    TSNode name_node = ts_node_child_by_field_name(class_node, "name", 4);
+    char *name = py_node_text(ctx, name_node);
+    if (!name || !name[0]) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    if (!qn) {
+        py_disable_callable_value_proof(ctx);
+        py_scope_bind(ctx, name, cbm_type_unknown());
+        return;
+    }
+    const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+    py_scope_bind(ctx, name,
+                  type ? cbm_type_named(ctx->arena, type->qualified_name) : cbm_type_unknown());
+}
+
+/* Preserve the historical registry fallback for an unshadowed function: it
+ * keeps ordinary direct-call resolution stable. When a definition actually
+ * replaces a prior binding (import, wildcard uncertainty, class, assignment),
+ * record the new exact callable value or clear the stale identity. */
+static void py_bind_module_function(PyLSPContext *ctx, TSNode func_node) {
+    if (!ctx || ts_node_is_null(func_node) || !ctx->module_qn)
+        return;
+    TSNode name_node = ts_node_child_by_field_name(func_node, "name", 4);
+    char *name = py_node_text(ctx, name_node);
+    if (!name || !name[0]) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    if (!cbm_scope_contains(ctx->current_scope, name))
+        return;
+
+    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
+    if (!qn) {
+        py_disable_callable_value_proof(ctx);
+        py_scope_bind(ctx, name, cbm_type_unknown());
+        return;
+    }
+    const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
+    if (py_func_is_exact_callable_value(func)) {
+        py_scope_bind_callable(ctx, name, cbm_type_unknown(), func->qualified_name);
+    } else {
+        py_scope_bind(ctx, name, cbm_type_unknown());
+    }
+}
+
+static bool py_import_statement_is_wildcard(TSNode stmt) {
+    uint32_t count = ts_node_named_child_count(stmt);
+    for (uint32_t i = 0; i < count; i++) {
+        if (strcmp(ts_node_type(ts_node_named_child(stmt, i)), "wildcard_import") == 0)
+            return true;
+    }
+    return false;
+}
+
+static void py_invalidate_registry_module_functions(PyLSPContext *ctx,
+                                                    const CBMTypeRegistry *registry) {
+    if (!ctx || !registry || !ctx->module_qn)
+        return;
+    size_t prefix_len = strlen(ctx->module_qn);
+    for (int i = 0; i < registry->func_count; i++) {
+        const CBMRegisteredFunc *func = &registry->funcs[i];
+        const char *qn = func->qualified_name;
+        if (!qn || func->receiver_type || strncmp(qn, ctx->module_qn, prefix_len) != 0 ||
+            qn[prefix_len] != '.') {
+            continue;
+        }
+        const char *suffix = qn + prefix_len + 1;
+        if (!suffix[0] || strchr(suffix, '.'))
+            continue;
+        py_scope_bind(ctx, func->short_name ? func->short_name : suffix, cbm_type_unknown());
+    }
+    py_invalidate_registry_module_functions(ctx, registry->fallback);
+}
+
+/* `from module import *` may overwrite any module global through `__all__`.
+ * Without the imported module's export set, retaining any callable identity is
+ * unsound. Clear current bindings and install UNKNOWN shadows for registry-only
+ * local functions so exact lookup cannot fall through around the wildcard. */
+static void py_invalidate_module_bindings_for_wildcard(PyLSPContext *ctx) {
+    if (!ctx || !ctx->current_scope)
+        return;
+    for (CBMScopeChunk *chunk = ctx->current_scope->chunks; chunk; chunk = chunk->next) {
+        for (int i = 0; i < chunk->used; i++) {
+            const char *name = chunk->bindings[i].name;
+            if (name)
+                py_scope_bind(ctx, name, cbm_type_unknown());
+        }
+    }
+    py_invalidate_registry_module_functions(ctx, ctx->registry);
+}
+
+static char *py_import_item_local_name(PyLSPContext *ctx, TSNode item, bool from_import) {
+    const char *kind = ts_node_type(item);
+    if (strcmp(kind, "aliased_import") == 0) {
+        TSNode alias = ts_node_child_by_field_name(item, "alias", 5);
+        return py_import_node_text_dup(ctx, alias);
+    }
+    if (strcmp(kind, "identifier") != 0 && strcmp(kind, "dotted_name") != 0)
+        return NULL;
+    char *name = py_import_node_text_dup(ctx, item);
+    if (!name || from_import)
+        return name;
+    char *dot = strchr(name, '.');
+    if (dot)
+        *dot = '\0';
+    return name;
+}
+
+/* Invalidate one syntactic binding target without treating attribute or
+ * subscript writes as rebinding the same-spelled module global. Pattern
+ * containers are walked recursively; a one-component dotted_name is the
+ * tree-sitter shape used by Python capture patterns. */
+static void py_invalidate_binding_target(PyLSPContext *ctx, TSNode target, int depth) {
+    if (!ctx || ts_node_is_null(target))
+        return;
+    if (depth > 64) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    const char *kind = ts_node_type(target);
+    if (strcmp(kind, "identifier") == 0) {
+        char *name = py_node_text(ctx, target);
+        if (!name) {
+            py_disable_callable_value_proof(ctx);
+            return;
+        }
+        py_scope_bind(ctx, name, cbm_type_unknown());
+        return;
+    }
+    if (strcmp(kind, "attribute") == 0 || strcmp(kind, "subscript") == 0)
+        return;
+    uint32_t count = ts_node_named_child_count(target);
+    if (strcmp(kind, "dotted_name") == 0 && count != 1)
+        return;
+    for (uint32_t i = 0; i < count; i++)
+        py_invalidate_binding_target(ctx, ts_node_named_child(target, i), depth + 1);
+}
+
+/* Match patterns mix value expressions and capture targets. Skip the class
+ * expression in `case Type(...)` and keyword labels, while invalidating every
+ * nested capture/as/star target that may replace a module binding. */
+static void py_invalidate_match_pattern(PyLSPContext *ctx, TSNode pattern, int depth) {
+    if (!ctx || ts_node_is_null(pattern))
+        return;
+    if (depth > 64) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    const char *kind = ts_node_type(pattern);
+    uint32_t count = ts_node_named_child_count(pattern);
+    if (strcmp(kind, "class_pattern") == 0) {
+        for (uint32_t i = 1; i < count; i++)
+            py_invalidate_match_pattern(ctx, ts_node_named_child(pattern, i), depth + 1);
+        return;
+    }
+    if (strcmp(kind, "keyword_pattern") == 0) {
+        if (count > 0)
+            py_invalidate_match_pattern(ctx, ts_node_named_child(pattern, count - 1), depth + 1);
+        return;
+    }
+    if (strcmp(kind, "attribute") == 0)
+        return;
+    if (strcmp(kind, "dotted_name") == 0) {
+        if (count == 1)
+            py_invalidate_binding_target(ctx, ts_node_named_child(pattern, 0), depth + 1);
+        return;
+    }
+    if (strcmp(kind, "identifier") == 0) {
+        py_invalidate_binding_target(ctx, pattern, depth + 1);
+        return;
+    }
+    for (uint32_t i = 0; i < count; i++)
+        py_invalidate_match_pattern(ctx, ts_node_named_child(pattern, i), depth + 1);
+}
+
+static void py_invalidate_import_bindings(PyLSPContext *ctx, TSNode stmt) {
+    if (py_import_statement_is_wildcard(stmt)) {
+        py_invalidate_module_bindings_for_wildcard(ctx);
+        return;
+    }
+    bool from_import = strcmp(ts_node_type(stmt), "import_from_statement") == 0;
+    TSNode module = from_import ? py_from_import_module_node(stmt) : (TSNode){0};
+    uint32_t count = ts_node_named_child_count(stmt);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(stmt, i);
+        if (from_import && !ts_node_is_null(module) && ts_node_eq(item, module))
+            continue;
+        const char *kind = ts_node_type(item);
+        char *local = py_import_item_local_name(ctx, item, from_import);
+        if (local) {
+            py_scope_bind(ctx, local, cbm_type_unknown());
+        } else if (strcmp(kind, "aliased_import") == 0 || strcmp(kind, "identifier") == 0 ||
+                   strcmp(kind, "dotted_name") == 0) {
+            py_disable_callable_value_proof(ctx);
+        }
+    }
+}
+
+/* Conservatively join possible binding effects from module/function compound
+ * statements. Only names that occur in a binding position lose exact callable
+ * identity. Nested lexical bodies are not walked after their definition name,
+ * and annotation-only assignments do not replace a runtime value. */
+static void py_invalidate_possible_bindings(PyLSPContext *ctx, TSNode node, int depth) {
+    if (!ctx || ts_node_is_null(node))
+        return;
+    if (depth > 64) {
+        py_disable_callable_value_proof(ctx);
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "lambda") == 0 || strcmp(kind, "list_comprehension") == 0 ||
+        strcmp(kind, "set_comprehension") == 0 ||
+        strcmp(kind, "dictionary_comprehension") == 0 ||
+        strcmp(kind, "generator_expression") == 0) {
+        return;
+    }
+    if (strcmp(kind, "function_definition") == 0 || strcmp(kind, "class_definition") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(name))
+            py_disable_callable_value_proof(ctx);
+        else
+            py_invalidate_binding_target(ctx, name, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "decorated_definition") == 0) {
+        TSNode definition = ts_node_child_by_field_name(node, "definition", 10);
+        if (ts_node_is_null(definition))
+            py_disable_callable_value_proof(ctx);
+        else
+            py_invalidate_possible_bindings(ctx, definition, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "import_statement") == 0 ||
+        strcmp(kind, "import_from_statement") == 0) {
+        py_invalidate_import_bindings(ctx, node);
+        return;
+    }
+    if (strcmp(kind, "assignment") == 0) {
+        TSNode right = ts_node_child_by_field_name(node, "right", 5);
+        if (ts_node_is_null(right))
+            return;
+        py_invalidate_binding_target(ctx, ts_node_child_by_field_name(node, "left", 4),
+                                     depth + 1);
+        py_invalidate_possible_bindings(ctx, right, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "augmented_assignment") == 0) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        TSNode right = ts_node_child_by_field_name(node, "right", 5);
+        py_invalidate_binding_target(ctx, left, depth + 1);
+        py_invalidate_possible_bindings(ctx, right, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "named_expression") == 0 ||
+        strcmp(kind, "assignment_expression") == 0) {
+        TSNode name = ts_node_child_by_field_name(node, "name", 4);
+        if (ts_node_is_null(name))
+            name = ts_node_child_by_field_name(node, "left", 4);
+        TSNode value = ts_node_child_by_field_name(node, "value", 5);
+        if (ts_node_is_null(value))
+            value = ts_node_child_by_field_name(node, "right", 5);
+        py_invalidate_binding_target(ctx, name, depth + 1);
+        py_invalidate_possible_bindings(ctx, value, depth + 1);
+        return;
+    }
+    if (strcmp(kind, "delete_statement") == 0) {
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++)
+            py_invalidate_binding_target(ctx, ts_node_named_child(node, i), depth + 1);
+        return;
+    }
+    if (strcmp(kind, "for_statement") == 0) {
+        TSNode left = ts_node_child_by_field_name(node, "left", 4);
+        py_invalidate_binding_target(ctx, left, depth + 1);
+        uint32_t count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (!ts_node_eq(child, left))
+                py_invalidate_possible_bindings(ctx, child, depth + 1);
+        }
+        return;
+    }
+    if (strcmp(kind, "as_pattern") == 0) {
+        TSNode alias = ts_node_child_by_field_name(node, "alias", 5);
+        uint32_t count = ts_node_named_child_count(node);
+        if (ts_node_is_null(alias) && count > 1)
+            alias = ts_node_named_child(node, count - 1);
+        py_invalidate_binding_target(ctx, alias, depth + 1);
+        for (uint32_t i = 0; i < count; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (!ts_node_eq(child, alias))
+                py_invalidate_possible_bindings(ctx, child, depth + 1);
+        }
+        return;
+    }
+    if (strcmp(kind, "match_statement") == 0) {
+        TSNode subject = ts_node_child_by_field_name(node, "subject", 7);
+        TSNode body = ts_node_child_by_field_name(node, "body", 4);
+        py_invalidate_possible_bindings(ctx, subject, depth + 1);
+        uint32_t cases = ts_node_named_child_count(body);
+        for (uint32_t i = 0; i < cases; i++) {
+            TSNode clause = ts_node_named_child(body, i);
+            if (strcmp(ts_node_type(clause), "case_clause") != 0)
+                continue;
+            TSNode pattern = {0};
+            uint32_t count = ts_node_named_child_count(clause);
+            for (uint32_t j = 0; j < count; j++) {
+                TSNode child = ts_node_named_child(clause, j);
+                if (ts_node_is_null(pattern) && strcmp(ts_node_type(child), "block") != 0) {
+                    pattern = child;
+                    py_invalidate_match_pattern(ctx, pattern, depth + 1);
+                } else if (!ts_node_eq(child, pattern)) {
+                    py_invalidate_possible_bindings(ctx, child, depth + 1);
+                }
+            }
+        }
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++)
+        py_invalidate_possible_bindings(ctx, ts_node_named_child(node, i), depth + 1);
+}
+
+static bool py_replayable_import_kind(PyDirectImportKind kind) {
+    return kind == PY_DIRECT_IMPORT_UNALIASED || kind == PY_DIRECT_IMPORT_ALIASED ||
+           kind == PY_FROM_IMPORT;
+}
+
+/* Replay one syntactic local-binding occurrence. UNKNOWN is installed first,
+ * so missing, conflicting, or project-prefix-ambiguous metadata fails closed.
+ * Exactly one canonical target may then upgrade that occurrence. */
+static void py_replay_import_local(PyLSPContext *ctx, TSNode stmt, const char *local,
+                                   unsigned char *consumed) {
+    if (!ctx || !local || !local[0])
+        return;
+    py_scope_bind(ctx, local, cbm_type_unknown());
+    if (ctx->import_count > 0 && !consumed)
+        return;
+
+    int chosen = -1;
+    PyDirectImportKind chosen_kind = PY_IMPORT_UNCLASSIFIED;
+    const char *chosen_qn = NULL;
+    bool conflicting_target = false;
+    for (int i = 0; i < ctx->import_count; i++) {
+        if ((consumed && consumed[i]) || !ctx->import_local_names[i] ||
+            !ctx->import_module_qns[i] || strcmp(ctx->import_local_names[i], local) != 0) {
+            continue;
+        }
+        const char *candidate_qn = ctx->import_module_qns[i];
+        PyDirectImportKind kind =
+            py_import_kind_from_statement(ctx, stmt, local, &candidate_qn);
+        if (!py_replayable_import_kind(kind))
+            continue;
+        if (!chosen_qn) {
+            chosen = i;
+            chosen_kind = kind;
+            chosen_qn = candidate_qn;
+        } else if (strcmp(chosen_qn, candidate_qn) != 0 || chosen_kind != kind) {
+            conflicting_target = true;
+        }
+    }
+    if (chosen < 0 || conflicting_target)
+        return;
+
+    ctx->import_module_qns[chosen] = chosen_qn;
+    if (ctx->import_kinds)
+        ctx->import_kinds[chosen] = (unsigned char)chosen_kind;
+    if (consumed)
+        consumed[chosen] = 1;
+    py_bind_import_index(ctx, chosen, false);
+}
+
+static void py_replay_import_statement(PyLSPContext *ctx, TSNode stmt,
+                                       unsigned char *consumed) {
+    if (py_import_statement_is_wildcard(stmt)) {
+        py_invalidate_module_bindings_for_wildcard(ctx);
+        return;
+    }
+    bool from_import = strcmp(ts_node_type(stmt), "import_from_statement") == 0;
+    TSNode module = from_import ? py_from_import_module_node(stmt) : (TSNode){0};
+    uint32_t count = ts_node_named_child_count(stmt);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode item = ts_node_named_child(stmt, i);
+        if (from_import && !ts_node_is_null(module) && ts_node_eq(item, module))
+            continue;
+        char *local = py_import_item_local_name(ctx, item, from_import);
+        if (local) {
+            py_replay_import_local(ctx, stmt, local, consumed);
+        } else {
+            const char *kind = ts_node_type(item);
+            if (strcmp(kind, "aliased_import") == 0 || strcmp(kind, "identifier") == 0 ||
+                strcmp(kind, "dotted_name") == 0) {
+                py_disable_callable_value_proof(ctx);
+            }
+        }
+    }
+}
+
+static bool py_expression_is_annotation_only_assignment(TSNode statement) {
+    if (ts_node_named_child_count(statement) != 1)
+        return false;
+    TSNode expression = ts_node_named_child(statement, 0);
+    if (strcmp(ts_node_type(expression), "assignment") != 0)
+        return false;
+    TSNode annotation = ts_node_child_by_field_name(expression, "type", 4);
+    TSNode value = ts_node_child_by_field_name(expression, "right", 5);
+    return !ts_node_is_null(annotation) && ts_node_is_null(value);
 }
 
 void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
     if (!ctx || ts_node_is_null(root))
         return;
-    py_lsp_bind_imports_for_root(ctx, root);
-    py_bind_module_classes(ctx);
+    py_classify_imports_for_root(ctx, root);
+    py_bind_external_module_classes(ctx, root);
+    unsigned char *consumed_imports = NULL;
+    if (ctx->import_count > 0) {
+        consumed_imports =
+            (unsigned char *)cbm_arena_alloc(ctx->arena, (size_t)ctx->import_count);
+        if (consumed_imports)
+            memset(consumed_imports, 0, (size_t)ctx->import_count);
+    }
 
     uint32_t nc = ts_node_named_child_count(root);
-    // Pass 1: top-level assignments bind into module scope.
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_named_child(root, i);
-        py_process_statement(ctx, c);
-    }
-    // Pass 2: top-level calls (rare) and nested definitions.
     const char *prev_func = ctx->enclosing_func_qn;
     ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.__module__", ctx->module_qn);
+    // Pass 1: execute top-level binding effects in source order. Function
+    // bodies remain deferred until the final module scope has been assembled.
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(root, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "import_statement") == 0 ||
+            strcmp(ck, "import_from_statement") == 0) {
+            py_replay_import_statement(ctx, c, consumed_imports);
+        } else if (strcmp(ck, "function_definition") == 0) {
+            py_bind_module_function(ctx, c);
+        } else if (strcmp(ck, "class_definition") == 0) {
+            py_bind_module_class(ctx, c);
+        } else if (strcmp(ck, "decorated_definition") == 0) {
+            TSNode def = ts_node_child_by_field_name(c, "definition", 10);
+            if (!ts_node_is_null(def)) {
+                const char *dk = ts_node_type(def);
+                if (strcmp(dk, "function_definition") == 0)
+                    py_bind_module_function(ctx, def);
+                else if (strcmp(dk, "class_definition") == 0)
+                    py_bind_module_class(ctx, def);
+            }
+        } else if (strcmp(ck, "expression_statement") == 0) {
+            /* The recursive walker reaches a wrapped assignment and applies
+             * its binding exactly once here, at module execution time. It also
+             * preserves top-level call edges without replaying the assignment
+             * later against the final module scope. */
+            if (!py_expression_is_annotation_only_assignment(c))
+                py_resolve_calls_in(ctx, c);
+        } else {
+            /* A compound statement can leave several possible module values.
+             * Invalidate only syntactic binding targets at the control-flow
+             * join; a later unconditional statement may restore exact proof. */
+            py_invalidate_possible_bindings(ctx, c, 0);
+        }
+    }
+    // Pass 2: top-level calls (rare) and nested definitions.
     for (uint32_t i = 0; i < nc; i++) {
         TSNode c = ts_node_named_child(root, i);
         const char *ck = ts_node_type(c);
@@ -4122,9 +4647,6 @@ void py_lsp_process_file(PyLSPContext *ctx, TSNode root) {
             } else if (strcmp(dk, "class_definition") == 0) {
                 py_process_class(ctx, def);
             }
-        } else if (strcmp(ck, "expression_statement") == 0) {
-            // Top-level call statements
-            py_resolve_calls_in(ctx, c);
         }
     }
     ctx->enclosing_func_qn = prev_func;

@@ -968,6 +968,70 @@ typedef struct {
     const char *target_name;
 } PreciseReferencePair;
 
+typedef struct {
+    bool database_opened;
+    bool query_ready;
+    bool query_completed;
+    int row_count;
+    int valid_json_count;
+    int exact_callee_count;
+} NamedEdgePropertyObservation;
+
+/* Read one named edge's persisted properties through SQLite's JSON functions.
+ * The guarded json_extract is intentional: on the RED revision the parallel
+ * usage emitter truncates the final `}` from a boundary-sized callee property.
+ * json_valid must report that row without json_extract aborting the statement,
+ * while the fixed revision must round-trip the complete callee value. */
+static NamedEdgePropertyObservation observe_named_edge_callee_property(
+    const char *db_path, const char *project, const char *edge_type, const char *source_name,
+    const char *target_name, const char *expected_callee) {
+    NamedEdgePropertyObservation observation = {0};
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return observation;
+    }
+    observation.database_opened = true;
+
+    static const char sql[] =
+        "SELECT e.properties, json_valid(e.properties), "
+        "CASE WHEN json_valid(e.properties) "
+        "THEN json_extract(e.properties, '$.callee') END "
+        "FROM edges e "
+        "JOIN nodes src ON src.id=e.source_id AND src.project=e.project "
+        "JOIN nodes tgt ON tgt.id=e.target_id AND tgt.project=e.project "
+        "WHERE e.project=?1 AND e.type=?2 AND src.name=?3 AND tgt.name=?4;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, edge_type, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 3, source_name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 4, target_name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return observation;
+    }
+    observation.query_ready = true;
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        observation.row_count++;
+        if (sqlite3_column_int(stmt, 1) != 0) {
+            observation.valid_json_count++;
+        }
+        const unsigned char *callee = sqlite3_column_text(stmt, 2);
+        if (callee && strcmp((const char *)callee, expected_callee) == 0) {
+            observation.exact_callee_count++;
+        }
+    }
+    observation.query_completed = step_rc == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return observation;
+}
+
 /* Count only edges of `edge_type` between the exact named source/target nodes.
  * The parity and incremental guards deliberately use unique symbol names, so
  * this canonicalizes across independent stores without depending on node IDs
@@ -1615,6 +1679,30 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     "func goReferenceTarget() {}\n"
                     "func goReferenceAccept(callback func()) {}\n"
                     "func goReferenceSite() { goReferenceAccept(goReferenceTarget) }\n");
+    /* `{"callee":""}` contributes 13 bytes. A 243-byte identifier therefore
+     * produces 256 bytes of JSON content: it fits the usage emitter's escaped
+     * value buffer but needs 257 bytes including NUL for the wrapper. The
+     * sequential 512-byte wrapper is valid; the parallel 256-byte wrapper is
+     * RED because snprintf drops the closing brace. */
+    enum { LONG_REFERENCE_NAME_LEN = 243 };
+    char long_reference_name[LONG_REFERENCE_NAME_LEN + 1];
+    memset(long_reference_name, 'x', LONG_REFERENCE_NAME_LEN);
+    long_reference_name[0] = 'l';
+    long_reference_name[LONG_REFERENCE_NAME_LEN] = '\0';
+    char long_reference_source[1024];
+    int long_reference_source_len = snprintf(
+        long_reference_source, sizeof(long_reference_source),
+        "package parity\n"
+        "func %s() {}\n"
+        "func longPropertiesReferenceAccept(callback func()) {}\n"
+        "func longPropertiesReferenceSite() { longPropertiesReferenceAccept(%s) }\n",
+        long_reference_name, long_reference_name);
+    if (long_reference_source_len <= 0 ||
+        (size_t)long_reference_source_len >= sizeof(long_reference_source)) {
+        th_rmtree(tmp);
+        FAIL("long reference source buffer");
+    }
+    write_temp_file(tmp, "long_properties.go", long_reference_source);
     write_temp_file(tmp, "python_target.py",
                     "def pythonReferenceTarget():\n"
                     "    pass\n");
@@ -1719,7 +1807,7 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                     "  const typescriptShadowTarget = (): void => {};\n"
                     "}\n");
 
-    /* Fourteen positive and three shadow fixtures plus 34 source fillers exceed
+    /* Fifteen positive and three shadow fixtures plus 34 source fillers exceed
      * the 50-file fused threshold without making the test larger than needed. */
     for (int i = 0; i < 34; i++) {
         char name[64];
@@ -1750,6 +1838,14 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
     }
     int sequential_total = -1;
     int parallel_total = -1;
+    int sequential_long_reference = -1;
+    int sequential_long_usage = -1;
+    int sequential_long_calls = -1;
+    int parallel_long_reference = -1;
+    int parallel_long_usage = -1;
+    int parallel_long_calls = -1;
+    NamedEdgePropertyObservation sequential_long_property = {0};
+    NamedEdgePropertyObservation parallel_long_property = {0};
 
     char *old_workers = getenv("CBM_WORKERS");
     char *saved_workers = old_workers ? strdup(old_workers) : NULL;
@@ -1788,6 +1884,18 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                 named_edge_count(sequential_store, sequential_project, "CALLS",
                                  shadow_controls[i].source_name, shadow_controls[i].target_name);
         }
+        sequential_long_reference = named_edge_count(
+            sequential_store, sequential_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name);
+        sequential_long_usage = named_edge_count(sequential_store, sequential_project, "USAGE",
+                                                 "longPropertiesReferenceSite",
+                                                 long_reference_name);
+        sequential_long_calls = named_edge_count(sequential_store, sequential_project, "CALLS",
+                                                 "longPropertiesReferenceSite",
+                                                 long_reference_name);
+        sequential_long_property = observe_named_edge_callee_property(
+            sequential_db_path, sequential_project, "CALL_REFERENCE",
+            "longPropertiesReferenceSite", long_reference_name, long_reference_name);
         cbm_store_close(sequential_store);
     }
     cbm_pipeline_free(sequential);
@@ -1825,6 +1933,16 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                 named_edge_count(parallel_store, parallel_project, "CALLS",
                                  shadow_controls[i].source_name, shadow_controls[i].target_name);
         }
+        parallel_long_reference = named_edge_count(
+            parallel_store, parallel_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name);
+        parallel_long_usage = named_edge_count(parallel_store, parallel_project, "USAGE",
+                                               "longPropertiesReferenceSite", long_reference_name);
+        parallel_long_calls = named_edge_count(parallel_store, parallel_project, "CALLS",
+                                               "longPropertiesReferenceSite", long_reference_name);
+        parallel_long_property = observe_named_edge_callee_property(
+            parallel_db_path, parallel_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name, long_reference_name);
         cbm_store_close(parallel_store);
     }
     cbm_pipeline_free(parallel);
@@ -1847,6 +1965,24 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
     ASSERT_TRUE(sequential_store_opened);
     ASSERT_EQ(parallel_run_rc, 0);
     ASSERT_TRUE(parallel_store_opened);
+    ASSERT_EQ(sequential_long_reference, 1);
+    ASSERT_EQ(sequential_long_usage, 0);
+    ASSERT_EQ(sequential_long_calls, 0);
+    ASSERT_TRUE(sequential_long_property.database_opened);
+    ASSERT_TRUE(sequential_long_property.query_ready);
+    ASSERT_TRUE(sequential_long_property.query_completed);
+    ASSERT_EQ(sequential_long_property.row_count, 1);
+    ASSERT_EQ(sequential_long_property.valid_json_count, 1);
+    ASSERT_EQ(sequential_long_property.exact_callee_count, 1);
+    ASSERT_EQ(parallel_long_reference, 1);
+    ASSERT_EQ(parallel_long_usage, 0);
+    ASSERT_EQ(parallel_long_calls, 0);
+    ASSERT_TRUE(parallel_long_property.database_opened);
+    ASSERT_TRUE(parallel_long_property.query_ready);
+    ASSERT_TRUE(parallel_long_property.query_completed);
+    ASSERT_EQ(parallel_long_property.row_count, 1);
+    ASSERT_EQ(parallel_long_property.valid_json_count, 1);
+    ASSERT_EQ(parallel_long_property.exact_callee_count, 1);
     ASSERT_EQ(parallel_total, sequential_total);
     int expected_total = 0;
     for (int i = 0; i < pair_count; i++) {
@@ -1858,6 +1994,7 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
         ASSERT_EQ(parallel_calls[i], 0);
         expected_total += sequential_reference[i];
     }
+    expected_total += sequential_long_reference;
     for (int i = 0; i < shadow_count; i++) {
         ASSERT_EQ(sequential_shadow_controls[i], 1);
         ASSERT_EQ(parallel_shadow_controls[i], 1);

@@ -922,6 +922,51 @@ TEST(pylsp_later_plain_import_rebinding_same_local_fails_closed) {
     PASS();
 }
 
+TEST(pylsp_top_level_function_shadows_imported_callable) {
+    static const char source[] = "from target import handler as callback\n"
+                                 "def callback():\n"
+                                 "    pass\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(callback)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "callback", "project.target.handler", "project.target.handler", NULL);
+    ASSERT_EQ(counts.first_target, 0);
+    PASS();
+}
+
+TEST(pylsp_decorated_top_level_function_shadows_imported_callable) {
+    static const char source[] = "from target import handler as callback\n"
+                                 "def replace(fn):\n"
+                                 "    return object()\n"
+                                 "@replace\n"
+                                 "def callback():\n"
+                                 "    pass\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(callback)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "callback", "project.target.handler", "project.target.handler", NULL);
+    ASSERT_EQ(counts.first_target, 0);
+    PASS();
+}
+
+TEST(pylsp_later_import_rebinds_top_level_function_name) {
+    static const char source[] = "def callback():\n"
+                                 "    pass\n"
+                                 "from target import handler as callback\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(callback)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "callback", "project.target.handler", "project.target.handler", NULL);
+    ASSERT_EQ(counts.first_target, 1);
+    PASS();
+}
+
 TEST(pylsp_batch_cross_file_callable_value_preserves_exact_reference_site) {
     static const char source[] = "from target import handler\n"
                                  "def accept(callback):\n"
@@ -2156,6 +2201,9 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_project_prefixed_direct_alias_same_tail_is_not_from_import_reference);
     RUN_TEST(pylsp_competing_import_forms_for_same_local_fail_closed);
     RUN_TEST(pylsp_later_plain_import_rebinding_same_local_fails_closed);
+    RUN_TEST(pylsp_top_level_function_shadows_imported_callable);
+    RUN_TEST(pylsp_decorated_top_level_function_shadows_imported_callable);
+    RUN_TEST(pylsp_later_import_rebinds_top_level_function_name);
     RUN_TEST(pylsp_batch_cross_file_callable_value_preserves_exact_reference_site);
     RUN_TEST(pylsp_same_target_calls_have_distinct_exact_semantic_sites);
     RUN_TEST(pylsp_batch_preserves_two_same_target_semantic_sites);

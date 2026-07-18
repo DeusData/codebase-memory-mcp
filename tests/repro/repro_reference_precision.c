@@ -1357,6 +1357,617 @@ TEST(repro_python_alias_equal_module_leaf_targets_imported_member) {
     PASS();
 }
 
+static int rp_assert_python_callback_occurrence_stays_usage(const char *source,
+                                                            const char *caller) {
+    CBMFileResult *raw = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "repro",
+                                          "use.py", 0, NULL, NULL);
+    ASSERT_NOT_NULL(raw);
+    ASSERT_FALSE(raw->has_error || raw->parse_incomplete);
+    const char *argument_call = NULL;
+    const char *scan = source;
+    while ((scan = strstr(scan, "accept(callback)")) != NULL) {
+        argument_call = scan;
+        scan++;
+    }
+    ASSERT_NOT_NULL(argument_call);
+    uint32_t site_start = (uint32_t)(argument_call - source) + 7U;
+    uint32_t site_end = site_start + (uint32_t)strlen("callback");
+    int ordinary_usage = 0;
+    int promoted_usage = 0;
+    int precise_reference = 0;
+    for (int i = 0; i < raw->usages.count; i++) {
+        const CBMUsage *usage = &raw->usages.items[i];
+        if (!usage->ref_name || strcmp(usage->ref_name, "callback") != 0 ||
+            !usage->enclosing_func_qn ||
+            !rp_qn_ends_with(usage->enclosing_func_qn, caller) ||
+            usage->site_start_byte != site_start || usage->site_end_byte != site_end)
+            continue;
+        if (usage->kind == CBM_USAGE_VALUE)
+            ordinary_usage++;
+        else if (usage->kind == CBM_USAGE_CALL_REFERENCE)
+            promoted_usage++;
+    }
+    for (int i = 0; i < raw->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &raw->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_CALL_REFERENCE && resolved->caller_qn &&
+            rp_qn_ends_with(resolved->caller_qn, caller) &&
+            resolved->site_start_byte == site_start && resolved->site_end_byte == site_end) {
+            precise_reference++;
+        }
+    }
+    cbm_free_result(raw);
+
+    ASSERT_GTE(ordinary_usage, 1);
+    ASSERT_EQ(promoted_usage, 0);
+    ASSERT_EQ(precise_reference, 0);
+    return 0;
+}
+
+static int rp_assert_python_imported_callback_fails_closed(const char *source) {
+    int raw_rc = rp_assert_python_callback_occurrence_stays_usage(source, "crossArgument");
+    if (raw_rc != 0)
+        return raw_rc;
+
+    const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", source},
+    };
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python module-binding fixture did not produce a graph store");
+    }
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                       "Function", "accept", ".use.accept");
+    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                         "crossArgument", NULL, NULL, NULL);
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "handler",
+                                           ".target.handler");
+    int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                        "Function", "handler", ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(total_references, 0);
+    ASSERT_EQ(imported_reference, 0);
+    ASSERT_EQ(fabricated_call, 0);
+    return 0;
+}
+
+static int rp_assert_python_exact_reference_occurrence(const char *filename, const char *source,
+                                                       const char *marker,
+                                                       const char *site_text,
+                                                       const char *ref_name) {
+    CBMFileResult *raw = cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "repro",
+                                          filename, 0, NULL, NULL);
+    ASSERT_NOT_NULL(raw);
+    ASSERT_FALSE(raw->has_error || raw->parse_incomplete);
+
+    const char *marker_start = strstr(source, marker);
+    ASSERT_NOT_NULL(marker_start);
+    const char *site = strstr(marker_start, site_text);
+    ASSERT_TRUE(site && site + strlen(site_text) <= marker_start + strlen(marker));
+    uint32_t site_start = (uint32_t)(site - source);
+    uint32_t site_end = site_start + (uint32_t)strlen(site_text);
+
+    const CBMUsage *carrier = NULL;
+    int carrier_count = 0;
+    int target_reference_rows = 0;
+    int target_invocation_rows = 0;
+    for (int i = 0; i < raw->usages.count; i++) {
+        const CBMUsage *usage = &raw->usages.items[i];
+        if (usage->kind == CBM_USAGE_VALUE && usage->ref_name &&
+            strcmp(usage->ref_name, ref_name) == 0 && usage->enclosing_func_qn &&
+            rp_qn_ends_with(usage->enclosing_func_qn, "argument") &&
+            usage->site_start_byte == site_start && usage->site_end_byte == site_end) {
+            carrier = usage;
+            carrier_count++;
+        }
+    }
+    for (int i = 0; i < raw->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &raw->resolved_calls.items[i];
+        if (!resolved->caller_qn || !rp_qn_ends_with(resolved->caller_qn, "argument") ||
+            !resolved->callee_qn || !rp_qn_ends_with(resolved->callee_qn, ".handler") ||
+            resolved->site_start_byte != site_start || resolved->site_end_byte != site_end) {
+            continue;
+        }
+        target_reference_rows += resolved->kind == CBM_RESOLVED_CALL_REFERENCE;
+        target_invocation_rows += resolved->kind == CBM_RESOLVED_INVOCATION;
+    }
+    const CBMResolvedCall *joined =
+        carrier ? cbm_pipeline_find_lsp_reference(&raw->resolved_calls, carrier, false) : NULL;
+    bool carrier_is_candidate = carrier && carrier->may_be_call_reference;
+    bool exact_join = joined && joined->kind == CBM_RESOLVED_CALL_REFERENCE &&
+                      joined->callee_qn && rp_qn_ends_with(joined->callee_qn, ".handler");
+    cbm_free_result(raw);
+
+    ASSERT_EQ(carrier_count, 1);
+    ASSERT_TRUE(carrier_is_candidate);
+    ASSERT_EQ(target_reference_rows, 1);
+    ASSERT_EQ(target_invocation_rows, 0);
+    ASSERT_TRUE(exact_join);
+    return rp_assert_exact_function_value_reference(filename, source, CBM_LANG_PYTHON,
+                                                    "Function");
+}
+
+TEST(repro_python_module_walrus_shadow_fails_closed) {
+    static const char source[] = "from target import handler as callback\n"
+                                 "(callback := 0)\n"
+                                 "def accept(fn):\n    pass\n"
+                                 "def crossArgument():\n    accept(callback)\n";
+    int rc = rp_assert_python_imported_callback_fails_closed(source);
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+/* A comprehension assignment expression binds in the containing scope, not
+ * the comprehension's implicit scope. */
+TEST(repro_python_module_comprehension_walrus_shadow_fails_closed) {
+    static const char source[] = "from target import handler as callback\n"
+                                 "[(callback := 0) for _ in (0,)]\n"
+                                 "def accept(fn):\n    pass\n"
+                                 "def crossArgument():\n    accept(callback)\n";
+    int rc = rp_assert_python_imported_callback_fails_closed(source);
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+TEST(repro_python_module_type_alias_shadow_fails_closed) {
+    static const char source[] = "from target import handler as callback\n"
+                                 "type callback = int\n"
+                                 "def accept(fn):\n    pass\n"
+                                 "def crossArgument():\n    accept(callback)\n";
+    int rc = rp_assert_python_imported_callback_fails_closed(source);
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+TEST(repro_python_parenthesized_function_value_is_exact_reference) {
+    static const char source[] = "def handler():\n"
+                                 "    pass\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def argument():\n"
+                                 "    accept((handler))\n";
+    int rc = rp_assert_python_exact_reference_occurrence(
+        "parenthesized_reference.py", source, "accept((handler))", "((handler))", "handler");
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+TEST(repro_python_local_callable_alias_value_is_exact_reference) {
+    static const char source[] = "def handler():\n"
+                                 "    pass\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def argument():\n"
+                                 "    callback = handler\n"
+                                 "    accept(callback)\n";
+    int rc = rp_assert_python_exact_reference_occurrence(
+        "local_alias_reference.py", source, "accept(callback)", "callback", "callback");
+    if (rc != 0)
+        return rc;
+    PASS();
+}
+
+/* Raw lexical coverage for this occurrence lives in
+ * repro_python_assignment_blocks_earlier_use_for_whole_function. This graph
+ * control proves that a semantic row cannot bypass that local-shadow guard. */
+TEST(repro_python_read_before_local_assignment_has_no_graph_reference) {
+    static const char source[] = "def handler():\n"
+                                 "    pass\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def argument():\n"
+                                 "    accept(handler)\n"
+                                 "    handler = 0\n";
+    ASSERT_TRUE(rp_extracts_clean(source, CBM_LANG_PYTHON, "read_before_write.py"));
+
+    RProj project;
+    cbm_store_t *store = rh_index(&project, "read_before_write.py", source);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python read-before-write fixture did not produce a graph store");
+    }
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "argument", "Function",
+                                       "accept", NULL);
+    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE", "argument",
+                                         NULL, NULL, NULL);
+    int fabricated_call = rp_edge_count(store, project.project, "CALLS", "argument", "Function",
+                                        "handler", NULL);
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(total_references, 0);
+    ASSERT_EQ(fabricated_call, 0);
+    PASS();
+}
+
+TEST(repro_python_local_function_shadows_imported_callable) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "from target import handler as callback\n"
+                   "def callback():\n    pass\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python local-function shadow fixture did not produce a graph store");
+    }
+    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                          "crossArgument", "Function", "callback",
+                                          ".use.callback");
+    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "handler",
+                                        ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(correct_reference, 1);
+    ASSERT_EQ(wrong_reference, 0);
+    PASS();
+}
+
+TEST(repro_python_alias_capture_precedes_later_import_rebinding) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "def callback():\n    pass\n"
+                   "alias = callback\n"
+                   "from target import handler as callback\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(alias)\n"},
+    };
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python ordered alias-capture fixture did not produce a graph store");
+    }
+    int correct_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                          "crossArgument", "Function", "callback",
+                                          ".use.callback");
+    int wrong_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "handler",
+                                        ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(correct_reference, 1);
+    ASSERT_EQ(wrong_reference, 0);
+    PASS();
+}
+
+TEST(repro_python_later_class_clears_function_value_identity) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "from target import handler as callback\n"
+                   "def callback():\n    pass\n"
+                   "class callback:\n    pass\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    int raw_rc =
+        rp_assert_python_callback_occurrence_stays_usage(files[1].content, "crossArgument");
+    if (raw_rc != 0)
+        return raw_rc;
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python class-rebinding fixture did not produce a graph store");
+    }
+    int local_function_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                                 "crossArgument", "Function", "callback",
+                                                 ".use.callback");
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "handler",
+                                           ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(local_function_reference, 0);
+    ASSERT_EQ(imported_reference, 0);
+    PASS();
+}
+
+TEST(repro_python_later_wildcard_import_clears_local_function_proof) {
+    static const RFile files[] = {
+        {"target.py", "def callback():\n    pass\n"},
+        {"use.py", "def callback():\n    pass\n"
+                   "from target import *\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    int raw_rc =
+        rp_assert_python_callback_occurrence_stays_usage(files[1].content, "crossArgument");
+    if (raw_rc != 0)
+        return raw_rc;
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python wildcard-rebinding fixture did not produce a graph store");
+    }
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "callback",
+                                        ".use.callback");
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "callback",
+                                           ".target.callback");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(local_reference, 0);
+    ASSERT_EQ(imported_reference, 0);
+    PASS();
+}
+
+TEST(repro_python_decorated_local_shadow_fails_closed) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "from target import handler as callback\n"
+                   "def replace(fn):\n    return object()\n"
+                   "@replace\n"
+                   "def callback():\n    pass\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    int raw_rc =
+        rp_assert_python_callback_occurrence_stays_usage(files[1].content, "crossArgument");
+    if (raw_rc != 0)
+        return raw_rc;
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python decorated-shadow fixture did not produce a graph store");
+    }
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "callback",
+                                        ".use.callback");
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "handler",
+                                           ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(local_reference, 0);
+    ASSERT_EQ(imported_reference, 0);
+    PASS();
+}
+
+TEST(repro_python_module_if_assignment_shadow_fails_closed) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "from target import handler as callback\n"
+                   "if True:\n    callback = 0\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    int raw_rc =
+        rp_assert_python_callback_occurrence_stays_usage(files[1].content, "crossArgument");
+    if (raw_rc != 0)
+        return raw_rc;
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python conditional-assignment shadow fixture did not produce a graph store");
+    }
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                       "Function", "accept", ".use.accept");
+    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                         "crossArgument", NULL, NULL, NULL);
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "handler",
+                                           ".target.handler");
+    int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                        "Function", "handler", ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(total_references, 0);
+    ASSERT_EQ(imported_reference, 0);
+    ASSERT_EQ(fabricated_call, 0);
+    PASS();
+}
+
+TEST(repro_python_module_if_definition_shadow_fails_closed) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "from target import handler as callback\n"
+                   "if True:\n"
+                   "    def callback():\n"
+                   "        pass\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    int raw_rc =
+        rp_assert_python_callback_occurrence_stays_usage(files[1].content, "crossArgument");
+    if (raw_rc != 0)
+        return raw_rc;
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python conditional-definition shadow fixture did not produce a graph store");
+    }
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                       "Function", "accept", ".use.accept");
+    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                         "crossArgument", NULL, NULL, NULL);
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "callback",
+                                        ".use.callback");
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "handler",
+                                           ".target.handler");
+    int local_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                   "Function", "callback", ".use.callback");
+    int imported_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                      "Function", "handler", ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(total_references, 0);
+    ASSERT_EQ(local_reference, 0);
+    ASSERT_EQ(imported_reference, 0);
+    ASSERT_EQ(local_call, 0);
+    ASSERT_EQ(imported_call, 0);
+    PASS();
+}
+
+TEST(repro_python_later_import_restores_imported_callable_identity) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "def callback():\n    pass\n"
+                   "from target import handler as callback\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python later-import fixture did not produce a graph store");
+    }
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                       "Function", "accept", ".use.accept");
+    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                         "crossArgument", NULL, NULL, NULL);
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "handler",
+                                           ".target.handler");
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "callback",
+                                        ".use.callback");
+    int imported_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
+                                       "Function", "handler", ".target.handler");
+    int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                        "Function", "handler", ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(total_references, 1);
+    ASSERT_EQ(imported_reference, 1);
+    ASSERT_EQ(local_reference, 0);
+    ASSERT_EQ(imported_usage, 0);
+    ASSERT_EQ(fabricated_call, 0);
+    PASS();
+}
+
+TEST(repro_python_wildcard_then_local_function_restores_exactness) {
+    static const RFile files[] = {
+        {"target.py", "def callback():\n    pass\n"},
+        {"use.py", "from target import *\n"
+                   "def callback():\n    pass\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python wildcard-then-definition fixture did not produce a graph store");
+    }
+    int registrar_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                       "Function", "accept", ".use.accept");
+    int total_references = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                         "crossArgument", NULL, NULL, NULL);
+    int local_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                        "crossArgument", "Function", "callback",
+                                        ".use.callback");
+    int imported_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                           "crossArgument", "Function", "callback",
+                                           ".target.callback");
+    int local_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
+                                    "Function", "callback", ".use.callback");
+    int fabricated_call = rp_edge_count(store, project.project, "CALLS", "crossArgument",
+                                        "Function", "callback", ".use.callback");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(registrar_call, 1);
+    ASSERT_EQ(total_references, 1);
+    ASSERT_EQ(local_reference, 1);
+    ASSERT_EQ(imported_reference, 0);
+    ASSERT_EQ(local_usage, 0);
+    ASSERT_EQ(fabricated_call, 0);
+    PASS();
+}
+
+TEST(repro_python_module_compound_binding_matrix_fails_closed) {
+    static const char *const cases[] = {
+        "from target import handler as callback\n"
+        "while flag:\n    callback = 0\n    break\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "for callback in items:\n    pass\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "with manager as callback:\n    pass\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "try:\n    callback = 0\nexcept Exception:\n    pass\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "match value:\n    case callback:\n        pass\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "if flag:\n    del callback\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "if flag:\n    from other import alternate as callback\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+        "from target import handler as callback\n"
+        "if flag:\n    from other import *\n"
+        "def accept(fn):\n    pass\n"
+        "def crossArgument():\n    accept(callback)\n",
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        int rc = rp_assert_python_callback_occurrence_stays_usage(cases[i], "crossArgument");
+        if (rc != 0)
+            return rc;
+    }
+    PASS();
+}
+
+TEST(repro_python_annotation_only_preserves_imported_callable_identity) {
+    static const RFile files[] = {
+        {"target.py", "def handler():\n    pass\n"},
+        {"use.py", "from target import handler as callback\n"
+                   "callback: object\n"
+                   "def accept(fn):\n    pass\n"
+                   "def crossArgument():\n    accept(callback)\n"},
+    };
+    RProj project;
+    cbm_store_t *store = rh_index_files(&project, files, 2);
+    if (!store) {
+        rh_cleanup(&project, store);
+        FAIL("Python annotation-only fixture did not produce a graph store");
+    }
+    int precise_reference = rp_edge_count(store, project.project, "CALL_REFERENCE",
+                                          "crossArgument", "Function", "handler",
+                                          ".target.handler");
+    int ordinary_usage = rp_edge_count(store, project.project, "USAGE", "crossArgument",
+                                       "Function", "handler", ".target.handler");
+    rh_cleanup(&project, store);
+
+    ASSERT_EQ(precise_reference, 1);
+    ASSERT_EQ(ordinary_usage, 0);
+    PASS();
+}
+
 TEST(repro_rust_cross_file_exact_function_value_is_call_reference) {
     static const RFile files[] = {
         {"target.rs", "pub fn handler() {}\n"},
@@ -2164,6 +2775,23 @@ SUITE(repro_reference_precision) {
     RUN_TEST(repro_python_cross_file_exact_function_value_is_call_reference);
     RUN_TEST(repro_python_aliased_import_function_value_is_call_reference);
     RUN_TEST(repro_python_alias_equal_module_leaf_targets_imported_member);
+    RUN_TEST(repro_python_module_walrus_shadow_fails_closed);
+    RUN_TEST(repro_python_module_comprehension_walrus_shadow_fails_closed);
+    RUN_TEST(repro_python_module_type_alias_shadow_fails_closed);
+    RUN_TEST(repro_python_parenthesized_function_value_is_exact_reference);
+    RUN_TEST(repro_python_local_callable_alias_value_is_exact_reference);
+    RUN_TEST(repro_python_read_before_local_assignment_has_no_graph_reference);
+    RUN_TEST(repro_python_local_function_shadows_imported_callable);
+    RUN_TEST(repro_python_alias_capture_precedes_later_import_rebinding);
+    RUN_TEST(repro_python_later_class_clears_function_value_identity);
+    RUN_TEST(repro_python_later_wildcard_import_clears_local_function_proof);
+    RUN_TEST(repro_python_decorated_local_shadow_fails_closed);
+    RUN_TEST(repro_python_module_if_assignment_shadow_fails_closed);
+    RUN_TEST(repro_python_module_if_definition_shadow_fails_closed);
+    RUN_TEST(repro_python_later_import_restores_imported_callable_identity);
+    RUN_TEST(repro_python_wildcard_then_local_function_restores_exactness);
+    RUN_TEST(repro_python_module_compound_binding_matrix_fails_closed);
+    RUN_TEST(repro_python_annotation_only_preserves_imported_callable_identity);
     RUN_TEST(repro_rust_cross_file_exact_function_value_is_call_reference);
     RUN_TEST(repro_csharp_cross_file_exact_function_value_is_call_reference);
     RUN_TEST(repro_csharp_cross_file_callable_alias_invocation_targets_exact_value);

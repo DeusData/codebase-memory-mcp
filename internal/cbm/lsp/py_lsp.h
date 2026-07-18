@@ -100,6 +100,12 @@ typedef struct {
     int eval_steps;                  // per-file work budget used (PY_EVAL_MAX_STEPS_PER_FILE)
     uint32_t eval_truncations;       // depth/budget cutoff count — gates memo inserts
 
+    // Sticky fail-closed guard for exact callable-value proof. If a required
+    // scope/name/overlay allocation fails, later semantic passes must leave
+    // the syntactic occurrence as ordinary USAGE instead of consulting stale
+    // bindings and fabricating CALL_REFERENCE/CALLS edges.
+    bool callable_value_proof_disabled;
+
     // Per-file instance-field OVERLAY. When the Tier-2 registry is shared + sealed
     // (registry->read_only), `self.x = ...` / PEP-526 field discoveries made during
     // resolve are recorded HERE instead of mutating the shared registry (which would
