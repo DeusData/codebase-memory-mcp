@@ -513,7 +513,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -638,6 +638,12 @@ $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_
 
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+
+# Parallel variant: every suite as its own process; identical gate quality
+# (see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh — union guard
+# against --list-suites + aggregated pass/fail/skip totals).
+test-par: $(BUILD_DIR)/test-runner
+	cd $(CURDIR) && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
 
 # Focused native development is intentionally a separate, explicit target so
 # an inherited TEST_SUITES value cannot silently narrow the gating test target.

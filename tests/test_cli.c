@@ -1413,6 +1413,10 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     char *saved_appdata = save_test_env("APPDATA");
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolvers prefer XDG */
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
 #ifdef _WIN32
@@ -1432,6 +1436,7 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("APPDATA", saved_appdata);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
     test_rmdir_r(tmpdir);
     if (rc != 0 || !removed)
         FAIL("VS Code uninstall must remove MCP entries from every existing profile");
@@ -2953,8 +2958,20 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         FAIL("cbm_mkdtemp failed");
 
     const char *const env_names[] = {
-        "HOME",         "PATH",           "CLAUDE_CONFIG_DIR", "CODEX_HOME", "QWEN_HOME",
-        "COPILOT_HOME", "CLINE_DATA_DIR", "KIRO_HOME",         "VIBE_HOME",  "OPENCODE_CONFIG",
+        "HOME",
+        "PATH",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "QWEN_HOME",
+        "COPILOT_HOME",
+        "CLINE_DATA_DIR",
+        "KIRO_HOME",
+        "VIBE_HOME",
+        "OPENCODE_CONFIG",
+        /* Linux path resolvers prefer $XDG_CONFIG_HOME over $HOME/.config;
+         * CI runners export it, so an isolated-process run resolved OUTSIDE
+         * the fixture home (green only via env leaked from earlier suites). */
+        "XDG_CONFIG_HOME",
     };
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
@@ -7786,7 +7803,12 @@ TEST(cli_detect_agents_finds_zed) {
 #endif
     test_mkdirp(dir);
 
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
     ASSERT_TRUE(agents.zed);
 
     test_rmdir_r(tmpdir);

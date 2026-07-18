@@ -57,8 +57,17 @@ verify_compiler "$CC"
 # Step 1: Clean
 scripts/clean.sh
 
-# Step 2 + 3: Build and run tests (Makefile applies $ARCHFLAGS on macOS)
-make -j"$NPROC" -f Makefile.cbm test $MAKE_ARGS
+# Step 2 + 3: Build, then run every suite as parallel processes (identical
+# gate quality — see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh:
+# the suite set is enumerated from the runner itself and union-guarded, and
+# pass/fail/skip totals aggregate to the same numbers as the sequential run).
+# CBM_TEST_SEQUENTIAL=1 restores the single-process runner.
+make -j"$NPROC" -f Makefile.cbm build/c/test-runner $MAKE_ARGS
+if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
+    make -f Makefile.cbm test $MAKE_ARGS
+else
+    make -f Makefile.cbm test-par $MAKE_ARGS
+fi
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.

@@ -441,6 +441,16 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
 #endif
 }
 
+#if !defined(_WIN32)
+/* Child-side alarm handler: a clean exit on the deadline — never reached on
+ * a crash (SIGSEGV/SIGBUS terminate the child first and stay visible). */
+static void so_parse_alarm_exit(int sig) {
+    (void)sig;
+    _exit(0);
+}
+
+#endif
+
 /* Parse `content` with tree-sitter DIRECTLY in a forked child — bypassing
  * cbm_extract_file's Perl pre-parse nesting guard — returning true if the child
  * died by signal. This is the crash-isolating regression for the vendored GLR
@@ -471,6 +481,20 @@ static bool so_parse_crashes(const char *content, CBMLanguage lang) {
         return false;
     }
     if (pid == 0) {
+        /* Deterministic ceiling. Falsification data (2026-07-18, macOS
+         * ASan): with CBM_TS_STACK_MERGE_MAX_DEPTH deleted outright, this
+         * branch stayed GREEN both unbounded (220s full grind, no crash)
+         * and bounded — instrumentation shows the recursive merge path is
+         * never even entered here (max depth 0 through the whole window).
+         * The cap-regression DETECTION therefore lives in the Windows
+         * in-process branch above (real ~1 MB native stack, where #913
+         * manifested); this POSIX branch is a bounded no-crash smoke of
+         * the pathological parse, and grinding past 10s adds no signal
+         * (unbounded it wandered 2s-218s with machine state). A real
+         * SIGSEGV/SIGBUS still terminates the child by signal before the
+         * alarm handler can exit cleanly. */
+        signal(SIGALRM, so_parse_alarm_exit);
+        alarm(10);
         TSParser *parser = ts_parser_new();
         if (parser) {
             ts_parser_set_language(parser, ts_lang);
@@ -750,7 +774,12 @@ TEST(lsp_kotlin_deep_nesting_no_crash) {
  * Suite registration
  * ═══════════════════════════════════════════════════════════════════ */
 
-SUITE(stack_overflow) {
+/* Split into three sub-suites so parallel/sharded runs are not serialized
+ * behind one ~4-minute suite (it was the wall-clock critical path: every
+ * other suite finished underneath it). Pure re-registration — the 20
+ * RUN_TEST entries are exactly the ones the single suite carried; the
+ * before/after test-count parity is asserted in the shard runner. */
+SUITE(stack_overflow_a) {
     cbm_init();
 
     RUN_TEST(ts_allocator_bound_to_mimalloc_issue424);
@@ -760,12 +789,25 @@ SUITE(stack_overflow) {
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
     RUN_TEST(lsp_python_deep_expression_no_crash);
     RUN_TEST(lsp_perl_deep_expression_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_b) {
+    cbm_init();
+
     RUN_TEST(perl_glr_deep_parse_recursion_capped);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
     RUN_TEST(lsp_python_deep_nesting_no_crash);
     RUN_TEST(lsp_go_deep_nesting_no_crash);
     RUN_TEST(lsp_php_deep_nesting_no_crash);
     RUN_TEST(lsp_kotlin_deep_nesting_no_crash);
+
+    cbm_shutdown();
+}
+
+SUITE(stack_overflow_c) {
+    cbm_init();
 
     RUN_TEST(js_calls_exceed_512);
     RUN_TEST(python_calls_exceed_512);
