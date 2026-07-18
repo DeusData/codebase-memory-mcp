@@ -8,7 +8,9 @@
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/platform.h"
 #include "test_framework.h"
+#include "test_helpers.h"
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <cli/cli.h>
@@ -39,7 +41,10 @@ static char *extract_text(const char *mcp_result) {
 
 /* ── Helper: create minimal server with pre-populated data ── */
 static cbm_mcp_server_t *setup_validation_server(char *tmp, size_t tmp_sz) {
-    snprintf(tmp, tmp_sz, "/tmp/cbm-test-validation-XXXXXX");
+    const char *cache = cbm_resolve_cache_dir();
+    int path_len = snprintf(tmp, tmp_sz, "%s/cbm-test-validation-XXXXXX", cache);
+    if (path_len < 0 || (size_t)path_len >= tmp_sz)
+        return NULL;
     if (!cbm_mkdtemp(tmp)) return NULL;
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -59,8 +64,24 @@ static cbm_mcp_server_t *setup_validation_server(char *tmp, size_t tmp_sz) {
     cbm_node_t bar = {.project = proj, .label = "Function", .name = "bar",
                       .qualified_name = "validation-test.test.bar",
                       .file_path = "test.c", .start_line = 2, .end_line = 2};
+    cbm_node_t alpha = {.project = proj,
+                        .label = "Function",
+                        .name = "alphaWorker",
+                        .qualified_name = "validation-test.services.alphaWorker",
+                        .file_path = "worker.c",
+                        .start_line = 3,
+                        .end_line = 3};
+    cbm_node_t beta = {.project = proj,
+                       .label = "Function",
+                       .name = "betaHandler",
+                       .qualified_name = "validation-test.services.betaHandler",
+                       .file_path = "handler.c",
+                       .start_line = 4,
+                       .end_line = 4};
     cbm_store_upsert_node(st, &foo);
     cbm_store_upsert_node(st, &bar);
+    cbm_store_upsert_node(st, &alpha);
+    cbm_store_upsert_node(st, &beta);
     cbm_edge_t e = {.project = proj, .source_id = 2, .target_id = 1, .type = "CALLS"};
     cbm_store_insert_edge(st, &e);
 
@@ -68,9 +89,7 @@ static cbm_mcp_server_t *setup_validation_server(char *tmp, size_t tmp_sz) {
 }
 
 static void cleanup_validation_dir(const char *dir) {
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "rm -rf '%s'", dir);
-    (void)system(cmd); // NOLINT
+    th_cleanup(dir);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -236,12 +255,12 @@ TEST(f9_glob_star_autoconverted) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
-    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"name_pattern\":\"*tool*\",\"limit\":3}");
+    char *raw =
+        cbm_mcp_handle_tool(srv, "search_graph", "{\"name_pattern\":\"*Worker*\",\"limit\":3}");
     char *resp = extract_text(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NULL(strstr(resp, "invalid regex"));
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_validation_dir(tmp);
@@ -253,11 +272,29 @@ TEST(f9_glob_question_autoconverted) {
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
     char *raw = cbm_mcp_handle_tool(srv, "search_graph",
-                                    "{\"name_pattern\":\"*foo?\",\"limit\":3}");
+                                    "{\"name_pattern\":\"*alpha?orker*\",\"limit\":3}");
     char *resp = extract_text(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NULL(strstr(resp, "invalid regex"));
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_valid_regex_shaped_glob_is_normalized_before_compile) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"name_pattern\":\"alpha?orker|beta?andler\",\"limit\":5,"
+                                    "\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_validation_dir(tmp);
@@ -305,7 +342,7 @@ TEST(f9_qn_pattern_glob_autoconverted) {
     char *resp = extract_text(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
-    ASSERT_NULL(strstr(resp, "invalid regex"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_validation_dir(tmp);
@@ -564,6 +601,43 @@ TEST(pattern_or_search_graph) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"error\""));
     ASSERT_NOT_NULL(strstr(resp, "\"results\"")); /* results array present */
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(pattern_or_search_graph_normalizes_valid_regex_shaped_glob) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph",
+                                    "{\"pattern\":\"services.alpha?orker|beta?andler\",\"limit\":5,"
+                                    "\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(f9_explicit_group_and_class_regex_quantifiers_stay_regex) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *raw =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"name_pattern\":\"(alpha)?Worker|[ab].*Handler\",\"limit\":5,"
+                            "\"format\":\"json\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "alphaWorker"));
+    ASSERT_NOT_NULL(strstr(resp, "betaHandler"));
     free(resp);
     cbm_mcp_server_free(srv);
     cleanup_validation_dir(tmp);
@@ -1286,7 +1360,9 @@ void suite_input_validation(void) {
     RUN_TEST(f6_sort_by_linkrank_accepted);
     RUN_TEST(f9_glob_star_autoconverted);
     RUN_TEST(f9_glob_question_autoconverted);
+    RUN_TEST(f9_valid_regex_shaped_glob_is_normalized_before_compile);
     RUN_TEST(f9_valid_regex_still_works);
+    RUN_TEST(f9_explicit_group_and_class_regex_quantifiers_stay_regex);
     RUN_TEST(f9_truly_invalid_pattern_still_errors);
     RUN_TEST(f9_qn_pattern_glob_autoconverted);
     RUN_TEST(f10_negative_depth_returns_results);
@@ -1300,6 +1376,7 @@ void suite_input_validation(void) {
     RUN_TEST(cq3_cypher_with_label_warns);
     RUN_TEST(ix2_status_resource_format);
     RUN_TEST(pattern_or_search_graph);
+    RUN_TEST(pattern_or_search_graph_normalizes_valid_regex_shaped_glob);
     RUN_TEST(source_search_via_search_in_param);
     RUN_TEST(source_search_path_project_normalizes_to_slug);
     RUN_TEST(source_search_default_is_graph);
