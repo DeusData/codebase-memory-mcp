@@ -11,11 +11,16 @@
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/artifact.h"
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include "foundation/sha256.h"
+#include "foundation/compat_fs.h"
+#include "discover/userconfig.h"
 
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdatomic.h>
 #include "foundation/compat_thread.h"
@@ -851,6 +856,46 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+/* True iff the exact named CALLS edge exists and its serialized strategy
+ * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
+ * this on a separate ordinary-call control: it proves the cross-file LSP ran
+ * successfully for the language/target, rather than letting a registry-only
+ * edge make a broken fixture look healthy. */
+static bool cross_file_call_has_strategy(cbm_store_t *s, const char *project, const char *src_name,
+                                         const char *tgt_name, const char *strategy_fragment) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && edges[j].properties_json &&
+                    strstr(edges[j].properties_json, strategy_fragment)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
 /* Regression: incremental re-index of an edited file must NOT drop inbound
  * cross-file CALLS edges whose source lives in an UNCHANGED file.
  *
@@ -917,6 +962,2856 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
  * local calls must still resolve. < 50 files → sequential path (pass_calls.c).
  * RED before the fix: checkFormat->test exists via unique_name/suffix_match. */
 static void write_temp_file(const char *dir, const char *name, const char *content);
+
+typedef struct {
+    const char *source_name;
+    const char *target_name;
+} PreciseReferencePair;
+
+typedef struct {
+    bool database_opened;
+    bool query_ready;
+    bool query_completed;
+    int row_count;
+    int valid_json_count;
+    int exact_callee_count;
+} NamedEdgePropertyObservation;
+
+/* Read one named edge's persisted properties through SQLite's JSON functions.
+ * The guarded json_extract is intentional: on the RED revision the parallel
+ * usage emitter truncates the final `}` from a boundary-sized callee property.
+ * json_valid must report that row without json_extract aborting the statement,
+ * while the fixed revision must round-trip the complete callee value. */
+static NamedEdgePropertyObservation observe_named_edge_callee_property(
+    const char *db_path, const char *project, const char *edge_type, const char *source_name,
+    const char *target_name, const char *expected_callee) {
+    NamedEdgePropertyObservation observation = {0};
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return observation;
+    }
+    observation.database_opened = true;
+
+    static const char sql[] =
+        "SELECT e.properties, json_valid(e.properties), "
+        "CASE WHEN json_valid(e.properties) "
+        "THEN json_extract(e.properties, '$.callee') END "
+        "FROM edges e "
+        "JOIN nodes src ON src.id=e.source_id AND src.project=e.project "
+        "JOIN nodes tgt ON tgt.id=e.target_id AND tgt.project=e.project "
+        "WHERE e.project=?1 AND e.type=?2 AND src.name=?3 AND tgt.name=?4;";
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 2, edge_type, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 3, source_name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(stmt, 4, target_name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(stmt);
+        sqlite3_close(db);
+        return observation;
+    }
+    observation.query_ready = true;
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        observation.row_count++;
+        if (sqlite3_column_int(stmt, 1) != 0) {
+            observation.valid_json_count++;
+        }
+        const unsigned char *callee = sqlite3_column_text(stmt, 2);
+        if (callee && strcmp((const char *)callee, expected_callee) == 0) {
+            observation.exact_callee_count++;
+        }
+    }
+    observation.query_completed = step_rc == SQLITE_DONE;
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    return observation;
+}
+
+/* Count only edges of `edge_type` between the exact named source/target nodes.
+ * The parity and incremental guards deliberately use unique symbol names, so
+ * this canonicalizes across independent stores without depending on node IDs
+ * or project-prefixed qualified names. */
+static int named_edge_count(cbm_store_t *s, const char *project, const char *edge_type,
+                            const char *source_name, const char *target_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.name &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.name, target_name) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Like named_edge_count, but distinguish same-named targets by their source
+ * file. Semantic-control fixtures intentionally keep the exported short name
+ * identical in two modules so a project-wide unique-name fallback cannot make
+ * an alias-mapping assertion pass accidentally. */
+static int named_edge_to_file_count(cbm_store_t *s, const char *project, const char *edge_type,
+                                    const char *source_name, const char *target_name,
+                                    const char *target_file_path) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(s, project, edge_type, &edges, &edge_count) != CBM_STORE_OK) {
+        return -1;
+    }
+
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        cbm_node_t target = {0};
+        int source_ok = cbm_store_find_node_by_id(s, edges[i].source_id, &source) == CBM_STORE_OK;
+        int target_ok = cbm_store_find_node_by_id(s, edges[i].target_id, &target) == CBM_STORE_OK;
+        if (source_ok && target_ok && source.name && target.name && target.file_path &&
+            strcmp(source.name, source_name) == 0 && strcmp(target.name, target_name) == 0 &&
+            strcmp(target.file_path, target_file_path) == 0) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+        cbm_node_free_fields(&target);
+    }
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    return matches;
+}
+
+/* Count exact-name nodes without depending on project-prefixed qualified names.
+ * Export-XML relationship tests use this as an anti-vacuous guard: the
+ * transcoded methods must exist even when their extracted relationships were
+ * accidentally discarded. */
+static int named_node_count(cbm_store_t *s, const char *project, const char *name) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(s, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    if (nodes) {
+        cbm_store_free_nodes(nodes, count);
+    }
+    return count;
+}
+
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int run_nodes;
+    int execute_nodes;
+    int run_execute_calls;
+    int shared_payload_nodes;
+    int run_shared_payload_usages;
+} ObjectScriptExportObservation;
+
+static ObjectScriptExportObservation observe_objectscript_export(const char *repo_path,
+                                                                 const char *db_name) {
+    ObjectScriptExportObservation observation = {
+        .run_rc = -1,
+        .store_opened = false,
+        .run_nodes = -1,
+        .execute_nodes = -1,
+        .run_execute_calls = -1,
+        .shared_payload_nodes = -1,
+        .run_shared_payload_usages = -1,
+    };
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", repo_path, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FULL);
+    if (!pipeline) {
+        return observation;
+    }
+
+    observation.run_rc = cbm_pipeline_run(pipeline);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    observation.store_opened = store != NULL;
+    if (store && project) {
+        observation.run_nodes = named_node_count(store, project, "Run");
+        observation.execute_nodes = named_node_count(store, project, "Execute");
+        observation.run_execute_calls = named_edge_count(store, project, "CALLS", "Run", "Execute");
+        observation.shared_payload_nodes = named_node_count(store, project, "SharedPayload");
+        observation.run_shared_payload_usages =
+            named_edge_count(store, project, "USAGE", "Run", "SharedPayload");
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+/* Studio Export XML is transformed into ObjectScript UDL during extraction.
+ * The transformed definitions already survive, but the old sequential and
+ * fused-parallel special cases freed each transformed result after inserting
+ * only its definitions. Calls/usages therefore vanished even though direct
+ * extraction of the same generated UDL found them.
+ *
+ * One shared multi-class fixture is indexed through both execution paths. The
+ * 50 filler files only select the fused path; CBM_INDEX_SINGLE_THREAD forces
+ * the first run through the sequential path without duplicating setup.
+ * RED before the fix: Run and Execute each exist once, Run -> Execute is 0 in
+ * both stores. GREEN requires exactly one CALLS edge in each store. */
+TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel) {
+    static const char export_xml[] = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                                     "<Export generator=\"Cache\" version=\"25\">\n"
+                                     "<Class name=\"Test.Worker\">\n"
+                                     "<Method name=\"Execute\">\n"
+                                     "<ClassMethod>1</ClassMethod>\n"
+                                     "<FormalSpec>pValue:%String</FormalSpec>\n"
+                                     "<ReturnType>%Status</ReturnType>\n"
+                                     "<Implementation><![CDATA[\n"
+                                     "    Quit $$$OK\n"
+                                     "]]></Implementation>\n"
+                                     "</Method>\n"
+                                     "</Class>\n"
+                                     "<Class name=\"Test.Caller\">\n"
+                                     "<Method name=\"Run\">\n"
+                                     "<ClassMethod>1</ClassMethod>\n"
+                                     "<FormalSpec>pPayload:%String</FormalSpec>\n"
+                                     "<ReturnType>%Status</ReturnType>\n"
+                                     "<Implementation><![CDATA[\n"
+                                     "    Do ##class(Test.Worker).Execute(pPayload)\n"
+                                     "    Quit $$$OK\n"
+                                     "]]></Implementation>\n"
+                                     "</Method>\n"
+                                     "</Class>\n"
+                                     "</Export>\n";
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_export_rel_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    char export_path[512];
+    snprintf(export_path, sizeof(export_path), "%s/studio-export.xml", tmp);
+    if (th_write_file(export_path, export_xml) != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to write Studio Export fixture");
+    }
+
+    /* Export XML plus 50 trackable fillers exceeds MIN_FILES_FOR_PARALLEL. */
+    for (int i = 0; i < 50; i++) {
+        char filename[64];
+        char path[512];
+        char source[128];
+        snprintf(filename, sizeof(filename), "export_pad_%02d.ts", i);
+        snprintf(path, sizeof(path), "%s/%s", tmp, filename);
+        snprintf(source, sizeof(source), "export function exportPad%02d(): number { return %d; }\n",
+                 i, i);
+        if (th_write_file(path, source) != 0) {
+            th_rmtree(tmp);
+            FAIL("failed to write parallel-selection fixture");
+        }
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    ObjectScriptExportObservation sequential =
+        observe_objectscript_export(tmp, "export-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    ObjectScriptExportObservation parallel = observe_objectscript_export(tmp, "export-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential.run_rc, 0);
+    ASSERT_TRUE(sequential.store_opened);
+    ASSERT_EQ(sequential.run_nodes, 1);
+    ASSERT_EQ(sequential.execute_nodes, 1);
+
+    ASSERT_EQ(parallel.run_rc, 0);
+    ASSERT_TRUE(parallel.store_opened);
+    ASSERT_EQ(parallel.run_nodes, 1);
+    ASSERT_EQ(parallel.execute_nodes, 1);
+    if (sequential.run_execute_calls != 1 || parallel.run_execute_calls != 1) {
+        fprintf(stderr,
+                "  [objectscript-export] invariant=transformed_calls_preserved "
+                "expected=1/1 actual=%d/%d\n",
+                sequential.run_execute_calls, parallel.run_execute_calls);
+    }
+    ASSERT_TRUE(sequential.run_execute_calls == 1 && parallel.run_execute_calls == 1);
+    PASS();
+}
+
+static int format_objectscript_export_lifecycle_fixture(char *xml, size_t xml_capacity,
+                                                        const char *default_value) {
+    int written = snprintf(xml, xml_capacity,
+                           "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                           "<Export generator=\"Cache\" version=\"25\">\n"
+                           "<Class name=\"Test.Worker\">\n"
+                           "<Method name=\"Execute\">\n"
+                           "<ClassMethod>1</ClassMethod>\n"
+                           "<FormalSpec>pValue:%%String</FormalSpec>\n"
+                           "<ReturnType>%%Status</ReturnType>\n"
+                           "<Implementation><![CDATA[\n"
+                           "    Quit $$$OK\n"
+                           "]]></Implementation>\n"
+                           "</Method>\n"
+                           "</Class>\n"
+                           "<Class name=\"Test.Caller\">\n"
+                           "<Parameter name=\"SharedPayload\"><Default>%s</Default></Parameter>\n"
+                           "<Method name=\"Run\">\n"
+                           "<ClassMethod>1</ClassMethod>\n"
+                           "<FormalSpec>watched:%%String</FormalSpec>\n"
+                           "<ReturnType>%%Status</ReturnType>\n"
+                           "<Implementation><![CDATA[\n"
+                           "    Do ##class(Test.Worker).Execute(watched)\n"
+                           "    Quit $$$OK\n"
+                           "]]></Implementation>\n"
+                           "</Method>\n"
+                           "</Class>\n"
+                           "</Export>\n",
+                           default_value);
+    if (written <= 0 || (size_t)written >= xml_capacity) {
+        return -1;
+    }
+    return written;
+}
+
+static int write_objectscript_export_lifecycle_fixture(const char *path,
+                                                       const char *default_value) {
+    char xml[4096];
+    int written = format_objectscript_export_lifecycle_fixture(xml, sizeof(xml), default_value);
+    if (written < 0) {
+        return -1;
+    }
+    return th_write_file(path, xml);
+}
+
+/* A changed Studio Export file must keep its transformed carriers alive for
+ * every incremental resolution pass. Compare the incrementally rebuilt graph
+ * with a clean full sequential build of the same replacement XML. Direct
+ * extraction separately proves that the transformed aggregate retains the
+ * method-argument USAGE carrier; formal parameters are not graph targets, so
+ * graph resolution of that carrier is outside this lifecycle regression.
+ * ObjectScript has no per-file or cross-file LSP dispatcher, so it cannot
+ * produce a resolved_calls semantic carrier to assert here.
+ *
+ * RED before the incremental cache lifecycle fix: definitions survived, but
+ * the changed Export was re-read as raw XML by later passes, so Run->Execute
+ * CALLS was absent from the incremental graph. */
+TEST(pipeline_objectscript_export_incremental_matches_full_relationships) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_export_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    char export_path[512];
+    snprintf(export_path, sizeof(export_path), "%s/studio-export.xml", tmp);
+    if (write_objectscript_export_lifecycle_fixture(export_path, "initial") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to write initial Studio Export fixture");
+    }
+
+    char carrier_xml[4096];
+    int carrier_xml_len =
+        format_objectscript_export_lifecycle_fixture(carrier_xml, sizeof(carrier_xml), "initial");
+    if (carrier_xml_len < 0) {
+        th_rmtree(tmp);
+        FAIL("failed to format Studio Export carrier fixture");
+    }
+    cbm_init();
+    CBMFileResult *carrier_result = cbm_pipeline_extract_objectscript_export(
+        carrier_xml, carrier_xml_len, "export-lifecycle", "studio-export.xml", NULL, NULL);
+    if (!carrier_result) {
+        th_rmtree(tmp);
+        FAIL("failed to extract Studio Export carrier fixture");
+    }
+    bool found_argument_usage = false;
+    for (int i = 0; i < carrier_result->usages.count; i++) {
+        const CBMUsage *usage = &carrier_result->usages.items[i];
+        if (usage->ref_name && strcmp(usage->ref_name, "watched") == 0 &&
+            usage->enclosing_func_qn && strstr(usage->enclosing_func_qn, ".Run")) {
+            found_argument_usage = true;
+            break;
+        }
+    }
+    cbm_free_result(carrier_result);
+    if (!found_argument_usage) {
+        th_rmtree(tmp);
+        FAIL("Studio Export aggregate lost method-argument USAGE carrier");
+    }
+
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+
+    ObjectScriptExportObservation initial =
+        observe_objectscript_export(tmp, "export-incremental.db");
+
+    if (write_objectscript_export_lifecycle_fixture(export_path,
+                                                    "replacement-with-a-different-size") != 0) {
+        if (saved_single) {
+            cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+            free(saved_single);
+        } else {
+            cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+        }
+        th_rmtree(tmp);
+        FAIL("failed to write replacement Studio Export fixture");
+    }
+
+    /* Same DB routes through incremental; a fresh DB is the full reference. */
+    ObjectScriptExportObservation incremental =
+        observe_objectscript_export(tmp, "export-incremental.db");
+    ObjectScriptExportObservation full =
+        observe_objectscript_export(tmp, "export-full-reference.db");
+
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(initial.run_rc, 0);
+    ASSERT_TRUE(initial.store_opened);
+    ASSERT_EQ(initial.run_execute_calls, 1);
+
+    ASSERT_EQ(incremental.run_rc, 0);
+    ASSERT_TRUE(incremental.store_opened);
+    ASSERT_EQ(full.run_rc, 0);
+    ASSERT_TRUE(full.store_opened);
+    ASSERT_EQ(incremental.run_nodes, full.run_nodes);
+    ASSERT_EQ(incremental.execute_nodes, full.execute_nodes);
+    ASSERT_EQ(incremental.shared_payload_nodes, full.shared_payload_nodes);
+    ASSERT_EQ(incremental.run_execute_calls, full.run_execute_calls);
+    ASSERT_EQ(incremental.run_shared_payload_usages, full.run_shared_payload_usages);
+    ASSERT_EQ(full.run_nodes, 1);
+    ASSERT_EQ(full.execute_nodes, 1);
+    ASSERT_EQ(full.shared_payload_nodes, 1);
+    ASSERT_EQ(full.run_execute_calls, 1);
+    PASS();
+}
+
+static bool test_buffer_appendf(char *buffer, size_t capacity, size_t *used, const char *format,
+                                ...) {
+    if (!buffer || !used || *used >= capacity) {
+        return false;
+    }
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(buffer + *used, capacity - *used, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= capacity - *used) {
+        return false;
+    }
+    *used += (size_t)written;
+    return true;
+}
+
+/* Each extracted class owns a separate arena. A CBMCall includes eight argument
+ * slots, so growing its call array through the 513th item requires at least four
+ * arena blocks per class. Sixty-four classes therefore exceed the aggregate's
+ * fixed 256-block adoption table even before aggregate-array growth is counted,
+ * while staying within the Studio Export transcoder's existing 64-class cap.
+ *
+ * RED with fixed-block ownership transfer: aggregation returns NULL before all
+ * 64 classes can be composed. GREEN requires one result containing every class,
+ * method, and call carrier without raising the class limit. */
+TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table) {
+    enum {
+        STRESS_CLASS_COUNT = 64,
+        STRESS_CALLS_PER_CLASS = 513,
+        STRESS_XML_CAPACITY = 4 * 1024 * 1024,
+    };
+    char *xml = (char *)malloc(STRESS_XML_CAPACITY);
+    if (!xml) {
+        FAIL("stress XML allocation");
+    }
+    size_t used = 0;
+    bool complete = test_buffer_appendf(xml, STRESS_XML_CAPACITY, &used,
+                                        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+                                        "<Export generator=\"Cache\" version=\"25\">\n");
+    for (int ci = 0; ci < STRESS_CLASS_COUNT && complete; ci++) {
+        complete = test_buffer_appendf(xml, STRESS_XML_CAPACITY, &used,
+                                       "<Class name=\"Arena.Stress%02d\">\n"
+                                       "<Method name=\"Run%02d\">\n"
+                                       "<ClassMethod>1</ClassMethod>\n"
+                                       "<Implementation><![CDATA[\n",
+                                       ci, ci);
+        for (int call = 0; call < STRESS_CALLS_PER_CLASS && complete; call++) {
+            complete = test_buffer_appendf(xml, STRESS_XML_CAPACITY, &used,
+                                           "    Do ##class(Arena.Target).Execute()\n");
+        }
+        complete = complete && test_buffer_appendf(xml, STRESS_XML_CAPACITY, &used,
+                                                   "    Quit\n"
+                                                   "]]></Implementation>\n"
+                                                   "</Method>\n"
+                                                   "</Class>\n");
+    }
+    complete = complete && test_buffer_appendf(xml, STRESS_XML_CAPACITY, &used, "</Export>\n");
+    if (!complete) {
+        free(xml);
+        FAIL("stress XML capacity");
+    }
+
+    cbm_init();
+    CBMFileResult *aggregate = cbm_pipeline_extract_objectscript_export(
+        xml, (int)used, "arena-stress", "studio-export.xml", NULL, NULL);
+    free(xml);
+    ASSERT_NOT_NULL(aggregate);
+
+    bool found_last_method = false;
+    for (int i = 0; i < aggregate->defs.count; i++) {
+        const CBMDefinition *def = &aggregate->defs.items[i];
+        if (def->name && strcmp(def->name, "Run63") == 0) {
+            found_last_method = true;
+            break;
+        }
+    }
+    int expected_calls = STRESS_CLASS_COUNT * STRESS_CALLS_PER_CLASS;
+    int actual_calls = aggregate->calls.count;
+    int actual_defs = aggregate->defs.count;
+    cbm_free_result(aggregate);
+
+    ASSERT_TRUE(found_last_method);
+    ASSERT_EQ(actual_calls, expected_calls);
+    ASSERT_GTE(actual_defs, STRESS_CLASS_COUNT * 2);
+    PASS();
+}
+
+typedef struct {
+    int run_rc;
+    bool store_opened;
+    int source_nodes;
+    int target_nodes;
+    int edge_count;
+} NamedEdgeObservation;
+
+static NamedEdgeObservation observe_named_edge(const char *repo_path, const char *db_name,
+                                               const char *edge_type, const char *source_name,
+                                               const char *target_name) {
+    NamedEdgeObservation observation = {
+        .run_rc = -1,
+        .store_opened = false,
+        .source_nodes = -1,
+        .target_nodes = -1,
+        .edge_count = -1,
+    };
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", repo_path, db_name);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FULL);
+    if (!pipeline) {
+        return observation;
+    }
+    observation.run_rc = cbm_pipeline_run(pipeline);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    observation.store_opened = store != NULL;
+    if (store && project) {
+        observation.source_nodes = named_node_count(store, project, source_name);
+        observation.target_nodes = named_node_count(store, project, target_name);
+        observation.edge_count =
+            named_edge_count(store, project, edge_type, source_name, target_name);
+    }
+    if (store) {
+        cbm_store_close(store);
+    }
+    cbm_pipeline_free(pipeline);
+    return observation;
+}
+
+/* env_accesses are extracted independently from calls and must materialize the
+ * same EnvVar + CONFIGURES relationship in both pipeline implementations.
+ *
+ * RED before the fused-path consumer is added: sequential definition insertion
+ * creates envParityRead -> CBM_PARITY_TOKEN, while cbm_build_registry_from_cache
+ * ignores result->env_accesses and the parallel graph contains neither target
+ * nor edge. */
+TEST(pipeline_env_access_configures_sequential_parallel_parity) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_env_parity_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/env.go", tmp);
+    if (th_write_file(source_path, "package envparity\n\n"
+                                   "import \"os\"\n\n"
+                                   "func envParityRead() string {\n"
+                                   "    return os.Getenv(\"CBM_PARITY_TOKEN\")\n"
+                                   "}\n") != 0) {
+        th_rmtree(tmp);
+        FAIL("failed to write env-access fixture");
+    }
+    for (int i = 0; i < 50; i++) {
+        char filename[64];
+        char path[512];
+        char source[128];
+        snprintf(filename, sizeof(filename), "env_pad_%02d.ts", i);
+        snprintf(path, sizeof(path), "%s/%s", tmp, filename);
+        snprintf(source, sizeof(source), "export function envPad%02d(): number { return %d; }\n", i,
+                 i);
+        if (th_write_file(path, source) != 0) {
+            th_rmtree(tmp);
+            FAIL("failed to write env parity filler");
+        }
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    NamedEdgeObservation sequential = observe_named_edge(tmp, "env-sequential.db", "CONFIGURES",
+                                                         "envParityRead", "CBM_PARITY_TOKEN");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    NamedEdgeObservation parallel = observe_named_edge(tmp, "env-parallel.db", "CONFIGURES",
+                                                       "envParityRead", "CBM_PARITY_TOKEN");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential.run_rc, 0);
+    ASSERT_TRUE(sequential.store_opened);
+    ASSERT_EQ(sequential.source_nodes, 1);
+    ASSERT_EQ(sequential.target_nodes, 1);
+    ASSERT_EQ(sequential.edge_count, 1);
+
+    ASSERT_EQ(parallel.run_rc, 0);
+    ASSERT_TRUE(parallel.store_opened);
+    ASSERT_EQ(parallel.source_nodes, sequential.source_nodes);
+    ASSERT_EQ(parallel.target_nodes, sequential.target_nodes);
+    ASSERT_EQ(parallel.edge_count, sequential.edge_count);
+    PASS();
+}
+
+/* Sequential and fused-parallel resolution must materialize the same precise
+ * CALL_REFERENCE edge set.  The table covers each independently implemented
+ * resolver family involved in callable-value/reference semantics; sibling
+ * frontends share those resolvers (JS/TSX -> TS, C++/CUDA -> C).
+ *
+ * Every pair uses a globally unique source and target name. That lets the test
+ * compare the semantic edge multiset across stores while ignoring unstable DB
+ * IDs and project-name prefixes. The fixture exceeds MIN_FILES_FOR_PARALLEL;
+ * CBM_INDEX_SINGLE_THREAD forces the first run through the sequential path and
+ * CBM_WORKERS forces the second through pass_parallel.c. */
+TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
+    static const PreciseReferencePair pairs[] = {
+        {"goReferenceSite", "goReferenceTarget"},
+        {"pythonReferenceSite", "pythonReferenceTarget"},
+        {"cReferenceSite", "cReferenceTarget"},
+        {"rustReferenceSite", "rustReferenceTarget"},
+        {"csharpReferenceSite", "csharpReferenceTarget"},
+        {"javascriptReferenceSite", "javascriptReferenceTarget"},
+        {"typescriptReferenceSite", "typescriptReferenceTarget"},
+        {"tsxReferenceSite", "tsxReferenceTarget"},
+        {"cppReferenceSite", "cppReferenceTarget"},
+        {"cudaReferenceSite", "cudaReferenceTarget"},
+        {"javaReferenceSite", "javaReferenceTarget"},
+        {"kotlinReferenceSite", "kotlinReferenceTarget"},
+        {"phpReferenceSite", "phpReferenceTarget"},
+        {"perlReferenceSite", "perlReferenceTarget"},
+    };
+    enum { pair_count = (int)(sizeof(pairs) / sizeof(pairs[0])) };
+    static const PreciseReferencePair shadow_pairs[] = {
+        {"pythonShadowSite", "pythonShadowTarget"},
+        {"javascriptShadowSite", "javascriptShadowTarget"},
+        {"typescriptShadowSite", "typescriptShadowTarget"},
+    };
+    static const PreciseReferencePair shadow_controls[] = {
+        {"pythonShadowSite", "pythonShadowAccept"},
+        {"javascriptShadowSite", "javascriptShadowAccept"},
+        {"typescriptShadowSite", "typescriptShadowAccept"},
+    };
+    enum { shadow_count = (int)(sizeof(shadow_pairs) / sizeof(shadow_pairs[0])) };
+
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_parity_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "parity.go",
+                    "package parity\n"
+                    "func goReferenceTarget() {}\n"
+                    "func goReferenceAccept(callback func()) {}\n"
+                    "func goReferenceSite() { goReferenceAccept(goReferenceTarget) }\n");
+    /* `{"callee":""}` contributes 13 bytes. A 243-byte identifier therefore
+     * produces 256 bytes of JSON content: it fits the usage emitter's escaped
+     * value buffer but needs 257 bytes including NUL for the wrapper. The
+     * sequential 512-byte wrapper is valid; the parallel 256-byte wrapper is
+     * RED because snprintf drops the closing brace. */
+    enum { LONG_REFERENCE_NAME_LEN = 243 };
+    char long_reference_name[LONG_REFERENCE_NAME_LEN + 1];
+    memset(long_reference_name, 'x', LONG_REFERENCE_NAME_LEN);
+    long_reference_name[0] = 'l';
+    long_reference_name[LONG_REFERENCE_NAME_LEN] = '\0';
+    char long_reference_source[1024];
+    int long_reference_source_len = snprintf(
+        long_reference_source, sizeof(long_reference_source),
+        "package parity\n"
+        "func %s() {}\n"
+        "func longPropertiesReferenceAccept(callback func()) {}\n"
+        "func longPropertiesReferenceSite() { longPropertiesReferenceAccept(%s) }\n",
+        long_reference_name, long_reference_name);
+    if (long_reference_source_len <= 0 ||
+        (size_t)long_reference_source_len >= sizeof(long_reference_source)) {
+        th_rmtree(tmp);
+        FAIL("long reference source buffer");
+    }
+    write_temp_file(tmp, "long_properties.go", long_reference_source);
+    write_temp_file(tmp, "python_target.py",
+                    "def pythonReferenceTarget():\n"
+                    "    pass\n");
+    write_temp_file(tmp, "parity.py",
+                    "from python_target import pythonReferenceTarget as pythonReferenceAlias\n"
+                    "def pythonReferenceAccept(callback):\n"
+                    "    pass\n"
+                    "def pythonReferenceSite():\n"
+                    "    pythonReferenceAccept(pythonReferenceAlias)\n");
+    write_temp_file(tmp, "parity.c",
+                    "typedef void (*c_reference_callback_t)(void);\n"
+                    "void cReferenceTarget(void) {}\n"
+                    "void cReferenceAccept(c_reference_callback_t callback) {}\n"
+                    "void cReferenceSite(void) { cReferenceAccept(cReferenceTarget); }\n");
+    write_temp_file(tmp, "parity.rs",
+                    "fn rustReferenceTarget() {}\n"
+                    "fn rustReferenceAccept(_callback: fn()) {}\n"
+                    "fn rustReferenceSite() { rustReferenceAccept(rustReferenceTarget); }\n");
+    write_temp_file(tmp, "Parity.cs",
+                    "using System;\n"
+                    "class CSharpParity {\n"
+                    "  static void csharpReferenceTarget() {}\n"
+                    "  static void csharpReferenceAccept(Action callback) {}\n"
+                    "  static void csharpReferenceSite() { "
+                    "csharpReferenceAccept(csharpReferenceTarget); }\n"
+                    "}\n");
+    write_temp_file(tmp, "parity.js",
+                    "function javascriptReferenceTarget() {}\n"
+                    "function javascriptReferenceAccept(callback) {}\n"
+                    "function javascriptReferenceSite() {\n"
+                    "  javascriptReferenceAccept(javascriptReferenceTarget);\n"
+                    "}\n");
+    write_temp_file(tmp, "parity.ts",
+                    "class TypeScriptParity { typescriptReferenceTarget(): void {} }\n"
+                    "function typescriptReferenceAccept(callback: () => void): void {}\n"
+                    "function typescriptReferenceSite(service: TypeScriptParity): void {\n"
+                    "  typescriptReferenceAccept(service.typescriptReferenceTarget);\n"
+                    "}\n");
+    write_temp_file(tmp, "parity.tsx",
+                    "function tsxReferenceTarget(): void {}\n"
+                    "function tsxReferenceAccept(callback: () => void): void {}\n"
+                    "function tsxReferenceSite(): void {\n"
+                    "  tsxReferenceAccept(tsxReferenceTarget);\n"
+                    "}\n");
+    write_temp_file(tmp, "parity.cpp",
+                    "using cpp_reference_callback_t = void (*)();\n"
+                    "void cppReferenceTarget() {}\n"
+                    "void cppReferenceAccept(cpp_reference_callback_t callback) {}\n"
+                    "void cppReferenceSite() { cppReferenceAccept(cppReferenceTarget); }\n");
+    write_temp_file(tmp, "parity.cu",
+                    "typedef void (*cuda_reference_callback_t)(void);\n"
+                    "__device__ void cudaReferenceTarget(void) {}\n"
+                    "__device__ void cudaReferenceAccept(cuda_reference_callback_t callback) {}\n"
+                    "__device__ void cudaReferenceSite(void) {\n"
+                    "  cudaReferenceAccept(cudaReferenceTarget);\n"
+                    "}\n");
+    write_temp_file(tmp, "JavaParity.java",
+                    "interface JavaParityTask { void run(); }\n"
+                    "class JavaParity {\n"
+                    "  static void javaReferenceTarget() {}\n"
+                    "  static void javaReferenceAccept(JavaParityTask callback) {}\n"
+                    "  static void javaReferenceSite() { "
+                    "javaReferenceAccept(JavaParity::javaReferenceTarget); }\n"
+                    "}\n");
+    write_temp_file(tmp, "parity.kt",
+                    "fun kotlinReferenceTarget(): Unit {}\n"
+                    "fun kotlinReferenceAccept(callback: () -> Unit): Unit {}\n"
+                    "fun kotlinReferenceSite(): Unit { "
+                    "kotlinReferenceAccept(::kotlinReferenceTarget) }\n");
+    write_temp_file(tmp, "parity.php",
+                    "<?php\n"
+                    "function phpReferenceTarget(): void {}\n"
+                    "function phpReferenceAccept(callable $callback): void {}\n"
+                    "function phpReferenceSite(): void { "
+                    "phpReferenceAccept(phpReferenceTarget(...)); }\n");
+    write_temp_file(tmp, "parity.pl",
+                    "sub perlReferenceTarget {}\n"
+                    "sub perlReferenceAccept { my ($callback) = @_; }\n"
+                    "sub perlReferenceSite { "
+                    "perlReferenceAccept(\\&perlReferenceTarget); }\n");
+
+    write_temp_file(tmp, "shadow.py",
+                    "def pythonShadowTarget():\n"
+                    "    pass\n"
+                    "def pythonShadowAccept(callback):\n"
+                    "    pass\n"
+                    "def pythonShadowSite():\n"
+                    "    pythonShadowAccept(pythonShadowTarget)\n"
+                    "    pythonShadowTarget = lambda: None\n");
+    write_temp_file(tmp, "shadow.js",
+                    "function javascriptShadowTarget() {}\n"
+                    "function javascriptShadowAccept(callback) {}\n"
+                    "function javascriptShadowSite() {\n"
+                    "  javascriptShadowAccept(javascriptShadowTarget);\n"
+                    "  const javascriptShadowTarget = () => {};\n"
+                    "}\n");
+    write_temp_file(tmp, "shadow.ts",
+                    "function typescriptShadowTarget(): void {}\n"
+                    "function typescriptShadowAccept(callback: () => void): void {}\n"
+                    "function typescriptShadowSite(): void {\n"
+                    "  typescriptShadowAccept(typescriptShadowTarget);\n"
+                    "  const typescriptShadowTarget = (): void => {};\n"
+                    "}\n");
+
+    /* Fifteen positive and three shadow fixtures plus 34 source fillers exceed
+     * the 50-file fused threshold without making the test larger than needed. */
+    for (int i = 0; i < 34; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "parity_pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function parityPad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(tmp, name, body);
+    }
+
+    int sequential_reference[pair_count];
+    int sequential_usage[pair_count];
+    int sequential_calls[pair_count];
+    int parallel_reference[pair_count];
+    int parallel_usage[pair_count];
+    int parallel_calls[pair_count];
+    int sequential_shadow_leaks[shadow_count];
+    int parallel_shadow_leaks[shadow_count];
+    int sequential_shadow_controls[shadow_count];
+    int parallel_shadow_controls[shadow_count];
+    for (int i = 0; i < pair_count; i++) {
+        sequential_reference[i] = sequential_usage[i] = sequential_calls[i] = -1;
+        parallel_reference[i] = parallel_usage[i] = parallel_calls[i] = -1;
+    }
+    for (int i = 0; i < shadow_count; i++) {
+        sequential_shadow_leaks[i] = parallel_shadow_leaks[i] = -1;
+        sequential_shadow_controls[i] = parallel_shadow_controls[i] = -1;
+    }
+    int sequential_total = -1;
+    int parallel_total = -1;
+    int sequential_long_reference = -1;
+    int sequential_long_usage = -1;
+    int sequential_long_calls = -1;
+    int parallel_long_reference = -1;
+    int parallel_long_usage = -1;
+    int parallel_long_calls = -1;
+    NamedEdgePropertyObservation sequential_long_property = {0};
+    NamedEdgePropertyObservation parallel_long_property = {0};
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    char sequential_db_path[512];
+    snprintf(sequential_db_path, sizeof(sequential_db_path), "%s/reference_sequential.db", tmp);
+    cbm_pipeline_t *sequential = cbm_pipeline_new(tmp, sequential_db_path, CBM_MODE_FULL);
+    int sequential_run_rc = sequential ? cbm_pipeline_run(sequential) : -1;
+    const char *sequential_project = sequential ? cbm_pipeline_project_name(sequential) : NULL;
+    cbm_store_t *sequential_store = cbm_store_open_path(sequential_db_path);
+    bool sequential_store_opened = sequential_store != NULL;
+    if (sequential_store && sequential_project) {
+        sequential_total =
+            cbm_store_count_edges_by_type(sequential_store, sequential_project, "CALL_REFERENCE");
+        for (int i = 0; i < pair_count; i++) {
+            sequential_reference[i] =
+                named_edge_count(sequential_store, sequential_project, "CALL_REFERENCE",
+                                 pairs[i].source_name, pairs[i].target_name);
+            sequential_usage[i] = named_edge_count(sequential_store, sequential_project, "USAGE",
+                                                   pairs[i].source_name, pairs[i].target_name);
+            sequential_calls[i] = named_edge_count(sequential_store, sequential_project, "CALLS",
+                                                   pairs[i].source_name, pairs[i].target_name);
+        }
+        for (int i = 0; i < shadow_count; i++) {
+            sequential_shadow_leaks[i] =
+                named_edge_count(sequential_store, sequential_project, "CALL_REFERENCE",
+                                 shadow_pairs[i].source_name, shadow_pairs[i].target_name) +
+                named_edge_count(sequential_store, sequential_project, "USAGE",
+                                 shadow_pairs[i].source_name, shadow_pairs[i].target_name) +
+                named_edge_count(sequential_store, sequential_project, "CALLS",
+                                 shadow_pairs[i].source_name, shadow_pairs[i].target_name);
+            sequential_shadow_controls[i] =
+                named_edge_count(sequential_store, sequential_project, "CALLS",
+                                 shadow_controls[i].source_name, shadow_controls[i].target_name);
+        }
+        sequential_long_reference = named_edge_count(
+            sequential_store, sequential_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name);
+        sequential_long_usage = named_edge_count(sequential_store, sequential_project, "USAGE",
+                                                 "longPropertiesReferenceSite",
+                                                 long_reference_name);
+        sequential_long_calls = named_edge_count(sequential_store, sequential_project, "CALLS",
+                                                 "longPropertiesReferenceSite",
+                                                 long_reference_name);
+        sequential_long_property = observe_named_edge_callee_property(
+            sequential_db_path, sequential_project, "CALL_REFERENCE",
+            "longPropertiesReferenceSite", long_reference_name, long_reference_name);
+        cbm_store_close(sequential_store);
+    }
+    cbm_pipeline_free(sequential);
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char parallel_db_path[512];
+    snprintf(parallel_db_path, sizeof(parallel_db_path), "%s/reference_parallel.db", tmp);
+    cbm_pipeline_t *parallel = cbm_pipeline_new(tmp, parallel_db_path, CBM_MODE_FULL);
+    int parallel_run_rc = parallel ? cbm_pipeline_run(parallel) : -1;
+    const char *parallel_project = parallel ? cbm_pipeline_project_name(parallel) : NULL;
+    cbm_store_t *parallel_store = cbm_store_open_path(parallel_db_path);
+    bool parallel_store_opened = parallel_store != NULL;
+    if (parallel_store && parallel_project) {
+        parallel_total =
+            cbm_store_count_edges_by_type(parallel_store, parallel_project, "CALL_REFERENCE");
+        for (int i = 0; i < pair_count; i++) {
+            parallel_reference[i] =
+                named_edge_count(parallel_store, parallel_project, "CALL_REFERENCE",
+                                 pairs[i].source_name, pairs[i].target_name);
+            parallel_usage[i] = named_edge_count(parallel_store, parallel_project, "USAGE",
+                                                 pairs[i].source_name, pairs[i].target_name);
+            parallel_calls[i] = named_edge_count(parallel_store, parallel_project, "CALLS",
+                                                 pairs[i].source_name, pairs[i].target_name);
+        }
+        for (int i = 0; i < shadow_count; i++) {
+            parallel_shadow_leaks[i] =
+                named_edge_count(parallel_store, parallel_project, "CALL_REFERENCE",
+                                 shadow_pairs[i].source_name, shadow_pairs[i].target_name) +
+                named_edge_count(parallel_store, parallel_project, "USAGE",
+                                 shadow_pairs[i].source_name, shadow_pairs[i].target_name) +
+                named_edge_count(parallel_store, parallel_project, "CALLS",
+                                 shadow_pairs[i].source_name, shadow_pairs[i].target_name);
+            parallel_shadow_controls[i] =
+                named_edge_count(parallel_store, parallel_project, "CALLS",
+                                 shadow_controls[i].source_name, shadow_controls[i].target_name);
+        }
+        parallel_long_reference = named_edge_count(
+            parallel_store, parallel_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name);
+        parallel_long_usage = named_edge_count(parallel_store, parallel_project, "USAGE",
+                                               "longPropertiesReferenceSite", long_reference_name);
+        parallel_long_calls = named_edge_count(parallel_store, parallel_project, "CALLS",
+                                               "longPropertiesReferenceSite", long_reference_name);
+        parallel_long_property = observe_named_edge_callee_property(
+            parallel_db_path, parallel_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name, long_reference_name);
+        cbm_store_close(parallel_store);
+    }
+    cbm_pipeline_free(parallel);
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential_run_rc, 0);
+    ASSERT_TRUE(sequential_store_opened);
+    ASSERT_EQ(parallel_run_rc, 0);
+    ASSERT_TRUE(parallel_store_opened);
+    ASSERT_EQ(sequential_long_reference, 1);
+    ASSERT_EQ(sequential_long_usage, 0);
+    ASSERT_EQ(sequential_long_calls, 0);
+    ASSERT_TRUE(sequential_long_property.database_opened);
+    ASSERT_TRUE(sequential_long_property.query_ready);
+    ASSERT_TRUE(sequential_long_property.query_completed);
+    ASSERT_EQ(sequential_long_property.row_count, 1);
+    ASSERT_EQ(sequential_long_property.valid_json_count, 1);
+    ASSERT_EQ(sequential_long_property.exact_callee_count, 1);
+    ASSERT_EQ(parallel_long_reference, 1);
+    ASSERT_EQ(parallel_long_usage, 0);
+    ASSERT_EQ(parallel_long_calls, 0);
+    ASSERT_TRUE(parallel_long_property.database_opened);
+    ASSERT_TRUE(parallel_long_property.query_ready);
+    ASSERT_TRUE(parallel_long_property.query_completed);
+    ASSERT_EQ(parallel_long_property.row_count, 1);
+    ASSERT_EQ(parallel_long_property.valid_json_count, 1);
+    ASSERT_EQ(parallel_long_property.exact_callee_count, 1);
+    ASSERT_EQ(parallel_total, sequential_total);
+    int expected_total = 0;
+    for (int i = 0; i < pair_count; i++) {
+        ASSERT_GT(sequential_reference[i], 0);
+        ASSERT_EQ(parallel_reference[i], sequential_reference[i]);
+        ASSERT_EQ(sequential_usage[i], 0);
+        ASSERT_EQ(parallel_usage[i], 0);
+        ASSERT_EQ(sequential_calls[i], 0);
+        ASSERT_EQ(parallel_calls[i], 0);
+        expected_total += sequential_reference[i];
+    }
+    expected_total += sequential_long_reference;
+    for (int i = 0; i < shadow_count; i++) {
+        ASSERT_EQ(sequential_shadow_controls[i], 1);
+        ASSERT_EQ(parallel_shadow_controls[i], 1);
+        ASSERT_EQ(sequential_shadow_leaks[i], 0);
+        ASSERT_EQ(parallel_shadow_leaks[i], 0);
+    }
+    ASSERT_EQ(sequential_total, expected_total);
+    PASS();
+}
+
+static int pipeline_test_set_mtime(const char *path, time_t seconds, long nanoseconds) {
+    struct timespec times[2] = {{.tv_sec = seconds, .tv_nsec = nanoseconds},
+                                {.tv_sec = seconds, .tv_nsec = nanoseconds}};
+    return utimensat(AT_FDCWD, path, times, 0);
+}
+
+/* Reindexing a changed callable-value occurrence must replace its exact target,
+ * not preserve the old CALL_REFERENCE alongside the new one or regress the new
+ * occurrence to USAGE/CALLS. Equal-length source generations use the exact same
+ * mtime so metadata heuristics cannot make the test pass: byte hashes must route
+ * the semantic change to a full rebuild. A metadata-only mtime change is a true
+ * no-op and must not rebuild. */
+TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    static const char initial_source[] = "package refs\n"
+                                         "func alphaReferenceTarget() {}\n"
+                                         "func bravoReferenceTarget() {}\n"
+                                         "func incrementalReferenceAccept(callback func()) {}\n"
+                                         "func incrementalReferenceSite() { "
+                                         "incrementalReferenceAccept(alphaReferenceTarget) }\n";
+    static const char replacement_source[] = "package refs\n"
+                                             "func alphaReferenceTarget() {}\n"
+                                             "func bravoReferenceTarget() {}\n"
+                                             "func incrementalReferenceAccept(callback func()) {}\n"
+                                             "func incrementalReferenceSite() { "
+                                             "incrementalReferenceAccept(bravoReferenceTarget) }\n";
+    ASSERT_EQ(sizeof(initial_source), sizeof(replacement_source));
+    write_temp_file(tmp, "refs.go", initial_source);
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/refs.go", tmp);
+    const time_t fixed_mtime = 1700000000;
+    ASSERT_EQ(pipeline_test_set_mtime(source_path, fixed_mtime, 123456789L), 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/reference_incremental.db", tmp);
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    const char *first_project = cbm_pipeline_project_name(first);
+    cbm_store_t *first_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(first_store);
+    ASSERT_EQ(named_edge_count(first_store, first_project, "CALL_REFERENCE",
+                               "incrementalReferenceSite", "alphaReferenceTarget"),
+              1);
+    ASSERT_EQ(named_edge_count(first_store, first_project, "CALL_REFERENCE",
+                               "incrementalReferenceSite", "bravoReferenceTarget"),
+              0);
+    ASSERT_EQ(named_edge_count(first_store, first_project, "USAGE", "incrementalReferenceSite",
+                               "alphaReferenceTarget"),
+              0);
+    ASSERT_EQ(named_edge_count(first_store, first_project, "CALLS", "incrementalReferenceSite",
+                               "alphaReferenceTarget"),
+              0);
+    cbm_file_hash_t stored_hash = {0};
+    ASSERT_EQ(cbm_store_get_file_hash(first_store, first_project, "refs.go", &stored_hash),
+              CBM_STORE_OK);
+    char expected_hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(initial_source, strlen(initial_source), expected_hash);
+    ASSERT_NOT_NULL(stored_hash.sha256);
+    ASSERT_STR_EQ(stored_hash.sha256, expected_hash);
+    cbm_store_clear_file_hash(&stored_hash);
+    cbm_coverage_meta_t baseline_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(first_store, first_project, &baseline_meta),
+              CBM_STORE_OK);
+    ASSERT_EQ(baseline_meta.coverage_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_TRUE(baseline_meta.hash_records_complete);
+    cbm_store_coverage_meta_clear(&baseline_meta);
+    cbm_store_close(first_store);
+    cbm_pipeline_free(first);
+
+    /* Same bytes, metadata only: exact manifest equality is a no-op. */
+    ASSERT_EQ(pipeline_test_set_mtime(source_path, fixed_mtime + 1, 123456789L), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *metadata_only = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(metadata_only);
+    ASSERT_EQ(cbm_pipeline_run(metadata_only), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_NOOP);
+    cbm_pipeline_free(metadata_only);
+
+    write_temp_file(tmp, "refs.go", replacement_source);
+    ASSERT_EQ(pipeline_test_set_mtime(source_path, fixed_mtime, 123456789L), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    ASSERT_EQ(cbm_pipeline_run(second), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    const char *second_project = cbm_pipeline_project_name(second);
+    cbm_store_t *second_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(second_store);
+    ASSERT_EQ(named_edge_count(second_store, second_project, "CALL_REFERENCE",
+                               "incrementalReferenceSite", "alphaReferenceTarget"),
+              0);
+    ASSERT_EQ(named_edge_count(second_store, second_project, "CALL_REFERENCE",
+                               "incrementalReferenceSite", "bravoReferenceTarget"),
+              1);
+    ASSERT_EQ(named_edge_count(second_store, second_project, "USAGE", "incrementalReferenceSite",
+                               "bravoReferenceTarget"),
+              0);
+    ASSERT_EQ(named_edge_count(second_store, second_project, "CALLS", "incrementalReferenceSite",
+                               "bravoReferenceTarget"),
+              0);
+    cbm_store_close(second_store);
+    cbm_pipeline_free(second);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Re-indexing only the caller must retain cross-file semantic proof for a
+ * callable value whose definition lives in an unchanged file. A fresh full
+ * index of the edited sources is the convergence oracle: incremental output
+ * must not downgrade the exact CALL_REFERENCE to a generic USAGE. */
+TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_cross_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    static const char target_source[] = "export function importedIncrementalHandler(): void {}\n";
+    static const char initial_caller_source[] =
+        "import { importedIncrementalHandler } from './plugin';\n"
+        "function acceptIncrementalReference(callback: () => void): void {}\n"
+        "export function incrementalImportedArgument(): void {\n"
+        "  acceptIncrementalReference(importedIncrementalHandler);\n"
+        "}\n";
+    static const char edited_caller_source[] =
+        "import { importedIncrementalHandler } from './plugin';\n"
+        "function acceptIncrementalReference(callback: () => void): void {}\n"
+        "export function incrementalImportedArgument(): void {\n"
+        "  acceptIncrementalReference(importedIncrementalHandler);\n"
+        "}\n"
+        "// caller-only size-changing edit\n";
+
+    write_temp_file(tmp, "plugin.ts", target_source);
+    write_temp_file(tmp, "main.ts", initial_caller_source);
+
+    char incremental_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/cross-reference-incremental.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    const char *baseline_project = cbm_pipeline_project_name(baseline);
+    cbm_store_t *baseline_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(baseline_store);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "CALL_REFERENCE",
+                               "incrementalImportedArgument", "importedIncrementalHandler"),
+              1);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "USAGE",
+                               "incrementalImportedArgument", "importedIncrementalHandler"),
+              0);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "CALLS",
+                               "incrementalImportedArgument", "importedIncrementalHandler"),
+              0);
+    cbm_store_close(baseline_store);
+    cbm_pipeline_free(baseline);
+
+    write_temp_file(tmp, "main.ts", edited_caller_source);
+
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    const char *incremental_project = cbm_pipeline_project_name(incremental);
+    cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(incremental_store);
+    int incremental_reference =
+        named_edge_count(incremental_store, incremental_project, "CALL_REFERENCE",
+                         "incrementalImportedArgument", "importedIncrementalHandler");
+    int incremental_usage =
+        named_edge_count(incremental_store, incremental_project, "USAGE",
+                         "incrementalImportedArgument", "importedIncrementalHandler");
+    int incremental_calls =
+        named_edge_count(incremental_store, incremental_project, "CALLS",
+                         "incrementalImportedArgument", "importedIncrementalHandler");
+    cbm_store_close(incremental_store);
+    cbm_pipeline_free(incremental);
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/cross-reference-full.db", tmp);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    const char *full_project = cbm_pipeline_project_name(full);
+    cbm_store_t *full_store = cbm_store_open_path(full_db);
+    ASSERT_NOT_NULL(full_store);
+    int full_reference =
+        named_edge_count(full_store, full_project, "CALL_REFERENCE", "incrementalImportedArgument",
+                         "importedIncrementalHandler");
+    int full_usage = named_edge_count(full_store, full_project, "USAGE",
+                                      "incrementalImportedArgument", "importedIncrementalHandler");
+    int full_calls = named_edge_count(full_store, full_project, "CALLS",
+                                      "incrementalImportedArgument", "importedIncrementalHandler");
+    cbm_store_close(full_store);
+    cbm_pipeline_free(full);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_reference, 1);
+    ASSERT_EQ(full_usage, 0);
+    ASSERT_EQ(full_calls, 0);
+    ASSERT_EQ(incremental_reference, full_reference);
+    ASSERT_EQ(incremental_usage, full_usage);
+    ASSERT_EQ(incremental_calls, full_calls);
+    PASS();
+}
+
+/* A semantic control file can change an unchanged source file's exact target.
+ * Both target modules deliberately export the same short name: without the
+ * tsconfig path mapping, project-wide unique-name fallback is ambiguous and
+ * cannot make this test pass. The clean full index after the config-only edit
+ * is therefore an exact oracle for which module owns the CALL_REFERENCE.
+ *
+ * RED: incremental hashing tracks source inputs but not the semantic influence
+ * of tsconfig.json. Changing only the alias mapping leaves the same-DB graph
+ * pointed at target_a.ts while a fresh full index points at target_b.ts. */
+TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_tsconfig_incr_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    static const char target_a_source[] = "export function semanticControlHandler(): void {\n"
+                                          "  const selected = 'a';\n"
+                                          "  void selected;\n"
+                                          "}\n";
+    static const char target_b_source[] = "export function semanticControlHandler(): void {\n"
+                                          "  const selected = 'b';\n"
+                                          "  void selected;\n"
+                                          "}\n";
+    static const char caller_source[] =
+        "import { semanticControlHandler } from '@semantic-target';\n"
+        "function acceptSemanticControl(callback: () => void): void {\n"
+        "  void callback;\n"
+        "}\n"
+        "export function semanticControlCaller(): void {\n"
+        "  acceptSemanticControl(semanticControlHandler);\n"
+        "}\n";
+    static const char initial_tsconfig[] =
+        "{\n"
+        "  \"compilerOptions\": {\n"
+        "    \"baseUrl\": \".\",\n"
+        "    \"paths\": {\"@semantic-target\": [\"./target_a\"]}\n"
+        "  }\n"
+        "}\n";
+    static const char replacement_tsconfig[] =
+        "{\n"
+        "  \"compilerOptions\": {\n"
+        "    \"baseUrl\": \".\",\n"
+        "    \"paths\": {\"@semantic-target\": [\"./target_b\"]}\n"
+        "  }\n"
+        "}\n";
+    static const char initial_jsconfig[] = "{\"compilerOptions\":{\"baseUrl\":\"./one\"}}\n";
+    static const char replacement_jsconfig[] = "{\"compilerOptions\":{\"baseUrl\":\"./two\"}}\n";
+    ASSERT_EQ(sizeof(initial_tsconfig), sizeof(replacement_tsconfig));
+    ASSERT_EQ(sizeof(initial_jsconfig), sizeof(replacement_jsconfig));
+
+    write_temp_file(tmp, "target_a.ts", target_a_source);
+    write_temp_file(tmp, "target_b.ts", target_b_source);
+    write_temp_file(tmp, "caller.ts", caller_source);
+    write_temp_file(tmp, "tsconfig.json", initial_tsconfig);
+    write_temp_file(tmp, "jsconfig.json", initial_jsconfig);
+    char tsconfig_path[512];
+    char jsconfig_path[512];
+    snprintf(tsconfig_path, sizeof(tsconfig_path), "%s/tsconfig.json", tmp);
+    snprintf(jsconfig_path, sizeof(jsconfig_path), "%s/jsconfig.json", tmp);
+    const time_t fixed_config_mtime = 1700000100;
+    ASSERT_EQ(pipeline_test_set_mtime(tsconfig_path, fixed_config_mtime, 222222222L), 0);
+    ASSERT_EQ(pipeline_test_set_mtime(jsconfig_path, fixed_config_mtime, 333333333L), 0);
+
+    char incremental_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/tsconfig-reference-incremental.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    const char *baseline_project = cbm_pipeline_project_name(baseline);
+    cbm_store_t *baseline_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(baseline_store);
+    ASSERT_EQ(named_node_count(baseline_store, baseline_project, "semanticControlHandler"), 2);
+    ASSERT_EQ(named_edge_to_file_count(baseline_store, baseline_project, "CALL_REFERENCE",
+                                       "semanticControlCaller", "semanticControlHandler",
+                                       "target_a.ts"),
+              1);
+    ASSERT_EQ(named_edge_to_file_count(baseline_store, baseline_project, "CALL_REFERENCE",
+                                       "semanticControlCaller", "semanticControlHandler",
+                                       "target_b.ts"),
+              0);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "USAGE", "semanticControlCaller",
+                               "semanticControlHandler"),
+              0);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "CALLS", "semanticControlCaller",
+                               "semanticControlHandler"),
+              0);
+    cbm_file_hash_t selected_config_hash = {0};
+    ASSERT_EQ(cbm_store_get_file_hash(baseline_store, baseline_project, "tsconfig.json",
+                                      &selected_config_hash),
+              CBM_STORE_OK);
+    char expected_config_hash[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(initial_tsconfig, strlen(initial_tsconfig), expected_config_hash);
+    ASSERT_NOT_NULL(selected_config_hash.sha256);
+    ASSERT_STR_EQ(selected_config_hash.sha256, expected_config_hash);
+    cbm_store_clear_file_hash(&selected_config_hash);
+    cbm_file_hash_t unselected_config_hash = {0};
+    ASSERT_EQ(cbm_store_get_file_hash(baseline_store, baseline_project, "jsconfig.json",
+                                      &unselected_config_hash),
+              CBM_STORE_NOT_FOUND);
+    cbm_store_close(baseline_store);
+    cbm_pipeline_free(baseline);
+
+    /* The lower-priority jsconfig is not a semantic input while tsconfig is
+     * present in the same directory. Its byte change must remain a no-op. */
+    write_temp_file(tmp, "jsconfig.json", replacement_jsconfig);
+    ASSERT_EQ(pipeline_test_set_mtime(jsconfig_path, fixed_config_mtime, 333333333L), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *unselected = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(unselected);
+    ASSERT_EQ(cbm_pipeline_run(unselected), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_NOOP);
+    cbm_pipeline_free(unselected);
+
+    /* The source files remain byte-for-byte unchanged; selected control bytes
+     * change at the same length and mtime. */
+    write_temp_file(tmp, "tsconfig.json", replacement_tsconfig);
+    ASSERT_EQ(pipeline_test_set_mtime(tsconfig_path, fixed_config_mtime, 222222222L), 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    const char *incremental_project = cbm_pipeline_project_name(incremental);
+    cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(incremental_store);
+    int incremental_reference_a =
+        named_edge_to_file_count(incremental_store, incremental_project, "CALL_REFERENCE",
+                                 "semanticControlCaller", "semanticControlHandler", "target_a.ts");
+    int incremental_reference_b =
+        named_edge_to_file_count(incremental_store, incremental_project, "CALL_REFERENCE",
+                                 "semanticControlCaller", "semanticControlHandler", "target_b.ts");
+    int incremental_usage = named_edge_count(incremental_store, incremental_project, "USAGE",
+                                             "semanticControlCaller", "semanticControlHandler");
+    int incremental_calls = named_edge_count(incremental_store, incremental_project, "CALLS",
+                                             "semanticControlCaller", "semanticControlHandler");
+    cbm_store_close(incremental_store);
+    cbm_pipeline_free(incremental);
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/tsconfig-reference-full.db", tmp);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    const char *full_project = cbm_pipeline_project_name(full);
+    cbm_store_t *full_store = cbm_store_open_path(full_db);
+    ASSERT_NOT_NULL(full_store);
+    int full_reference_a =
+        named_edge_to_file_count(full_store, full_project, "CALL_REFERENCE",
+                                 "semanticControlCaller", "semanticControlHandler", "target_a.ts");
+    int full_reference_b =
+        named_edge_to_file_count(full_store, full_project, "CALL_REFERENCE",
+                                 "semanticControlCaller", "semanticControlHandler", "target_b.ts");
+    int full_usage = named_edge_count(full_store, full_project, "USAGE", "semanticControlCaller",
+                                      "semanticControlHandler");
+    int full_calls = named_edge_count(full_store, full_project, "CALLS", "semanticControlCaller",
+                                      "semanticControlHandler");
+    cbm_store_close(full_store);
+    cbm_pipeline_free(full);
+    th_rmtree(tmp);
+
+    /* Prove the fresh oracle changed only because the alias now selects B. */
+    ASSERT_EQ(full_reference_a, 0);
+    ASSERT_EQ(full_reference_b, 1);
+    ASSERT_EQ(full_usage, 0);
+    ASSERT_EQ(full_calls, 0);
+
+    /* Incremental output must converge exactly on the fresh target and kind. */
+    ASSERT_EQ(incremental_reference_a, full_reference_a);
+    ASSERT_EQ(incremental_reference_b, full_reference_b);
+    ASSERT_EQ(incremental_usage, full_usage);
+    ASSERT_EQ(incremental_calls, full_calls);
+    PASS();
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static void observe_named_generation(const char *db_path, const char *project,
+                                     const char *before_name, const char *after_name,
+                                     int *before_count, int *after_count) {
+    *before_count = -1;
+    *after_count = -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return;
+    }
+    *before_count = named_node_count(store, project, before_name);
+    *after_count = named_node_count(store, project, after_name);
+    cbm_store_close(store);
+}
+
+static int count_generation_stage_artifacts(const char *dir_path, const char *db_basename) {
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return -1;
+    }
+    char prefix[256];
+    snprintf(prefix, sizeof(prefix), "%s.stage.", db_basename);
+    size_t prefix_len = strlen(prefix);
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, prefix, prefix_len) == 0) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+typedef struct {
+    const char *path;
+    const char *replacement;
+    int write_rc;
+} manifest_race_mutation_t;
+
+static void mutate_semantic_input_before_final_manifest(void *userdata) {
+    manifest_race_mutation_t *mutation = (manifest_race_mutation_t *)userdata;
+    mutation->write_rc = th_write_file(mutation->path, mutation->replacement);
+}
+
+/* A graph and its exact manifest are one generation. If source bytes change
+ * after extraction but before publication, the mixed generation must be
+ * rejected and the previous live DB preserved. */
+TEST(pipeline_source_mutation_before_publication_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_generation_race_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char source_path[512];
+    char db_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/generation.py", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    ASSERT_EQ(th_write_file(source_path, "def StableGeneration():\n    return 1\n"), 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    ASSERT_EQ(th_write_file(source_path, "def ExtractedGeneration():\n    return 2\n"), 0);
+    manifest_race_mutation_t mutation = {
+        .path = source_path,
+        .replacement = "def FinalGeneration():\n    return 3\n",
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *raced = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(raced);
+    int raced_rc = cbm_pipeline_run(raced);
+    cbm_pipeline_free(raced);
+    int raced_stable = -1;
+    int raced_extracted = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "ExtractedGeneration",
+                             &raced_stable, &raced_extracted);
+    int raced_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_pipeline_free(retry);
+    int retry_stable = -1;
+    int retry_final = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "FinalGeneration", &retry_stable,
+                             &retry_final);
+    int retry_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(raced_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(raced_stable, 1);
+    ASSERT_EQ(raced_extracted, 0);
+    ASSERT_EQ(raced_stage_count, 0);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_stable, 0);
+    ASSERT_EQ(retry_final, 1);
+    ASSERT_EQ(retry_stage_count, 0);
+    PASS();
+}
+
+/* Discovery and extraction must describe the same immutable generation. A
+ * source file created after extraction is not present in the original file
+ * list, so merely re-hashing that list cannot detect the race. Publication
+ * must abort, leave the old DB intact, and let a clean retry discover both
+ * files. */
+TEST(pipeline_source_addition_before_publication_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_addition_race_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char source_path[512];
+    char late_path[512];
+    char db_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/generation.py", tmp);
+    snprintf(late_path, sizeof(late_path), "%s/late.py", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    ASSERT_EQ(th_write_file(source_path, "def StableAdditionGeneration():\n    return 1\n"), 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    ASSERT_EQ(th_write_file(source_path, "def ExtractedAdditionGeneration():\n    return 2\n"), 0);
+    manifest_race_mutation_t mutation = {
+        .path = late_path,
+        .replacement = "def LateDiscoveredGeneration():\n    return 3\n",
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *raced = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(raced);
+    int raced_rc = cbm_pipeline_run(raced);
+    cbm_pipeline_free(raced);
+
+    int raced_stable = -1;
+    int raced_extracted = -1;
+    int raced_late = -1;
+    cbm_store_t *raced_store = cbm_store_open_path(db_path);
+    if (raced_store) {
+        raced_stable = named_node_count(raced_store, project, "StableAdditionGeneration");
+        raced_extracted = named_node_count(raced_store, project, "ExtractedAdditionGeneration");
+        raced_late = named_node_count(raced_store, project, "LateDiscoveredGeneration");
+        cbm_store_close(raced_store);
+    }
+    int raced_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_incremental_route_t retry_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(retry);
+
+    int retry_stable = -1;
+    int retry_extracted = -1;
+    int retry_late = -1;
+    cbm_store_t *retry_store = cbm_store_open_path(db_path);
+    if (retry_store) {
+        retry_stable = named_node_count(retry_store, project, "StableAdditionGeneration");
+        retry_extracted = named_node_count(retry_store, project, "ExtractedAdditionGeneration");
+        retry_late = named_node_count(retry_store, project, "LateDiscoveredGeneration");
+        cbm_store_close(retry_store);
+    }
+    int retry_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(raced_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(raced_stable, 1);
+    ASSERT_EQ(raced_extracted, 0);
+    ASSERT_EQ(raced_late, 0);
+    ASSERT_EQ(raced_stage_count, 0);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(retry_stable, 0);
+    ASSERT_EQ(retry_extracted, 1);
+    ASSERT_EQ(retry_late, 1);
+    ASSERT_EQ(retry_stage_count, 0);
+    PASS();
+}
+
+/* A selected path-alias config is an extraction input, not just manifest
+ * metadata. Rewriting it after extraction must not publish an A-resolved graph
+ * beside a B-hashed manifest; that combination would make the next run a
+ * false no-op and permanently retain the stale target. */
+TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_tsconfig_race_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    static const char target_a_source[] = "export function publicationRaceHandler(): void {\n"
+                                          "  const selected = 'a';\n"
+                                          "  void selected;\n"
+                                          "}\n";
+    static const char target_b_source[] = "export function publicationRaceHandler(): void {\n"
+                                          "  const selected = 'b';\n"
+                                          "  void selected;\n"
+                                          "}\n";
+    static const char stable_caller_source[] =
+        "import { publicationRaceHandler } from '@publication-race';\n"
+        "function acceptPublicationRace(callback: () => void): void {\n"
+        "  void callback;\n"
+        "}\n"
+        "export function PublicationRaceStableCaller(): void {\n"
+        "  acceptPublicationRace(publicationRaceHandler);\n"
+        "}\n";
+    static const char extracted_caller_source[] =
+        "import { publicationRaceHandler } from '@publication-race';\n"
+        "function acceptPublicationRace(callback: () => void): void {\n"
+        "  void callback;\n"
+        "}\n"
+        "export function PublicationRaceExtractedCaller(): void {\n"
+        "  acceptPublicationRace(publicationRaceHandler);\n"
+        "}\n";
+    static const char tsconfig_a[] = "{\n"
+                                     "  \"compilerOptions\": {\n"
+                                     "    \"baseUrl\": \".\",\n"
+                                     "    \"paths\": {\"@publication-race\": [\"./target_a\"]}\n"
+                                     "  }\n"
+                                     "}\n";
+    static const char tsconfig_b[] = "{\n"
+                                     "  \"compilerOptions\": {\n"
+                                     "    \"baseUrl\": \".\",\n"
+                                     "    \"paths\": {\"@publication-race\": [\"./target_b\"]}\n"
+                                     "  }\n"
+                                     "}\n";
+
+    write_temp_file(tmp, "target_a.ts", target_a_source);
+    write_temp_file(tmp, "target_b.ts", target_b_source);
+    write_temp_file(tmp, "caller.ts", stable_caller_source);
+    write_temp_file(tmp, "tsconfig.json", tsconfig_a);
+    char caller_path[512];
+    char tsconfig_path[512];
+    char db_path[512];
+    snprintf(caller_path, sizeof(caller_path), "%s/caller.ts", tmp);
+    snprintf(tsconfig_path, sizeof(tsconfig_path), "%s/tsconfig.json", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    ASSERT_EQ(th_write_file(caller_path, extracted_caller_source), 0);
+    manifest_race_mutation_t mutation = {
+        .path = tsconfig_path,
+        .replacement = tsconfig_b,
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *raced = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(raced);
+    int raced_rc = cbm_pipeline_run(raced);
+    cbm_pipeline_free(raced);
+
+    int raced_stable_a = -1;
+    int raced_stable_b = -1;
+    int raced_extracted_nodes = -1;
+    cbm_store_t *raced_store = cbm_store_open_path(db_path);
+    if (raced_store) {
+        raced_stable_a = named_edge_to_file_count(raced_store, project, "CALL_REFERENCE",
+                                                  "PublicationRaceStableCaller",
+                                                  "publicationRaceHandler", "target_a.ts");
+        raced_stable_b = named_edge_to_file_count(raced_store, project, "CALL_REFERENCE",
+                                                  "PublicationRaceStableCaller",
+                                                  "publicationRaceHandler", "target_b.ts");
+        raced_extracted_nodes =
+            named_node_count(raced_store, project, "PublicationRaceExtractedCaller");
+        cbm_store_close(raced_store);
+    }
+    int raced_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_incremental_route_t retry_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(retry);
+
+    int retry_stable_nodes = -1;
+    int retry_extracted_a = -1;
+    int retry_extracted_b = -1;
+    int retry_extracted_usage = -1;
+    int retry_extracted_calls = -1;
+    cbm_store_t *retry_store = cbm_store_open_path(db_path);
+    if (retry_store) {
+        retry_stable_nodes = named_node_count(retry_store, project, "PublicationRaceStableCaller");
+        retry_extracted_a = named_edge_to_file_count(retry_store, project, "CALL_REFERENCE",
+                                                     "PublicationRaceExtractedCaller",
+                                                     "publicationRaceHandler", "target_a.ts");
+        retry_extracted_b = named_edge_to_file_count(retry_store, project, "CALL_REFERENCE",
+                                                     "PublicationRaceExtractedCaller",
+                                                     "publicationRaceHandler", "target_b.ts");
+        retry_extracted_usage =
+            named_edge_count(retry_store, project, "USAGE", "PublicationRaceExtractedCaller",
+                             "publicationRaceHandler");
+        retry_extracted_calls =
+            named_edge_count(retry_store, project, "CALLS", "PublicationRaceExtractedCaller",
+                             "publicationRaceHandler");
+        cbm_store_close(retry_store);
+    }
+    int retry_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(raced_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(raced_stable_a, 1);
+    ASSERT_EQ(raced_stable_b, 0);
+    ASSERT_EQ(raced_extracted_nodes, 0);
+    ASSERT_EQ(raced_stage_count, 0);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(retry_stable_nodes, 0);
+    ASSERT_EQ(retry_extracted_a, 0);
+    ASSERT_EQ(retry_extracted_b, 1);
+    ASSERT_EQ(retry_extracted_usage, 0);
+    ASSERT_EQ(retry_extracted_calls, 0);
+    ASSERT_EQ(retry_stage_count, 0);
+    PASS();
+}
+
+/* Metadata participates in exact-input compatibility. Old coverage schema or
+ * an upgrade to a more comprehensive discovery/index mode must force a
+ * complete replacement even when every semantic-input byte is unchanged; the
+ * replacement must write current metadata so the next identical run is a
+ * true no-op. Cheaper requests retain fuller published coverage separately. */
+TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_metadata_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def ExactMetadataGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *exact_before_migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(exact_before_migration);
+    ASSERT_EQ(cbm_pipeline_run(exact_before_migration), 0);
+    cbm_incremental_route_t exact_before_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(exact_before_migration);
+
+    cbm_store_t *metadata_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(metadata_store);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    int coverage_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(metadata_store, project, &coverage_rows, &coverage_count),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t current_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &current_meta), CBM_STORE_OK);
+    cbm_coverage_meta_t legacy_meta = current_meta;
+    legacy_meta.coverage_version = 1;
+    ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
+                                            &legacy_meta),
+              CBM_STORE_OK);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
+    cbm_store_coverage_meta_clear(&current_meta);
+    cbm_store_close(metadata_store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(migration);
+    ASSERT_EQ(cbm_pipeline_run(migration), 0);
+    cbm_incremental_route_t migration_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(migration);
+
+    metadata_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(metadata_store);
+    cbm_coverage_meta_t migrated_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &migrated_meta), CBM_STORE_OK);
+    int migrated_version = migrated_meta.coverage_version;
+    bool migrated_hashes_complete = migrated_meta.hash_records_complete;
+    char migrated_mode[32];
+    snprintf(migrated_mode, sizeof(migrated_mode), "%s",
+             migrated_meta.index_mode ? migrated_meta.index_mode : "");
+    cbm_store_coverage_meta_clear(&migrated_meta);
+    cbm_store_close(metadata_store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *mode_change = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(mode_change);
+    ASSERT_EQ(cbm_pipeline_run(mode_change), 0);
+    cbm_incremental_route_t mode_change_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(mode_change);
+
+    metadata_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(metadata_store);
+    cbm_coverage_meta_t full_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &full_meta), CBM_STORE_OK);
+    int full_version = full_meta.coverage_version;
+    bool full_hashes_complete = full_meta.hash_records_complete;
+    char full_mode[32];
+    snprintf(full_mode, sizeof(full_mode), "%s", full_meta.index_mode ? full_meta.index_mode : "");
+    cbm_store_coverage_meta_clear(&full_meta);
+    cbm_store_close(metadata_store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *exact_full = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(exact_full);
+    ASSERT_EQ(cbm_pipeline_run(exact_full), 0);
+    cbm_incremental_route_t exact_full_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(exact_full);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(exact_before_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(migration_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(migrated_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_TRUE(migrated_hashes_complete);
+    ASSERT_STR_EQ(migrated_mode, "fast");
+    ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(full_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_TRUE(full_hashes_complete);
+    ASSERT_STR_EQ(full_mode, "full");
+    ASSERT_EQ(exact_full_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
+/* Once a repository contains a shared artifact, every subsequently published
+ * full generation must refresh it, even when persistence was not explicitly
+ * requested on that invocation. Otherwise the live DB advances while a clean
+ * teammate import silently restores the previous graph. */
+TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_artifact_refresh_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char source_path[512];
+    char db_path[512];
+    char imported_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/generation.py", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    snprintf(imported_path, sizeof(imported_path), "%s/imported.db", tmp);
+    ASSERT_EQ(th_write_file(source_path, "def ArtifactGenerationBefore():\n    return 1\n"), 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    cbm_pipeline_set_persistence(baseline, true);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    ASSERT_TRUE(cbm_artifact_exists(tmp));
+
+    ASSERT_EQ(th_write_file(source_path, "def ArtifactGenerationAfter():\n    return 2\n"), 0);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *default_reindex = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(default_reindex);
+    int reindex_rc = cbm_pipeline_run(default_reindex);
+    cbm_incremental_route_t reindex_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(default_reindex);
+
+    /* A derived artifact must not become an input that forces another rebuild,
+     * and refreshing it must not switch the authoritative DB back to WAL. */
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *unchanged = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(unchanged);
+    int unchanged_rc = cbm_pipeline_run(unchanged);
+    cbm_incremental_route_t unchanged_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(unchanged);
+
+    char journal_mode[16] = {0};
+    sqlite3 *raw = NULL;
+    sqlite3_stmt *journal_stmt = NULL;
+    int journal_ok =
+        sqlite3_open_v2(db_path, &raw, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(raw, "PRAGMA journal_mode;", -1, &journal_stmt, NULL) == SQLITE_OK &&
+        sqlite3_step(journal_stmt) == SQLITE_ROW;
+    if (journal_ok) {
+        const unsigned char *mode = sqlite3_column_text(journal_stmt, 0);
+        if (!mode || snprintf(journal_mode, sizeof(journal_mode), "%s", (const char *)mode) >=
+                         (int)sizeof(journal_mode)) {
+            journal_ok = 0;
+        }
+    }
+    sqlite3_finalize(journal_stmt);
+    if (raw) {
+        sqlite3_close(raw);
+    }
+
+    int live_before = -1;
+    int live_after = -1;
+    cbm_store_t *live_store = cbm_store_open_path(db_path);
+    if (live_store) {
+        live_before = named_node_count(live_store, project, "ArtifactGenerationBefore");
+        live_after = named_node_count(live_store, project, "ArtifactGenerationAfter");
+        cbm_store_close(live_store);
+    }
+
+    int import_rc = cbm_artifact_import(tmp, imported_path);
+    int artifact_before = -1;
+    int artifact_after = -1;
+    cbm_store_t *artifact_store = import_rc == 0 ? cbm_store_open_path(imported_path) : NULL;
+    if (artifact_store) {
+        artifact_before = named_node_count(artifact_store, project, "ArtifactGenerationBefore");
+        artifact_after = named_node_count(artifact_store, project, "ArtifactGenerationAfter");
+        cbm_store_close(artifact_store);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(reindex_rc, 0);
+    ASSERT_EQ(reindex_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(unchanged_rc, 0);
+    ASSERT_EQ(unchanged_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_TRUE(journal_ok);
+    ASSERT_STR_EQ(journal_mode, "delete");
+    ASSERT_EQ(live_before, 0);
+    ASSERT_EQ(live_after, 1);
+    ASSERT_EQ(import_rc, 0);
+    ASSERT_EQ(artifact_before, 0);
+    ASSERT_EQ(artifact_after, 1);
+    PASS();
+}
+
+/* Cancellation observed after predump must be an explicit preserved abort,
+ * never a false success. The retry then publishes the edited generation. */
+TEST(pipeline_full_cancel_after_predump_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_cancel_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char before_source[] = "def BeforeCancel():\n    return 1\n";
+    static const char after_source[] = "def AfterCancel():\n    return 2\n# changed\n";
+    write_temp_file(tmp, "generation.py", before_source);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    write_temp_file(tmp, "generation.py", after_source);
+    cbm_pipeline_incremental_test_cancel_after_predump_once();
+    cbm_pipeline_t *cancelled = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(cancelled);
+    int cancelled_rc = cbm_pipeline_run(cancelled);
+    cbm_incremental_route_t cancelled_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(cancelled);
+    int cancelled_before = -1;
+    int cancelled_after = -1;
+    observe_named_generation(db_path, project, "BeforeCancel", "AfterCancel", &cancelled_before,
+                             &cancelled_after);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_incremental_route_t retry_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(retry);
+    int retry_before = -1;
+    int retry_after = -1;
+    observe_named_generation(db_path, project, "BeforeCancel", "AfterCancel", &retry_before,
+                             &retry_after);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(cancelled_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(cancelled_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(cancelled_before, 1);
+    ASSERT_EQ(cancelled_after, 0);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(retry_before, 0);
+    ASSERT_EQ(retry_after, 1);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
+/* Cancellation can arrive while the destination DB is being quiesced. It must
+ * still be observed at the final commit boundary, before the atomic rename. */
+TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_late_cancel_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def BeforeLateCancel():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    write_temp_file(tmp, "generation.py", "def AfterLateCancel():\n    return 2\n# changed\n");
+    cbm_pipeline_incremental_test_cancel_after_destination_prepare_once();
+    cbm_pipeline_t *cancelled = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(cancelled);
+    int cancelled_rc = cbm_pipeline_run(cancelled);
+    cbm_pipeline_free(cancelled);
+
+    int before_count = -1;
+    int after_count = -1;
+    observe_named_generation(db_path, project, "BeforeLateCancel", "AfterLateCancel", &before_count,
+                             &after_count);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(cancelled_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(before_count, 1);
+    ASSERT_EQ(after_count, 0);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
+/* A failure after graph serialization but before metadata/publication must
+ * discard only the staged generation. The final path remains the complete old
+ * graph and a clean retry converges. */
+TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_full_fail_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def BeforeFullPersist():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    write_temp_file(tmp, "generation.py",
+                    "def AfterFullPersist():\n    return 2\n# changed generation\n");
+    cbm_pipeline_incremental_test_fail_after_stage_dump_once();
+    cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(faulted);
+    int faulted_rc = cbm_pipeline_run(faulted);
+    cbm_pipeline_free(faulted);
+    int faulted_before = -1;
+    int faulted_after = -1;
+    observe_named_generation(db_path, project, "BeforeFullPersist", "AfterFullPersist",
+                             &faulted_before, &faulted_after);
+    int faulted_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_pipeline_free(retry);
+    int retry_before = -1;
+    int retry_after = -1;
+    observe_named_generation(db_path, project, "BeforeFullPersist", "AfterFullPersist",
+                             &retry_before, &retry_after);
+    int retry_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(faulted_rc, CBM_PIPELINE_PERSIST_FAILED);
+    ASSERT_EQ(faulted_before, 1);
+    ASSERT_EQ(faulted_after, 0);
+    ASSERT_EQ(faulted_stage_count, 0);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_before, 0);
+    ASSERT_EQ(retry_after, 1);
+    ASSERT_EQ(retry_stage_count, 0);
+    PASS();
+}
+
+/* Keep the legacy partial route test-only so its fail-closed behavior remains
+ * covered even though production semantic changes now force a full rebuild. */
+TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retries) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_incr_fail_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def BeforeIncrementalPersist():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    write_temp_file(tmp, "generation.py",
+                    "def AfterIncrementalPersist():\n    return 2\n# changed generation\n");
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_incremental_test_fail_after_stage_dump_once();
+    cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(faulted);
+    int faulted_rc = cbm_pipeline_run(faulted);
+    cbm_incremental_route_t faulted_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(faulted);
+    int faulted_before = -1;
+    int faulted_after = -1;
+    observe_named_generation(db_path, project, "BeforeIncrementalPersist",
+                             "AfterIncrementalPersist", &faulted_before, &faulted_after);
+    int faulted_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_incremental_route_t retry_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(retry);
+    int retry_before = -1;
+    int retry_after = -1;
+    observe_named_generation(db_path, project, "BeforeIncrementalPersist",
+                             "AfterIncrementalPersist", &retry_before, &retry_after);
+    int retry_stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(faulted_rc, CBM_PIPELINE_PERSIST_FAILED);
+    ASSERT_EQ(faulted_route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(faulted_before, 1);
+    ASSERT_EQ(faulted_after, 0);
+    ASSERT_EQ(faulted_stage_count, 0);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(retry_before, 0);
+    ASSERT_EQ(retry_after, 1);
+    ASSERT_EQ(retry_stage_count, 0);
+    PASS();
+}
+
+TEST(pipeline_incremental_successful_publication_preserves_adr) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_incr_adr_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def BeforeAdrIncremental():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+    static const char adr_text[] = "# Decision\nPreserve across publication.";
+    cbm_store_t *adr_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(adr_store);
+    ASSERT_EQ(cbm_store_adr_store(adr_store, project, adr_text), CBM_STORE_OK);
+    cbm_store_close(adr_store);
+
+    write_temp_file(tmp, "generation.py",
+                    "def AfterAdrIncremental():\n    return 2\n# changed generation\n");
+    cbm_pipeline_incremental_test_force_legacy_partial_once();
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    int run_rc = cbm_pipeline_run(incremental);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incremental);
+    cbm_store_t *published = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(published);
+    cbm_adr_t adr = {0};
+    int adr_rc = cbm_store_adr_get(published, project, &adr);
+    bool adr_matches = adr_rc == CBM_STORE_OK && adr.content && strcmp(adr.content, adr_text) == 0;
+    cbm_store_adr_free(&adr);
+    cbm_store_close(published);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_TRUE(adr_matches);
+    PASS();
+}
+
+/* A forced-full rebuild must never erase an ADR merely because the old
+ * generation could not be read completely. The capture is part of the
+ * publication transaction: failure preserves both graph and ADR. */
+TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_adr_capture_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def BeforeAdrCapture():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    static const char adr_text[] = "# Decision\nADR capture is fail-closed.";
+    cbm_store_t *adr_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(adr_store);
+    ASSERT_EQ(cbm_store_adr_store(adr_store, project, adr_text), CBM_STORE_OK);
+    cbm_store_close(adr_store);
+
+    write_temp_file(tmp, "generation.py", "def AfterAdrCapture():\n    return 2\n");
+    cbm_pipeline_incremental_test_fail_adr_capture_once();
+    cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(faulted);
+    int faulted_rc = cbm_pipeline_run(faulted);
+    cbm_pipeline_free(faulted);
+
+    int faulted_before = -1;
+    int faulted_after = -1;
+    observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture",
+                             &faulted_before, &faulted_after);
+    cbm_store_t *preserved = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(preserved);
+    cbm_adr_t preserved_adr = {0};
+    int preserved_adr_rc = cbm_store_adr_get(preserved, project, &preserved_adr);
+    bool preserved_adr_matches = preserved_adr_rc == CBM_STORE_OK && preserved_adr.content &&
+                                 strcmp(preserved_adr.content, adr_text) == 0;
+    cbm_store_adr_free(&preserved_adr);
+    cbm_store_close(preserved);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(retry);
+    int retry_rc = cbm_pipeline_run(retry);
+    cbm_pipeline_free(retry);
+    int retry_before = -1;
+    int retry_after = -1;
+    observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture", &retry_before,
+                             &retry_after);
+    cbm_store_t *published = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(published);
+    cbm_adr_t published_adr = {0};
+    int published_adr_rc = cbm_store_adr_get(published, project, &published_adr);
+    bool published_adr_matches = published_adr_rc == CBM_STORE_OK && published_adr.content &&
+                                 strcmp(published_adr.content, adr_text) == 0;
+    cbm_store_adr_free(&published_adr);
+    cbm_store_close(published);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(faulted_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
+    ASSERT_EQ(faulted_before, 1);
+    ASSERT_EQ(faulted_after, 0);
+    ASSERT_TRUE(preserved_adr_matches);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_before, 0);
+    ASSERT_EQ(retry_after, 1);
+    ASSERT_TRUE(published_adr_matches);
+    PASS();
+}
+
+/* An exact semantic manifest must fail closed when its repository root cannot
+ * be traversed. A regular file is a deterministic cross-platform opendir
+ * failure that does not depend on process permissions. */
+TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_not_dir_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "not-a-directory", "manifest root sentinel\n");
+    char root_path[512];
+    snprintf(root_path, sizeof(root_path), "%s/not-a-directory", tmp);
+
+    cbm_file_hash_t *manifest = NULL;
+    int manifest_count = -1;
+    int rc = cbm_pipeline_build_semantic_manifest("manifest-fail-closed", root_path, NULL, 0, NULL,
+                                                  0, NULL, NULL, &manifest, &manifest_count);
+    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(rc != 0);
+    ASSERT_EQ(manifest_count, 0);
+    PASS();
+}
+
+/* A fully validated staged graph must be able to recover from a definitely
+ * non-SQLite destination without deleting evidence or overwriting an earlier
+ * quarantine. The replacement happens only after the corrupt bytes are moved. */
+TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite) {
+    static const char corrupt_bytes[] = "not a sqlite database\n";
+    static const char previous_backup[] = "older quarantine\n";
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_corrupt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "fresh.py", "def FreshAfterCorruption():\n    return 1\n");
+    write_temp_file(tmp, "generation.db", corrupt_bytes);
+    write_temp_file(tmp, "generation.db.corrupt", previous_backup);
+
+    char db_path[512];
+    char old_backup_path[512];
+    char new_backup_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    snprintf(old_backup_path, sizeof(old_backup_path), "%s.corrupt", db_path);
+    snprintf(new_backup_path, sizeof(new_backup_path), "%s.corrupt.1", db_path);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int run_rc = cbm_pipeline_run(pipeline);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    char old_observed[64] = {0};
+    char new_observed[64] = {0};
+    FILE *old_backup_file = cbm_fopen(old_backup_path, "rb");
+    FILE *new_backup_file = cbm_fopen(new_backup_path, "rb");
+    size_t old_size =
+        old_backup_file ? fread(old_observed, 1, sizeof(old_observed) - 1, old_backup_file) : 0;
+    size_t new_size =
+        new_backup_file ? fread(new_observed, 1, sizeof(new_observed) - 1, new_backup_file) : 0;
+    if (old_backup_file) {
+        fclose(old_backup_file);
+    }
+    if (new_backup_file) {
+        fclose(new_backup_file);
+    }
+
+    int fresh_nodes = -1;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (store) {
+        fresh_nodes = named_node_count(store, project, "FreshAfterCorruption");
+        cbm_store_close(store);
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ((int)old_size, (int)strlen(previous_backup));
+    ASSERT_STR_EQ(old_observed, previous_backup);
+    ASSERT_EQ((int)new_size, (int)strlen(corrupt_bytes));
+    ASSERT_STR_EQ(new_observed, corrupt_bytes);
+    ASSERT_EQ(fresh_nodes, 1);
+    PASS();
+}
+
+/* Readable legacy graphs are replaceable generations, not corruption. The
+ * publication boundary must neither run current-schema migration against the
+ * old edges table nor require an ADR table that did not exist yet. */
+TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_legacy_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "fresh.py", "def FreshAfterLegacy():\n    return 1\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    sqlite3 *legacy = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db_path, &legacy, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL),
+              SQLITE_OK);
+    const char *legacy_schema =
+        "CREATE TABLE projects(name TEXT PRIMARY KEY,indexed_at TEXT NOT NULL,root_path TEXT NOT "
+        "NULL);"
+        "CREATE TABLE file_hashes(project TEXT NOT NULL,rel_path TEXT NOT NULL,sha256 TEXT NOT "
+        "NULL,mtime_ns INTEGER NOT NULL DEFAULT 0,size INTEGER NOT NULL DEFAULT 0,PRIMARY KEY "
+        "(project,rel_path));"
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY,project TEXT NOT NULL,label TEXT NOT NULL,name "
+        "TEXT NOT NULL,qualified_name TEXT NOT NULL,file_path TEXT,start_line INTEGER,end_line "
+        "INTEGER,properties TEXT DEFAULT '{}');"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY,project TEXT NOT NULL,source_id INTEGER NOT "
+        "NULL,target_id INTEGER NOT NULL,type TEXT NOT NULL,properties TEXT DEFAULT '{}',UNIQUE "
+        "(source_id,target_id,type));";
+    ASSERT_EQ(sqlite3_exec(legacy, legacy_schema, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_stmt *insert_project = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(
+                  legacy, "INSERT INTO projects(name,indexed_at,root_path) VALUES(?1,'legacy',?2);",
+                  -1, &insert_project, NULL),
+              SQLITE_OK);
+    const char *project_name = strrchr(tmp, '/');
+    project_name = project_name ? project_name + 1 : tmp;
+    ASSERT_EQ(sqlite3_bind_text(insert_project, 1, project_name, -1, SQLITE_TRANSIENT), SQLITE_OK);
+    ASSERT_EQ(sqlite3_bind_text(insert_project, 2, tmp, -1, SQLITE_TRANSIENT), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(insert_project), SQLITE_DONE);
+    sqlite3_finalize(insert_project);
+    sqlite3_close(legacy);
+
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int run_rc = cbm_pipeline_run(pipeline);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+
+    int fresh_nodes = -1;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (store) {
+        fresh_nodes = named_node_count(store, project, "FreshAfterLegacy");
+        cbm_store_close(store);
+    }
+    int generated_column_count = 0;
+    sqlite3 *current = NULL;
+    sqlite3_stmt *column_query = NULL;
+    if (sqlite3_open_v2(db_path, &current, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK &&
+        sqlite3_prepare_v2(current,
+                           "SELECT count(*) FROM pragma_table_xinfo('edges') "
+                           "WHERE name='local_name_gen';",
+                           -1, &column_query, NULL) == SQLITE_OK &&
+        sqlite3_step(column_query) == SQLITE_ROW) {
+        generated_column_count = sqlite3_column_int(column_query, 0);
+    }
+    sqlite3_finalize(column_query);
+    if (current) {
+        sqlite3_close(current);
+    }
+    char quarantine_path[512];
+    snprintf(quarantine_path, sizeof(quarantine_path), "%s.corrupt", db_path);
+    cbm_path_info_t quarantine_info;
+    bool quarantined = cbm_path_info_utf8(quarantine_path, &quarantine_info) == 0;
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(fresh_nodes, 1);
+    ASSERT_EQ(generated_column_count, 1);
+    ASSERT_FALSE(quarantined);
+    PASS();
+}
+#endif
+
+/* Re-indexing only a target whose qualified name survives a callable-to-value
+ * edit must not restore the unchanged caller's stale inbound CALL_REFERENCE
+ * snapshot. A fresh full index of the edited sources is the convergence oracle:
+ * the now-non-callable identifier remains a USAGE, never a call relationship. */
+TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ref_stale_inbound_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    static const char callable_target_source[] = "export function staleSemanticTarget(): void {}\n";
+    static const char value_target_source[] = "export const staleSemanticTarget = 42;\n";
+    static const char caller_source[] =
+        "import { staleSemanticTarget } from './target';\n"
+        "function acceptStaleSemanticReference(callback: () => void): void {}\n"
+        "export function staleSemanticCaller(): void {\n"
+        "  acceptStaleSemanticReference(staleSemanticTarget);\n"
+        "}\n";
+
+    write_temp_file(tmp, "target.ts", callable_target_source);
+    write_temp_file(tmp, "caller.ts", caller_source);
+
+    char incremental_db[512];
+    snprintf(incremental_db, sizeof(incremental_db), "%s/stale-inbound-incremental.db", tmp);
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    const char *baseline_project = cbm_pipeline_project_name(baseline);
+    cbm_store_t *baseline_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(baseline_store);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "CALL_REFERENCE",
+                               "staleSemanticCaller", "staleSemanticTarget"),
+              1);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "USAGE", "staleSemanticCaller",
+                               "staleSemanticTarget"),
+              0);
+    ASSERT_EQ(named_edge_count(baseline_store, baseline_project, "CALLS", "staleSemanticCaller",
+                               "staleSemanticTarget"),
+              0);
+    cbm_store_close(baseline_store);
+    cbm_pipeline_free(baseline);
+
+    write_temp_file(tmp, "target.ts", value_target_source);
+
+    cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, incremental_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incremental);
+    ASSERT_EQ(cbm_pipeline_run(incremental), 0);
+    const char *incremental_project = cbm_pipeline_project_name(incremental);
+    cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
+    ASSERT_NOT_NULL(incremental_store);
+    int incremental_reference =
+        named_edge_count(incremental_store, incremental_project, "CALL_REFERENCE",
+                         "staleSemanticCaller", "staleSemanticTarget");
+    int incremental_usage = named_edge_count(incremental_store, incremental_project, "USAGE",
+                                             "staleSemanticCaller", "staleSemanticTarget");
+    int incremental_calls = named_edge_count(incremental_store, incremental_project, "CALLS",
+                                             "staleSemanticCaller", "staleSemanticTarget");
+    cbm_store_close(incremental_store);
+    cbm_pipeline_free(incremental);
+
+    char full_db[512];
+    snprintf(full_db, sizeof(full_db), "%s/stale-inbound-full.db", tmp);
+    cbm_pipeline_t *full = cbm_pipeline_new(tmp, full_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    const char *full_project = cbm_pipeline_project_name(full);
+    cbm_store_t *full_store = cbm_store_open_path(full_db);
+    ASSERT_NOT_NULL(full_store);
+    int full_reference = named_edge_count(full_store, full_project, "CALL_REFERENCE",
+                                          "staleSemanticCaller", "staleSemanticTarget");
+    int full_usage = named_edge_count(full_store, full_project, "USAGE", "staleSemanticCaller",
+                                      "staleSemanticTarget");
+    int full_calls = named_edge_count(full_store, full_project, "CALLS", "staleSemanticCaller",
+                                      "staleSemanticTarget");
+    cbm_store_close(full_store);
+    cbm_pipeline_free(full);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(full_reference, 0);
+    ASSERT_EQ(full_usage, 1);
+    ASSERT_EQ(full_calls, 0);
+    ASSERT_EQ(incremental_reference, full_reference);
+    ASSERT_EQ(incremental_usage, full_usage);
+    ASSERT_EQ(incremental_calls, full_calls);
+    PASS();
+}
+
+/* Registry construction in incremental-parallel mode can materialize serial
+ * resource nodes after extraction establishes the workers' shared-ID
+ * watermark. A subsequent worker-created synthetic node must not reuse that
+ * ID: duplicate temporary IDs make dump-time edge remapping point CONFIGURES
+ * or DECORATES at the wrong target. The second run changes all 51 files so the
+ * production incremental path crosses MIN_FILES_FOR_PARALLEL_INCR. */
+TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incr_ids_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    char collision_path[512];
+    snprintf(collision_path, sizeof(collision_path), "%s/00_collision.py", tmp);
+    int setup_ok =
+        th_write_file(collision_path, "import os\n"
+                                      "def incrementalCollisionTarget(): return 1\n"
+                                      "def incrementalCollisionAccept(callback): pass\n"
+                                      "@old_marker\n"
+                                      "def incrementalCollisionCarrier():\n"
+                                      "    incrementalCollisionTarget()\n"
+                                      "    incrementalCollisionAccept(incrementalCollisionTarget)\n"
+                                      "    return os.getenv(\"OLD_TOKEN\")\n") == 0;
+    for (int i = 0; setup_ok && i < 50; i++) {
+        char path[512];
+        char source[128];
+        snprintf(path, sizeof(path), "%s/z_pad_%02d.ts", tmp, i);
+        snprintf(source, sizeof(source), "// initial incremental ID pad %02d\n", i);
+        setup_ok = th_write_file(path, source) == 0;
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/incremental-ids.db", tmp);
+    int first_rc = -1;
+    int second_rc = -1;
+    int env_edge_count = -1;
+    int decorator_edge_count = -1;
+    int misdirected_env_edge_count = -1;
+    int reference_edge_count = -1;
+    int env_node_count = -1;
+    int decorator_node_count = -1;
+
+    if (setup_ok) {
+        cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (first) {
+            first_rc = cbm_pipeline_run(first);
+            cbm_pipeline_free(first);
+        }
+    }
+
+    int update_ok =
+        setup_ok && first_rc == 0 &&
+        th_write_file(collision_path, "import os\n"
+                                      "def incrementalCollisionTarget(): return 1\n"
+                                      "def incrementalCollisionAccept(callback): pass\n"
+                                      "@new_marker\n"
+                                      "def incrementalCollisionCarrier():\n"
+                                      "    incrementalCollisionTarget()\n"
+                                      "    incrementalCollisionAccept(incrementalCollisionTarget)\n"
+                                      "    return os.getenv(\"NEW_TOKEN\")\n"
+                                      "# incremental size marker\n") == 0;
+    for (int i = 0; update_ok && i < 50; i++) {
+        char path[512];
+        char source[160];
+        snprintf(path, sizeof(path), "%s/z_pad_%02d.ts", tmp, i);
+        snprintf(source, sizeof(source), "// changed incremental ID pad %02d with marker\n", i);
+        update_ok = th_write_file(path, source) == 0;
+    }
+
+    if (update_ok) {
+        cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (second) {
+            second_rc = cbm_pipeline_run(second);
+            const char *project = cbm_pipeline_project_name(second);
+            cbm_store_t *store = cbm_store_open_path(db_path);
+            if (store && project) {
+                env_edge_count = named_edge_count(store, project, "CONFIGURES",
+                                                  "incrementalCollisionCarrier", "NEW_TOKEN");
+                decorator_edge_count = named_edge_count(
+                    store, project, "DECORATES", "incrementalCollisionCarrier", "new_marker");
+                misdirected_env_edge_count = named_edge_count(
+                    store, project, "CONFIGURES", "incrementalCollisionCarrier", "new_marker");
+                reference_edge_count =
+                    named_edge_count(store, project, "CALL_REFERENCE",
+                                     "incrementalCollisionCarrier", "incrementalCollisionTarget");
+                env_node_count = named_node_count(store, project, "NEW_TOKEN");
+                decorator_node_count = named_node_count(store, project, "new_marker");
+            }
+            if (store) {
+                cbm_store_close(store);
+            }
+            cbm_pipeline_free(second);
+        }
+    }
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    if (env_node_count != 1 || decorator_node_count != 1 || env_edge_count != 1 ||
+        decorator_edge_count != 1 || misdirected_env_edge_count != 0 || reference_edge_count != 1) {
+        printf("  incremental ID diagnostic: env_node=%d decorator_node=%d "
+               "configures_env=%d decorates=%d configures_decorator=%d call_reference=%d\n",
+               env_node_count, decorator_node_count, env_edge_count, decorator_edge_count,
+               misdirected_env_edge_count, reference_edge_count);
+    }
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_TRUE(update_ok);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_EQ(env_node_count, 1);
+    ASSERT_EQ(decorator_node_count, 1);
+    ASSERT_EQ(env_edge_count, 1);
+    ASSERT_EQ(decorator_edge_count, 1);
+    ASSERT_EQ(misdirected_env_edge_count, 0);
+    ASSERT_EQ(reference_edge_count, 1);
+    PASS();
+}
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static void observe_incremental_generation(const char *db_path, const char *project,
+                                           int generation_size, int *before_count,
+                                           int *after_count) {
+    *before_count = -1;
+    *after_count = -1;
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store || !project) {
+        if (store) {
+            cbm_store_close(store);
+        }
+        return;
+    }
+
+    int before = 0;
+    int after = 0;
+    for (int i = 0; i < generation_size; i++) {
+        char before_name[32];
+        char after_name[32];
+        snprintf(before_name, sizeof(before_name), "Before%02d", i);
+        snprintf(after_name, sizeof(after_name), "After%02d", i);
+        int before_nodes = named_node_count(store, project, before_name);
+        int after_nodes = named_node_count(store, project, after_name);
+        if (before_nodes < 0 || after_nodes < 0) {
+            cbm_store_close(store);
+            return;
+        }
+        before += before_nodes;
+        after += after_nodes;
+    }
+    cbm_store_close(store);
+    *before_count = before;
+    *after_count = after;
+}
+
+/* A parallel incremental run must preserve its prior database when the
+ * per-file result cache cannot be allocated. A clean retry must then converge
+ * to the new generation.
+ *
+ * RED before fail-closed propagation: the injected allocation failure skips
+ * extract/resolve, but the caller dumps the already-purged graph, advances all
+ * file hashes, and returns 0. The second graph is empty and the third run is a
+ * no-op instead of recovering the missing definitions. */
+TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries) {
+    enum { GENERATION_SIZE = 51 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incr_cache_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    cbm_pipeline_incremental_test_reset_faults();
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    int setup_ok = 1;
+    for (int i = 0; setup_ok && i < GENERATION_SIZE; i++) {
+        char path[512];
+        char source[128];
+        snprintf(path, sizeof(path), "%s/generation_%02d.py", tmp, i);
+        snprintf(source, sizeof(source), "def Before%02d():\n    return %d\n", i, i);
+        setup_ok = th_write_file(path, source) == 0;
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/incremental-cache.db", tmp);
+    int first_rc = -1;
+    int baseline_before = -1;
+    int baseline_after = -1;
+    if (setup_ok) {
+        cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (first) {
+            first_rc = cbm_pipeline_run(first);
+            observe_incremental_generation(db_path, cbm_pipeline_project_name(first),
+                                           GENERATION_SIZE, &baseline_before, &baseline_after);
+            cbm_pipeline_free(first);
+        }
+    }
+
+    int edit_ok = setup_ok && first_rc == 0;
+    for (int i = 0; edit_ok && i < GENERATION_SIZE; i++) {
+        char path[512];
+        char source[160];
+        snprintf(path, sizeof(path), "%s/generation_%02d.py", tmp, i);
+        snprintf(source, sizeof(source),
+                 "def After%02d():\n    return %d\n# edited generation %02d\n", i, i, i);
+        edit_ok = th_write_file(path, source) == 0;
+    }
+
+    int second_rc = -1;
+    int second_before = -1;
+    int second_after = -1;
+    if (edit_ok) {
+        cbm_pipeline_incremental_test_fail_result_cache_alloc_once();
+        cbm_pipeline_incremental_test_force_legacy_partial_once();
+        cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (second) {
+            second_rc = cbm_pipeline_run(second);
+            observe_incremental_generation(db_path, cbm_pipeline_project_name(second),
+                                           GENERATION_SIZE, &second_before, &second_after);
+            cbm_pipeline_free(second);
+        }
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+
+    int third_rc = -1;
+    int retry_before = -1;
+    int retry_after = -1;
+    if (edit_ok) {
+        cbm_pipeline_t *third = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        if (third) {
+            third_rc = cbm_pipeline_run(third);
+            observe_incremental_generation(db_path, cbm_pipeline_project_name(third),
+                                           GENERATION_SIZE, &retry_before, &retry_after);
+            cbm_pipeline_free(third);
+        }
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    bool second_is_preserved_failure = second_rc == CBM_PIPELINE_ABORT_PRESERVE_DB &&
+                                       second_before == GENERATION_SIZE && second_after == 0;
+    if (!second_is_preserved_failure) {
+        printf("  incremental cache failure diagnostic: rc=%d before=%d after=%d\n", second_rc,
+               second_before, second_after);
+    }
+
+    ASSERT_TRUE(setup_ok);
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_EQ(baseline_before, GENERATION_SIZE);
+    ASSERT_EQ(baseline_after, 0);
+    ASSERT_TRUE(edit_ok);
+    ASSERT_TRUE(second_is_preserved_failure);
+    ASSERT_EQ(third_rc, 0);
+    ASSERT_EQ(retry_before, 0);
+    ASSERT_EQ(retry_after, GENERATION_SIZE);
+    PASS();
+}
+#endif
+
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_recv_XXXXXX");
@@ -1126,6 +4021,179 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
         cbm_unsetenv("CBM_WORKERS");
     }
     th_rmtree(tmp);
+    PASS();
+}
+
+/* Reproduce-first: pass_parallel's fused cross-LSP eligibility currently counts
+ * only parser-backed calls/call references. A Python binary operator has no
+ * parser CBMCall; its __add__ semantic record and carrier are created together
+ * only by the cross resolver. Consequently combine.py looks like it has zero
+ * semantic sites and the fused pass skips it before that carrier can exist.
+ *
+ * `visible()` is deliberately in a different file. Its ordinary method-call
+ * carrier makes THAT file cross-LSP eligible and its lsp_* edge proves that the
+ * Alpha definition, import map, shared registry, and cross resolver are all
+ * healthy. Putting the control call in combine.py would hide the bug by making
+ * the broken file eligible. The 52 fillers plus three fixture files exceed
+ * MIN_FILES_FOR_PARALLEL (50), and CBM_WORKERS=4 forces the production fused
+ * path independent of host core count. */
+TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_syn_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "alpha.py",
+                    "class Alpha:\n"
+                    "    def __add__(self, other):\n"
+                    "        return self\n");
+    write_temp_file(tmp, "visible.py",
+                    "from .alpha import Alpha\n\n"
+                    "def visible(left: Alpha, right: Alpha):\n"
+                    "    return left.__add__(right)\n");
+    write_temp_file(tmp, "combine.py",
+                    "from .alpha import Alpha\n\n"
+                    "def combine(left: Alpha, right: Alpha):\n"
+                    "    return left + right\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "py_pad_%02d.py", i);
+        snprintf(body, sizeof(body), "def py_pad_%02d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/python_parallel.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int run_rc = cbm_pipeline_run(p);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    bool store_opened = s != NULL;
+    bool control_lsp = false;
+    bool combine_to_add = false;
+    if (s) {
+        control_lsp =
+            cross_file_call_has_strategy(s, project, "visible", "__add__", "\"strategy\":\"lsp_");
+        combine_to_add = cross_file_call_exists(s, project, "combine", "__add__");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_TRUE(control_lsp);    /* non-vacuity: cross LSP + target are healthy */
+    ASSERT_TRUE(combine_to_add); /* RED: fused eligibility skips combine.py */
+    PASS();
+}
+
+/* Same fused-eligibility hole for Rust built-in macro arguments. The parser
+ * exposes format! but not render() inside its token tree. Per-file LSP already
+ * qualifies every parser-backed site in hidden.rs, so the fused heuristic sees
+ * no remaining work and never runs the cross pass that would discover both the
+ * semantic render target and its exact synthetic carrier.
+ *
+ * The exact same 55-file fixture is indexed once through the sequential path
+ * first. A hidden() -> render CALLS edge there is a strong non-vacuity control:
+ * only the sequential cross-LSP pass can discover both the macro-hidden call
+ * and its synthetic carrier. The parallel run must preserve that result. */
+TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_syn_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "lib.rs", "pub fn render() -> &'static str { \"ok\" }\n");
+    write_temp_file(tmp, "main.rs",
+                    "mod lib;\n\n"
+                    "pub fn hidden() -> String { format!(\"{}\", lib::render()) }\n");
+    for (int i = 0; i < 53; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "rust_pad_%02d.rs", i);
+        snprintf(body, sizeof(body), "pub fn rust_pad_%02d() -> i32 { %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    char seq_db_path[512];
+    snprintf(seq_db_path, sizeof(seq_db_path), "%s/rust_sequential.db", tmp);
+    cbm_pipeline_t *seq = cbm_pipeline_new(tmp, seq_db_path, CBM_MODE_FULL);
+    int seq_run_rc = seq ? cbm_pipeline_run(seq) : -1;
+    const char *seq_project = seq ? cbm_pipeline_project_name(seq) : NULL;
+    cbm_store_t *seq_store = cbm_store_open_path(seq_db_path);
+    bool seq_store_opened = seq_store != NULL;
+    bool seq_hidden_to_render = false;
+    if (seq_store && seq_project) {
+        seq_hidden_to_render = cross_file_call_exists(seq_store, seq_project, "hidden", "render");
+        cbm_store_close(seq_store);
+    }
+    cbm_pipeline_free(seq);
+
+    /* The parallel half must not inherit a caller-level single-thread override,
+     * even when the surrounding test process was launched with one. Restore it
+     * after both halves complete. */
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_parallel.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int run_rc = cbm_pipeline_run(p);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    bool store_opened = s != NULL;
+    bool render_target_present = false;
+    bool hidden_to_render = false;
+    if (s) {
+        render_target_present = count_nodes_named(s, project, "render") > 0;
+        hidden_to_render = cross_file_call_exists(s, project, "hidden", "render");
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(seq_run_rc, 0);
+    ASSERT_TRUE(seq_store_opened);
+    ASSERT_TRUE(seq_hidden_to_render); /* same fixture is semantically resolvable */
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_TRUE(store_opened);
+    ASSERT_TRUE(render_target_present); /* target is present in the parallel graph */
+    ASSERT_TRUE(hidden_to_render);      /* RED: fused eligibility skips hidden.rs */
     PASS();
 }
 
@@ -1859,7 +4927,7 @@ TEST(calls_edge_carries_call_site_line) {
 
 TEST(usages_kotlin_creates_edges) {
     /* Port of TestPassUsagesKotlinCreatesEdges.
-     * Kotlin source with callback reference → USAGE edge. */
+     * Explicit Kotlin callable syntax produces CALL_REFERENCE, not USAGE. */
     const char *kt_source = "fun process(data: String): String {\n"
                             "    return data\n"
                             "}\n\n"
@@ -1883,15 +4951,44 @@ TEST(usages_kotlin_creates_edges) {
     ASSERT_NOT_NULL(s);
     const char *project = cbm_pipeline_project_name(p);
 
-    /* Check USAGE edges exist (Kotlin extraction may or may not produce them
-     * depending on extraction support — just verify no crash and valid counts) */
+    /* The explicit reference is resolved and classified exclusively. */
     cbm_edge_t *edges = NULL;
     int edge_count = 0;
-    rc = cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &edge_count);
+    rc = cbm_store_find_edges_by_type(s, project, "CALL_REFERENCE", &edges, &edge_count);
     ASSERT_EQ(rc, CBM_STORE_OK);
-    /* Note: The Go test just logs, doesn't assert — same behavior here */
+    bool found_reference = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK && src.name &&
+            tgt.name && strcmp(src.name, "register") == 0 && strcmp(tgt.name, "process") == 0) {
+            found_reference = true;
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
     if (edges)
         cbm_store_free_edges(edges, edge_count);
+    ASSERT_TRUE(found_reference);
+
+    edges = NULL;
+    edge_count = 0;
+    rc = cbm_store_find_edges_by_type(s, project, "USAGE", &edges, &edge_count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    bool duplicated_as_usage = false;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t src = {0}, tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].source_id, &src) == CBM_STORE_OK &&
+            cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK && src.name &&
+            tgt.name && strcmp(src.name, "register") == 0 && strcmp(tgt.name, "process") == 0) {
+            duplicated_as_usage = true;
+        }
+        cbm_node_free_fields(&src);
+        cbm_node_free_fields(&tgt);
+    }
+    if (edges)
+        cbm_store_free_edges(edges, edge_count);
+    ASSERT_FALSE(duplicated_as_usage);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -2995,6 +6092,231 @@ TEST(git_context_linked_worktree) {
     th_rmtree(tmp);
     PASS();
 }
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static int branch_head_match_count(cbm_store_t *store, const char *project, const char *head_sha) {
+    cbm_node_t *branches = NULL;
+    int branch_count = 0;
+    if (!store || !project || !head_sha ||
+        cbm_store_find_nodes_by_label(store, project, "Branch", &branches, &branch_count) !=
+            CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    for (int i = 0; i < branch_count; i++) {
+        if (branches[i].properties_json && strstr(branches[i].properties_json, head_sha)) {
+            matches++;
+        }
+    }
+    cbm_store_free_nodes(branches, branch_count);
+    return matches;
+}
+
+/* Git context is graph input even when every repository file is unchanged.
+ * Construct the second pipeline before moving HEAD so the test also proves
+ * that run start refreshes the snapshot captured by cbm_pipeline_new(). */
+TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
+    if (!git_available()) {
+        FAIL("git unavailable");
+    }
+
+    char tmp[256];
+    char *created = th_mktempdir("cbm_manifest_git_context");
+    ASSERT_NOT_NULL(created);
+    snprintf(tmp, sizeof(tmp), "%s", created);
+
+    char repo[512], db_path[512], cmd[2048];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/context.db", tmp);
+    ASSERT_EQ(th_mkdir_p(repo), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "stable.py"), "def StableGitContext():\n    return 1\n"),
+              0);
+    const char *null_dev = test_null_dev();
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" init >%s 2>&1", repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" add stable.py >%s 2>&1", repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" "
+             "-c user.email=\"cbm@example.invalid\" commit -m \"initial\" >%s 2>&1",
+             repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+
+    cbm_git_context_t initial_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &initial_ctx), 0);
+    ASSERT_NOT_NULL(initial_ctx.head_sha);
+    char initial_head[128];
+    snprintf(initial_head, sizeof(initial_head), "%s", initial_ctx.head_sha);
+    cbm_git_context_free(&initial_ctx);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    cbm_pipeline_t *after_head_move = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(after_head_move);
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" "
+             "-c user.email=\"cbm@example.invalid\" commit --allow-empty "
+             "-m \"head-only change\" >%s 2>&1",
+             repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    cbm_git_context_t changed_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &changed_ctx), 0);
+    ASSERT_NOT_NULL(changed_ctx.head_sha);
+    char changed_head[128];
+    snprintf(changed_head, sizeof(changed_head), "%s", changed_ctx.head_sha);
+    cbm_git_context_free(&changed_ctx);
+    ASSERT_TRUE(strcmp(initial_head, changed_head) != 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    int changed_rc = cbm_pipeline_run(after_head_move);
+    cbm_incremental_route_t changed_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(after_head_move);
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    int changed_branch_matches = store ? branch_head_match_count(store, project, changed_head) : -1;
+    int stale_branch_matches = store ? branch_head_match_count(store, project, initial_head) : -1;
+    cbm_file_hash_t git_input = {0};
+    int git_input_rc =
+        store ? cbm_store_get_file_hash(
+                    store, project, ".codebase-memory/.semantic-input/git-context-v1", &git_input)
+              : CBM_STORE_NOT_FOUND;
+    cbm_store_clear_file_hash(&git_input);
+    if (store) {
+        cbm_store_close(store);
+    }
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *unchanged = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(unchanged);
+    int unchanged_rc = cbm_pipeline_run(unchanged);
+    cbm_incremental_route_t unchanged_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(unchanged);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(changed_rc, 0);
+    ASSERT_EQ(changed_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(changed_branch_matches, 1);
+    ASSERT_EQ(stale_branch_matches, 0);
+    ASSERT_EQ(git_input_rc, CBM_STORE_OK);
+    ASSERT_EQ(unchanged_rc, 0);
+    ASSERT_EQ(unchanged_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
+/* The global extension config lives outside the repository but changes both
+ * discovery and parsing. Its exact consumed bytes therefore belong to the
+ * same semantic generation as the graph they selected. */
+TEST(pipeline_global_extension_config_change_forces_full) {
+    char tmp[256];
+    char *created = th_mktempdir("cbm_manifest_global_config");
+    ASSERT_NOT_NULL(created);
+    snprintf(tmp, sizeof(tmp), "%s", created);
+
+    char repo[512], config_root[512], app_dir[768], config_path[1024], db_path[512];
+    snprintf(repo, sizeof(repo), "%s/repo", tmp);
+    snprintf(config_root, sizeof(config_root), "%s/config-root", tmp);
+    snprintf(app_dir, sizeof(app_dir), "%s/codebase-memory-mcp", config_root);
+    snprintf(config_path, sizeof(config_path), "%s/config.json", app_dir);
+    snprintf(db_path, sizeof(db_path), "%s/config.db", tmp);
+    ASSERT_EQ(th_mkdir_p(repo), 0);
+    ASSERT_EQ(th_mkdir_p(app_dir), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "fixture.cbmfixture"),
+                            "def GlobalExtensionTarget():\n    return 1\n"),
+              0);
+    ASSERT_EQ(th_write_file(config_path, "{\"extra_extensions\":{\".cbmfixture\":\"python\"}}\n"),
+              0);
+
+#ifdef _WIN32
+    const char *env_name = "APPDATA";
+#else
+    const char *env_name = "XDG_CONFIG_HOME";
+#endif
+    char old_env[CBM_SZ_1K] = {0};
+    bool had_old_env = cbm_safe_getenv(env_name, old_env, sizeof(old_env), NULL) != NULL;
+
+    int setenv_rc = cbm_setenv(env_name, config_root, 1);
+    int baseline_rc = -1;
+    int initial_nodes = -1;
+    int changed_rc = -1;
+    cbm_incremental_route_t changed_route = CBM_INCREMENTAL_ROUTE_NONE;
+    int changed_nodes = -1;
+    int config_input_rc = CBM_STORE_NOT_FOUND;
+    int unchanged_rc = -1;
+    cbm_incremental_route_t unchanged_route = CBM_INCREMENTAL_ROUTE_NONE;
+    char project[256] = {0};
+
+    if (setenv_rc == 0) {
+        cbm_pipeline_incremental_test_reset_faults();
+        cbm_pipeline_t *baseline = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+        if (baseline) {
+            baseline_rc = cbm_pipeline_run(baseline);
+            snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+            cbm_pipeline_free(baseline);
+        }
+        cbm_store_t *baseline_store = cbm_store_open_path(db_path);
+        if (baseline_store) {
+            initial_nodes = named_node_count(baseline_store, project, "GlobalExtensionTarget");
+            cbm_store_close(baseline_store);
+        }
+
+        if (th_write_file(config_path, "{\"extra_extensions\":{\".cbmfixture\":\"json\"}}\n") ==
+            0) {
+            cbm_pipeline_incremental_test_reset_faults();
+            cbm_pipeline_t *changed = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+            if (changed) {
+                changed_rc = cbm_pipeline_run(changed);
+                changed_route = cbm_pipeline_incremental_test_last_route();
+                cbm_pipeline_free(changed);
+            }
+            cbm_store_t *changed_store = cbm_store_open_path(db_path);
+            if (changed_store) {
+                changed_nodes = named_node_count(changed_store, project, "GlobalExtensionTarget");
+                cbm_file_hash_t config_input = {0};
+                config_input_rc = cbm_store_get_file_hash(
+                    changed_store, project,
+                    ".codebase-memory/.semantic-input/global-extension-config-v1", &config_input);
+                cbm_store_clear_file_hash(&config_input);
+                cbm_store_close(changed_store);
+            }
+
+            cbm_pipeline_incremental_test_reset_faults();
+            cbm_pipeline_t *unchanged = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+            if (unchanged) {
+                unchanged_rc = cbm_pipeline_run(unchanged);
+                unchanged_route = cbm_pipeline_incremental_test_last_route();
+                cbm_pipeline_free(unchanged);
+            }
+        }
+    }
+
+    if (had_old_env) {
+        cbm_setenv(env_name, old_env, 1);
+    } else {
+        cbm_unsetenv(env_name);
+    }
+    cbm_set_user_lang_config(NULL);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(setenv_rc, 0);
+    ASSERT_EQ(baseline_rc, 0);
+    ASSERT_EQ(initial_nodes, 1);
+    ASSERT_EQ(changed_rc, 0);
+    ASSERT_EQ(changed_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(changed_nodes, 0);
+    ASSERT_EQ(config_input_rc, CBM_STORE_OK);
+    ASSERT_EQ(unchanged_rc, 0);
+    ASSERT_EQ(unchanged_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+#endif
 
 TEST(project_name_uniqueness) {
     /* Port of TestProjectNameUniqueness */
@@ -5687,7 +9009,7 @@ TEST(incremental_detects_changed_file) {
     PASS();
 }
 
-TEST(incremental_aborts_when_previous_coverage_is_unreadable) {
+TEST(full_reindex_recovers_when_previous_coverage_is_unreadable) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -5718,14 +9040,21 @@ TEST(incremental_aborts_when_previous_coverage_is_unreadable) {
 
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
-    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
-    /* Failure happens before the dump/replacement boundary, preserving the
-     * original graph rather than publishing a falsely complete generation. */
+    /* An exact-manifest delta routes to an isolated full generation, which
+     * does not depend on the damaged coverage table and repairs it atomically. */
     s = cbm_store_open_path(g_incr_dbpath);
     ASSERT_NOT_NULL(s);
-    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    ASSERT_GT(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_node_t *recovered = NULL;
+    int recovered_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_nodes_by_name(s, project, "MustNotBeIndexed", &recovered, &recovered_count),
+        CBM_STORE_OK);
+    ASSERT_EQ(recovered_count, 1);
+    cbm_store_free_nodes(recovered, recovered_count);
     cbm_store_close(s);
     free(project);
 
@@ -6920,8 +10249,21 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
+    RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
+    RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
+    RUN_TEST(pipeline_env_access_configures_sequential_parallel_parity);
+    RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
+    RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
+    RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
+    RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
+#endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
+    RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
@@ -7092,7 +10434,7 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
-    RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
+    RUN_TEST(full_reindex_recovers_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
@@ -7157,4 +10499,30 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+}
+
+/* Focused semantic-manifest and publication contracts. Kept separate from the
+ * broad pipeline suite so RED/GREEN iterations exercise only this boundary;
+ * the default all-suite run still executes it. */
+SUITE(pipeline_semantic_manifest_repro) {
+    RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
+    RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_git_context_change_forces_full_and_refreshes_branch);
+    RUN_TEST(pipeline_global_extension_config_change_forces_full);
+    RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
+    RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
+    RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
+    RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
+    RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
+    RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
+    RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);
+    RUN_TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generation);
+    RUN_TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retries);
+    RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
+    RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
+    RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
+    RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
+    RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);
+#endif
 }

@@ -1049,6 +1049,42 @@ TEST(jlsp_user_class_method) {
     PASS();
 }
 
+/* Java's grammar nests enum methods under enum_body_declarations rather than
+ * placing them directly in enum_body.  Require both the indexed Method targets
+ * and the receiver-typed calls so a graph-level name fallback cannot mask a
+ * missing enum declaration walk. */
+TEST(jlsp_user_enum_methods) {
+    const char *src = "enum Day {\n"
+                      "  SAT, SUN;\n"
+                      "  public String label() { return name(); }\n"
+                      "  public boolean isWeekend() { return true; }\n"
+                      "}\n"
+                      "class DayUtil {\n"
+                      "  static String describe(Day day) {\n"
+                      "    return day.label() + day.isWeekend();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+
+    int enum_methods = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *definition = &r->defs.items[i];
+        if (definition->label && strcmp(definition->label, "Method") == 0 &&
+            definition->parent_class && strstr(definition->parent_class, "Day") &&
+            definition->name &&
+            (strcmp(definition->name, "label") == 0 ||
+             strcmp(definition->name, "isWeekend") == 0)) {
+            enum_methods++;
+        }
+    }
+    ASSERT_EQ(enum_methods, 2);
+    ASSERT_GTE(require_resolved(r, "describe", "Day.label"), 0);
+    ASSERT_GTE(require_resolved(r, "describe", "Day.isWeekend"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(jlsp_user_static_method) {
     const char *src =
         "public class Main {\n"
@@ -1874,6 +1910,7 @@ void suite_java_lsp(void) {
 
     /* User-defined */
     RUN_TEST(jlsp_user_class_method);
+    RUN_TEST(jlsp_user_enum_methods);
     RUN_TEST(jlsp_user_static_method);
     RUN_TEST(jlsp_user_chain);
 

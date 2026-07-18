@@ -574,7 +574,7 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
     /* Get node/edge counts for metadata */
     int nodes = 0;
     int edges = 0;
-    cbm_store_t *count_store = cbm_store_open_path(db_path);
+    cbm_store_t *count_store = cbm_store_open_path_query(db_path);
     if (count_store) {
         nodes = cbm_store_count_nodes(count_store, project_name);
         edges = cbm_store_count_edges(count_store, project_name);

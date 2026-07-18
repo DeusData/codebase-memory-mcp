@@ -84,9 +84,21 @@ typedef struct {
     const char* embedded_types; // "|"-separated embedded type QNs (for struct embedding)
     const char* field_defs;     // "|"-separated "name:type" pairs (for struct fields, e.g. "Binder:Binder|Name:string")
     const char* method_names_str; // "|"-separated method names for interfaces (e.g. "Get|Put|Delete")
+    const char **signature_param_types; // borrowed ordered parameter type texts; "?" means unknown
+    int signature_param_count;          // number of positional entries above
     bool is_interface;
     CBMLanguage lang;           // language of the file that defined this — used by Tier 2 per-language registry build to filter all_defs
     const char* namespace_name; // declared namespace/package for source-root-independent JVM filtering
+    /* Rust-only raw trait spelling.  The Rust registry canonicalizes this
+     * only when it has one exact/unique trait target. */
+    const char *trait_qn;
+    bool is_rust_impl_relation; // independent type-level impl record (empty impls survive)
+    bool is_abstract;           // Rust required trait method; false for defaults
+    /* Python-only raw decorator syntax, borrowed from CBMDefinition.  The
+     * resolver must retain it across fused/cross-file registry construction:
+     * a decorator rebinds the function name, so the undecorated definition is
+     * not automatically an exact callable-value target. */
+    const char **decorators;
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

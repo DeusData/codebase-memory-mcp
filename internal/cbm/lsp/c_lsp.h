@@ -60,10 +60,14 @@ typedef struct {
 
     // Output
     CBMResolvedCallArray *resolved_calls;
+    CBMSourceOrigin source_origin; // source buffer represented by emitted occurrence spans
 
-    // Function pointer targets: var_name -> target function QN
+    // Function pointer targets: lexical binding -> exact target function QN.
+    // A NULL target is an explicitly unknown/ambiguous binding and must shadow
+    // any outer exact target of the same name.
     const char **fp_var_names;
     const char **fp_target_qns;
+    const CBMScope **fp_binding_scopes;
     int fp_count;
     int fp_cap;
 
@@ -93,6 +97,7 @@ typedef struct {
     int eval_depth; // recursion depth for c_eval_expr_type (crash guard)
     int eval_steps; // total expression eval calls for current file (hang guard)
     int walk_depth; // c_resolve_calls_in_node self-recursion (AST nesting)
+    int control_flow_depth; // if/loop/switch/catch nesting; assignments merge fail-closed
 } CLSPContext;
 
 // --- API ---
@@ -120,7 +125,7 @@ const CBMType *c_simplify_type(CLSPContext *ctx, const CBMType *t, bool unwrap_p
 
 // Single-file LSP: build registry from file defs + stdlib, run resolution.
 void cbm_run_c_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
-                   TSNode root, bool cpp_mode);
+                   TSNode root, bool cpp_mode, CBMSourceOrigin source_origin);
 
 // Cross-file LSP: build registry from defs + stdlib, re-parse and resolve.
 void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, const char *module_qn,

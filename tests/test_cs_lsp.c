@@ -25,6 +25,7 @@
 
 #include "test_framework.h"
 #include "cbm.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "lsp/cs_lsp.h"
 #include <string.h>
 
@@ -1131,6 +1132,100 @@ TEST(cslsp_httpclient_chain) {
     PASS();
 }
 
+/* Two typed receivers can invoke the same method leaf in one caller. Each
+ * parser carrier and type-aware semantic result must retain the full,
+ * occurrence-specific call span so the bridge cannot join both calls to the
+ * first Render target (or let a legacy zero-span record hijack either one). */
+TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site) {
+    static const char source[] = "class Alpha { public void Render() {} }\n"
+                                 "class Beta { public void Render() {} }\n"
+                                 "class OccurrenceProbe {\n"
+                                 "    public void Run(Alpha alpha, Beta beta) {\n"
+                                 "        alpha.Render();\n"
+                                 "        beta.Render();\n"
+                                 "    }\n"
+                                 "}\n";
+    static const char alpha_text[] = "alpha.Render()";
+    static const char beta_text[] = "beta.Render()";
+
+    const char *alpha_site = strstr(source, alpha_text);
+    const char *beta_site = strstr(source, beta_text);
+    ASSERT_NOT_NULL(alpha_site);
+    ASSERT_NOT_NULL(beta_site);
+    const uint32_t alpha_start = (uint32_t)(alpha_site - source);
+    const uint32_t alpha_end = alpha_start + (uint32_t)strlen(alpha_text);
+    const uint32_t beta_start = (uint32_t)(beta_site - source);
+    const uint32_t beta_end = beta_start + (uint32_t)strlen(beta_text);
+
+    CBMFileResult *r = extract_cs(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *alpha_call = NULL;
+    const CBMCall *beta_call = NULL;
+    int render_carriers = 0;
+    int zero_span_carriers = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "OccurrenceProbe.Run") ||
+            !call->callee_name || !strstr(call->callee_name, "Render")) {
+            continue;
+        }
+        render_carriers++;
+        if (call->site_end_byte <= call->site_start_byte)
+            zero_span_carriers++;
+        if (call->site_start_byte == alpha_start && call->site_end_byte == alpha_end)
+            alpha_call = call;
+        if (call->site_start_byte == beta_start && call->site_end_byte == beta_end)
+            beta_call = call;
+    }
+
+    ASSERT_EQ(render_carriers, 2);
+    ASSERT_EQ(zero_span_carriers, 0);
+    ASSERT_NOT_NULL(alpha_call);
+    ASSERT_NOT_NULL(beta_call);
+    ASSERT_TRUE(alpha_call != beta_call);
+
+    const CBMResolvedCall *alpha_semantic = NULL;
+    const CBMResolvedCall *beta_semantic = NULL;
+    int render_semantics = 0;
+    int zero_span_hijackers = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || rc->confidence <= 0.0f || !rc->caller_qn ||
+            !strstr(rc->caller_qn, "OccurrenceProbe.Run") || !rc->callee_qn ||
+            !strstr(rc->callee_qn, ".Render")) {
+            continue;
+        }
+        render_semantics++;
+        if (rc->site_end_byte <= rc->site_start_byte)
+            zero_span_hijackers++;
+        if (strstr(rc->callee_qn, "Alpha.Render") && rc->site_start_byte == alpha_start &&
+            rc->site_end_byte == alpha_end) {
+            alpha_semantic = rc;
+        }
+        if (strstr(rc->callee_qn, "Beta.Render") && rc->site_start_byte == beta_start &&
+            rc->site_end_byte == beta_end) {
+            beta_semantic = rc;
+        }
+    }
+
+    ASSERT_EQ(render_semantics, 2);
+    ASSERT_EQ(zero_span_hijackers, 0);
+    ASSERT_NOT_NULL(alpha_semantic);
+    ASSERT_NOT_NULL(beta_semantic);
+    ASSERT_TRUE(alpha_semantic != beta_semantic);
+
+    const CBMResolvedCall *alpha_join =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, alpha_call, false);
+    const CBMResolvedCall *beta_join =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, beta_call, false);
+    ASSERT_TRUE(alpha_join == alpha_semantic);
+    ASSERT_TRUE(beta_join == beta_semantic);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────── */
 
 SUITE(cs_lsp) {
@@ -1194,4 +1289,5 @@ SUITE(cs_lsp) {
     RUN_TEST(cslsp_using_static_console);
     RUN_TEST(cslsp_stringbuilder_chain);
     RUN_TEST(cslsp_httpclient_chain);
+    RUN_TEST(cslsp_ordinary_same_leaf_calls_join_by_exact_site);
 }

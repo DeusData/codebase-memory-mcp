@@ -650,16 +650,24 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     int64_t *node_ids = malloc((size_t)n * sizeof(int64_t));
     int *in_calls = calloc((size_t)n, sizeof(int));
     int *in_usage = calloc((size_t)n, sizeof(int));
+    int *in_call_reference = calloc((size_t)n, sizeof(int));
     int *deg_dummy = calloc((size_t)n, sizeof(int));
-    if (node_ids && in_calls && in_usage && deg_dummy) {
+    bool dead_degrees_valid = node_ids && in_calls && in_usage && in_call_reference && deg_dummy;
+    if (dead_degrees_valid) {
         for (int i = 0; i < n; i++)
             node_ids[i] = search_out.results[i].node.id;
         for (int off = 0; off < n; off += DEAD_DEGREE_CHUNK) {
             int cnt = (n - off < DEAD_DEGREE_CHUNK) ? (n - off) : DEAD_DEGREE_CHUNK;
-            cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALLS", in_calls + off,
-                                          deg_dummy + off);
-            cbm_store_batch_count_degrees(store, node_ids + off, cnt, "USAGE", in_usage + off,
-                                          deg_dummy + off);
+            if (cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALLS", in_calls + off,
+                                              deg_dummy + off) != CBM_STORE_OK ||
+                cbm_store_batch_count_degrees(store, node_ids + off, cnt, "USAGE", in_usage + off,
+                                              deg_dummy + off) != CBM_STORE_OK ||
+                cbm_store_batch_count_degrees(store, node_ids + off, cnt, "CALL_REFERENCE",
+                                              in_call_reference + off,
+                                              deg_dummy + off) != CBM_STORE_OK) {
+                dead_degrees_valid = false;
+                break;
+            }
         }
     }
 
@@ -720,8 +728,8 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         bool is_fn =
             sn->label && (strcmp(sn->label, "Function") == 0 || strcmp(sn->label, "Method") == 0);
         bool testish = nf.is_test || (sn->file_path && cbm_is_test_file_path(sn->file_path));
-        int ic = in_calls ? in_calls[i] : 1;
-        int iu = in_usage ? in_usage[i] : 1;
+        int ic = dead_degrees_valid ? in_calls[i] : 1;
+        int iu = dead_degrees_valid ? in_usage[i] + in_call_reference[i] : 1;
         const char *status;
         if (!is_fn)
             status = "structural";
@@ -770,6 +778,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     free(node_ids);
     free(in_calls);
     free(in_usage);
+    free(in_call_reference);
     free(deg_dummy);
     free_edge_array(all_edges, mapped);
     cbm_store_search_free(&search_out);

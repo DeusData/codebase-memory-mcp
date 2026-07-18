@@ -127,6 +127,60 @@ static int mn_count_label(cbm_store_t *store, const char *project, const char *l
     return count;
 }
 
+static int mn_named_node_match_count(cbm_store_t *store, const char *project, const char *name,
+                                     const char *label, const char *qn_suffix) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int matches = 0;
+    size_t suffix_len = strlen(qn_suffix);
+    for (int i = 0; i < count; i++) {
+        size_t qn_len = nodes[i].qualified_name ? strlen(nodes[i].qualified_name) : 0;
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0 && qn_len >= suffix_len &&
+            strcmp(nodes[i].qualified_name + qn_len - suffix_len, qn_suffix) == 0) {
+            matches++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    return matches;
+}
+
+static int mn_exact_edge_by_qn_suffix(cbm_store_t *store, const char *project,
+                                      const char *edge_type, const char *source_suffix,
+                                      const char *target_suffix) {
+    cbm_node_t *sources = NULL;
+    cbm_node_t *targets = NULL;
+    int source_count = 0;
+    int target_count = 0;
+    if (cbm_store_find_nodes_by_qn_suffix(store, project, source_suffix, &sources, &source_count) !=
+            CBM_STORE_OK ||
+        cbm_store_find_nodes_by_qn_suffix(store, project, target_suffix, &targets, &target_count) !=
+            CBM_STORE_OK ||
+        source_count != 1 || target_count != 1) {
+        cbm_store_free_nodes(sources, source_count);
+        cbm_store_free_nodes(targets, target_count);
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int matches = -1;
+    if (cbm_store_find_edges_by_source_type(store, sources[0].id, edge_type, &edges, &edge_count) ==
+        CBM_STORE_OK) {
+        matches = 0;
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == targets[0].id) {
+                matches++;
+            }
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_free_nodes(targets, target_count);
+    return matches;
+}
+
 /* Sum type-like nodes (Class + Struct + Interface + Enum + Trait + Type). */
 static int mn_type_nodes(cbm_store_t *store, const char *project) {
     static const char *labels[] = {"Class", "Struct", "Interface", "Enum", "Trait", "Type", NULL};
@@ -1319,9 +1373,19 @@ TEST(mn_nested_function_c) {
  * must still be attributed to the right callable.
  * ══════════════════════════════════════════════════════════════════ */
 
-/* TypeScript: nested namespace with class and function. */
-TEST(mn_module_ts_namespace) {
-    MN_Metrics m = mn_metrics("ns.ts",
+typedef struct {
+    int app_module;
+    int utils_module;
+    int namespace_classes;
+    int config_class;
+    int clamp_function;
+    int normalise_function;
+    int normalise_calls_clamp;
+    int constructor_calls_normalise;
+} MN_TSNamespaceObservation;
+
+static MN_TSNamespaceObservation mn_observe_ts_namespace(const char *filename) {
+    static const char source[] =
         "namespace App {\n"
         "    export namespace Utils {\n"
         "        export function clamp(v: number, lo: number, hi: number): number {\n"
@@ -1334,13 +1398,59 @@ TEST(mn_module_ts_namespace) {
         "        constructor(t: number) { this.threshold = Utils.normalise(t); }\n"
         "    }\n"
         "}\n\n"
-        "function run(): number { return new App.Config(0.5).threshold; }\n");
-    ASSERT_TRUE(m.ok);
-    ASSERT_TRUE(m.functions >= 2); /* clamp, normalise, run */
-    ASSERT_TRUE(m.types >= 1);    /* Config */
-    ASSERT_TRUE(m.calls >= 1);
+        "function run(): number { return new App.Config(0.5).threshold; }\n";
+    MN_LangFile file = {filename, source};
+    MN_LangProj lp;
+    cbm_store_t *store = mn_index_files(&lp, &file, 1);
+    MN_TSNamespaceObservation o = {0};
+    if (store) {
+        o.app_module = mn_named_node_match_count(store, lp.project, "App", "Module", ".ns.App");
+        o.utils_module =
+            mn_named_node_match_count(store, lp.project, "Utils", "Module", ".ns.App.Utils");
+        o.namespace_classes =
+            mn_named_node_match_count(store, lp.project, "App", "Class", ".ns.App") +
+            mn_named_node_match_count(store, lp.project, "Utils", "Class", ".ns.App.Utils");
+        o.config_class =
+            mn_named_node_match_count(store, lp.project, "Config", "Class", ".ns.App.Config");
+        o.clamp_function = mn_named_node_match_count(store, lp.project, "clamp", "Function",
+                                                     ".ns.App.Utils.clamp");
+        o.normalise_function = mn_named_node_match_count(store, lp.project, "normalise", "Function",
+                                                         ".ns.App.Utils.normalise");
+        o.normalise_calls_clamp = mn_exact_edge_by_qn_suffix(
+            store, lp.project, "CALLS", "ns.App.Utils.normalise", "ns.App.Utils.clamp");
+        o.constructor_calls_normalise = mn_exact_edge_by_qn_suffix(
+            store, lp.project, "CALLS", "ns.App.Config.constructor", "ns.App.Utils.normalise");
+    }
+    mn_cleanup(&lp, store);
+    return o;
+}
+
+#define MN_ASSERT_TS_NAMESPACE(o)                      \
+    do {                                               \
+        ASSERT_EQ((o).app_module, 1);                  \
+        ASSERT_EQ((o).utils_module, 1);                \
+        ASSERT_EQ((o).namespace_classes, 0);           \
+        ASSERT_EQ((o).config_class, 1);                \
+        ASSERT_EQ((o).clamp_function, 1);              \
+        ASSERT_EQ((o).normalise_function, 1);          \
+        ASSERT_EQ((o).normalise_calls_clamp, 1);       \
+        ASSERT_EQ((o).constructor_calls_normalise, 1); \
+    } while (0)
+
+/* TypeScript: nested namespace functions remain free functions with exact QNs. */
+TEST(mn_module_ts_namespace) {
+    MN_TSNamespaceObservation observation = mn_observe_ts_namespace("ns.ts");
+    MN_ASSERT_TS_NAMESPACE(observation);
     PASS();
 }
+
+/* TSX shares the TypeScript namespace grammar and must retain identical semantics. */
+TEST(mn_module_tsx_namespace) {
+    MN_TSNamespaceObservation observation = mn_observe_ts_namespace("ns.tsx");
+    MN_ASSERT_TS_NAMESPACE(observation);
+    PASS();
+}
+#undef MN_ASSERT_TS_NAMESPACE
 
 /* C++: namespace with nested classes and functions. */
 TEST(mn_module_cpp_namespace) {
@@ -1558,6 +1668,7 @@ SUITE(matrix_new_constructs) {
     /* Family 10: module/namespace nesting */
     printf("\n%s--- Family 10: modules/namespaces ---%s\n", "\033[90m", "\033[0m");
     RUN_TEST(mn_module_ts_namespace);
+    RUN_TEST(mn_module_tsx_namespace);
     RUN_TEST(mn_module_cpp_namespace);
     RUN_TEST(mn_module_csharp_namespace);
     RUN_TEST(mn_module_rust_mod);

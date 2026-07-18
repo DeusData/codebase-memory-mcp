@@ -12,7 +12,7 @@
  * Languages covered (12) and the CBM_LANG_* enum each uses (every enum verified
  * present in internal/cbm/cbm.h; none missing, none skipped):
  *   Zig      -> CBM_LANG_ZIG
- *   Nim      -> CBM_LANG_NIM
+ *   Nim      -> CBM_LANG_NIM (explicitly unsupported; no grammar is vendored)
  *   Crystal  -> CBM_LANG_CRYSTAL
  *   Hare     -> CBM_LANG_HARE
  *   Odin     -> CBM_LANG_ODIN
@@ -65,8 +65,8 @@
  *   - Crystal (method_def), Odin (procedure_declaration), Pony (method),
  *     Ada (subprogram_body), Fortran (function/subroutine),
  *     COBOL (program_definition), Pascal (defProc), Move (function_item).
- * Nim has NO lang_spec / grammar entry at all, so it extracts zero defs and zero
- * calls today: dims 5/6/7 are RED for Nim and the fixture documents that gap.
+ * Nim has no lang_spec / grammar entry. Its row is an explicit registry contract,
+ * not a skipped extraction fixture.
  *
  * When a language extracts NO in-body call today, dimension 6 (calls-extracted)
  * is asserted anyway -- the language SHOULD capture the call -- so the RED row
@@ -78,6 +78,7 @@
  */
 
 #include "test_framework.h"
+#include "lang_specs.h"
 #include "repro_invariant_lib.h"
 #include <store/store.h>
 
@@ -248,39 +249,13 @@ TEST(repro_grammar_systems_zig) {
 }
 
 /* -- Nim --------------------------------------------------------------------
- * Idiomatic: import, an object type, two `proc`s with the callee called inside
- * the caller body. Nim has NO lang_spec row and NO grammar_nim.c -- there is no
- * func/class/call node-type table for it. Expected: dim 1 (extract-clean) GREEN
- * (cbm_extract_file returns a result), but dims 5/6 RED (zero defs, zero calls)
- * and dim 7 RED (zero CALLS edges to attribute). These RED rows document the
- * missing Nim support; the fixture asserts it SHOULD extract a "Function" and a
- * call to "add".
+ * The enum is retained for API compatibility, but no Nim grammar is linked.
+ * Unsupported must mean NULL; it must never alias the zero-initialized Go row.
  */
 TEST(repro_grammar_systems_nim) {
-    /* DISABLED — GRAMMAR ISSUE (maintainer-approved, 2026-06-28): extraction of
-     * standard Nim (`proc add(a, b: int): int = ...`) fails extract-clean (NULL
-     * result or has_error set) — tree-sitter-nim mis-parses the indentation-
-     * sensitive layout (Nim was a deferred/problematic grammar in the sweep). A
-     * grammar/parser defect, not a cbm extraction bug. Original assertions below
-     * are preserved (unreachable) for re-enable when the grammar is fixed. */
-    printf("%sSKIP%s grammar issue (tree-sitter-nim parse failure)\n", tf_dim(), tf_reset());
-    return -1; /* skip — not counted as pass or fail */
-    static const char src[] =
-        "import std/strutils\n"
-        "\n"
-        "type\n"
-        "  Calc = object\n"
-        "    base: int\n"
-        "\n"
-        "proc add(a, b: int): int =\n"
-        "  return a + b\n"
-        "\n"
-        "proc compute(x: int): int =\n"
-        "  return add(x, 1)\n";
-    if (single_file_battery("Nim", src, CBM_LANG_NIM, "calc.nim",
-                            "Function", NULL, "add") != 0)
-        return 1;
-    return pipeline_battery("Nim", "calc.nim", src);
+    ASSERT_NULL(cbm_lang_spec(CBM_LANG_NIM));
+    ASSERT_NULL(cbm_ts_language(CBM_LANG_NIM));
+    PASS();
 }
 
 /* -- Crystal ----------------------------------------------------------------

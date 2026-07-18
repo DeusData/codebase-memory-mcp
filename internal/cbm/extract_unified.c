@@ -14,14 +14,195 @@ enum { MAX_INFRA_BINDINGS = 8 };
 
 // --- Scope stack management ---
 
-static void push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
-    if (state->scope_top >= MAX_SCOPES) {
-        return;
+static bool ensure_scope_capacity(WalkState *state) {
+    if (state->scope_top < state->scope_capacity) {
+        return true;
+    }
+    int new_capacity = state->scope_capacity > 0 ? state->scope_capacity * 2 : MAX_SCOPES;
+    CBMWalkScope *grown =
+        (CBMWalkScope *)cbm_arena_alloc(state->arena, (size_t)new_capacity * sizeof(*grown));
+    if (!grown) {
+        return false;
+    }
+    memcpy(grown, state->scopes, (size_t)state->scope_top * sizeof(*grown));
+    state->scopes = grown;
+    state->scope_capacity = new_capacity;
+    return true;
+}
+
+static const CBMLexicalScope *lexical_scope_by_id(const WalkState *state, uint32_t id) {
+    return state && id > 0 && id <= (uint32_t)state->lexical_scope_count
+               ? &state->lexical_scopes[id - 1U]
+               : NULL;
+}
+
+static CBMLexicalScope *mutable_lexical_scope_by_id(WalkState *state, uint32_t id) {
+    return state && id > 0 && id <= (uint32_t)state->lexical_scope_count
+               ? &state->lexical_scopes[id - 1U]
+               : NULL;
+}
+
+static uint32_t current_lexical_scope_id(const WalkState *state) {
+    if (!state) {
+        return 0;
+    }
+    for (int i = state->scope_top - 1; i >= 0; i--) {
+        if (state->scopes[i].lexical_scope_id != 0) {
+            return state->scopes[i].lexical_scope_id;
+        }
+    }
+    return state->root_lexical_scope_id;
+}
+
+static bool ensure_lexical_scope_capacity(WalkState *state) {
+    if (state->lexical_scope_count < state->lexical_scope_capacity) {
+        return true;
+    }
+    if (state->lexical_scope_capacity > INT32_MAX / PAIR_LEN) {
+        state->lexical_binding_tracking_failed = true;
+        return false;
+    }
+    int new_capacity = state->lexical_scope_capacity * PAIR_LEN;
+    CBMLexicalScope *grown =
+        (CBMLexicalScope *)cbm_arena_alloc(state->arena, (size_t)new_capacity * sizeof(*grown));
+    if (!grown) {
+        state->lexical_binding_tracking_failed = true;
+        return false;
+    }
+    memcpy(grown, state->lexical_scopes, (size_t)state->lexical_scope_count * sizeof(*grown));
+    state->lexical_scopes = grown;
+    state->lexical_scope_capacity = new_capacity;
+    return true;
+}
+
+static uint32_t python_function_lookup_parent(const WalkState *state,
+                                              uint32_t structural_parent_id) {
+    uint32_t id = structural_parent_id;
+    int remaining = state ? state->lexical_scope_count : 0;
+    while (id != 0 && remaining-- > 0) {
+        const CBMLexicalScope *scope = lexical_scope_by_id(state, id);
+        if (!scope) {
+            return structural_parent_id;
+        }
+        if (scope->kind == CBM_LEXICAL_SCOPE_CLASS) {
+            return scope->lookup_parent_id;
+        }
+        if (scope->kind == CBM_LEXICAL_SCOPE_FUNCTION ||
+            scope->kind == CBM_LEXICAL_SCOPE_COMPREHENSION ||
+            scope->kind == CBM_LEXICAL_SCOPE_MODULE) {
+            return structural_parent_id;
+        }
+        id = scope->parent_id;
+    }
+    return structural_parent_id;
+}
+
+static uint32_t add_lexical_scope(WalkState *state, TSNode node, CBMLexicalScopeKind kind) {
+    if (!state || ts_node_is_null(node) || !ensure_lexical_scope_capacity(state)) {
+        return 0;
+    }
+    uint32_t parent_id = current_lexical_scope_id(state);
+    uint32_t lookup_parent_id = parent_id;
+    /* Python method/function lookup bypasses the containing class namespace;
+     * class attributes require qualification (`self.x`/`Cls.x`). */
+    if (kind == CBM_LEXICAL_SCOPE_FUNCTION && state->language == CBM_LANG_PYTHON) {
+        lookup_parent_id = python_function_lookup_parent(state, parent_id);
+    }
+    CBMLexicalScope *scope = &state->lexical_scopes[state->lexical_scope_count];
+    scope->id = (uint32_t)state->lexical_scope_count + 1U;
+    scope->parent_id = parent_id;
+    scope->lookup_parent_id = lookup_parent_id;
+    scope->start_byte = ts_node_start_byte(node);
+    scope->end_byte = ts_node_end_byte(node);
+    scope->kind = (uint8_t)kind;
+    state->lexical_scope_count++;
+    return scope->id;
+}
+
+static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
+    if (!ensure_scope_capacity(state)) {
+        return false;
     }
     state->scopes[state->scope_top].kind = kind;
     state->scopes[state->scope_top].depth = depth;
     state->scopes[state->scope_top].qn = qn;
+    state->scopes[state->scope_top].lexical_scope_id = 0;
+    state->scopes[state->scope_top].invocation_kind = CBM_INVOCATION_NONE;
+    state->scopes[state->scope_top].callee_expr = (TSNode){0};
+    state->scopes[state->scope_top].callee_leaf = (TSNode){0};
     state->scope_top++;
+    return true;
+}
+
+static bool push_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t depth, const char *qn,
+                               TSNode node, CBMLexicalScopeKind lexical_kind) {
+    if (!push_scope(state, walk_kind, depth, qn)) {
+        state->lexical_binding_tracking_failed = true;
+        return false;
+    }
+    state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id =
+        add_lexical_scope(state, node, lexical_kind);
+    return true;
+}
+
+static bool push_existing_lexical_scope(WalkState *state, uint8_t walk_kind, uint32_t depth,
+                                        const char *qn, uint32_t lexical_scope_id, TSNode node) {
+    CBMLexicalScope *scope = mutable_lexical_scope_by_id(state, lexical_scope_id);
+    if (!scope || !push_scope(state, walk_kind, depth, qn)) {
+        state->lexical_binding_tracking_failed = true;
+        return false;
+    }
+    state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id = lexical_scope_id;
+    uint32_t end_byte = ts_node_end_byte(node);
+    if (end_byte > scope->end_byte) {
+        scope->end_byte = end_byte;
+    }
+    return true;
+}
+
+static uint32_t active_same_function_scope_id(const WalkState *state, const char *function_qn,
+                                              TSNode node) {
+    if (!state || !function_qn) {
+        return 0;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    for (int i = state->scope_top - 1; i >= 0; i--) {
+        if (state->scopes[i].kind != SCOPE_FUNC || !state->scopes[i].qn ||
+            strcmp(state->scopes[i].qn, function_qn) != 0) {
+            continue;
+        }
+        const CBMLexicalScope *scope =
+            lexical_scope_by_id(state, state->scopes[i].lexical_scope_id);
+        if (scope && scope->start_byte <= start && end <= scope->end_byte) {
+            return scope->id;
+        }
+    }
+    return 0;
+}
+
+static bool push_function_scope(WalkState *state, uint32_t depth, const char *function_qn,
+                                TSNode node) {
+    uint32_t existing_id = active_same_function_scope_id(state, function_qn, node);
+    return existing_id ? push_existing_lexical_scope(state, SCOPE_FUNC, depth, function_qn,
+                                                     existing_id, node)
+                       : push_lexical_scope(state, SCOPE_FUNC, depth, function_qn, node,
+                                            CBM_LEXICAL_SCOPE_FUNCTION);
+}
+
+static void push_call_scope(WalkState *state, uint32_t depth,
+                            const CBMInvocationDescriptor *invocation) {
+    if (!invocation ||
+        (invocation->kind != CBM_INVOCATION_CALLABLE_REFERENCE && !invocation->raw_call_emitted) ||
+        (ts_node_is_null(invocation->callee_expr) && ts_node_is_null(invocation->callee_leaf))) {
+        return;
+    }
+    if (!push_scope(state, SCOPE_CALL, depth, NULL)) {
+        return;
+    }
+    state->scopes[state->scope_top - SKIP_ONE].invocation_kind = invocation->kind;
+    state->scopes[state->scope_top - SKIP_ONE].callee_expr = invocation->callee_expr;
+    state->scopes[state->scope_top - SKIP_ONE].callee_leaf = invocation->callee_leaf;
 }
 
 // Pop scopes that we've ascended out of (depth >= current cursor depth).
@@ -35,7 +216,9 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
 static void recompute_state(WalkState *state, const char *module_qn) {
     state->enclosing_func_qn = module_qn;
     state->enclosing_class_qn = NULL;
-    state->inside_call = false;
+    state->invocation_kind = CBM_INVOCATION_NONE;
+    state->callee_expr = (TSNode){0};
+    state->callee_leaf = (TSNode){0};
     state->inside_import = false;
     state->loop_depth = 0;
     state->branch_depth = 0;
@@ -46,10 +229,13 @@ static void recompute_state(WalkState *state, const char *module_qn) {
             state->enclosing_func_qn = state->scopes[i].qn;
             break;
         case SCOPE_CLASS:
+        case SCOPE_NAMESPACE:
             state->enclosing_class_qn = state->scopes[i].qn;
             break;
         case SCOPE_CALL:
-            state->inside_call = true;
+            state->invocation_kind = state->scopes[i].invocation_kind;
+            state->callee_expr = state->scopes[i].callee_expr;
+            state->callee_leaf = state->scopes[i].callee_leaf;
             break;
         case SCOPE_IMPORT:
             state->inside_import = true;
@@ -453,10 +639,22 @@ static const char *objectscript_get_class_name(CBMExtractCtx *ctx, TSNode node) 
     return NULL;
 }
 
-// Resolve the QN of an ObjectScript method/classmethod node for scope tracking.
+// Resolve the QN of an ObjectScript method/classmethod/query node for scope tracking.
 static const char *objectscript_get_method_qn(CBMExtractCtx *ctx, TSNode node,
                                               const char *enclosing_class_qn) {
     const char *nk = ts_node_type(node);
+    if (strcmp(nk, "query") == 0) {
+        TSNode query_name = cbm_find_child_by_kind(node, "query_name");
+        if (ts_node_is_null(query_name)) {
+            return NULL;
+        }
+        char *name = cbm_node_text(ctx->arena, query_name, ctx->source);
+        if (!name || !name[0]) {
+            return NULL;
+        }
+        return enclosing_class_qn ? cbm_arena_sprintf(ctx->arena, "%s.%s", enclosing_class_qn, name)
+                                  : cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
+    }
     if (strcmp(nk, "method") != 0 && strcmp(nk, "classmethod") != 0) {
         return NULL;
     }
@@ -495,8 +693,20 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         return objectscript_get_method_qn(ctx, node, state->enclosing_class_qn);
     }
     if (ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
-        if (strcmp(ts_node_type(node), "tag") == 0) {
-            char *name = cbm_node_text(ctx->arena, node, ctx->source);
+        const char *kind = ts_node_type(node);
+        TSNode tag = {0};
+        if (strcmp(kind, "procedure") == 0) {
+            tag = cbm_find_child_by_kind(node, "tag");
+        } else if (strcmp(kind, "tag") == 0) {
+            /* The enclosing procedure owns the full callable range and already
+             * pushed this QN. Do not create a nested label-only function scope. */
+            TSNode parent = ts_node_parent(node);
+            if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "procedure") != 0) {
+                tag = node;
+            }
+        }
+        if (!ts_node_is_null(tag)) {
+            char *name = cbm_node_text(ctx->arena, tag, ctx->source);
             if (name && name[0]) {
                 return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, name);
             }
@@ -1315,6 +1525,15 @@ static void scan_infra_bindings(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+/* Extra nodes are grammar-declared trivia (most commonly comments). They still
+ * participate in cursor traversal and scope expiry, but none of the unified
+ * semantic handlers consumes their contents; documentation is collected by
+ * the definition/LSP passes. The grammar predicate covers every language
+ * without confusing structured syntax such as SQL COMMENT statements. */
+static bool is_unified_trivia_node(TSNode node) {
+    return ts_node_is_extra(node);
+}
+
 // JS/TS `export_statement` appears in import_node_types so re-exports
 // (`export { X } from './m'`) are treated as an import boundary.  But it also
 // wraps exported *declarations* (`export function f(cfg: Config) {}`), and
@@ -1341,9 +1560,280 @@ static bool is_export_of_declaration(TSNode node) {
     return false;
 }
 
+// Some languages encode imports with the same generic AST node used by every
+// ordinary invocation. Static node-kind membership is therefore not enough to
+// make the whole subtree an import scope.
+static bool is_actual_import_boundary(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
+    bool direct_import = spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types);
+    bool from_import = spec->import_from_types && cbm_kind_in_set(node, spec->import_from_types);
+    if (!direct_import && !from_import) {
+        return false;
+    }
+
+    const char *kind = ts_node_type(node);
+    TSNode head = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    if (ts_node_is_null(head)) {
+        head = ts_node_child_by_field_name(node, TS_FIELD("method"));
+    }
+    if (ts_node_is_null(head)) {
+        head = ts_node_child_by_field_name(node, TS_FIELD("command_name"));
+    }
+    if (ts_node_is_null(head)) {
+        head = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    }
+    if (ts_node_is_null(head) && ts_node_named_child_count(node) > 0) {
+        head = ts_node_named_child(node, 0);
+    }
+    char *name = ts_node_is_null(head) ? NULL : cbm_node_text(ctx->arena, head, ctx->source);
+
+    switch (ctx->language) {
+    case CBM_LANG_ELIXIR:
+        return strcmp(kind, "call") != 0 ||
+               (name && (strcmp(name, "import") == 0 || strcmp(name, "alias") == 0 ||
+                         strcmp(name, "require") == 0 || strcmp(name, "use") == 0));
+    case CBM_LANG_LUA:
+        return strcmp(kind, "function_call") != 0 || (name && strcmp(name, "require") == 0);
+    case CBM_LANG_RUBY:
+        return strcmp(kind, "call") != 0 ||
+               (name && (strcmp(name, "require") == 0 || strcmp(name, "require_relative") == 0));
+    case CBM_LANG_BASH:
+        return strcmp(kind, "command") != 0 ||
+               (name && (strcmp(name, "source") == 0 || strcmp(name, ".") == 0));
+    case CBM_LANG_R:
+        if (strcmp(kind, "call") != 0 || !name) {
+            return strcmp(kind, "call") != 0;
+        }
+        return strcmp(name, "library") == 0 || strcmp(name, "require") == 0 ||
+               strcmp(name, "requireNamespace") == 0 || strcmp(name, "loadNamespace") == 0 ||
+               strcmp(name, "source") == 0 || strcmp(name, "box::use") == 0;
+    case CBM_LANG_ZIG: {
+        if (strcmp(kind, "builtin_function") != 0) {
+            return true;
+        }
+        char *text = cbm_node_text(ctx->arena, node, ctx->source);
+        return text && (strncmp(text, "@import", sizeof("@import") - 1) == 0 ||
+                        strncmp(text, "@cImport", sizeof("@cImport") - 1) == 0);
+    }
+    case CBM_LANG_SCSS:
+        /* `@include` is an executable mixin invocation, not a module import. */
+        return strcmp(kind, "include_statement") != 0;
+    default:
+        return true;
+    }
+}
+
+/* NASM labels and instructions are flat siblings. For an actual instruction,
+ * find the nearest preceding label at the first ancestor level that has one.
+ * This is structural scope recovery; the instruction mnemonic is not used. */
+static TSNode nasm_wrapped_label(TSNode node, int remaining_depth) {
+    if (ts_node_is_null(node) || remaining_depth < 0) {
+        return (TSNode){0};
+    }
+    if (strcmp(ts_node_type(node), "label") == 0) {
+        return node;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "instruction") != 0 && strcmp(kind, "source_line") != 0) {
+        return (TSNode){0};
+    }
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode label = nasm_wrapped_label(ts_node_named_child(node, i), remaining_depth - 1);
+        if (!ts_node_is_null(label)) {
+            return label;
+        }
+    }
+    return (TSNode){0};
+}
+
+static TSNode nasm_preceding_label(TSNode node) {
+    TSNode current = node;
+    for (int level = 0; level < 4 && !ts_node_is_null(current); level++) {
+        TSNode previous = ts_node_prev_named_sibling(current);
+        while (!ts_node_is_null(previous)) {
+            TSNode label = nasm_wrapped_label(previous, 2);
+            if (!ts_node_is_null(label)) {
+                return label;
+            }
+            previous = ts_node_prev_named_sibling(previous);
+        }
+        TSNode parent = ts_node_parent(current);
+        if (ts_node_is_null(parent) || strcmp(ts_node_type(current), "source_file") == 0) {
+            break;
+        }
+        current = parent;
+    }
+    return (TSNode){0};
+}
+
+/* Traditional ObjectScript routines are flat: a tag statement is followed by
+ * sibling command statements until the next tag. Re-anchor each top-level
+ * command statement to its nearest preceding tag, just as NASM instructions
+ * are re-anchored to flat labels. Braced `procedure` nodes already provide a
+ * real lexical boundary and deliberately bypass this recovery path. */
+static TSNode objectscript_routine_statement_tag(TSNode statement) {
+    TSNode tag_statement = cbm_find_child_by_kind(statement, "tag_statement");
+    return ts_node_is_null(tag_statement) ? (TSNode){0}
+                                          : cbm_find_child_by_kind(tag_statement, "tag");
+}
+
+static TSNode objectscript_routine_preceding_tag(TSNode node) {
+    if (strcmp(ts_node_type(node), "statement") != 0) {
+        return (TSNode){0};
+    }
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "source_file") != 0 ||
+        !ts_node_is_null(cbm_find_child_by_kind(node, "tag_statement")) ||
+        !ts_node_is_null(cbm_find_child_by_kind(node, "procedure"))) {
+        return (TSNode){0};
+    }
+    for (TSNode previous = ts_node_prev_named_sibling(node); !ts_node_is_null(previous);
+         previous = ts_node_prev_named_sibling(previous)) {
+        TSNode tag = objectscript_routine_statement_tag(previous);
+        if (!ts_node_is_null(tag)) {
+            return tag;
+        }
+    }
+    return (TSNode){0};
+}
+
+static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+                                WalkState *state, uint32_t depth) {
+    for (int i = 0; i < state->scope_top; i++) {
+        if (state->scopes[i].kind == SCOPE_FUNC) {
+            return false;
+        }
+    }
+
+    TSNode label = {0};
+    if (ctx->language == CBM_LANG_NASM && strcmp(ts_node_type(node), "actual_instruction") == 0) {
+        label = nasm_preceding_label(node);
+    } else if (ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+        if (strcmp(ts_node_type(node), "tag_statement") == 0) {
+            /* A parameterized flat tag owns its header as well as the following
+             * sibling command statements. Anchor before descending so its
+             * parameter_list records lexical bindings under the same tag QN. */
+            label = cbm_find_child_by_kind(node, "tag");
+        } else {
+            label = objectscript_routine_preceding_tag(node);
+        }
+    }
+    if (ts_node_is_null(label)) {
+        return false;
+    }
+    const char *fqn = compute_func_qn(ctx, label, spec, state);
+    if (!fqn) {
+        return false;
+    }
+    uint32_t anchor_start = ts_node_start_byte(label);
+    uint32_t anchor_end = ts_node_end_byte(label);
+    bool same_flat_callable = state->flat_function_scope_id != 0 &&
+                              state->flat_anchor_start_byte == anchor_start &&
+                              state->flat_anchor_end_byte == anchor_end &&
+                              state->flat_function_qn && strcmp(state->flat_function_qn, fqn) == 0;
+    bool pushed = same_flat_callable
+                      ? push_existing_lexical_scope(state, SCOPE_FUNC, depth, fqn,
+                                                    state->flat_function_scope_id, node)
+                      : push_function_scope(state, depth, fqn, node);
+    if (pushed && !same_flat_callable) {
+        state->flat_function_scope_id = state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id;
+        state->flat_anchor_start_byte = anchor_start;
+        state->flat_anchor_end_byte = anchor_end;
+        state->flat_function_qn = fqn;
+    }
+    return pushed;
+}
+
+static bool unified_kind_in_set(const char *kind, const char *const *set) {
+    for (int i = 0; kind && set && set[i]; i++) {
+        if (strcmp(kind, set[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool lexical_boundary_kind(TSNode node, CBMLexicalScopeKind *out_kind) {
+    const char *kind = ts_node_type(node);
+    static const char *const block_kinds[] = {"block",
+                                              "statement_block",
+                                              "compound_statement",
+                                              "switch_body",
+                                              "catch_clause",
+                                              "except_clause",
+                                              "finally_clause",
+                                              "for_statement",
+                                              "for_in_statement",
+                                              "for_of_statement",
+                                              "enhanced_for_statement",
+                                              "foreach_statement",
+                                              "foreach_clause",
+                                              "loop_expression",
+                                              "match_block",
+                                              "case_block",
+                                              "script_block",
+                                              "do_block",
+                                              NULL};
+    static const char *const comprehension_kinds[] = {
+        "list_comprehension",   "set_comprehension",        "dictionary_comprehension",
+        "generator_expression", "comprehension_expression", NULL};
+    static const char *const anonymous_function_kinds[] = {"lambda",
+                                                           "lambda_expression",
+                                                           "anonymous_function",
+                                                           "anonymous_function_creation_expression",
+                                                           "anonymous_method_expression",
+                                                           "arrow_function",
+                                                           "closure_expression",
+                                                           "func_literal",
+                                                           "function_expression",
+                                                           "function_literal",
+                                                           NULL};
+    /* Rust inline modules own independent item/import namespaces. Without a
+     * concrete module scope, `mod inner { use ... as x; }` leaks x into every
+     * sibling function in the file. */
+    if (strcmp(kind, "mod_item") == 0) {
+        *out_kind = CBM_LEXICAL_SCOPE_MODULE;
+        return true;
+    }
+    if (unified_kind_in_set(kind, comprehension_kinds)) {
+        *out_kind = CBM_LEXICAL_SCOPE_COMPREHENSION;
+        return true;
+    }
+    if (unified_kind_in_set(kind, anonymous_function_kinds)) {
+        *out_kind = CBM_LEXICAL_SCOPE_FUNCTION;
+        return true;
+    }
+    if (unified_kind_in_set(kind, block_kinds)) {
+        *out_kind = CBM_LEXICAL_SCOPE_BLOCK;
+        return true;
+    }
+    return false;
+}
+
+static bool node_already_has_lexical_scope(const WalkState *state, TSNode node) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    for (int i = state->scope_top - 1; i >= 0; i--) {
+        const CBMLexicalScope *scope =
+            lexical_scope_by_id(state, state->scopes[i].lexical_scope_id);
+        if (scope && scope->start_byte == start && scope->end_byte == end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth) {
+    CBMLexicalScopeKind kind;
+    if (!node_already_has_lexical_scope(state, node) && lexical_boundary_kind(node, &kind)) {
+        (void)push_lexical_scope(state, SCOPE_LEXICAL, depth, NULL, node, kind);
+    }
+}
+
 // Push scope markers for function, class, call, and import boundary nodes.
 static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
-                                 WalkState *state, uint32_t depth) {
+                                 WalkState *state, uint32_t depth,
+                                 const CBMInvocationDescriptor *invocation) {
     if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
          * but the def walk does not descend into function bodies, so it emits no
@@ -1362,8 +1852,20 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         }
         if (!skip_nested) {
             const char *fqn = compute_func_qn(ctx, node, spec, state);
-            if (fqn) {
-                push_scope(state, SCOPE_FUNC, depth, fqn);
+            if (fqn && push_function_scope(state, depth, fqn, node)) {
+                const char *node_kind = ts_node_type(node);
+                bool split_signature = (ctx->language == CBM_LANG_DART &&
+                                        (strcmp(node_kind, "function_signature") == 0 ||
+                                         strcmp(node_kind, "method_signature") == 0)) ||
+                                       (ctx->language == CBM_LANG_LLVM_IR &&
+                                        strcmp(node_kind, "function_header") == 0);
+                if (split_signature) {
+                    state->split_function_scope_id =
+                        state->scopes[state->scope_top - SKIP_ONE].lexical_scope_id;
+                    state->split_signature_start_byte = ts_node_start_byte(node);
+                    state->split_signature_end_byte = ts_node_end_byte(node);
+                    state->split_function_qn = fqn;
+                }
                 // ObjectScript: entering a method resets local var types (keeping
                 // class-level property types) and seeds the declared parameter types.
                 if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
@@ -1407,10 +1909,16 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
                 }
             }
         }
+    } else if (cbm_is_namespace_scope_kind(ctx->language, ts_node_type(node))) {
+        const char *namespace_qn = compute_class_qn(ctx, node, state);
+        if (namespace_qn) {
+            push_lexical_scope(state, SCOPE_NAMESPACE, depth, namespace_qn, node,
+                               CBM_LEXICAL_SCOPE_MODULE);
+        }
     } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
         const char *cqn = compute_class_qn(ctx, node, state);
         if (cqn) {
-            push_scope(state, SCOPE_CLASS, depth, cqn);
+            push_lexical_scope(state, SCOPE_CLASS, depth, cqn, node, CBM_LEXICAL_SCOPE_CLASS);
             // ObjectScript: a new class clears the type map entirely.
             if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
                 ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
@@ -1425,7 +1933,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
             if (type_name && type_name[0]) {
                 const char *tqn =
                     cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, type_name);
-                push_scope(state, SCOPE_CLASS, depth, tqn);
+                push_lexical_scope(state, SCOPE_CLASS, depth, tqn, node, CBM_LEXICAL_SCOPE_CLASS);
             }
         }
     } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
@@ -1442,16 +1950,54 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         if (!ts_node_is_null(prev)) {
             const char *fqn = compute_func_qn(ctx, prev, spec, state);
             if (fqn) {
-                push_scope(state, SCOPE_FUNC, depth, fqn);
+                bool exact_pending =
+                    state->split_function_scope_id != 0 && state->split_function_qn &&
+                    strcmp(state->split_function_qn, fqn) == 0 &&
+                    state->split_signature_start_byte == ts_node_start_byte(prev) &&
+                    state->split_signature_end_byte == ts_node_end_byte(prev);
+                if (exact_pending) {
+                    push_existing_lexical_scope(state, SCOPE_FUNC, depth, fqn,
+                                                state->split_function_scope_id, node);
+                } else {
+                    push_function_scope(state, depth, fqn, node);
+                }
+                state->split_function_scope_id = 0;
+                state->split_function_qn = NULL;
+            }
+        }
+    } else if (ctx->language == CBM_LANG_LLVM_IR &&
+               strcmp(ts_node_type(node), "function_body") == 0) {
+        /* LLVM's function_header and function_body are siblings under
+         * fn_define. Re-anchor the already-extracted header definition across
+         * its body so instruction_call nodes inherit that routine. */
+        TSNode previous = ts_node_prev_sibling(node);
+        while (!ts_node_is_null(previous) &&
+               strcmp(ts_node_type(previous), "function_header") != 0) {
+            previous = ts_node_prev_sibling(previous);
+        }
+        if (!ts_node_is_null(previous)) {
+            const char *fqn = compute_func_qn(ctx, previous, spec, state);
+            if (fqn) {
+                bool exact_pending =
+                    state->split_function_scope_id != 0 && state->split_function_qn &&
+                    strcmp(state->split_function_qn, fqn) == 0 &&
+                    state->split_signature_start_byte == ts_node_start_byte(previous) &&
+                    state->split_signature_end_byte == ts_node_end_byte(previous);
+                if (exact_pending) {
+                    push_existing_lexical_scope(state, SCOPE_FUNC, depth, fqn,
+                                                state->split_function_scope_id, node);
+                } else {
+                    push_function_scope(state, depth, fqn, node);
+                }
+                state->split_function_scope_id = 0;
+                state->split_function_qn = NULL;
             }
         }
     }
 
-    if (spec->call_node_types && cbm_kind_in_set(node, spec->call_node_types)) {
-        push_scope(state, SCOPE_CALL, depth, NULL);
-    }
-    if (spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types) &&
-        !is_export_of_declaration(node)) {
+    push_lexical_boundary(node, state, depth);
+    push_call_scope(state, depth, invocation);
+    if (is_actual_import_boundary(ctx, node, spec) && !is_export_of_declaration(node)) {
         push_scope(state, SCOPE_IMPORT, depth, NULL);
     }
     /* Loop / branch nesting for bottleneck metrics. Loops are gated on named
@@ -1472,33 +2018,56 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    TSTreeCursor occurrence_cursor = ts_tree_cursor_copy(&cursor);
     WalkState state;
     memset(&state, 0, sizeof(state));
+    state.current_cursor = &cursor;
+    state.occurrence_cursor = &occurrence_cursor;
+    state.arena = ctx->arena;
+    state.language = ctx->language;
+    state.scopes = state.inline_scopes;
+    state.scope_capacity = MAX_SCOPES;
+    state.lexical_scopes = state.inline_lexical_scopes;
+    state.lexical_scope_capacity = INLINE_LEXICAL_SCOPES;
+    state.usage_start_index = ctx->result->usages.count;
+    state.root_lexical_scope_id = add_lexical_scope(&state, ctx->root, CBM_LEXICAL_SCOPE_MODULE);
 
     uint32_t depth = 0;
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        bool trivia = is_unified_trivia_node(node);
+        if (!trivia) {
+            /* Trivia consumes no semantic state. Scope expiry may be deferred
+             * until the next code-bearing node, which recomputes before use. */
+            pop_expired_scopes(&state, depth);
+            recompute_state(&state, ctx->module_qn);
+            if (push_pre_node_scope(ctx, node, spec, &state, depth)) {
+                recompute_state(&state, ctx->module_qn);
+            }
 
-        pop_expired_scopes(&state, depth);
-        recompute_state(&state, ctx->module_qn);
+            handle_string_constants(ctx, node, &state);
+            handle_objectscript_type_map(ctx, node, &state);
+            CBMInvocationDescriptor invocation = handle_calls(ctx, node, spec, &state);
+            handle_usages(ctx, node, spec, &state);
+            handle_throws(ctx, node, spec, &state);
+            handle_readwrites(ctx, node, spec, &state);
+            handle_type_refs(ctx, node, spec, &state);
+            handle_env_accesses(ctx, node, spec, &state);
+            handle_type_assigns(ctx, node, spec, &state);
+            handle_string_refs(ctx, node, &state);
+            handle_yaml_nested(ctx, node);
+            scan_infra_bindings(ctx, node);
 
-        handle_string_constants(ctx, node, &state);
-        handle_objectscript_type_map(ctx, node, &state);
-        handle_calls(ctx, node, spec, &state);
-        handle_usages(ctx, node, spec, &state);
-        handle_throws(ctx, node, spec, &state);
-        handle_readwrites(ctx, node, spec, &state);
-        handle_type_refs(ctx, node, spec, &state);
-        handle_env_accesses(ctx, node, spec, &state);
-        handle_type_assigns(ctx, node, spec, &state);
-        handle_string_refs(ctx, node, &state);
-        handle_yaml_nested(ctx, node);
-        scan_infra_bindings(ctx, node);
+            push_boundary_scopes(ctx, node, spec, &state, depth, &invocation);
+        }
 
-        push_boundary_scopes(ctx, node, spec, &state, depth);
-
-        if (ts_tree_cursor_goto_first_child(&cursor)) {
+        /* Lexer-terminal trivia has no semantic work and no descendants. Avoid
+         * asking the cursor to construct a child iterator for every one of
+         * hundreds of thousands of flat comment siblings. Structured extras
+         * still descend normally. */
+        if ((!trivia || ts_node_child_count(node) > 0) &&
+            ts_tree_cursor_goto_first_child(&cursor)) {
             depth++;
             continue;
         }
@@ -1518,5 +2087,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
         }
     }
 
+    cbm_finalize_lexical_usages(ctx, &state);
+    ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);
 }

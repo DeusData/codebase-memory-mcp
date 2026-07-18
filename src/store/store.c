@@ -437,15 +437,17 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
             return rc;
         }
         /* #1083: bound the WAL file so a checkpoint-starved log is physically
-         * reclaimed the next time a checkpoint can reset it. Our checkpoints are
-         * all PASSIVE (they never ftruncate — see cbm_store_checkpoint's SIGBUS
-         * note), so without a size limit the -wal file only ever grows; a
-         * journal_size_limit truncates it back to N bytes on the next successful
+         * reclaimed the next time a checkpoint can reset it. Shared/live
+         * checkpoints are PASSIVE (they never ftruncate — see
+         * cbm_store_checkpoint's SIGBUS note), so without a size limit the -wal
+         * file only ever grows; journal_size_limit truncates it back to N bytes
+         * on the next successful
          * reset. N is far above the healthy WAL (~4 MiB under the default
          * 1000-page autocheckpoint), so normal indexing never triggers
-         * truncate/regrow churn — it only fires after abnormal growth. We do NOT
-         * use a TRUNCATE checkpoint: its ftruncate(fd,0) can raise SIGBUS in a
-         * sibling process that has the DB mmap'd on macOS. */
+         * truncate/regrow churn — it only fires after abnormal growth.
+         * Shared/live paths do NOT use a TRUNCATE checkpoint: truncating the WAL
+         * to zero can raise SIGBUS in a sibling process that has the DB mmap'd
+         * on macOS. Exclusive staging publication seals separately below. */
         rc = exec_sql(s, "PRAGMA journal_size_limit = 268435456;"); /* 256 MiB */
         if (rc != CBM_STORE_OK) {
             return rc;
@@ -1135,6 +1137,118 @@ int64_t cbm_store_journal_size_limit(cbm_store_t *s) {
     return limit;
 }
 
+int cbm_store_seal_for_atomic_publish(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+
+    /* Bulk indexing deliberately relaxes synchronous writes. Restore the
+     * strongest durability before copying WAL pages into the database file.
+     * This staging connection is exclusively owned by the publisher. */
+    if (exec_sql(s, "PRAGMA synchronous = FULL;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    int log_frames = 0;
+    int checkpointed_frames = 0;
+    int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log_frames,
+                                       &checkpointed_frames);
+    if (rc != SQLITE_OK) {
+        snprintf(s->errbuf, sizeof(s->errbuf), "seal checkpoint: %s (log=%d checkpointed=%d)",
+                 sqlite3_errstr(rc), log_frames, checkpointed_frames);
+        return CBM_STORE_ERR;
+    }
+
+    /* PRAGMA journal_mode returns the mode SQLite actually entered. sqlite3_exec
+     * would discard that result and could falsely report a successful seal. */
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(s->db, "PRAGMA journal_mode = DELETE;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "seal journal_mode prepare");
+        return CBM_STORE_ERR;
+    }
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "seal journal_mode step");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+    bool is_delete = mode && sqlite3_stricmp(mode, "delete") == 0;
+
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "seal journal_mode completion");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "seal journal_mode finalize");
+        return CBM_STORE_ERR;
+    }
+    if (!is_delete) {
+        store_set_error(s, "seal journal_mode did not enter delete mode");
+        return CBM_STORE_ERR;
+    }
+
+    return CBM_STORE_OK;
+}
+
+int cbm_store_seal_existing_path_for_replace(const char *db_path) {
+    if (!db_path || !db_path[0]) {
+        return CBM_STORE_ERR;
+    }
+
+    cbm_store_t maintenance = {0};
+    int rc = sqlite3_open_v2(db_path, &maintenance.db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        int primary = rc & 0xff;
+        sqlite3_close(maintenance.db);
+        return primary == SQLITE_CORRUPT || primary == SQLITE_NOTADB || primary == SQLITE_FORMAT
+                   ? CBM_STORE_NOT_FOUND
+                   : CBM_STORE_ERR;
+    }
+    (void)sqlite3_busy_timeout(maintenance.db, 10000);
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(maintenance.db, "PRAGMA quick_check(1);", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        int primary = rc & 0xff;
+        sqlite3_close(maintenance.db);
+        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED || primary == SQLITE_READONLY ||
+                       primary == SQLITE_CANTOPEN || primary == SQLITE_IOERR
+                   ? CBM_STORE_ERR
+                   : CBM_STORE_NOT_FOUND;
+    }
+    rc = sqlite3_step(stmt);
+    const char *result = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(stmt, 0) : NULL;
+    bool structurally_valid = result && strcmp(result, "ok") == 0;
+    int finalize_rc = sqlite3_finalize(stmt);
+    if (!structurally_valid || finalize_rc != SQLITE_OK) {
+        int primary = rc & 0xff;
+        sqlite3_close(maintenance.db);
+        return primary == SQLITE_BUSY || primary == SQLITE_LOCKED || primary == SQLITE_READONLY ||
+                       primary == SQLITE_CANTOPEN || primary == SQLITE_IOERR
+                   ? CBM_STORE_ERR
+                   : CBM_STORE_NOT_FOUND;
+    }
+
+    /* A structurally valid SQLite file that is not recognizably a codebase
+     * graph is incompatible at this destination and must be preserved before
+     * replacement. Legacy graph schemas still pass this shallow identity
+     * check and can be sealed without running init_schema(). */
+    if (!cbm_store_check_integrity(&maintenance)) {
+        sqlite3_close(maintenance.db);
+        return CBM_STORE_NOT_FOUND;
+    }
+
+    int seal_rc = cbm_store_seal_for_atomic_publish(&maintenance);
+    sqlite3_close(maintenance.db);
+    return seal_rc;
+}
+
 /* ── Dump ───────────────────────────────────────────────────────── */
 
 /* Dump entire in-memory database to a file via sqlite3_backup.
@@ -1288,8 +1402,15 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
         out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
         out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
         out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        /* Cached SELECT statements must not remain parked on SQLITE_ROW.
+         * Besides retaining a read transaction, an active reader prevents
+         * publication from switching a fully-written staging database out of
+         * WAL mode before the atomic rename. All result text is owned by the
+         * caller at this point, so release the reader immediately. */
+        sqlite3_reset(stmt);
         return CBM_STORE_OK;
     }
+    sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;
 }
 
@@ -1438,8 +1559,10 @@ int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         scan_node(stmt, out);
+        sqlite3_reset(stmt);
         return CBM_STORE_OK;
     }
+    sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;
 }
 
@@ -1462,8 +1585,10 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         scan_node(stmt, out);
+        sqlite3_reset(stmt);
         return CBM_STORE_OK;
     }
+    sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;
 }
 
@@ -1484,8 +1609,10 @@ int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *ou
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
         scan_node(stmt, out);
+        sqlite3_reset(stmt);
         return CBM_STORE_OK;
     }
+    sqlite3_reset(stmt);
     return CBM_STORE_NOT_FOUND;
 }
 
@@ -1654,10 +1781,12 @@ int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
+    int count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
+        count = sqlite3_column_int(stmt, 0);
     }
-    return 0;
+    sqlite3_reset(stmt);
+    return count;
 }
 
 int cbm_store_delete_nodes_by_project(cbm_store_t *s, const char *project) {
@@ -1972,10 +2101,12 @@ int cbm_store_count_edges(cbm_store_t *s, const char *project) {
     }
 
     bind_text(stmt, SKIP_ONE, project);
+    int count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
+        count = sqlite3_column_int(stmt, 0);
     }
-    return 0;
+    sqlite3_reset(stmt);
+    return count;
 }
 
 int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const char *type) {
@@ -1988,10 +2119,12 @@ int cbm_store_count_edges_by_type(cbm_store_t *s, const char *project, const cha
 
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, type);
+    int count = 0;
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return sqlite3_column_int(stmt, 0);
+        count = sqlite3_column_int(stmt, 0);
     }
-    return 0;
+    sqlite3_reset(stmt);
+    return count;
 }
 
 int cbm_store_delete_edges_by_project(cbm_store_t *s, const char *project) {
@@ -3552,9 +3685,11 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     const char *select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
                               "n.file_path, n.start_line, n.end_line, n.properties, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
-                              "e.type IN ('CALLS', 'USAGE', 'INHERITS', 'IMPLEMENTS')) AS in_deg, "
+                              "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
+                              "'IMPLEMENTS')) AS in_deg, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
-                              "e.type IN ('CALLS', 'USAGE', 'INHERITS', 'IMPLEMENTS')) AS out_deg ";
+                              "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
+                              "'IMPLEMENTS')) AS out_deg ";
 
     char where[CBM_SZ_2K] = "";
     search_bind_t binds[ST_SEARCH_MAX_BINDS];
@@ -7174,6 +7309,33 @@ int cbm_store_adr_store(cbm_store_t *s, const char *project, const char *content
 }
 
 int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
+    if (!s || !s->db || !project || !out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+
+    /* ADR storage was added after the original graph schema. A readable
+     * legacy generation without project_summaries has no ADR to preserve; it
+     * is not a read failure and must remain replaceable by a full reindex. */
+    sqlite3_stmt *table_stmt = NULL;
+    int rc = sqlite3_prepare_v2(
+        s->db,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_summaries' LIMIT 1;",
+        CBM_NOT_FOUND, &table_stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "adr_get table probe");
+        return CBM_STORE_ERR;
+    }
+    rc = sqlite3_step(table_stmt);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(table_stmt);
+        return CBM_STORE_NOT_FOUND;
+    }
+    if (rc != SQLITE_ROW || sqlite3_finalize(table_stmt) != SQLITE_OK) {
+        store_set_error_sqlite(s, "adr_get table probe step");
+        return CBM_STORE_ERR;
+    }
+
     const char *sql = "SELECT project, summary, created_at, updated_at FROM project_summaries "
                       "WHERE project=?1";
     sqlite3_stmt *stmt = NULL;
@@ -7181,18 +7343,42 @@ int cbm_store_adr_get(cbm_store_t *s, const char *project, cbm_adr_t *out) {
         store_set_error_sqlite(s, "adr_get");
         return CBM_STORE_ERR;
     }
-    bind_text(stmt, SKIP_ONE, project);
-    int rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) {
+    if (bind_text(stmt, SKIP_ONE, project) != SQLITE_OK) {
+        store_set_error_sqlite(s, "adr_get bind");
         sqlite3_finalize(stmt);
-        store_set_error(s, "no ADR found");
-        return CBM_STORE_NOT_FOUND;
+        return CBM_STORE_ERR;
+    }
+    rc = sqlite3_step(stmt);
+    if (rc != SQLITE_ROW) {
+        if (rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "adr_get step");
+        }
+        sqlite3_finalize(stmt);
+        if (rc == SQLITE_DONE) {
+            store_set_error(s, "no ADR found");
+            return CBM_STORE_NOT_FOUND;
+        }
+        return CBM_STORE_ERR;
     }
     out->project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
     out->content = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
     out->created_at = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
     out->updated_at = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_3));
-    sqlite3_finalize(stmt);
+    rc = sqlite3_finalize(stmt);
+    if (rc != SQLITE_OK) {
+        cbm_store_adr_free(out);
+        store_set_error_sqlite(s, "adr_get finalize");
+        return CBM_STORE_ERR;
+    }
+
+    /* Every selected column is NOT NULL in the schema. A NULL here therefore
+     * means either allocation failure or corrupt data; never return a partial
+     * ADR that a full rebuild could silently drop during publication. */
+    if (!out->project || !out->content || !out->created_at || !out->updated_at) {
+        cbm_store_adr_free(out);
+        store_set_error(s, "adr_get: failed to copy complete ADR");
+        return CBM_STORE_ERR;
+    }
     return CBM_STORE_OK;
 }
 

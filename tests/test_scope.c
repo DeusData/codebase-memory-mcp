@@ -108,6 +108,75 @@ TEST(scope_child_shadows_parent) {
     PASS();
 }
 
+TEST(scope_callable_identity_follows_nearest_binding) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *root = cbm_scope_push(&a, NULL);
+    CBMScope *child = cbm_scope_push(&a, root);
+    const CBMType *callback_type = named_t(&a, "Callback");
+    cbm_scope_bind_callable(root, "callback", callback_type, "pkg.actual");
+    ASSERT_TRUE(cbm_scope_contains(child, "callback"));
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(child, "callback"), "pkg.actual");
+
+    cbm_scope_bind(child, "callback", named_t(&a, "int"));
+    ASSERT_NULL(cbm_scope_lookup_callable(child, "callback"));
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(root, "callback"), "pkg.actual");
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(scope_assignment_updates_or_clears_nearest_callable_only) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *root = cbm_scope_push(&a, NULL);
+    CBMScope *child = cbm_scope_push(&a, root);
+    const CBMType *callback_type = named_t(&a, "Callback");
+    cbm_scope_bind_callable(root, "callback", callback_type, "pkg.actual");
+
+    ASSERT_TRUE(cbm_scope_update_callable(child, "callback", "pkg.alternate"));
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(root, "callback"), "pkg.alternate");
+    ASSERT(cbm_scope_lookup(root, "callback") == callback_type);
+    ASSERT_TRUE(cbm_scope_update_callable(child, "callback", NULL));
+    ASSERT_NULL(cbm_scope_lookup_callable(root, "callback"));
+    ASSERT_FALSE(cbm_scope_update_callable(child, "missing", "pkg.never"));
+
+    cbm_scope_bind_callable(root, "callback", callback_type, "pkg.restored");
+    cbm_scope_bind_callable(child, "callback", callback_type, "pkg.child");
+    ASSERT_TRUE(cbm_scope_update_callable(child, "callback", "pkg.child_new"));
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(child, "callback"), "pkg.child_new");
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(root, "callback"), "pkg.restored");
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(scope_checked_bind_reports_child_oom_despite_parent_name) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMScope *root = cbm_scope_push(&a, NULL);
+    CBMScope *ordinary_child = cbm_scope_push(&a, root);
+    CBMScope *callable_child = cbm_scope_push(&a, root);
+    const CBMType *callback_type = named_t(&a, "Callback");
+    const CBMType *shadow_type = named_t(&a, "Shadow");
+    cbm_scope_bind_callable(root, "callback", callback_type, "pkg.parent");
+
+    int saved_nblocks = a.nblocks;
+    size_t saved_used = a.used;
+    a.nblocks = CBM_ARENA_MAX_BLOCKS;
+    a.used = a.block_size;
+    bool ordinary_bound = cbm_scope_bind_checked(ordinary_child, "callback", shadow_type);
+    bool callable_bound = cbm_scope_bind_callable_checked(
+        callable_child, "callback", shadow_type, "pkg.child");
+    a.nblocks = saved_nblocks;
+    a.used = saved_used;
+
+    ASSERT_FALSE(ordinary_bound);
+    ASSERT_FALSE(callable_bound);
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(ordinary_child, "callback"), "pkg.parent");
+    ASSERT_STR_EQ(cbm_scope_lookup_callable(callable_child, "callback"), "pkg.parent");
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 /* ── Dynamic growth — the Phase 0 win ───────────────────────────── */
 
 TEST(scope_dynamic_growth_300_bindings) {
@@ -190,6 +259,9 @@ SUITE(scope) {
     RUN_TEST(scope_rebind_overwrites_in_place);
     RUN_TEST(scope_lookup_walks_parent_chain);
     RUN_TEST(scope_child_shadows_parent);
+    RUN_TEST(scope_callable_identity_follows_nearest_binding);
+    RUN_TEST(scope_assignment_updates_or_clears_nearest_callable_only);
+    RUN_TEST(scope_checked_bind_reports_child_oom_despite_parent_name);
     RUN_TEST(scope_dynamic_growth_300_bindings);
     RUN_TEST(scope_growth_chunk_boundary);
     RUN_TEST(scope_rebind_in_old_chunk);

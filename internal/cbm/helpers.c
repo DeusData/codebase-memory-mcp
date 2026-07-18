@@ -460,6 +460,19 @@ bool cbm_kind_in_set(TSNode node, const char **types) {
     return kind_in_set_strcmp(node, (const char *const *)types);
 }
 
+bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
+    if (!kind) {
+        return false;
+    }
+    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
+        return strcmp(kind, "namespace_definition") == 0;
+    }
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        return strcmp(kind, "internal_module") == 0;
+    }
+    return false;
+}
+
 /* Free the calling thread's node-type bitset cache (the calloc'd `bits` arrays
  * that cbm_kind_in_set builds lazily). The cache is thread-local, so each worker
  * thread and the main thread must call this at teardown (worker exit / process
@@ -917,7 +930,8 @@ const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, co
         const char *class_chain = NULL;
         for (TSNode cur = ts_node_parent(func_node); !ts_node_is_null(cur);
              cur = ts_node_parent(cur)) {
-            if (!cbm_kind_in_set(cur, spec->class_node_types)) {
+            if (!cbm_kind_in_set(cur, spec->class_node_types) &&
+                !cbm_is_namespace_scope_kind(lang, ts_node_type(cur))) {
                 continue;
             }
             TSNode class_name = ts_node_child_by_field_name(cur, TS_FIELD("name"));

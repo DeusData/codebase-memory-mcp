@@ -684,9 +684,12 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             return null_node;
         }
 
-        // ObjectScript routine tag is its own name node.
-        if (lang == CBM_LANG_OBJECTSCRIPT_ROUTINE && strcmp(kind, "tag") == 0) {
-            return node;
+        // A parameterized ObjectScript routine wraps its tag and body in a
+        // procedure node. Use the direct tag as the callable name so the
+        // definition spans the complete procedure instead of only its label.
+        if (lang == CBM_LANG_OBJECTSCRIPT_ROUTINE &&
+            (strcmp(kind, "tag") == 0 || strcmp(kind, "procedure") == 0)) {
+            return strcmp(kind, "tag") == 0 ? node : cbm_find_child_by_kind(node, "tag");
         }
         // ObjectScript method/classmethod: name lives under method_definition ->
         // method_name -> first named child.
@@ -701,6 +704,9 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
             }
             TSNode null_node = {0};
             return null_node;
+        }
+        if (lang == CBM_LANG_OBJECTSCRIPT_UDL && strcmp(kind, "query") == 0) {
+            return cbm_find_child_by_kind(node, "query_name");
         }
 
         TSNode name = func_name_node(node);
@@ -2821,6 +2827,14 @@ static char *clean_type_name(CBMArena *a, const char *raw) {
 static char *resolve_param_name(CBMArena *a, TSNode param, const char *source) {
     const char *pk = ts_node_type(param);
 
+    if (strcmp(pk, "argument") == 0 || strcmp(pk, "tag_parameter") == 0) {
+        TSNode name = find_first_descendant_by_kind(param, "objectscript_identifier", 6);
+        if (ts_node_is_null(name)) {
+            name = find_first_descendant_by_kind(param, "objectscript_identifier_special", 6);
+        }
+        return ts_node_is_null(name) ? NULL : cbm_node_text(a, name, source);
+    }
+
     if (strcmp(pk, "parameter_declaration") == 0) {
         TSNode nm = ts_node_child_by_field_name(param, TS_FIELD("name"));
         if (!ts_node_is_null(nm)) {
@@ -3024,6 +3038,15 @@ static char *resolve_param_type_text(CBMArena *a, TSNode param, const char *sour
                                      CBMLanguage lang) {
     const char *pk = ts_node_type(param);
 
+    if ((lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE) &&
+        (strcmp(pk, "argument") == 0 || strcmp(pk, "tag_parameter") == 0)) {
+        TSNode return_type = cbm_find_child_by_kind(param, "return_type");
+        TSNode typename = ts_node_is_null(return_type)
+                              ? (TSNode){0}
+                              : cbm_find_child_by_kind(return_type, "typename");
+        return ts_node_is_null(typename) ? NULL : cbm_node_text(a, typename, source);
+    }
+
     if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         if (strcmp(pk, "required_parameter") == 0 || strcmp(pk, "optional_parameter") == 0) {
             return extract_ts_param_type(a, param, source);
@@ -3094,6 +3117,226 @@ static const char **extract_param_types(CBMArena *a, TSNode params, const char *
     return result;
 }
 
+/* Internal, occurrence-preserving signature extraction.  `param_types` above is
+ * the legacy USES_TYPE projection: it intentionally drops builtins and
+ * duplicate types.  Semantic call resolution needs a different contract — one
+ * type entry per source-level call argument, in declaration order. */
+static const char signature_unknown_type[] = "?";
+
+static char *signature_receiver_name(CBMArena *a, TSNode param, const char *source,
+                                     bool unwrap_wrappers) {
+    char *name = resolve_param_name(a, param, source);
+    if (name && name[0]) {
+        return name;
+    }
+
+    TSNode candidate = ts_node_child_by_field_name(param, TS_FIELD("pattern"));
+    if (ts_node_is_null(candidate)) {
+        candidate = ts_node_child_by_field_name(param, TS_FIELD("name"));
+    }
+    if (ts_node_is_null(candidate)) {
+        uint32_t nc = ts_node_named_child_count(param);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode child = ts_node_named_child(param, i);
+            const char *ck = ts_node_type(child);
+            if (strcmp(ck, "type_annotation") == 0 || strcmp(ck, "decorator") == 0 ||
+                strcmp(ck, "attribute_item") == 0) {
+                continue;
+            }
+            candidate = child;
+            break;
+        }
+    }
+
+    /* Python typed/splat wrappers and TS pattern wrappers place the actual
+     * receiver identifier at the first named leaf. */
+    for (int depth = 0; depth < 4 && !ts_node_is_null(candidate); depth++) {
+        if (ts_node_named_child_count(candidate) == 0) {
+            return cbm_node_text(a, candidate, source);
+        }
+        if (!unwrap_wrappers) {
+            return NULL;
+        }
+        TSNode next = ts_node_child_by_field_name(candidate, TS_FIELD("pattern"));
+        if (ts_node_is_null(next)) {
+            next = ts_node_child_by_field_name(candidate, TS_FIELD("name"));
+        }
+        if (ts_node_is_null(next)) {
+            next = ts_node_named_child(candidate, 0);
+        }
+        candidate = next;
+    }
+    return NULL;
+}
+
+static bool is_signature_implicit_receiver(CBMArena *a, TSNode param, const char *source,
+                                           CBMLanguage lang, bool method, bool first_parameter) {
+    const char *pk = ts_node_type(param);
+
+    /* These grammar nodes describe a receiver supplied by member-call syntax,
+     * not an argument at the call site. */
+    if (strcmp(pk, "self_parameter") == 0 || strcmp(pk, "receiver_parameter") == 0 ||
+        strcmp(pk, "explicit_object_parameter_declaration") == 0) {
+        return true;
+    }
+
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+        char *name = signature_receiver_name(a, param, source, false);
+        return name && strcmp(name, "this") == 0;
+    }
+
+    /* Python instance/class receivers are conventional identifiers rather than
+     * distinct AST nodes.  Only exclude the leading slot on a method path. */
+    if (method && first_parameter && lang == CBM_LANG_PYTHON) {
+        char *name = signature_receiver_name(a, param, source, true);
+        return name && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0);
+    }
+    return false;
+}
+
+static bool is_signature_non_parameter(TSNode param, const char *source, CBMLanguage lang) {
+    const char *pk = ts_node_type(param);
+    if (strcmp(pk, "comment") == 0 || strcmp(pk, "line_comment") == 0 ||
+        strcmp(pk, "block_comment") == 0 || strcmp(pk, "attribute_item") == 0 ||
+        strcmp(pk, "inner_attribute_item") == 0 || strcmp(pk, "attribute_specifier") == 0 ||
+        strcmp(pk, "attribute_declaration") == 0 || strcmp(pk, "annotation") == 0 ||
+        strcmp(pk, "decorator") == 0 || strcmp(pk, "modifiers") == 0 ||
+        strcmp(pk, "positional_separator") == 0 || strcmp(pk, "keyword_separator") == 0 ||
+        strcmp(pk, "type_parameters") == 0 || strcmp(pk, "type_parameter_declaration") == 0) {
+        return true;
+    }
+
+    /* In C-family declarations `(void)` means zero parameters.  The grammar
+     * exposes `void` as a named primitive_type child rather than a parameter. */
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+         lang == CBM_LANG_GLSL) &&
+        strcmp(pk, "primitive_type") == 0) {
+        uint32_t start = ts_node_start_byte(param);
+        uint32_t end = ts_node_end_byte(param);
+        return end - start == 4 && strncmp(source + start, "void", 4) == 0;
+    }
+    return false;
+}
+
+/* Go permits one declaration node to introduce several positional parameters:
+ * `func f(a, b T)`.  Count its direct name identifiers; unnamed parameter
+ * declarations still represent one position. */
+static int signature_param_multiplicity(TSNode param, CBMLanguage lang) {
+    if (lang != CBM_LANG_GO) {
+        return 1;
+    }
+    const char *pk = ts_node_type(param);
+    if (strcmp(pk, "parameter_declaration") != 0 &&
+        strcmp(pk, "variadic_parameter_declaration") != 0) {
+        return 1;
+    }
+
+    int field_names = 0;
+    int identifier_names = 0;
+    uint32_t nc = ts_node_child_count(param);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_child(param, i);
+        if (ts_node_is_null(child) || !ts_node_is_named(child)) {
+            continue;
+        }
+        const char *field = ts_node_field_name_for_child(param, i);
+        if (field && strcmp(field, "name") == 0) {
+            field_names++;
+        }
+        if (strcmp(ts_node_type(child), "identifier") == 0) {
+            identifier_names++;
+        }
+    }
+    int names = field_names > 0 ? field_names : identifier_names;
+    return names > 0 ? names : 1;
+}
+
+/* Resolve the full source spelling where the legacy resolver has no supported
+ * case (defaulted C++ parameters, Python annotations, complex TS types, etc.).
+ * This deliberately does not clean or deduplicate the text. */
+static char *resolve_signature_param_type_text(CBMArena *a, TSNode param, const char *source,
+                                               CBMLanguage lang) {
+    TSNode type_node = ts_node_child_by_field_name(param, TS_FIELD("type"));
+    if (!ts_node_is_null(type_node)) {
+        /* TypeScript-family grammars may expose the `type_annotation` wrapper
+         * (including its colon) through the field.  Store the actual type node. */
+        if (strcmp(ts_node_type(type_node), "type_annotation") == 0 &&
+            ts_node_named_child_count(type_node) > 0) {
+            type_node = ts_node_named_child(type_node, 0);
+        }
+        char *type_text = cbm_node_text(a, type_node, source);
+        if (type_text && type_text[0]) {
+            return type_text;
+        }
+    }
+
+    TSNode annotation = cbm_find_child_by_kind(param, "type_annotation");
+    if (!ts_node_is_null(annotation)) {
+        uint32_t nc = ts_node_named_child_count(annotation);
+        if (nc > 0) {
+            char *type_text = cbm_node_text(a, ts_node_named_child(annotation, 0), source);
+            if (type_text && type_text[0]) {
+                return type_text;
+            }
+        }
+    }
+
+    TSNode typed_pattern = cbm_find_child_by_kind(param, "typed_pattern");
+    if (!ts_node_is_null(typed_pattern)) {
+        type_node = ts_node_child_by_field_name(typed_pattern, TS_FIELD("type"));
+        if (!ts_node_is_null(type_node)) {
+            char *type_text = cbm_node_text(a, type_node, source);
+            if (type_text && type_text[0]) {
+                return type_text;
+            }
+        }
+    }
+    return resolve_param_type_text(a, param, source, lang);
+}
+
+static const char **extract_signature_param_types(CBMArena *a, TSNode params, const char *source,
+                                                  CBMLanguage lang, bool method, int *out_count) {
+    *out_count = 0;
+    if (ts_node_is_null(params)) {
+        return NULL;
+    }
+
+    const char *types[MAX_PARAMS];
+    uint32_t nc = ts_node_child_count(params);
+    for (uint32_t i = 0; i < nc && *out_count < MAX_PARAMS_MINUS_1; i++) {
+        TSNode param = ts_node_child(params, i);
+        if (ts_node_is_null(param) || !ts_node_is_named(param) ||
+            is_signature_non_parameter(param, source, lang)) {
+            continue;
+        }
+        if (is_signature_implicit_receiver(a, param, source, lang, method, *out_count == 0)) {
+            continue;
+        }
+
+        char *type_text = resolve_signature_param_type_text(a, param, source, lang);
+        const char *entry = type_text && type_text[0] ? type_text : signature_unknown_type;
+        int multiplicity = signature_param_multiplicity(param, lang);
+        for (int n = 0; n < multiplicity && *out_count < MAX_PARAMS_MINUS_1; n++) {
+            types[(*out_count)++] = entry;
+        }
+    }
+
+    if (*out_count == 0) {
+        return NULL;
+    }
+    const char **result =
+        (const char **)cbm_arena_alloc(a, (size_t)(*out_count + NULL_TERM) * sizeof(const char *));
+    if (!result) {
+        *out_count = 0;
+        return NULL;
+    }
+    for (int i = 0; i < *out_count; i++) {
+        result[i] = types[i];
+    }
+    result[*out_count] = NULL;
+    return result;
+}
+
 // --- Function definition extraction ---
 
 // For C++/CUDA template_declaration, find the inner function_definition or declaration.
@@ -3108,15 +3351,55 @@ static TSNode unwrap_template_inner(TSNode node, CBMLanguage lang) {
 // C/C++/CUDA/GLSL: parameters live on function_declarator inside declarator chain.
 static TSNode find_c_params(TSNode func_node) {
     TSNode decl = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
-    for (int d = 0; d < C_RETURN_WALK_DEPTH && !ts_node_is_null(decl); d++) {
+    for (int d = 0; d < DECLARATOR_DEPTH_LIMIT && !ts_node_is_null(decl); d++) {
         TSNode params = ts_node_child_by_field_name(decl, TS_FIELD("parameters"));
         if (!ts_node_is_null(params)) {
             return params;
         }
-        decl = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        TSNode nested = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        /* tree-sitter-cpp and tree-sitter-cuda do not assign the nested
+         * function declarator a `declarator` field when a reference return
+         * wraps it (`Item& operator[](int)`).  That wrapper has one named child;
+         * descend only for this reproduced grammar shape. */
+        if (ts_node_is_null(nested) && strcmp(ts_node_type(decl), "reference_declarator") == 0 &&
+            ts_node_named_child_count(decl) > 0) {
+            nested = ts_node_named_child(decl, 0);
+        }
+        decl = nested;
     }
     TSNode null_node = {0};
     return null_node;
+}
+
+/* Resolve the parameter-list node across the grammars used by the generic
+ * definition extractor. Newer tree-sitter-kotlin exposes
+ * `function_value_parameters` as a direct child rather than a `parameters`
+ * field. Keep the legacy and ordered signature extractors on the same node so
+ * adding positional metadata does not replace or reinterpret `param_types`. */
+static TSNode find_function_params(TSNode func_node, CBMLanguage lang) {
+    TSNode params = ts_node_child_by_field_name(func_node, TS_FIELD("parameters"));
+    // ObjectScript exposes the parameter list under a `parameter_list` field.
+    if (ts_node_is_null(params) &&
+        (lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
+        params = ts_node_child_by_field_name(func_node, TS_FIELD("parameter_list"));
+    }
+    if (ts_node_is_null(params) && lang == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+        params = cbm_find_child_by_kind(func_node, "parameter_list");
+    }
+    if (ts_node_is_null(params) && lang == CBM_LANG_OBJECTSCRIPT_UDL) {
+        TSNode method_definition = cbm_find_child_by_kind(func_node, "method_definition");
+        if (!ts_node_is_null(method_definition)) {
+            params = cbm_find_child_by_kind(method_definition, "arguments");
+        }
+    }
+    if (ts_node_is_null(params) && lang == CBM_LANG_KOTLIN) {
+        params = cbm_find_child_by_kind(func_node, "function_value_parameters");
+    }
+    if (ts_node_is_null(params) && (lang == CBM_LANG_C || lang == CBM_LANG_CPP ||
+                                    lang == CBM_LANG_CUDA || lang == CBM_LANG_GLSL)) {
+        params = find_c_params(func_node);
+    }
+    return params;
 }
 
 // C++: resolve trailing return type (auto f() -> Type) on a declarator node.
@@ -3237,7 +3520,8 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
      * enclosing scope here is always a namespace. The out-of-line method path
      * below overrides this for `Ns::Cls::method` definitions. */
     if (ctx->enclosing_class_qn &&
-        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA)) {
+        (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA ||
+         ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX)) {
         def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
     }
     def.label = "Function";
@@ -3246,18 +3530,19 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(node), "function_signature_item") == 0) {
+        def.is_abstract = true;
+    }
 
     // Parameters — use func_node (inner function for templates)
-    TSNode params = ts_node_child_by_field_name(func_node, TS_FIELD("parameters"));
-    if (ts_node_is_null(params) &&
-        (ctx->language == CBM_LANG_C || ctx->language == CBM_LANG_CPP ||
-         ctx->language == CBM_LANG_CUDA || ctx->language == CBM_LANG_GLSL)) {
-        params = find_c_params(func_node);
-    }
+    TSNode params = find_function_params(func_node, ctx->language);
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
         def.param_names = extract_param_names(a, params, ctx->source, ctx->language);
         def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
+        def.signature_param_types = extract_signature_param_types(
+            a, params, ctx->source, ctx->language, false, &def.signature_param_count);
     }
 
     // Return type — use func_node (inner function for templates)
@@ -4110,6 +4395,22 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     return null_node;
 }
 
+/* Java keeps enum constants directly in enum_body, but declarations that
+ * follow the semicolon (methods, fields, and nested types) inside a dedicated
+ * enum_body_declarations child.  Keep find_class_body() returning the raw body
+ * so enum-member extraction still sees the constants, and normalize only the
+ * consumers that walk declaration members. */
+static TSNode find_class_member_body(TSNode class_node, CBMLanguage lang) {
+    TSNode body = find_class_body(class_node, lang);
+    if (ts_node_is_null(body) || lang != CBM_LANG_JAVA ||
+        strcmp(ts_node_type(body), "enum_body") != 0) {
+        return body;
+    }
+
+    TSNode declarations = cbm_find_child_by_kind(body, "enum_body_declarations");
+    return ts_node_is_null(declarations) ? body : declarations;
+}
+
 // Dart: resolve method name from method_signature/function_signature.
 static TSNode resolve_dart_method_name(TSNode child, const char *ck) {
     if (strcmp(ck, "method_signature") == 0) {
@@ -4247,16 +4548,17 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
-
-    TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
-    // ObjectScript exposes the parameter list under a `parameter_list` field.
-    if (ts_node_is_null(params) && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
-                                    ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
-        params = ts_node_child_by_field_name(child, TS_FIELD("parameter_list"));
+    if (ctx->language == CBM_LANG_RUST &&
+        strcmp(ts_node_type(child), "function_signature_item") == 0) {
+        def.is_abstract = true;
     }
+
+    TSNode params = find_function_params(child, ctx->language);
     if (!ts_node_is_null(params)) {
         def.signature = cbm_node_text(a, params, ctx->source);
         def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
+        def.signature_param_types = extract_signature_param_types(
+            a, params, ctx->source, ctx->language, true, &def.signature_param_count);
     }
 
     // Return type (same fields as extract_func_def)
@@ -4332,7 +4634,7 @@ static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, cons
 // Extract methods inside a class body
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec) {
-    TSNode body = find_class_body(class_node, ctx->language);
+    TSNode body = find_class_member_body(class_node, ctx->language);
     if (ts_node_is_null(body)) {
         return;
     }
@@ -4407,6 +4709,23 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
+        /* Kotlin secondary constructors have no source-level name node. They
+         * are nevertheless concrete callable declarations, so materialize one
+         * under the owning class using the class name (`Explicit.Explicit`).
+         * Classes with only an implicit constructor do not enter this branch
+         * and therefore do not gain a fabricated callable target. */
+        if (ctx->language == CBM_LANG_KOTLIN &&
+            strcmp(ts_node_type(method_node), "secondary_constructor") == 0) {
+            TSNode constructor_name = ts_node_child_by_field_name(class_node, TS_FIELD("name"));
+            if (ts_node_is_null(constructor_name)) {
+                constructor_name = cbm_find_child_by_kind(class_node, "type_identifier");
+            }
+            if (!ts_node_is_null(constructor_name)) {
+                push_method_def(ctx, method_node, class_node, class_qn, spec, constructor_name);
+            }
+            continue;
+        }
+
         TSNode name_node = resolve_method_name(method_node, ctx->language);
         if (ts_node_is_null(name_node)) {
             continue;
@@ -4439,7 +4758,10 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
     }
 
+    const char *type_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, type_name);
+
     // Check for "impl Trait for Struct" pattern
+    const char *impl_trait = NULL;
     TSNode trait_node = ts_node_child_by_field_name(node, TS_FIELD("trait"));
     if (!ts_node_is_null(trait_node)) {
         char *trait_name = cbm_node_text(a, trait_node, ctx->source);
@@ -4453,14 +4775,14 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
         }
         if (trait_name && trait_name[0]) {
-            CBMImplTrait it;
+            CBMImplTrait it = {0};
             it.trait_name = trait_name;
             it.struct_name = type_name;
+            it.struct_qn = type_qn;
             cbm_impltrait_push(&ctx->result->impl_traits, a, it);
+            impl_trait = trait_name;
         }
     }
-
-    const char *type_qn = cbm_fqn_compute(a, ctx->project, ctx->rel_path, type_name);
 
     // Extract methods inside impl body
     TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
@@ -4497,6 +4819,7 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         def.label = "Method";
         def.file_path = ctx->rel_path;
         def.parent_class = type_qn;
+        def.impl_trait = impl_trait;
         def.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
@@ -4505,6 +4828,8 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         if (!ts_node_is_null(params)) {
             def.signature = cbm_node_text(a, params, ctx->source);
             def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
+            def.signature_param_types = extract_signature_param_types(
+                a, params, ctx->source, ctx->language, true, &def.signature_param_count);
         }
 
         if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -5723,7 +6048,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
         return;
     }
 
-    TSNode body = find_class_body(class_node, ctx->language);
+    TSNode body = find_class_member_body(class_node, ctx->language);
     if (ts_node_is_null(body)) {
         return;
     }
@@ -6038,7 +6363,7 @@ static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node,
         return;
     }
 
-    TSNode body = find_class_body(class_node, ctx->language);
+    TSNode body = find_class_member_body(class_node, ctx->language);
     if (ts_node_is_null(body)) {
         return;
     }
@@ -6218,20 +6543,14 @@ static bool is_template_class_node(TSNode node, CBMLanguage lang) {
     return false;
 }
 
-// Compute the enclosing class QN for a class node (for nested class context).
+// Compute the enclosing class/namespace QN for a scoped node.
 /* A namespace contributes a QN segment so a symbol declared in `namespace ns`
  * is `proj.file.ns.sym`, not a top-level `proj.file.sym`. Without the namespace
  * in the QN, namespace-aware resolution (C++ ADL) is starved: a bare call
  * collapses to the file scope and resolves directly instead. Unlike a class, a
- * namespace emits no def of its own — it only extends the enclosing scope for
- * its members. C#/PHP need the same treatment paired with their LSP resolvers
- * (a def-only change breaks their existing namespace handling), done separately. */
-static bool is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
-    if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
-        return strcmp(kind, "namespace_definition") == 0;
-    }
-    return false;
-}
+ * namespace extends the enclosing scope for its members. C#/PHP need the same
+ * treatment paired with their LSP resolvers (a def-only change breaks their
+ * existing namespace handling), done separately. */
 
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char *saved_enclosing) {
     TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
@@ -6259,26 +6578,53 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
     return saved_enclosing;
 }
 
+static void extract_typescript_namespace_def(CBMExtractCtx *ctx, TSNode node,
+                                             const char *saved_enclosing) {
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    if (ts_node_is_null(name_node)) {
+        return;
+    }
+    char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+    const char *namespace_qn = compute_class_qn(ctx, node, saved_enclosing);
+    if (!name || !name[0] || !namespace_qn || !namespace_qn[0]) {
+        return;
+    }
+    CBMDefinition def = {0};
+    def.name = name;
+    def.qualified_name = namespace_qn;
+    def.label = "Module";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
+    def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
+    def.is_exported = true;
+    cbm_defs_push(&ctx->result->defs, ctx->arena, def);
+}
+
 // Push nested class children from a class body container onto the walk stack.
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
                                      const char *new_enclosing, CBMArena *arena) {
-    uint32_t nc = ts_node_child_count(node);
-    for (uint32_t ci = 0; ci < nc; ci++) {
-        TSNode child = ts_node_child(node, ci);
-        const char *ck = ts_node_type(child);
-        if (strcmp(ck, "field_declaration_list") == 0 || strcmp(ck, "class_body") == 0 ||
-            strcmp(ck, "declaration_list") == 0 || strcmp(ck, "body") == 0 ||
-            strcmp(ck, "block") == 0 || strcmp(ck, "suite") == 0 ||
-            // Groovy class bodies are a `closure` node; routing through the
-            // nested-class path keeps methods from being re-walked (and thus
-            // double-extracted) as top-level functions. Gated to Groovy so other
-            // grammars that also name a node "closure" are unaffected.
-            (strcmp(ck, "closure") == 0 && spec->language == CBM_LANG_GROOVY)) {
-            push_nested_class_nodes(child, spec, s, new_enclosing, arena);
-            return;
-        }
+    /* Use the same language-aware body selection as method extraction.  The old
+     * independent spelling list omitted valid containers such as Scala's
+     * `template_body` and Solidity's contract body.  Methods were extracted
+     * once by extract_class_methods(), then the generic walk descended through
+     * the unrecognized body and extracted them again as free functions. */
+    /* Smali's class node is itself the member container.  Method extraction
+     * currently preserves Smali's established file-level Function contract,
+     * so the generic walk must still visit those direct method_definition
+     * children.  Treating the class itself as a completed body here would only
+     * scan it for nested classes and silently drop every method. */
+    TSNode body = {0};
+    if (spec->language != CBM_LANG_SMALI) {
+        body = find_class_member_body(node, spec->language);
     }
+    if (!ts_node_is_null(body)) {
+        push_nested_class_nodes(body, spec, s, new_enclosing, arena);
+        return;
+    }
+
     // No body found — push all children directly
+    uint32_t nc = ts_node_child_count(node);
     for (int ci = (int)nc - SKIP_CHAR; ci >= 0; ci--) {
         wd_push(s, ts_node_child(node, (uint32_t)ci), new_enclosing);
     }
@@ -6779,8 +7125,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * is walked normally — functions AND classes, unlike a class body which
          * routes methods through extract_class_methods. Do NOT emit a def or run
          * the class/func paths on the namespace node itself. */
-        if (is_namespace_scope_kind(ctx->language, kind)) {
+        if (cbm_is_namespace_scope_kind(ctx->language, kind)) {
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
+            if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) {
+                extract_typescript_namespace_def(ctx, node, frame.enclosing_class_qn);
+            }
             wd_push_children_reverse(&s, node, new_enclosing);
             continue;
         }

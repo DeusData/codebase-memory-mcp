@@ -289,24 +289,29 @@ static cbm_path_alias_map_t *load_tsconfig_file(const char *abs_path, const char
 
 /* ── Public API ────────────────────────────────────────────────── */
 
+static void free_alias_map(cbm_path_alias_map_t *map) {
+    if (!map) {
+        return;
+    }
+    for (int j = 0; j < map->count; j++) {
+        free(map->entries[j].alias_prefix);
+        free(map->entries[j].alias_suffix);
+        free(map->entries[j].target_prefix);
+        free(map->entries[j].target_suffix);
+    }
+    free(map->entries);
+    free(map->base_url);
+    free(map);
+}
+
 void cbm_path_alias_collection_free(cbm_path_alias_collection_t *coll) {
     if (!coll) {
         return;
     }
     for (int i = 0; i < coll->count; i++) {
         free(coll->scopes[i].dir_prefix);
-        if (coll->scopes[i].map) {
-            cbm_path_alias_map_t *map = coll->scopes[i].map;
-            for (int j = 0; j < map->count; j++) {
-                free(map->entries[j].alias_prefix);
-                free(map->entries[j].alias_suffix);
-                free(map->entries[j].target_prefix);
-                free(map->entries[j].target_suffix);
-            }
-            free(map->entries);
-            free(map->base_url);
-            free(map);
-        }
+        free(coll->scopes[i].source_rel_path);
+        free_alias_map(coll->scopes[i].map);
     }
     free(coll->scopes);
     free(coll);
@@ -472,7 +477,24 @@ cbm_path_alias_collection_t *cbm_load_path_aliases_excluded(const char *repo_pat
         if (!map) {
             continue;
         }
-        coll->scopes[coll->count].dir_prefix = strdup(hits[i].rel);
+        const char *base = strrchr(hits[i].abs, '/');
+        base = base ? base + 1 : hits[i].abs;
+        char selected_rel[CBM_SZ_512];
+        if (hits[i].rel[0]) {
+            snprintf(selected_rel, sizeof(selected_rel), "%s/%s", hits[i].rel, base);
+        } else {
+            snprintf(selected_rel, sizeof(selected_rel), "%s", base);
+        }
+        char *dir_prefix = strdup(hits[i].rel);
+        char *source_rel_path = strdup(selected_rel);
+        if (!dir_prefix || !source_rel_path) {
+            free(dir_prefix);
+            free(source_rel_path);
+            free_alias_map(map);
+            continue;
+        }
+        coll->scopes[coll->count].dir_prefix = dir_prefix;
+        coll->scopes[coll->count].source_rel_path = source_rel_path;
         coll->scopes[coll->count].map = map;
         coll->count++;
     }
