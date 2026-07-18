@@ -76,6 +76,7 @@ enum {
 #include <yyjson/yyjson.h>
 #include <ctype.h>
 #include <stdint.h> // int64_t
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -292,6 +293,23 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     char *out = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return out;
+}
+
+bool cbm_mcp_result_succeeded(const char *result_json) {
+    if (!result_json) {
+        return false;
+    }
+
+    yyjson_doc *doc = yyjson_read(result_json, strlen(result_json), 0);
+    if (!doc) {
+        return false;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *is_error = yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    bool succeeded = yyjson_is_bool(is_error) && !yyjson_get_bool(is_error);
+    yyjson_doc_free(doc);
+    return succeeded;
 }
 
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
@@ -1403,10 +1421,14 @@ bool cbm_mcp_get_bool_arg(const char *args_json, const char *key) {
  * ══════════════════════════════════════════════════════════════════ */
 
 struct cbm_mcp_server {
-    cbm_store_t *store;             /* currently open project store (or NULL) */
-    bool owns_store;                /* true if we opened the store */
-    char *current_project;          /* which project store is open for (heap) */
-    time_t store_last_used;         /* last time resolve_store was called for a named project */
+    cbm_store_t *store;      /* currently open project store (or NULL) */
+    bool owns_store;         /* true if we opened the store */
+    char *current_project;   /* which project store is open for (heap) */
+    time_t store_last_used;  /* last time resolve_store was called for a named project */
+    atomic_bool store_stale; /* background index completed; event thread must reopen */
+#ifdef _WIN32
+    cbm_mutex_t store_update_gate; /* serialize cached readers with atomic DB replacement */
+#endif
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -1444,6 +1466,10 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     }
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
+    atomic_init(&srv->store_stale, false);
+#ifdef _WIN32
+    cbm_mutex_init(&srv->store_update_gate);
+#endif
 
     return srv;
 }
@@ -1478,6 +1504,12 @@ void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg) {
     }
 }
 
+void cbm_mcp_server_mark_store_stale(cbm_mcp_server_t *srv) {
+    if (srv) {
+        atomic_store_explicit(&srv->store_stale, true, memory_order_release);
+    }
+}
+
 void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
@@ -1493,33 +1525,90 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     }
     free(srv->current_project);
     free(srv->active_request_id_str);
+#ifdef _WIN32
+    cbm_mutex_destroy(&srv->store_update_gate);
+#endif
     free(srv);
 }
 
-/* ── Idle store eviction ──────────────────────────────────────── */
+static void store_update_gate_lock(cbm_mcp_server_t *srv) {
+#ifdef _WIN32
+    if (srv) {
+        cbm_mutex_lock(&srv->store_update_gate);
+    }
+#else
+    (void)srv;
+#endif
+}
 
-void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
-    if (!srv || !srv->store) {
+static void store_update_gate_unlock(cbm_mcp_server_t *srv) {
+#ifdef _WIN32
+    if (srv) {
+        cbm_mutex_unlock(&srv->store_update_gate);
+    }
+#else
+    (void)srv;
+#endif
+}
+
+/* Callers must run on the request thread, or hold store_update_gate on
+ * Windows so no request can concurrently use the cached SQLite handle. */
+static void invalidate_cached_store(cbm_mcp_server_t *srv) {
+    if (!srv) {
         return;
     }
-    /* Protect initial in-memory stores that were never accessed via a named project.
-     * store_last_used stays 0 until resolve_store is called with a non-NULL project. */
-    if (srv->store_last_used == 0) {
-        return;
-    }
-
-    time_t now = time(NULL);
-    if ((now - srv->store_last_used) < timeout_s) {
-        return;
-    }
-
-    if (srv->owns_store) {
+    if (srv->owns_store && srv->store) {
         cbm_store_close(srv->store);
     }
     srv->store = NULL;
     free(srv->current_project);
     srv->current_project = NULL;
     srv->store_last_used = 0;
+}
+
+void cbm_mcp_server_begin_store_update(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    store_update_gate_lock(srv);
+#ifdef _WIN32
+    /* Windows cannot atomically replace a SQLite file while this process has
+     * an open reader. The gate makes cross-thread close safe and keeps new
+     * query handles from opening until publication completes. */
+    invalidate_cached_store(srv);
+#endif
+}
+
+void cbm_mcp_server_end_store_update(cbm_mcp_server_t *srv, bool published) {
+    if (!srv) {
+        return;
+    }
+    if (published) {
+        cbm_mcp_server_mark_store_stale(srv);
+    }
+    store_update_gate_unlock(srv);
+}
+
+static void consume_stale_store(cbm_mcp_server_t *srv) {
+    if (atomic_exchange_explicit(&srv->store_stale, false, memory_order_acq_rel)) {
+        invalidate_cached_store(srv);
+    }
+}
+
+/* ── Idle store eviction ──────────────────────────────────────── */
+
+void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
+    if (!srv) {
+        return;
+    }
+    store_update_gate_lock(srv);
+    if (srv->store && srv->store_last_used != 0) {
+        time_t now = time(NULL);
+        if ((now - srv->store_last_used) >= timeout_s) {
+            invalidate_cached_store(srv);
+        }
+    }
+    store_update_gate_unlock(srv);
 }
 
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
@@ -1576,6 +1665,8 @@ static cbm_store_t *resolve_store_fallback_scan(const char *project);
  * Caches the connection — reopens only when project changes.
  * Tracks last-access time so the event loop can evict idle stores. */
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
+    consume_stale_store(srv);
+
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
@@ -6503,15 +6594,7 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
  * writes the DB and the parent only needs the return code, so there is nothing
  * to invalidate. */
 static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
-    if (!srv) {
-        return;
-    }
-    if (srv->owns_store && srv->store) {
-        cbm_store_close(srv->store);
-        srv->store = NULL;
-    }
-    free(srv->current_project);
-    srv->current_project = NULL;
+    invalidate_cached_store(srv);
 }
 
 /* Resolve a per-supervisor-run temp path <cache_dir>/logs/.supervisor-<pid><suffix>
@@ -9267,7 +9350,8 @@ static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── Tool dispatch ────────────────────────────────────────────── */
 
-char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+static char *handle_tool_unlocked(cbm_mcp_server_t *srv, const char *tool_name,
+                                  const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result("missing tool name", true);
     }
@@ -9328,6 +9412,13 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     char msg[CBM_SZ_256];
     snprintf(msg, sizeof(msg), "unknown tool: %s", tool_name);
     return cbm_mcp_text_result(msg, true);
+}
+
+char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
+    store_update_gate_lock(srv);
+    char *result = handle_tool_unlocked(srv, tool_name, args_json);
+    store_update_gate_unlock(srv);
+    return result;
 }
 
 /* ── Session detection + auto-index ────────────────────────────── */
@@ -9391,6 +9482,7 @@ static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
     cbm_log_info("autoindex.start", "project", srv->session_project, "path", srv->session_root);
+    cbm_mcp_server_begin_store_update(srv);
 
     /* #832: prefer the supervised worker subprocess. Indexing the whole session in
      * this long-lived server thread ratchets RSS (mimalloc v3 does not reclaim the
@@ -9398,9 +9490,17 @@ static void *autoindex_thread(void *arg) {
      * 100% of that memory back to the OS every cycle. Degrade to the in-process
      * pipeline below when the supervisor is off (kill switch) or the spawn fails. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *resp = index_run_supervised_path(srv, srv->session_root);
+        /* This is a background thread: use the srv-less runner so the
+         * supervisor cannot close the event loop's cached query handle. */
+        char *resp = index_run_supervised_path(NULL, srv->session_root);
         if (resp) {
+            bool succeeded = cbm_mcp_result_succeeded(resp);
             free(resp);
+            cbm_mcp_server_end_store_update(srv, succeeded);
+            if (!succeeded) {
+                cbm_log_warn("autoindex.err", "msg", "supervised_index_failed");
+                return NULL;
+            }
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
             /* Register with watcher for ongoing change detection — gated on
              * auto_watch (#849), same as the in-process branch below. A bare
@@ -9414,6 +9514,7 @@ static void *autoindex_thread(void *arg) {
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
+        cbm_mcp_server_end_store_update(srv, false);
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
@@ -9424,6 +9525,7 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
+    cbm_mcp_server_end_store_update(srv, rc == 0);
     cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {

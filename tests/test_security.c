@@ -707,6 +707,22 @@ TEST(popen_isolated_propagates_exit_code) {
     PASS();
 }
 
+TEST(popen_argv_direct_spawn_propagates_exit_code) {
+    char self[MAX_PATH];
+    ASSERT(GetModuleFileNameA(NULL, self, sizeof(self)) > 0);
+    const char *literal = "%CBM_POPEN_ARGV_LITERAL% & value";
+    const char *argv[] = {self, "__cbm_argvprobe", literal, "37", NULL};
+    FILE *fp = cbm_popen_argv(argv);
+    ASSERT_NOT_NULL(fp);
+    ASSERT_EQ(cbm_popen_last_was_isolated(), 1);
+    char line[128];
+    ASSERT_NOT_NULL(fgets(line, sizeof(line), fp));
+    line[strcspn(line, "\r\n")] = '\0';
+    ASSERT_STR_EQ(line, literal);
+    ASSERT_EQ(cbm_pclose(fp), 37);
+    PASS();
+}
+
 /* #798 follow-up (the full-repro gap flagged above): prove the EXACT handle class
  * that deadlocked git — an inheritable AFD/listening-socket handle, the kind the
  * UI HTTP server holds — does NOT cross into the cbm_popen child. Unlike the
@@ -837,6 +853,7 @@ SUITE(security) {
     /* Isolated popen — handle-inheritance regression guard for #798 */
     RUN_TEST(popen_isolated_git_version_round_trip);
     RUN_TEST(popen_isolated_propagates_exit_code);
+    RUN_TEST(popen_argv_direct_spawn_propagates_exit_code);
     RUN_TEST(popen_isolates_listening_socket);
 #endif
 }

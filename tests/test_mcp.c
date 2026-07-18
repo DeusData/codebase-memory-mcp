@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include <sqlite3.h>
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
+#include "../src/foundation/compat_thread.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "test_framework.h"
@@ -593,6 +594,24 @@ TEST(mcp_text_result_error) {
     ASSERT_NOT_NULL(strstr(json, "\"isError\":true"));
     ASSERT_NOT_NULL(strstr(json, "something failed"));
     free(json);
+    PASS();
+}
+
+TEST(mcp_result_success_requires_explicit_non_error) {
+    char *success = cbm_mcp_text_result("indexed", false);
+    char *failure = cbm_mcp_text_result("index failed", true);
+
+    ASSERT_NOT_NULL(success);
+    ASSERT_NOT_NULL(failure);
+    ASSERT_TRUE(cbm_mcp_result_succeeded(success));
+    ASSERT_FALSE(cbm_mcp_result_succeeded(failure));
+    ASSERT_FALSE(cbm_mcp_result_succeeded("{}"));
+    ASSERT_FALSE(cbm_mcp_result_succeeded("{\"isError\":\"false\"}"));
+    ASSERT_FALSE(cbm_mcp_result_succeeded("not json"));
+    ASSERT_FALSE(cbm_mcp_result_succeeded(NULL));
+
+    free(success);
+    free(failure);
     PASS();
 }
 
@@ -4039,6 +4058,92 @@ TEST(tool_ingest_traces_empty) {
  *  IDLE STORE EVICTION
  * ══════════════════════════════════════════════════════════════════ */
 
+static bool stale_store_make_db(const char *cache, const char *project, const char *function_name) {
+    char db_path[CBM_SZ_4K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return false;
+    }
+
+    bool ok = cbm_store_upsert_project(store, project, cache) == CBM_STORE_OK;
+    if (ok) {
+        char qualified_name[CBM_SZ_256];
+        snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, function_name);
+        cbm_node_t node = {
+            .project = project,
+            .label = "Function",
+            .name = function_name,
+            .qualified_name = qualified_name,
+            .file_path = "main.c",
+            .start_line = 1,
+            .end_line = 2,
+        };
+        ok = cbm_store_upsert_node(store, &node) > 0;
+    }
+    cbm_store_close(store);
+    return ok;
+}
+
+static void *mark_stale_store_thread(void *arg) {
+    cbm_mcp_server_mark_store_stale((cbm_mcp_server_t *)arg);
+    return NULL;
+}
+
+TEST(store_stale_notification_is_consumed_by_resolve_thread) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-stale-store-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "stale-store-project";
+    ASSERT_TRUE(stale_store_make_db(cache, project, "BeforeRefresh"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"name_pattern\":\"BeforeRefresh\"}", project);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "BeforeRefresh"));
+    free(resp);
+    ASSERT_TRUE(cbm_mcp_server_has_cached_store(srv));
+
+    cbm_thread_t tid;
+    ASSERT_EQ(cbm_thread_create(&tid, 0, mark_stale_store_thread, srv), 0);
+    ASSERT_EQ(cbm_thread_join(&tid), 0);
+
+    /* Publishing from the background thread must not close the live handle. */
+    ASSERT_TRUE(cbm_mcp_server_has_cached_store(srv));
+
+    /* The next resolve runs on this request thread. A missing project leaves
+     * no replacement handle, making consumption directly observable. */
+    resp = cbm_mcp_handle_tool(srv, "search_graph",
+                               "{\"project\":\"missing-after-stale\",\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    free(resp);
+    ASSERT_FALSE(cbm_mcp_server_has_cached_store(srv));
+
+    /* A later resolve reopens the original project in the same server. */
+    resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "BeforeRefresh"));
+    free(resp);
+    ASSERT_TRUE(cbm_mcp_server_has_cached_store(srv));
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    cbm_rmdir(cache);
+    PASS();
+}
+
 TEST(store_idle_eviction) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     cbm_mcp_server_set_project(srv, "test-evict");
@@ -6960,6 +7065,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_text_result_wraps_plain_text_as_structured_content);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
+    RUN_TEST(mcp_result_success_requires_explicit_non_error);
 
     /* Argument extraction */
     RUN_TEST(mcp_get_tool_name);
@@ -7088,6 +7194,7 @@ SUITE(mcp) {
     RUN_TEST(readonly_query_succeeds_on_readonly_fs);
 
     /* Idle store eviction */
+    RUN_TEST(store_stale_notification_is_consumed_by_resolve_thread);
     RUN_TEST(store_idle_eviction);
     RUN_TEST(store_idle_no_eviction_within_timeout);
     RUN_TEST(store_idle_evict_protects_initial_store);

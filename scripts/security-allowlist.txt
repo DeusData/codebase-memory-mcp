@@ -23,6 +23,10 @@ src/watcher/watcher.c:cbm_popen:git working tree status (git_is_dirty)
 src/watcher/watcher.c:cbm_popen:git file count (git_file_count)
 src/watcher/watcher.c:popen:via cbm_popen wrapper calls
 
+# ── Watcher: SVN status polling (trusted executable pinned during registration) ──
+src/watcher/svn_state.c:cbm_popen:recursive local SVN status XML (executable pinned; args validated)
+src/watcher/svn_state.c:popen:via cbm_popen wrapper call
+
 # ── Git context: git metadata resolution (repo paths validated via cbm_validate_shell_arg) ──
 src/git/git_context.c:cbm_popen:git rev-parse/symbolic-ref/merge-base metadata lookup
 src/git/git_context.c:popen:via cbm_popen wrapper call

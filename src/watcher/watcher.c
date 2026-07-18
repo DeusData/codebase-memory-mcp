@@ -1,8 +1,8 @@
 /*
- * watcher.c — Git-based file change watcher.
+ * watcher.c — VCS-based file change watcher.
  *
- * Strategy: git status + HEAD tracking (the most reliable approach).
- * For non-git projects, the watcher skips polling (no fsnotify/dirmtime yet).
+ * Strategy: Git HEAD/dirty tracking or local SVN status observations.
+ * For non-VCS projects, the watcher skips polling (no fsnotify/dirmtime yet).
  *
  *
  * Per-project state tracks:
@@ -21,6 +21,7 @@
  */
 #include <stdint.h>
 #include "watcher/watcher.h"
+#include "watcher/svn_state.h"
 #include "store/store.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
@@ -41,12 +42,18 @@
 
 /* ── Per-project state ──────────────────────────────────────────── */
 
+typedef enum {
+    VCS_UNCLASSIFIED = 0,
+    VCS_NONE,
+    VCS_GIT,
+    VCS_SVN,
+} vcs_strategy_t;
+
 typedef struct {
     char *project_name;
     char *root_path;
     char last_head[CBM_SZ_64]; /* git HEAD hash (committed baseline) */
-    bool is_git;               /* false → skip polling */
-    bool baseline_done;        /* true after first poll */
+    vcs_strategy_t strategy;
     int missing_root_count;    /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms; /* cbm_now_ms() of the streak's first miss (0 = no streak) */
     int file_count;            /* approximate, for interval calc */
@@ -60,6 +67,10 @@ typedef struct {
     uint64_t last_dirty_sig;      /* committed dirty-state signature */
     uint64_t pending_dirty_sig;   /* observed at check time */
     char pending_head[CBM_SZ_64]; /* HEAD observed at check time */
+    cbm_svn_client_t svn_client;
+    cbm_svn_observation_t last_svn;
+    cbm_svn_observation_t pending_svn;
+    bool svn_initial_sync_pending;
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -329,6 +340,34 @@ static int git_file_count(const char *root_path) {
     return count;
 }
 
+static bool vcs_metadata_exists(const char *root_path, const char *name) {
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s/%s", root_path, name);
+    if (written < 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    return cbm_file_exists(path);
+}
+
+static bool svn_observation_equal(const cbm_svn_observation_t *left,
+                                  const cbm_svn_observation_t *right) {
+    return left->semantic_signature == right->semantic_signature &&
+           left->content_signature == right->content_signature;
+}
+
+static void finish_git_baseline(project_state_t *s) {
+    s->strategy = VCS_GIT;
+    git_head(s->root_path, s->last_head, sizeof(s->last_head));
+    /* A tree that is already dirty at baseline reindexes once on the next
+     * eligible poll, matching the established watcher contract. */
+    s->last_dirty_sig = 0;
+    s->file_count = git_file_count(s->root_path);
+    s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+    cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
+                 s->file_count > 0 ? "yes" : "0");
+    s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+}
+
 /* ── Project state lifecycle ────────────────────────────────────── */
 
 static project_state_t *state_new(const char *name, const char *root_path) {
@@ -517,8 +556,11 @@ void cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     cbm_mutex_lock(&w->projects_lock);
     project_state_t *old = cbm_ht_get(w->projects, project_name);
     if (old) {
+        if (!defer_state_free(w, old)) {
+            cbm_mutex_unlock(&w->projects_lock);
+            return;
+        }
         cbm_ht_delete(w->projects, project_name);
-        state_free(old);
     }
 
     project_state_t *s = state_new(project_name, root_path);
@@ -576,34 +618,69 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
-/* Init baseline for a project: check if git, get HEAD, count files */
+/* Initialize one immutable VCS strategy. Metadata selects precedence while
+ * command failures remain retryable instead of being mistaken for non-VCS. */
 static void init_baseline(project_state_t *s) {
     struct stat st;
     if (stat(s->root_path, &st) != 0) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
-        s->baseline_done = true;
-        s->is_git = false;
+        s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
         return;
     }
 
-    s->is_git = is_git_repo(s->root_path);
-    s->baseline_done = true;
-
-    if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
-        /* last_dirty_sig stays 0 ("clean known"): a tree that is ALREADY
-         * dirty at baseline reindexes once on the first poll — the watcher
-         * cannot know whether that state made it into the DB (e.g. server
-         * restart with a stale artifact). At-least-once, then the signature
-         * gates further polls (#937). */
-        s->file_count = git_file_count(s->root_path);
-        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
-        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
-                     s->file_count > 0 ? "yes" : "0");
-    } else {
-        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
+    bool has_git_metadata = vcs_metadata_exists(s->root_path, ".git");
+    if (has_git_metadata) {
+        if (is_git_repo(s->root_path)) {
+            finish_git_baseline(s);
+            return;
+        }
+        cbm_log_warn("watcher.probe.pending", "project", s->project_name, "strategy", "git");
+        s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+        return;
     }
 
+    if (vcs_metadata_exists(s->root_path, ".svn")) {
+        if (!s->svn_client.executable[0] &&
+            cbm_svn_client_init(s->root_path, &s->svn_client) != CBM_SVN_PROBE_OK) {
+            cbm_log_warn("watcher.probe.pending", "project", s->project_name, "strategy", "svn",
+                         "reason", "client_unavailable");
+            s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+            return;
+        }
+        cbm_svn_observation_t observation = {0};
+        cbm_svn_probe_result_t probe = cbm_svn_probe(&s->svn_client, s->root_path, &observation);
+        if (probe == CBM_SVN_PROBE_NOT_WORKING_COPY) {
+            s->strategy = VCS_NONE;
+            cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
+            s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+            return;
+        }
+        if (probe != CBM_SVN_PROBE_OK) {
+            cbm_log_warn("watcher.probe.pending", "project", s->project_name, "strategy", "svn",
+                         "reason", "status_failed");
+            s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+            return;
+        }
+        s->strategy = VCS_SVN;
+        s->last_svn = observation;
+        s->svn_initial_sync_pending = observation.has_local_changes;
+        s->file_count = observation.entry_count;
+        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "svn", "files",
+                     s->file_count > 0 ? "yes" : "0");
+        s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+        return;
+    }
+
+    /* Preserve Git-subdirectory registrations, but only after root SVN
+     * metadata has precedence over an inherited parent Git worktree. */
+    if (is_git_repo(s->root_path)) {
+        finish_git_baseline(s);
+        return;
+    }
+
+    s->strategy = VCS_NONE;
+    cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
@@ -612,11 +689,7 @@ static void init_baseline(project_state_t *s) {
  * poll_project commits them only after a SUCCESSFUL reindex so that
  * busy-skips and failed runs retry instead of silently losing the change
  * (#937). Observations are staged in the pending_* fields. */
-static bool check_changes(project_state_t *s) {
-    if (!s->is_git) {
-        return false;
-    }
-
+static bool check_git_changes(project_state_t *s) {
     bool changed = false;
 
     /* Check HEAD movement (commit, checkout, pull) */
@@ -642,6 +715,26 @@ static bool check_changes(project_state_t *s) {
     s->pending_dirty_sig = sig;
 
     return changed;
+}
+
+typedef enum {
+    CHANGE_UNCERTAIN = -1,
+    CHANGE_NONE = 0,
+    CHANGE_DETECTED = 1,
+} change_result_t;
+
+static change_result_t check_svn_changes(project_state_t *s) {
+    cbm_svn_observation_t observation = {0};
+    if (cbm_svn_probe(&s->svn_client, s->root_path, &observation) != CBM_SVN_PROBE_OK) {
+        cbm_log_warn("watcher.probe.failed", "project", s->project_name, "strategy", "svn");
+        return CHANGE_UNCERTAIN;
+    }
+    s->pending_svn = observation;
+    s->file_count = observation.entry_count;
+    s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+    return s->svn_initial_sync_pending || !svn_observation_equal(&observation, &s->last_svn)
+               ? CHANGE_DETECTED
+               : CHANGE_NONE;
 }
 
 /* Context for poll_once foreach callback */
@@ -685,9 +778,8 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
 
-    /* Stale-root pruning (#286): classify the root BEFORE the baseline /
-     * is_git / interval gates so vanished roots are noticed even for
-     * non-git projects and regardless of adaptive backoff. */
+    /* Stale-root pruning (#286): classify the root before VCS/interval gates
+     * so vanished roots are noticed for every strategy. */
     int stat_errno = 0;
     root_status_t rs = root_status(s->root_path, &stat_errno);
     if (rs == ROOT_UNCERTAIN) {
@@ -723,31 +815,36 @@ static void poll_project(const char *key, void *val, void *ud) {
         s->first_missing_ms = 0;
     }
 
-    /* Initialize baseline on first poll */
-    if (!s->baseline_done) {
-        init_baseline(s);
-        return;
-    }
-
-    /* Skip non-git projects */
-    if (!s->is_git) {
-        return;
-    }
-
-    /* Respect adaptive interval */
+    /* Retryable strategy probes use the same adaptive scheduling gate. */
     if (ctx->now < s->next_poll_ns) {
         return;
     }
 
-    /* Check for changes */
-    bool changed = check_changes(s);
-    if (!changed) {
-        s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+    /* Initialize baseline on first eligible poll. */
+    if (s->strategy == VCS_UNCLASSIFIED) {
+        init_baseline(s);
+        return;
+    }
+
+    if (s->strategy == VCS_NONE) {
+        return;
+    }
+
+    change_result_t change = CHANGE_NONE;
+    if (s->strategy == VCS_GIT) {
+        change = check_git_changes(s) ? CHANGE_DETECTED : CHANGE_NONE;
+    } else if (s->strategy == VCS_SVN) {
+        change = check_svn_changes(s);
+    }
+    int64_t completed_at = s->strategy == VCS_SVN ? now_ns() : ctx->now;
+    if (change != CHANGE_DETECTED) {
+        s->next_poll_ns = completed_at + ((int64_t)s->interval_ms * US_PER_MS);
         return;
     }
 
     /* Trigger reindex */
-    cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
+    const char *strategy_name = s->strategy == VCS_SVN ? "svn" : "git";
+    cbm_log_info("watcher.changed", "project", s->project_name, "strategy", strategy_name);
     if (ctx->w->index_fn) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
@@ -756,13 +853,17 @@ static void poll_project(const char *key, void *val, void *ud) {
              * reindex just succeeded. A commit/edit landing during the
              * reindex is deliberately not absorbed: the next poll sees it
              * as a new delta (at-least-once, never lost). */
-            if (s->pending_head[0] != '\0') {
-                snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
+            if (s->strategy == VCS_GIT) {
+                if (s->pending_head[0] != '\0') {
+                    snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
+                }
+                s->last_dirty_sig = s->pending_dirty_sig;
+                s->file_count = git_file_count(s->root_path);
+                s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+            } else {
+                s->last_svn = s->pending_svn;
+                s->svn_initial_sync_pending = false;
             }
-            s->last_dirty_sig = s->pending_dirty_sig;
-            /* Refresh file count for interval */
-            s->file_count = git_file_count(s->root_path);
-            s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
             cbm_log_info("watcher.index.retry", "project", s->project_name);
@@ -771,7 +872,8 @@ static void poll_project(const char *key, void *val, void *ud) {
         }
     }
 
-    s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+    completed_at = s->strategy == VCS_SVN ? now_ns() : ctx->now;
+    s->next_poll_ns = completed_at + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
 /* Callback to snapshot project state pointers into an array. */

@@ -65,7 +65,8 @@ CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
 EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
-	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1
+	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
+	-DCBM_SVN_STATE_ENABLE_TEST_API=1
 CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 $(SANITIZE)
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
 
@@ -236,7 +237,7 @@ UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 TRACES_SRCS = src/traces/traces.c
 
 # Watcher module (new)
-WATCHER_SRCS = src/watcher/watcher.c
+WATCHER_SRCS = src/watcher/watcher.c src/watcher/svn_state.c
 
 # Git context module (new)
 GIT_SRCS = src/git/git_context.c
@@ -359,7 +360,7 @@ TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
 TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
-TEST_WATCHER_SRCS = tests/test_watcher.c
+TEST_WATCHER_SRCS = tests/test_watcher.c tests/test_svn_state.c
 
 TEST_LZ4_SRCS = tests/test_lz4.c
 TEST_ZSTD_SRCS = tests/test_zstd.c

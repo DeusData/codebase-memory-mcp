@@ -148,6 +148,20 @@ static int tf_maybe_run_socket_probe(int argc, char **argv) {
 #endif
 }
 
+static int tf_maybe_run_argv_probe(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc < 4 || strcmp(argv[1], "__cbm_argvprobe") != 0) {
+        return -1;
+    }
+    puts(argv[2]);
+    return atoi(argv[3]);
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
@@ -207,6 +221,7 @@ extern void suite_index_resilience(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
+extern void suite_svn_state(void);
 extern void suite_watcher(void);
 extern void suite_lz4(void);
 extern void suite_zstd(void);
@@ -283,6 +298,10 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    int argv_probe_rc = tf_maybe_run_argv_probe(argc, argv);
+    if (argv_probe_rc >= 0) {
+        return argv_probe_rc;
+    }
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
      * inheritable socket handle crossed into this child and exit before any suite. */
     int probe_rc = tf_maybe_run_socket_probe(argc, argv);
@@ -374,6 +393,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(path_alias);
 
     /* Watcher (M10) */
+    RUN_SELECTED_SUITE(svn_state);
     RUN_SELECTED_SUITE(watcher);
 
     /* LZ4 + zstd + SQLite writer */

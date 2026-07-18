@@ -54,6 +54,10 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
+/* Return true only for a valid MCP tool result that explicitly reports
+ * isError=false. Malformed or ambiguous results fail closed. */
+bool cbm_mcp_result_succeeded(const char *result_json);
+
 /* Return true when notifications/cancelled params target the active request. */
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
                                     const char *active_id_str);
@@ -122,6 +126,17 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
+
+/* Publish a thread-safe notification that the cached query store is stale.
+ * The owning MCP request thread consumes it before its next store resolution. */
+void cbm_mcp_server_mark_store_stale(cbm_mcp_server_t *srv);
+
+/* Bracket a background graph publication. On Windows this waits for active
+ * MCP tools, closes the cached SQLite reader, and blocks new tools until end;
+ * on POSIX the existing generation remains queryable during publication.
+ * Every successful begin must be paired with end on every exit path. */
+void cbm_mcp_server_begin_store_update(cbm_mcp_server_t *srv);
+void cbm_mcp_server_end_store_update(cbm_mcp_server_t *srv, bool published);
 
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
