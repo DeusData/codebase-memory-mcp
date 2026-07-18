@@ -13,6 +13,7 @@
 
 enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "pipeline/pipeline.h"
+#include "pipeline/artifact.h"
 #include <stdio.h>
 #include <time.h>
 #include "pipeline/pipeline_internal.h"
@@ -640,9 +641,8 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                             cbm_file_info_t *files, int file_count,
                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                            const char *repo_path, bool persistence,
-                            const cbm_coverage_row_t *cov, int cov_count,
-                            const cbm_coverage_meta_t *meta_template) {
+                            const char *repo_path, bool persistence, const cbm_coverage_row_t *cov,
+                            int cov_count, const cbm_coverage_meta_t *meta_template) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -707,9 +707,15 @@ static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *p
      * Runs after the store is closed so the export reads a settled DB file. */
     bool artifact_exists = repo_path && cbm_artifact_exists(repo_path);
     if (repo_path && (persistence || artifact_exists)) {
-        cbm_artifact_export(db_path, repo_path, project,
-                            artifact_exists ? CBM_ARTIFACT_FAST : CBM_ARTIFACT_BEST);
+        int arc = cbm_artifact_export(db_path, repo_path, project,
+                                      artifact_exists ? CBM_ARTIFACT_FAST : CBM_ARTIFACT_BEST);
+        if (arc != 0) {
+            const char *err = cbm_artifact_export_last_error();
+            cbm_log_error("pipeline.err", "phase", "artifact_export", "err", err ? err : "unknown");
+            return arc;
+        }
     }
+
     return rc;
 }
 
@@ -758,12 +764,22 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * that were already preserved by an earlier run) remain intact. */
     if (n_changed == 0 && deleted_count == 0) {
         cbm_log_info("incremental.noop", "reason", "no_changes");
+        int arc = 0;
+        const char *repo_path = cbm_pipeline_repo_path(p);
+        if (cbm_pipeline_persistence(p) && repo_path && !cbm_artifact_exists(repo_path)) {
+            arc = cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_BEST);
+            if (arc != 0) {
+                const char *err = cbm_artifact_export_last_error();
+                cbm_log_error("pipeline.err", "phase", "artifact_export", "err",
+                              err ? err : "unknown");
+            }
+        }
         free(is_changed);
         free(deleted);
         free_mode_skipped(mode_skipped, mode_skipped_count);
         cbm_store_free_file_hashes(stored, stored_count);
         cbm_store_close(store);
-        return 0;
+        return arc;
     }
 
     cbm_store_free_file_hashes(stored, stored_count);
