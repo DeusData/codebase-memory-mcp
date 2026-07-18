@@ -45,6 +45,9 @@ typedef enum {
 // Forward declaration
 typedef struct CBMType CBMType;
 
+// Language-specific adapter used to parse one ordered signature type spelling.
+typedef const CBMType *(*CBMTypeTextParser)(CBMArena *arena, const char *text, void *parser_ctx);
+
 // CBMTypeParam represents a generic type parameter with optional constraint.
 typedef struct {
     const char* name;        // "T", "K", "V"
@@ -153,6 +156,14 @@ const CBMType* cbm_type_slice(CBMArena* a, const CBMType* elem);
 const CBMType* cbm_type_map(CBMArena* a, const CBMType* key, const CBMType* value);
 const CBMType* cbm_type_channel(CBMArena* a, const CBMType* elem, int direction);
 const CBMType* cbm_type_func(CBMArena* a, const char** param_names, const CBMType** param_types, const CBMType** return_types);
+// Materialize exactly count positional parameter slots. NULL, empty, exact "?",
+// and parser failures become UNKNOWN; the returned vector is NULL-terminated.
+const CBMType **cbm_type_materialize_signature_params(CBMArena *a, const char *const *type_texts,
+                                                      int count, CBMTypeTextParser parser,
+                                                      void *parser_ctx);
+// Rebuild a FUNC with new returns while preserving its parameter names/types.
+const CBMType *cbm_type_func_replace_returns(CBMArena *a, const CBMType *old_signature,
+                                             const CBMType *const *new_return_types);
 const CBMType* cbm_type_builtin(CBMArena* a, const char* name);
 const CBMType* cbm_type_tuple(CBMArena* a, const CBMType** elems, int count);
 const CBMType* cbm_type_type_param(CBMArena* a, const char* name);

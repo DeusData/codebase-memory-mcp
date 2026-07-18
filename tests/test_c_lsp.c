@@ -26,7 +26,9 @@
 #include "lsp/ts_lsp.h"
 #include "lsp/go_lsp.h"
 #include "lsp/type_registry.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "arena.h"
+#include "preprocessor.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -60,6 +62,13 @@ static CBMFileResult *extract_c(const char *src) {
 
 static CBMFileResult *extract_cpp(const char *src) {
     return cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "test", "main.cpp", 0, NULL, NULL);
+}
+
+static CBMFileResult *extract_c_family(const char *src, CBMLanguage language) {
+    const char *path = language == CBM_LANG_C      ? "main.c"
+                       : language == CBM_LANG_CUDA ? "main.cu"
+                                                   : "main.cpp";
+    return cbm_extract_file(src, (int)strlen(src), language, "test", path, 0, NULL, NULL);
 }
 
 TEST(clsp_simple_var_decl) {
@@ -572,17 +581,18 @@ TEST(clsp_nocrash_template_extra_call_args) {
 }
 
 TEST(clsp_nocrash_template_function_multi_param_nested_call) {
-    CBMFileResult *r = extract_cpp("\n"
-                                   "void right_aligned_text(int color, int width, const char* fmt, float value) {}\n"
-                                   "\n"
-                                   "template<typename T, typename R = float>\n"
-                                   "R format_units(T value, const char*& unit) { return value; }\n"
-                                   "\n"
-                                   "void f() {\n"
-                                   "    const char* unit = nullptr;\n"
-                                   "    right_aligned_text(0, 0, \"%.1f\", format_units(1, unit));\n"
-                                   "}\n"
-                                   "");
+    CBMFileResult *r = extract_cpp(
+        "\n"
+        "void right_aligned_text(int color, int width, const char* fmt, float value) {}\n"
+        "\n"
+        "template<typename T, typename R = float>\n"
+        "R format_units(T value, const char*& unit) { return value; }\n"
+        "\n"
+        "void f() {\n"
+        "    const char* unit = nullptr;\n"
+        "    right_aligned_text(0, 0, \"%.1f\", format_units(1, unit));\n"
+        "}\n"
+        "");
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(find_resolved(r, "f", "right_aligned_text"), 0);
     ASSERT_GTE(find_resolved(r, "f", "format_units"), 0);
@@ -6367,7 +6377,10 @@ TEST(clsp_cross_gap_new_then_method_chain) {
     ASSERT_GTE(find_resolved(r, "test", "Service.Service"), 0);
     ASSERT_GTE(find_resolved(r, "test", "start"), 0);
     ASSERT_GTE(find_resolved(r, "test", "stop"), 0);
-    ASSERT_GTE(find_resolved(r, "test", "~Service"), 0);
+    /* Service declares no destructor node. Explicit delete retains its
+     * semantic-only carrier, but the resolver must not fabricate an implicit
+     * ~Service target that the graph cannot materialize. */
+    ASSERT_EQ(find_resolved(r, "test", "~Service"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -7292,7 +7305,10 @@ TEST(clsp_pattern_auto_ptr_from_new) {
     ASSERT_NOT_NULL(r);
     ASSERT_GTE(find_resolved(r, "test", "draw"), 0);
     ASSERT_GTE(find_resolved(r, "test", "Widget.Widget"), 0);
-    ASSERT_GTE(find_resolved(r, "test", "~Widget"), 0);
+    /* Widget has only an implicit destructor, so delete cannot resolve to a
+     * concrete graph target. A declared ~Widget is covered by the dedicated
+     * explicit-destructor test. */
+    ASSERT_EQ(find_resolved(r, "test", "~Widget"), -1);
     cbm_free_result(r);
     PASS();
 }
@@ -15370,7 +15386,7 @@ TEST(seal_py_shared_registry_readonly) {
     const char *src = "def helper(x):\n    return x + 1\n\ndef caller():\n    return helper(1)\n";
     CBMResolvedCallArray out = {0};
     cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
-                                       0, NULL, &out);
+                                       0, NULL, &out, NULL);
     ASSERT_EQ(reg->func_count, fb);
     ASSERT_EQ(reg->type_count, tb);
     cbm_arena_destroy(&arena);
@@ -15436,8 +15452,8 @@ TEST(seal_py_shared_registry_readonly_fields) {
                       "    def m(self):\n"
                       "        self.x = 1\n";
     CBMResolvedCallArray out = {0};
-    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL, 0,
-                                       NULL, &out);
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out, NULL);
 
     /* The sealed registry entry must be untouched by resolve. */
     int count_after = 0;
@@ -15502,7 +15518,547 @@ TEST(seal_go_shared_registry_readonly) {
     PASS();
 }
 
+static int assert_cpp_family_repeated_method_occurrences(CBMLanguage language) {
+    static const char source[] = "struct Alpha { int render() { return 1; } };\n"
+                                 "struct Bravo { int render() { return 2; } };\n"
+                                 "int occurrence_probe() {\n"
+                                 "    Alpha alpha;\n"
+                                 "    Bravo bravo;\n"
+                                 "    return alpha.render() + bravo.render();\n"
+                                 "}\n";
+    static const char *call_texts[2] = {"alpha.render()", "bravo.render()"};
+    const char *sites[2] = {strstr(source, call_texts[0]), strstr(source, call_texts[1])};
+    ASSERT_NOT_NULL(sites[0]);
+    ASSERT_NOT_NULL(sites[1]);
+    uint32_t starts[2] = {(uint32_t)(sites[0] - source), (uint32_t)(sites[1] - source)};
+    uint32_t ends[2] = {starts[0] + (uint32_t)strlen(call_texts[0]),
+                        starts[1] + (uint32_t)strlen(call_texts[1])};
+
+    CBMFileResult *result = extract_c_family(source, language);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *calls[2] = {NULL, NULL};
+    const CBMResolvedCall *semantics[2] = {NULL, NULL};
+    int carrier_count = 0;
+    int semantic_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrence_probe") ||
+            !call->callee_name || strcmp(cbm_lsp_bare_segment(call->callee_name), "render") != 0) {
+            continue;
+        }
+        carrier_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (call->site_start_byte == starts[occurrence] &&
+                call->site_end_byte == ends[occurrence]) {
+                calls[occurrence] = call;
+            }
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            !resolved->caller_qn || !strstr(resolved->caller_qn, "occurrence_probe") ||
+            !resolved->callee_qn ||
+            strcmp(cbm_lsp_bare_segment(resolved->callee_qn), "render") != 0) {
+            continue;
+        }
+        semantic_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (resolved->site_start_byte == starts[occurrence] &&
+                resolved->site_end_byte == ends[occurrence]) {
+                semantics[occurrence] = resolved;
+            }
+        }
+    }
+
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_NOT_NULL(calls[0]);
+    ASSERT_NOT_NULL(calls[1]);
+    ASSERT_NOT_NULL(semantics[0]);
+    ASSERT_NOT_NULL(semantics[1]);
+    ASSERT_NOT_NULL(strstr(semantics[0]->callee_qn, "Alpha.render"));
+    ASSERT_NOT_NULL(strstr(semantics[1]->callee_qn, "Bravo.render"));
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[0], false) ==
+                semantics[0]);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[1], false) ==
+                semantics[1]);
+    cbm_free_result(result);
+    return 0;
+}
+
+TEST(clsp_cpp_repeated_same_leaf_calls_join_exact_occurrences) {
+    return assert_cpp_family_repeated_method_occurrences(CBM_LANG_CPP);
+}
+
+TEST(clsp_cuda_repeated_same_leaf_calls_join_exact_occurrences) {
+    return assert_cpp_family_repeated_method_occurrences(CBM_LANG_CUDA);
+}
+
+TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences) {
+    static const char source[] = "static int alpha_target(void) { return 1; }\n"
+                                 "static int bravo_target(void) { return 2; }\n"
+                                 "int occurrence_probe(void) {\n"
+                                 "    int (*fp)(void) = alpha_target;\n"
+                                 "    int first = fp();\n"
+                                 "    fp = bravo_target;\n"
+                                 "    return first + fp();\n"
+                                 "}\n";
+    static const char call_text[] = "fp()";
+    const char *first_site = strstr(source, call_text);
+    const char *second_site = first_site ? strstr(first_site + 1, call_text) : NULL;
+    ASSERT_NOT_NULL(first_site);
+    ASSERT_NOT_NULL(second_site);
+    uint32_t starts[2] = {(uint32_t)(first_site - source), (uint32_t)(second_site - source)};
+    uint32_t ends[2] = {starts[0] + (uint32_t)strlen(call_text),
+                        starts[1] + (uint32_t)strlen(call_text)};
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *calls[2] = {NULL, NULL};
+    const CBMResolvedCall *semantics[2] = {NULL, NULL};
+    int carrier_count = 0;
+    int semantic_count = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrence_probe") ||
+            !call->callee_name || strcmp(call->callee_name, "fp") != 0) {
+            continue;
+        }
+        carrier_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (call->site_start_byte == starts[occurrence] &&
+                call->site_end_byte == ends[occurrence]) {
+                calls[occurrence] = call;
+            }
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            !resolved->caller_qn || !strstr(resolved->caller_qn, "occurrence_probe") ||
+            !resolved->reason || strcmp(resolved->reason, "fp") != 0) {
+            continue;
+        }
+        semantic_count++;
+        for (int occurrence = 0; occurrence < 2; occurrence++) {
+            if (resolved->site_start_byte == starts[occurrence] &&
+                resolved->site_end_byte == ends[occurrence]) {
+                semantics[occurrence] = resolved;
+            }
+        }
+    }
+
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_NOT_NULL(calls[0]);
+    ASSERT_NOT_NULL(calls[1]);
+    ASSERT_NOT_NULL(semantics[0]);
+    ASSERT_NOT_NULL(semantics[1]);
+    ASSERT_NOT_NULL(strstr(semantics[0]->callee_qn, "alpha_target"));
+    ASSERT_NOT_NULL(strstr(semantics[1]->callee_qn, "bravo_target"));
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[0], false) ==
+                semantics[0]);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, calls[1], false) ==
+                semantics[1]);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target) {
+    static const char source[] = "static int alpha_target(void) { return 1; }\n"
+                                 "static int bravo_target(void) { return 2; }\n"
+                                 "int occurrence_probe(void) {\n"
+                                 "    int (*fp)(void) = alpha_target;\n"
+                                 "    int inner = 0;\n"
+                                 "    {\n"
+                                 "        int (*fp)(void) = bravo_target;\n"
+                                 "        inner = fp();\n"
+                                 "    }\n"
+                                 "    return inner + fp();\n"
+                                 "}\n";
+    const char *inner_site = strstr(source, "fp();");
+    const char *outer_site = inner_site ? strstr(inner_site + 1, "fp();") : NULL;
+    ASSERT_NOT_NULL(inner_site);
+    ASSERT_NOT_NULL(outer_site);
+    uint32_t inner_start = (uint32_t)(inner_site - source);
+    uint32_t outer_start = (uint32_t)(outer_site - source);
+    uint32_t call_len = (uint32_t)strlen("fp()");
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMResolvedCall *inner_semantic = NULL;
+    const CBMResolvedCall *outer_semantic = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || !resolved->reason ||
+            strcmp(resolved->reason, "fp") != 0 || !resolved->callee_qn) {
+            continue;
+        }
+        if (resolved->site_start_byte == inner_start &&
+            resolved->site_end_byte == inner_start + call_len) {
+            inner_semantic = resolved;
+        }
+        if (resolved->site_start_byte == outer_start &&
+            resolved->site_end_byte == outer_start + call_len) {
+            outer_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(inner_semantic);
+    ASSERT_NOT_NULL(outer_semantic);
+    ASSERT_NOT_NULL(strstr(inner_semantic->callee_qn, "bravo_target"));
+    ASSERT_NOT_NULL(strstr(outer_semantic->callee_qn, "alpha_target"));
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_cpp_new_expression_joins_exact_occurrence) {
+    static const char source[] = "struct Widget { Widget() {} };\n"
+                                 "Widget* occurrence_probe() { return new Widget(); }\n";
+    const char *site = strstr(source, "new Widget()");
+    ASSERT_NOT_NULL(site);
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen("new Widget()");
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_CPP);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *carrier = NULL;
+    const CBMResolvedCall *semantic = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->site_start_byte == start && call->site_end_byte == end) {
+            carrier = call;
+            break;
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "Widget.Widget") && resolved->site_start_byte == start &&
+            resolved->site_end_byte == end) {
+            semantic = resolved;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(carrier);
+    ASSERT_NOT_NULL(semantic);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, carrier, false) ==
+                semantic);
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_c_global_initializer_does_not_inherit_previous_function_caller) {
+    static const char source[] = "int helper(void) { return 1; }\n"
+                                 "void previous(void) {}\n"
+                                 "int global_value = helper();\n";
+    const char *site = strrchr(source, 'h');
+    ASSERT_NOT_NULL(site);
+    ASSERT_STR_EQ(site, "helper();\n");
+    uint32_t start = (uint32_t)(site - source);
+    uint32_t end = start + (uint32_t)strlen("helper()");
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *carrier = NULL;
+    const CBMResolvedCall *semantic = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->site_start_byte == start && call->site_end_byte == end) {
+            carrier = call;
+            break;
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "helper") && resolved->site_start_byte == start &&
+            resolved->site_end_byte == end) {
+            semantic = resolved;
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(carrier);
+    ASSERT_NOT_NULL(semantic);
+    ASSERT_STR_EQ(semantic->caller_qn, carrier->enclosing_func_qn);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, carrier, false) ==
+                semantic);
+    cbm_free_result(result);
+    PASS();
+}
+
+static int assert_cpp_family_preprocessed_collision_isolated(CBMLanguage language) {
+    /* simplecpp removes the 41-byte comment payload and normalizes tokens. As
+     * verified by the non-vacuity assertions below, raw alpha.render and the
+     * macro-hidden expanded bravo.render both land at numeric span 182:200,
+     * even though those offsets refer to different source texts. */
+    static const char source[] =
+        "struct Alpha { int render(){return 1;} };\n"
+        "struct Bravo { int render(){return 2;} };\n"
+        "int occurrence_probe(){\n"
+        " Alpha alpha; Bravo bravo;\n"
+        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ alpha . render ( );\n"
+        "#define HIDDEN_RENDER(x) x.render()\n"
+        " return HIDDEN_RENDER(bravo);\n"
+        "}\n";
+    const uint32_t collision_start = 182;
+    const uint32_t collision_end = 200;
+    ASSERT_EQ((uint32_t)(strstr(source, "alpha . render ( )") - source), collision_start);
+
+    CBMFileResult *result = extract_c_family(source, language);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *raw_alpha = NULL;
+    const CBMCall *expanded_bravo = NULL;
+    int colliding_carriers = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrence_probe") ||
+            call->site_start_byte != collision_start || call->site_end_byte != collision_end ||
+            !call->callee_name || !strstr(call->callee_name, "render")) {
+            continue;
+        }
+        colliding_carriers++;
+        if (strstr(call->callee_name, "alpha")) {
+            raw_alpha = call;
+        }
+        if (strstr(call->callee_name, "bravo")) {
+            expanded_bravo = call;
+        }
+    }
+    ASSERT_EQ(colliding_carriers, 2);
+    ASSERT_NOT_NULL(raw_alpha);
+    ASSERT_NOT_NULL(expanded_bravo);
+
+    const CBMResolvedCall *raw_alpha_semantic = NULL;
+    const CBMResolvedCall *expanded_bravo_semantic = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            resolved->site_start_byte != collision_start ||
+            resolved->site_end_byte != collision_end || !resolved->callee_qn) {
+            continue;
+        }
+        if (strstr(resolved->callee_qn, "Alpha.render")) {
+            raw_alpha_semantic = resolved;
+        }
+        if (strstr(resolved->callee_qn, "Bravo.render")) {
+            expanded_bravo_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(raw_alpha_semantic);
+    ASSERT_NOT_NULL(expanded_bravo_semantic);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, raw_alpha, false) ==
+                raw_alpha_semantic);
+    ASSERT_TRUE(cbm_pipeline_find_lsp_resolution(&result->resolved_calls, expanded_bravo, false) ==
+                expanded_bravo_semantic);
+    cbm_free_result(result);
+    return 0;
+}
+
+TEST(clsp_cpp_preprocessed_coordinate_collision_isolated) {
+    return assert_cpp_family_preprocessed_collision_isolated(CBM_LANG_CPP);
+}
+
+TEST(clsp_cuda_preprocessed_coordinate_collision_isolated) {
+    return assert_cpp_family_preprocessed_collision_isolated(CBM_LANG_CUDA);
+}
+
+TEST(clsp_c_preprocessed_coordinate_collision_isolated) {
+    /* The raw fp call and macro-hidden expanded fp call both occupy 206:212,
+     * but data flow resolves them to different targets. */
+    static const char source[] =
+        "static int alpha_target(void){return 1;}\n"
+        "static int bravo_target(void){return 2;}\n"
+        "int occurrence_probe(void){\n"
+        " int (*fp)(void) = alpha_target;\n"
+        " /*xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx*/ fp ( );\n"
+        "#define HIDDEN_FP_CALL() (fp = bravo_target, fp())\n"
+        " return HIDDEN_FP_CALL();\n"
+        "}\n";
+    const uint32_t collision_start = 206;
+    const uint32_t collision_end = 212;
+    const char *raw_probe = strstr(source, "occurrence_probe");
+    ASSERT_NOT_NULL(raw_probe);
+    ASSERT_EQ((uint32_t)(strstr(raw_probe, "fp ( )") - source), collision_start);
+
+    CBMFileResult *result = extract_c_family(source, CBM_LANG_C);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *colliding_calls[2] = {NULL, NULL};
+    int colliding_carriers = 0;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "occurrence_probe") &&
+            call->callee_name && strcmp(call->callee_name, "fp") == 0 &&
+            call->site_start_byte == collision_start && call->site_end_byte == collision_end) {
+            if (colliding_carriers < 2) {
+                colliding_calls[colliding_carriers] = call;
+            }
+            colliding_carriers++;
+        }
+    }
+    ASSERT_EQ(colliding_carriers, 2);
+    ASSERT_NOT_NULL(colliding_calls[0]);
+    ASSERT_NOT_NULL(colliding_calls[1]);
+
+    const CBMResolvedCall *alpha_semantic = NULL;
+    const CBMResolvedCall *bravo_semantic = NULL;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0.0f ||
+            resolved->site_start_byte != collision_start ||
+            resolved->site_end_byte != collision_end || !resolved->callee_qn || !resolved->reason ||
+            strcmp(resolved->reason, "fp") != 0) {
+            continue;
+        }
+        if (strstr(resolved->callee_qn, "alpha_target")) {
+            alpha_semantic = resolved;
+        }
+        if (strstr(resolved->callee_qn, "bravo_target")) {
+            bravo_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(alpha_semantic);
+    ASSERT_NOT_NULL(bravo_semantic);
+    const CBMResolvedCall *first_join =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, colliding_calls[0], false);
+    const CBMResolvedCall *second_join =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, colliding_calls[1], false);
+    ASSERT_TRUE((first_join == alpha_semantic && second_join == bravo_semantic) ||
+                (first_join == bravo_semantic && second_join == alpha_semantic));
+    cbm_free_result(result);
+    PASS();
+}
+
+TEST(clsp_preprocessed_destructor_rewrite_respects_origin_during_rewrite) {
+    /* Calibrate the comment padding against simplecpp itself: comments vanish
+     * from the expanded buffer, so one padding length makes the raw
+     * `delete alpha` and macro-expanded `delete bravo` occupy the same numeric
+     * byte span. The names intentionally have equal length.
+     *
+     * The raw destructor carrier is rewritten during the first C-LSP walk. On
+     * the second walk, a preprocessed carrier must be stamped PREPROCESSED
+     * before c_rewrite_proved_destructor_candidates compares it with the
+     * already-present raw semantic rows. Otherwise the earlier raw ~Alpha row
+     * wins this colliding occurrence and rewrites the expanded carrier to the
+     * wrong destructor. */
+    static const char format[] = "struct Alpha { ~Alpha(){} };\n"
+                                 "struct Bravo { ~Bravo(){} };\n"
+                                 "void occurrence_probe(){\n"
+                                 " Alpha* alpha = new Alpha(); Bravo* bravo = new Bravo();\n"
+                                 " /*%s*/ delete alpha;\n"
+                                 "#define HIDDEN_DELETE(p) delete p\n"
+                                 " HIDDEN_DELETE(bravo);\n"
+                                 "}\n";
+    char padding[1024] = {0};
+    char source[4096];
+    int written = snprintf(source, sizeof(source), format, padding);
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(source));
+
+    char *expanded = cbm_preprocess(source, written, "main.cpp", NULL, NULL, true);
+    ASSERT_NOT_NULL(expanded);
+    const char *raw_alpha = strstr(source, "delete alpha");
+    const char *expanded_bravo = strstr(expanded, "delete bravo");
+    ASSERT_NOT_NULL(raw_alpha);
+    ASSERT_NOT_NULL(expanded_bravo);
+    ptrdiff_t raw_offset = raw_alpha - source;
+    ptrdiff_t expanded_offset = expanded_bravo - expanded;
+    cbm_preprocess_free(expanded);
+    ASSERT_GTE(expanded_offset, raw_offset);
+    size_t padding_length = (size_t)(expanded_offset - raw_offset);
+    ASSERT_LT(padding_length, sizeof(padding));
+
+    memset(padding, 'x', padding_length);
+    padding[padding_length] = '\0';
+    written = snprintf(source, sizeof(source), format, padding);
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(source));
+
+    expanded = cbm_preprocess(source, written, "main.cpp", NULL, NULL, true);
+    ASSERT_NOT_NULL(expanded);
+    raw_alpha = strstr(source, "delete alpha");
+    expanded_bravo = strstr(expanded, "delete bravo");
+    ASSERT_NOT_NULL(raw_alpha);
+    ASSERT_NOT_NULL(expanded_bravo);
+    const uint32_t collision_start = (uint32_t)(raw_alpha - source);
+    ASSERT_EQ((uint32_t)(expanded_bravo - expanded), collision_start);
+    const uint32_t collision_end = collision_start + (uint32_t)strlen("delete alpha");
+    cbm_preprocess_free(expanded);
+
+    CBMFileResult *result = extract_cpp(source);
+    ASSERT_NOT_NULL(result);
+    const CBMCall *raw_carrier = NULL;
+    const CBMCall *preprocessed_carrier = NULL;
+    const CBMResolvedCall *raw_semantic = NULL;
+    const CBMResolvedCall *preprocessed_semantic = NULL;
+    for (int i = 0; i < result->calls.count; i++) {
+        const CBMCall *call = &result->calls.items[i];
+        if (!call->requires_lsp_resolution || call->site_start_byte != collision_start ||
+            call->site_end_byte != collision_end) {
+            continue;
+        }
+        if (call->source_origin == CBM_SOURCE_ORIGIN_RAW) {
+            raw_carrier = call;
+        } else if (call->source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED) {
+            preprocessed_carrier = call;
+        }
+    }
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &result->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || !resolved->strategy ||
+            strcmp(resolved->strategy, "lsp_destructor") != 0 || !resolved->callee_qn ||
+            resolved->site_start_byte != collision_start ||
+            resolved->site_end_byte != collision_end) {
+            continue;
+        }
+        if (resolved->source_origin == CBM_SOURCE_ORIGIN_RAW &&
+            strstr(resolved->callee_qn, "~Alpha")) {
+            raw_semantic = resolved;
+        } else if (resolved->source_origin == CBM_SOURCE_ORIGIN_PREPROCESSED &&
+                   strstr(resolved->callee_qn, "~Bravo")) {
+            preprocessed_semantic = resolved;
+        }
+    }
+    ASSERT_NOT_NULL(raw_carrier);
+    ASSERT_NOT_NULL(preprocessed_carrier);
+    ASSERT_NOT_NULL(raw_semantic);
+    ASSERT_NOT_NULL(preprocessed_semantic);
+
+    bool raw_name_ok = raw_carrier->callee_name &&
+                       strcmp(cbm_lsp_bare_segment(raw_carrier->callee_name), "~Alpha") == 0;
+    bool preprocessed_name_ok =
+        preprocessed_carrier->callee_name &&
+        strcmp(cbm_lsp_bare_segment(preprocessed_carrier->callee_name), "~Bravo") == 0;
+    bool raw_join_ok = cbm_pipeline_find_lsp_resolution(&result->resolved_calls, raw_carrier,
+                                                        false) == raw_semantic;
+    bool preprocessed_join_ok =
+        cbm_pipeline_find_lsp_resolution(&result->resolved_calls, preprocessed_carrier, false) ==
+        preprocessed_semantic;
+    if (!raw_name_ok || !preprocessed_name_ok || !raw_join_ok || !preprocessed_join_ok) {
+        printf("  destructor origin rewrite diagnostic: raw=%s/%d preprocessed=%s/%d\n",
+               raw_carrier->callee_name ? raw_carrier->callee_name : "<null>", raw_join_ok,
+               preprocessed_carrier->callee_name ? preprocessed_carrier->callee_name : "<null>",
+               preprocessed_join_ok);
+    }
+    cbm_free_result(result);
+    ASSERT_TRUE(raw_name_ok);
+    ASSERT_TRUE(preprocessed_name_ok);
+    ASSERT_TRUE(raw_join_ok);
+    ASSERT_TRUE(preprocessed_join_ok);
+    PASS();
+}
+
 SUITE(c_lsp) {
+    RUN_TEST(clsp_c_reassigned_function_pointer_calls_join_exact_occurrences);
+    RUN_TEST(clsp_c_nested_function_pointer_shadow_restores_outer_target);
+    RUN_TEST(clsp_cpp_repeated_same_leaf_calls_join_exact_occurrences);
+    RUN_TEST(clsp_cuda_repeated_same_leaf_calls_join_exact_occurrences);
+    RUN_TEST(clsp_cpp_new_expression_joins_exact_occurrence);
+    RUN_TEST(clsp_c_global_initializer_does_not_inherit_previous_function_caller);
+    RUN_TEST(clsp_c_preprocessed_coordinate_collision_isolated);
+    RUN_TEST(clsp_cpp_preprocessed_coordinate_collision_isolated);
+    RUN_TEST(clsp_cuda_preprocessed_coordinate_collision_isolated);
+    RUN_TEST(clsp_preprocessed_destructor_rewrite_respects_origin_during_rewrite);
     RUN_TEST(clsp_tier2_shared_registry_readonly_c);
     RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
     RUN_TEST(seal_py_shared_registry_readonly);

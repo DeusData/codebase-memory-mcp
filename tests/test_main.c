@@ -212,6 +212,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_index_resilience(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
@@ -255,6 +256,22 @@ extern void suite_config_text_edit(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
+extern void suite_call_reference_language_complex_contract(void);
+extern void suite_repro_call_scope_usages(void);
+extern void suite_repro_call_argument_usages(void);
+extern void suite_repro_reference_precision(void);
+extern void suite_repro_lexical_binding_precision(void);
+extern void suite_repro_call_argument_matrix_a(void);
+extern void suite_repro_call_argument_matrix_b(void);
+extern void suite_repro_call_node_behaviors(void);
+extern void suite_repro_language_registry(void);
+extern void suite_repro_call_node_manifest(void);
+extern void suite_repro_lsp_ordered_signatures(void);
+extern void suite_repro_lsp_ordered_local(void);
+extern void suite_repro_ts_overload_return_chains(void);
+extern void suite_repro_harness_cleanup(void);
+extern void suite_repro_runner_filter(void);
+extern void suite_call_reference_contract(void);
 extern void suite_mem(void);
 extern void suite_ui(void);
 extern void suite_httpd(void);
@@ -386,6 +403,22 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
+    RUN_SELECTED_SUITE(call_reference_contract);
+    RUN_SELECTED_SUITE(call_reference_language_complex_contract);
+    RUN_SELECTED_SUITE(repro_call_scope_usages);
+    RUN_SELECTED_SUITE(repro_call_argument_usages);
+    RUN_SELECTED_SUITE(repro_reference_precision);
+    RUN_SELECTED_SUITE(repro_call_argument_matrix_a);
+    RUN_SELECTED_SUITE(repro_call_argument_matrix_b);
+    RUN_SELECTED_SUITE(repro_call_node_behaviors);
+    RUN_SELECTED_SUITE(repro_language_registry);
+    RUN_SELECTED_SUITE(repro_call_node_manifest);
+    RUN_SELECTED_SUITE(repro_lsp_ordered_signatures);
+    RUN_SELECTED_SUITE(repro_lsp_ordered_local);
+    RUN_SELECTED_SUITE(repro_ts_overload_return_chains);
+    RUN_SELECTED_SUITE(repro_harness_cleanup);
+    RUN_SELECTED_SUITE(repro_runner_filter);
     RUN_SELECTED_SUITE(index_resilience);
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);
@@ -450,6 +483,9 @@ int main(int argc, char **argv) {
 
     /* Parallel pipeline */
     RUN_SELECTED_SUITE(parallel);
+
+    /* Promoted lexical-resolution regression contracts. */
+    RUN_SELECTED_SUITE(repro_lexical_binding_precision);
 
     /* mem + arena + slab integration */
     RUN_SELECTED_SUITE(slab_alloc);

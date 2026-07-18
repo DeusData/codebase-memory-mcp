@@ -85,7 +85,8 @@ static const CBMType *perl_eval_function_call_type(PerlLSPContext *ctx, TSNode n
 static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_new_type(PerlLSPContext *ctx, TSNode node);
 static void perl_emit_resolved(PerlLSPContext *ctx, const char *callee_qn, const char *strategy,
-                               float confidence);
+                               float confidence, TSNode site);
+static void perl_resolve_direct_coderef_arguments(PerlLSPContext *ctx, TSNode call);
 
 /* ── helpers ────────────────────────────────────────────────────── */
 
@@ -625,16 +626,160 @@ static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode nod
 /* ── emit ───────────────────────────────────────────────────────── */
 
 static void perl_emit_resolved(PerlLSPContext *ctx, const char *callee_qn, const char *strategy,
-                               float confidence) {
+                               float confidence, TSNode site) {
     if (!ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn)
         return;
-    CBMResolvedCall rc;
+    CBMResolvedCall rc = {0};
     rc.caller_qn = ctx->enclosing_func_qn;
     rc.callee_qn = callee_qn;
     rc.strategy = strategy;
     rc.confidence = confidence;
     rc.reason = NULL;
+    rc.kind = CBM_RESOLVED_INVOCATION;
+    if (!ts_node_is_null(site)) {
+        rc.site_start_byte = ts_node_start_byte(site);
+        rc.site_end_byte = ts_node_end_byte(site);
+    }
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+static void perl_emit_reference(PerlLSPContext *ctx, const char *callee_qn, TSNode site) {
+    if (!ctx || !ctx->resolved_calls || !callee_qn || !ctx->enclosing_func_qn ||
+        ts_node_is_null(site)) {
+        return;
+    }
+    CBMResolvedCall rc = {0};
+    rc.caller_qn = ctx->enclosing_func_qn;
+    rc.callee_qn = callee_qn;
+    rc.strategy = "perl_coderef";
+    rc.confidence = PERL_CONF_LITERAL;
+    rc.kind = CBM_RESOLVED_CALL_REFERENCE;
+    rc.site_start_byte = ts_node_start_byte(site);
+    rc.site_end_byte = ts_node_end_byte(site);
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
+}
+
+/* Accept only the exact coderef spelling represented by one direct
+ * refgen_expression. Conditional/list/map expressions are not examined, so
+ * their constituent \&names remain ordinary usages. */
+static char *perl_exact_coderef_name(PerlLSPContext *ctx, TSNode refgen) {
+    if (ts_node_is_null(refgen) || strcmp(ts_node_type(refgen), "refgen_expression") != 0)
+        return NULL;
+    char *text = perl_node_text(ctx, refgen);
+    if (!text)
+        return NULL;
+    const char *p = text;
+    while (isspace((unsigned char)*p))
+        p++;
+    if (p[0] != '\\' || p[1] != '&')
+        return NULL;
+    p += 2;
+    const char *start = p;
+    if (!(isalpha((unsigned char)*p) || *p == '_'))
+        return NULL;
+    while (isalnum((unsigned char)*p) || *p == '_' || *p == ':')
+        p++;
+    const char *end = p;
+    while (isspace((unsigned char)*p))
+        p++;
+    if (*p != '\0' || end == start)
+        return NULL;
+    return cbm_arena_strndup(ctx->arena, start, (size_t)(end - start));
+}
+
+static const CBMRegisteredFunc *perl_resolve_coderef_target(PerlLSPContext *ctx, char *name) {
+    if (!ctx || !name || !name[0])
+        return NULL;
+    char *colons = NULL;
+    for (char *p = strstr(name, "::"); p; p = strstr(p + 2, "::"))
+        colons = p;
+    if (colons) {
+        char *pkg = cbm_arena_strndup(ctx->arena, name, (size_t)(colons - name));
+        const char *short_name = colons + 2;
+        const CBMRegisteredFunc *f = perl_lookup_method(ctx, pkg, short_name);
+        return f ? f : cbm_registry_lookup_symbol(ctx->registry, pkg, short_name);
+    }
+    const char *import_qn = perl_find_import(ctx, name);
+    if (import_qn) {
+        const CBMRegisteredFunc *f = cbm_registry_lookup_func(ctx->registry, import_qn);
+        if (f)
+            return f;
+    }
+    return cbm_registry_lookup_symbol(ctx->registry, ctx->module_qn, name);
+}
+
+static void perl_resolve_one_coderef(PerlLSPContext *ctx, TSNode refgen) {
+    char *name = perl_exact_coderef_name(ctx, refgen);
+    const CBMRegisteredFunc *target = name ? perl_resolve_coderef_target(ctx, name) : NULL;
+    if (target && target->qualified_name)
+        perl_emit_reference(ctx, target->qualified_name, refgen);
+}
+
+static void perl_resolve_direct_coderef_arguments(PerlLSPContext *ctx, TSNode call) {
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    if (ts_node_is_null(args))
+        return;
+    if (strcmp(ts_node_type(args), "refgen_expression") == 0) {
+        perl_resolve_one_coderef(ctx, args);
+        return;
+    }
+    /* Multiple arguments are exposed through a flat list_expression. Do not
+     * recurse into any other wrapper: in particular, a conditional argument
+     * may contain refgen descendants but does not select one exact target. */
+    if (strcmp(ts_node_type(args), "list_expression") != 0)
+        return;
+    uint32_t count = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "refgen_expression") == 0)
+            perl_resolve_one_coderef(ctx, arg);
+    }
+}
+
+static bool perl_is_direct_coderef_argument(TSNode refgen) {
+    TSNode container = ts_node_parent(refgen);
+    if (ts_node_is_null(container))
+        return false;
+    if (strcmp(ts_node_type(container), "list_expression") != 0)
+        container = refgen;
+    TSNode call = ts_node_parent(container);
+    if (ts_node_is_null(call))
+        return false;
+    const char *kind = ts_node_type(call);
+    if (strcmp(kind, "function_call_expression") != 0 &&
+        strcmp(kind, "ambiguous_function_call_expression") != 0) {
+        return false;
+    }
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+    return !ts_node_is_null(args) && ts_node_eq(args, container);
+}
+
+static void perl_emit_non_direct_coderef_usage(PerlLSPContext *ctx, TSNode refgen) {
+    if (!ctx || !ctx->usages || !ctx->enclosing_func_qn ||
+        perl_is_direct_coderef_argument(refgen)) {
+        return;
+    }
+    char *name = perl_exact_coderef_name(ctx, refgen);
+    if (!name)
+        return;
+    uint32_t start = ts_node_start_byte(refgen);
+    uint32_t end = ts_node_end_byte(refgen);
+    for (int i = 0; i < ctx->usages->count; i++) {
+        const CBMUsage *existing = &ctx->usages->items[i];
+        if (existing->kind == CBM_USAGE_VALUE && existing->ref_name &&
+            existing->enclosing_func_qn && strcmp(existing->ref_name, name) == 0 &&
+            strcmp(existing->enclosing_func_qn, ctx->enclosing_func_qn) == 0 &&
+            existing->site_start_byte == start && existing->site_end_byte == end) {
+            return;
+        }
+    }
+    CBMUsage usage = {0};
+    usage.ref_name = name;
+    usage.enclosing_func_qn = ctx->enclosing_func_qn;
+    usage.kind = CBM_USAGE_VALUE;
+    usage.site_start_byte = start;
+    usage.site_end_byte = end;
+    cbm_usages_push(ctx->usages, ctx->arena, usage);
 }
 
 /* ── call/method dispatch (emit edges) ──────────────────────────── */
@@ -642,6 +787,7 @@ static void perl_emit_resolved(PerlLSPContext *ctx, const char *callee_qn, const
 /* Resolve a function/static call and emit an edge if it lands on a registered
  * sub. Bare func(), Exporter func(), and Package::func() static calls. */
 static void perl_resolve_function_call(PerlLSPContext *ctx, TSNode call) {
+    perl_resolve_direct_coderef_arguments(ctx, call);
     TSNode fn = ts_node_child_by_field_name(call, "function", 8);
     if (ts_node_is_null(fn))
         return;
@@ -669,7 +815,7 @@ static void perl_resolve_function_call(PerlLSPContext *ctx, TSNode call) {
         if (!f)
             f = cbm_registry_lookup_symbol(ctx->registry, pkg, shortn);
         if (f) {
-            perl_emit_resolved(ctx, f->qualified_name, "perl_static_call", PERL_CONF_LITERAL);
+            perl_emit_resolved(ctx, f->qualified_name, "perl_static_call", PERL_CONF_LITERAL, call);
             return;
         }
     } else {
@@ -678,13 +824,14 @@ static void perl_resolve_function_call(PerlLSPContext *ctx, TSNode call) {
             f = cbm_registry_lookup_func(ctx->registry, imp);
             if (f) {
                 perl_emit_resolved(ctx, f->qualified_name, "perl_imported_function",
-                                   PERL_CONF_LITERAL);
+                                   PERL_CONF_LITERAL, call);
                 return;
             }
         }
         f = cbm_registry_lookup_symbol(ctx->registry, ctx->module_qn, name);
         if (f) {
-            perl_emit_resolved(ctx, f->qualified_name, "perl_function_local", PERL_CONF_LITERAL);
+            perl_emit_resolved(ctx, f->qualified_name, "perl_function_local", PERL_CONF_LITERAL,
+                               call);
             return;
         }
     }
@@ -718,7 +865,8 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
             return;
         const CBMRegisteredFunc *sf = perl_lookup_method(ctx, parent_qn, super_method);
         if (sf)
-            perl_emit_resolved(ctx, sf->qualified_name, "perl_method_super", PERL_CONF_LITERAL);
+            perl_emit_resolved(ctx, sf->qualified_name, "perl_method_super", PERL_CONF_LITERAL,
+                               call);
         return;
     }
 
@@ -747,7 +895,7 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
         const char *strat = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                 ? strategy
                                 : "perl_method_inherited";
-        perl_emit_resolved(ctx, f->qualified_name, strat, PERL_CONF_LITERAL);
+        perl_emit_resolved(ctx, f->qualified_name, strat, PERL_CONF_LITERAL, call);
         return;
     }
     /* Receiver typed but method not found in the indexed inheritance chain.
@@ -822,6 +970,9 @@ static void perl_resolve_calls_in_node_inner(PerlLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(assign))
             perl_process_assignment(ctx, assign);
     }
+
+    if (strcmp(k, "refgen_expression") == 0)
+        perl_emit_non_direct_coderef_usage(ctx, node);
 
     /* Call-resolution dispatch. */
     if (strcmp(k, "function_call_expression") == 0 ||
@@ -1529,6 +1680,7 @@ void cbm_run_perl_lsp(CBMArena *arena, CBMFileResult *result, const char *source
      * finished (const) registry. */
     PerlLSPContext ctx;
     perl_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, &result->resolved_calls);
+    ctx.usages = &result->usages;
 
     ctx.current_package_qn = "";
     ctx.enclosing_package_qn = "";

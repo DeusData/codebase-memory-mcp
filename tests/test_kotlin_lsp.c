@@ -29,7 +29,11 @@
  */
 #include "test_framework.h"
 #include "cbm.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "lsp/kotlin_lsp.h"
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 /* ── helpers ───────────────────────────────────────────────── */
@@ -78,6 +82,48 @@ static int count_resolved(const CBMFileResult *r, const char *callerSub, const c
         const CBMResolvedCall *rc = &r->resolved_calls.items[i];
         if (rc->caller_qn && strstr(rc->caller_qn, callerSub) && rc->callee_qn &&
             strstr(rc->callee_qn, calleeSub)) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static int count_exact_resolved_site(const CBMFileResult *r, const char *callerSub,
+                                     const char *calleeSub, uint32_t start, uint32_t end) {
+    int n = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind == CBM_RESOLVED_INVOCATION && rc->caller_qn &&
+            strstr(rc->caller_qn, callerSub) && rc->callee_qn && strstr(rc->callee_qn, calleeSub) &&
+            rc->strategy && strcmp(rc->strategy, "lsp_kt_delegate_access") == 0 &&
+            rc->site_start_byte == start && rc->site_end_byte == end) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static int count_exact_synthetic_call(const CBMFileResult *r, const char *callerSub,
+                                      const char *callee, uint32_t start, uint32_t end) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->requires_lsp_resolution && call->enclosing_func_qn &&
+            strstr(call->enclosing_func_qn, callerSub) && call->callee_name &&
+            strcmp(call->callee_name, callee) == 0 && call->site_start_byte == start &&
+            call->site_end_byte == end) {
+            n++;
+        }
+    }
+    return n;
+}
+
+static int count_synthetic_call(const CBMFileResult *r, const char *callee) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->requires_lsp_resolution && call->callee_name &&
+            strcmp(call->callee_name, callee) == 0) {
             n++;
         }
     }
@@ -677,6 +723,96 @@ TEST(ktlsp_unknown_external_unresolved) {
     PASS();
 }
 
+/* A call_expression contains a navigation_expression, and the Kotlin walker
+ * currently visits both.  Keep one occurrence-exact semantic record per full
+ * parser call so same-leaf methods cannot duplicate or join the other target. */
+TEST(ktlsp_ordinary_same_leaf_calls_join_by_exact_site) {
+    const char *source = "class Alpha { fun render(): String = \"alpha\" }\n"
+                         "class Beta { fun render(): String = \"beta\" }\n"
+                         "fun occurrenceProbe(alpha: Alpha, beta: Beta) {\n"
+                         "    alpha.render()\n"
+                         "    beta.render()\n"
+                         "}\n";
+    static const char alpha_text[] = "alpha.render()";
+    static const char beta_text[] = "beta.render()";
+    const char *alpha_site = strstr(source, alpha_text);
+    const char *beta_site = strstr(source, beta_text);
+    ASSERT_NOT_NULL(alpha_site);
+    ASSERT_NOT_NULL(beta_site);
+    const uint32_t alpha_start = (uint32_t)(alpha_site - source);
+    const uint32_t alpha_end = alpha_start + (uint32_t)strlen(alpha_text);
+    const uint32_t beta_start = (uint32_t)(beta_site - source);
+    const uint32_t beta_end = beta_start + (uint32_t)strlen(beta_text);
+
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *alpha_call = NULL;
+    const CBMCall *beta_call = NULL;
+    int carrier_count = 0;
+    int zero_span_carriers = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrenceProbe") ||
+            !call->callee_name || !strstr(call->callee_name, "render")) {
+            continue;
+        }
+        carrier_count++;
+        if (call->site_end_byte <= call->site_start_byte)
+            zero_span_carriers++;
+        if (call->site_start_byte == alpha_start && call->site_end_byte == alpha_end)
+            alpha_call = call;
+        if (call->site_start_byte == beta_start && call->site_end_byte == beta_end)
+            beta_call = call;
+    }
+
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(zero_span_carriers, 0);
+    ASSERT_NOT_NULL(alpha_call);
+    ASSERT_NOT_NULL(beta_call);
+    ASSERT_NEQ(alpha_call->site_start_byte, beta_call->site_start_byte);
+
+    const CBMResolvedCall *alpha_semantic = NULL;
+    const CBMResolvedCall *beta_semantic = NULL;
+    int semantic_count = 0;
+    int zero_span_semantics = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || rc->confidence <= 0.0f || !rc->caller_qn ||
+            !strstr(rc->caller_qn, "occurrenceProbe") || !rc->callee_qn ||
+            !strstr(rc->callee_qn, ".render")) {
+            continue;
+        }
+        semantic_count++;
+        if (rc->site_end_byte <= rc->site_start_byte)
+            zero_span_semantics++;
+        if (strstr(rc->callee_qn, ".Alpha.render") && rc->site_start_byte == alpha_start &&
+            rc->site_end_byte == alpha_end) {
+            alpha_semantic = rc;
+        }
+        if (strstr(rc->callee_qn, ".Beta.render") && rc->site_start_byte == beta_start &&
+            rc->site_end_byte == beta_end) {
+            beta_semantic = rc;
+        }
+    }
+
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_EQ(zero_span_semantics, 0);
+    ASSERT_NOT_NULL(alpha_semantic);
+    ASSERT_NOT_NULL(beta_semantic);
+    ASSERT_TRUE(alpha_semantic != beta_semantic);
+
+    const CBMResolvedCall *alpha_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, alpha_call, false);
+    const CBMResolvedCall *beta_joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, beta_call, false);
+    ASSERT_TRUE(alpha_joined == alpha_semantic);
+    ASSERT_TRUE(beta_joined == beta_semantic);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(ktlsp_no_duplicate_emission) {
     /* Same call shouldn't emit twice. */
     CBMFileResult *r = extract_kotlin("fun main() { println(\"a\"); println(\"b\") }\n");
@@ -888,6 +1024,51 @@ TEST(ktlsp_operator_int_plus) {
     PASS();
 }
 
+#if defined(CBM_KOTLIN_DEDUP_TEST_API) && CBM_KOTLIN_DEDUP_TEST_API
+TEST(ktlsp_operator_dedup_comparison_growth_is_linear) {
+    /* Each distinct operator site appends one exact-span carrier.  Comparing a
+     * new site with every carrier already emitted costs at least
+     * N*(N-1)/2 comparisons: 18,336 at N=192.  A constant-work dedup check
+     * (the duplicate wrapper, when present, is adjacent) stays near N.  Count
+     * operations instead of elapsed time so this guard is deterministic under
+     * sanitizers, emulation, and loaded CI hosts. */
+    enum { OPERATOR_SITE_COUNT = 192, SOURCE_CAPACITY = 32768 };
+    char source[SOURCE_CAPACITY];
+    size_t used = 0;
+    int written = snprintf(source, sizeof(source),
+                           "class Token {\n"
+                           "    operator fun plus(other: Token): Token = this\n"
+                           "}\n"
+                           "fun exercise(a: Token, b: Token) {\n");
+    ASSERT_GT(written, 0);
+    used = (size_t)written;
+
+    for (int i = 0; i < OPERATOR_SITE_COUNT; i++) {
+        written = snprintf(source + used, sizeof(source) - used, "    val r%03d = a + b\n", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(source) - used);
+        used += (size_t)written;
+    }
+    written = snprintf(source + used, sizeof(source) - used, "}\n");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(source) - used);
+
+    cbm_kotlin_operator_dedup_test_reset();
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(count_synthetic_call(r, "plus"), OPERATOR_SITE_COUNT);
+
+    uint64_t comparisons = cbm_kotlin_operator_dedup_test_comparisons();
+    uint64_t linear_budget = (uint64_t)OPERATOR_SITE_COUNT * 8U;
+    printf("    Kotlin operator dedup: %" PRIu64 " comparisons for %d sites "
+           "(linear budget %" PRIu64 ")\n",
+           comparisons, OPERATOR_SITE_COUNT, linear_budget);
+    cbm_free_result(r);
+    ASSERT_LTE(comparisons, linear_budget);
+    PASS();
+}
+#endif
+
 /* ── 27. Iterator protocol ──────────────────────────────────── */
 
 TEST(ktlsp_for_iterator_protocol) {
@@ -954,6 +1135,144 @@ TEST(ktlsp_property_delegation_lazy) {
     int n_lazy = count_resolved(r, "expensive", "lazy");
     int n_get = count_resolved(r, "expensive", "getValue");
     ASSERT_TRUE(n_lazy + n_get >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Access-level delegated-property contract. */
+
+TEST(ktlsp_property_delegate_declaration_emits_no_access_operator) {
+    static const char source[] =
+        "import kotlin.reflect.KProperty\n"
+        "class Slot {\n"
+        "    operator fun getValue(thisRef: Any?, property: KProperty<*>): Int = 1\n"
+        "    operator fun setValue(thisRef: Any?, property: KProperty<*>, next: Int) {}\n"
+        "}\n"
+        "class Holder {\n"
+        "    var value: Int by Slot()\n"
+        "}\n";
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+    /* Declaring a delegated property selects its operators but does not invoke
+     * either one. Access edges belong exclusively to source read/write sites. */
+    ASSERT_EQ(count_resolved(r, "", "getValue"), 0);
+    ASSERT_EQ(count_resolved(r, "", "setValue"), 0);
+    ASSERT_EQ(count_synthetic_call(r, "getValue"), 0);
+    ASSERT_EQ(count_synthetic_call(r, "setValue"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ktlsp_property_delegate_read_emits_exact_get_only) {
+    static const char source[] =
+        "import kotlin.reflect.KProperty\n"
+        "class Slot {\n"
+        "    operator fun getValue(thisRef: Any?, property: KProperty<*>): Int = 1\n"
+        "    operator fun setValue(thisRef: Any?, property: KProperty<*>, next: Int) {}\n"
+        "}\n"
+        "class Holder {\n"
+        "    var value: Int by Slot()\n"
+        "    fun read(): Int = value\n"
+        "}\n";
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+    const char *access = strstr(source, "fun read(): Int = value");
+    ASSERT_NOT_NULL(access);
+    uint32_t start = (uint32_t)(access - source) + (uint32_t)strlen("fun read(): Int = ");
+    uint32_t end = start + (uint32_t)strlen("value");
+    ASSERT_EQ(count_exact_resolved_site(r, "read", "getValue", start, end), 1);
+    ASSERT_EQ(count_exact_resolved_site(r, "read", "setValue", start, end), 0);
+    ASSERT_EQ(count_exact_synthetic_call(r, "read", "getValue", start, end), 1);
+    ASSERT_EQ(count_exact_synthetic_call(r, "read", "setValue", start, end), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ktlsp_property_delegate_write_emits_exact_set_only) {
+    static const char source[] =
+        "import kotlin.reflect.KProperty\n"
+        "class Slot {\n"
+        "    operator fun getValue(thisRef: Any?, property: KProperty<*>): Int = 1\n"
+        "    operator fun setValue(thisRef: Any?, property: KProperty<*>, next: Int) {}\n"
+        "}\n"
+        "class Holder {\n"
+        "    var value: Int by Slot()\n"
+        "    fun write() { value = 2 }\n"
+        "}\n";
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+    const char *access = strstr(source, "value = 2");
+    ASSERT_NOT_NULL(access);
+    uint32_t start = (uint32_t)(access - source);
+    uint32_t end = start + (uint32_t)strlen("value");
+    ASSERT_EQ(count_exact_resolved_site(r, "write", "getValue", start, end), 0);
+    ASSERT_EQ(count_exact_resolved_site(r, "write", "setValue", start, end), 1);
+    ASSERT_EQ(count_exact_synthetic_call(r, "write", "getValue", start, end), 0);
+    ASSERT_EQ(count_exact_synthetic_call(r, "write", "setValue", start, end), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ktlsp_property_delegate_compound_write_emits_get_and_set) {
+    static const char source[] =
+        "import kotlin.reflect.KProperty\n"
+        "class Slot {\n"
+        "    operator fun getValue(thisRef: Any?, property: KProperty<*>): Int = 1\n"
+        "    operator fun setValue(thisRef: Any?, property: KProperty<*>, next: Int) {}\n"
+        "}\n"
+        "class Holder {\n"
+        "    var value: Int by Slot()\n"
+        "    fun increment() { value += 2 }\n"
+        "}\n";
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+    const char *access = strstr(source, "value += 2");
+    ASSERT_NOT_NULL(access);
+    uint32_t start = (uint32_t)(access - source);
+    uint32_t end = start + (uint32_t)strlen("value");
+    /* Compound assignment is read-modify-write in Kotlin, so both operators
+     * are real access-level calls at the same source occurrence. */
+    ASSERT_EQ(count_exact_resolved_site(r, "increment", "getValue", start, end), 1);
+    ASSERT_EQ(count_exact_resolved_site(r, "increment", "setValue", start, end), 1);
+    ASSERT_EQ(count_exact_synthetic_call(r, "increment", "getValue", start, end), 1);
+    ASSERT_EQ(count_exact_synthetic_call(r, "increment", "setValue", start, end), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(ktlsp_local_shadow_does_not_inherit_member_delegate) {
+    static const char source[] =
+        "import kotlin.reflect.KProperty\n"
+        "class Slot {\n"
+        "    operator fun getValue(thisRef: Any?, property: KProperty<*>): Int = 1\n"
+        "    operator fun setValue(thisRef: Any?, property: KProperty<*>, next: Int) {}\n"
+        "}\n"
+        "class Holder {\n"
+        "    var value: Int by Slot()\n"
+        "    fun memberRead(): Int = value\n"
+        "    fun localRead(): Int {\n"
+        "        val value: Int = 7\n"
+        "        return value\n"
+        "    }\n"
+        "}\n";
+    CBMFileResult *r = extract_kotlin(source);
+    ASSERT_NOT_NULL(r);
+
+    const char *member = strstr(source, "fun memberRead(): Int = value");
+    ASSERT_NOT_NULL(member);
+    uint32_t member_start =
+        (uint32_t)(member - source) + (uint32_t)strlen("fun memberRead(): Int = ");
+    uint32_t member_end = member_start + (uint32_t)strlen("value");
+    ASSERT_EQ(count_exact_resolved_site(r, "memberRead", "getValue", member_start, member_end), 1);
+
+    const char *local = strstr(source, "return value");
+    ASSERT_NOT_NULL(local);
+    uint32_t local_start = (uint32_t)(local - source) + (uint32_t)strlen("return ");
+    uint32_t local_end = local_start + (uint32_t)strlen("value");
+    ASSERT_EQ(count_exact_resolved_site(r, "localRead", "getValue", local_start, local_end), 0);
+    ASSERT_EQ(count_exact_resolved_site(r, "localRead", "setValue", local_start, local_end), 0);
+    ASSERT_EQ(count_exact_synthetic_call(r, "localRead", "getValue", local_start, local_end), 0);
+    ASSERT_EQ(count_exact_synthetic_call(r, "localRead", "setValue", local_start, local_end), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -1151,6 +1470,7 @@ SUITE(kotlin_lsp) {
     RUN_TEST(ktlsp_only_imports);
     RUN_TEST(ktlsp_kts_script);
     RUN_TEST(ktlsp_unknown_external_unresolved);
+    RUN_TEST(ktlsp_ordinary_same_leaf_calls_join_by_exact_site);
     RUN_TEST(ktlsp_no_duplicate_emission);
     RUN_TEST(ktlsp_constructor_high_confidence);
     RUN_TEST(ktlsp_method_high_confidence);
@@ -1167,6 +1487,9 @@ SUITE(kotlin_lsp) {
     RUN_TEST(ktlsp_operator_get);
     RUN_TEST(ktlsp_operator_unary);
     RUN_TEST(ktlsp_operator_int_plus);
+#if defined(CBM_KOTLIN_DEDUP_TEST_API) && CBM_KOTLIN_DEDUP_TEST_API
+    RUN_TEST(ktlsp_operator_dedup_comparison_growth_is_linear);
+#endif
     /* Iterator protocol */
     RUN_TEST(ktlsp_for_iterator_protocol);
     RUN_TEST(ktlsp_for_range_iterator);
@@ -1175,6 +1498,11 @@ SUITE(kotlin_lsp) {
     RUN_TEST(ktlsp_destructuring_data_class);
     /* Property delegation */
     RUN_TEST(ktlsp_property_delegation_lazy);
+    RUN_TEST(ktlsp_property_delegate_declaration_emits_no_access_operator);
+    RUN_TEST(ktlsp_property_delegate_read_emits_exact_get_only);
+    RUN_TEST(ktlsp_property_delegate_write_emits_exact_set_only);
+    RUN_TEST(ktlsp_property_delegate_compound_write_emits_get_and_set);
+    RUN_TEST(ktlsp_local_shadow_does_not_inherit_member_delegate);
     /* String interpolation */
     RUN_TEST(ktlsp_string_interpolation);
     /* Range */

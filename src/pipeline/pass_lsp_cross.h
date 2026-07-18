@@ -58,6 +58,17 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
                       bool *out_dts);
 
+/* Build the local-name -> semantic import-QN map consumed by cross-file LSPs.
+ * Both sequential and parallel drivers use this exact helper so import
+ * metadata cannot diverge between pipelines. Values are owned by the returned
+ * map (not borrowed from gbuf); release both arrays with
+ * cbm_pxc_free_import_map(). */
+int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
+                             CBMLanguage lang, const CBMFileResult *result, const char ***out_keys,
+                             const char ***out_vals, int *out_count);
+
+void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
+
 /* ── Per-module def index (the gopls "package summary" pattern) ──
  *
  * The hot path used to register ALL all_defs[] into a fresh registry
@@ -87,11 +98,13 @@ void cbm_pxc_free_module_def_index(CBMModuleDefIndex *idx);
  * `src/main/kotlin` roots without import statements. String fields inside
  * each entry are borrowed from the original all_defs[] arena (caller keeps
  * it alive). Caller frees the returned array with free(). Writes the entry
- * count to *out_count. Returns NULL if no matches (with *out_count = 0). */
+ * count to *out_count and sets *out_success on every valid selection. A valid
+ * empty selection returns NULL with *out_count = 0 and *out_success = true;
+ * NULL with *out_success = false means invalid input or allocation failure. */
 CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef *all_defs,
                                         CBMLanguage caller_lang, const char *caller_namespace,
                                         const char *own_module, const char *const *imp_qns,
-                                        int imp_count, int *out_count);
+                                        int imp_count, int *out_count, bool *out_success);
 
 /* ── Tier 2 full: pre-built per-language cross-LSP registries ─────
  *

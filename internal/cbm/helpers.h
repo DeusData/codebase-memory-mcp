@@ -86,6 +86,11 @@ TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
 
+/* Namespace/module declarations that extend a qualified-name scope without
+ * turning their children into class methods. Shared by definition and unified
+ * walks so TS/TSX scope attribution cannot drift. */
+bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind);
+
 // Free the calling thread's cbm_kind_in_set bitset cache (call at thread/process
 // teardown so the thread-local cache is not reported as a leak).
 void cbm_kind_in_set_free_cache(void);

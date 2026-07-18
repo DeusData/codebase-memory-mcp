@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # repro.sh — Build + run the cumulative BUG-REPRODUCTION suite (test-repro).
 #
-# Unlike test.sh (the gating suite, must be GREEN), this suite is RED by design:
-# every case reproduces an open bug. So we distinguish two outcomes:
+# Unlike test.sh (the gating suite, must be GREEN), this suite tracks open RED
+# reproductions alongside GREEN controls and regression guards. We distinguish:
 #   - BUILD/LINK failure  → real breakage → exit non-zero (fail the CI job).
-#   - Test redness        → EXPECTED → report the count, exit 0 (green board).
+#   - Reproduced RED cases → expected board data → report the count, exit 0.
+#   - Any skipped case     → incomplete board → report it, exit non-zero.
 #
 # Usage: scripts/repro.sh [CC=clang] [CXX=clang++] [--arch arm64|x86_64]
 set -uo pipefail
@@ -37,7 +38,12 @@ done
 print_env "repro.sh"
 verify_compiler "$CC"
 
-OUT="$ROOT/repro-out.txt"
+OUT="$(mktemp "${TMPDIR:-/tmp}/cbm-repro-out.XXXXXX")"
+if [[ -z "$OUT" ]]; then
+    echo "::error::unable to create bug-repro transcript"
+    exit 1
+fi
+trap 'rm -f "$OUT"' EXIT
 # A RED reproduction fails its assertion and returns EARLY — before any cleanup —
 # so LeakSanitizer would flag benign harness leaks on every red store-level test
 # and abort. The board's signal is the FAIL rows, not leak-cleanliness (the leak
@@ -50,23 +56,45 @@ set +e
 make -j"$NPROC" -f Makefile.cbm test-repro $MAKE_ARGS 2>&1 | tee "$OUT"
 set -e
 
-# The runner prints a "<N> passed[, <M> failed]" summary line only if it actually
-# ran. No summary line ⇒ the build/link failed ⇒ real breakage.
-if ! grep -qE '[0-9]+ passed' "$OUT"; then
+# The runner's final aggregate is the only line that starts with the count.
+# Per-suite lines also contain "N passed, M failed", so selecting the first
+# match undercounts every multi-suite run.
+summary_line="$(grep -E '^[[:space:]]*[0-9]+ passed(, [0-9]+ failed)?(, [0-9]+ skipped)?[[:space:]]*$' "$OUT" | tail -1 || true)"
+if [[ -z "$summary_line" ]]; then
     echo "::error::bug-repro runner did not execute — build or link failure"
     exit 1
 fi
 
-reproduced=$(grep -oE '[0-9]+ failed' "$OUT" | head -1 | grep -oE '[0-9]+' || echo 0)
-green=$(grep -oE '[0-9]+ passed' "$OUT" | head -1 | grep -oE '[0-9]+' || echo 0)
+green="$(printf '%s\n' "$summary_line" | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')"
+reproduced="$(printf '%s\n' "$summary_line" | grep -oE '[0-9]+ failed' | grep -oE '[0-9]+' || echo 0)"
+skipped="$(printf '%s\n' "$summary_line" | grep -oE '[0-9]+ skipped' | grep -oE '[0-9]+' || echo 0)"
 
-{
+if ((green + reproduced == 0)); then
+    echo "::error::bug-repro runner executed zero tests"
+    exit 1
+fi
+
+emit_board_summary() {
     echo "## Bug-reproduction board — ${OS:-$(uname -s)} ${ARCH:-}"
     echo ""
     echo "- **${reproduced}** open bug(s) still reproduced (RED — expected)"
-    echo "- **${green}** case(s) PASSING — candidate-fixed → verify + close the issue + promote the guard to the gating suite"
-} >> "${GITHUB_STEP_SUMMARY:-/dev/stderr}"
+    echo "- **${green}** case(s) passing control(s) or candidate-fix candidate(s); verify each RED→GREEN transition before closing an issue"
+    if ((skipped > 0)); then
+        echo "- **${skipped}** case(s) SKIPPED — board is incomplete"
+    fi
+}
 
-echo "=== bug-repro board: ${reproduced} reproduced (RED), ${green} passing (candidate-fixed) ==="
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+    emit_board_summary >> "$GITHUB_STEP_SUMMARY"
+else
+    emit_board_summary >&2
+fi
+
+echo "=== bug-repro board: ${reproduced} reproduced (RED), ${green} passing control(s) or candidate-fix candidate(s) ==="
+if ((skipped > 0)); then
+    echo "::warning::bug-repro board incomplete — ${skipped} case(s) skipped"
+    exit 1
+fi
+
 # Green board: the suite ran. Redness is the data, not a job failure.
 exit 0

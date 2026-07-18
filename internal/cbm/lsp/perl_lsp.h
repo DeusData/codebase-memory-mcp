@@ -61,6 +61,7 @@ typedef struct {
 
     /* Output: resolved calls accumulate here. */
     CBMResolvedCallArray *resolved_calls;
+    CBMUsageArray *usages;
 
     /* Recursion guard for perl_eval_expr_type. */
     int eval_depth;

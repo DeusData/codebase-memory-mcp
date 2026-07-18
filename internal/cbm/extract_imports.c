@@ -107,6 +107,17 @@ static const char *path_last(CBMArena *a, const char *path) {
     return path;
 }
 
+/* An unaliased dotted Python import binds its first component, not its last:
+ * `import xml.etree` introduces `xml`.  Keep module_path intact for dependency
+ * resolution while recording the language-correct local spelling. */
+static const char *python_import_root(CBMArena *a, const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    const char *dot = strchr(path, '.');
+    return dot ? cbm_arena_strndup(a, path, (size_t)(dot - path)) : path;
+}
+
 // --- Go imports ---
 // import_declaration -> import_spec_list -> import_spec -> (name, path)
 
@@ -197,7 +208,7 @@ static void process_py_import_stmt(CBMExtractCtx *ctx, TSNode node) {
             if (strcmp(ck, "dotted_name") == 0 || strcmp(ck, "identifier") == 0) {
                 char *mod = cbm_node_text(a, child, ctx->source);
                 if (mod && mod[0]) {
-                    CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
+                    CBMImport imp = {.local_name = python_import_root(a, mod), .module_path = mod};
                     cbm_imports_push(&ctx->result->imports, a, imp);
                 }
             } else if (strcmp(ck, "aliased_import") == 0) {
@@ -211,7 +222,7 @@ static void process_py_import_stmt(CBMExtractCtx *ctx, TSNode node) {
     } else {
         char *mod = cbm_node_text(a, name_node, ctx->source);
         if (mod && mod[0]) {
-            CBMImport imp = {.local_name = path_last(a, mod), .module_path = mod};
+            CBMImport imp = {.local_name = python_import_root(a, mod), .module_path = mod};
             cbm_imports_push(&ctx->result->imports, a, imp);
         }
     }

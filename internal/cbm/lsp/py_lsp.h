@@ -50,6 +50,7 @@ typedef struct {
     // Built from CBMFileResult.imports.
     const char **import_local_names;
     const char **import_module_qns;
+    unsigned char *import_kinds; // internal PyDirectImportKind, classified once from the AST
     int import_count;
 
     // Current function/class context for resolving `self`/`cls` and emitting
@@ -69,8 +70,9 @@ typedef struct {
     // appears in result->calls because a `subscript`/`binary_operator` is not
     // a `call` node, so the syntactic extractor produced no call. When this is
     // non-NULL, py_emit_dunder_call injects a matching synthetic CBMCall so the
-    // recovered dunder call becomes a real CALLS edge. NULL in the cross-file
-    // path (no result->calls available there). Mirrors RustLSPContext.syn_calls.
+    // recovered dunder call becomes a real CALLS edge. Cross-file callers use
+    // a separate arena-owned output and merge it into the file result after
+    // resolution. Mirrors RustLSPContext.syn_calls.
     CBMCallArray *syn_calls;
 
     // Lambda registry: simple linear list, looked up by name.
@@ -155,7 +157,7 @@ void cbm_run_py_lsp_cross(CBMArena *arena, const char *source, int source_len,
                           const char *module_qn, CBMLSPDef *defs, int def_count,
                           const char **import_names, const char **import_qns, int import_count,
                           TSTree *cached_tree, // NULL = parse internally
-                          CBMResolvedCallArray *out);
+                          CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 /* Tier 2: pre-built per-language registry (mirrors Go pilot).
  * Filters all_defs to Python entries, builds + finalizes once. */
@@ -166,7 +168,7 @@ void cbm_run_py_lsp_cross_with_registry(CBMArena *arena, const char *source, int
                                         CBMTypeRegistry *reg, // pre-built, finalized, READ-ONLY
                                         const char **import_names, const char **import_qns,
                                         int import_count, TSTree *cached_tree,
-                                        CBMResolvedCallArray *out);
+                                        CBMResolvedCallArray *out, CBMCallArray *synthetic_calls);
 
 // --- Batch cross-file LSP ---
 

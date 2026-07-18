@@ -186,38 +186,44 @@ typedef struct {
     const char *file_path;      // relative path
     uint32_t start_line;
     uint32_t end_line;
-    const char *signature;     // parameter text (NULL if none)
-    const char *return_type;   // return type text (NULL if none)
-    const char *receiver;      // Go method receiver (NULL if none)
-    const char *docstring;     // leading doc comment (NULL if none)
-    const char *parent_class;  // enclosing class QN for methods (NULL if none)
-    const char **decorators;   // NULL-terminated array (NULL if none)
-    const char **base_classes; // NULL-terminated array (NULL if none)
-    const char **param_names;  // NULL-terminated array (NULL if none)
-    const char **param_types;  // NULL-terminated array (NULL if none)
-    const char **return_types; // NULL-terminated array (NULL if none)
-    const char *route_path;    // HTTP route path from decorator (e.g., "/api/users") or NULL
-    const char *route_method;  // HTTP method from decorator (e.g., "POST") or NULL
-    int complexity;            // cyclomatic complexity
-    int cognitive;             // cognitive complexity (nesting-weighted)
-    int loop_count;            // number of loop constructs in the body
-    int loop_depth;            // max nested-loop depth (bottleneck proxy)
-    bool is_recursive;         // body contains a direct self-call (seed for "recursive")
-    int param_count;           // number of parameters (large = complexity smell)
-    int max_access_depth;      // deepest chained member/subscript access (a.b.c.d)
-    int linear_scan_in_loop;   // count of linear-scan calls (find/contains/indexOf) inside loops
-    int alloc_in_loop;         // count of allocation/append calls inside loops
-    bool recursion_in_loop;    // a self-call occurs inside a loop body
-    bool unguarded_recursion;  // recursive with no self-call guarded by a conditional
-    int lines;                 // body line count
-    uint32_t *fingerprint;     // MinHash fingerprint (arena-allocated, K values) or NULL
-    int fingerprint_k;         // number of hash values (CBM_MINHASH_K or 0)
+    const char *signature;              // parameter text (NULL if none)
+    const char *return_type;            // return type text (NULL if none)
+    const char *receiver;               // Go method receiver (NULL if none)
+    const char *docstring;              // leading doc comment (NULL if none)
+    const char *parent_class;           // enclosing class QN for methods (NULL if none)
+    const char **decorators;            // NULL-terminated array (NULL if none)
+    const char **base_classes;          // NULL-terminated array (NULL if none)
+    const char **param_names;           // NULL-terminated array (NULL if none)
+    const char **param_types;           // NULL-terminated array (NULL if none)
+    const char **signature_param_types; // ordered internal signature types; "?" means unknown
+    int signature_param_count;          // number of entries in signature_param_types
+    const char **return_types;          // NULL-terminated array (NULL if none)
+    const char *route_path;   // HTTP route path from decorator (e.g., "/api/users") or NULL
+    const char *route_method; // HTTP method from decorator (e.g., "POST") or NULL
+    int complexity;           // cyclomatic complexity
+    int cognitive;            // cognitive complexity (nesting-weighted)
+    int loop_count;           // number of loop constructs in the body
+    int loop_depth;           // max nested-loop depth (bottleneck proxy)
+    bool is_recursive;        // body contains a direct self-call (seed for "recursive")
+    int param_count;          // number of parameters (large = complexity smell)
+    int max_access_depth;     // deepest chained member/subscript access (a.b.c.d)
+    int linear_scan_in_loop;  // count of linear-scan calls (find/contains/indexOf) inside loops
+    int alloc_in_loop;        // count of allocation/append calls inside loops
+    bool recursion_in_loop;   // a self-call occurs inside a loop body
+    bool unguarded_recursion; // recursive with no self-call guarded by a conditional
+    int lines;                // body line count
+    uint32_t *fingerprint;    // MinHash fingerprint (arena-allocated, K values) or NULL
+    int fingerprint_k;        // number of hash values (CBM_MINHASH_K or 0)
     bool is_exported;
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
+    /* Rust only: raw trait path from the exact `impl Trait for Type` block
+     * that declared this method.  Kept at the tail so zero-initialised
+     * callers in every other language remain ABI/source compatible. */
+    const char *impl_trait;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -230,6 +236,14 @@ typedef struct {
 
 #define CBM_MAX_CALL_ARGS 8
 
+/* Byte offsets are meaningful only within the source buffer that produced
+ * them. C/C++/CUDA run both raw and preprocessed extraction passes, and those
+ * buffers can contain unrelated occurrences at the same numeric span. */
+typedef enum {
+    CBM_SOURCE_ORIGIN_RAW = 0,
+    CBM_SOURCE_ORIGIN_PREPROCESSED,
+} CBMSourceOrigin;
+
 typedef struct {
     const char *callee_name;            // raw callee text ("pkg.Func", "foo")
     const char *enclosing_func_qn;      // QN of enclosing function (or module QN)
@@ -240,9 +254,14 @@ typedef struct {
     int loop_depth;                     // enclosing loop nesting at the call site
     int branch_depth;                   // enclosing branch nesting at the call site
     int start_line;                     // 1-based source line of the call (for def range-match)
+    uint32_t site_start_byte;           // exact AST occurrence span; end > start when present
+    uint32_t site_end_byte;             // exclusive byte offset in the source file
+    CBMSourceOrigin source_origin;      // raw source or C-family preprocessed buffer
     bool is_method;                     // method/member call with a non-self receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
                                         // x.foo() whose receiver is not this/super. Default false.
+    bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
+                                        // C++ operator). Never fall back to textual resolution.
 } CBMCall;
 
 typedef struct {
@@ -250,9 +269,22 @@ typedef struct {
     const char *module_path; // resolved module path / QN
 } CBMImport;
 
+typedef enum {
+    CBM_USAGE_VALUE = 0,
+    CBM_USAGE_CALL_REFERENCE,
+} CBMUsageKind;
+
 typedef struct {
-    const char *ref_name;          // referenced identifier
-    const char *enclosing_func_qn; // QN of enclosing function (or module QN)
+    const char *ref_name;            // referenced identifier
+    const char *enclosing_func_qn;   // QN of enclosing function (or module QN)
+    CBMUsageKind kind;               // ordinary USAGE or explicit callable reference
+    bool may_be_call_reference;      // syntactic candidate; exact LSP proof may upgrade its edge
+    bool semantic_reference_blocked; // lexical evidence blocks only unproven textual fallback
+    bool semantic_reference_local_shadow; // blocker belongs to a non-module lexical scope
+    uint32_t lexical_scope_id;            // extraction-local scope instance; never graph identity
+    uint32_t site_start_byte;             // exact reference-token span; end > start when present
+    uint32_t site_end_byte;               // exclusive byte offset in the source file
+    CBMSourceOrigin source_origin;        // raw source or C-family preprocessed buffer
 } CBMUsage;
 
 typedef struct {
@@ -327,15 +359,28 @@ typedef struct {
 typedef struct {
     const char *trait_name;  // trait name (raw text)
     const char *struct_name; // struct/type name (raw text)
+    /* Exact extracted QN of the implementing type.  Unlike struct_name this
+     * does not need a later leaf-name guess, and the relation exists even for
+     * an empty `impl Trait for Type {}` block. */
+    const char *struct_qn;
 } CBMImplTrait;
 
-// LSP-resolved call: high-confidence type-aware call resolution
+typedef enum {
+    CBM_RESOLVED_INVOCATION = 0,
+    CBM_RESOLVED_CALL_REFERENCE,
+} CBMResolvedKind;
+
+// LSP-resolved invocation/reference: high-confidence type-aware resolution.
 typedef struct {
-    const char *caller_qn; // enclosing function QN
-    const char *callee_qn; // resolved target QN (fully qualified)
-    const char *strategy;  // "lsp_type_dispatch", "lsp_direct", etc.
-    float confidence;      // 0.90-0.95
-    const char *reason;    // diagnostic label for unresolved calls (NULL if resolved)
+    const char *caller_qn;         // enclosing function QN
+    const char *callee_qn;         // resolved target QN (fully qualified)
+    const char *strategy;          // "lsp_type_dispatch", "lsp_direct", etc.
+    float confidence;              // 0.90-0.95
+    const char *reason;            // diagnostic label for unresolved calls (NULL if resolved)
+    CBMResolvedKind kind;          // invocation (CALLS) or explicit callable reference
+    uint32_t site_start_byte;      // exact source occurrence; end > start when present
+    uint32_t site_end_byte;        // exclusive byte offset in the source file
+    CBMSourceOrigin source_origin; // raw source or C-family preprocessed buffer
 } CBMResolvedCall;
 
 typedef struct {
@@ -424,8 +469,8 @@ typedef struct {
 } CBMChannelArray;
 
 // Full extraction result for one file.
-typedef struct {
-    CBMArena arena; // owns all string memory
+typedef struct CBMFileResult {
+    CBMArena arena; // owns local memory; composites may also retain child arenas below
 
     CBMDefArray defs;
     CBMCallArray calls;
@@ -437,7 +482,7 @@ typedef struct {
     CBMEnvAccessArray env_accesses;
     CBMTypeAssignArray type_assigns;
     CBMImplTraitArray impl_traits;       // Rust: impl Trait for Struct pairs
-    CBMResolvedCallArray resolved_calls; // LSP-resolved calls (high confidence)
+    CBMResolvedCallArray resolved_calls; // LSP-resolved invocations/references (high confidence)
     CBMStringRefArray string_refs;       // URL/config string literals from AST
     CBMInfraBindingArray infra_bindings; // topic→URL pairs from IaC configs
     CBMChannelArray channels;            // Socket.IO / EventEmitter pub/sub participation
@@ -474,6 +519,13 @@ typedef struct {
     // file (defs/calls already extracted are unaffected).
     const char *source;
     int source_len;
+
+    // Composite extraction results (currently ObjectScript Studio Export)
+    // retain their per-unit results so shallow-copied carrier strings remain
+    // valid for the composite's full lifetime. Owned and recursively released
+    // by cbm_free_result(); ordinary single-file results leave these zeroed.
+    struct CBMFileResult **owned_results;
+    int owned_result_count;
 } CBMFileResult;
 
 // --- Enclosing function cache ---
@@ -627,6 +679,21 @@ uint64_t cbm_get_lsp_ns(void);
 uint64_t cbm_get_preprocess_ns(void);
 uint64_t cbm_get_files_preprocessed(void);
 void cbm_reset_profile(void);
+
+#if defined(CBM_KOTLIN_DEDUP_TEST_API) && CBM_KOTLIN_DEDUP_TEST_API
+// Test-build-only operation counter for Kotlin operator-carrier deduplication.
+// Production builds do not expose or retain this instrumentation.
+void cbm_kotlin_operator_dedup_test_reset(void);
+uint64_t cbm_kotlin_operator_dedup_test_comparisons(void);
+#endif
+
+#if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
+// Test-build-only work counter for resolving a node's field role while
+// classifying value references. Production builds retain no instrumentation.
+void cbm_usage_field_lookup_test_reset(void);
+uint64_t cbm_usage_field_lookup_test_work(void);
+uint64_t cbm_usage_slow_parent_fallback_test_count(void);
+#endif
 
 // Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables
 // it only for full/advanced index modes (it dominates extraction on macro-dense

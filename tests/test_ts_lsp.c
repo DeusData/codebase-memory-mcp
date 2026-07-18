@@ -24,6 +24,7 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "../src/foundation/compat.h"
+#include "../src/pipeline/lsp_resolve.h"
 #include "lsp/ts_lsp.h"
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
@@ -71,6 +72,88 @@ static int require_resolved(const CBMFileResult *r, const char *callerSub, const
         }
     }
     return idx;
+}
+
+/* Verify that two parser-backed calls with the same method leaf retain their
+ * own source occurrence all the way through semantic resolution.  A leaf-only
+ * join can otherwise attach both carriers to whichever `render` target was
+ * emitted first. */
+static bool ts_same_leaf_render_occurrences_are_exact(const CBMFileResult *r, const char *source) {
+    static const char alpha_text[] = "a.render()";
+    static const char beta_text[] = "b.render()";
+    const char *alpha_site = source ? strstr(source, alpha_text) : NULL;
+    const char *beta_site = source ? strstr(source, beta_text) : NULL;
+    if (!r || !alpha_site || !beta_site)
+        return false;
+
+    const uint32_t alpha_start = (uint32_t)(alpha_site - source);
+    const uint32_t alpha_end = alpha_start + (uint32_t)strlen(alpha_text);
+    const uint32_t beta_start = (uint32_t)(beta_site - source);
+    const uint32_t beta_end = beta_start + (uint32_t)strlen(beta_text);
+    const CBMCall *alpha_call = NULL;
+    const CBMCall *beta_call = NULL;
+    int carrier_count = 0;
+    int zero_span_carriers = 0;
+
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "occurrenceProbe") ||
+            !call->callee_name || !strstr(call->callee_name, "render")) {
+            continue;
+        }
+        carrier_count++;
+        if (call->site_end_byte <= call->site_start_byte)
+            zero_span_carriers++;
+        if (call->site_start_byte == alpha_start && call->site_end_byte == alpha_end)
+            alpha_call = call;
+        if (call->site_start_byte == beta_start && call->site_end_byte == beta_end)
+            beta_call = call;
+    }
+
+    const CBMResolvedCall *alpha_semantic = NULL;
+    const CBMResolvedCall *beta_semantic = NULL;
+    int semantic_count = 0;
+    int zero_span_semantics = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->kind != CBM_RESOLVED_INVOCATION || resolved->confidence <= 0 ||
+            !resolved->caller_qn || !strstr(resolved->caller_qn, "occurrenceProbe") ||
+            !resolved->callee_qn || !strstr(resolved->callee_qn, ".render")) {
+            continue;
+        }
+        semantic_count++;
+        if (resolved->site_end_byte <= resolved->site_start_byte)
+            zero_span_semantics++;
+        if (strstr(resolved->callee_qn, ".Alpha.render"))
+            alpha_semantic = resolved;
+        if (strstr(resolved->callee_qn, ".Beta.render"))
+            beta_semantic = resolved;
+    }
+
+    const CBMResolvedCall *alpha_join =
+        alpha_call ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, alpha_call, false) : NULL;
+    const CBMResolvedCall *beta_join =
+        beta_call ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, beta_call, false) : NULL;
+
+    const bool alpha_exact = alpha_call && alpha_semantic && alpha_join == alpha_semantic &&
+                             alpha_semantic->site_start_byte == alpha_call->site_start_byte &&
+                             alpha_semantic->site_end_byte == alpha_call->site_end_byte;
+    const bool beta_exact = beta_call && beta_semantic && beta_join == beta_semantic &&
+                            beta_semantic->site_start_byte == beta_call->site_start_byte &&
+                            beta_semantic->site_end_byte == beta_call->site_end_byte;
+    const bool distinct = alpha_call && beta_call && alpha_semantic && beta_semantic &&
+                          alpha_call != beta_call && alpha_semantic != beta_semantic &&
+                          alpha_call->site_start_byte != beta_call->site_start_byte;
+
+    if (carrier_count != 2 || semantic_count != 2 || zero_span_carriers != 0 ||
+        zero_span_semantics != 0 || !alpha_exact || !beta_exact || !distinct) {
+        printf("  same-leaf occurrence identity: carriers=%d zero_carriers=%d semantics=%d "
+               "zero_semantics=%d alpha_exact=%d beta_exact=%d distinct=%d\n",
+               carrier_count, zero_span_carriers, semantic_count, zero_span_semantics, alpha_exact,
+               beta_exact, distinct);
+    }
+    return carrier_count == 2 && semantic_count == 2 && zero_span_carriers == 0 &&
+           zero_span_semantics == 0 && alpha_exact && beta_exact && distinct;
 }
 
 /* ── Category 0: smoke (Phase 1 carryover) ─────────────────────────────────── */
@@ -943,6 +1026,147 @@ TEST(tslsp_jsx_component_with_children) {
     PASS();
 }
 
+/* An import binding proves lexical ownership, but the raw module specifier is
+ * not itself proof that the imported component exists.  Keep the site
+ * unresolved until the cross-file registry materializes the exact symbol; a
+ * guessed `<specifier>.MissingCard` target can otherwise suppress that pass and
+ * disappear (or point at a fabricated callable) in the graph builder. */
+TEST(tslsp_jsx_import_requires_registered_component) {
+    CBMFileResult *r = extract_tsx("import { MissingCard } from '@app/missing-card';\n"
+                                   "function App(): JSX.Element { return <MissingCard />; }\n");
+    ASSERT_NOT_NULL(r);
+
+    int confident = 0;
+    int unresolved = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (!resolved->caller_qn || !strstr(resolved->caller_qn, "App") || !resolved->callee_qn ||
+            !strstr(resolved->callee_qn, "MissingCard")) {
+            continue;
+        }
+        if (resolved->kind == CBM_RESOLVED_INVOCATION &&
+            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR) {
+            confident++;
+        }
+        if (resolved->strategy && strcmp(resolved->strategy, "lsp_unresolved") == 0 &&
+            resolved->reason && strcmp(resolved->reason, "jsx_component_not_in_registry") == 0) {
+            unresolved++;
+        }
+    }
+
+    cbm_free_result(r);
+    ASSERT_EQ(confident, 0);
+    ASSERT_EQ(unresolved, 1);
+    PASS();
+}
+
+/* JSX components are parser-backed call occurrences.  Repeated components in
+ * one caller must retain the opening tag that produced each semantic record;
+ * a legacy 0:0 record can join both carriers to the first matching target. */
+TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites) {
+    const char *source =
+        "function Card(): JSX.Element { return <span/>; }\n"
+        "function App(): JSX.Element { return <div><Card/><Card>child</Card></div>; }\n";
+    CBMFileResult *r = extract_tsx(source);
+    ASSERT_NOT_NULL(r);
+
+    const char *self_site = strstr(source, "<Card/>");
+    const char *open_site = strstr(source, "<Card>child");
+    const uint32_t self_start = self_site ? (uint32_t)(self_site - source) : 0;
+    const uint32_t self_end = self_start + (uint32_t)strlen("<Card/>");
+    const uint32_t open_start = open_site ? (uint32_t)(open_site - source) : 0;
+    const uint32_t open_end = open_start + (uint32_t)strlen("<Card>");
+    const CBMCall *self_call = NULL;
+    const CBMCall *open_call = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (!call->enclosing_func_qn || !strstr(call->enclosing_func_qn, "App") ||
+            !call->callee_name || strcmp(call->callee_name, "Card") != 0) {
+            continue;
+        }
+        carrier_count++;
+        if (call->site_start_byte == self_start && call->site_end_byte == self_end)
+            self_call = call;
+        if (call->site_start_byte == open_start && call->site_end_byte == open_end)
+            open_call = call;
+    }
+
+    int semantic_count = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "App") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, ".Card") && resolved->strategy &&
+            strcmp(resolved->strategy, "lsp_ts_jsx") == 0) {
+            semantic_count++;
+        }
+    }
+    const CBMResolvedCall *self_join =
+        self_call ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, self_call, false) : NULL;
+    const CBMResolvedCall *open_join =
+        open_call ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, open_call, false) : NULL;
+    const bool self_exact = self_join && self_join->site_start_byte == self_start &&
+                            self_join->site_end_byte == self_end;
+    const bool open_exact = open_join && open_join->site_start_byte == open_start &&
+                            open_join->site_end_byte == open_end;
+
+    if (carrier_count != 2 || semantic_count != 2 || !self_exact || !open_exact) {
+        printf("  JSX occurrence diagnostic: carriers=%d semantics=%d self_exact=%d "
+               "open_exact=%d\n",
+               carrier_count, semantic_count, self_exact, open_exact);
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(carrier_count, 2);
+    ASSERT_EQ(semantic_count, 2);
+    ASSERT_TRUE(self_exact);
+    ASSERT_TRUE(open_exact);
+    PASS();
+}
+
+/* A callable value named like a module component owns the JSX tag.  The LSP
+ * pass must not confidently redirect it to the module function, and the
+ * carrier must require semantic resolution so graph construction cannot do
+ * the same redirect via textual fallback. */
+TEST(tslsp_jsx_local_tag_shadow_blocks_module_component) {
+    const char *source =
+        "function Card(): JSX.Element { return <div/>; }\n"
+        "function Shadowed(Card: () => JSX.Element): JSX.Element { return <Card/>; }\n";
+    CBMFileResult *r = extract_tsx(source);
+    ASSERT_NOT_NULL(r);
+
+    const char *site = strstr(source, "<Card/>");
+    const uint32_t start = site ? (uint32_t)(site - source) : 0;
+    const uint32_t end = start + (uint32_t)strlen("<Card/>");
+    int wrong_semantics = 0;
+    bool gated_carrier = false;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->kind == CBM_RESOLVED_INVOCATION && resolved->confidence >= 0.6f &&
+            resolved->caller_qn && strstr(resolved->caller_qn, "Shadowed") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, ".Card")) {
+            wrong_semantics++;
+        }
+    }
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "Shadowed") &&
+            call->callee_name && strcmp(call->callee_name, "Card") == 0 &&
+            call->site_start_byte == start && call->site_end_byte == end &&
+            call->requires_lsp_resolution) {
+            gated_carrier = true;
+        }
+    }
+    if (wrong_semantics != 0 || !gated_carrier) {
+        printf("  JSX shadow diagnostic: wrong_semantics=%d gated_carrier=%d\n", wrong_semantics,
+               gated_carrier);
+    }
+    cbm_free_result(r);
+    ASSERT_EQ(wrong_semantics, 0);
+    ASSERT_TRUE(gated_carrier);
+    PASS();
+}
+
 TEST(tslsp_jsx_intrinsic_skipped) {
     CBMFileResult *r = extract_tsx("function go(): JSX.Element { return <div>plain</div>; }\n");
     ASSERT_NOT_NULL(r);
@@ -1270,6 +1494,34 @@ TEST(tslsp_nocrash_namespace) {
     CBMFileResult *r = extract_ts("namespace MyNS { export function inner(): void {} }\n"
                                   "function go() { MyNS.inner(); }\n");
     ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".go", ".MyNS.inner"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_imported_namespace_shadows_local_namespace) {
+    CBMFileResult *r = extract_ts("import * as MyNS from './external';\n"
+                                  "namespace MyNS { export function inner(): void {} }\n"
+                                  "function go() { MyNS.inner(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, ".go", ".MyNS.inner"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_nested_namespace_preserves_exact_callers) {
+    CBMFileResult *r = extract_ts("namespace App {\n"
+                                  "  export namespace Utils {\n"
+                                  "    export function clamp(): number { return 1; }\n"
+                                  "    export function normalise(): number { return clamp(); }\n"
+                                  "  }\n"
+                                  "  export class Config {\n"
+                                  "    constructor() { Utils.normalise(); }\n"
+                                  "  }\n"
+                                  "}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, ".App.Utils.normalise", ".App.Utils.clamp"), 0);
+    ASSERT_GTE(require_resolved(r, ".App.Config.constructor", ".App.Utils.normalise"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -3501,6 +3753,24 @@ TEST(tslsp_hash_registry_post_finalize_adds) {
     t.qualified_name = "test.A";
     t.short_name = "A";
     cbm_registry_add_type(&reg, t);
+
+    const CBMType *zero_param_signature = cbm_type_func(&arena, NULL, NULL, NULL);
+    CBMRegisteredFunc seed_method;
+    memset(&seed_method, 0, sizeof(seed_method));
+    seed_method.qualified_name = "test.A.seed";
+    seed_method.short_name = "seed";
+    seed_method.receiver_type = "test.A";
+    seed_method.signature = zero_param_signature;
+    seed_method.min_params = 0;
+    cbm_registry_add_func(&reg, seed_method);
+
+    CBMRegisteredFunc seed_free;
+    memset(&seed_free, 0, sizeof(seed_free));
+    seed_free.qualified_name = "test.seed";
+    seed_free.short_name = "seed";
+    seed_free.signature = zero_param_signature;
+    seed_free.min_params = 0;
+    cbm_registry_add_func(&reg, seed_free);
     cbm_registry_finalize(&reg);
 
     /* Post-finalize additions — the stub-registration pattern. */
@@ -3515,17 +3785,41 @@ TEST(tslsp_hash_registry_post_finalize_adds) {
     f2.qualified_name = "test.LateStub.run";
     f2.short_name = "run";
     f2.receiver_type = "test.LateStub";
-    f2.min_params = -1;
+    f2.signature = zero_param_signature;
+    f2.min_params = 0;
     cbm_registry_add_func(&reg, f2);
+
+    CBMRegisteredFunc late_free;
+    memset(&late_free, 0, sizeof(late_free));
+    late_free.qualified_name = "test.lateFree";
+    late_free.short_name = "lateFree";
+    late_free.signature = zero_param_signature;
+    late_free.min_params = 0;
+    cbm_registry_add_func(&reg, late_free);
 
     ASSERT_NOT_NULL(cbm_registry_lookup_type(&reg, "test.A"));
     ASSERT_NOT_NULL(cbm_registry_lookup_type(&reg, "test.LateStub"));
     ASSERT_NOT_NULL(cbm_registry_lookup_func(&reg, "test.LateStub.run"));
+    const CBMType *no_arg_types[1] = {NULL};
+    bool method_args = cbm_registry_lookup_method_by_args(&reg, "test.LateStub", "run", 0) != NULL;
+    bool method_types =
+        cbm_registry_lookup_method_by_types(&reg, "test.LateStub", "run", no_arg_types, 0) != NULL;
+    bool symbol_args = cbm_registry_lookup_symbol_by_args(&reg, "test", "lateFree", 0) != NULL;
+    bool symbol_types =
+        cbm_registry_lookup_symbol_by_types(&reg, "test", "lateFree", no_arg_types, 0) != NULL;
+    if (!method_args || !method_types || !symbol_args || !symbol_types) {
+        printf("  post-finalize overload tail: method_args=%d method_types=%d "
+               "symbol_args=%d symbol_types=%d\n",
+               method_args, method_types, symbol_args, symbol_types);
+    }
+    ASSERT(method_args && method_types && symbol_args && symbol_types);
 
     /* Re-finalize folds the tail into the buckets; still findable. */
     cbm_registry_finalize(&reg);
     ASSERT_NOT_NULL(cbm_registry_lookup_type(&reg, "test.LateStub"));
     ASSERT_NOT_NULL(cbm_registry_lookup_func(&reg, "test.LateStub.run"));
+    ASSERT_NOT_NULL(cbm_registry_lookup_method_by_args(&reg, "test.LateStub", "run", 0));
+    ASSERT_NOT_NULL(cbm_registry_lookup_symbol_by_args(&reg, "test", "lateFree", 0));
 
     cbm_arena_destroy(&arena);
     PASS();
@@ -3834,6 +4128,59 @@ TEST(tslsp_nested_class_resolution) {
     PASS();
 }
 
+/* JavaScript relies on local `new` inference here, while TypeScript and TSX use
+ * explicit parameter types below.  All three parser modes must preserve the
+ * full ordinary call-expression span, independent of JSX-specific behavior. */
+TEST(tslsp_js_ordinary_same_leaf_calls_join_by_exact_site) {
+    static const char source[] = "class Alpha { render() {} }\n"
+                                 "class Beta { render() {} }\n"
+                                 "function occurrenceProbe() {\n"
+                                 "    const a = new Alpha();\n"
+                                 "    const b = new Beta();\n"
+                                 "    a.render();\n"
+                                 "    b.render();\n"
+                                 "}\n";
+    CBMFileResult *r = extract_js(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error || r->parse_incomplete);
+    const bool exact = ts_same_leaf_render_occurrences_are_exact(r, source);
+    cbm_free_result(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(tslsp_ts_ordinary_same_leaf_calls_join_by_exact_site) {
+    static const char source[] = "class Alpha { render(): void {} }\n"
+                                 "class Beta { render(): void {} }\n"
+                                 "function occurrenceProbe(a: Alpha, b: Beta): void {\n"
+                                 "    a.render();\n"
+                                 "    b.render();\n"
+                                 "}\n";
+    CBMFileResult *r = extract_ts(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error || r->parse_incomplete);
+    const bool exact = ts_same_leaf_render_occurrences_are_exact(r, source);
+    cbm_free_result(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(tslsp_tsx_ordinary_same_leaf_calls_join_by_exact_site) {
+    static const char source[] = "class Alpha { render(): void {} }\n"
+                                 "class Beta { render(): void {} }\n"
+                                 "function occurrenceProbe(a: Alpha, b: Beta): void {\n"
+                                 "    a.render();\n"
+                                 "    b.render();\n"
+                                 "}\n";
+    CBMFileResult *r = extract_tsx(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error || r->parse_incomplete);
+    const bool exact = ts_same_leaf_render_occurrences_are_exact(r, source);
+    cbm_free_result(r);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────────────────── */
 
 SUITE(ts_lsp) {
@@ -3973,6 +4320,9 @@ SUITE(ts_lsp) {
     /* Category 22: JSX */
     RUN_TEST(tslsp_jsx_component_self_closing);
     RUN_TEST(tslsp_jsx_component_with_children);
+    RUN_TEST(tslsp_jsx_import_requires_registered_component);
+    RUN_TEST(tslsp_jsx_component_resolutions_join_exact_tag_sites);
+    RUN_TEST(tslsp_jsx_local_tag_shadow_blocks_module_component);
     RUN_TEST(tslsp_jsx_intrinsic_skipped);
     RUN_TEST(tslsp_jsx_nested_component);
 
@@ -4018,6 +4368,8 @@ SUITE(ts_lsp) {
     /* More crash-safety */
     RUN_TEST(tslsp_nocrash_enum_basic);
     RUN_TEST(tslsp_nocrash_namespace);
+    RUN_TEST(tslsp_imported_namespace_shadows_local_namespace);
+    RUN_TEST(tslsp_nested_namespace_preserves_exact_callers);
     RUN_TEST(tslsp_nocrash_async_generator);
     RUN_TEST(tslsp_nocrash_template_literal_expr);
     RUN_TEST(tslsp_nocrash_complex_generic_constraint);
@@ -4288,4 +4640,9 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_optional_property_chain);
     RUN_TEST(tslsp_void_returning_method);
     RUN_TEST(tslsp_nested_class_resolution);
+
+    /* Ordinary same-leaf occurrence identity (JS / TS / TSX). */
+    RUN_TEST(tslsp_js_ordinary_same_leaf_calls_join_by_exact_site);
+    RUN_TEST(tslsp_ts_ordinary_same_leaf_calls_join_by_exact_site);
+    RUN_TEST(tslsp_tsx_ordinary_same_leaf_calls_join_by_exact_site);
 }

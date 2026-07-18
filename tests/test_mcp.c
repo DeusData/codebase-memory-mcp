@@ -308,6 +308,13 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Check index coverage\""));
     ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
     ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
+    /* search_graph's compact degree columns intentionally count the graph
+     * relationships used for call/reference/type centrality, not every edge
+     * family (for example DEFINES or CONTAINS_FILE). Keep the public contract
+     * aligned with the store query. */
+    ASSERT_NOT_NULL(strstr(json, "in/out = selected degree across CALLS, USAGE, CALL_REFERENCE, "
+                                 "INHERITS, and IMPLEMENTS"));
+    ASSERT_NULL(strstr(json, "TOTAL degree across ALL edge types"));
     free(json);
     PASS();
 }

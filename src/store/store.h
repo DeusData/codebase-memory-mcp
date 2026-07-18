@@ -207,6 +207,12 @@ cbm_store_t *cbm_store_open_path(const char *db_path);
  * exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+/* Validate and seal an existing DB for atomic replacement without creating or
+ * migrating its schema. Returns OK when sealed, NOT_FOUND when the bytes are
+ * definitely corrupt/incompatible and should be quarantined, or ERR when the
+ * file is busy/unavailable and must be left in place. */
+int cbm_store_seal_existing_path_for_replace(const char *db_path);
+
 /* On-disk path of a file-backed store, or NULL for an in-memory (:memory:)
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);
@@ -270,6 +276,14 @@ int64_t cbm_store_journal_size_limit(cbm_store_t *s);
  * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
  * bumps on every index run. "legacy" for DBs predating store_meta. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
+
+/* Seal a fully-written staging database before atomic publication.
+ * Raises synchronous to FULL, requires an exclusive TRUNCATE checkpoint to
+ * complete, then leaves the database in verified DELETE journal mode so the
+ * main file is self-contained (no required -wal/-shm sidecars). This is a
+ * fail-closed operation: SQLITE_BUSY and an unconfirmed mode transition are
+ * errors. The caller must own the staging database exclusively. */
+int cbm_store_seal_for_atomic_publish(cbm_store_t *s);
 
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)

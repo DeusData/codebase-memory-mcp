@@ -275,14 +275,36 @@ static int cp_callables(cbm_store_t *store, const char *project) {
 }
 
 /* Diagnostic edge histogram (stderr only, so test output stays clean). */
-static const char *CP_ALL_EDGE_TYPES[] = {
-    "CALLS", "CONFIGURES", "CONTAINS_FILE", "CONTAINS_FOLDER",
-    "DATA_FLOWS", "DECORATES", "DEFINES", "DEFINES_METHOD",
-    "DEPENDS_ON", "FILE_CHANGES_WITH", "GRAPHQL_CALLS", "GRPC_CALLS",
-    "HANDLES", "HTTP_CALLS", "IMPLEMENTS", "IMPORTS",
-    "INHERITS", "INFRA_MAPS", "OVERRIDE", "READS",
-    "SEMANTICALLY_RELATED", "SIMILAR_TO", "TESTS_FILE", "TESTS",
-    "TRPC_CALLS", "USAGE", "ASYNC_CALLS", "WRITES", NULL};
+static const char *CP_ALL_EDGE_TYPES[] = {"CALLS",
+                                          "CALL_REFERENCE",
+                                          "CONFIGURES",
+                                          "CONTAINS_FILE",
+                                          "CONTAINS_FOLDER",
+                                          "DATA_FLOWS",
+                                          "DECORATES",
+                                          "DEFINES",
+                                          "DEFINES_METHOD",
+                                          "DEPENDS_ON",
+                                          "FILE_CHANGES_WITH",
+                                          "GRAPHQL_CALLS",
+                                          "GRPC_CALLS",
+                                          "HANDLES",
+                                          "HTTP_CALLS",
+                                          "IMPLEMENTS",
+                                          "IMPORTS",
+                                          "INHERITS",
+                                          "INFRA_MAPS",
+                                          "OVERRIDE",
+                                          "READS",
+                                          "SEMANTICALLY_RELATED",
+                                          "SIMILAR_TO",
+                                          "TESTS_FILE",
+                                          "TESTS",
+                                          "TRPC_CALLS",
+                                          "USAGE",
+                                          "ASYNC_CALLS",
+                                          "WRITES",
+                                          NULL};
 
 static void cp_diag(cbm_store_t *store, const char *project, const char *label) {
     if (!store) { fprintf(stderr, "  [CP] %s: no graph DB\n", label); return; }

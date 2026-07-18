@@ -57,9 +57,8 @@
  *     lsp_static_call          (1904)       ClassName.staticMethod()
  *     lsp_interface_resolve    (1985)       iface-typed call, SOLE concrete impl
  *     lsp_interface_dispatch   (1990)       iface-typed call, no sole impl
- *     lsp_method_ref_ctor      (2591)       ClassName::new, ctor indexed
- *     lsp_method_ref_ctor_synth(2594)       ClassName::new, ctor NOT in registry
- *     lsp_method_ref           (2614)       Type::instanceMethod reference
+ *     lsp_method_ref_ctor      (2758)       ClassName::new, ctor indexed
+ *     lsp_method_ref           (2783)       Type::instanceMethod reference
  *     lsp_constructor          (2787)       new Foo(), ctor indexed
  *     lsp_constructor_synth    (2792)       new Foo(), ctor NOT in registry
  *     lsp_unresolved           (1801)       fallback marker for an unresolved call
@@ -150,6 +149,63 @@ static int assert_lsp_strategy(const char *filename, const char *src,
     }
 
     rh_cleanup(&lp, store);
+    return rc;
+}
+
+static int count_edges_from_callable(cbm_store_t *store, const char *project, const char *edge_type,
+                                     const char *callable_name) {
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_type(store, project, edge_type, &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        return 0;
+    }
+
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        cbm_node_t source = {0};
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &source) == CBM_STORE_OK &&
+            source.name && strcmp(source.name, callable_name) == 0 && source.label &&
+            (strcmp(source.label, "Function") == 0 || strcmp(source.label, "Method") == 0)) {
+            matches++;
+        }
+        cbm_node_free_fields(&source);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    return matches;
+}
+
+static int assert_method_reference_semantics(const char *filename, const char *src,
+                                             int target_is_materialized) {
+    RProj project;
+    cbm_store_t *store = rh_index(&project, filename, src);
+    if (!store) {
+        printf("  %sFAIL%s %s:%d: method-reference fixture failed to index\n", tf_red(), tf_reset(),
+               __FILE__, __LINE__);
+        rh_cleanup(&project, store);
+        return 1;
+    }
+
+    int references = count_edges_from_callable(store, project.project, "CALL_REFERENCE", "run");
+    int calls = count_edges_from_callable(store, project.project, "CALLS", "run");
+    int usages = count_edges_from_callable(store, project.project, "USAGE", "run");
+    int rc = 0;
+    if (references != (target_is_materialized ? 1 : 0)) {
+        printf("  %sFAIL%s %s:%d: method reference count expected=%d actual=%d\n", tf_red(),
+               tf_reset(), __FILE__, __LINE__, target_is_materialized ? 1 : 0, references);
+        rc = 1;
+    }
+    if (calls != 0) {
+        printf("  %sFAIL%s %s:%d: method reference fabricated %d CALLS edges\n", tf_red(),
+               tf_reset(), __FILE__, __LINE__, calls);
+        rc = 1;
+    }
+    if (!target_is_materialized && usages < 1) {
+        printf("  %sFAIL%s %s:%d: unmaterialized constructor reference lost its USAGE\n", tf_red(),
+               tf_reset(), __FILE__, __LINE__);
+        rc = 1;
+    }
+    rh_cleanup(&project, store);
     return rc;
 }
 
@@ -336,9 +392,8 @@ static const char kJavaMethodRefCtor[] =
     "    Maker run() { return Foo::new; }\n"
     "}\n";
 
-/* lsp_method_ref_ctor_synth — a constructor reference ClassName::new whose ctor
- * is NOT in the registry, so the resolver synthesizes the ctor QN
- * (java_lsp.c:2592-2594). Foo declares no explicit constructor. */
+/* A constructor reference ClassName::new whose ctor is NOT materialized. The
+ * reference must remain ordinary USAGE; a class node is not a callable target. */
 static const char kJavaMethodRefCtorSynth[] =
     "interface Maker {\n"
     "    Foo make();\n"
@@ -607,17 +662,15 @@ TEST(repro_lsp_java_interface_dispatch) {
 }
 
 TEST(repro_lsp_java_method_ref_ctor) {
-    return assert_lsp_strategy("Client.java", kJavaMethodRefCtor,
-                               "lsp_method_ref_ctor");
+    return assert_method_reference_semantics("Client.java", kJavaMethodRefCtor, 1);
 }
 
 TEST(repro_lsp_java_method_ref_ctor_synth) {
-    return assert_lsp_strategy("Client.java", kJavaMethodRefCtorSynth,
-                               "lsp_method_ref_ctor_synth");
+    return assert_method_reference_semantics("Client.java", kJavaMethodRefCtorSynth, 0);
 }
 
 TEST(repro_lsp_java_method_ref) {
-    return assert_lsp_strategy("Client.java", kJavaMethodRef, "lsp_method_ref");
+    return assert_method_reference_semantics("Client.java", kJavaMethodRef, 1);
 }
 
 TEST(repro_lsp_java_constructor) {

@@ -184,9 +184,9 @@ static int lrp_usage(LRP_Proj *lp, const LRP_File *files, int nfiles) {
 
 /* Diagnostic: dump edge histogram to stderr on failure. */
 static const char *LRP_ALL_EDGE_TYPES[] = {
-    "CALLS", "DEFINES", "DEFINES_METHOD", "IMPORTS", "INHERITS", "IMPLEMENTS",
-    "USAGE", "DECORATES", "HANDLES", "HTTP_CALLS", "ASYNC_CALLS",
-    "OVERRIDE", "TESTS", "TESTS_FILE", "DATA_FLOWS", NULL};
+    "CALLS",      "CALL_REFERENCE", "DEFINES",    "DEFINES_METHOD", "IMPORTS",    "INHERITS",
+    "IMPLEMENTS", "USAGE",          "DECORATES",  "HANDLES",        "HTTP_CALLS", "ASYNC_CALLS",
+    "OVERRIDE",   "TESTS",          "TESTS_FILE", "DATA_FLOWS",     NULL};
 
 static void lrp_diag(cbm_store_t *store, const char *project, const char *scenario) {
     if (!store) { fprintf(stderr, "    [LRP] %s: no graph DB\n", scenario); return; }
@@ -222,6 +222,93 @@ static int lrp_assert_calls(const LRP_File *files, int nfiles, int min_calls,
     }
     lrp_cleanup(&lp, store);
     return got >= min_calls;
+}
+
+/* Count one exact CALLS relationship by unique source/target node names.
+ * Returning -1 distinguishes a malformed fixture or DB failure from a genuine
+ * missing edge. This prevents broad CALLS totals (including macro/stdlib edges)
+ * from masking a missing source-specific relationship. */
+static int lrp_exact_edge_by_name(cbm_store_t *store, const char *project, const char *edge_type,
+                                  const char *source_name, const char *target_name) {
+    if (!store || !project || !edge_type || !source_name || !target_name) {
+        return -1;
+    }
+
+    cbm_node_t *sources = NULL;
+    cbm_node_t *targets = NULL;
+    int source_count = 0;
+    int target_count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, source_name, &sources, &source_count) !=
+            CBM_STORE_OK ||
+        cbm_store_find_nodes_by_name(store, project, target_name, &targets, &target_count) !=
+            CBM_STORE_OK ||
+        source_count != 1 || target_count != 1) {
+        cbm_store_free_nodes(sources, source_count);
+        cbm_store_free_nodes(targets, target_count);
+        return -1;
+    }
+
+    int64_t source_id = sources[0].id;
+    int64_t target_id = targets[0].id;
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_free_nodes(targets, target_count);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    if (cbm_store_find_edges_by_source_type(store, source_id, edge_type, &edges, &edge_count) !=
+        CBM_STORE_OK) {
+        cbm_store_free_edges(edges, edge_count);
+        return -1;
+    }
+
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == target_id) {
+            matches++;
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    return matches;
+}
+
+static int lrp_exact_calls_by_name(cbm_store_t *store, const char *project, const char *source_name,
+                                   const char *target_name) {
+    return lrp_exact_edge_by_name(store, project, "CALLS", source_name, target_name);
+}
+
+static int lrp_exact_edge_by_qn_suffix(cbm_store_t *store, const char *project,
+                                       const char *edge_type, const char *source_suffix,
+                                       const char *target_suffix) {
+    cbm_node_t *sources = NULL;
+    cbm_node_t *targets = NULL;
+    int source_count = 0;
+    int target_count = 0;
+    if (!store ||
+        cbm_store_find_nodes_by_qn_suffix(store, project, source_suffix, &sources, &source_count) !=
+            CBM_STORE_OK ||
+        cbm_store_find_nodes_by_qn_suffix(store, project, target_suffix, &targets, &target_count) !=
+            CBM_STORE_OK ||
+        source_count != 1 || target_count != 1) {
+        cbm_store_free_nodes(sources, source_count);
+        cbm_store_free_nodes(targets, target_count);
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    int matches = -1;
+    if (cbm_store_find_edges_by_source_type(store, sources[0].id, edge_type, &edges, &edge_count) ==
+        CBM_STORE_OK) {
+        matches = 0;
+        for (int i = 0; i < edge_count; i++) {
+            if (edges[i].target_id == targets[0].id) {
+                matches++;
+            }
+        }
+    }
+    cbm_store_free_edges(edges, edge_count);
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_free_nodes(targets, target_count);
+    return matches;
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -787,6 +874,35 @@ TEST(lrp_rust_s8_field_call) {
     PASS();
 }
 
+/* Cross-file call hidden inside format!'s token tree. The visible() control
+ * proves the target and ordinary cross-file resolution are present; hidden()
+ * requires the Rust LSP's semantic result to be paired with a synthetic
+ * CBMCall carrier before pass_calls can materialize the exact graph edge. */
+TEST(lrp_rust_crossfile_macro_hidden_call_carrier) {
+    static const LRP_File f[] = {
+        {"lib.rs", "pub fn render() -> &'static str { \"ok\" }\n"},
+        {"main.rs", "mod lib;\n\n"
+                    "pub fn visible() -> &'static str { lib::render() }\n\n"
+                    "pub fn hidden() -> String { format!(\"{}\", lib::render()) }\n"}};
+
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    int visible_to_render = lrp_exact_calls_by_name(store, lp.project, "visible", "render");
+    int hidden_to_render = lrp_exact_calls_by_name(store, lp.project, "hidden", "render");
+    if (visible_to_render != 1 || hidden_to_render != 1) {
+        fprintf(stderr,
+                "  [LRP] rust/macro_hidden_carrier visible->render=%d "
+                "hidden->render=%d (expected 1 each)\n",
+                visible_to_render, hidden_to_render);
+        lrp_diag(store, lp.project, "rust/macro_hidden_carrier");
+    }
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(visible_to_render, 1); /* ordinary-call control */
+    ASSERT_EQ(hidden_to_render, 1);  /* synthetic carrier regression guard */
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * ─── GROUP 5: PYTHON (lsp_cross WIRED) ──────────────────────────────
  * ══════════════════════════════════════════════════════════════════════
@@ -910,6 +1026,34 @@ TEST(lrp_python_s8_field_type_hint) {
     /* GREEN: self.logger is annotated as Logger; py_lsp_cross resolves
      * self.logger.log() to Logger.log. */
     ASSERT_TRUE(lrp_assert_calls(f, 2, 1, "python/S8/field_type_hint", 1));
+    PASS();
+}
+
+/* A cross-file dunder can resolve semantically only after the project-wide
+ * Python registry is available. Because `left + right` is not a parser call,
+ * the cross resolver must return an exact synthetic carrier as well as the
+ * semantic record or pass_calls has nothing to materialize. */
+TEST(lrp_python_crossfile_dunder_carrier) {
+    static const LRP_File f[] = {{"alpha.py", "class Alpha:\n"
+                                              "    def __add__(self, other):\n"
+                                              "        return self\n"},
+                                 {"main.py", "from .alpha import Alpha\n\n"
+                                             "def combine(left: Alpha, right: Alpha):\n"
+                                             "    return left + right\n"}};
+
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    int combine_to_add = lrp_exact_calls_by_name(store, lp.project, "combine", "__add__");
+    if (combine_to_add != 1) {
+        fprintf(stderr,
+                "  [LRP] python/crossfile_dunder_carrier combine->__add__=%d "
+                "(expected 1)\n",
+                combine_to_add);
+        lrp_diag(store, lp.project, "python/crossfile_dunder_carrier");
+    }
+    lrp_cleanup(&lp, store);
+
+    ASSERT_EQ(combine_to_add, 1);
     PASS();
 }
 
@@ -1605,9 +1749,8 @@ TEST(lrp_php_s8_field_type_hint) {
 /* ══════════════════════════════════════════════════════════════════════
  * ─── BONUS: USAGE-EDGE PROBES (type references, not calls) ───────────
  * ══════════════════════════════════════════════════════════════════════
- * USAGE edges are created for type references (not calls).  These probe
- * whether the LSP pass emits USAGE in addition to CALLS for instantiation
- * and typed-parameter scenarios.
+ * USAGE edges are created for non-call type references. Constructor syntax is
+ * a CALLS relationship; typed-parameter scenarios remain USAGE.
  */
 
 /* Go: struct literal usage of a cross-file type. */
@@ -1626,14 +1769,7 @@ TEST(lrp_go_usage_struct_literal) {
     PASS();
 }
 
-/* TypeScript: type reference as parameter annotation.
- * REAL BUG: a cross-file TS TYPE-position reference (the `Config` type_identifier
- * in `cfg: Config`) yields NO USAGE edge → n=0, even though `Config` is a
- * registered Interface node and is_reference_node() accepts "type_identifier".
- * Value-position type refs DO work (lrp_go_usage_struct_literal and
- * lrp_python_usage_instantiation both pass), so the gap is TS type-annotation
- * usage emission/resolution (handle_usages / resolve_usage_edges path) — the
- * type-only parameter annotation is dropped rather than emitted as USAGE. */
+/* TypeScript: exact imported type reference as parameter annotation. */
 TEST(lrp_ts_usage_type_param) {
     static const LRP_File f[] = {
         {"types.ts", "export interface Config { timeout: number; }\n"},
@@ -1641,27 +1777,54 @@ TEST(lrp_ts_usage_type_param) {
          "import { Config } from './types';\n\n"
          "export function run(cfg: Config): number { return cfg.timeout; }\n"}};
     LRP_Proj lp;
-    int n = lrp_usage(&lp, f, 2);
-    if (n < 1) {
-        fprintf(stderr, "  [LRP] ts/USAGE/type_param n=%d expected>=1\n", n);
-    }
-    ASSERT_TRUE(n >= 1);
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    int exact = store ? lrp_exact_edge_by_name(store, lp.project, "USAGE", "run", "Config") : -1;
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(exact, 1);
     PASS();
 }
 
-/* Python: class instantiation USAGE. */
+static int lrp_ts_imported_type_with_decoy(const char *main_filename) {
+    LRP_File files[] = {
+        {"a/types.ts", "export interface Config { selected: number; }\n"},
+        {"b/types.ts", "export interface Config { decoy: string; }\n"},
+        {main_filename, "import type { Config } from './a/types';\n"
+                        "export function choose(cfg: Config): number { return cfg.selected; }\n"},
+    };
+    LRP_Proj lp;
+    cbm_store_t *store = lrp_index(&lp, files, 3);
+    int exact = store ? lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE", "main.choose",
+                                                    "a.types.Config")
+                      : -1;
+    int decoy = store ? lrp_exact_edge_by_qn_suffix(store, lp.project, "USAGE", "main.choose",
+                                                    "b.types.Config")
+                      : -1;
+    lrp_cleanup(&lp, store);
+    return exact == 1 && decoy == 0;
+}
+
+/* A duplicate type name must not let unique-name fallback hide import identity. */
+TEST(lrp_ts_usage_import_type_with_decoy) {
+    ASSERT_TRUE(lrp_ts_imported_type_with_decoy("main.ts"));
+    PASS();
+}
+
+TEST(lrp_tsx_usage_import_type_with_decoy) {
+    ASSERT_TRUE(lrp_ts_imported_type_with_decoy("main.tsx"));
+    PASS();
+}
+
+/* Python: constructor syntax is an exact call to the materialized Class node. */
 TEST(lrp_python_usage_instantiation) {
     static const LRP_File f[] = {
         {"model.py", "class User:\n    def __init__(self, name):\n        self.name = name\n"},
         {"main.py",
          "from .model import User\n\n\ndef create(name):\n    return User(name)\n"}};
     LRP_Proj lp;
-    int n = lrp_usage(&lp, f, 2);
-    /* Uncertain: USAGE edge for Python instantiation. Diagnose but assert correct. */
-    if (n < 1) {
-        fprintf(stderr, "  [LRP] python/USAGE/instantiation n=%d (uncertain)\n", n);
-    }
-    ASSERT_TRUE(n >= 1);
+    cbm_store_t *store = lrp_index(&lp, f, 2);
+    int exact = store ? lrp_exact_calls_by_name(store, lp.project, "create", "User") : -1;
+    lrp_cleanup(&lp, store);
+    ASSERT_EQ(exact, 1);
     PASS();
 }
 
@@ -1710,6 +1873,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_rust_s6_trait_method);
     RUN_TEST(lrp_rust_s7_generic);
     RUN_TEST(lrp_rust_s8_field_call);
+    RUN_TEST(lrp_rust_crossfile_macro_hidden_call_carrier);
 
     /* ── Python (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 uncertain (extraction bug) ── */
     RUN_TEST(lrp_python_s1_crossfile_call);
@@ -1720,6 +1884,7 @@ SUITE(lsp_resolution_probe) {
     RUN_TEST(lrp_python_s6_inherited_method);
     RUN_TEST(lrp_python_s7_annotated_call);
     RUN_TEST(lrp_python_s8_field_type_hint);
+    RUN_TEST(lrp_python_crossfile_dunder_carrier);
 
     /* ── TypeScript (lsp_cross WIRED) — S1–S5,S7,S8 GREEN; S6 uncertain ── */
     RUN_TEST(lrp_ts_s1_crossfile_call);
@@ -1775,5 +1940,7 @@ SUITE(lsp_resolution_probe) {
     /* ── USAGE-edge bonus probes ── */
     RUN_TEST(lrp_go_usage_struct_literal);
     RUN_TEST(lrp_ts_usage_type_param);
+    RUN_TEST(lrp_ts_usage_import_type_with_decoy);
+    RUN_TEST(lrp_tsx_usage_import_type_with_decoy);
     RUN_TEST(lrp_python_usage_instantiation);
 }

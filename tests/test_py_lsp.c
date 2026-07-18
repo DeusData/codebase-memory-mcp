@@ -10,6 +10,8 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "lsp/py_lsp.h"
+#include "pipeline/lsp_resolve.h"
+#include "pipeline/pass_lsp_cross.h"
 
 /* ── Helpers — same shape as test_go_lsp.c ──────────────────────── */
 
@@ -515,6 +517,32 @@ static int find_resolved_arr(const CBMResolvedCallArray *arr, const char *caller
     return -1;
 }
 
+typedef struct {
+    int target_count;
+    int first_site_count;
+    int second_site_count;
+} PyResolvedSiteCounts;
+
+static PyResolvedSiteCounts count_invocation_sites(const CBMResolvedCallArray *arr,
+                                                   const char *caller_sub, const char *callee_sub,
+                                                   uint32_t first_start, uint32_t first_end,
+                                                   uint32_t second_start, uint32_t second_end) {
+    PyResolvedSiteCounts counts = {0};
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            !strstr(rc->caller_qn, caller_sub) || !strstr(rc->callee_qn, callee_sub)) {
+            continue;
+        }
+        counts.target_count++;
+        if (rc->site_start_byte == first_start && rc->site_end_byte == first_end)
+            counts.first_site_count++;
+        if (rc->site_start_byte == second_start && rc->site_end_byte == second_end)
+            counts.second_site_count++;
+    }
+    return counts;
+}
+
 TEST(pylsp_crossfile_method_dispatch) {
     /* file svc.py defines class RedisStore with Get(); file main.py calls
      * the method on a typed parameter. Reuses CBMLSPDef to feed the
@@ -544,8 +572,8 @@ TEST(pylsp_crossfile_method_dispatch) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
 
-    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main",
-                         defs, 2, imp_names, imp_qns, 1, NULL, &out);
+    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, imp_names,
+                         imp_qns, 1, NULL, &out, NULL);
 
     ASSERT_GTE(find_resolved_arr(&out, "process", "Get"), 0);
     cbm_arena_destroy(&arena);
@@ -595,8 +623,8 @@ TEST(pylsp_fused_self_attr_chain_via_overlay) {
                       "    def run(self):\n"
                       "        return self.b.work()\n";
     CBMResolvedCallArray out = {0};
-    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL, 0,
-                                       NULL, &out);
+    cbm_run_py_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod", reg, NULL, NULL,
+                                       0, NULL, &out, NULL);
 
     /* Overlay preserves the attribute-chain edge. */
     ASSERT_GTE(find_resolved_arr(&out, "run", "work"), 0);
@@ -640,7 +668,7 @@ TEST(pylsp_crossfile_classmethod_on_class_issue228) {
     CBMResolvedCallArray out = {0};
 
     cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, imp_names,
-                         imp_qns, 1, NULL, &out);
+                         imp_qns, 1, NULL, &out, NULL);
 
     ASSERT_GTE(find_resolved_arr(&out, "run_plain_flow", "build_from_text"), 0);
     cbm_arena_destroy(&arena);
@@ -689,8 +717,8 @@ TEST(pylsp_crossfile_inheritance) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
 
-    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main",
-                         defs, 4, imp_names, imp_qns, 1, NULL, &out);
+    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 4, imp_names,
+                         imp_qns, 1, NULL, &out, NULL);
 
     ASSERT_GTE(find_resolved_arr(&out, "go", "shared"), 0);
     cbm_arena_destroy(&arena);
@@ -759,15 +787,452 @@ TEST(pylsp_batch_two_files) {
     PASS();
 }
 
+static int pylsp_exact_reference_count(const CBMResolvedCallArray *out, const char *caller,
+                                        const char *callee_qn, const char *reason,
+                                        uint32_t site_start, uint32_t site_end) {
+    int count = 0;
+    for (int i = 0; out && i < out->count; i++) {
+        const CBMResolvedCall *resolved = &out->items[i];
+        if (resolved->kind == CBM_RESOLVED_CALL_REFERENCE && resolved->caller_qn &&
+            strstr(resolved->caller_qn, caller) && resolved->callee_qn &&
+            strcmp(resolved->callee_qn, callee_qn) == 0 &&
+            resolved->confidence >= CBM_LSP_CONFIDENCE_FLOOR &&
+            resolved->site_start_byte == site_start && resolved->site_end_byte == site_end &&
+            (!reason || (resolved->reason && strcmp(resolved->reason, reason) == 0))) {
+            count++;
+        }
+    }
+    return count;
+}
+
+typedef struct {
+    int first_target;
+    int second_target;
+} PyImportReferenceCounts;
+
+static PyImportReferenceCounts pylsp_import_reference_counts(
+    const char *source, const char *local_name, const char *import_qn, const char *first_target_qn,
+    const char *second_target_qn) {
+    PyImportReferenceCounts counts = {0};
+    const char *call = strstr(source, "    accept(");
+    if (!call)
+        return counts;
+    uint32_t site_start = (uint32_t)(call - source) + (uint32_t)strlen("    accept(");
+    uint32_t site_end = site_start + (uint32_t)strlen(local_name);
+
+    CBMLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = first_target_qn;
+    defs[0].short_name = cbm_lsp_bare_segment(first_target_qn);
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "project.target";
+    int def_count = 1;
+    if (second_target_qn) {
+        defs[1].qualified_name = second_target_qn;
+        defs[1].short_name = cbm_lsp_bare_segment(second_target_qn);
+        defs[1].label = "Function";
+        defs[1].def_module_qn = "project.target";
+        def_count++;
+    }
+    defs[def_count].qualified_name = "project.use.accept";
+    defs[def_count].short_name = "accept";
+    defs[def_count].label = "Function";
+    defs[def_count].def_module_qn = "project.use";
+    def_count++;
+    defs[def_count].qualified_name = "project.use.crossArgument";
+    defs[def_count].short_name = "crossArgument";
+    defs[def_count].label = "Function";
+    defs[def_count].def_module_qn = "project.use";
+    def_count++;
+
+    const char *import_names[] = {local_name};
+    const char *import_qns[] = {import_qn};
+    CBMBatchPyLSPFile file = {0};
+    file.source = source;
+    file.source_len = (int)strlen(source);
+    file.module_qn = "project.use";
+    file.defs = defs;
+    file.def_count = def_count;
+    file.import_names = import_names;
+    file.import_qns = import_qns;
+    file.import_count = 1;
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+    counts.first_target = pylsp_exact_reference_count(
+        &out, "crossArgument", first_target_qn, local_name, site_start, site_end);
+    if (second_target_qn) {
+        counts.second_target = pylsp_exact_reference_count(
+            &out, "crossArgument", second_target_qn, local_name, site_start, site_end);
+    }
+    cbm_arena_destroy(&arena);
+    return counts;
+}
+
+TEST(pylsp_from_import_alias_equal_module_leaf_targets_imported_member) {
+    static const char source[] = "from target import handler as target\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(target)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "target", "project.target", "project.target.handler", "project.target.target");
+    ASSERT_EQ(counts.first_target, 1);
+    ASSERT_EQ(counts.second_target, 0);
+    PASS();
+}
+
+TEST(pylsp_project_prefixed_direct_alias_same_tail_is_not_from_import_reference) {
+    static const char source[] = "import target.handler as handler\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(handler)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "handler", "project.target.handler", "project.target.handler", NULL);
+    ASSERT_EQ(counts.first_target, 0);
+    PASS();
+}
+
+TEST(pylsp_competing_import_forms_for_same_local_fail_closed) {
+    static const char source[] = "from target import handler as callback\n"
+                                 "import target.handler as callback\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(callback)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "callback", "project.target", "project.target.handler", NULL);
+    ASSERT_EQ(counts.first_target, 0);
+    PASS();
+}
+
+TEST(pylsp_later_plain_import_rebinding_same_local_fails_closed) {
+    static const char source[] = "from target import handler as target\n"
+                                 "import target\n"
+                                 "def accept(fn):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(target)\n";
+    PyImportReferenceCounts counts = pylsp_import_reference_counts(
+        source, "target", "project.target.handler", "project.target.handler", NULL);
+    ASSERT_EQ(counts.first_target, 0);
+    PASS();
+}
+
+TEST(pylsp_batch_cross_file_callable_value_preserves_exact_reference_site) {
+    static const char source[] = "from target import handler\n"
+                                 "def accept(callback):\n"
+                                 "    pass\n"
+                                 "def crossArgument():\n"
+                                 "    accept(handler)\n";
+    const char *argument = strstr(source, "accept(handler)");
+    ASSERT_NOT_NULL(argument);
+    uint32_t site_start = (uint32_t)(argument - source) + 7U;
+    uint32_t site_end = site_start + (uint32_t)strlen("handler");
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "target.handler";
+    defs[0].short_name = "handler";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "target";
+    defs[1].qualified_name = "use.accept";
+    defs[1].short_name = "accept";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "use";
+    defs[2].qualified_name = "use.crossArgument";
+    defs[2].short_name = "crossArgument";
+    defs[2].label = "Function";
+    defs[2].def_module_qn = "use";
+    const char *import_names[] = {"handler"};
+    const char *import_qns[] = {"target.handler"};
+
+    CBMBatchPyLSPFile file;
+    memset(&file, 0, sizeof(file));
+    file.source = source;
+    file.source_len = (int)strlen(source);
+    file.module_qn = "use";
+    file.defs = defs;
+    file.def_count = 3;
+    file.import_names = import_names;
+    file.import_qns = import_qns;
+    file.import_count = 1;
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+
+    int exact = pylsp_exact_reference_count(&out, "crossArgument", "target.handler", NULL,
+                                             site_start, site_end);
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(exact, 1);
+
+    static const char alias_source[] = "from target import handler as callback\n"
+                                       "def accept(fn):\n"
+                                       "    pass\n"
+                                       "def crossArgument():\n"
+                                       "    accept(callback)\n";
+    const char *alias_argument = strstr(alias_source, "accept(callback)");
+    ASSERT_NOT_NULL(alias_argument);
+    site_start = (uint32_t)(alias_argument - alias_source) + 7U;
+    site_end = site_start + (uint32_t)strlen("callback");
+    const char *alias_import_names[] = {"callback"};
+    const char *alias_import_qns[] = {"project.target"};
+    defs[0].qualified_name = "project.target.handler";
+    defs[0].def_module_qn = "project.target";
+    defs[1].qualified_name = "project.use.accept";
+    defs[1].def_module_qn = "project.use";
+    defs[2].qualified_name = "project.use.crossArgument";
+    defs[2].def_module_qn = "project.use";
+    file.source = alias_source;
+    file.source_len = (int)strlen(alias_source);
+    file.module_qn = "project.use";
+    file.import_names = alias_import_names;
+    file.import_qns = alias_import_qns;
+    memset(&out, 0, sizeof(out));
+    cbm_arena_init(&arena);
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+
+    int alias_exact = pylsp_exact_reference_count(&out, "crossArgument",
+                                                   "project.target.handler", "callback",
+                                                   site_start, site_end);
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(alias_exact, 1);
+
+    /* The module and imported member may have the same leaf. Matching only
+     * leaves would keep `project.handler` and lose the member; the parsed
+     * from-import must canonicalize it to `project.handler.handler`. */
+    static const char same_name_source[] = "from handler import handler as callback\n"
+                                           "def accept(fn):\n"
+                                           "    pass\n"
+                                           "def crossArgument():\n"
+                                           "    accept(callback)\n";
+    const char *same_name_argument = strstr(same_name_source, "accept(callback)");
+    ASSERT_NOT_NULL(same_name_argument);
+    site_start = (uint32_t)(same_name_argument - same_name_source) + 7U;
+    site_end = site_start + (uint32_t)strlen("callback");
+    const char *same_name_import_qns[] = {"project.handler"};
+    defs[0].qualified_name = "project.handler.handler";
+    defs[0].def_module_qn = "project.handler";
+    file.source = same_name_source;
+    file.source_len = (int)strlen(same_name_source);
+    file.import_qns = same_name_import_qns;
+    memset(&out, 0, sizeof(out));
+    cbm_arena_init(&arena);
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+    int same_name_exact = pylsp_exact_reference_count(
+        &out, "crossArgument", "project.handler.handler", "callback", site_start, site_end);
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(same_name_exact, 1);
+
+    /* Identical extraction metadata can also come from a direct module alias.
+     * Its import_statement must never be upgraded to the same-named function. */
+    static const char module_alias_source[] = "import target.handler as callback\n"
+                                              "def accept(fn):\n"
+                                              "    pass\n"
+                                              "def crossArgument():\n"
+                                              "    accept(callback)\n";
+    const char *module_alias_argument = strstr(module_alias_source, "accept(callback)");
+    ASSERT_NOT_NULL(module_alias_argument);
+    site_start = (uint32_t)(module_alias_argument - module_alias_source) + 7U;
+    site_end = site_start + (uint32_t)strlen("callback");
+    defs[0].qualified_name = "project.target.handler";
+    defs[0].def_module_qn = "project.target";
+    file.source = module_alias_source;
+    file.source_len = (int)strlen(module_alias_source);
+    file.import_qns = alias_import_qns;
+    memset(&out, 0, sizeof(out));
+    cbm_arena_init(&arena);
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+    int module_alias_reference = pylsp_exact_reference_count(
+        &out, "crossArgument", "project.target.handler", "callback", site_start, site_end);
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(module_alias_reference, 0);
+
+    /* Syntax alone is not callable proof: decorators can replace the runtime
+     * binding with any value. Canonicalization must still pass through the
+     * registry's exact-callable eligibility gate. */
+    const char *decorators[] = {"@replace_with_value", NULL};
+    defs[0].decorators = decorators;
+    file.source = alias_source;
+    file.source_len = (int)strlen(alias_source);
+    memset(&out, 0, sizeof(out));
+    cbm_arena_init(&arena);
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+    int decorated_reference = pylsp_exact_reference_count(
+        &out, "crossArgument", "project.target.handler", "callback",
+        (uint32_t)(alias_argument - alias_source) + 7U,
+        (uint32_t)(alias_argument - alias_source) + 7U + (uint32_t)strlen("callback"));
+    cbm_arena_destroy(&arena);
+    ASSERT_EQ(decorated_reference, 0);
+    PASS();
+}
+
+/* A semantic invocation is an occurrence, not merely a caller/callee pair.
+ * Calling one target twice in one function must therefore retain two records,
+ * each stamped with the full `target(...)` expression that caused it. */
+TEST(pylsp_same_target_calls_have_distinct_exact_semantic_sites) {
+    static const char source[] = "def target(value):\n"
+                                 "    return value\n"
+                                 "def caller():\n"
+                                 "    first = target(1)\n"
+                                 "    second = target(22)\n"
+                                 "    return first + second\n";
+    static const char first_text[] = "target(1)";
+    static const char second_text[] = "target(22)";
+    const char *first = strstr(source, first_text);
+    const char *second = strstr(source, second_text);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+
+    CBMFileResult *r = extract_py(source);
+    ASSERT_NOT_NULL(r);
+    uint32_t first_start = (uint32_t)(first - source);
+    uint32_t second_start = (uint32_t)(second - source);
+    PyResolvedSiteCounts counts =
+        count_invocation_sites(&r->resolved_calls, "caller", ".target", first_start,
+                               first_start + (uint32_t)strlen(first_text), second_start,
+                               second_start + (uint32_t)strlen(second_text));
+
+    ASSERT_EQ(counts.target_count, 2);
+    ASSERT_EQ(counts.first_site_count, 1);
+    ASSERT_EQ(counts.second_site_count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* cbm_batch_py_lsp_cross resolves in a temporary per-file arena, then copies
+ * semantic records into the caller arena. Both occurrence spans must survive
+ * that copy; caller/callee-only dedup must not collapse the two calls. */
+TEST(pylsp_batch_preserves_two_same_target_semantic_sites) {
+    static const char source[] = "def target(value):\n"
+                                 "    return value\n"
+                                 "def caller():\n"
+                                 "    first = target(1)\n"
+                                 "    second = target(22)\n"
+                                 "    return first + second\n";
+    static const char first_text[] = "target(1)";
+    static const char second_text[] = "target(22)";
+    const char *first = strstr(source, first_text);
+    const char *second = strstr(source, second_text);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "batch.target";
+    defs[0].short_name = "target";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "batch";
+    defs[1].qualified_name = "batch.caller";
+    defs[1].short_name = "caller";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "batch";
+
+    CBMBatchPyLSPFile file;
+    memset(&file, 0, sizeof(file));
+    file.source = source;
+    file.source_len = (int)strlen(source);
+    file.module_qn = "batch";
+    file.defs = defs;
+    file.def_count = 2;
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_batch_py_lsp_cross(&arena, &file, 1, &out);
+
+    uint32_t first_start = (uint32_t)(first - source);
+    uint32_t second_start = (uint32_t)(second - source);
+    PyResolvedSiteCounts counts = count_invocation_sites(
+        &out, "caller", ".target", first_start, first_start + (uint32_t)strlen(first_text),
+        second_start, second_start + (uint32_t)strlen(second_text));
+    ASSERT_EQ(counts.target_count, 2);
+    ASSERT_EQ(counts.first_site_count, 1);
+    ASSERT_EQ(counts.second_site_count, 1);
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The fallback cross pass resolves in a scratch arena that is destroyed
+ * inside cbm_pxc_run_one. A Python dunder carrier created only by that cross
+ * resolver must be deep-copied into result.arena, remain occurrence-exact,
+ * and still join its semantic target after the function returns. */
+TEST(pylsp_scratch_cross_dunder_carrier_survives_copy) {
+    static const char source[] = "class Number:\n"
+                                 "    def __add__(self, other):\n"
+                                 "        return self\n"
+                                 "def combine(left: Number, right: Number):\n"
+                                 "    return left + right\n";
+    static const char site_text[] = "left + right";
+
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "scratch.Number";
+    defs[0].short_name = "Number";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "scratch";
+    defs[0].lang = CBM_LANG_PYTHON;
+    defs[1].qualified_name = "scratch.Number.__add__";
+    defs[1].short_name = "__add__";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "scratch.Number";
+    defs[1].def_module_qn = "scratch";
+    defs[1].lang = CBM_LANG_PYTHON;
+    defs[2].qualified_name = "scratch.combine";
+    defs[2].short_name = "combine";
+    defs[2].label = "Function";
+    defs[2].def_module_qn = "scratch";
+    defs[2].lang = CBM_LANG_PYTHON;
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    cbm_pxc_run_one(CBM_LANG_PYTHON, &result, source, (int)strlen(source), "scratch", defs, 3, NULL,
+                    NULL, 0);
+
+    const CBMCall *carrier = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < result.calls.count; i++) {
+        const CBMCall *call = &result.calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "__add__") == 0 &&
+            call->enclosing_func_qn && strstr(call->enclosing_func_qn, "combine")) {
+            carrier = call;
+            carrier_count++;
+        }
+    }
+    const char *site = strstr(source, site_text);
+    ASSERT_NOT_NULL(site);
+    uint32_t expected_start = (uint32_t)(site - source);
+    uint32_t expected_end = expected_start + (uint32_t)strlen(site_text);
+    ASSERT_EQ(carrier_count, 1);
+    ASSERT_NOT_NULL(carrier);
+    ASSERT_STR_EQ(carrier->callee_name, "__add__");
+    ASSERT_TRUE(strstr(carrier->enclosing_func_qn, "combine") != NULL);
+    ASSERT_TRUE(carrier->requires_lsp_resolution);
+    ASSERT_EQ(carrier->site_start_byte, expected_start);
+    ASSERT_EQ(carrier->site_end_byte, expected_end);
+
+    const CBMResolvedCall *joined =
+        cbm_pipeline_find_lsp_resolution(&result.resolved_calls, carrier, false);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_STR_EQ(joined->callee_qn, "scratch.Number.__add__");
+    ASSERT_EQ(joined->site_start_byte, expected_start);
+    ASSERT_EQ(joined->site_end_byte, expected_end);
+
+    cbm_arena_destroy(&result.arena);
+    PASS();
+}
+
 /* ── Phase 10 — stdlib resolution ─────────────────────────────── */
 
 TEST(pylsp_stdlib_os_getcwd) {
-    /* Top-level module attribute resolution against the stdlib registry.
-     * Note: `import os.path` only binds `path` in scope (the leaf binding
-     * extracted from the dotted import) — full submodule traversal of
-     * `os.path.join` style accesses needs a Phase 10.5 follow-up where we
-     * also stamp parent-module bindings. For v1, top-level module calls
-     * resolve correctly. */
+    /* Top-level module attribute resolution against the stdlib registry. */
     CBMFileResult *r = extract_py(
         "import os\n"
         "def use():\n"
@@ -827,6 +1292,26 @@ TEST(pylsp_round1_dotted_import_walk) {
         "def use():\n"
         "    return os.path.join('a', 'b')\n");
     ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT_STR_EQ(r->imports.items[0].local_name, "os");
+    ASSERT_STR_EQ(r->imports.items[0].module_path, "os.path");
+    int idx = find_resolved(r, "use", "join");
+    ASSERT_GTE(idx, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pylsp_round1_dotted_import_alias_matching_root) {
+    /* The metadata pair (local=os, module=os.path) is also possible for an
+     * explicit alias. Unlike the unaliased form above, this binds `os`
+     * directly to MODULE(os.path), so os.join resolves os.path.join. */
+    CBMFileResult *r = extract_py("import os.path as os\n"
+                                  "def use():\n"
+                                  "    return os.join('a', 'b')\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT_STR_EQ(r->imports.items[0].local_name, "os");
+    ASSERT_STR_EQ(r->imports.items[0].module_path, "os.path");
     int idx = find_resolved(r, "use", "join");
     ASSERT_GTE(idx, 0);
     cbm_free_result(r);
@@ -1236,6 +1721,221 @@ TEST(pylsp_round5_super_init) {
     PASS();
 }
 
+/* Synthetic dunder calls have no ordinary tree-sitter `call` carrier. Two
+ * different receiver classes can therefore produce the same textual leaf in
+ * one caller. The synthetic carrier and semantic record must retain the exact
+ * operator occurrence so the pipeline cannot bind both `__add__` calls to the
+ * first class it happens to inspect. */
+TEST(pylsp_dunder_same_leaf_occurrences_join_by_exact_site) {
+    static const char source[] =
+        "class Alpha:\n"
+        "    def __add__(self, other):\n"
+        "        return self\n"
+        "class Beta:\n"
+        "    def __add__(self, other):\n"
+        "        return self\n"
+        "def combine(left_a: Alpha, left_b: Alpha, right_a: Beta, right_b: Beta):\n"
+        "    first = left_a + left_b\n"
+        "    second = right_a + right_b\n"
+        "    return first, second\n";
+    static const char alpha_text[] = "left_a + left_b";
+    static const char beta_text[] = "right_a + right_b";
+
+    const char *alpha_site = strstr(source, alpha_text);
+    const char *beta_site = strstr(source, beta_text);
+    ASSERT_NOT_NULL(alpha_site);
+    ASSERT_NOT_NULL(beta_site);
+
+    CBMFileResult *r = extract_py(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error || r->parse_incomplete);
+
+    const CBMCall *dunder_calls[2] = {0};
+    int dunder_count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "__add__") == 0 &&
+            call->enclosing_func_qn && strstr(call->enclosing_func_qn, "combine")) {
+            if (dunder_count < 2)
+                dunder_calls[dunder_count] = call;
+            dunder_count++;
+        }
+    }
+    ASSERT_EQ(dunder_count, 2);
+    ASSERT_NOT_NULL(dunder_calls[0]);
+    ASSERT_NOT_NULL(dunder_calls[1]);
+
+    const CBMCall *alpha_call = dunder_calls[0];
+    const CBMCall *beta_call = dunder_calls[1];
+    if (alpha_call->site_start_byte > beta_call->site_start_byte) {
+        const CBMCall *tmp = alpha_call;
+        alpha_call = beta_call;
+        beta_call = tmp;
+    }
+
+    uint32_t alpha_start = (uint32_t)(alpha_site - source);
+    uint32_t alpha_end = alpha_start + (uint32_t)strlen(alpha_text);
+    uint32_t beta_start = (uint32_t)(beta_site - source);
+    uint32_t beta_end = beta_start + (uint32_t)strlen(beta_text);
+
+    ASSERT_GT(alpha_call->site_end_byte, alpha_call->site_start_byte);
+    ASSERT_GT(beta_call->site_end_byte, beta_call->site_start_byte);
+    ASSERT_NEQ(alpha_call->site_start_byte, beta_call->site_start_byte);
+    ASSERT_EQ(alpha_call->site_start_byte, alpha_start);
+    ASSERT_EQ(alpha_call->site_end_byte, alpha_end);
+    ASSERT_EQ(beta_call->site_start_byte, beta_start);
+    ASSERT_EQ(beta_call->site_end_byte, beta_end);
+    ASSERT_TRUE(alpha_call->requires_lsp_resolution);
+    ASSERT_TRUE(beta_call->requires_lsp_resolution);
+
+    const CBMResolvedCall *alpha_resolution =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, alpha_call, false);
+    const CBMResolvedCall *beta_resolution =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, beta_call, false);
+    ASSERT_NOT_NULL(alpha_resolution);
+    ASSERT_NOT_NULL(beta_resolution);
+    ASSERT_TRUE(alpha_resolution != beta_resolution);
+    ASSERT_TRUE(strstr(alpha_resolution->callee_qn, ".Alpha.__add__") != NULL);
+    ASSERT_TRUE(strstr(beta_resolution->callee_qn, ".Beta.__add__") != NULL);
+    ASSERT_EQ(alpha_resolution->site_start_byte, alpha_call->site_start_byte);
+    ASSERT_EQ(alpha_resolution->site_end_byte, alpha_call->site_end_byte);
+    ASSERT_EQ(beta_resolution->site_start_byte, beta_call->site_start_byte);
+    ASSERT_EQ(beta_resolution->site_end_byte, beta_call->site_end_byte);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A named lambda body is re-walked once per invocation so its parameters can
+ * inherit the call-site argument types. Both walks below visit the same single
+ * `a + b` AST occurrence. That occurrence must produce one semantic record and
+ * one synthetic carrier, not one carrier per re-walk. */
+TEST(pylsp_lambda_rewalk_dedupes_dunder_occurrence) {
+    static const char source[] = "class Number:\n"
+                                 "    def __add__(self, other):\n"
+                                 "        return self\n"
+                                 "def combine(left: Number, right: Number):\n"
+                                 "    add = lambda a, b: a + b\n"
+                                 "    first = add(left, right)\n"
+                                 "    second = add(left, right)\n"
+                                 "    return first, second\n";
+    static const char site_text[] = "a + b";
+    const char *site = strstr(source, site_text);
+    ASSERT_NOT_NULL(site);
+    uint32_t expected_start = (uint32_t)(site - source);
+    uint32_t expected_end = expected_start + (uint32_t)strlen(site_text);
+
+    CBMFileResult *r = extract_py(source);
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error || r->parse_incomplete);
+
+    const CBMCall *carrier = NULL;
+    int carrier_count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "__add__") == 0 &&
+            call->enclosing_func_qn && strstr(call->enclosing_func_qn, "<lambda>")) {
+            carrier = call;
+            carrier_count++;
+        }
+    }
+
+    const CBMResolvedCall *semantic = NULL;
+    int semantic_count = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &r->resolved_calls.items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, "<lambda>") && rc->callee_qn &&
+            strstr(rc->callee_qn, ".Number.__add__")) {
+            semantic = rc;
+            semantic_count++;
+        }
+    }
+
+    ASSERT_EQ(semantic_count, 1);
+    ASSERT_NOT_NULL(semantic);
+    ASSERT_EQ(semantic->kind, CBM_RESOLVED_INVOCATION);
+    ASSERT_EQ(semantic->site_start_byte, expected_start);
+    ASSERT_EQ(semantic->site_end_byte, expected_end);
+
+    if (carrier_count != 1) {
+        for (int i = 0; i < r->calls.count; i++) {
+            const CBMCall *call = &r->calls.items[i];
+            if (call->callee_name && strcmp(call->callee_name, "__add__") == 0) {
+                fprintf(stderr, "  [PY-LAMBDA-CARRIER] caller=%s site=%u:%u requires_lsp=%d\n",
+                        call->enclosing_func_qn ? call->enclosing_func_qn : "(null)",
+                        call->site_start_byte, call->site_end_byte,
+                        call->requires_lsp_resolution ? 1 : 0);
+            }
+        }
+    }
+    ASSERT_EQ(carrier_count, 1);
+    ASSERT_NOT_NULL(carrier);
+    ASSERT_TRUE(carrier->requires_lsp_resolution);
+    ASSERT_EQ(carrier->site_start_byte, expected_start);
+    ASSERT_EQ(carrier->site_end_byte, expected_end);
+
+    const CBMResolvedCall *joined =
+        cbm_pipeline_find_lsp_resolution(&r->resolved_calls, carrier, false);
+    ASSERT_NOT_NULL(joined);
+    ASSERT_TRUE(joined == semantic);
+    ASSERT_TRUE(strstr(joined->callee_qn, ".Number.__add__") != NULL);
+    ASSERT_EQ(joined->site_start_byte, expected_start);
+    ASSERT_EQ(joined->site_end_byte, expected_end);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Parser-backed Python calls have the same occurrence-identity requirement as
+ * synthetic dunders. Distinct typed receivers can expose the same method leaf
+ * in one caller; each CBMCall must join the semantic record for its own site. */
+TEST(pylsp_ordinary_same_leaf_calls_join_by_exact_site) {
+    CBMFileResult *r = extract_py("class Alpha:\n"
+                                  "    def render(self):\n"
+                                  "        return 1\n"
+                                  "class Beta:\n"
+                                  "    def render(self):\n"
+                                  "        return 2\n"
+                                  "def combine(a: Alpha, b: Beta):\n"
+                                  "    return a.render(), b.render()\n");
+    ASSERT_NOT_NULL(r);
+
+    const CBMCall *calls[2] = {0};
+    int call_count = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->enclosing_func_qn && strstr(call->enclosing_func_qn, "combine") &&
+            call->callee_name && strstr(call->callee_name, "render")) {
+            if (call_count < 2)
+                calls[call_count] = call;
+            call_count++;
+        }
+    }
+    if (calls[0] && calls[1] && calls[0]->site_start_byte > calls[1]->site_start_byte) {
+        const CBMCall *tmp = calls[0];
+        calls[0] = calls[1];
+        calls[1] = tmp;
+    }
+    const CBMResolvedCall *alpha_hit =
+        calls[0] ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, calls[0], false) : NULL;
+    const CBMResolvedCall *beta_hit =
+        calls[1] ? cbm_pipeline_find_lsp_resolution(&r->resolved_calls, calls[1], false) : NULL;
+    bool alpha_exact = alpha_hit && alpha_hit->callee_qn &&
+                       strstr(alpha_hit->callee_qn, ".Alpha.render") &&
+                       alpha_hit->site_start_byte == calls[0]->site_start_byte &&
+                       alpha_hit->site_end_byte == calls[0]->site_end_byte;
+    bool beta_exact = beta_hit && beta_hit->callee_qn &&
+                      strstr(beta_hit->callee_qn, ".Beta.render") &&
+                      beta_hit->site_start_byte == calls[1]->site_start_byte &&
+                      beta_hit->site_end_byte == calls[1]->site_end_byte;
+
+    cbm_free_result(r);
+    ASSERT_EQ(call_count, 2);
+    ASSERT_TRUE(alpha_exact);
+    ASSERT_TRUE(beta_exact);
+    PASS();
+}
+
 /* ── Round 6 — generators, dataclasses, decorator flags ───────── */
 
 TEST(pylsp_round6_generator_yields_iterable) {
@@ -1452,6 +2152,14 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_crossfile_classmethod_on_class_issue228);
     RUN_TEST(pylsp_crossfile_inheritance);
     RUN_TEST(pylsp_batch_two_files);
+    RUN_TEST(pylsp_from_import_alias_equal_module_leaf_targets_imported_member);
+    RUN_TEST(pylsp_project_prefixed_direct_alias_same_tail_is_not_from_import_reference);
+    RUN_TEST(pylsp_competing_import_forms_for_same_local_fail_closed);
+    RUN_TEST(pylsp_later_plain_import_rebinding_same_local_fails_closed);
+    RUN_TEST(pylsp_batch_cross_file_callable_value_preserves_exact_reference_site);
+    RUN_TEST(pylsp_same_target_calls_have_distinct_exact_semantic_sites);
+    RUN_TEST(pylsp_batch_preserves_two_same_target_semantic_sites);
+    RUN_TEST(pylsp_scratch_cross_dunder_carrier_survives_copy);
     /* Phase 10 — stdlib resolution */
     RUN_TEST(pylsp_stdlib_os_getcwd);
     RUN_TEST(pylsp_stdlib_collections_defaultdict);
@@ -1459,6 +2167,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_stdlib_logging_getlogger);
     /* Round 1 — parity push */
     RUN_TEST(pylsp_round1_dotted_import_walk);
+    RUN_TEST(pylsp_round1_dotted_import_alias_matching_root);
     RUN_TEST(pylsp_round1_typing_cast);
     RUN_TEST(pylsp_round1_assert_type_passthrough);
     RUN_TEST(pylsp_round1_forward_reference);
@@ -1484,6 +2193,9 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_round5_dict_subscript_value_type);
     RUN_TEST(pylsp_round5_list_subscript_value_type);
     RUN_TEST(pylsp_round5_super_init);
+    RUN_TEST(pylsp_dunder_same_leaf_occurrences_join_by_exact_site);
+    RUN_TEST(pylsp_lambda_rewalk_dedupes_dunder_occurrence);
+    RUN_TEST(pylsp_ordinary_same_leaf_calls_join_by_exact_site);
     /* Round 6 — generators, dataclasses, properties */
     RUN_TEST(pylsp_round6_generator_yields_iterable);
     RUN_TEST(pylsp_round6_dataclass_field_access);

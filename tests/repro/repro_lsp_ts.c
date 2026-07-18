@@ -64,11 +64,8 @@
  *                                        registry).
  *     lsp_ts_jsx_import (ts_lsp.c:2657)  <Comp/> JSX element whose tag is an
  *                                        imported component (TSX only; tag matches
- *                                        an import local name → synthetic
- *                                        "<module>.<Comp>" QN). NOTE: this site
- *                                        builds the callee QN WITHOUT verifying the
- *                                        symbol exists in the registry, so it can
- *                                        emit even when the import target is absent.
+ *                                        an import local name and the exact
+ *                                        component exists in the registry.
  *     lsp_ts            (ts_lsp.c:116)   DEFAULT fallback inside ts_emit_resolved_call
  *                                        used only when a caller passes a NULL
  *                                        strategy. Every concrete emit site passes a
@@ -311,10 +308,9 @@ static const char kTsxJsx[] =
     "    return <Widget />;\n"
     "}\n";
 
-/* lsp_ts_jsx_import — <Comp/> JSX element whose tag is an imported component
- * (ts_lsp.c:2652-2657). TSX only; the tag matches an import local name → a
- * synthetic "<module>.<Comp>" callee QN is emitted (this site does NOT verify
- * the symbol is in the registry). Cross-file: widget.tsx exports Widget,
+/* lsp_ts_jsx_import — <Comp/> JSX element whose tag is an imported component.
+ * TSX only; the tag matches an import local name and the cross-file registry
+ * proves the exact component symbol. Cross-file: widget.tsx exports Widget,
  * app.tsx imports it and renders <Widget/>. */
 static const RFile kTsxJsxImport[] = {
     {"widget.tsx",

@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 #ifdef _WIN32
 
@@ -116,6 +117,40 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     d->entry.is_dir = (d->find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     d->entry.d_type = 0;
     return &d->entry;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return CBM_NOT_FOUND;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
+    free(wpath);
+    if (!ok) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    out->is_symlink = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    out->is_regular = !out->is_directory && !out->is_symlink;
+    ULARGE_INTEGER file_size;
+    file_size.LowPart = data.nFileSizeLow;
+    file_size.HighPart = data.nFileSizeHigh;
+    out->size = (int64_t)file_size.QuadPart;
+    ULARGE_INTEGER written;
+    written.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    written.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    enum { NANOSECONDS_PER_WINDOWS_TICK = 100 };
+    const uint64_t windows_to_unix_ticks = UINT64_C(116444736000000000);
+    out->mtime_ns =
+        written.QuadPart >= windows_to_unix_ticks
+            ? (int64_t)((written.QuadPart - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
+            : 0;
+    return 0;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -658,11 +693,49 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
         }
         memcpy(d->entry.name, de->d_name, nlen);
         d->entry.name[nlen] = '\0';
-        d->entry.is_dir = (de->d_type == DT_DIR);
-        d->entry.d_type = de->d_type;
+        unsigned char type = de->d_type;
+#if defined(DT_UNKNOWN) && defined(AT_SYMLINK_NOFOLLOW)
+        if (type == DT_UNKNOWN) {
+            struct stat state;
+            if (fstatat(dirfd(d->dir), de->d_name, &state, AT_SYMLINK_NOFOLLOW) == 0) {
+                if (S_ISDIR(state.st_mode)) {
+                    type = DT_DIR;
+                } else if (S_ISREG(state.st_mode)) {
+                    type = DT_REG;
+                } else if (S_ISLNK(state.st_mode)) {
+                    type = DT_LNK;
+                }
+            }
+        }
+#endif
+        d->entry.is_dir = (type == DT_DIR);
+        d->entry.d_type = type;
         return &d->entry;
     }
     return NULL;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    if (!path || !out) {
+        return CBM_NOT_FOUND;
+    }
+    struct stat state;
+    if (lstat(path, &state) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    out->is_regular = S_ISREG(state.st_mode);
+    out->is_directory = S_ISDIR(state.st_mode);
+    out->is_symlink = S_ISLNK(state.st_mode);
+    out->size = (int64_t)state.st_size;
+#ifdef __APPLE__
+    out->mtime_ns = ((int64_t)state.st_mtimespec.tv_sec * INT64_C(1000000000)) +
+                    (int64_t)state.st_mtimespec.tv_nsec;
+#else
+    out->mtime_ns =
+        ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
+#endif
+    return 0;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -871,23 +944,67 @@ int cbm_rename_replace(const char *src, const char *dst) {
 #endif
 }
 
+int cbm_rename_noreplace(const char *src, const char *dst) {
+    if (!src || !dst || !src[0] || !dst[0]) {
+        return CBM_NOT_FOUND;
+    }
+#ifdef _WIN32
+    wchar_t *wsrc = cbm_utf8_to_wide(src);
+    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    int ret = CBM_NOT_FOUND;
+    if (wsrc && wdst) {
+        ret = MoveFileExW(wsrc, wdst, MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)
+                  ? 0
+                  : CBM_NOT_FOUND;
+    }
+    free(wsrc);
+    free(wdst);
+    return ret;
+#else
+    /* link()+unlink() provides no-overwrite semantics portably (including
+     * macOS, where renameat2(RENAME_NOREPLACE) is unavailable). Both paths
+     * are adjacent database files and therefore on the same filesystem. */
+    if (link(src, dst) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (unlink(src) != 0) {
+        int saved_errno = errno;
+        (void)unlink(dst);
+        errno = saved_errno;
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+#endif
+}
+
 /* Remove a SQLite database's -wal/-shm sidecars (both platforms). Any code
  * path that installs a FRESH database file where a previous generation lived
  * must remove them before the new generation can be opened: SQLite decides
  * whether to replay a WAL purely from the sidecar's own header/checksums, so
  * a leftover WAL can splice old-generation pages into the new file (#897). */
-void cbm_remove_db_sidecars(const char *db_path) {
+int cbm_remove_db_sidecars_checked(const char *db_path) {
     if (!db_path || !db_path[0]) {
-        return;
+        return CBM_NOT_FOUND;
     }
     enum { SIDECAR_PATH_MAX = 4096 };
     char side[SIDECAR_PATH_MAX];
     int n = snprintf(side, sizeof(side), "%s-wal", db_path);
-    if (n > 0 && (size_t)n < sizeof(side)) {
-        (void)cbm_unlink(side);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
+    }
+    if (cbm_unlink(side) != 0 && errno != ENOENT) {
+        return CBM_NOT_FOUND;
     }
     n = snprintf(side, sizeof(side), "%s-shm", db_path);
-    if (n > 0 && (size_t)n < sizeof(side)) {
-        (void)cbm_unlink(side);
+    if (n <= 0 || (size_t)n >= sizeof(side)) {
+        return CBM_NOT_FOUND;
     }
+    if (cbm_unlink(side) != 0 && errno != ENOENT) {
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
+void cbm_remove_db_sidecars(const char *db_path) {
+    (void)cbm_remove_db_sidecars_checked(db_path);
 }
