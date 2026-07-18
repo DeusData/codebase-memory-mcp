@@ -8,8 +8,8 @@
  *   - parse_or_expr, parse_xor_expr, parse_and_expr, parse_not_expr
  *   - parse_atom_expr, parse_post_where, cbm_parse
  *
- * Cypher expression evaluator (bounded by WHERE clause depth ~5):
- *   - eval_expr
+ * Cypher expression traversal (bounded by WHERE clause depth ~5):
+ *   - eval_expr, eval_expr_partial
  *
  * Glob pattern matcher (bounded by pattern nesting ~3):
  *   - glob_match, glob_match_star, glob_match_doublestar
@@ -27,7 +27,7 @@
  */
 #define CBM_RECURSION_WHITELIST                                                               \
     "parse_or_expr", "parse_xor_expr", "parse_and_expr", "parse_not_expr", "parse_atom_expr", \
-        "parse_post_where", "cbm_parse", "eval_expr", "glob_match", "glob_match_star",        \
-        "glob_match_doublestar", "glob_match_doublestar_slash", "glob_match_doublestar_any",  \
-        "parse_bool_expr", "parse_bool_atom", "r_collect_imports",                            \
+        "parse_post_where", "cbm_parse", "eval_expr", "eval_expr_partial", "glob_match",       \
+        "glob_match_star", "glob_match_doublestar", "glob_match_doublestar_slash",             \
+        "glob_match_doublestar_any", "parse_bool_expr", "parse_bool_atom", "r_collect_imports", \
         "find_first_descendant_by_kind", "find_first_descendant_of"

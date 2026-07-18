@@ -2619,6 +2619,87 @@ static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
     return is_and;
 }
 
+typedef enum { CYP_PARTIAL_FALSE = 0, CYP_PARTIAL_TRUE, CYP_PARTIAL_UNKNOWN } cypher_partial_bool_t;
+
+static cypher_partial_bool_t partial_and(cypher_partial_bool_t left, cypher_partial_bool_t right) {
+    if (left == CYP_PARTIAL_FALSE || right == CYP_PARTIAL_FALSE) {
+        return CYP_PARTIAL_FALSE;
+    }
+    return left == CYP_PARTIAL_TRUE && right == CYP_PARTIAL_TRUE ? CYP_PARTIAL_TRUE
+                                                                 : CYP_PARTIAL_UNKNOWN;
+}
+
+static cypher_partial_bool_t partial_or(cypher_partial_bool_t left, cypher_partial_bool_t right) {
+    if (left == CYP_PARTIAL_TRUE || right == CYP_PARTIAL_TRUE) {
+        return CYP_PARTIAL_TRUE;
+    }
+    return left == CYP_PARTIAL_FALSE && right == CYP_PARTIAL_FALSE ? CYP_PARTIAL_FALSE
+                                                                   : CYP_PARTIAL_UNKNOWN;
+}
+
+/* Evaluate the portion of a WHERE expression whose aliases are already
+ * bound. Unknown leaves keep the seed; definitively false source predicates
+ * still prune before relationship expansion. Per seed this is O(expression
+ * nodes) time, O(expression depth) stack, and allocation-free; AND/OR retain
+ * the full evaluator's safe short-circuit behavior. */
+static cypher_partial_bool_t eval_expr_partial(const cbm_expr_t *e, // NOLINT(misc-no-recursion)
+                                               binding_t *b) {
+    if (!e) {
+        return CYP_PARTIAL_TRUE;
+    }
+    if (e->type == EXPR_CONDITION) {
+        if (!binding_get(b, e->cond.variable) && !binding_get_edge(b, e->cond.variable)) {
+            return CYP_PARTIAL_UNKNOWN;
+        }
+        return eval_condition(&e->cond, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+    }
+
+    cypher_partial_bool_t left = eval_expr_partial(e->left, b);
+    if (e->type == EXPR_NOT) {
+        return left == CYP_PARTIAL_UNKNOWN
+                   ? CYP_PARTIAL_UNKNOWN
+                   : (left == CYP_PARTIAL_TRUE ? CYP_PARTIAL_FALSE : CYP_PARTIAL_TRUE);
+    }
+    if (e->type == EXPR_AND && left == CYP_PARTIAL_FALSE) {
+        return CYP_PARTIAL_FALSE;
+    }
+    if (e->type == EXPR_OR && left == CYP_PARTIAL_TRUE) {
+        return CYP_PARTIAL_TRUE;
+    }
+    cypher_partial_bool_t right = eval_expr_partial(e->right, b);
+    if (e->type == EXPR_AND) {
+        return partial_and(left, right);
+    }
+    if (e->type == EXPR_OR) {
+        return partial_or(left, right);
+    }
+    if (left == CYP_PARTIAL_UNKNOWN || right == CYP_PARTIAL_UNKNOWN) {
+        return CYP_PARTIAL_UNKNOWN;
+    }
+    return left != right ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+}
+
+static cypher_partial_bool_t eval_where_partial(const cbm_where_clause_t *where, binding_t *b) {
+    if (!where) {
+        return CYP_PARTIAL_TRUE;
+    }
+    if (where->root) {
+        return eval_expr_partial(where->root, b);
+    }
+    cypher_partial_bool_t result =
+        where->op && strcmp(where->op, "AND") == 0 ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+    for (int i = 0; i < where->count; i++) {
+        cypher_partial_bool_t item =
+            (!binding_get(b, where->conditions[i].variable) &&
+             !binding_get_edge(b, where->conditions[i].variable))
+                ? CYP_PARTIAL_UNKNOWN
+                : (eval_condition(&where->conditions[i], b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE);
+        result = where->op && strcmp(where->op, "AND") == 0 ? partial_and(result, item)
+                                                            : partial_or(result, item);
+    }
+    return result;
+}
+
 /* Check if a string value looks like a regex pattern. */
 static bool looks_like_regex(const char *s) {
     if (!s) {
@@ -4668,7 +4749,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         b.project = project;
         b.use_active_overlay_edges = scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY;
         binding_set(&b, var_name, &scanned[i]);
-        bool pass = !q->where || eval_where(q->where, &b);
+        bool pass = eval_where_partial(q->where, &b) != CYP_PARTIAL_FALSE;
         if (pass) {
             bindings[bind_count++] = b;
         } else {

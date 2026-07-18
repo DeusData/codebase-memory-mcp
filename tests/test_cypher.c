@@ -1929,6 +1929,69 @@ TEST(cypher_exec_where_not) {
     PASS();
 }
 
+TEST(cypher_exec_where_not_on_relationship_target) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                                "WHERE NOT b.name CONTAINS \"Order\" RETURN b.name",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "LogError");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_where_mixed_alias_and) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (a:Function)-[:CALLS]->(b:Function) "
+        "WHERE a.name = \"HandleOrder\" AND NOT b.name CONTAINS \"Order\" RETURN b.name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "LogError");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_where_mixed_alias_or) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (a:Function)-[:CALLS]->(b:Function) "
+        "WHERE a.name = \"NoSuchFunction\" OR NOT b.name CONTAINS \"Order\" RETURN b.name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "LogError");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_where_mixed_alias_xor) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s,
+                           "MATCH (a:Function)-[:CALLS]->(b:Function) "
+                           "WHERE a.name = \"HandleOrder\" XOR b.name = \"LogError\" RETURN b.name",
+                           "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_in) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3073,6 +3136,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_neq_bang);
     RUN_TEST(cypher_exec_where_ends_with);
     RUN_TEST(cypher_exec_where_not);
+    RUN_TEST(cypher_exec_where_not_on_relationship_target);
+    RUN_TEST(cypher_exec_where_mixed_alias_and);
+    RUN_TEST(cypher_exec_where_mixed_alias_or);
+    RUN_TEST(cypher_exec_where_mixed_alias_xor);
     RUN_TEST(cypher_exec_where_in);
     RUN_TEST(cypher_exec_where_not_in);
     RUN_TEST(cypher_exec_where_is_null);
