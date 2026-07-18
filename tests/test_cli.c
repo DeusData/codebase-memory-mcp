@@ -730,6 +730,10 @@ TEST(cli_codex_instructions) {
     ASSERT_NOT_NULL(instr);
     ASSERT(strstr(instr, "Codebase Knowledge Graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
+    ASSERT(strstr(instr, "effective, computationally efficient") != NULL);
+    ASSERT(strstr(instr, "examples and LIMIT are optional guidance") != NULL);
+    ASSERT(strstr(instr, "retry that operation with escalation") != NULL);
+    ASSERT(strstr(instr, "MCP approval and shell sandbox authorization are separate") != NULL);
     PASS();
 }
 
