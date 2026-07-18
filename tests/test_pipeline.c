@@ -5677,6 +5677,32 @@ TEST(incremental_persistence_creates_first_artifact) {
     PASS();
 }
 
+TEST(incremental_noop_persistence_creates_first_artifact) {
+    /* Populate the local DB without persistence, then request persistence
+     * without changing any files. The incremental no-op path must still
+     * create the missing artifact. */
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT_FALSE(cbm_artifact_exists(g_incr_tmpdir));
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_persistence(p, true);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_TRUE(cbm_artifact_exists(g_incr_tmpdir));
+    cbm_pipeline_free(p);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_detects_changed_file) {
     /* Full index, modify one file, re-index → changed file re-parsed */
     if (setup_incremental_repo() != 0) {
@@ -7123,6 +7149,7 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_persistence_creates_first_artifact);
+    RUN_TEST(incremental_noop_persistence_creates_first_artifact);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
