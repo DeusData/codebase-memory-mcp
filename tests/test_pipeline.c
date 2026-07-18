@@ -3023,6 +3023,42 @@ TEST(pipeline_imports_multi_symbol_edges) {
     PASS();
 }
 
+TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation) {
+    enum { FILE_COUNT = 3 };
+    const char *files[] = {"nested/feature-adapter/implementation.ts",
+                           "nested/feature-adapter/barrel.ts",
+                           "nested/feature-adapter/consumer.ts"};
+    const char *contents[] = {
+        "export async function targetOperation(): Promise<void> {\n  return;\n}\n",
+        "export { targetOperation } from './implementation';\n",
+        "import {\n  targetOperation,\n} from './barrel';\n\n"
+        "export async function callerOperation(): Promise<void> {\n"
+        "  await targetOperation();\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_exists(s, cbm_pipeline_project_name(p), "callerOperation",
+                                       "targetOperation"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_go_cross_package_call) {
     /* Port of TestGoCrossPackageCallViaImport */
     const char *files[] = {"main.go", "svc/handler.go"};
@@ -17430,6 +17466,7 @@ SUITE(pipeline) {
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
+    RUN_TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
