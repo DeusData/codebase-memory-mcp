@@ -771,6 +771,8 @@ TEST(query_graph_max_output_bytes_truncates) {
 
     /* Response should indicate truncation */
     ASSERT_NOT_NULL(strstr(resp, "\"truncated\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "Narrow returned fields, add LIMIT when appropriate, or raise "
+                                 "max_output_bytes"));
     /* Response body should be near the byte limit */
     ASSERT_TRUE(strlen(resp) <= 2048); /* some slack for metadata */
 

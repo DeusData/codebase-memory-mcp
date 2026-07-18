@@ -1117,21 +1117,26 @@ static const tool_def_t TOOLS[] = {
      "signature. Internal fp/sp/bt indexing fields are never returned.\"}}}"},
 
     {"query_graph", "Query graph",
-     "Execute a Cypher query against the knowledge graph for complex multi-hop patterns, "
-     "aggregations, and cross-service analysis. Row scan and output bytes are capped by default "
-     "(config keys query_max_rows and query_max_output_bytes). Set max_output_bytes=0 for "
-     "unlimited output bytes or add LIMIT. "
-     "Dependency sub-project symbols (proj.dep.*) are tagged source:dependency; to rank your own "
-     "project's symbols above them, ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END.",
+     "Core compositional tool; use it early for bespoke structural questions. Create new, "
+     "effective, computationally efficient custom Cypher for multi-hop paths, aggregates/hotspots, "
+     "arbitrary predicates, cross-service links, or graph=\"missed\". Non-exhaustive examples: "
+     "MATCH (f:Function)-[:CALLS]->(g) RETURN f.name,g.name LIMIT 20; "
+     "MATCH (f:File) RETURN f.file_path,count(*). Any valid query shape is allowed; explicit "
+     "labels/properties and LIMIT are optional efficiency aids. Server caps query_max_rows and "
+     "query_max_output_bytes; raise only when needed. Dependency symbols use proj.dep.* and "
+     "source:dependency; rank primary symbols first with "
+     "ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to "
      "use the MCP server project derived from server CWD.\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":\"Scan-level row limit. Omit to use query_max_rows config. Set 0 to use "
      "the implementation ceiling. Note: limits nodes scanned, not rows returned. For output size, "
-     "use max_output_bytes or add LIMIT to your Cypher query.\"},\"max_output_bytes\":{\"type\":"
+     "set max_output_bytes; an optional Cypher LIMIT can reduce computation and output.\"},"
+     "\"max_output_bytes\":{\"type\":"
      "\"integer\",\"description\":\"Max response size in bytes (configurable via "
      "query_max_output_bytes config key). Set to 0 for unlimited. When exceeded, returns "
-     "truncated=true with total_bytes and hint to add LIMIT.\"},\"graph\":{\"type\":\"string\","
+     "truncated=true with total_bytes and optional ways to narrow the query or raise the cap.\"},"
+     "\"graph\":{\"type\":\"string\","
      "\"enum\":[\"code\",\"missed\"],\"default\":\"code\",\"description\":\"Query the code "
      "graph or the best-effort graph of files not fully indexed.\"},\"format\":{\"type\":\"string\","
      "\"enum\":[\"toon\",\"json\"],\"default\":\"toon\"}},\"required\":[\"query\"]}"},
@@ -1398,6 +1403,12 @@ static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def
 }
 
 static bool is_streamlined_default_tool(const char *name) {
+    /* query_graph is intentionally a core tool, not merely an advanced escape
+     * hatch. It composes labels, properties, relationships, predicates and
+     * aggregations into new solutions without requiring a dedicated MCP
+     * tool/schema for every structural code question. Its description asks
+     * callers to create effective, computationally efficient custom Cypher;
+     * examples and optimization guidance are explicitly non-binding. */
     return name && (strcmp(name, "search_graph") == 0 ||
                     strcmp(name, "query_graph") == 0 ||
                     strcmp(name, "search_code") == 0 ||
@@ -5216,13 +5227,21 @@ static char *semantic_query_type_error_response(void) {
 }
 
 static bool run_semantic_query(yyjson_mut_doc *doc, yyjson_mut_val *root, const char *args,
-                               cbm_store_t *store, const char *project, int limit) {
+                               cbm_store_t *store, const char *project, int limit,
+                               bool *out_present, int *out_count) {
     cbm_vector_result_t *vresults = NULL;
     int vcount = 0;
+    bool present = false;
     bool type_error =
-        run_semantic_query_core(args, store, project, limit, &vresults, &vcount, NULL);
-    if (project && cbm_store_derived_view_is_stale(
-                       store, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES)) {
+        run_semantic_query_core(args, store, project, limit, &vresults, &vcount, &present);
+    if (out_present) {
+        *out_present = present;
+    }
+    if (out_count) {
+        *out_count = vcount;
+    }
+    if (present && project &&
+        cbm_store_derived_view_is_stale(store, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES)) {
         add_stale_derived_view_warning(
             doc, root, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
             "semantic_edges derived view is stale; semantic_results may be stale.");
@@ -5384,7 +5403,7 @@ static char *append_semantic_query_to_json(const char *base_json, const char *ar
     }
     yyjson_mut_doc_set_root(mdoc, root);
 
-    bool sq_type_error = run_semantic_query(mdoc, root, args, store, project, limit);
+    bool sq_type_error = run_semantic_query(mdoc, root, args, store, project, limit, NULL, NULL);
     if (sq_type_error) {
         if (type_error) {
             *type_error = true;
@@ -5831,6 +5850,15 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             true);
     }
 
+    /* A semantic-only request must not silently prepend an unrelated unfiltered
+     * graph search. Besides misleading callers, that legacy JSON behavior added
+     * an unnecessary O(graph-result-page) scan to the requested vector lookup.
+     * This mirrors the compact TOON path above. */
+    bool has_graph_filters = label || name_pattern || qn_pattern || unified_pattern ||
+                             file_pattern || relationship || exclude_entry_points ||
+                             min_degree != CBM_NOT_FOUND || max_degree != CBM_NOT_FOUND;
+    bool semantic_only = cbm_mcp_has_arg(args, "semantic_query") && !has_graph_filters;
+
     cbm_search_output_t out = {0};
     cbm_store_overlay_node_view_summary_t overlay_summary = {0};
     bool overlay_ready_for_nodes =
@@ -5844,10 +5872,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         (sort_by && (strcmp(sort_by, "degree") == 0 || strcmp(sort_by, "calls") == 0 ||
                      strcmp(sort_by, "linkrank") == 0));
     bool overlay_search_used = overlay_ready_for_nodes;
-    if (overlay_search_used) {
-        cbm_store_search_overlay_view(store, &params, &out);
-    } else {
-        cbm_store_search(store, &params, &out);
+    if (!semantic_only) {
+        if (overlay_search_used) {
+            cbm_store_search_overlay_view(store, &params, &out);
+        } else {
+            cbm_store_search(store, &params, &out);
+        }
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -5986,7 +6016,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     /* Semantic (vector) search: append semantic_results if semantic_query
      * array was provided.  Returns true on type error (non-array value). */
-    bool sq_type_error = run_semantic_query(doc, root, args, store, project, limit);
+    bool sq_present = false;
+    int semantic_count = 0;
+    bool sq_type_error =
+        run_semantic_query(doc, root, args, store, project, limit, &sq_present, &semantic_count);
     if (sq_type_error) {
         for (int pi = 0; pi < props_doc_count; pi++) {
             yyjson_doc_free(props_docs[pi]);
@@ -5999,6 +6032,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(file_pattern); free(relationship); free(search_mode); free(sort_by);
         free_string_array(exclude);
         return semantic_query_type_error_response();
+    }
+    if (semantic_only && sq_present && semantic_count == 0) {
+        yyjson_mut_obj_add_val(doc, root, "semantic_results", yyjson_mut_arr(doc));
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "No semantic matches. semantic_query needs a moderate/full index; "
+                               "try broader or fewer keywords.");
     }
 
     char *json = yy_doc_to_str(doc);
@@ -6226,7 +6265,8 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             snprintf(trunc_json, sizeof(trunc_json),
                      "{\"truncated\":true,\"total_bytes\":%lu,"
                      "\"rows_returned\":%d,"
-                     "\"hint\":\"Add LIMIT to your Cypher query\"}",
+                     "\"hint\":\"Narrow returned fields, add LIMIT when appropriate, or raise "
+                     "max_output_bytes\"}",
                      (unsigned long)json_len, total_rows);
             char *result_text = cbm_mcp_text_result(trunc_json, false);
             free(json);

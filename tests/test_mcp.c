@@ -2445,6 +2445,56 @@ TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view) {
     PASS();
 }
 
+TEST(tool_search_graph_semantic_only_json_does_not_return_unfiltered_nodes) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "semantic-only-json";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/semantic-only-json"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    /* A graph node without a semantic vector proves the handler does not
+     * silently substitute an unrelated unfiltered graph search when the
+     * semantic-only request has no matches. */
+    cbm_node_t unrelated = {.project = proj,
+                            .label = "Function",
+                            .name = "unrelated_ranked_function",
+                            .qualified_name = "semantic.only.unrelated_ranked_function",
+                            .file_path = "src/unrelated.c"};
+    ASSERT_GT(cbm_store_upsert_node(st, &unrelated), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":481,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"semantic-only-json\","
+             "\"semantic_query\":[\"transport\",\"lifecycle\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *results = yyjson_obj_get(root, "results");
+    yyjson_val *semantic_results = yyjson_obj_get(root, "semantic_results");
+    ASSERT_NOT_NULL(results);
+    ASSERT_TRUE(yyjson_is_arr(results));
+    ASSERT_EQ(yyjson_arr_size(results), 0);
+    ASSERT_NOT_NULL(semantic_results);
+    ASSERT_TRUE(yyjson_is_arr(semantic_results));
+    ASSERT_EQ(yyjson_arr_size(semantic_results), 0);
+    ASSERT_NOT_NULL(yyjson_obj_get(root, "hint"));
+    ASSERT_NULL(strstr(inner, "unrelated_ranked_function"));
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* MCP discovery probes must return valid lists, not -32601 Method-not-found:
  * clients like Cline call these on connect and
  * resources/list + prompts/list + resources/templates/list on connect and
@@ -10077,6 +10127,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_query_uses_search_limit_config);
     RUN_TEST(tool_search_graph_query_rejects_bad_semantic_query);
     RUN_TEST(tool_search_graph_semantic_query_warns_on_stale_semantic_view);
+    RUN_TEST(tool_search_graph_semantic_only_json_does_not_return_unfiltered_nodes);
     RUN_TEST(tool_search_graph_blocks_internal_fields_and_compacts_json_properties);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(mcp_discovery_methods_return_supported_lists);

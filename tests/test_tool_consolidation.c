@@ -544,6 +544,36 @@ TEST(default_tool_autoindex_description_is_precise) {
     PASS();
 }
 
+TEST(query_graph_description_explains_compositional_value) {
+    char *streamlined = cbm_mcp_tools_list(NULL);
+    ASSERT_NOT_NULL(streamlined);
+    ASSERT_NOT_NULL(strstr(streamlined, "Core compositional tool; use it early"));
+    ASSERT_NOT_NULL(
+        strstr(streamlined, "Create new, effective, computationally efficient custom Cypher"));
+    ASSERT_NOT_NULL(strstr(streamlined, "Non-exhaustive examples"));
+    ASSERT_NOT_NULL(strstr(streamlined, "Any valid query shape is allowed"));
+    ASSERT_NOT_NULL(strstr(streamlined, "multi-hop paths"));
+    ASSERT_NOT_NULL(strstr(streamlined, "aggregates/hotspots"));
+    ASSERT_NOT_NULL(strstr(streamlined, "LIMIT are optional efficiency aids"));
+    free(streamlined);
+
+    /* query_graph is serialized from the same canonical definition in both
+     * modes; this guards the user-facing value contract as well as schema parity. */
+    char *saved_mode = save_tool_mode();
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
+    char *classic = cbm_mcp_tools_list(NULL);
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(classic);
+    ASSERT_NOT_NULL(strstr(classic, "Core compositional tool; use it early"));
+    ASSERT_NOT_NULL(
+        strstr(classic, "Create new, effective, computationally efficient custom Cypher"));
+    ASSERT_NOT_NULL(strstr(classic, "Non-exhaustive examples"));
+    ASSERT_NOT_NULL(strstr(classic, "Any valid query shape is allowed"));
+    free(classic);
+
+    PASS();
+}
+
 TEST(revealed_trace_path_parameter_contract) {
     char *saved_mode = save_tool_mode();
     cbm_unsetenv("CBM_TOOL_MODE");
@@ -2918,6 +2948,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
     RUN_TEST(streamlined_core_parameter_contract);
     RUN_TEST(default_tool_autoindex_description_is_precise);
+    RUN_TEST(query_graph_description_explains_compositional_value);
     RUN_TEST(revealed_trace_path_parameter_contract);
     RUN_TEST(revealed_advanced_tool_schema_matches_handlers);
     /* Dispatch */
