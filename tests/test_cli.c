@@ -227,6 +227,19 @@ static void restore_test_env(const char *name, char *saved) {
     }
 }
 
+TEST(cli_runner_uses_private_codex_home) {
+    const char *home = getenv("HOME");
+    const char *codex_home = getenv("CODEX_HOME");
+    ASSERT_NOT_NULL(home);
+    ASSERT_NOT_NULL(codex_home);
+
+    char expected[1024];
+    int expected_len = snprintf(expected, sizeof(expected), "%s/.codex", home);
+    ASSERT(expected_len >= 0 && (size_t)expected_len < sizeof(expected));
+    ASSERT_STR_EQ(codex_home, expected);
+    PASS();
+}
+
 /* Helper: mkdirp */
 static int test_mkdirp(const char *path) {
     char tmp[1024];
@@ -2355,10 +2368,13 @@ TEST(cli_detect_agents_finds_codex) {
     snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
     test_mkdirp(dir);
 
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_unsetenv("CODEX_HOME");
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
-    ASSERT_TRUE(agents.codex);
+    restore_test_env("CODEX_HOME", saved_codex);
 
     test_rmdir_r(tmpdir);
+    ASSERT_TRUE(agents.codex);
     PASS();
 }
 
@@ -2396,7 +2412,10 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
     test_mkdirp(dir);
 
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_unsetenv("CODEX_HOME");
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    restore_test_env("CODEX_HOME", saved_codex);
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
     ASSERT(strstr(json, "writes_started") != NULL);
@@ -9686,6 +9705,7 @@ TEST(cli_sha256_file_matches_known_vector) {
  * ═══════════════════════════════════════════════════════════════════ */
 
 SUITE(cli) {
+    RUN_TEST(cli_runner_uses_private_codex_home);
     RUN_TEST(cli_sha256_file_matches_known_vector);
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);

@@ -25,10 +25,10 @@ int tf_skip_count = 0;
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
 #endif
 
-/* Test handlers that exercise the production index_repository flow must never
- * inherit the user's real cache. Individual tests may temporarily override
- * this sentinel and restore it; atexit removes anything left behind by an
- * assertion that returns before fixture cleanup. */
+/* Test handlers that exercise production indexing or agent installation must
+ * never inherit the user's real cache or Codex configuration. Individual tests
+ * may temporarily override this sentinel and restore it; atexit removes
+ * anything left behind by an assertion that returns before fixture cleanup. */
 static char tf_home_sentinel[512];
 
 static void tf_cleanup_cache_sentinel(void) {
@@ -45,8 +45,14 @@ static bool tf_setup_cache_sentinel(void) {
     /* Legacy integration fixtures derive DB paths from HOME, while production
      * cache_dir() prefers CBM_CACHE_DIR. A private HOME plus no inherited cache
      * override keeps both conventions pointed at the same isolated tree. */
-    cbm_setenv("HOME", tf_home_sentinel, 1);
-    cbm_unsetenv("CBM_CACHE_DIR");
+    char codex_home[sizeof(tf_home_sentinel) + sizeof("/.codex")];
+    int codex_home_len = snprintf(codex_home, sizeof(codex_home), "%s/.codex", tf_home_sentinel);
+    if (codex_home_len < 0 || (size_t)codex_home_len >= sizeof(codex_home) ||
+        cbm_setenv("HOME", tf_home_sentinel, 1) != 0 ||
+        cbm_setenv("CODEX_HOME", codex_home, 1) != 0 || cbm_unsetenv("CBM_CACHE_DIR") != 0) {
+        tf_cleanup_cache_sentinel();
+        return false;
+    }
     atexit(tf_cleanup_cache_sentinel);
     return true;
 }
@@ -304,7 +310,7 @@ int main(int argc, char **argv) {
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
     if (!tf_setup_cache_sentinel()) {
-        fprintf(stderr, "failed to create isolated test cache\n");
+        fprintf(stderr, "failed to create isolated test home\n");
         return 2;
     }
 
