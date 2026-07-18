@@ -13795,6 +13795,177 @@ TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow
     PASS();
 }
 
+typedef struct {
+    const char *name;
+    const char *filename;
+    const char *initial_source;
+    const char *updated_source;
+    cbm_pipeline_publish_kind_t expected_publish_kind;
+} incremental_language_oracle_case_t;
+
+static int run_incremental_language_oracle_case(const incremental_language_oracle_case_t *tc,
+                                                char *err, size_t err_sz) {
+    char root[CBM_PATH_MAX];
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(root, sizeof(root), "%s/cbm-incr-language-%s-XXXXXX", cache, tc->name);
+    if (n < 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root)) {
+        snprintf(err, err_sz, "%s: fixture directory creation failed", tc->name);
+        return CBM_STORE_ERR;
+    }
+
+    int rc = CBM_STORE_ERR;
+    char source_path[CBM_PATH_MAX];
+    char db_path[CBM_PATH_MAX];
+    char *project = NULL;
+    cbm_config_t *cfg = NULL;
+    cbm_pipeline_t *pipeline = NULL;
+    n = snprintf(source_path, sizeof(source_path), "%s/%s", root, tc->filename);
+    if (n < 0 || (size_t)n >= sizeof(source_path) ||
+        th_write_file(source_path, tc->initial_source) != 0) {
+        snprintf(err, err_sz, "%s: initial source write failed", tc->name);
+        goto cleanup;
+    }
+    n = snprintf(db_path, sizeof(db_path), "%s/graph.db", root);
+    if (n < 0 || (size_t)n >= sizeof(db_path)) {
+        snprintf(err, err_sz, "%s: database path overflow", tc->name);
+        goto cleanup;
+    }
+
+    cfg = incremental_test_config(root);
+    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                               CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER) != 0) {
+        snprintf(err, err_sz, "%s: incremental config setup failed", tc->name);
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "%s: initial pipeline allocation failed", tc->name);
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "%s: initial full publication failed", tc->name);
+        goto cleanup;
+    }
+    project = cbm_strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+    if (!project) {
+        snprintf(err, err_sz, "%s: project name allocation failed", tc->name);
+        goto cleanup;
+    }
+
+    if (th_write_file(source_path, tc->updated_source) != 0) {
+        snprintf(err, err_sz, "%s: updated source write failed", tc->name);
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "%s: incremental pipeline allocation failed", tc->name);
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "%s: incremental publication failed", tc->name);
+        goto cleanup;
+    }
+    cbm_pipeline_publish_kind_t actual_kind = cbm_pipeline_publish_kind(pipeline);
+    const char *actual_reason = cbm_pipeline_publish_reason(pipeline);
+    if (actual_kind != tc->expected_publish_kind) {
+        snprintf(err, err_sz, "%s: publish kind=%d reason=%s, expected=%d", tc->name, actual_kind,
+                 actual_reason ? actual_reason : "", tc->expected_publish_kind);
+        goto cleanup;
+    }
+    if (actual_kind == CBM_PIPELINE_PUBLISH_FULL &&
+        (!actual_reason || strcmp(actual_reason, "scoped_lsp_gap") != 0)) {
+        snprintf(err, err_sz, "%s: full fallback reason=%s, expected=scoped_lsp_gap", tc->name,
+                 actual_reason ? actual_reason : "");
+        goto cleanup;
+    }
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+
+    rc =
+        pipeline_compare_current_db_to_fresh_fast_rebuild(root, db_path, project, cfg, err, err_sz);
+    if (rc != 0 && (!err || err[0] == '\0')) {
+        snprintf(err, err_sz, "%s: incremental graph differed from fresh rebuild", tc->name);
+    }
+
+cleanup:
+    cbm_pipeline_free(pipeline);
+    free(project);
+    cbm_config_close(cfg);
+    const char *artifact_dir = getenv("CBM_TEST_ARTIFACT_DIR");
+    if (rc != 0 && artifact_dir && artifact_dir[0] != '\0') {
+        printf("    [incremental-language-artifact] %s\n", root);
+    } else {
+        th_rmtree(root);
+    }
+    return rc;
+}
+
+TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild) {
+    static const incremental_language_oracle_case_t cases[] = {
+        {"go", "sample.go", "package sample\n\nfunc Value() int { return 1 }\n",
+         "package sample\n\nfunc Value() int { return 2 }\nfunc Added() int { return Value() }\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"c", "sample.c", "int matrix_value(void) { return 1; }\n",
+         "int matrix_value(void) { return 2; }\nint matrix_added(void) { return matrix_value(); "
+         "}\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"cpp", "sample.cpp", "int matrix_value() { return 1; }\n",
+         "int matrix_value() { return 2; }\nint matrix_added() { return matrix_value(); }\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"cuda", "sample.cu", "__device__ int matrix_value() { return 1; }\n",
+         "__device__ int matrix_value() { return 2; }\n"
+         "__device__ int matrix_added() { return matrix_value(); }\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"python", "sample.py", "def matrix_value():\n    return 1\n",
+         "def matrix_value():\n    return 2\n\ndef matrix_added():\n    return matrix_value()\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"javascript", "sample.js", "export function matrixValue() { return 1; }\n",
+         "export function matrixValue() { return 2; }\n"
+         "export function matrixAdded() { return matrixValue(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"typescript", "sample.ts", "export function matrixValue(): number { return 1; }\n",
+         "export function matrixValue(): number { return 2; }\n"
+         "export function matrixAdded(): number { return matrixValue(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"tsx", "sample.tsx", "export function MatrixValue(): number { return 1; }\n",
+         "export function MatrixValue(): number { return 2; }\n"
+         "export function MatrixAdded(): number { return MatrixValue(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"php", "sample.php", "<?php function matrix_value() { return 1; }\n",
+         "<?php function matrix_value() { return 2; }\n"
+         "function matrix_added() { return matrix_value(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"csharp", "Sample.cs", "class MatrixType { static int Value() { return 1; } }\n",
+         "class MatrixType { static int Value() { return 2; } "
+         "static int Added() { return Value(); } }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"java", "MatrixType.java", "class MatrixType { static int value() { return 1; } }\n",
+         "class MatrixType { static int value() { return 2; } "
+         "static int added() { return value(); } }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"kotlin", "Sample.kt", "fun matrixValue(): Int = 1\n",
+         "fun matrixValue(): Int = 2\nfun matrixAdded(): Int = matrixValue()\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"rust", "sample.rs", "pub fn matrix_value() -> i32 { 1 }\n",
+         "pub fn matrix_value() -> i32 { 2 }\n"
+         "pub fn matrix_added() -> i32 { matrix_value() }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+    };
+    char err[CBM_SZ_8K];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        err[0] = '\0';
+        int rc = run_incremental_language_oracle_case(&cases[i], err, sizeof(err));
+        if (rc != 0) {
+            FAIL(err[0] ? err : "incremental language oracle failed");
+        }
+    }
+    PASS();
+}
+
 TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild) {
     enum { PIPELINE_EXACT_ONE_PATH = 1 };
     if (setup_incremental_repo() != 0) {
@@ -17455,6 +17626,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
     RUN_TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild);
     RUN_TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow);
+    RUN_TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild);
     RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);
     RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
     RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
