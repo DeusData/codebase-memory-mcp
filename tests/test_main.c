@@ -263,14 +263,23 @@ extern void cbm_kind_in_set_free_cache(void);
 #define ENV_OVERWRITE 1
 /* Test-only injection used to prove cleanup failures make the runner red. */
 #define TEST_CACHE_CLEANUP_FAIL_ENV "CBM_TEST_FAIL_CACHE_CLEANUP"
+/* Existing integration-test artifact root: setting it opts failed runs into
+ * retaining their isolated cache alongside other diagnostic evidence. */
+#define TEST_ARTIFACT_DIR_ENV "CBM_TEST_ARTIFACT_DIR"
 
 static char test_cache_dir[TEST_CACHE_DIR_CAP];
 
 static int cleanup_test_cache(void) {
-    /* Preserve failed/crashed runs for diagnosis; green runs own and remove
-     * only the isolated cache root created below. Forked tests use _exit(), so
-     * child processes do not run this inherited atexit handler. */
-    if (tf_fail_count != 0 || !test_cache_dir[0]) {
+    if (!test_cache_dir[0]) {
+        return 0;
+    }
+    /* Retention is explicit. Ordinary red and green runs both clean the exact
+     * runner-owned root; CBM_TEST_ARTIFACT_DIR opts a failed run into keeping
+     * its cache for debugging. Forked children use _exit() and cannot run this
+     * inherited atexit handler. */
+    const char *artifact_dir = getenv(TEST_ARTIFACT_DIR_ENV);
+    if (tf_fail_count != 0 && artifact_dir && artifact_dir[0] != '\0') {
+        fprintf(stderr, "retained failed test cache: %s\n", test_cache_dir);
         return 0;
     }
     if (getenv(TEST_CACHE_CLEANUP_FAIL_ENV)) {
@@ -335,8 +344,15 @@ int main(int argc, char **argv) {
      * path (pipeline.c + mcp.c) honors CBM_CACHE_DIR regardless. */
     const char *no_iso = getenv("CBM_TEST_NO_ISOLATE");
     if (!no_iso || no_iso[0] == '\0') {
+        const char *artifact_dir = getenv(TEST_ARTIFACT_DIR_ENV);
+        const char *cache_parent =
+            artifact_dir && artifact_dir[0] != '\0' ? artifact_dir : cbm_tmpdir();
+        if (artifact_dir && artifact_dir[0] != '\0' && !cbm_mkdir_p(artifact_dir, 0755)) {
+            fprintf(stderr, "failed to create test artifact directory: %s\n", artifact_dir);
+            return 1;
+        }
         int n = snprintf(test_cache_dir, sizeof(test_cache_dir), "%s/cbm-test-cache-XXXXXX",
-                         cbm_tmpdir());
+                         cache_parent);
         if (n < 0 || (size_t)n >= sizeof(test_cache_dir) || !cbm_mkdtemp(test_cache_dir)) {
             fprintf(stderr, "failed to create isolated test cache\n");
             return 1;

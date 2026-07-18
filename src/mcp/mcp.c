@@ -5437,28 +5437,63 @@ static char *add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t
     return cbm_mcp_add_dirty_file_freshness_to_json(base_json, store, project, NULL);
 }
 
-/* Convert shell-glob wildcards to POSIX ERE: bare '*' → '.*', bare '?' → '.'
- * "Bare" means not already preceded by '.' or '\'. This lets users pass
- * glob-style patterns like "*tool*" and have them work as ".*tool.*". */
+/* Convert shell-glob wildcards to POSIX ERE: bare '*' → '.*', bare '?' → '.'.
+ * Keep explicit regex wildcards (.* / .?), escaped characters, character
+ * classes, and quantifiers following a closed regex group/class unchanged. */
 static char *glob_to_regex(const char *glob) {
     size_t len = strlen(glob);
     /* Worst case: every char expands to 2 chars plus NUL */
     char *out = malloc(len * 2 + 1);
     if (!out) return NULL;
     size_t o = 0;
+    bool in_class = false;
+    bool escaped = false;
     for (size_t i = 0; i < len; i++) {
         char prev = i > 0 ? glob[i - 1] : 0;
-        if (glob[i] == '*' && prev != '.' && prev != '\\') {
+        char current = glob[i];
+        if (!escaped && current == '[') {
+            in_class = true;
+        } else if (!escaped && current == ']' && in_class) {
+            in_class = false;
+        }
+        bool regex_quantifier_target = prev == '.' || prev == ']' || prev == ')' || prev == '}';
+        if (!escaped && !in_class && current == '*' && !regex_quantifier_target) {
             out[o++] = '.';
             out[o++] = '*';
-        } else if (glob[i] == '?' && prev != '.' && prev != '\\') {
+        } else if (!escaped && !in_class && current == '?' && !regex_quantifier_target) {
             out[o++] = '.';
         } else {
-            out[o++] = glob[i];
+            out[o++] = current;
         }
+        escaped = !escaped && current == '\\';
     }
     out[o] = '\0';
     return out;
+}
+
+static bool normalize_search_pattern(char **pattern, const char *field, char *error,
+                                     size_t error_size) {
+    if (!pattern || !*pattern) {
+        return true;
+    }
+    char *converted = glob_to_regex(*pattern);
+    if (!converted) {
+        snprintf(error, error_size, "{\"error\":\"out of memory normalizing %s\"}", field);
+        return false;
+    }
+    cbm_regex_t re;
+    if (cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+        snprintf(error, error_size,
+                 "{\"error\":\"invalid regex in %s: '%s'\","
+                 "\"hint\":\"Use POSIX regex syntax or glob wildcards such as *tool*\"}",
+                 field, *pattern);
+        free(converted);
+        return false;
+    }
+    cbm_regfree(&re);
+    free(*pattern);
+    *pattern = converted;
+    return true;
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
@@ -5556,74 +5591,30 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     if (label && label[0] == '\0') { free(label); label = NULL; }
     char *name_pattern = cbm_mcp_get_string_arg(args, "name_pattern");
     char *qn_pattern = cbm_mcp_get_string_arg(args, "qn_pattern");
-    /* F9: pre-validate regex patterns — auto-convert glob wildcards to regex.
-     * Users/agents frequently pass *tool* (glob) instead of .*tool.* (regex).
-     * On regex compilation failure, try glob_to_regex() conversion before erroring. */
-    if (name_pattern) {
-        cbm_regex_t re;
-        if (cbm_regcomp(&re, name_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
-            char *converted = glob_to_regex(name_pattern);
-            if (converted && cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
-                cbm_regfree(&re);
-                free(name_pattern);
-                name_pattern = converted;
-            } else {
-                free(converted);
-                char errbuf[512];
-                snprintf(errbuf, sizeof(errbuf),
-                    "{\"error\":\"invalid regex in name_pattern: '%s'\","
-                    "\"hint\":\"Use regex syntax: '.*tool.*' instead of '*tool*'\"}", name_pattern);
-                free(label); free(name_pattern); free(pe.value);
-                return cbm_mcp_text_result(errbuf, true);
-            }
-        } else {
-            cbm_regfree(&re);
-        }
-    }
-    if (qn_pattern) {
-        cbm_regex_t re;
-        if (cbm_regcomp(&re, qn_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
-            char *converted = glob_to_regex(qn_pattern);
-            if (converted && cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
-                cbm_regfree(&re);
-                free(qn_pattern);
-                qn_pattern = converted;
-            } else {
-                free(converted);
-                char errbuf[512];
-                snprintf(errbuf, sizeof(errbuf),
-                    "{\"error\":\"invalid regex in qn_pattern: '%s'\","
-                    "\"hint\":\"Use regex syntax: '.*tool.*' instead of '*tool*'\"}", qn_pattern);
-                free(label); free(name_pattern); free(qn_pattern); free(pe.value);
-                return cbm_mcp_text_result(errbuf, true);
-            }
-        } else {
-            cbm_regfree(&re);
-        }
+    /* Normalize glob-compatible wildcards before compiling. Waiting for regex
+     * compilation to fail misses ambiguous inputs such as foo?ar and foo*|bar*,
+     * which are valid POSIX EREs with different semantics. */
+    char pattern_error[512];
+    if (!normalize_search_pattern(&name_pattern, "name_pattern", pattern_error,
+                                  sizeof(pattern_error)) ||
+        !normalize_search_pattern(&qn_pattern, "qn_pattern", pattern_error,
+                                  sizeof(pattern_error))) {
+        free(label);
+        free(name_pattern);
+        free(qn_pattern);
+        free(pe.value);
+        return cbm_mcp_text_result(pattern_error, true);
     }
     /* NEW: unified pattern — OR search across name AND qualified_name */
     char *unified_pattern = cbm_mcp_get_string_arg(args, "pattern");
-    if (unified_pattern) {
-        cbm_regex_t re;
-        if (cbm_regcomp(&re, unified_pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
-            char *converted = glob_to_regex(unified_pattern);
-            if (converted && cbm_regcomp(&re, converted, CBM_REG_EXTENDED | CBM_REG_NOSUB) == 0) {
-                cbm_regfree(&re);
-                free(unified_pattern);
-                unified_pattern = converted;
-            } else {
-                free(converted);
-                char errbuf[512];
-                snprintf(errbuf, sizeof(errbuf),
-                    "{\"error\":\"invalid regex in pattern: '%s'\","
-                    "\"hint\":\"Use regex syntax: '.*tool.*' instead of '*tool*'\"}", unified_pattern);
-                free(label); free(name_pattern); free(qn_pattern);
-                free(unified_pattern); free(pe.value);
-                return cbm_mcp_text_result(errbuf, true);
-            }
-        } else {
-            cbm_regfree(&re);
-        }
+    if (!normalize_search_pattern(&unified_pattern, "pattern", pattern_error,
+                                  sizeof(pattern_error))) {
+        free(label);
+        free(name_pattern);
+        free(qn_pattern);
+        free(unified_pattern);
+        free(pe.value);
+        return cbm_mcp_text_result(pattern_error, true);
     }
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
     char *relationship = cbm_mcp_get_string_arg(args, "relationship");
@@ -8679,12 +8670,33 @@ static char *build_worker_failure_response(const char *args, cbm_proc_outcome_t 
     return result;
 }
 
+bool cbm_mcp_index_response_published(const char *response) {
+    if (!response) {
+        return false;
+    }
+    yyjson_doc *outer = yyjson_read(response, strlen(response), 0);
+    if (!outer) {
+        return false;
+    }
+    yyjson_val *content = yyjson_obj_get(yyjson_doc_get_root(outer), "content");
+    yyjson_val *item = content && yyjson_is_arr(content) ? yyjson_arr_get(content, 0) : NULL;
+    yyjson_val *text_value = item ? yyjson_obj_get(item, "text") : NULL;
+    const char *text = text_value ? yyjson_get_str(text_value) : NULL;
+    yyjson_doc *inner = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *status_value = inner ? yyjson_obj_get(yyjson_doc_get_root(inner), "status") : NULL;
+    const char *status = status_value ? yyjson_get_str(status_value) : NULL;
+    bool published = status && (strcmp(status, "indexed") == 0 || strcmp(status, "degraded") == 0);
+    yyjson_doc_free(inner);
+    yyjson_doc_free(outer);
+    return published;
+}
+
 /* Drop the cached store so the next query reopens whatever the worker wrote (each
  * worker is a fresh process that deletes + recreates the .db). NULL-safe: the
  * background watcher path (main.c) has no MCP server / cached store — the child
  * writes the DB and the parent only needs the return code, so there is nothing
  * to invalidate. */
-static void supervisor_invalidate_store(cbm_mcp_server_t *srv) {
+void cbm_mcp_server_notify_index_published(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
@@ -8841,7 +8853,6 @@ static bool supervisor_append_quarantine(const char *path, const char *rel, cons
  * Returns NULL only when the worker could not be spawned at all, so the caller
  * degrades to the in-process path. */
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
-    supervisor_invalidate_store(srv);
     const atomic_bool *cancel_requested = srv ? &srv->stop_requested : NULL;
 
     /* First attempt: normal parallel run. */
@@ -8850,7 +8861,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
 
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        cbm_mcp_server_notify_index_published(srv);
         return NULL; /* degrade to in-process */
     }
     if (wr.outcome == CBM_PROC_CLEAN) {
@@ -8862,13 +8873,13 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
         wr.response = NULL;
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        cbm_mcp_server_notify_index_published(srv);
         return resp;
     }
     if (cancel_requested && atomic_load(cancel_requested)) {
         cbm_proc_outcome_t cancelled_outcome = wr.outcome;
         cbm_index_worker_result_free(&wr);
-        supervisor_invalidate_store(srv);
+        cbm_mcp_server_notify_index_published(srv);
         return build_worker_failure_response(args, cancelled_outcome);
     }
 
@@ -9011,7 +9022,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     }
 
     (void)remove(quarantine_path);
-    supervisor_invalidate_store(srv);
+    cbm_mcp_server_notify_index_published(srv);
 
     if (resp) {
         return resp;
@@ -9041,10 +9052,10 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     return resp;
 }
 
-/* Public entry (see mcp.h): the watcher re-index in main.c has no MCP server, so
- * it reaches the supervised runner through this srv-less wrapper. */
-char *cbm_mcp_index_run_supervised_path(const char *root_path) {
-    return index_run_supervised_path(NULL, root_path);
+/* Public entry (see mcp.h): watcher and auto-index callers pass their long-lived
+ * server so worker publication can defer cached-store invalidation safely. */
+char *cbm_mcp_index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path) {
+    return index_run_supervised_path(srv, root_path);
 }
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */

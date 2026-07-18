@@ -187,11 +187,21 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
  * crash/hang-isolating runner used by handle_index_repository), so the child
  * returns 100% of its RSS to the OS on exit instead of ratcheting the long-lived
  * parent. Builds {"repo_path": root_path} internally. Returns the worker's
- * response string (caller frees) on success, or NULL to signal the caller must
- * degrade to the in-process path (kill switch set, spawn failure, or the process
- * is not a supervisor host). This is the shared entry the watcher re-index
- * (main.c) and the session auto-index (mcp.c) route through. */
-char *cbm_mcp_index_run_supervised_path(const char *root_path);
+ * response string (caller frees), including contained index-error responses, or
+ * NULL to signal the caller must degrade to the in-process path (kill switch,
+ * spawn failure, or an unmarked supervisor host). This is the shared entry used
+ * by watcher re-index (main.c) and session auto-index (mcp.c). */
+char *cbm_mcp_index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path);
+
+/* Return true only when a supervised index tool response reports an indexed or
+ * degraded (partially indexed) publication. Malformed and error responses are
+ * false so watcher baselines remain pending for retry. */
+bool cbm_mcp_index_response_published(const char *response);
+
+/* Notify a long-lived server that an external index publisher replaced its
+ * project database. Thread-safe and non-blocking: the next request reopens the
+ * cached store on the request thread that owns it. */
+void cbm_mcp_server_notify_index_published(cbm_mcp_server_t *srv);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 

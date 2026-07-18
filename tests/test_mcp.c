@@ -173,6 +173,29 @@ static int mcp_project_db_path(char *out, size_t out_sz, const char *cache,
     return CBM_STORE_OK;
 }
 
+static bool mcp_create_generation_db(const char *db_path, const char *project,
+                                     const char *node_name) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return false;
+    }
+    char qualified_name[CBM_PATH_MAX];
+    int n = snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, node_name);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = node_name,
+                       .qualified_name = qualified_name,
+                       .file_path = "src/generation.c",
+                       .start_line = 1,
+                       .end_line = 2,
+                       .properties_json = "{}"};
+    bool ok = n >= 0 && (size_t)n < sizeof(qualified_name) &&
+              cbm_store_upsert_project(store, project, "/synthetic/repository") == CBM_STORE_OK &&
+              cbm_store_upsert_node(store, &node) > 0;
+    cbm_store_close(store);
+    return ok;
+}
+
 static void mcp_unlink_db_sidecars(const char *db_path) {
     if (!db_path || !db_path[0]) {
         return;
@@ -700,6 +723,24 @@ TEST(mcp_text_result_error) {
     ASSERT_NOT_NULL(strstr(json, "\"isError\":true"));
     ASSERT_NOT_NULL(strstr(json, "something failed"));
     free(json);
+    PASS();
+}
+
+TEST(supervised_index_response_publication_status_contract) {
+    char *indexed = cbm_mcp_text_result("{\"status\":\"indexed\"}", false);
+    char *degraded = cbm_mcp_text_result("{\"status\":\"degraded\"}", false);
+    char *failed = cbm_mcp_text_result("{\"status\":\"error\"}", true);
+    ASSERT_NOT_NULL(indexed);
+    ASSERT_NOT_NULL(degraded);
+    ASSERT_NOT_NULL(failed);
+    ASSERT_TRUE(cbm_mcp_index_response_published(indexed));
+    ASSERT_TRUE(cbm_mcp_index_response_published(degraded));
+    ASSERT_FALSE(cbm_mcp_index_response_published(failed));
+    ASSERT_FALSE(cbm_mcp_index_response_published("not-json"));
+    ASSERT_FALSE(cbm_mcp_index_response_published(NULL));
+    free(indexed);
+    free(degraded);
+    free(failed);
     PASS();
 }
 
@@ -8946,6 +8987,50 @@ TEST(index_supervisor_gate_requires_marked_host_issue845) {
     PASS();
 }
 
+/* A watcher publishes a new database generation from a worker process while the
+ * long-lived MCP request thread may still hold a read-only handle to the old,
+ * unlinked inode. Publication notification must be deferred: the watcher only
+ * marks the handle stale, and the next request closes and reopens it on its
+ * owning thread. */
+TEST(watcher_publication_reopens_cached_store_generation) {
+    const char *cache = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache);
+    const char *project = "synthetic-generation-project";
+    char live_path[CBM_PATH_MAX];
+    char next_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(live_path, sizeof(live_path), cache, project), CBM_STORE_OK);
+    snprintf(next_path, sizeof(next_path), "%s/next-generation.db", cache);
+    ASSERT_TRUE(mcp_create_generation_db(live_path, project, "BeforePublication"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *before =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"synthetic-generation-project\","
+                            "\"name_pattern\":\"BeforePublication\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(before);
+    ASSERT_NOT_NULL(strstr(before, "BeforePublication"));
+    free(before);
+
+    ASSERT_TRUE(mcp_create_generation_db(next_path, project, "AfterPublication"));
+    cbm_remove_db_sidecars(live_path);
+    ASSERT_EQ(cbm_replace_file(next_path, live_path), 0);
+
+    cbm_mcp_server_notify_index_published(srv);
+    char *after = cbm_mcp_handle_tool(srv, "search_graph",
+                                      "{\"project\":\"synthetic-generation-project\","
+                                      "\"name_pattern\":\"AfterPublication\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "AfterPublication"));
+    ASSERT_NULL(strstr(after, "BeforePublication"));
+    free(after);
+
+    cbm_mcp_server_free(srv);
+    mcp_unlink_db_sidecars(live_path);
+    mcp_unlink_db_sidecars(next_path);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #832 — background auto-index + watcher re-index must run in the
  *         supervised worker SUBPROCESS (RSS isolation)
@@ -8987,7 +9072,7 @@ static int idx832_supervised_route_check(const char *repo_dir) {
     cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
 
     int spawns_before = cbm_index_supervisor_spawn_count();
-    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+    char *resp = cbm_mcp_index_run_supervised_path(NULL, repo_dir);
     int spawns_after = cbm_index_supervisor_spawn_count();
 
     if (spawns_after == spawns_before) {
@@ -9138,7 +9223,7 @@ static int idxpar_recovery_check(const char *repo_dir) {
     cbm_setenv("CBM_TEST_CRASH_ON", "idxpar_crasher", 1);
 
     int st_before = cbm_index_supervisor_spawn_st_count();
-    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+    char *resp = cbm_mcp_index_run_supervised_path(NULL, repo_dir);
     int st_after = cbm_index_supervisor_spawn_st_count();
     cbm_unsetenv("CBM_TEST_CRASH_ON");
 
@@ -9924,6 +10009,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_text_result_skips_structured_content_for_plain_text);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
+    RUN_TEST(supervised_index_response_publication_status_contract);
 
     /* Argument extraction */
     RUN_TEST(mcp_get_tool_name);
@@ -10095,6 +10181,7 @@ SUITE(mcp) {
     /* Query store read-only (data integrity) */
     RUN_TEST(readonly_query_does_not_mutate_db);
     RUN_TEST(readonly_query_succeeds_on_readonly_fs);
+    RUN_TEST(watcher_publication_reopens_cached_store_generation);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);

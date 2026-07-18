@@ -210,11 +210,12 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
      * Degrade to the in-process pipeline when the supervisor is off (kill switch)
      * or the spawn fails. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *resp = cbm_mcp_index_run_supervised_path(root_path);
+        char *resp = cbm_mcp_index_run_supervised_path(g_server, root_path);
         if (resp) {
+            bool published = cbm_mcp_index_response_published(resp);
             free(resp);
             cbm_pipeline_unlock();
-            return 0;
+            return published ? 0 : CBM_STORE_ERR;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
     }
@@ -246,6 +247,7 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
             cbm_store_close(store);
         }
         free(pname);
+        cbm_mcp_server_notify_index_published(g_server);
     }
     cbm_mem_collect();
     cbm_pipeline_unlock();
@@ -948,8 +950,16 @@ int main(int argc, char **argv) {
         g_http_server = NULL;
     }
 
-    /* Join autoindex thread first — it may reference watcher and store.
-     * cbm_mcp_server_free joins the autoindex thread internally. */
+    /* Stop and join the watcher callback before freeing g_server: an in-flight
+     * publication may atomically mark the server's cached store stale. Keep the
+     * watcher object itself alive until cbm_mcp_server_free joins autoindex,
+     * because autoindex may still reference srv->watcher. */
+    if (watcher_started) {
+        cbm_watcher_stop(g_watcher);
+        cbm_thread_join(&watcher_tid);
+    }
+
+    /* Joins autoindex while watcher and watch_store are still alive. */
     cbm_mcp_server_free(g_server);
 
     /* Release pipeline-level global state (compiled regex patterns etc.).
@@ -958,10 +968,6 @@ int main(int argc, char **argv) {
      * cleanup (which ran earlier in cbm_http_server_free). */
     cbm_pipeline_global_cleanup();
 
-    if (watcher_started) {
-        cbm_watcher_stop(g_watcher);
-        cbm_thread_join(&watcher_tid);
-    }
     cbm_watcher_free(g_watcher);
     cbm_store_close(watch_store);
     cbm_config_close(runtime_config);
