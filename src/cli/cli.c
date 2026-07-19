@@ -5159,6 +5159,13 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
     return rc;
 }
 
+/* Whether the background watcher subsystem should run (default true). main()
+ * gates watcher-thread startup on this; see cbm_config_watcher_enabled in
+ * cli.h. NULL-safe via cbm_config_get_bool (a NULL cfg returns the default). */
+bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
+    return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
+}
+
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
 int cbm_cmd_config(int argc, char **argv) {
@@ -5178,6 +5185,8 @@ int cbm_cmd_config(int argc, char **argv) {
                "Register background git watcher on session connect");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_UI_LANG, "auto",
                "Pin graph UI language: en, zh, or auto");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_WATCHER_ENABLED, "true",
+               "Run the background watcher thread (auto-reindex); false to disable");
         return 0;
     }
 
@@ -5207,6 +5216,8 @@ int cbm_cmd_config(int argc, char **argv) {
                cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
                cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+        printf("  %-25s = %-10s\n", CBM_CONFIG_WATCHER_ENABLED,
+               cbm_config_get(cfg, CBM_CONFIG_WATCHER_ENABLED, "true"));
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");

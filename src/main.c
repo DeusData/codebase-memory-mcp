@@ -793,10 +793,21 @@ int main(int argc, char **argv) {
 
     cbm_store_t *watch_store = NULL;
     if (!restricted_tool_profile) {
-        watch_store = cbm_store_open_memory();
-        g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
-        /* Wire watcher + config into MCP server for session auto-index. */
-        cbm_mcp_server_set_watcher(g_server, g_watcher);
+        /* #335: watcher_enabled (default true) is the master switch for the
+         * background watcher. When false, skip creating it entirely — the poll
+         * thread never starts (the thread-create below is gated on g_watcher)
+         * and no projects register (register_watcher_if_enabled early-returns
+         * on a NULL watcher). Manual index_repository is unaffected. The config
+         * wiring below stays unconditional so auto_index / auto_watch keep
+         * working even when the watcher is off. */
+        if (cbm_config_watcher_enabled(runtime_config)) {
+            watch_store = cbm_store_open_memory();
+            g_watcher = cbm_watcher_new(watch_store, watcher_index_fn, NULL);
+            /* Wire watcher into MCP server for session auto-index. */
+            cbm_mcp_server_set_watcher(g_server, g_watcher);
+        } else {
+            cbm_log_info("watcher.disabled", "reason", "config");
+        }
         cbm_mcp_server_set_config(g_server, runtime_config);
     }
     cbm_thread_t watcher_tid;

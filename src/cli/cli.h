@@ -367,6 +367,15 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+#define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+
+/* Whether the background watcher subsystem should run at all (default true).
+ * When false, main() skips creating and starting the watcher entirely: the
+ * poll thread never starts and no projects are registered (#335). Distinct
+ * from auto_watch, which only gates per-session registration while the
+ * watcher IS running. NULL-safe — a NULL cfg returns the default (true), so a
+ * failure to open the config store never silently disables the watcher. */
+bool cbm_config_watcher_enabled(cbm_config_t *cfg);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
