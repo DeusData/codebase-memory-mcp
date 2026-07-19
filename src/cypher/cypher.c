@@ -2225,6 +2225,7 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
 /* A binding: maps variable names to nodes and/or edges */
 typedef struct {
     const char *var_names[CYP_MAX_VARS]; /* variable names (nodes) */
+    bool var_name_owned[CYP_MAX_VARS];   /* WITH aliases are heap-owned */
     cbm_node_t var_nodes[CYP_MAX_VARS];  /* node data */
     int var_count;
     const char *edge_var_names[CYP_MAX_EDGE_VARS]; /* variable names (edges) */
@@ -2533,6 +2534,11 @@ static void binding_set_edge(binding_t *b, const char *var, const cbm_edge_t *ed
 static void binding_free(binding_t *b) {
     for (int i = 0; i < b->var_count; i++) {
         node_fields_free(&b->var_nodes[i]);
+        if (b->var_name_owned[i]) {
+            free((void *)b->var_names[i]);
+            b->var_names[i] = NULL;
+            b->var_name_owned[i] = false;
+        }
     }
     for (int i = 0; i < b->edge_var_count; i++) {
         edge_fields_free(&b->edge_vars[i]);
@@ -2543,13 +2549,10 @@ static void binding_free(binding_t *b) {
 static void binding_copy(binding_t *dst, const binding_t *src) {
     dst->var_count = src->var_count;
     for (int i = 0; i < src->var_count; i++) {
-        /* Ordinary names are AST-borrowed. WITH virtual names instead alias
-         * the projected node's owned qualified_name; after deep-copying that
-         * node the copied binding must point at its own allocation. */
-        bool name_owned_by_node = src->var_names[i] == src->var_nodes[i].qualified_name;
         node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
-        dst->var_names[i] =
-            name_owned_by_node ? dst->var_nodes[i].qualified_name : src->var_names[i];
+        dst->var_name_owned[i] = src->var_name_owned[i];
+        dst->var_names[i] = src->var_name_owned[i] ? heap_strdup(src->var_names[i])
+                                                   : src->var_names[i];
     }
     dst->edge_var_count = src->edge_var_count;
     for (int i = 0; i < src->edge_var_count; i++) {
@@ -2575,6 +2578,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
         return;
     }
     b->var_names[b->var_count] = var; /* not owned — points to AST string */
+    b->var_name_owned[b->var_count] = false;
     node_deep_copy(&b->var_nodes[b->var_count], node);
     b->var_count++;
 }
@@ -4222,12 +4226,13 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
 
 /* Add a virtual variable binding for one WITH item */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
-    cbm_node_t vn = {.name = heap_strdup(val), .qualified_name = heap_strdup(alias)};
-    if (vb->var_count < CYP_BUF_16) {
-        vb->var_names[vb->var_count] = vn.qualified_name;
-        vb->var_nodes[vb->var_count] = vn;
-        vb->var_count++;
+    if (vb->var_count >= CYP_MAX_VARS) {
+        return;
     }
+    int index = vb->var_count++;
+    vb->var_names[index] = heap_strdup(alias);
+    vb->var_name_owned[index] = true;
+    vb->var_nodes[index].name = heap_strdup(val);
 }
 
 /* Free with_agg_t array */

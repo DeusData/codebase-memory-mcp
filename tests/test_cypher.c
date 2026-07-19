@@ -2567,12 +2567,13 @@ TEST(cypher_exec_with_node_groupvar_prop) {
                                 "MATCH (f:Function)-[:CALLS]->(g:Function) "
                                 "WHERE g.name = \"ValidateOrder\" "
                                 "WITH g, COUNT(*) AS c "
-                                "RETURN g.file_path, g.name, c",
+                                "RETURN g.file_path, g.name, g.qualified_name, c",
                                 "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 1);
     ASSERT_STR_EQ(r.rows[0][0], "validate.go"); /* was "" before the fix */
     ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[0][2], "test.ValidateOrder");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
