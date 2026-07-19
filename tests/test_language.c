@@ -89,6 +89,11 @@ TEST(lang_ext_csharp) {
     ASSERT_EQ(cbm_language_for_extension(".cs"), CBM_LANG_CSHARP);
     PASS();
 }
+TEST(lang_ext_visualbasic) {
+    ASSERT_EQ(cbm_language_for_extension(".vb"), CBM_LANG_VISUALBASIC);
+    ASSERT_EQ(cbm_language_for_filename("Form1.Designer.vb"), CBM_LANG_VISUALBASIC);
+    PASS();
+}
 TEST(lang_ext_php) {
     ASSERT_EQ(cbm_language_for_extension(".php"), CBM_LANG_PHP);
     PASS();
@@ -553,6 +558,10 @@ TEST(lang_name_cpp) {
 }
 TEST(lang_name_csharp) {
     ASSERT_STR_EQ(cbm_language_name(CBM_LANG_CSHARP), "C#");
+    PASS();
+}
+TEST(lang_name_visualbasic) {
+    ASSERT_STR_EQ(cbm_language_name(CBM_LANG_VISUALBASIC), "VB.NET");
     PASS();
 }
 TEST(lang_name_unknown) {
@@ -1079,6 +1088,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_h);
     RUN_TEST(lang_ext_ixx);
     RUN_TEST(lang_ext_csharp);
+    RUN_TEST(lang_ext_visualbasic);
     RUN_TEST(lang_ext_php);
     RUN_TEST(lang_ext_lua);
     RUN_TEST(lang_ext_scala);
@@ -1202,6 +1212,7 @@ SUITE(language) {
     RUN_TEST(lang_name_python);
     RUN_TEST(lang_name_cpp);
     RUN_TEST(lang_name_csharp);
+    RUN_TEST(lang_name_visualbasic);
     RUN_TEST(lang_name_unknown);
 
     /* .m disambiguation */
