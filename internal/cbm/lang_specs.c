@@ -397,10 +397,9 @@ static const char *vb_class_types[] = {"class_block",     "module_block", "struc
 static const char *vb_module_types[] = {"source_file", NULL};
 static const char *vb_call_types[] = {"invocation", "new_expression", NULL};
 static const char *vb_import_types[] = {"imports_statement", NULL};
-static const char *vb_branch_types[] = {"if_statement", "for_statement",
-                                        "for_each_statement", "while_statement",
-                                        "do_statement", "select_case_statement",
-                                        "try_statement", NULL};
+static const char *vb_branch_types[] = {
+    "if_statement", "for_statement",         "for_each_statement", "while_statement",
+    "do_statement", "select_case_statement", "try_statement",      NULL};
 static const char *vb_var_types[] = {"field_declaration", "dim_statement", "const_declaration",
                                      NULL};
 static const char *vb_field_types[] = {"field_declaration", "property_declaration", NULL};
