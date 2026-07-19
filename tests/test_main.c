@@ -251,6 +251,7 @@ extern void suite_simhash(void);
 extern void suite_stack_overflow(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
+extern void suite_schema_declared_property_keys(void);
 
 /* Free the main thread's thread-local node-type bitset cache before exit so
  * LeakSanitizer (Linux x64) doesn't report it. Worker threads free their own
@@ -394,6 +395,8 @@ int main(int argc, char **argv) {
         if (strstr("store_pragmas", only_suite)) RUN_SUITE(store_pragmas);
         if (strstr("store_checkpoint", only_suite)) RUN_SUITE(store_checkpoint);
         if (strstr("dump_verify_io", only_suite)) RUN_SUITE(dump_verify_io);
+        if (strstr("schema_declared_property_keys", only_suite))
+            RUN_SUITE(schema_declared_property_keys);
         if (strstr("cypher", only_suite)) RUN_SUITE(cypher);
         if (strstr("mcp", only_suite)) RUN_SUITE(mcp);
         if (strstr("language", only_suite)) RUN_SUITE(language);
@@ -507,6 +510,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(store_pragmas);
     RUN_SELECTED_SUITE(store_checkpoint);
     RUN_SELECTED_SUITE(dump_verify_io);
+    RUN_SELECTED_SUITE(schema_declared_property_keys);
 
     /* Cypher (M6) */
     RUN_SELECTED_SUITE(cypher);

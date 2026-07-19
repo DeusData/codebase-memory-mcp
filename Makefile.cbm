@@ -402,7 +402,8 @@ TEST_STORE_SRCS = \
     tests/test_store_bulk.c \
     tests/test_store_pragmas.c \
     tests/test_store_checkpoint.c \
-    tests/test_dump_verify_io.c
+    tests/test_dump_verify_io.c \
+    tests/test_schema_declared_property_keys.c
 
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
