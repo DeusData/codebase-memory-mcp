@@ -1037,7 +1037,7 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
                     if (paren) {
                         *paren = '\0';
                     }
-                    return t[0] ? t : NULL;
+                    return t;
                 }
             }
             return NULL;
