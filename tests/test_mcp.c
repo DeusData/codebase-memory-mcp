@@ -338,6 +338,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"detect_changes", false, true, true, false},
         {"manage_adr", false, true, false, false},
         {"ingest_traces", false, false, false, false},
+        {"diff_versions", true, false, true, false},
     };
 
     char *json = cbm_mcp_tools_list();

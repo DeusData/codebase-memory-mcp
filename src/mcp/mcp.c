@@ -82,6 +82,7 @@ enum {
 #include <sys/stat.h>
 #include <time.h>
 #include <errno.h>
+#include <ctype.h>
 
 /* ── Constants ────────────────────────────────────────────────── */
 
@@ -361,8 +362,25 @@ static const tool_def_t TOOLS[] = {
      "are normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
-     "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     "Teammates can bootstrap from the artifact instead of full re-indexing.\"},"
+     "\"version\":{\"type\":\"string\",\"description\":"
+     "\"Version tag stamped on every extracted node (e.g. '28.0', '30.0'). "
+     "Enables cross-version diff queries: MATCH (n:Class {version:'30.0'}) ... "
+     "Auto-detected from trailing path segment when the segment is numeric (e.g. "
+     "/exports/MyApp/28.0 → version='28.0'). Versioned runs always do a full index.\"}"
      "},\"required\":[\"repo_path\"]}"},
+
+    {"diff_versions", "Diff versions",
+     "Compare two indexed versions of the same project to find added, removed, and "
+     "changed nodes. Requires version tags set via index_repository version= parameter.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"project\":{\"type\":\"string\",\"description\":\"Project name\"},"
+     "\"from_version\":{\"type\":\"string\",\"description\":\"Baseline version tag (e.g. "
+     "'28.0')\"},"
+     "\"to_version\":{\"type\":\"string\",\"description\":\"Comparison version tag (e.g. "
+     "'30.0')\"},"
+     "\"label\":{\"type\":\"string\",\"description\":\"Node label to compare (default: Class)\"}"
+     "},\"required\":[\"project\",\"from_version\",\"to_version\"]}"},
 
     {"search_graph", "Search graph",
      "Search the code knowledge graph for functions, classes, routes, and variables. Use INSTEAD "
@@ -669,6 +687,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
+    {"diff_versions", true, false, true, false},
 };
 
 static const tool_annotation_def_t *mcp_tool_annotations(const char *name) {
@@ -6844,6 +6863,112 @@ char *cbm_mcp_index_run_supervised_path(const char *root_path) {
 
 bool cbm_path_within_root(const char *root_path, const char *abs_path); /* defined below */
 
+static char *handle_diff_versions(cbm_mcp_server_t *srv, const char *args) {
+    char *project = cbm_mcp_get_string_arg(args, "project");
+    char *from_ver = cbm_mcp_get_string_arg(args, "from_version");
+    char *to_ver = cbm_mcp_get_string_arg(args, "to_version");
+    char *label_arg = cbm_mcp_get_string_arg(args, "label");
+    const char *label = (label_arg && label_arg[0]) ? label_arg : "Class";
+
+    if (!project || !from_ver || !to_ver) {
+        free(project);
+        free(from_ver);
+        free(to_ver);
+        free(label_arg);
+        return cbm_mcp_text_result("project, from_version, and to_version required", true);
+    }
+
+    cbm_store_t *store = resolve_store(srv, project);
+    if (!store) {
+        free(project);
+        free(from_ver);
+        free(to_ver);
+        free(label_arg);
+        return cbm_mcp_text_result("project not found", true);
+    }
+
+    char added_q[512], removed_q[512];
+    snprintf(added_q, sizeof(added_q),
+             "MATCH (n:%s {version:'%s'}) "
+             "OPTIONAL MATCH (m:%s {name:n.name,version:'%s'}) "
+             "WHERE m IS NULL RETURN n.name LIMIT 500",
+             label, to_ver, label, from_ver);
+    snprintf(removed_q, sizeof(removed_q),
+             "MATCH (n:%s {version:'%s'}) "
+             "OPTIONAL MATCH (m:%s {name:n.name,version:'%s'}) "
+             "WHERE m IS NULL RETURN n.name LIMIT 500",
+             label, from_ver, label, to_ver);
+
+    cbm_cypher_result_t added = {0}, removed = {0};
+    cbm_cypher_execute(store, added_q, project, 500, &added);
+    cbm_cypher_execute(store, removed_q, project, 500, &removed);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+
+    yyjson_mut_val *added_arr = yyjson_mut_arr(doc);
+    for (int r = 0; r < added.row_count; r++) {
+        if (added.rows[r][0]) {
+            yyjson_mut_arr_add_strcpy(doc, added_arr, added.rows[r][0]);
+        }
+    }
+    yyjson_mut_val *removed_arr = yyjson_mut_arr(doc);
+    for (int r = 0; r < removed.row_count; r++) {
+        if (removed.rows[r][0]) {
+            yyjson_mut_arr_add_strcpy(doc, removed_arr, removed.rows[r][0]);
+        }
+    }
+
+    yyjson_mut_obj_add_val(doc, root, "added", added_arr);
+    yyjson_mut_obj_add_val(doc, root, "removed", removed_arr);
+    yyjson_mut_obj_add_strcpy(doc, root, "from_version", from_ver);
+    yyjson_mut_obj_add_strcpy(doc, root, "to_version", to_ver);
+
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    yyjson_mut_doc_free(doc);
+    cbm_cypher_result_free(&added);
+    cbm_cypher_result_free(&removed);
+    free(project);
+    free(from_ver);
+    free(to_ver);
+    free(label_arg);
+    return result;
+}
+
+/* Derive a version tag from the last path segment when it looks like a
+ * version number (e.g. "/repos/MyApp/28.0" → "28.0").
+ * Writes to out[0..out_sz-1]; sets out[0]='\0' when nothing found. */
+static void cbm_derive_version_from_path(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz == 0) {
+        return;
+    }
+    out[0] = '\0';
+    const char *p = path + strlen(path);
+    while (p > path) {
+        p--;
+        if (*p == '/' || *p == '\\') {
+            const char *seg = p + 1;
+            size_t slen = strlen(seg);
+            if (slen > 0 && slen < 32 && isdigit((unsigned char)seg[0])) {
+                bool ok = true;
+                for (size_t i = 0; i < slen; i++) {
+                    if (!isdigit((unsigned char)seg[i]) && seg[i] != '.') {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    snprintf(out, out_sz, "%s", seg);
+                    return;
+                }
+            }
+        }
+    }
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* Supervisor gate: run the index in a crash/hang-isolating worker subprocess
      * unless this process IS the worker or the kill switch (CBM_INDEX_SUPERVISOR=0)
@@ -6914,6 +7039,21 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(name_override);
     cbm_pipeline_set_persistence(p, persistence);
+
+    /* Optional version tag: stamp every node with the given version string.
+     * Falls back to auto-detecting a version number from the trailing path segment
+     * (e.g. /exports/MyApp/28.0 → version="28.0"). */
+    char *version_tag = cbm_mcp_get_string_arg(args, "version");
+    if (version_tag && version_tag[0]) {
+        cbm_pipeline_set_version(p, version_tag);
+    } else {
+        char derived[64] = {0};
+        cbm_derive_version_from_path(repo_path, derived, sizeof(derived));
+        if (derived[0]) {
+            cbm_pipeline_set_version(p, derived);
+        }
+    }
+    free(version_tag);
 
     char *project_name = heap_strdup(cbm_pipeline_project_name(p));
 
@@ -9304,6 +9444,10 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "get_architecture") == 0) {
         return handle_get_architecture(srv, args_json);
+    }
+
+    if (strcmp(tool_name, "diff_versions") == 0) {
+        return handle_diff_versions(srv, args_json);
     }
 
     /* Pipeline-dependent tools */
