@@ -424,8 +424,12 @@ mcp_start() {
     return 0
 }
 
-# Send one JSON-RPC line and read exactly one response line, bounded.
-# Sets MCP_RESP. Returns 0 if a line arrived within the bound, 1 on timeout.
+# Send one JSON-RPC request and read through notifications until its matching
+# response arrives. MCP notifications may be interleaved after any state change
+# (for example notifications/tools/list_changed after indexing), so treating the
+# next line as the response shifts every later assertion. The deadline covers
+# the whole correlation loop rather than restarting for each notification.
+# Sets MCP_RESP. Returns 0 for the matching response, 1 on timeout/EOF.
 MCP_RESP=""
 mcp_send_recv() {
     # mcp_send_recv <request_json> <timeout_secs>
@@ -433,11 +437,42 @@ mcp_send_recv() {
     MCP_RESP=""
     # If we already abandoned a wedged server, fail instantly (no wait).
     [ "$SERVER_WEDGED" -eq 1 ] && return 1
+    local expected_id
+    expected_id="$(printf '%s' "$req" | "$PY" -c '
+import json,sys
+try:
+    print(json.dumps(json.load(sys.stdin).get("id"), separators=(",", ":")))
+except Exception:
+    print("")
+' 2>/dev/null)"
+    [ -n "$expected_id" ] && [ "$expected_id" != "null" ] || return 1
     printf '%s\n' "$req" >&3 2>/dev/null || return 1
-    # `read -t` is the bounded wait — NO sleep loop.
-    if IFS= read -t "$secs" -r MCP_RESP <&4; then
-        return 0
-    fi
+    local deadline=$((SECONDS + secs))
+    local remaining line response_id
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        remaining=$((deadline - SECONDS))
+        if ! IFS= read -t "$remaining" -r line <&4; then
+            break
+        fi
+        response_id="$(printf '%s' "$line" | "$PY" -c '
+import json,sys
+try:
+    print(json.dumps(json.load(sys.stdin).get("id"), separators=(",", ":")))
+except Exception:
+    print("")
+' 2>/dev/null)"
+        if [ "$response_id" = "$expected_id" ]; then
+            MCP_RESP="$line"
+            return 0
+        fi
+        # A valid notification has no id and can be skipped. Any malformed
+        # stdout or different response id is a protocol/client-order failure,
+        # not a notification and not a server hang; preserve it for diagnostics.
+        if [ "$response_id" != "null" ]; then
+            MCP_RESP="$line"
+            return 1
+        fi
+    done
     # Timeout. If the process is still alive it is wedged — abandon it so the
     # rest of the battery does not pay this bound repeatedly.
     if mcp_alive; then
@@ -511,8 +546,8 @@ inv_mcp_initialize() {
 
 # ── Invariant 4: tools/list returns all expected tools ─────────────────────
 # Cross-check against the canonical classic-tool list (TOOLS[] in src/mcp/mcp.c).
-EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status detect_changes manage_adr ingest_traces index_dependencies"
-EXPECTED_TOOL_COUNT=15
+EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes manage_adr ingest_traces index_dependencies"
+EXPECTED_TOOL_COUNT="$(printf '%s\n' "$EXPECTED_TOOLS" | wc -w | tr -d ' ')"
 inv_tools_list() {
     if ! mcp_alive; then
         fail "tools-list" "server not alive"
@@ -629,6 +664,7 @@ inv_every_tool() {
         "search_code|{\"project\":\"$p\",\"pattern\":\"def \"}"
         "list_projects|{}"
         "index_status|{\"project\":\"$p\"}"
+        "check_index_coverage|{\"project\":\"$p\"}"
         "detect_changes|{\"project\":\"$p\"}"
         "manage_adr|{\"project\":\"$p\",\"mode\":\"get\"}"
         "ingest_traces|{\"project\":\"$p\",\"traces\":[]}"
