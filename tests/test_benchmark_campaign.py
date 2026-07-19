@@ -1,8 +1,11 @@
+import hashlib
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -32,6 +35,343 @@ def cell(command: list[str], **overrides: object) -> dict:
 
 
 class BenchmarkCampaignTest(unittest.TestCase):
+    def test_filename_datetime_is_sortable_explicit_utc_and_filename_safe(self) -> None:
+        stamp = CAMPAIGN.filename_datetime(datetime(2026, 7, 19, 21, 13, 58, 123456, tzinfo=timezone.utc))
+
+        self.assertEqual(stamp, "2026-07-19-211358.123456Z")
+
+    def test_campaign_names_separate_definition_runset_source_and_generation_identity(
+        self,
+    ) -> None:
+        source = {
+            "revision": "a" * 40,
+            "commit_datetime_slug": "2026-07-19-1642",
+            "tree": "b" * 40,
+        }
+        runset = CAMPAIGN.runset_identity(b'{"stable":"spec"}\n')
+        generated = datetime(2026, 7, 19, 21, 13, 58, 123456, tzinfo=timezone.utc)
+
+        root = CAMPAIGN.automatic_campaign_name("quick", source, runset)
+        spec = CAMPAIGN.automatic_spec_name("quick", runset)
+        report = CAMPAIGN.generated_artifact_name(
+            "report", runset, ".md", preset="quick", moment=generated
+        )
+        manifest = CAMPAIGN.generated_artifact_name(
+            "manifest", runset, ".json", moment=generated, nonce="c0ffee12"
+        )
+
+        self.assertEqual(
+            root,
+            "v0001-quick-commit-2026-07-19-1642-aaaaaaaaaaaa-runset-ff40aae6b1de",
+        )
+        self.assertEqual(spec, "spec-v0001-quick-runset-ff40aae6b1de.json")
+        self.assertEqual(
+            report,
+            "report-v0001-quick-runset-ff40aae6b1de-generated-2026-07-19-211358.123456Z.md",
+        )
+        self.assertEqual(
+            manifest,
+            "manifest-v0001-runset-ff40aae6b1de-generated-2026-07-19-211358.123456Z-c0ffee12.json",
+        )
+        self.assertLessEqual(max(map(len, (root, spec, report, manifest))), 96)
+
+    def test_runset_identity_is_stable_for_resume_and_changes_with_spec_bytes(self) -> None:
+        first = CAMPAIGN.runset_identity(b'{"preset":"quick"}\n')
+        resumed = CAMPAIGN.runset_identity(b'{"preset":"quick"}\n')
+        changed = CAMPAIGN.runset_identity(b'{"preset":"full"}\n')
+
+        self.assertEqual(resumed, first)
+        self.assertNotEqual(changed, first)
+        self.assertRegex(first, r"^[0-9a-f]{12}$")
+
+    def test_automatic_runset_identity_ignores_path_remapping_but_not_binary_changes(
+        self,
+    ) -> None:
+        spec = {
+            "schema_version": 1,
+            "campaign_version": "v0001",
+            "harness_version": "runner-deadbeef",
+            "benchmark_script": "/checkout-a/scripts/benchmark.py",
+            "cwd": "/checkout-a",
+            "repository_background": {
+                "repo": "/corpus-a",
+                "revision": "a" * 40,
+                "tree": "b" * 40,
+            },
+            "candidates": [
+                {
+                    "label": "latest",
+                    "revision": "c" * 40,
+                    "binary": "/checkout-a/build/cbm",
+                    "binary_sha256": "d" * 64,
+                    "build": {"compiler": "clang 18", "cflags": "-O2"},
+                }
+            ],
+            "profiles": [{"label": "default", "capabilities": {}}],
+        }
+        remapped = json.loads(json.dumps(spec))
+        remapped["benchmark_script"] = "/checkout-b/scripts/benchmark.py"
+        remapped["cwd"] = "/checkout-b"
+        remapped["repository_background"]["repo"] = "/corpus-b"
+        remapped["candidates"][0]["binary"] = "/checkout-b/build/cbm"
+        changed = json.loads(json.dumps(remapped))
+        changed["candidates"][0]["binary_sha256"] = "e" * 64
+
+        self.assertEqual(
+            CAMPAIGN.automatic_runset_identity(remapped),
+            CAMPAIGN.automatic_runset_identity(spec),
+        )
+        self.assertNotEqual(
+            CAMPAIGN.automatic_runset_identity(changed),
+            CAMPAIGN.automatic_runset_identity(spec),
+        )
+
+    def test_identity_v2_resumes_after_canonical_path_remap_without_changing_legacy_ids(
+        self,
+    ) -> None:
+        original = cell(
+            [
+                "/checkout-a/scripts/benchmark.py",
+                "--binary",
+                "/candidate-a/cbm",
+                "--repo-root",
+                "/corpus-a",
+                "--out",
+                "{result_path}",
+            ],
+            cwd="/checkout-a",
+            identity_version=2,
+            parameters={
+                "benchmark_script_sha256": "c" * 64,
+                "repository_background": {
+                    "repo": "/corpus-a",
+                    "revision": "d" * 40,
+                    "tree": "e" * 40,
+                },
+            },
+        )
+        remapped = json.loads(json.dumps(original))
+        remapped["command"][0] = "/checkout-b/scripts/benchmark.py"
+        remapped["command"][2] = "/candidate-b/cbm"
+        remapped["command"][4] = "/corpus-b"
+        remapped["cwd"] = "/checkout-b"
+        remapped["parameters"]["repository_background"]["repo"] = "/corpus-b"
+        legacy_original = {key: value for key, value in original.items() if key != "identity_version"}
+        legacy_remapped = {key: value for key, value in remapped.items() if key != "identity_version"}
+        legacy_document = {
+            key: legacy_original.get(key)
+            for key in CAMPAIGN.IDENTITY_FIELDS
+            if key != "identity_version"
+        }
+        legacy_expected = hashlib.sha256(CAMPAIGN.canonical_json(legacy_document)).hexdigest()[:24]
+
+        self.assertEqual(CAMPAIGN.cell_identity(remapped), CAMPAIGN.cell_identity(original))
+        self.assertEqual(CAMPAIGN.cell_identity(legacy_original), legacy_expected)
+        self.assertNotEqual(
+            CAMPAIGN.cell_identity(legacy_remapped),
+            CAMPAIGN.cell_identity(legacy_original),
+        )
+
+    def test_no_arguments_selects_quick_preset_and_full_flag_selects_full_matrix(
+        self,
+    ) -> None:
+        quick = CAMPAIGN.parse_arguments([])
+        full = CAMPAIGN.parse_arguments(["--full"])
+        explicit = CAMPAIGN.parse_arguments(
+            ["--matrix-spec", "legacy-spec.json", "--campaign-root", "legacy-results"]
+        )
+
+        self.assertEqual(quick.preset, "quick")
+        self.assertEqual(full.preset, "full")
+        self.assertIsNone(explicit.preset)
+        self.assertEqual(explicit.matrix_spec, Path("legacy-spec.json"))
+        with self.assertRaises(SystemExit):
+            CAMPAIGN.parse_arguments(["--full", "--matrix-spec", "spec.json"])
+
+    def test_default_candidates_use_current_upstream_stable_run_premerge_and_head(
+        self,
+    ) -> None:
+        self.assertEqual(
+            CAMPAIGN.DEFAULT_CANDIDATE_REFS,
+            (
+                ("upstream-main", "upstream/main"),
+                (
+                    "pre-today-major",
+                    "api-consolidation-stable-2026-07-16-semantic-v2",
+                ),
+                ("pre-upstream-merge", "pre-upstream-main-merge-2026-07-19"),
+                ("latest", "HEAD"),
+            ),
+        )
+
+    def test_automatic_specs_keep_quick_small_and_full_capability_complete(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(root),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Benchmark Test"],
+                check=True,
+            )
+            benchmark = root / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "benchmark.py"], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            candidates = []
+            for index, label in enumerate(("upstream-main", "pre-today-major", "pre-upstream-merge", "latest")):
+                binary = root / f"cbm-{label}"
+                binary.write_bytes(label.encode())
+                candidates.append(
+                    {
+                        "label": label,
+                        "revision": str(index) * 40,
+                        "binary": str(binary),
+                        "binary_sha256": CAMPAIGN.file_sha256(binary),
+                        "build": {"target": "make cbm", "cflags": "-O2"},
+                    }
+                )
+
+            quick = CAMPAIGN.build_automatic_spec(root, benchmark, candidates, preset="quick")
+            full = CAMPAIGN.build_automatic_spec(root, benchmark, candidates, preset="full")
+
+            self.assertEqual(quick["repetitions"], 1)
+            self.assertEqual(quick["index_mode"], "fast")
+            self.assertIn("commit_datetime", quick["repository_background"])
+            self.assertEqual([item["label"] for item in quick["profiles"]], ["default"])
+            self.assertEqual(full["repetitions"], 3)
+            self.assertEqual(full["index_mode"], "moderate")
+            self.assertEqual(
+                [item["label"] for item in full["profiles"]],
+                [
+                    "default",
+                    "upstream-equivalent",
+                    "eager-derived-freshness",
+                    "rank-disabled",
+                    "dependency-disabled",
+                    "similarity-disabled",
+                    "semantic-edges-disabled",
+                    "git-history-disabled",
+                    "http-links-disabled",
+                    "optional-graph-disabled",
+                    "minimal-indexing",
+                ],
+            )
+            self.assertTrue(all(item.get("candidate_labels") == ["latest"] for item in full["profiles"][1:]))
+            expanded = CAMPAIGN.expand_matrix_spec(quick)
+            self.assertEqual(
+                expanded["cells"][0]["parameters"]["repository_background"][
+                    "commit_datetime"
+                ],
+                quick["repository_background"]["commit_datetime"],
+            )
+
+    def test_materialize_candidate_resolves_tag_builds_and_reuses_detached_worktree(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir)
+            repo = base / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Benchmark Test"],
+                check=True,
+            )
+            (repo / "candidate.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (repo / "Makefile.cbm").write_text(
+                "CFLAGS_PROD = -O3 -DFIXTURE_PRODUCTION=1\n"
+                "cbm:\n\tmkdir -p build/c\n\tcp candidate.sh build/c/codebase-memory-mcp\n"
+                "\tchmod +x build/c/codebase-memory-mcp\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+            subprocess.run(["git", "-C", str(repo), "tag", "stable"], check=True)
+            candidate_root = base / "candidates"
+
+            first = CAMPAIGN.materialize_candidate(repo, candidate_root, "stable-candidate", "stable", jobs=1)
+            build_logs_after_first = sorted((candidate_root / "build-logs").glob("*.log"))
+            second = CAMPAIGN.materialize_candidate(repo, candidate_root, "stable-candidate", "stable", jobs=1)
+
+            expected_revision = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "stable^{commit}"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            self.assertEqual(first["revision"], expected_revision)
+            self.assertEqual(second, first)
+            self.assertEqual(second["binary_sha256"], first["binary_sha256"])
+            self.assertEqual(second["binary"], first["binary"])
+            self.assertEqual(second["build"]["cflags"], "-O3 -DFIXTURE_PRODUCTION=1")
+            self.assertTrue(Path(first["binary"]).is_file())
+            self.assertEqual(
+                sorted((candidate_root / "build-logs").glob("*.log")),
+                build_logs_after_first,
+            )
+            Path(second["binary"]).write_bytes(b"tampered")
+            rebuilt = CAMPAIGN.materialize_candidate(
+                repo, candidate_root, "stable-candidate", "stable", jobs=1
+            )
+            self.assertEqual(rebuilt, first)
+            self.assertEqual(
+                len(list((candidate_root / "build-logs").glob("*.log"))),
+                len(build_logs_after_first) + 1,
+            )
+            worktrees = subprocess.run(
+                ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertEqual(worktrees.count(expected_revision), 2)
+
+    def test_clean_tree_check_rejects_tracked_edits_but_allows_untracked_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo), "config", "user.name", "Benchmark Test"],
+                check=True,
+            )
+            tracked = repo / "tracked.txt"
+            tracked.write_text("committed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
+            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+            (repo / "retained.log").write_text("untracked evidence\n", encoding="utf-8")
+
+            CAMPAIGN.ensure_clean_tracked_worktree(repo, "fixture")
+            tracked.write_text("modified\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "fixture has tracked modifications"):
+                CAMPAIGN.ensure_clean_tracked_worktree(repo, "fixture")
+
     def test_campaign_root_rejects_os_temporary_tree_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             temporary_root = Path(tmpdir) / "system-temp"
@@ -79,7 +419,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
             variant[key] = changed
             self.assertNotEqual(base_id, CAMPAIGN.cell_identity(variant), key)
 
-    def test_matrix_spec_expands_structured_frontier_cap_and_repetition_cells(self) -> None:
+    def test_matrix_spec_expands_structured_frontier_cap_and_repetition_cells(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             binary = root / "cbm"
@@ -131,11 +473,10 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(first["parameters"]["frontier_files"], 4)
             self.assertEqual(first["parameters"]["exact_cap"], 4)
             self.assertEqual(first["accepted_exit_codes"], [0, 1])
+            self.assertEqual(first["capability_support"], {"dependencies": True, "rank": True})
             self.assertEqual(
-                first["capability_support"], {"dependencies": True, "rank": True}
-            )
-            self.assertEqual(
-                first["parameters"]["benchmark_script_sha256"], CAMPAIGN.file_sha256(benchmark)
+                first["parameters"]["benchmark_script_sha256"],
+                CAMPAIGN.file_sha256(benchmark),
             )
             self.assertIn("--frontier-files", first["command"])
             self.assertIn("incremental_exact_max_affected_paths=4", first["command"])
@@ -170,7 +511,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
                     }
                 ],
                 "scenarios": [
-                    {"name": "go_inbound_frontier", "frontier_files": [4], "exact_caps": [8]}
+                    {
+                        "name": "go_inbound_frontier",
+                        "frontier_files": [4],
+                        "exact_caps": [8],
+                    }
                 ],
             }
 
@@ -217,9 +562,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "scenarios": [{"name": "c_new_leaf"}],
             }
 
-            with self.assertRaisesRegex(
-                ValueError, "capabilities claims auto_index_deps=false"
-            ):
+            with self.assertRaisesRegex(ValueError, "capabilities claims auto_index_deps=false"):
                 CAMPAIGN.expand_matrix_spec(spec)
 
     def test_matrix_spec_expands_capability_quality_without_frontier_axes(self) -> None:
@@ -299,7 +642,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "transports": ["cli"],
                 "candidates": candidates,
                 "profiles": [
-                    {"label": "default", "config_profile": "default", "capabilities": {}},
+                    {
+                        "label": "default",
+                        "config_profile": "default",
+                        "capabilities": {},
+                    },
                     {
                         "label": "rank-disabled",
                         "config_profile": "rank_disabled",
@@ -307,9 +654,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                         "candidate_labels": ["latest"],
                     },
                 ],
-                "scenarios": [
-                    {"name": "go_modify_1", "frontier_files": [4], "exact_caps": [None]}
-                ],
+                "scenarios": [{"name": "go_modify_1", "frontier_files": [4], "exact_caps": [None]}],
             }
 
             plan = CAMPAIGN.expand_matrix_spec(spec)
@@ -353,7 +698,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
                     }
                 ],
                 "profiles": [
-                    {"label": "default", "config_profile": "default", "capabilities": {}}
+                    {
+                        "label": "default",
+                        "config_profile": "default",
+                        "capabilities": {},
+                    }
                 ],
                 "scenarios": [{"name": "route_handler"}],
             }
@@ -408,7 +757,11 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "transports": ["cli"],
                 "candidates": candidates,
                 "profiles": [
-                    {"label": "default", "config_profile": "default", "capabilities": {}},
+                    {
+                        "label": "default",
+                        "config_profile": "default",
+                        "capabilities": {},
+                    },
                     {
                         "label": "eager",
                         "config_profile": "incremental_semantic_freshness_eager",
@@ -468,10 +821,18 @@ class BenchmarkCampaignTest(unittest.TestCase):
                     }
                 ],
                 "profiles": [
-                    {"label": "default", "config_profile": "default", "capabilities": {}}
+                    {
+                        "label": "default",
+                        "config_profile": "default",
+                        "capabilities": {},
+                    }
                 ],
                 "scenarios": [
-                    {"name": "go_modify_1", "frontier_files": [16], "exact_caps": [None]}
+                    {
+                        "name": "go_modify_1",
+                        "frontier_files": [16],
+                        "exact_caps": [None],
+                    }
                 ],
             }
 
@@ -480,9 +841,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(cell["label"], "candidate.default.mcp.go_modify_1.f16.capdefault")
             self.assertIsNone(cell["parameters"]["exact_cap"])
             self.assertNotIn("incremental_exact_max_affected_paths", cell["capabilities"])
-            self.assertFalse(
-                any("incremental_exact_max_affected_paths=" in item for item in cell["command"])
-            )
+            self.assertFalse(any("incremental_exact_max_affected_paths=" in item for item in cell["command"]))
 
     def test_successful_cell_resumes_without_second_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -492,8 +851,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "-c",
                 (
                     "import json,sys; "
-                    "json.dump({'binary_metadata':{'sha256':'" + "b" * 64 +
-                    "'},'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
+                    "json.dump({'binary_metadata':{'sha256':'"
+                    + "b" * 64
+                    + "'},'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
                 ),
                 "{result_path}",
             ]
@@ -521,8 +881,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
                     "import json,os,pathlib,sys; "
                     "artifact=pathlib.Path(os.environ['CBM_BENCHMARK_ARTIFACT_DIR'])/'worker.log.gz'; "
                     "artifact.parent.mkdir(parents=True); artifact.write_bytes(b'audit-log'); "
-                    "json.dump({'binary_metadata':{'sha256':'" + "b" * 64 +
-                    "'},'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
+                    "json.dump({'binary_metadata':{'sha256':'"
+                    + "b" * 64
+                    + "'},'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
                 ),
                 "{result_path}",
             ]
@@ -542,7 +903,10 @@ class BenchmarkCampaignTest(unittest.TestCase):
 
     def test_scan_rejects_changed_missing_or_unlisted_completed_artifacts(self) -> None:
         for mutation in ("changed", "missing", "unlisted"):
-            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                self.subTest(mutation=mutation),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
                 root = Path(tmpdir)
                 command = [
                     sys.executable,
@@ -552,8 +916,10 @@ class BenchmarkCampaignTest(unittest.TestCase):
                         "artifact=pathlib.Path(os.environ['CBM_BENCHMARK_ARTIFACT_DIR'])/"
                         "'worker.log.gz'; "
                         "artifact.parent.mkdir(parents=True); artifact.write_bytes(b'audit-log'); "
-                        "json.dump({'binary_metadata':{'sha256':'" + "b" * 64 +
-                        "'},'derived':{'passed':True},'cases':[{'passed':True}]},"
+                        "json.dump({'binary_metadata':{'sha256':'"
+                        + "b"
+                        * 64
+                        + "'},'derived':{'passed':True},'cases':[{'passed':True}]},"
                         "open(sys.argv[1],'w'))"
                     ),
                     "{result_path}",
@@ -577,7 +943,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 self.assertEqual(audit["counts"]["corrupt"], 1)
                 self.assertIn("artifact manifest", audit["cells"][0]["error"])
 
-    def test_report_input_adds_candidate_support_without_mutating_raw_result(self) -> None:
+    def test_report_input_adds_candidate_support_without_mutating_raw_result(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             raw = root / "raw.json"
@@ -608,10 +976,14 @@ class BenchmarkCampaignTest(unittest.TestCase):
             self.assertEqual(document["parameters"]["execution_order"], "paired_interleaved")
             self.assertEqual(document["parameters"]["execution_block"], 2)
             self.assertEqual(document["parameters"]["execution_position"], 7)
-            self.assertEqual(document["campaign_provenance"]["source_result_sha256"],
-                             CAMPAIGN.file_sha256(raw))
-            self.assertEqual(document["campaign_provenance"]["cell_identity"],
-                             CAMPAIGN.cell_identity(planned))
+            self.assertEqual(
+                document["campaign_provenance"]["source_result_sha256"],
+                CAMPAIGN.file_sha256(raw),
+            )
+            self.assertEqual(
+                document["campaign_provenance"]["cell_identity"],
+                CAMPAIGN.cell_identity(planned),
+            )
 
     def test_result_rejects_background_revision_or_tree_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -706,9 +1078,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 f"subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[1]]); "
                 "time.sleep(60)"
             )
-            planned = cell(
-                [sys.executable, "-c", parent, str(marker)], timeout_seconds=0.5
-            )
+            planned = cell([sys.executable, "-c", parent, str(marker)], timeout_seconds=0.5)
 
             outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
             cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
