@@ -8431,6 +8431,89 @@ TEST(mcp_notify_index_published_sends_list_changed_once) {
     PASS();
 }
 
+/* A publication invalidates both the cached query_graph description and the
+ * cached SQLite handle. The next protocol tools/list must reopen the store,
+ * advertise newly published vocabulary, and coalesce repeated publication
+ * signals into one post-response notification. */
+TEST(mcp_published_schema_refreshes_description_once) {
+    const char *project = "mcp_published_schema_refresh_fixture";
+    const char *cache = cbm_resolve_cache_dir();
+    char db_path[CBM_SZ_4K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+
+    cbm_store_t *seed = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(seed);
+    ASSERT_EQ(cbm_store_upsert_project(seed, project, "/tmp/published-schema-refresh"),
+              CBM_STORE_OK);
+    cbm_node_t initial = {.project = project,
+                          .label = "InitialSchemaLabel",
+                          .name = "initial",
+                          .qualified_name = "mcp_published_schema_refresh_fixture.initial",
+                          .file_path = "initial.c"};
+    ASSERT_GT(cbm_store_upsert_node(seed, &initial), 0);
+    cbm_store_close(seed);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, project);
+    char *before = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(before);
+    ASSERT_NOT_NULL(strstr(before, "InitialSchemaLabel"));
+    ASSERT_NULL(strstr(before, "PublishedOnlyLabel"));
+    free(before);
+
+    cbm_store_t *writer = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writer);
+    cbm_node_t published = {.project = project,
+                            .label = "PublishedOnlyLabel",
+                            .name = "published",
+                            .qualified_name = "mcp_published_schema_refresh_fixture.published",
+                            .file_path = "published.c"};
+    ASSERT_GT(cbm_store_upsert_node(writer, &published), 0);
+    cbm_store_close(writer);
+
+    cbm_mcp_server_notify_index_published(srv);
+    cbm_mcp_server_notify_index_published(srv);
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    const char *msgs = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+                       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_EQ(written, (ssize_t)strlen(msgs));
+    close(fds[1]);
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_EQ(count_substr_mcp(buf, "PublishedOnlyLabel"), 2);
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    cleanup_project_db(cache, project);
+    PASS();
+}
+
 /* Inverse of the above: the handshake-proxy's actual promise is that a
  * session which publishes but never serves a tools/list emits ZERO
  * notifications — untested until now. A single non-tools/list request
@@ -8494,7 +8577,7 @@ TEST(mcp_delete_project_sends_list_changed) {
     ASSERT_EQ(cbm_store_upsert_project(seed, project, "/tmp/delete-project-fixture"),
               CBM_STORE_OK);
     cbm_node_t seed_node = {.project = project,
-                            .label = "Function",
+                            .label = "DeletedProjectOnlyLabel",
                             .name = "seed_fn",
                             .qualified_name = "mcp_delete_project_sends_list_changed_fixture.seed_fn",
                             .file_path = "seed.go"};
@@ -8523,6 +8606,7 @@ TEST(mcp_delete_project_sends_list_changed) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, project);
 
     signal(SIGALRM, alarm_handler);
     alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
@@ -8545,6 +8629,9 @@ TEST(mcp_delete_project_sends_list_changed) {
     ASSERT_NOT_NULL(strstr(buf, "\"status\":\"deleted\""));
     ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
     ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+    /* The first tools/list advertises the seeded schema; after deletion the
+     * relist must not reuse that cached description. */
+    ASSERT_EQ(count_substr_mcp(buf, "DeletedProjectOnlyLabel"), 1);
 
     free(buf);
     cbm_mcp_server_free(srv);
@@ -11075,6 +11162,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_hidden_tools_reveal_sends_list_changed);
     RUN_TEST(mcp_hidden_tools_reveal_frames_list_changed);
     RUN_TEST(mcp_notify_index_published_sends_list_changed_once);
+    RUN_TEST(mcp_published_schema_refreshes_description_once);
     RUN_TEST(mcp_notify_before_any_tools_list_suppressed);
     RUN_TEST(mcp_delete_project_sends_list_changed);
     RUN_TEST(mcp_delete_project_noop_sends_no_list_changed);
