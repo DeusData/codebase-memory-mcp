@@ -5,9 +5,11 @@ This is an explicit opt-in performance gate. It creates a synthetic Go repo in
 a temporary work root, uses an isolated CBM_CACHE_DIR, enables disk incremental
 indexing only for that cache, and removes only paths it created.
 """
+
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import gzip
 import hashlib
 import json
@@ -70,7 +72,9 @@ CONFIG_PROFILE_GIT_HISTORY_DISABLED = "git_history_disabled"
 CONFIG_PROFILE_HTTP_LINKS_DISABLED = "http_links_disabled"
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
 CONFIG_PROFILE_DEPENDENCY_DISABLED = "dependency_disabled"
-CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER = "incremental_semantic_freshness_eager"
+CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER = (
+    "incremental_semantic_freshness_eager"
+)
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
 DERIVED_REFRESH_CANDIDATE_DEFAULT = "candidate_default"
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
@@ -109,6 +113,70 @@ FAILURE_ARTIFACT_DIRNAME = "failures"
 FAILURE_FALLBACK_DIRNAME = "cbm-benchmark-failures"
 FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
+MCP_CAPABILITY_SURFACES = (
+    (
+        "structural_search",
+        "structural and semantic symbol lookup",
+        ("search_graph",),
+        ("search_graph",),
+    ),
+    (
+        "programmable_graph_analysis",
+        "problem-specific read-only Cypher",
+        ("query_graph",),
+        ("query_graph",),
+    ),
+    (
+        "source_text_search",
+        "literal and regular-expression source lookup",
+        ("search_code",),
+        ("search_code",),
+    ),
+    (
+        "call_path_analysis",
+        "inbound, outbound, and bidirectional call tracing",
+        ("trace_path",),
+        ("trace_path",),
+    ),
+    (
+        "source_retrieval",
+        "qualified-symbol source retrieval",
+        ("get_code_snippet",),
+        ("get_code",),
+    ),
+    (
+        "explicit_index_control",
+        "explicit repository indexing",
+        ("index_repository",),
+        (),
+    ),
+    (
+        "schema_and_architecture",
+        "graph schema and architecture diagnostics",
+        ("get_graph_schema", "get_architecture"),
+        (),
+    ),
+    (
+        "index_diagnostics",
+        "freshness, inventory, and coverage diagnostics",
+        ("index_status", "list_projects", "check_index_coverage"),
+        (),
+    ),
+    ("change_impact", "git-change blast-radius analysis", ("detect_changes",), ()),
+    (
+        "dependency_sources",
+        "local dependency source indexing",
+        ("index_dependencies",),
+        (),
+    ),
+    ("project_lifecycle", "indexed-project deletion", ("delete_project",), ()),
+    (
+        "architecture_evidence",
+        "ADR storage and runtime-trace ingest request surfaces",
+        ("manage_adr", "ingest_traces"),
+        (),
+    ),
+)
 MATRIX_SCENARIOS_DEFAULT = "go_modify_1,go_modify_2,go_create,go_delete,go_rename,go_new_folder,route_decorator,python_reexport"
 MATRIX_REAL_REPO_SCENARIOS = frozenset({"fastapi_insert_probe"})
 CAPABILITY_QUALITY_CASES = (
@@ -150,7 +218,9 @@ MATRIX_FRONTIER_SCENARIOS = {
     "kotlin_inbound_frontier": "kotlin",
     "rust_inbound_frontier": "rust",
 }
-SELF_DOGFOOD_SCENARIOS_DEFAULT = "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
+SELF_DOGFOOD_SCENARIOS_DEFAULT = (
+    "noop,one_source_file,route_handler,store_pipeline_batch,multi_file_small"
+)
 SELF_DOGFOOD_MARKER_PREFIX = "cbm_pan4_oracle"
 SELF_DOGFOOD_REPO_SUBDIR = "repo"
 SELF_DOGFOOD_CACHE_SUBDIR = "cache"
@@ -236,7 +306,9 @@ def archive_measurement_log(source: Path, artifact_dir: Path) -> dict[str, Any]:
     source_bytes = 0
     try:
         with source.open("rb") as input_stream, temporary.open("wb") as output_stream:
-            with gzip.GzipFile(filename="", mode="wb", fileobj=output_stream, mtime=0) as compressed:
+            with gzip.GzipFile(
+                filename="", mode="wb", fileobj=output_stream, mtime=0
+            ) as compressed:
                 for chunk in iter(lambda: input_stream.read(1024 * 1024), b""):
                     source_digest.update(chunk)
                     source_bytes += len(chunk)
@@ -283,10 +355,15 @@ def create_repo(repo_dir: Path, file_count: int, funcs_per_file: int) -> None:
     write_text(repo_dir / "go.mod", "module example.com/cbmbench\n\ngo 1.22\n")
     write_text(repo_dir / "main.go", "package main\n\nfunc main() {}\n")
     for index in range(file_count):
-        write_text(repo_dir / f"pkg/file_{index:04d}.go", go_file_content(index, 0, funcs_per_file))
+        write_text(
+            repo_dir / f"pkg/file_{index:04d}.go",
+            go_file_content(index, 0, funcs_per_file),
+        )
 
 
-def modify_existing_files(repo_dir: Path, changed_files: int, funcs_per_file: int) -> list[str]:
+def modify_existing_files(
+    repo_dir: Path, changed_files: int, funcs_per_file: int
+) -> list[str]:
     changed: list[str] = []
     for index in range(changed_files):
         rel = Path("pkg") / f"file_{index:04d}.go"
@@ -296,14 +373,19 @@ def modify_existing_files(repo_dir: Path, changed_files: int, funcs_per_file: in
 
 
 def create_python_reexport_repo(repo_dir: Path) -> None:
-    write_text(repo_dir / "fastapi" / "__init__.py", "from .param_functions import Header\n")
-    write_text(repo_dir / "fastapi" / "param_functions.py", "def Header(default=None):\n    return default\n")
-    write_text(repo_dir / "fastapi" / "openapi" / "models.py", "class Header:\n    pass\n")
+    write_text(
+        repo_dir / "fastapi" / "__init__.py", "from .param_functions import Header\n"
+    )
+    write_text(
+        repo_dir / "fastapi" / "param_functions.py",
+        "def Header(default=None):\n    return default\n",
+    )
+    write_text(
+        repo_dir / "fastapi" / "openapi" / "models.py", "class Header:\n    pass\n"
+    )
     write_text(
         repo_dir / "docs_src" / "app" / "main.py",
-        "from fastapi import Header\n\n"
-        "def create_item():\n"
-        "    return Header(None)\n",
+        "from fastapi import Header\n\ndef create_item():\n    return Header(None)\n",
     )
 
 
@@ -323,15 +405,13 @@ def create_rank_quality_repo(repo_dir: Path) -> dict[str, Any]:
     write_text(
         repo_dir / "order_core.py",
         "def zz_order_core(order):\n"
-        "    \"\"\"Validate and persist the canonical order workflow.\"\"\"\n"
+        '    """Validate and persist the canonical order workflow."""\n'
         "    return {'accepted': bool(order)}\n",
     )
     decoy_names = [f"a{letter}_order_stub" for letter in "abcdefgh"]
     write_text(
         repo_dir / "order_stubs.py",
-        "\n\n".join(
-            f"def {name}(order):\n    return order" for name in decoy_names
-        )
+        "\n\n".join(f"def {name}(order):\n    return order" for name in decoy_names)
         + "\n",
     )
     for index in range(8):
@@ -445,7 +525,13 @@ def create_git_history_quality_repo(repo_dir: Path) -> dict[str, Any]:
             else f"def beta_{commit_index}():\n    return {commit_index}\n\n",
         )
         git("add", "--", "alpha.py", "beta.py")
-        git("commit", "-q", "-m", f"coupled change {commit_index}", commit_index=commit_index)
+        git(
+            "commit",
+            "-q",
+            "-m",
+            f"coupled change {commit_index}",
+            commit_index=commit_index,
+        )
     return {
         "fixture_version": 1,
         "capability": "git_history",
@@ -468,8 +554,8 @@ def create_http_links_quality_repo(repo_dir: Path) -> dict[str, Any]:
         "import io.ktor.server.routing.*\n\n"
         "fun Application.configureRouting() {\n"
         "    routing {\n"
-        f"        get(\"{route_template}\") {{\n"
-        "            call.respondText(\"order\")\n"
+        f'        get("{route_template}") {{\n'
+        '            call.respondText("order")\n'
         "        }\n"
         "    }\n"
         "}\n",
@@ -605,7 +691,9 @@ def create_inbound_frontier_repo(
     dependent_paths: list[str] = []
     if language == "go":
         write_text(repo_dir / "go.mod", "module example.com/cbmfrontier\n\ngo 1.22\n")
-        write_text(repo_dir / "leaf.go", "package frontier\n\nfunc Leaf() int { return 1 }\n")
+        write_text(
+            repo_dir / "leaf.go", "package frontier\n\nfunc Leaf() int { return 1 }\n"
+        )
         for index in range(dependent_files):
             relative = f"caller_{index:04d}.go"
             write_text(
@@ -659,7 +747,10 @@ def create_inbound_frontier_repo(
         extension = {"javascript": "js", "typescript": "ts", "tsx": "tsx"}[language]
         changed_path = f"leaf.{extension}"
         return_type = "" if language == "javascript" else ": number"
-        write_text(repo_dir / changed_path, f"export function leaf(){return_type} {{ return 1; }}\n")
+        write_text(
+            repo_dir / changed_path,
+            f"export function leaf(){return_type} {{ return 1; }}\n",
+        )
         for index in range(dependent_files):
             relative = f"caller_{index:04d}.{extension}"
             import_suffix = ".js" if language == "javascript" else ""
@@ -716,7 +807,9 @@ def create_inbound_frontier_repo(
             dependent_paths.append(relative)
     elif language == "kotlin":
         changed_path = "Leaf.kt"
-        write_text(repo_dir / changed_path, "package frontier\n\nfun leafValue(): Int = 1\n")
+        write_text(
+            repo_dir / changed_path, "package frontier\n\nfun leafValue(): Int = 1\n"
+        )
         for index in range(dependent_files):
             relative = f"Caller{index:04d}.kt"
             write_text(
@@ -726,7 +819,9 @@ def create_inbound_frontier_repo(
             dependent_paths.append(relative)
     elif language == "rust":
         changed_path = "leaf.rs"
-        write_text(repo_dir / "Cargo.toml", "[package]\nname='cbm-frontier'\nversion='0.1.0'\n")
+        write_text(
+            repo_dir / "Cargo.toml", "[package]\nname='cbm-frontier'\nversion='0.1.0'\n"
+        )
         write_text(repo_dir / changed_path, "pub fn leaf_value() -> i32 { 1 }\n")
         modules = ["mod leaf;"]
         for index in range(dependent_files):
@@ -780,8 +875,7 @@ def mutate_inbound_frontier_repo(repo_dir: Path, language: str) -> list[str]:
     elif language == "python":
         changed_path = "leaf.py"
         content = (
-            "def leaf():\n    return 2\n\n"
-            "def leaf_extra():\n    return leaf() + 1\n"
+            "def leaf():\n    return 2\n\ndef leaf_extra():\n    return leaf() + 1\n"
         )
     elif language == "c_header":
         changed_path = "shared.h"
@@ -868,7 +962,9 @@ def parse_list_project_counts(raw: str) -> list[int]:
     try:
         counts = [int(item.strip()) for item in items if item.strip()]
     except ValueError as exc:
-        raise ValueError("list project counts must be comma-separated integers") from exc
+        raise ValueError(
+            "list project counts must be comma-separated integers"
+        ) from exc
     if not counts or any(count <= 0 for count in counts):
         raise ValueError("list project counts must contain positive integers")
     if any(left >= right for left, right in zip(counts, counts[1:])):
@@ -978,7 +1074,9 @@ def command_stdout(cmd: list[str], timeout: int, cwd: Path | None = None) -> str
     return proc.stdout.strip()
 
 
-def command_stdout_bytes(cmd: list[str], timeout: int, cwd: Path | None = None) -> bytes:
+def command_stdout_bytes(
+    cmd: list[str], timeout: int, cwd: Path | None = None
+) -> bytes:
     proc = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -1047,7 +1145,11 @@ def build_search_projection_observation(
     transport_survived: bool,
 ) -> dict[str, Any]:
     results = data.get("results")
-    typed_results = [item for item in results if isinstance(item, dict)] if isinstance(results, list) else []
+    typed_results = (
+        [item for item in results if isinstance(item, dict)]
+        if isinstance(results, list)
+        else []
+    )
     result_keys = {str(key) for item in typed_results for key in item}
     property_fields = sorted(result_keys - SEARCH_PROJECTION_CORE_FIELDS)
     internal_fields = sorted(result_keys & SEARCH_PROJECTION_INTERNAL_FIELDS)
@@ -1068,7 +1170,9 @@ def build_search_projection_observation(
         "mcp_envelope_bytes": mcp_envelope_bytes,
         "elapsed_ms": round(elapsed_ms, 3),
         "transport_survived": transport_survived,
-        "passed": isinstance(results, list) and not internal_fields and transport_survived,
+        "passed": isinstance(results, list)
+        and not internal_fields
+        and transport_survived,
     }
 
 
@@ -1095,6 +1199,25 @@ def tool_schema_sha256(tool: dict[str, Any]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def tool_contract_sha256(tool: dict[str, Any]) -> str:
+    """Hash every MCP tools/list field that affects client discovery and invocation."""
+    contract = {
+        key: tool.get(key)
+        for key in (
+            "name",
+            "title",
+            "description",
+            "inputSchema",
+            "outputSchema",
+            "annotations",
+        )
+    }
+    payload = json.dumps(contract, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(payload).hexdigest()
+
+
 def tool_schema_properties(tool: dict[str, Any] | None) -> set[str]:
     if not isinstance(tool, dict):
         return set()
@@ -1111,6 +1234,19 @@ def tool_schema_required(tool: dict[str, Any] | None) -> set[str]:
     return set(map(str, required)) if isinstance(required, list) else set()
 
 
+def schema_validation_shape(value: Any) -> Any:
+    """Remove documentation-only JSON Schema fields while retaining validation semantics."""
+    if isinstance(value, dict):
+        return {
+            str(key): schema_validation_shape(item)
+            for key, item in sorted(value.items())
+            if key not in {"description", "title", "$comment", "examples"}
+        }
+    if isinstance(value, list):
+        return [schema_validation_shape(item) for item in value]
+    return value
+
+
 def compare_mcp_tool_surfaces(
     pre_reveal: list[dict[str, Any]],
     post_reveal: list[dict[str, Any]],
@@ -1120,9 +1256,15 @@ def compare_mcp_tool_surfaces(
     list_changed_observed: bool,
 ) -> dict[str, Any]:
     """Compare discovery and callable coverage without conflating hidden with absent."""
-    pre_by_name = {str(tool.get("name")): tool for tool in pre_reveal if tool.get("name")}
-    post_by_name = {str(tool.get("name")): tool for tool in post_reveal if tool.get("name")}
-    classic_by_name = {str(tool.get("name")): tool for tool in classic if tool.get("name")}
+    pre_by_name = {
+        str(tool.get("name")): tool for tool in pre_reveal if tool.get("name")
+    }
+    post_by_name = {
+        str(tool.get("name")): tool for tool in post_reveal if tool.get("name")
+    }
+    classic_by_name = {
+        str(tool.get("name")): tool for tool in classic if tool.get("name")
+    }
     classic_names = set(classic_by_name)
     advertised_pre = sorted(classic_names & set(pre_by_name))
     hidden_pre = sorted(classic_names - set(pre_by_name))
@@ -1133,11 +1275,21 @@ def compare_mcp_tool_surfaces(
     schema_mismatches = sorted(
         name
         for name in classic_names & set(post_by_name)
-        if tool_schema_sha256(classic_by_name[name]) != tool_schema_sha256(post_by_name[name])
+        if tool_schema_sha256(classic_by_name[name])
+        != tool_schema_sha256(post_by_name[name])
     )
     name_parity = not missing_post
     schema_parity = name_parity and not schema_mismatches
-    dispatch_parity = len(dispatch_recognized_pre) == len(classic_names) and bool(classic_names)
+    contract_mismatches = sorted(
+        name
+        for name in classic_names & set(post_by_name)
+        if tool_contract_sha256(classic_by_name[name])
+        != tool_contract_sha256(post_by_name[name])
+    )
+    contract_parity = name_parity and not contract_mismatches
+    dispatch_parity = len(dispatch_recognized_pre) == len(classic_names) and bool(
+        classic_names
+    )
     alias_streamlined = pre_by_name.get("get_code")
     alias_classic = classic_by_name.get("get_code_snippet")
     streamlined_properties = tool_schema_properties(alias_streamlined)
@@ -1147,23 +1299,74 @@ def compare_mcp_tool_surfaces(
     alias = {
         "streamlined_name": "get_code",
         "classic_name": "get_code_snippet",
-        "both_advertised_in_compared_surfaces": bool(alias_streamlined and alias_classic),
+        "both_advertised_in_compared_surfaces": bool(
+            alias_streamlined and alias_classic
+        ),
         "schema_equal": bool(alias_streamlined and alias_classic)
         and tool_schema_sha256(alias_streamlined) == tool_schema_sha256(alias_classic),
+        "validation_shape_equal": bool(alias_streamlined and alias_classic)
+        and schema_validation_shape(alias_streamlined.get("inputSchema"))
+        == schema_validation_shape(alias_classic.get("inputSchema")),
         "property_names_equal": streamlined_properties == classic_properties,
         "shared_properties": sorted(streamlined_properties & classic_properties),
-        "streamlined_only_properties": sorted(streamlined_properties - classic_properties),
+        "streamlined_only_properties": sorted(
+            streamlined_properties - classic_properties
+        ),
         "classic_only_properties": sorted(classic_properties - streamlined_properties),
         "streamlined_required": sorted(streamlined_required),
         "classic_required": sorted(classic_required),
         "required_names_equal": streamlined_required == classic_required,
     }
+    capability_parity: list[dict[str, Any]] = []
+    for (
+        capability,
+        outcome,
+        classic_required_names,
+        streamlined_names,
+    ) in MCP_CAPABILITY_SURFACES:
+        classic_required = set(classic_required_names)
+        if not classic_required.issubset(classic_names):
+            continue
+        streamlined_required = set(streamlined_names)
+        pre_advertised = bool(streamlined_required) and streamlined_required.issubset(
+            pre_by_name
+        )
+        pre_callable = pre_advertised or all(
+            pre_dispatch.get(name) is True for name in classic_required
+        )
+        capability_parity.append(
+            {
+                "capability": capability,
+                "outcome": outcome,
+                "classic_tools": sorted(classic_required),
+                "streamlined_pre_reveal_tools": sorted(streamlined_required),
+                "classic_advertised": True,
+                "streamlined_pre_reveal_advertised": pre_advertised,
+                "streamlined_pre_reveal_callable": pre_callable,
+                "streamlined_post_reveal_advertised": classic_required.issubset(
+                    post_by_name
+                ),
+                "evidence": "tools/list contracts and bounded handler-recognition probes",
+            }
+        )
+    capability_parity_passed = bool(capability_parity) and all(
+        item["streamlined_pre_reveal_callable"]
+        and item["streamlined_post_reveal_advertised"]
+        for item in capability_parity
+    )
     return {
         "comparison_scope": {
-            "advertised_parity": "tool names and input-schema hashes",
+            "advertised_parity": (
+                "tool names and full tools/list contract hashes: title, description, "
+                "input/output schemas, and annotations"
+            ),
             "dispatch_parity": (
                 "handler recognition from bounded empty-argument calls; this does not claim "
                 "end-to-end behavioral equality"
+            ),
+            "capability_parity": (
+                "user-outcome mapping from advertised contracts and bounded handler recognition; "
+                "functional quality is measured by separate capability fixtures"
             ),
         },
         "pre_reveal": {
@@ -1182,13 +1385,25 @@ def compare_mcp_tool_surfaces(
             "missing_classic_tools": missing_post,
             "classic_schema_parity": schema_parity,
             "schema_mismatches": schema_mismatches,
+            "classic_contract_parity": contract_parity,
+            "contract_mismatches": contract_mismatches,
             "tools_list_changed_observed": list_changed_observed,
         },
-        "passed": dispatch_parity and name_parity and schema_parity and list_changed_observed,
+        "capability_parity": capability_parity,
+        "passed": (
+            dispatch_parity
+            and name_parity
+            and schema_parity
+            and contract_parity
+            and capability_parity_passed
+            and list_changed_observed
+        ),
     }
 
 
-def capture_tool_surface(client: "McpClient") -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def capture_tool_surface(
+    client: "McpClient",
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     start = now_ms()
     response = client._request("tools/list", {})
     elapsed_ms = now_ms() - start
@@ -1197,7 +1412,9 @@ def capture_tool_surface(client: "McpClient") -> tuple[dict[str, Any], list[dict
     if not isinstance(tools, list) or not all(isinstance(tool, dict) for tool in tools):
         raise RuntimeError("MCP tools/list did not return an object array")
     typed_tools = list(tools)
-    payload = json.dumps(response, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    payload = json.dumps(response, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
     return (
         {
             "tool_count": len(typed_tools),
@@ -1229,6 +1446,11 @@ class McpClient:
         self.proc: subprocess.Popen[str] | None = None
         self.stdout_thread: threading.Thread | None = None
         self.stderr_thread: threading.Thread | None = None
+        self.cleanup: dict[str, Any] = {
+            "process_reaped": False,
+            "reader_threads_reaped": False,
+            "returncode": None,
+        }
 
     def __enter__(self) -> "McpClient":
         self.proc = subprocess.Popen(
@@ -1251,18 +1473,22 @@ class McpClient:
         if not self.proc:
             return
         proc = self.proc
+        process_reaped = False
         try:
             try:
                 if proc.stdin:
                     proc.stdin.close()
                 proc.wait(timeout=5)
+                process_reaped = True
             except subprocess.TimeoutExpired:
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
+                    process_reaped = True
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=5)
+                    process_reaped = True
         finally:
             reader_threads = tuple(
                 thread for thread in (self.stdout_thread, self.stderr_thread) if thread
@@ -1276,6 +1502,11 @@ class McpClient:
             for thread in alive_threads:
                 thread.join(timeout=1)
             readers_still_alive = any(thread.is_alive() for thread in alive_threads)
+            self.cleanup = {
+                "process_reaped": process_reaped,
+                "reader_threads_reaped": not readers_still_alive,
+                "returncode": getattr(proc, "returncode", None),
+            }
             self.proc = None
             self.stdout_thread = None
             self.stderr_thread = None
@@ -1308,7 +1539,9 @@ class McpClient:
         self.proc.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
         self.proc.stdin.flush()
 
-    def _request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _request(
+        self, method: str, params: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
         req_id = self.next_id
         self.next_id += 1
         message: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
@@ -1388,7 +1621,10 @@ def run_mcp_surface_parity(
         "mode": "mcp_surface_parity",
         "protocol_version": MCP_INIT_PROTOCOL_VERSION,
         "work_root": str(work_root),
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
     }
     exit_code = 1
     try:
@@ -1399,6 +1635,7 @@ def run_mcp_surface_parity(
         classic_env["CBM_TOOL_MODE"] = "classic"
         with McpClient(binary, classic_env, args.timeout) as classic_client:
             classic_summary, classic_tools = capture_tool_surface(classic_client)
+        classic_summary["lifecycle"] = dict(classic_client.cleanup)
 
         streamlined_env = dict(base_env)
         streamlined_env["CBM_TOOL_MODE"] = "streamlined"
@@ -1419,6 +1656,8 @@ def run_mcp_surface_parity(
                 item.get("method") == "notifications/tools/list_changed"
                 for item in streamlined_client.notifications
             )
+        pre_summary["lifecycle"] = dict(streamlined_client.cleanup)
+        post_summary["lifecycle"] = dict(streamlined_client.cleanup)
 
         comparison = compare_mcp_tool_surfaces(
             pre_tools,
@@ -1429,6 +1668,13 @@ def run_mcp_surface_parity(
         )
         pre_summary["classic_dispatch_recognized"] = pre_dispatch
         pre_summary["dispatch_response_bytes"] = dispatch_bytes
+        lifecycle_passed = all(
+            bool(summary.get("lifecycle", {}).get("process_reaped"))
+            and bool(summary.get("lifecycle", {}).get("reader_threads_reaped"))
+            for summary in (classic_summary, pre_summary, post_summary)
+        )
+        comparison["lifecycle_passed"] = lifecycle_passed
+        comparison["passed"] = bool(comparison["passed"]) and lifecycle_passed
         report.update(
             {
                 "surfaces": {
@@ -1480,7 +1726,9 @@ def run_list_projects_scaling(
         "generated_at_utc": generated_at.isoformat(),
         "binary": str(binary),
         "binary_metadata": metadata,
-        "source_revision": git_metadata(Path(__file__).resolve().parents[1], args.timeout),
+        "source_revision": git_metadata(
+            Path(__file__).resolve().parents[1], args.timeout
+        ),
         "mode": "list_projects_scaling",
         "parameters": {
             "project_counts": counts,
@@ -1495,7 +1743,10 @@ def run_list_projects_scaling(
             "rss_measurement": "post_call_resident_kb_not_peak",
         },
         "work_root": str(work_root),
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
         "observations": [],
         "completion": {"status": "running"},
     }
@@ -1619,7 +1870,9 @@ def run_list_projects_scaling(
     return report, exit_code
 
 
-def run_search_projection(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+def run_search_projection(
+    args: argparse.Namespace, binary: Path
+) -> tuple[dict[str, Any], int]:
     if args.search_projection_results <= 0:
         raise ValueError("search projection results must be positive")
     auto_root = not bool(args.work_root)
@@ -1642,7 +1895,9 @@ def run_search_projection(args: argparse.Namespace, binary: Path) -> tuple[dict[
         ),
         "generated_at_utc": generated_at.isoformat(),
         "binary_metadata": metadata,
-        "source_revision": git_metadata(Path(__file__).resolve().parents[1], args.timeout),
+        "source_revision": git_metadata(
+            Path(__file__).resolve().parents[1], args.timeout
+        ),
         "mode": "search_projection",
         "parameters": {
             "requested_results": args.search_projection_results,
@@ -1654,7 +1909,10 @@ def run_search_projection(args: argparse.Namespace, binary: Path) -> tuple[dict[
             "rss_measurement": "post_call_resident_kb_not_peak",
         },
         "work_root": str(work_root),
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
         "observations": [],
         "completion": {"status": "running"},
     }
@@ -1746,21 +2004,26 @@ def run_search_projection(args: argparse.Namespace, binary: Path) -> tuple[dict[
             "identity_parity": all(
                 bool(item["identity_equal_to_default"]) for item in observations
             ),
-            "internal_fields_absent": all(not item["internal_fields"] for item in observations),
+            "internal_fields_absent": all(
+                not item["internal_fields"] for item in observations
+            ),
             "compact_bytes": compact_bytes,
             "selected_fields_bytes": selected_bytes,
             "non_compact_bytes": verbose_bytes,
             "non_compact_over_compact_ratio": (
                 round(verbose_bytes / compact_bytes, 3) if compact_bytes else None
             ),
-            "projection_order_expected": compact_bytes <= selected_bytes <= verbose_bytes,
+            "projection_order_expected": compact_bytes
+            <= selected_bytes
+            <= verbose_bytes,
             "claim_boundary": (
                 "Measures response projection for identical ranked results after one small FAST "
                 "index; one latency observation per variant is descriptive only."
             ),
         }
         report["derived"]["passed"] = bool(
-            report["derived"]["passed"] and report["derived"]["projection_order_expected"]
+            report["derived"]["passed"]
+            and report["derived"]["projection_order_expected"]
         )
         exit_code = 0 if report["derived"]["passed"] else 1
         report["completion"] = {"status": "complete", "exit_code": exit_code}
@@ -1818,7 +2081,10 @@ def declared_stale_views(oracles: dict[str, Any]) -> list[str]:
         if not isinstance(oracle, dict):
             continue
         freshness = oracle.get("freshness")
-        if not isinstance(freshness, dict) or freshness.get("state") != "stale_with_warning":
+        if (
+            not isinstance(freshness, dict)
+            or freshness.get("state") != "stale_with_warning"
+        ):
             continue
         stale = freshness.get("stale_views")
         if isinstance(stale, list):
@@ -1835,7 +2101,9 @@ def is_incremental_publish_kind(publish_kind: str) -> bool:
     }
 
 
-def is_explicit_incremental_route(publish_kind: str | None, reason: str | None = None) -> bool:
+def is_explicit_incremental_route(
+    publish_kind: str | None, reason: str | None = None
+) -> bool:
     return is_incremental_publish_kind(publish_kind or "") or bool(reason)
 
 
@@ -1893,8 +2161,12 @@ def parse_exact_reason(stderr: str) -> str | None:
 
 def parse_exact_route_detail(stderr: str) -> dict[str, Any]:
     detail: dict[str, Any] = {
-        "frontier_changed_files": parse_log_int_field(stderr, LOG_MARKER_EXACT_FRONTIER, "changed"),
-        "frontier_expanded_files": parse_log_int_field(stderr, LOG_MARKER_EXACT_FRONTIER, "expanded"),
+        "frontier_changed_files": parse_log_int_field(
+            stderr, LOG_MARKER_EXACT_FRONTIER, "changed"
+        ),
+        "frontier_expanded_files": parse_log_int_field(
+            stderr, LOG_MARKER_EXACT_FRONTIER, "expanded"
+        ),
         "exact_done_files": parse_log_int_field(stderr, LOG_MARKER_EXACT_DONE, "files"),
         "event": None,
         "reason": None,
@@ -1967,7 +2239,9 @@ def indexed_work_elapsed_ms(logged_elapsed_ms: dict[str, int | None]) -> int | N
     return logged_elapsed_ms.get("pipeline_done")
 
 
-def run_config_set(binary: Path, env: dict[str, str], key: str, value: str, timeout: int) -> None:
+def run_config_set(
+    binary: Path, env: dict[str, str], key: str, value: str, timeout: int
+) -> None:
     cmd = [str(binary), "config", "set", key, value]
     proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
@@ -2091,8 +2365,12 @@ def build_index_result(
     elapsed_ms_int = int(elapsed_ms)
     publish_kind = response_publish_kind(data)
     logged_elapsed_ms = {
-        "pipeline_done": parse_logged_elapsed_ms(measurement_text, LOG_MARKER_PIPELINE_DONE),
-        "incremental_done": parse_logged_elapsed_ms(measurement_text, LOG_MARKER_INCREMENTAL_DONE),
+        "pipeline_done": parse_logged_elapsed_ms(
+            measurement_text, LOG_MARKER_PIPELINE_DONE
+        ),
+        "incremental_done": parse_logged_elapsed_ms(
+            measurement_text, LOG_MARKER_INCREMENTAL_DONE
+        ),
     }
     indexed_ms = indexed_work_elapsed_ms(logged_elapsed_ms)
     publish_reason = response_publish_reason(data)
@@ -2103,13 +2381,21 @@ def build_index_result(
     freshness_state = response_freshness_state(data)
     peak_candidates = [
         parse_log_max_int_field(measurement_text, marker, "peak_mb")
-        for marker in ("mem.phase", LOG_MARKER_PIPELINE_DONE, LOG_MARKER_INCREMENTAL_DONE)
+        for marker in (
+            "mem.phase",
+            LOG_MARKER_PIPELINE_DONE,
+            LOG_MARKER_INCREMENTAL_DONE,
+        )
     ]
-    peak_rss_mb = max((value for value in peak_candidates if value is not None), default=None)
+    peak_rss_mb = max(
+        (value for value in peak_candidates if value is not None), default=None
+    )
     dependency_phase_ms = parse_log_int_field(
         measurement_text, LOG_MARKER_DEP_AUTO_INDEX, "ms"
     )
-    rank_refresh_ms = parse_log_int_field(measurement_text, LOG_MARKER_RANK_REFRESH, "ms")
+    rank_refresh_ms = parse_log_int_field(
+        measurement_text, LOG_MARKER_RANK_REFRESH, "ms"
+    )
     worker_elapsed_ms = parse_log_int_field(
         measurement_text, LOG_MARKER_INDEX_WORKER_TOTAL, "ms"
     )
@@ -2285,7 +2571,9 @@ def build_tool_call_result(
         "response_bytes": len(payload),
         "response_token_estimate": estimate_response_tokens(payload),
         "token_estimator": TOKEN_ESTIMATOR,
-        "response_encoding": "tool_default" if response_payload is not None else "canonical_json",
+        "response_encoding": "tool_default"
+        if response_payload is not None
+        else "canonical_json",
         "quality_response_bytes": len(quality_payload),
         "response": data,
         "freshness_state": response_freshness_state(data) or None,
@@ -2314,17 +2602,29 @@ def run_cli_tool_call(
     quality_arguments = dict(arguments)
     quality_arguments["format"] = "json"
     quality_cmd = [
-        str(binary), "cli", "--json", tool_name,
+        str(binary),
+        "cli",
+        "--json",
+        tool_name,
         json.dumps(quality_arguments, separators=(",", ":")),
     ]
     quality_proc, quality_elapsed_ms = command_result(quality_cmd, env, timeout)
     if quality_proc.returncode != 0:
         raise command_failure(
-            f"{tool_name}_quality_call", quality_cmd, env, quality_proc, quality_elapsed_ms
+            f"{tool_name}_quality_call",
+            quality_cmd,
+            env,
+            quality_proc,
+            quality_elapsed_ms,
         )
     data = unwrap_cli_json(quality_proc.stdout)
     result = build_tool_call_result(
-        data, proc.stderr, len(proc.stdout.encode("utf-8")), elapsed_ms, include_logs, raw_payload
+        data,
+        proc.stderr,
+        len(proc.stdout.encode("utf-8")),
+        elapsed_ms,
+        include_logs,
+        raw_payload,
     )
     result["quality_probe_elapsed_ms"] = round(quality_elapsed_ms, 3)
     return result
@@ -2336,7 +2636,9 @@ def run_mcp_tool_call(
     arguments: dict[str, Any],
     include_logs: bool,
 ) -> dict[str, Any]:
-    raw_text, stderr, stdout_bytes, elapsed_ms = client.call_tool_text(tool_name, arguments)
+    raw_text, stderr, stdout_bytes, elapsed_ms = client.call_tool_text(
+        tool_name, arguments
+    )
     quality_arguments = dict(arguments)
     quality_arguments["format"] = "json"
     data, _, _, quality_elapsed_ms = client.call_tool(tool_name, quality_arguments)
@@ -2390,7 +2692,11 @@ def measure_cli_overhead_probes(
         run_cli_tool_probe(binary, env, tool_name, timeout, include_logs)
         for _ in range(count)
     ]
-    return {"tool": tool_name, "trials": probes, "summary": summarize_elapsed_ms(probes)}
+    return {
+        "tool": tool_name,
+        "trials": probes,
+        "summary": summarize_elapsed_ms(probes),
+    }
 
 
 def measure_mcp_overhead_probes(
@@ -2402,7 +2708,11 @@ def measure_mcp_overhead_probes(
     if count <= 0:
         return None
     probes = [run_mcp_tool_probe(client, tool_name, include_logs) for _ in range(count)]
-    return {"tool": tool_name, "trials": probes, "summary": summarize_elapsed_ms(probes)}
+    return {
+        "tool": tool_name,
+        "trials": probes,
+        "summary": summarize_elapsed_ms(probes),
+    }
 
 
 def remove_project_dbs(cache_dir: Path) -> list[str]:
@@ -2426,11 +2736,15 @@ def find_project_db(cache_dir: Path) -> Path:
     dbs = sorted(
         path
         for path in cache_dir.iterdir()
-        if path.is_file() and path.name != CONFIG_DB_NAME and path.name.endswith(PROJECT_DB_SUFFIX)
+        if path.is_file()
+        and path.name != CONFIG_DB_NAME
+        and path.name.endswith(PROJECT_DB_SUFFIX)
     )
     if len(dbs) != 1:
         names = ", ".join(path.name for path in dbs)
-        raise RuntimeError(f"expected one project DB in {cache_dir}, found {len(dbs)}: {names}")
+        raise RuntimeError(
+            f"expected one project DB in {cache_dir}, found {len(dbs)}: {names}"
+        )
     return dbs[0]
 
 
@@ -2447,14 +2761,19 @@ def copy_sqlite_snapshot(source: Path, destination: Path) -> None:
         destination.unlink()
     remove_sqlite_sidecars(destination)
     uri = f"{source.resolve().as_uri()}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as src, sqlite3.connect(str(destination)) as dst:
+    with (
+        closing(sqlite3.connect(uri, uri=True)) as src,
+        closing(sqlite3.connect(str(destination))) as dst,
+    ):
         src.backup(dst)
 
 
-def clone_list_project_db(source: Path, destination: Path, project: str, root_path: str) -> None:
+def clone_list_project_db(
+    source: Path, destination: Path, project: str, root_path: str
+) -> None:
     """Clone one valid project DB and rekey rows used by list_projects."""
     copy_sqlite_snapshot(source, destination)
-    with sqlite3.connect(str(destination)) as con:
+    with closing(sqlite3.connect(str(destination))) as con, con:
         project_rows = con.execute("SELECT name FROM projects").fetchall()
         if len(project_rows) != 1:
             raise RuntimeError(
@@ -2465,8 +2784,12 @@ def clone_list_project_db(source: Path, destination: Path, project: str, root_pa
             "UPDATE projects SET name = ?, root_path = ? WHERE name = ?",
             (project, root_path, old_project),
         )
-        con.execute("UPDATE nodes SET project = ? WHERE project = ?", (project, old_project))
-        con.execute("UPDATE edges SET project = ? WHERE project = ?", (project, old_project))
+        con.execute(
+            "UPDATE nodes SET project = ? WHERE project = ?", (project, old_project)
+        )
+        con.execute(
+            "UPDATE edges SET project = ? WHERE project = ?", (project, old_project)
+        )
 
 
 def decode_sqlite_text(data: bytes) -> str:
@@ -2602,6 +2925,7 @@ CANONICAL_NODES_SQL = (
     "ORDER BY je.key, je.type, CAST(je.value AS TEXT)"
     ")), '')"
 )
+
 
 def build_canonical_edges_sql(edge_predicate: str = "") -> str:
     return (
@@ -2837,13 +3161,17 @@ def stable_graph_fingerprint(db_path: Path, project: str) -> dict[str, Any]:
     return {"sha256": aggregate.hexdigest(), "components": components}
 
 
-def compare_canonical_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
+def compare_canonical_graph(
+    left_db: Path, right_db: Path, project: str
+) -> dict[str, Any]:
     for kind, sql in (
         ("canonical nodes", CANONICAL_NODES_SQL),
         ("canonical edges", CANONICAL_EDGES_SQL),
         ("file hashes", CANONICAL_HASHES_SQL),
     ):
-        result = compare_query_rows(left_db, right_db, kind, sql, (project,), sql, (project,))
+        result = compare_query_rows(
+            left_db, right_db, kind, sql, (project,), sql, (project,)
+        )
         if not result["equal"]:
             return result
     return {"equal": True}
@@ -2883,7 +3211,9 @@ def compare_graph_excluding_declared_stale_views(
     }
 
 
-def compare_active_overlay_graph(left_db: Path, right_db: Path, project: str) -> dict[str, Any]:
+def compare_active_overlay_graph(
+    left_db: Path, right_db: Path, project: str
+) -> dict[str, Any]:
     left_params = (
         OVERLAY_STATUS_READY,
         OVERLAY_TOMBSTONE_FILE,
@@ -2963,7 +3293,10 @@ def frontier_coverage_gate(
     if isinstance(expected_publish_kind, str) and isinstance(expected_reason, str):
         observed_publish_kind = incremental.get("publish_kind")
         observed_reason = incremental.get("exact_reason")
-        passed = observed_publish_kind == expected_publish_kind and observed_reason == expected_reason
+        passed = (
+            observed_publish_kind == expected_publish_kind
+            and observed_reason == expected_reason
+        )
         result = {
             "passed": passed,
             "applicable": True,
@@ -2974,7 +3307,9 @@ def frontier_coverage_gate(
             "observed_reason": observed_reason,
         }
         if not passed:
-            result["reason"] = "observed fallback route does not match the fixture contract"
+            result["reason"] = (
+                "observed fallback route does not match the fixture contract"
+            )
         return result
     expected = scenario_metadata.get("expected_minimum_affected_files")
     if not isinstance(expected, int):
@@ -2982,7 +3317,9 @@ def frontier_coverage_gate(
     exact_delta = incremental.get("response", {}).get("exact_delta", {})
     observed = exact_delta.get("affected_paths")
     if not isinstance(observed, int):
-        observed = incremental.get("exact_route_detail", {}).get("frontier_expanded_files")
+        observed = incremental.get("exact_route_detail", {}).get(
+            "frontier_expanded_files"
+        )
     if isinstance(exact_cap, int) and exact_cap < expected:
         observed_publish_kind = incremental.get("publish_kind")
         observed_reason = incremental.get("exact_reason")
@@ -3043,7 +3380,9 @@ def prepare_matrix_scenario(
 ) -> dict[str, Any]:
     frontier_language = MATRIX_FRONTIER_SCENARIOS.get(name)
     if frontier_language:
-        return create_inbound_frontier_repo(repo_dir, frontier_language, args.frontier_files)
+        return create_inbound_frontier_repo(
+            repo_dir, frontier_language, args.frontier_files
+        )
     if name in {
         "go_modify_1",
         "go_modify_2",
@@ -3089,7 +3428,10 @@ def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> li
         return [old_rel.as_posix(), new_rel.as_posix()]
     if name == "go_new_folder":
         rel = Path("newpkg") / "leaf.go"
-        write_text(repo_dir / rel, "package newpkg\n\nfunc NewFolderLeaf() int {\n\treturn 23\n}\n")
+        write_text(
+            repo_dir / rel,
+            "package newpkg\n\nfunc NewFolderLeaf() int {\n\treturn 23\n}\n",
+        )
         return [rel.as_posix()]
     if name == "route_decorator":
         create_route_repo(repo_dir, "/api/items")
@@ -3108,12 +3450,18 @@ def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> li
             f"        return {FASTAPI_PROBE_RETURN_VALUE}\n"
         )
         if FASTAPI_PROBE_INSERT_BEFORE not in source:
-            raise RuntimeError(f"FastAPI probe insertion point not found: {rel.as_posix()}")
-        mutated = source.replace(FASTAPI_PROBE_INSERT_BEFORE, insert + FASTAPI_PROBE_INSERT_BEFORE, 1)
+            raise RuntimeError(
+                f"FastAPI probe insertion point not found: {rel.as_posix()}"
+            )
+        mutated = source.replace(
+            FASTAPI_PROBE_INSERT_BEFORE, insert + FASTAPI_PROBE_INSERT_BEFORE, 1
+        )
         try:
             compile(mutated, rel.as_posix(), "exec")
         except SyntaxError as exc:
-            raise RuntimeError(f"FastAPI probe mutation produced invalid Python: {exc}") from exc
+            raise RuntimeError(
+                f"FastAPI probe mutation produced invalid Python: {exc}"
+            ) from exc
         path.write_text(mutated, encoding="utf-8")
         return [rel.as_posix()]
     raise ValueError(f"unknown matrix scenario: {name}")
@@ -3121,7 +3469,9 @@ def mutate_matrix_scenario(name: str, repo_dir: Path, funcs_per_file: int) -> li
 
 def resolve_git_repo_root(repo_root: Path, timeout: int) -> Path:
     root = repo_root.expanduser().resolve()
-    return Path(command_stdout(["git", "rev-parse", "--show-toplevel"], timeout, root)).resolve()
+    return Path(
+        command_stdout(["git", "rev-parse", "--show-toplevel"], timeout, root)
+    ).resolve()
 
 
 def git_metadata(repo_root: Path, timeout: int) -> dict[str, Any]:
@@ -3198,12 +3548,12 @@ def copy_git_head_to_dir(source_repo: Path, dest: Path, timeout: int) -> None:
         ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD"], timeout, source_repo
     )
     rel_paths = [
-        item.decode("utf-8", "surrogateescape")
-        for item in raw.split(b"\0")
-        if item
+        item.decode("utf-8", "surrogateescape") for item in raw.split(b"\0") if item
     ]
     for rel_path in rel_paths:
-        blob = command_stdout_bytes(["git", "show", f"HEAD:{rel_path}"], timeout, source_repo)
+        blob = command_stdout_bytes(
+            ["git", "show", f"HEAD:{rel_path}"], timeout, source_repo
+        )
         target = dest / rel_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(blob)
@@ -3258,8 +3608,13 @@ def copy_git_revision_to_dir(
             ]
             for member in members:
                 target = (dest / member.name).resolve()
-                if target != destination_root and destination_root not in target.parents:
-                    raise RuntimeError(f"git archive member escapes destination: {member.name}")
+                if (
+                    target != destination_root
+                    and destination_root not in target.parents
+                ):
+                    raise RuntimeError(
+                        f"git archive member escapes destination: {member.name}"
+                    )
             archive.extractall(dest, members=members, filter="data")
     finally:
         if archive_path.exists():
@@ -3306,8 +3661,14 @@ def create_self_dogfood_worktree(
     return repo_dir
 
 
-def remove_self_dogfood_worktree(source_repo: Path, repo_dir: Path, timeout: int) -> dict[str, Any]:
-    cleanup: dict[str, Any] = {"requested": True, "path": str(repo_dir), "removed": False}
+def remove_self_dogfood_worktree(
+    source_repo: Path, repo_dir: Path, timeout: int
+) -> dict[str, Any]:
+    cleanup: dict[str, Any] = {
+        "requested": True,
+        "path": str(repo_dir),
+        "removed": False,
+    }
     proc, _ = command_result(
         ["git", "worktree", "remove", "--force", str(repo_dir)],
         dict(os.environ),
@@ -3325,15 +3686,12 @@ def self_dogfood_marker(name: str) -> str:
     return f"{SELF_DOGFOOD_MARKER_PREFIX}_{name}"
 
 
-def append_c_marker_function(repo_dir: Path, rel_path: str, marker: str, value: int) -> str:
+def append_c_marker_function(
+    repo_dir: Path, rel_path: str, marker: str, value: int
+) -> str:
     append_text(
         repo_dir / rel_path,
-        (
-            "\n"
-            f"static int {marker}(void) {{\n"
-            f"    return {value};\n"
-            "}\n"
-        ),
+        (f"\nstatic int {marker}(void) {{\n    return {value};\n}}\n"),
     )
     return rel_path
 
@@ -3341,7 +3699,9 @@ def append_c_marker_function(repo_dir: Path, rel_path: str, marker: str, value: 
 def create_c_marker_file(repo_dir: Path, rel_path: str, marker: str, value: int) -> str:
     path = repo_dir / rel_path
     if path.exists():
-        raise RuntimeError(f"benchmark new-file mutation target already exists: {rel_path}")
+        raise RuntimeError(
+            f"benchmark new-file mutation target already exists: {rel_path}"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"static int {marker}(void) {{\n    return {value};\n}}\n",
@@ -3358,7 +3718,10 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
         "one_source_file": ["src/pipeline/pipeline_internal.h"],
         "route_handler": ["src/ui/http_server.c"],
         "c_new_leaf": ["src/cbm_benchmark_leaf.c"],
-        "store_pipeline_batch": ["src/store/store.h", "src/pipeline/pipeline_internal.h"],
+        "store_pipeline_batch": [
+            "src/store/store.h",
+            "src/pipeline/pipeline_internal.h",
+        ],
         "multi_file_small": ["src/mcp/mcp.c", "tests/test_mcp.c"],
     }
     paths = scenario_paths.get(name)
@@ -3375,7 +3738,9 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
                 "path": path,
                 "before_sha256": before_hashes[path],
                 "after_sha256": (
-                    file_sha256(repo_dir / path) if (repo_dir / path).is_file() else None
+                    file_sha256(repo_dir / path)
+                    if (repo_dir / path).is_file()
+                    else None
                 ),
             }
             for path in paths
@@ -3384,14 +3749,24 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
 
     if name == "noop":
         return finish(
-            {"marker": None, "changed_paths": changed, "description": "no source mutation"}
+            {
+                "marker": None,
+                "changed_paths": changed,
+                "description": "no source mutation",
+            }
         )
     if name == "one_source_file":
         changed.append(
-            append_c_marker_function(repo_dir, "src/pipeline/pipeline_internal.h", marker, 4101)
+            append_c_marker_function(
+                repo_dir, "src/pipeline/pipeline_internal.h", marker, 4101
+            )
         )
         return finish(
-            {"marker": marker, "changed_paths": changed, "description": "single C header edit"}
+            {
+                "marker": marker,
+                "changed_paths": changed,
+                "description": "single C header edit",
+            }
         )
     if name == "route_handler":
         append_text(
@@ -3428,10 +3803,14 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
             }
         )
     if name == "store_pipeline_batch":
-        changed.append(append_c_marker_function(repo_dir, "src/store/store.h", marker, 4103))
+        changed.append(
+            append_c_marker_function(repo_dir, "src/store/store.h", marker, 4103)
+        )
         second_marker = f"{marker}_pipeline"
         changed.append(
-            append_c_marker_function(repo_dir, "src/pipeline/pipeline_internal.h", second_marker, 4104)
+            append_c_marker_function(
+                repo_dir, "src/pipeline/pipeline_internal.h", second_marker, 4104
+            )
         )
         return finish(
             {
@@ -3442,9 +3821,13 @@ def mutate_self_dogfood_scenario(name: str, repo_dir: Path) -> dict[str, Any]:
             }
         )
     if name == "multi_file_small":
-        changed.append(append_c_marker_function(repo_dir, "src/mcp/mcp.c", marker, 4105))
+        changed.append(
+            append_c_marker_function(repo_dir, "src/mcp/mcp.c", marker, 4105)
+        )
         second_marker = f"{marker}_test"
-        changed.append(append_c_marker_function(repo_dir, "tests/test_mcp.c", second_marker, 4106))
+        changed.append(
+            append_c_marker_function(repo_dir, "tests/test_mcp.c", second_marker, 4106)
+        )
         return finish(
             {
                 "marker": marker,
@@ -3464,7 +3847,12 @@ def oracle_passed(tool_result: dict[str, Any], marker: str | None) -> bool:
 
 def canonical_pair(source: str, target: str) -> tuple[str, str]:
     """Return an order-independent pair identity without losing endpoint names."""
-    if not isinstance(source, str) or not source or not isinstance(target, str) or not target:
+    if (
+        not isinstance(source, str)
+        or not source
+        or not isinstance(target, str)
+        or not target
+    ):
         raise ValueError("pair endpoints must be non-empty strings")
     if source == target:
         raise ValueError("pair endpoints must be distinct")
@@ -3569,7 +3957,9 @@ def score_pair_classification(
         "witnesses": witnesses,
         "unjudged_observed_count": len(unjudged_observed),
         "unjudged_observed": unjudged_observed,
-        "passed": recall_denominator > 0 and confusion["fp"] == 0 and confusion["fn"] == 0,
+        "passed": recall_denominator > 0
+        and confusion["fp"] == 0
+        and confusion["fn"] == 0,
         "ground_truth_boundary": (
             "Only explicit judgments enter TP/FP/FN/TN; unjudged observed pairs are retained "
             "but excluded because natural-repository ground truth is incomplete."
@@ -3615,11 +4005,13 @@ def score_ranked_relevance(
             ),
             default=0.0,
         )
-        all_relevance.append(
-            int(relevance) if relevance.is_integer() else relevance
-        )
+        all_relevance.append(int(relevance) if relevance.is_integer() else relevance)
     first_relevant_rank = next(
-        (index for index, relevance in enumerate(all_relevance, start=1) if relevance > 0),
+        (
+            index
+            for index, relevance in enumerate(all_relevance, start=1)
+            if relevance > 0
+        ),
         None,
     )
     matched_relevance = all_relevance[:cutoff]
@@ -3631,9 +4023,9 @@ def score_ranked_relevance(
         )
 
     dcg = discounted_gain(matched_relevance)
-    ideal_relevance = sorted(
-        (item["grade"] for item in valid_judgments), reverse=True
-    )[:cutoff]
+    ideal_relevance = sorted((item["grade"] for item in valid_judgments), reverse=True)[
+        :cutoff
+    ]
     idcg = discounted_gain(ideal_relevance)
     ndcg = dcg / idcg if idcg > 0 else None
     result = {
@@ -3686,9 +4078,11 @@ def score_quality_oracles(
                 and float(item["relevance"]) > 0
             ]
             expected = (
-                str(max(positive_judgments, key=lambda item: float(item["relevance"]))[
-                    "expected_substring"
-                ])
+                str(
+                    max(positive_judgments, key=lambda item: float(item["relevance"]))[
+                        "expected_substring"
+                    ]
+                )
                 if positive_judgments
                 else None
             )
@@ -3717,8 +4111,11 @@ def score_quality_oracles(
             response = result.get("response")
             ranked_items = (
                 response.get("results")
-                if isinstance(response, dict) and isinstance(response.get("results"), list)
-                else response if isinstance(response, list) else [response]
+                if isinstance(response, dict)
+                and isinstance(response.get("results"), list)
+                else response
+                if isinstance(response, list)
+                else [response]
             )
             returned_count = len(ranked_items)
             if graded:
@@ -3726,7 +4123,9 @@ def score_quality_oracles(
                 rank = ranking["first_relevant_rank"]
                 reciprocal_rank = float(ranking["reciprocal_rank"])
                 ndcg_value = ranking["ndcg"]
-                ndcg = float(ndcg_value) if isinstance(ndcg_value, (int, float)) else None
+                ndcg = (
+                    float(ndcg_value) if isinstance(ndcg_value, (int, float)) else None
+                )
                 passed = bool(ranking["hit_at_5"])
                 if ndcg is not None:
                     ndcg_total += ndcg
@@ -3736,7 +4135,9 @@ def score_quality_oracles(
                     response, separators=(",", ":"), sort_keys=True
                 )
                 for position, item in enumerate(ranked_items, start=1):
-                    if expected in json.dumps(item, separators=(",", ":"), sort_keys=True):
+                    if expected in json.dumps(
+                        item, separators=(",", ":"), sort_keys=True
+                    ):
                         rank = position
                         break
                 reciprocal_rank = 1.0 / rank if rank is not None else 0.0
@@ -3768,19 +4169,27 @@ def score_quality_oracles(
         "passed": passed_count == applicable_count,
         "passed_count": passed_count,
         "applicable_count": applicable_count,
-        "binary_pass_rate": round(passed_count / applicable_count, 6) if applicable_count else None,
+        "binary_pass_rate": round(passed_count / applicable_count, 6)
+        if applicable_count
+        else None,
         "mean_reciprocal_rank": (
             round(mean_reciprocal_rank, 6) if mean_reciprocal_rank is not None else None
         ),
-        "hit_at_1": round(hit_at_1_count / applicable_count, 6) if applicable_count else None,
-        "hit_at_5": round(hit_at_5_count / applicable_count, 6) if applicable_count else None,
+        "hit_at_1": round(hit_at_1_count / applicable_count, 6)
+        if applicable_count
+        else None,
+        "hit_at_5": round(hit_at_5_count / applicable_count, 6)
+        if applicable_count
+        else None,
         "mean_ndcg_at_5": (
             round(ndcg_total / ndcg_applicable_count, 6)
             if ndcg_applicable_count
             else None
         ),
         "ndcg_applicable_count": ndcg_applicable_count,
-        "score": round(mean_reciprocal_rank, 6) if mean_reciprocal_rank is not None else None,
+        "score": round(mean_reciprocal_rank, 6)
+        if mean_reciprocal_rank is not None
+        else None,
     }
 
 
@@ -3799,7 +4208,11 @@ def run_self_dogfood_oracles(
     oracles: dict[str, Any] = {}
     expectations: dict[str, tuple[str | None, str]] = {}
     if marker:
-        search_code_args: dict[str, Any] = {"project": project, "pattern": marker, "limit": 5}
+        search_code_args: dict[str, Any] = {
+            "project": project,
+            "pattern": marker,
+            "limit": 5,
+        }
         if first_changed:
             search_code_args["file_pattern"] = Path(first_changed).name
             search_code_args["path_filter"] = f"^{re.escape(first_changed)}$"
@@ -3813,7 +4226,10 @@ def run_self_dogfood_oracles(
             args.include_logs,
             client,
         )
-        expectations["marker_search_graph"] = (marker, "mutated symbol appears in graph search")
+        expectations["marker_search_graph"] = (
+            marker,
+            "mutated symbol appears in graph search",
+        )
         oracles["marker_search_code"] = run_tool_call_for_transport(
             transport,
             binary,
@@ -3824,7 +4240,10 @@ def run_self_dogfood_oracles(
             args.include_logs,
             client,
         )
-        expectations["marker_search_code"] = (marker, "mutated symbol appears in source search")
+        expectations["marker_search_code"] = (
+            marker,
+            "mutated symbol appears in source search",
+        )
     if first_changed:
         oracles["changed_file_query_graph"] = run_tool_call_for_transport(
             transport,
@@ -3860,9 +4279,11 @@ def run_self_dogfood_oracles(
             first_changed,
             "changed file path appears in scoped architecture",
         )
-    route_expected = "/api/pan4-oracle" if mutation.get("description", "").startswith(
-        "HTTP UI handler"
-    ) else None
+    route_expected = (
+        "/api/pan4-oracle"
+        if mutation.get("description", "").startswith("HTTP UI handler")
+        else None
+    )
     route_arguments: dict[str, Any] = {"project": project, "label": "Route", "limit": 5}
     if route_expected:
         route_arguments["name_pattern"] = "pan4-oracle"
@@ -3878,7 +4299,9 @@ def run_self_dogfood_oracles(
     )
     expectations["route_freshness_probe"] = (
         route_expected,
-        "new route literal appears in route search" if route_expected else "route mutation not applicable",
+        "new route literal appears in route search"
+        if route_expected
+        else "route mutation not applicable",
     )
     quality = score_quality_oracles(oracles, expectations)
     oracles["quality"] = quality
@@ -3967,9 +4390,9 @@ def run_dependency_quality_oracles(
                 {
                     "expected_substring": symbol,
                     "required_substrings": [
-                        '\"source\":\"dependency\"',
-                        f'\"package\":\"{package_name}\"',
-                        '\"read_only\":true',
+                        '"source":"dependency"',
+                        f'"package":"{package_name}"',
+                        '"read_only":true',
                     ],
                     "relevance": 3,
                 }
@@ -4081,7 +4504,9 @@ def run_http_links_quality_oracles(
     return oracles
 
 
-def observed_pairs_from_query_response(tool_result: dict[str, Any]) -> list[dict[str, Any]]:
+def observed_pairs_from_query_response(
+    tool_result: dict[str, Any],
+) -> list[dict[str, Any]]:
     response = tool_result.get("response")
     if not isinstance(response, dict):
         return []
@@ -4131,7 +4556,9 @@ def compare_pair_oracle_outputs(
     incremental_pairs = canonical(incremental)
     fresh_pairs = canonical(fresh)
 
-    def render(values: set[tuple[str, str, float | str | None]]) -> list[dict[str, Any]]:
+    def render(
+        values: set[tuple[str, str, float | str | None]],
+    ) -> list[dict[str, Any]]:
         return [
             {"source": source, "target": target, "score": score}
             for source, target, score in sorted(values)
@@ -4156,13 +4583,14 @@ def evaluate_pair_incremental_policy(
     explicit_policy = config_overrides.get("incremental_derived_refresh")
     policy = explicit_policy or DERIVED_REFRESH_CANDIDATE_DEFAULT
     policy_source = "explicit_override" if explicit_policy else "candidate_default"
-    warnings = incremental_oracles.get("edge_query", {}).get("response", {}).get(
-        "warnings", []
+    warnings = (
+        incremental_oracles.get("edge_query", {})
+        .get("response", {})
+        .get("warnings", [])
     )
     warnings = warnings if isinstance(warnings, list) else []
     stale_warning_present = any(
-        isinstance(warning, str)
-        and "semantic_edges derived view is stale" in warning
+        isinstance(warning, str) and "semantic_edges derived view is stale" in warning
         for warning in warnings
     )
     pair_freshness_met = bool(
@@ -4415,9 +4843,17 @@ def run_pair_quality_lifecycle(
                 client,
                 index_mode=args.index_mode,
             )
-            fresh_project = str(fresh_index.get("response", {}).get("project") or project)
+            fresh_project = str(
+                fresh_index.get("response", {}).get("project") or project
+            )
             fresh_oracles = run_relation_quality_oracles(
-                args.transport, binary, fresh_env, fresh_project, post_fixture, args, client
+                args.transport,
+                binary,
+                fresh_env,
+                fresh_project,
+                post_fixture,
+                args,
+                client,
             )
     else:
         fresh_index = run_index_for_transport(
@@ -4434,7 +4870,9 @@ def run_pair_quality_lifecycle(
             args.transport, binary, fresh_env, fresh_project, post_fixture, args
         )
     fresh_db = find_project_db(fresh_cache)
-    incremental_graph_fingerprint = stable_graph_fingerprint(incremental_snapshot, project)
+    incremental_graph_fingerprint = stable_graph_fingerprint(
+        incremental_snapshot, project
+    )
     fresh_graph_fingerprint = stable_graph_fingerprint(fresh_db, fresh_project)
     canonical_graph = compare_canonical_graph(incremental_snapshot, fresh_db, project)
     pair_equality = compare_pair_oracle_outputs(incremental_oracles, fresh_oracles)
@@ -4473,7 +4911,9 @@ def run_pair_quality_lifecycle(
     }
 
 
-def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+def run_capability_quality(
+    args: argparse.Namespace, binary: Path
+) -> tuple[dict[str, Any], int]:
     capability = args.capability_quality
     if capability not in CAPABILITY_QUALITY_CASES:
         raise ValueError(f"unsupported capability quality case: {capability}")
@@ -4501,7 +4941,9 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                 args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
             ),
             "index_mode": args.index_mode,
-            "capability_applicability": index_mode_capability_applicability(args.index_mode),
+            "capability_applicability": index_mode_capability_applicability(
+                args.index_mode
+            ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "transport": args.transport,
@@ -4513,7 +4955,10 @@ def run_capability_quality(args: argparse.Namespace, binary: Path) -> tuple[dict
                 else None
             ),
         },
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
         "cases": [],
     }
     exit_code = 1
@@ -4655,22 +5100,48 @@ def run_matrix_case(
     if args.transport == "mcp":
         with McpClient(binary, case_env, args.timeout) as client:
             initial = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                client,
                 index_mode=args.index_mode,
             )
-            changed_paths = mutate_matrix_scenario(scenario, repo_dir, args.functions_per_file)
+            changed_paths = mutate_matrix_scenario(
+                scenario, repo_dir, args.functions_per_file
+            )
             incremental = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                client,
                 index_mode=args.index_mode,
             )
     else:
         initial = run_index_for_transport(
-            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+            args.transport,
+            binary,
+            case_env,
+            repo_dir,
+            args.timeout,
+            args.include_logs,
             index_mode=args.index_mode,
         )
-        changed_paths = mutate_matrix_scenario(scenario, repo_dir, args.functions_per_file)
+        changed_paths = mutate_matrix_scenario(
+            scenario, repo_dir, args.functions_per_file
+        )
         incremental = run_index_for_transport(
-            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+            args.transport,
+            binary,
+            case_env,
+            repo_dir,
+            args.timeout,
+            args.include_logs,
             index_mode=args.index_mode,
         )
 
@@ -4683,12 +5154,23 @@ def run_matrix_case(
     if args.transport == "mcp":
         with McpClient(binary, case_env, args.timeout) as client:
             full_rebuild = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
+                client,
                 index_mode=args.index_mode,
             )
     else:
         full_rebuild = run_index_for_transport(
-            args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+            args.transport,
+            binary,
+            case_env,
+            repo_dir,
+            args.timeout,
+            args.include_logs,
             index_mode=args.index_mode,
         )
 
@@ -4698,7 +5180,9 @@ def run_matrix_case(
     publish_kind = incremental.get("publish_kind")
     active_overlay = None
     if publish_kind == PUBLISH_INCREMENTAL_OVERLAY:
-        active_overlay = compare_active_overlay_graph(incremental_snapshot, full_db, project)
+        active_overlay = compare_active_overlay_graph(
+            incremental_snapshot, full_db, project
+        )
     graph_gate = graph_gate_for_publish_kind(
         canonical, str(publish_kind or ""), active_overlay=active_overlay
     )
@@ -4707,10 +5191,18 @@ def run_matrix_case(
         exact_cap = int(configured_cap) if configured_cap is not None else None
     except ValueError:
         exact_cap = None
-    frontier_gate = frontier_coverage_gate(scenario_metadata, incremental, exact_cap=exact_cap)
+    frontier_gate = frontier_coverage_gate(
+        scenario_metadata, incremental, exact_cap=exact_cap
+    )
     explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
-    passed = bool(graph_gate.get("passed")) and bool(frontier_gate.get("passed")) and explicit_route
-    speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
+    passed = (
+        bool(graph_gate.get("passed"))
+        and bool(frontier_gate.get("passed"))
+        and explicit_route
+    )
+    speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(
+        1, int(incremental["elapsed_ms"])
+    )
     return {
         "scenario": scenario,
         "project": project,
@@ -4734,11 +5226,15 @@ def run_matrix_case(
 
 def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
     auto_root = not bool(args.work_root)
-    work_root = Path(args.work_root).expanduser() if args.work_root else Path(
-        tempfile.mkdtemp(prefix="cbm-incr-matrix-")
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="cbm-incr-matrix-"))
     )
     work_root.mkdir(parents=True, exist_ok=True)
-    scenarios = [item.strip() for item in args.matrix_scenarios.split(",") if item.strip()]
+    scenarios = [
+        item.strip() for item in args.matrix_scenarios.split(",") if item.strip()
+    ]
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
@@ -4754,21 +5250,28 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
                 args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
             ),
             "index_mode": args.index_mode,
-            "capability_applicability": index_mode_capability_applicability(args.index_mode),
+            "capability_applicability": index_mode_capability_applicability(
+                args.index_mode
+            ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
         },
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
         "cases": [],
     }
     exit_code = 1
     try:
         base_env = build_env(work_root / "cache-base")
         for scenario in scenarios:
-            case = run_matrix_case(scenario, binary, base_env, work_root / scenario, args)
+            case = run_matrix_case(
+                scenario, binary, base_env, work_root / scenario, args
+            )
             report["cases"].append(case)
         report["derived"] = {
             "passed": all(bool(case.get("passed")) for case in report["cases"]),
@@ -4814,31 +5317,57 @@ def run_self_dogfood_case(
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
                 initial = run_index_for_transport(
-                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                    args.transport,
+                    binary,
+                    case_env,
+                    repo_dir,
+                    args.timeout,
+                    args.include_logs,
+                    client,
                     index_mode=args.index_mode,
                 )
                 mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
                 incremental = run_index_for_transport(
-                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                    args.transport,
+                    binary,
+                    case_env,
+                    repo_dir,
+                    args.timeout,
+                    args.include_logs,
+                    client,
                     index_mode=args.index_mode,
                 )
                 project_db = find_project_db(cache_dir)
-                project = str(incremental.get("response", {}).get("project") or project_db.stem)
+                project = str(
+                    incremental.get("response", {}).get("project") or project_db.stem
+                )
                 oracles = run_self_dogfood_oracles(
                     args.transport, binary, case_env, project, mutation, args, client
                 )
         else:
             initial = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
                 index_mode=args.index_mode,
             )
             mutation = mutate_self_dogfood_scenario(scenario, repo_dir)
             incremental = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
                 index_mode=args.index_mode,
             )
             project_db = find_project_db(cache_dir)
-            project = str(incremental.get("response", {}).get("project") or project_db.stem)
+            project = str(
+                incremental.get("response", {}).get("project") or project_db.stem
+            )
             oracles = run_self_dogfood_oracles(
                 args.transport, binary, case_env, project, mutation, args
             )
@@ -4849,12 +5378,23 @@ def run_self_dogfood_case(
         if args.transport == "mcp":
             with McpClient(binary, case_env, args.timeout) as client:
                 full_rebuild = run_index_for_transport(
-                    args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs, client,
+                    args.transport,
+                    binary,
+                    case_env,
+                    repo_dir,
+                    args.timeout,
+                    args.include_logs,
+                    client,
                     index_mode=args.index_mode,
                 )
         else:
             full_rebuild = run_index_for_transport(
-                args.transport, binary, case_env, repo_dir, args.timeout, args.include_logs,
+                args.transport,
+                binary,
+                case_env,
+                repo_dir,
+                args.timeout,
+                args.include_logs,
                 index_mode=args.index_mode,
             )
         full_db = find_project_db(cache_dir)
@@ -4867,9 +5407,13 @@ def run_self_dogfood_case(
         incremental_reason = incremental.get("exact_reason")
         active_overlay = None
         if publish_kind == PUBLISH_INCREMENTAL_OVERLAY:
-            active_overlay = compare_active_overlay_graph(incremental_snapshot, full_db, project)
+            active_overlay = compare_active_overlay_graph(
+                incremental_snapshot, full_db, project
+            )
         explicit_route = is_explicit_incremental_route(publish_kind, incremental_reason)
-        speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(1, int(incremental["elapsed_ms"]))
+        speedup = max(1, int(full_rebuild["elapsed_ms"])) / max(
+            1, int(incremental["elapsed_ms"])
+        )
         graph_gate = graph_gate_for_publish_kind(
             canonical,
             str(publish_kind or ""),
@@ -4877,7 +5421,11 @@ def run_self_dogfood_case(
             active_overlay=active_overlay,
             freshness_scoped=freshness_scoped,
         )
-        passed = bool(graph_gate.get("passed")) and explicit_route and bool(oracles.get("passed"))
+        passed = (
+            bool(graph_gate.get("passed"))
+            and explicit_route
+            and bool(oracles.get("passed"))
+        )
         result = {
             "scenario": scenario,
             "project": project,
@@ -4913,10 +5461,14 @@ def run_self_dogfood_case(
     return result
 
 
-def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], int]:
+def run_self_dogfood(
+    args: argparse.Namespace, binary: Path
+) -> tuple[dict[str, Any], int]:
     auto_root = not bool(args.work_root)
-    work_root = Path(args.work_root).expanduser() if args.work_root else Path(
-        tempfile.mkdtemp(prefix="cbm-self-dogfood-")
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="cbm-self-dogfood-"))
     )
     work_root.mkdir(parents=True, exist_ok=True)
     source_repo = resolve_git_repo_root(Path(args.repo_root), args.timeout)
@@ -4930,7 +5482,9 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
         args.timeout,
         source_repo,
     )
-    scenarios = [item.strip() for item in args.self_dogfood_scenarios.split(",") if item.strip()]
+    scenarios = [
+        item.strip() for item in args.self_dogfood_scenarios.split(",") if item.strip()
+    ]
     report: dict[str, Any] = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "binary": str(binary),
@@ -4954,7 +5508,9 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
                 args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
             ),
             "index_mode": args.index_mode,
-            "capability_applicability": index_mode_capability_applicability(args.index_mode),
+            "capability_applicability": index_mode_capability_applicability(
+                args.index_mode
+            ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
@@ -4962,7 +5518,10 @@ def run_self_dogfood(args: argparse.Namespace, binary: Path) -> tuple[dict[str, 
             "scenarios": scenarios,
             "repo_revision": source_revision,
         },
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
         "cases": [],
     }
     exit_code = 1
@@ -5007,7 +5566,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--out", default="")
     parser.add_argument("--files", type=int, default=DEFAULT_FILE_COUNT)
-    parser.add_argument("--functions-per-file", type=int, default=DEFAULT_FUNCTIONS_PER_FILE)
+    parser.add_argument(
+        "--functions-per-file", type=int, default=DEFAULT_FUNCTIONS_PER_FILE
+    )
     parser.add_argument("--changed-files", type=int, default=DEFAULT_CHANGED_FILES)
     parser.add_argument("--min-speedup", type=float, default=DEFAULT_MIN_SPEEDUP)
     parser.add_argument(
@@ -5124,7 +5685,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Commit-ish copied by git archive for --quality-background-repo; campaigns should use a full hash.",
     )
-    parser.add_argument("--matrix", action="store_true", help="Run the affected-frontier scenario matrix.")
+    parser.add_argument(
+        "--matrix",
+        action="store_true",
+        help="Run the affected-frontier scenario matrix.",
+    )
     parser.add_argument(
         "--self-dogfood",
         action="store_true",
@@ -5237,8 +5802,10 @@ def main() -> int:
         return self_dogfood_exit_code
 
     auto_root = not bool(args.work_root)
-    work_root = Path(args.work_root).expanduser() if args.work_root else Path(
-        tempfile.mkdtemp(prefix="cbm-incr-speed-")
+    work_root = (
+        Path(args.work_root).expanduser()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="cbm-incr-speed-"))
     )
     work_root.mkdir(parents=True, exist_ok=True)
     repo_dir = work_root / "repo"
@@ -5261,7 +5828,9 @@ def main() -> int:
                 args.rank_refresh != RANK_REFRESH_CANDIDATE_DEFAULT
             ),
             "index_mode": args.index_mode,
-            "capability_applicability": index_mode_capability_applicability(args.index_mode),
+            "capability_applicability": index_mode_capability_applicability(
+                args.index_mode
+            ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
             "timeout": args.timeout,
@@ -5269,7 +5838,10 @@ def main() -> int:
             "overhead_probes": args.overhead_probes,
             "overhead_tool": args.overhead_tool,
         },
-        "cleanup": {"requested": auto_root and not args.keep_work_root, "removed": False},
+        "cleanup": {
+            "requested": auto_root and not args.keep_work_root,
+            "removed": False,
+        },
     }
 
     exit_code = 1
@@ -5285,11 +5857,15 @@ def main() -> int:
                 overhead_probe = measure_mcp_overhead_probes(
                     client, args.overhead_tool, args.overhead_probes, args.include_logs
                 )
-                initial = run_index_mcp(client, repo_dir, args.include_logs, args.index_mode)
+                initial = run_index_mcp(
+                    client, repo_dir, args.include_logs, args.index_mode
+                )
                 changed_paths = modify_existing_files(
                     repo_dir, args.changed_files, args.functions_per_file
                 )
-                incremental = run_index_mcp(client, repo_dir, args.include_logs, args.index_mode)
+                incremental = run_index_mcp(
+                    client, repo_dir, args.include_logs, args.index_mode
+                )
             removed_dbs = remove_project_dbs(cache_dir)
             with McpClient(binary, env, args.timeout) as client:
                 full_rebuild = run_index_mcp(

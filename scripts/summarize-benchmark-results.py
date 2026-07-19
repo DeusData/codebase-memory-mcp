@@ -36,7 +36,9 @@ def evidence_lifecycle(reports: list[dict[str, Any]]) -> str:
     unknown = 0
     for report in reports:
         cleanup = report.get("cleanup")
-        if not isinstance(cleanup, dict) or not isinstance(cleanup.get("requested"), bool):
+        if not isinstance(cleanup, dict) or not isinstance(
+            cleanup.get("requested"), bool
+        ):
             unknown += 1
         elif cleanup["requested"] is False:
             retained += 1
@@ -83,9 +85,13 @@ def config_label(reports: list[dict[str, Any]]) -> str:
     for report in reports:
         parameters = report.get("parameters", {})
         overrides = (
-            parameters.get("config_overrides", {}) if isinstance(parameters, dict) else {}
+            parameters.get("config_overrides", {})
+            if isinstance(parameters, dict)
+            else {}
         )
-        profile = parameters.get("config_profile") if isinstance(parameters, dict) else None
+        profile = (
+            parameters.get("config_profile") if isinstance(parameters, dict) else None
+        )
         if isinstance(overrides, dict) and overrides:
             expanded = ", ".join(f"{key}={overrides[key]}" for key in sorted(overrides))
             labels.add(
@@ -94,18 +100,28 @@ def config_label(reports: list[dict[str, Any]]) -> str:
                 else expanded
             )
         else:
-            labels.add(str(profile) if isinstance(profile, str) and profile else "defaults")
+            labels.add(
+                str(profile) if isinstance(profile, str) and profile else "defaults"
+            )
     return " / ".join(sorted(labels))
 
 
-def config_signature(reports: list[dict[str, Any]]) -> tuple[tuple[str, str], ...] | None:
+def config_signature(
+    reports: list[dict[str, Any]],
+) -> tuple[tuple[str, str], ...] | None:
     signatures: set[tuple[tuple[str, str], ...]] = set()
     for report in reports:
         parameters = report.get("parameters")
-        overrides = parameters.get("config_overrides", {}) if isinstance(parameters, dict) else {}
+        overrides = (
+            parameters.get("config_overrides", {})
+            if isinstance(parameters, dict)
+            else {}
+        )
         if not isinstance(overrides, dict):
             return None
-        signatures.add(tuple(sorted((str(key), str(value)) for key, value in overrides.items())))
+        signatures.add(
+            tuple(sorted((str(key), str(value)) for key, value in overrides.items()))
+        )
     return next(iter(signatures)) if len(signatures) == 1 else None
 
 
@@ -227,7 +243,11 @@ def correctness_findings(
                     expected = compact_witness(quality.get("expected_substring"))
                     rank = quality.get("rank")
                     cutoff = quality.get("relevance_cutoff")
-                    if capability_quality and isinstance(rank, int) and isinstance(cutoff, int):
+                    if (
+                        capability_quality
+                        and isinstance(rank, int)
+                        and isinstance(cutoff, int)
+                    ):
                         finding = f"{name} below quality cutoff (rank {rank}, cutoff {cutoff})"
                     elif capability_quality:
                         finding = f"{name} did not meet the quality target"
@@ -239,7 +259,9 @@ def correctness_findings(
 
         lifecycle = case.get("pair_lifecycle")
         fixture = case.get("fixture")
-        capability = str(fixture.get("capability") or "") if isinstance(fixture, dict) else ""
+        capability = (
+            str(fixture.get("capability") or "") if isinstance(fixture, dict) else ""
+        )
         if not isinstance(lifecycle, dict) or capability in disabled_pair_capabilities:
             continue
         lifecycle_canonical = lifecycle.get("canonical_graph")
@@ -249,7 +271,8 @@ def correctness_findings(
                 findings.append(detail)
         policy = lifecycle.get("incremental_policy")
         immediate_expected = (
-            isinstance(policy, dict) and policy.get("immediate_freshness_expected") is True
+            isinstance(policy, dict)
+            and policy.get("immediate_freshness_expected") is True
         )
         for stage, key, required in (
             ("Initial", "initial_oracles", True),
@@ -257,11 +280,17 @@ def correctness_findings(
             ("Fresh", "fresh_oracles", True),
         ):
             oracle = lifecycle.get(key)
-            if not required or not isinstance(oracle, dict) or oracle.get("passed") is not False:
+            if (
+                not required
+                or not isinstance(oracle, dict)
+                or oracle.get("passed") is not False
+            ):
                 continue
             classification = oracle.get("pair_classification")
             confusion = (
-                classification.get("confusion") if isinstance(classification, dict) else None
+                classification.get("confusion")
+                if isinstance(classification, dict)
+                else None
             )
             finding = f"{stage} semantic-pair quality missed the declared target"
             if isinstance(confusion, dict):
@@ -315,7 +344,9 @@ def mutation_reindex_details(
             changed_paths = mutation.get("changed_paths")
             if isinstance(changed_paths, list):
                 group["changed_paths"].update(
-                    str(path) for path in changed_paths if isinstance(path, str) and path
+                    str(path)
+                    for path in changed_paths
+                    if isinstance(path, str) and path
                 )
         # Matrix artifacts predate the self-dogfood mutation object and retain
         # their changed paths at the case root. Consume both schemas so an
@@ -323,7 +354,9 @@ def mutation_reindex_details(
         case_changed_paths = case.get("changed_paths")
         if isinstance(case_changed_paths, list):
             group["changed_paths"].update(
-                str(path) for path in case_changed_paths if isinstance(path, str) and path
+                str(path)
+                for path in case_changed_paths
+                if isinstance(path, str) and path
             )
         scenario_metadata = case.get("scenario_metadata")
         if not group["descriptions"] and isinstance(scenario_metadata, dict):
@@ -383,7 +416,8 @@ def mutation_reindex_details(
             {
                 "scenario": scenario,
                 "mutation": "; ".join(sorted(group["descriptions"])) or "not reported",
-                "changed_paths": ", ".join(sorted(group["changed_paths"])) or "not reported",
+                "changed_paths": ", ".join(sorted(group["changed_paths"]))
+                or "not reported",
                 "publication": route,
                 "incremental_p50_ms": percentile(group["incremental_ms"], 0.50),
                 "work_p50_ms": percentile(group["work_ms"], 0.50),
@@ -439,7 +473,9 @@ def dependency_observation(index_result: Any) -> tuple[int | None, int | None]:
     return phase_ms, packages
 
 
-def dependency_mode(reports: list[dict[str, Any]], observed_packages: list[float]) -> str:
+def dependency_mode(
+    reports: list[dict[str, Any]], observed_packages: list[float]
+) -> str:
     support: set[bool] = set()
     overrides: set[str] = set()
     for report in reports:
@@ -487,7 +523,9 @@ def summarize_capability_applicability(
         for report in reports:
             parameters = report.get("parameters")
             capability_support = (
-                parameters.get("capability_support") if isinstance(parameters, dict) else None
+                parameters.get("capability_support")
+                if isinstance(parameters, dict)
+                else None
             )
             if isinstance(capability_support, dict) and isinstance(
                 capability_support.get(capability), bool
@@ -498,9 +536,15 @@ def summarize_capability_applicability(
                 if isinstance(parameters, dict)
                 else None
             )
-            state = applicability.get(capability) if isinstance(applicability, dict) else None
+            state = (
+                applicability.get(capability)
+                if isinstance(applicability, dict)
+                else None
+            )
             if isinstance(state, dict) and isinstance(state.get("applicable"), bool):
-                states.add((state["applicable"], str(state.get("reason") or "unspecified")))
+                states.add(
+                    (state["applicable"], str(state.get("reason") or "unspecified"))
+                )
         if support == {False}:
             summarized[capability] = "unsupported by candidate"
         elif len(support) > 1:
@@ -545,7 +589,11 @@ def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str,
 
         def classification(stage: str) -> tuple[dict[str, int] | None, float | None]:
             oracles = lifecycle.get(f"{stage}_oracles")
-            pair = oracles.get("pair_classification") if isinstance(oracles, dict) else None
+            pair = (
+                oracles.get("pair_classification")
+                if isinstance(oracles, dict)
+                else None
+            )
             confusion = pair.get("confusion") if isinstance(pair, dict) else None
             f1 = pair.get("f1") if isinstance(pair, dict) else None
             return (
@@ -609,7 +657,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             graph_gate = case.get("graph_gate")
             core_graph.append(
                 bool(graph_gate.get("passed"))
-                if isinstance(graph_gate, dict) and isinstance(graph_gate.get("passed"), bool)
+                if isinstance(graph_gate, dict)
+                and isinstance(graph_gate.get("passed"), bool)
                 else canonical_equal
             )
             continue
@@ -731,7 +780,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             if isinstance(incremental.get("elapsed_ms"), (int, float)):
                 incremental_ms.append(float(incremental["elapsed_ms"]))
             if isinstance(incremental.get("indexed_work_elapsed_ms"), (int, float)):
-                incremental_work_ms.append(float(incremental["indexed_work_elapsed_ms"]))
+                incremental_work_ms.append(
+                    float(incremental["indexed_work_elapsed_ms"])
+                )
             if isinstance(incremental.get("peak_rss_mb"), (int, float)):
                 incremental_peak_rss.append(float(incremental["peak_rss_mb"]))
                 peak_rss.append(int(incremental["peak_rss_mb"]))
@@ -746,7 +797,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             (
                 not isinstance(lifecycle, dict)
                 or isinstance(lifecycle.get("incremental_policy"), dict)
-                and lifecycle["incremental_policy"].get("immediate_freshness_met") is True
+                and lifecycle["incremental_policy"].get("immediate_freshness_met")
+                is True
             )
             and isinstance(full, dict)
             and isinstance(full.get("elapsed_ms"), (int, float))
@@ -754,7 +806,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             and isinstance(incremental.get("elapsed_ms"), (int, float))
             and float(incremental["elapsed_ms"]) > 0
         ):
-            speedups.append(float(full["elapsed_ms"]) / float(incremental["elapsed_ms"]))
+            speedups.append(
+                float(full["elapsed_ms"]) / float(incremental["elapsed_ms"])
+            )
         for index_result, timings in (
             (initial, dependency_initial_ms),
             (incremental, dependency_incremental_ms),
@@ -795,7 +849,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 if isinstance(oracle.get("response_bytes"), (int, float)):
                     query_response_bytes.append(float(oracle["response_bytes"]))
                 if isinstance(oracle.get("response_token_estimate"), (int, float)):
-                    query_response_tokens.append(float(oracle["response_token_estimate"]))
+                    query_response_tokens.append(
+                        float(oracle["response_token_estimate"])
+                    )
         for relation in relation_oracles:
             response_quality = (
                 relation.get("response_quality") if isinstance(relation, dict) else None
@@ -806,8 +862,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 query_latency_ms.append(float(response_quality["elapsed_ms"]))
             if isinstance(response_quality.get("response_bytes"), (int, float)):
                 query_response_bytes.append(float(response_quality["response_bytes"]))
-            if isinstance(response_quality.get("response_token_estimate"), (int, float)):
-                query_response_tokens.append(float(response_quality["response_token_estimate"]))
+            if isinstance(
+                response_quality.get("response_token_estimate"), (int, float)
+            ):
+                query_response_tokens.append(
+                    float(response_quality["response_token_estimate"])
+                )
 
     canonical_failed = any(not value for value in core_graph)
     oracle_target_missed = any(not value for value in oracles)
@@ -818,12 +878,16 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             continue
         policy = lifecycle.get("incremental_policy")
         immediate_expected = (
-            isinstance(policy, dict) and policy.get("immediate_freshness_expected") is True
+            isinstance(policy, dict)
+            and policy.get("immediate_freshness_expected") is True
         )
         required = [lifecycle.get("initial_oracles"), lifecycle.get("fresh_oracles")]
         if immediate_expected:
             required.append(lifecycle.get("incremental_oracles"))
-        if any(isinstance(oracle, dict) and oracle.get("passed") is False for oracle in required):
+        if any(
+            isinstance(oracle, dict) and oracle.get("passed") is False
+            for oracle in required
+        ):
             required_pair_stage_missed = True
             break
     quality_target_missed = oracle_target_missed or required_pair_stage_missed
@@ -896,7 +960,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     task_success_score = (
         quality_passed / quality_applicable
         if quality_applicable
-        else sum(oracles) / len(oracles) if oracles else None
+        else sum(oracles) / len(oracles)
+        if oracles
+        else None
     )
     result_quality_values = [
         value
@@ -906,7 +972,11 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     result_quality_score = (
         statistics.mean(result_quality_values) if result_quality_values else None
     )
-    quality_categories = (result_quality_score, graph_fidelity_score, task_success_score)
+    quality_categories = (
+        result_quality_score,
+        graph_fidelity_score,
+        task_success_score,
+    )
     overall_quality_score = (
         math.prod(quality_categories) ** (1.0 / len(quality_categories))
         if all(isinstance(value, (int, float)) for value in quality_categories)
@@ -1001,7 +1071,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         findings.insert(
             0,
             "Immediate semantic freshness was intentionally deferred under the recorded policy; "
-            "the structured stale warning was present and initial/fresh pair tasks passed"
+            "the structured stale warning was present and initial/fresh pair tasks passed",
         )
     return {
         "candidate": label,
@@ -1016,8 +1086,12 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "graph_fidelity_score": graph_fidelity_score,
         "core_graph_fidelity_score": core_graph_fidelity_score,
         "task_success_score": task_success_score,
-        "hit_at_1": hit_at_1_weighted / quality_score_count if quality_score_count else None,
-        "hit_at_5": hit_at_5_weighted / quality_score_count if quality_score_count else None,
+        "hit_at_1": hit_at_1_weighted / quality_score_count
+        if quality_score_count
+        else None,
+        "hit_at_5": hit_at_5_weighted / quality_score_count
+        if quality_score_count
+        else None,
         "ndcg_at_5": ndcg_weighted / ndcg_count if ndcg_count else None,
         "quality_checks": ratio(quality_passed, quality_applicable),
         "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
@@ -1048,7 +1122,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "dependency_incremental_p50_ms": percentile(dependency_incremental_ms, 0.50),
         "dependency_fresh_p50_ms": percentile(dependency_fresh_ms, 0.50),
         "index_modes": ", ".join(sorted(index_modes)) if index_modes else "unknown",
-        "execution_orders": ", ".join(sorted(execution_orders)) if execution_orders else "unknown",
+        "execution_orders": ", ".join(sorted(execution_orders))
+        if execution_orders
+        else "unknown",
         "capability_applicability": summarize_capability_applicability(reports),
         "lifecycle": evidence_lifecycle(reports),
         "binary_sha256": ", ".join(value[:12] for value in hashes) or "n/a",
@@ -1071,7 +1147,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             separators=(",", ":"),
             sort_keys=True,
         ),
-        "frontier_files": next(iter(frontier_files)) if len(frontier_files) == 1 else None,
+        "frontier_files": next(iter(frontier_files))
+        if len(frontier_files) == 1
+        else None,
         "exact_cap": next(iter(exact_caps)) if len(exact_caps) == 1 else None,
         "frontier_contract": next(iter(contracts)) if len(contracts) == 1 else None,
         "pareto": "unclassified",
@@ -1101,7 +1179,10 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         baseline_decision = baseline.get("decision")
         latest_decision = latest.get("decision")
-        if baseline_decision not in accepted_decisions or latest_decision not in accepted_decisions:
+        if (
+            baseline_decision not in accepted_decisions
+            or latest_decision not in accepted_decisions
+        ):
             comparison_status = "not comparable: correctness/quality gate"
         elif baseline_decision != latest_decision:
             comparison_status = "not comparable: freshness/quality decision differs"
@@ -1118,7 +1199,10 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     isinstance(baseline.get(axis), (int, float))
                     and isinstance(latest.get(axis), (int, float))
                     and math.isclose(
-                        float(baseline[axis]), float(latest[axis]), rel_tol=1e-9, abs_tol=1e-12
+                        float(baseline[axis]),
+                        float(latest[axis]),
+                        rel_tol=1e-9,
+                        abs_tol=1e-12,
                     )
                 )
                 for axis in quality_axes
@@ -1136,11 +1220,14 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 )
                 minimum_observations = min(
                     minimum_observations,
-                    *(int(latest.get(key) or 0) for key in (
-                        "incremental_observations",
-                        "full_observations",
-                        "query_observations",
-                    )),
+                    *(
+                        int(latest.get(key) or 0)
+                        for key in (
+                            "incremental_observations",
+                            "full_observations",
+                            "query_observations",
+                        )
+                    ),
                 )
                 comparison_status = (
                     "quality-matched repeated evidence"
@@ -1359,9 +1446,13 @@ def render_search_projection(document: dict[str, Any]) -> str:
     observations = document.get("observations")
     derived = document.get("derived")
     if not isinstance(observations, list) or not isinstance(derived, dict):
-        raise ValueError("search-projection result is missing observations or derived data")
+        raise ValueError(
+            "search-projection result is missing observations or derived data"
+        )
     completion = document.get("completion")
-    status = str(completion.get("status")) if isinstance(completion, dict) else "unknown"
+    status = (
+        str(completion.get("status")) if isinstance(completion, dict) else "unknown"
+    )
     labels = {
         "compact_default": "compact default",
         "compact_true": "compact true",
@@ -1404,7 +1495,9 @@ def render_search_projection(document: dict[str, Any]) -> str:
                     f"{int(item['response_bytes']):,}",
                     f"{int(item['response_token_estimate']):,}",
                     f"{float(item['elapsed_ms']):.3f}",
-                    f"{float(rss_kb) / 1024:.1f}" if isinstance(rss_kb, (int, float)) else "n/a",
+                    f"{float(rss_kb) / 1024:.1f}"
+                    if isinstance(rss_kb, (int, float))
+                    else "n/a",
                     "Survived" if item.get("transport_survived") else "Interrupted",
                     "Reaped" if item.get("server_reaped") else "Incomplete",
                 )
@@ -1462,7 +1555,9 @@ def render_list_projects_scaling(document: dict[str, Any]) -> str:
     observations = document.get("observations")
     derived = document.get("derived")
     if not isinstance(observations, list) or not isinstance(derived, dict):
-        raise ValueError("list-project scaling result is missing observations or derived data")
+        raise ValueError(
+            "list-project scaling result is missing observations or derived data"
+        )
     completion = document.get("completion")
     completion_status = (
         str(completion.get("status")) if isinstance(completion, dict) else "unknown"
@@ -1497,7 +1592,9 @@ def render_list_projects_scaling(document: dict[str, Any]) -> str:
                     f"{int(item['response_bytes']):,}",
                     f"{int(item['response_token_estimate']):,}",
                     f"{float(item['elapsed_ms']):.3f}",
-                    f"{float(rss_kb) / 1024:.1f}" if isinstance(rss_kb, (int, float)) else "n/a",
+                    f"{float(rss_kb) / 1024:.1f}"
+                    if isinstance(rss_kb, (int, float))
+                    else "n/a",
                     "Survived" if item.get("transport_survived") else "Interrupted",
                     "Reaped" if item.get("server_reaped") else "Incomplete",
                     (
@@ -1555,7 +1652,10 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
     post = surfaces.get("streamlined_post_reveal")
     pre_comparison = comparison.get("pre_reveal")
     post_comparison = comparison.get("post_reveal")
-    if not all(isinstance(value, dict) for value in (classic, pre, post, pre_comparison, post_comparison)):
+    if not all(
+        isinstance(value, dict)
+        for value in (classic, pre, post, pre_comparison, post_comparison)
+    ):
         raise ValueError("MCP surface result is missing one or more parity states")
 
     assert isinstance(classic, dict)
@@ -1563,6 +1663,9 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
     assert isinstance(post, dict)
     assert isinstance(pre_comparison, dict)
     assert isinstance(post_comparison, dict)
+    capability_parity = comparison.get("capability_parity")
+    if not isinstance(capability_parity, list):
+        capability_parity = []
     classic_count = classic.get("tool_count")
     post_classic = (
         f"{classic_count}/{classic_count}"
@@ -1573,7 +1676,9 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
         (
             "Pure classic",
             classic,
-            f"{classic_count}/{classic_count}" if isinstance(classic_count, int) else "n/a",
+            f"{classic_count}/{classic_count}"
+            if isinstance(classic_count, int)
+            else "n/a",
             "n/a (advertised directly)",
         ),
         (
@@ -1595,10 +1700,47 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
         "These are three separate discovery states. The post-reveal row comes from the same "
         "streamlined server process as the pre-reveal row.",
         "",
-        "| State | Advertised tools | Advertised classic names | Classic handlers recognized* | "
-        "tools/list bytes | Estimated tokens† | tools/list ms‡ |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "### Capability outcomes",
+        "",
+        "| Capability outcome | Classic advertised | Streamlined before reveal | "
+        "Streamlined after reveal | Evidence boundary |",
+        "|---|---|---|---|---|",
     ]
+    for item in capability_parity:
+        if not isinstance(item, dict):
+            continue
+        pre_state = (
+            "advertised"
+            if item.get("streamlined_pre_reveal_advertised")
+            else "callable but hidden"
+            if item.get("streamlined_pre_reveal_callable")
+            else "not demonstrated"
+        )
+        lines.append(
+            "| "
+            + " | ".join(
+                (
+                    str(item.get("outcome") or item.get("capability") or "unknown"),
+                    "yes" if item.get("classic_advertised") else "no",
+                    pre_state,
+                    "advertised"
+                    if item.get("streamlined_post_reveal_advertised")
+                    else "not demonstrated",
+                    str(item.get("evidence") or "surface evidence only"),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "### Discovery and response cost",
+            "",
+            "| State | Advertised tools | Advertised classic names | Classic handlers recognized* | "
+            "tools/list bytes | Estimated tokens† | tools/list ms‡ |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
     for label, surface, advertised_classic, dispatch in rows:
         lines.append(
             "| "
@@ -1624,7 +1766,8 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
         alias_text = (
             f"property names equal={str(bool(alias.get('property_names_equal'))).lower()}, "
             f"required names equal={str(bool(alias.get('required_names_equal'))).lower()}, "
-            f"full schema equal={str(bool(alias.get('schema_equal'))).lower()}"
+            f"validation shape equal={str(bool(alias.get('validation_shape_equal'))).lower()}, "
+            f"complete advertised schema identical={str(bool(alias.get('schema_equal'))).lower()}"
         )
     lines.extend(
         (
@@ -1634,8 +1777,12 @@ def render_mcp_surface_parity(document: dict[str, Any]) -> str:
             f"- Pre-reveal intentionally hidden classic names: {hidden_count}.",
             f"- Post-reveal classic name parity: {str(bool(post_comparison.get('classic_name_parity'))).lower()}.",
             f"- Post-reveal classic input-schema parity: {str(bool(post_comparison.get('classic_schema_parity'))).lower()}.",
+            f"- Post-reveal full MCP contract parity: "
+            f"{str(bool(post_comparison.get('classic_contract_parity'))).lower()}.",
             f"- `notifications/tools/list_changed` observed after reveal: "
             f"{str(bool(post_comparison.get('tools_list_changed_observed'))).lower()}.",
+            f"- MCP processes and reader threads reaped: "
+            f"{str(bool(comparison.get('lifecycle_passed'))).lower()}.",
             f"- `get_code` versus classic `get_code_snippet`: {alias_text}.",
             "",
             "\\* Handler recognition uses bounded empty-argument `tools/call` requests and only proves "
@@ -1757,6 +1904,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             )
         )
         for comparison in comparisons:
+
             def multiple(value: Any) -> str:
                 return f"{value:.2f}×" if isinstance(value, (int, float)) else "n/a"
 
@@ -1941,7 +2089,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         for crossover in crossovers:
             ratio_value = crossover["exact_fallback_ratio"]
             rendered_ratio = (
-                f"{ratio_value:.2f}×" if isinstance(ratio_value, (int, float)) else "n/a"
+                f"{ratio_value:.2f}×"
+                if isinstance(ratio_value, (int, float))
+                else "n/a"
             )
             lines.append(
                 "| "
@@ -1991,7 +2141,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["cases"]),
                     display(row["capabilities"]),
                     display(row["execution_orders"]),
-                    display(f"{row['incremental_observations']}/{row['full_observations']}"),
+                    display(
+                        f"{row['incremental_observations']}/{row['full_observations']}"
+                    ),
                     display(row["incremental_p95_ms"]),
                     display(row["full_p50_ms"]),
                     display(row["speedup_p50"], 2),
@@ -2057,7 +2209,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                 f"{row['decision']}: no stage-level witness was recorded; inspect the retained "
                 "raw result before drawing a causal conclusion."
             ]
-        lines.append(f"| {display(row['candidate'])} | {display('; '.join(evidence))} |")
+        lines.append(
+            f"| {display(row['candidate'])} | {display('; '.join(evidence))} |"
+        )
     lines.extend(
         (
             "",
@@ -2200,7 +2354,9 @@ def load_composition_groups(
         matrix_value = campaign.get("matrix_spec")
         plan_value = campaign.get("plan")
         if (matrix_value is None) == (plan_value is None):
-            raise ValueError(f"{prefix} must declare exactly one of matrix_spec or plan")
+            raise ValueError(
+                f"{prefix} must declare exactly one of matrix_spec or plan"
+            )
         campaign_root = _composition_path(
             base, campaign.get("campaign_root"), f"{prefix}.campaign_root"
         )
@@ -2211,9 +2367,7 @@ def load_composition_groups(
             cells = runner.validate_plan(plan)
             source_kind = "immutable_plan"
         else:
-            source_path = _composition_path(
-                base, matrix_value, f"{prefix}.matrix_spec"
-            )
+            source_path = _composition_path(base, matrix_value, f"{prefix}.matrix_spec")
             with source_path.open(encoding="utf-8") as stream:
                 matrix_spec = json.load(stream)
             plan = runner.expand_matrix_spec(matrix_spec)

@@ -1,4 +1,5 @@
 import importlib.util
+from contextlib import closing
 import gzip
 import json
 import os
@@ -11,7 +12,9 @@ from unittest import mock
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "benchmark-incremental-speed.py"
+SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "benchmark-incremental-speed.py"
+)
 SPEC = importlib.util.spec_from_file_location("benchmark_incremental_speed", SCRIPT)
 assert SPEC and SPEC.loader
 BENCHMARK = importlib.util.module_from_spec(SPEC)
@@ -58,7 +61,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertTrue(gate["freshness_scoped_equal"])
         self.assertEqual(gate["declared_stale_views"], ["semantic_edges"])
 
-    def test_declared_stale_semantic_edges_do_not_hide_core_graph_mismatch(self) -> None:
+    def test_declared_stale_semantic_edges_do_not_hide_core_graph_mismatch(
+        self,
+    ) -> None:
         gate = BENCHMARK.graph_gate_for_publish_kind(
             {"equal": False},
             BENCHMARK.PUBLISH_INCREMENTAL_EXACT,
@@ -75,7 +80,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
 
     def test_freshness_scoped_comparison_excludes_only_semantic_edges(self) -> None:
         def create_graph(database: Path, extra_type: str) -> None:
-            with sqlite3.connect(database) as con:
+            with closing(sqlite3.connect(database)) as con, con:
                 con.execute(
                     "CREATE TABLE nodes("
                     "id INTEGER PRIMARY KEY, project TEXT, label TEXT, name TEXT, "
@@ -94,16 +99,29 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                     "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?)",
                     [
                         (1, "repo", "Function", "left", "repo.left", "a.c", 1, 2, "{}"),
-                        (2, "repo", "Function", "right", "repo.right", "a.c", 4, 5, "{}"),
+                        (
+                            2,
+                            "repo",
+                            "Function",
+                            "right",
+                            "repo.right",
+                            "a.c",
+                            4,
+                            5,
+                            "{}",
+                        ),
                     ],
                 )
                 con.execute(
                     "INSERT INTO edges VALUES ('repo',1,2,?,?)",
-                    (extra_type, '{"score":0.75}' if extra_type == "SEMANTICALLY_RELATED" else "{}"),
+                    (
+                        extra_type,
+                        '{"score":0.75}'
+                        if extra_type == "SEMANTICALLY_RELATED"
+                        else "{}",
+                    ),
                 )
-                con.execute(
-                    "INSERT INTO file_hashes VALUES ('repo','a.c','abc',1,10)"
-                )
+                con.execute("INSERT INTO file_hashes VALUES ('repo','a.c','abc',1,10)")
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -111,7 +129,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             semantic = root / "semantic.db"
             core = root / "core.db"
             create_graph(empty, "SEMANTICALLY_RELATED")
-            with sqlite3.connect(empty) as con:
+            with closing(sqlite3.connect(empty)) as con, con:
                 con.execute("DELETE FROM edges")
             create_graph(semantic, "SEMANTICALLY_RELATED")
             create_graph(core, "CALLS")
@@ -137,7 +155,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
 
         self.assertEqual(args.rank_refresh, BENCHMARK.RANK_REFRESH_CANDIDATE_DEFAULT)
 
-    def test_candidate_default_rank_refresh_does_not_write_config_override(self) -> None:
+    def test_candidate_default_rank_refresh_does_not_write_config_override(
+        self,
+    ) -> None:
         with mock.patch.object(BENCHMARK, "run_config_set") as run:
             applied = BENCHMARK.apply_rank_refresh_override(
                 Path("/tmp/cbm"), {}, BENCHMARK.RANK_REFRESH_CANDIDATE_DEFAULT, 30
@@ -157,10 +177,12 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             Path("/tmp/cbm"), {}, "rank_refresh", "stale_on_exact", 30
         )
 
-    def test_stream_query_fingerprint_is_ordered_bounded_and_change_sensitive(self) -> None:
+    def test_stream_query_fingerprint_is_ordered_bounded_and_change_sensitive(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             database = Path(tmpdir) / "graph.db"
-            with sqlite3.connect(database) as con:
+            with closing(sqlite3.connect(database)) as con, con:
                 con.execute("CREATE TABLE rows(value TEXT NOT NULL)")
                 con.executemany("INSERT INTO rows VALUES (?)", [("beta",), ("alpha",)])
 
@@ -170,7 +192,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             second = BENCHMARK.stream_query_fingerprint(
                 database, "SELECT value FROM rows ORDER BY value", ()
             )
-            with sqlite3.connect(database) as con:
+            with closing(sqlite3.connect(database)) as con, con:
                 con.execute("INSERT INTO rows VALUES ('gamma')")
             changed = BENCHMARK.stream_query_fingerprint(
                 database, "SELECT value FROM rows ORDER BY value", ()
@@ -188,7 +210,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             canonical_hashes = []
             for index, mtime_ns in enumerate((100, 900)):
                 database = Path(tmpdir) / f"graph-{index}.db"
-                with sqlite3.connect(database) as con:
+                with closing(sqlite3.connect(database)) as con, con:
                     con.execute(
                         "CREATE TABLE file_hashes("
                         "project TEXT, rel_path TEXT, sha256 TEXT, mtime_ns INTEGER, size INTEGER)"
@@ -211,9 +233,11 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(fingerprints[0], fingerprints[1])
         self.assertNotEqual(canonical_hashes[0], canonical_hashes[1])
 
-    def test_graph_fingerprint_normalizes_project_root_but_retains_semantic_score(self) -> None:
+    def test_graph_fingerprint_normalizes_project_root_but_retains_semantic_score(
+        self,
+    ) -> None:
         def create_graph(database: Path, project: str, score: float) -> None:
-            with sqlite3.connect(database) as con:
+            with closing(sqlite3.connect(database)) as con, con:
                 con.execute(
                     "CREATE TABLE nodes("
                     "id INTEGER PRIMARY KEY, project TEXT, label TEXT, name TEXT, "
@@ -231,17 +255,50 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 con.executemany(
                     "INSERT INTO nodes VALUES (?,?,?,?,?,?,?,?,?)",
                     [
-                        (1, project, "Function", "left", f"{project}.pkg.left", "src/a.py", 1, 2,
-                         json.dumps({"checkout": f"/tmp/{project}"})),
-                        (2, project, "Function", "right", f"{project}.pkg.right", "src/a.py", 4, 5,
-                         json.dumps({"checkout": f"/tmp/{project}"})),
-                        (3, project, "Project", project, project, "", 0, 0,
-                         json.dumps({"root": f"/tmp/{project}"})),
+                        (
+                            1,
+                            project,
+                            "Function",
+                            "left",
+                            f"{project}.pkg.left",
+                            "src/a.py",
+                            1,
+                            2,
+                            json.dumps({"checkout": f"/tmp/{project}"}),
+                        ),
+                        (
+                            2,
+                            project,
+                            "Function",
+                            "right",
+                            f"{project}.pkg.right",
+                            "src/a.py",
+                            4,
+                            5,
+                            json.dumps({"checkout": f"/tmp/{project}"}),
+                        ),
+                        (
+                            3,
+                            project,
+                            "Project",
+                            project,
+                            project,
+                            "",
+                            0,
+                            0,
+                            json.dumps({"root": f"/tmp/{project}"}),
+                        ),
                     ],
                 )
                 con.execute(
                     "INSERT INTO edges VALUES (?,?,?,?,?)",
-                    (project, 1, 2, "SEMANTICALLY_RELATED", json.dumps({"score": score})),
+                    (
+                        project,
+                        1,
+                        2,
+                        "SEMANTICALLY_RELATED",
+                        json.dumps({"score": score}),
+                    ),
                 )
                 con.execute(
                     "INSERT INTO file_hashes VALUES (?,?,?,?,?)",
@@ -258,7 +315,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             right = BENCHMARK.stable_graph_fingerprint(right_db, "random-root-b")
             self.assertEqual(left, right)
 
-            with sqlite3.connect(right_db) as con:
+            with closing(sqlite3.connect(right_db)) as con, con:
                 con.execute(
                     "UPDATE edges SET properties = ?",
                     (json.dumps({"score": 0.811}),),
@@ -272,7 +329,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             changed["components"]["semantic_scores"],
         )
 
-    def test_archive_measurement_log_streams_reproducible_gzip_with_hashes(self) -> None:
+    def test_archive_measurement_log_streams_reproducible_gzip_with_hashes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source = root / "worker.log"
@@ -291,23 +350,43 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             self.assertEqual(len(first["artifact_sha256"]), 64)
             self.assertEqual(len(list(artifacts.glob("*.log.gz"))), 1)
 
-    def test_copy_git_revision_to_dir_excludes_dirty_and_untracked_source_state(self) -> None:
+    def test_copy_git_revision_to_dir_excludes_dirty_and_untracked_source_state(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             source = root / "source"
             destination = root / "destination"
             source.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=source, check=True)
-            subprocess.run(["git", "config", "user.email", "benchmark@example.invalid"], cwd=source, check=True)
-            subprocess.run(["git", "config", "user.name", "Benchmark Fixture"], cwd=source, check=True)
+            subprocess.run(
+                ["git", "config", "user.email", "benchmark@example.invalid"],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "Benchmark Fixture"],
+                cwd=source,
+                check=True,
+            )
             (source / "tracked.py").write_text("VERSION = 1\n", encoding="utf-8")
             task_source = source / "benchmarks" / "semantic-pairs-v1" / "canary.py"
             task_source.parent.mkdir(parents=True)
             task_source.write_text("DUPLICATE = True\n", encoding="utf-8")
-            subprocess.run(["git", "add", "tracked.py", str(task_source.relative_to(source))], cwd=source, check=True)
-            subprocess.run(["git", "commit", "-q", "-m", "fixture"], cwd=source, check=True)
+            subprocess.run(
+                ["git", "add", "tracked.py", str(task_source.relative_to(source))],
+                cwd=source,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "fixture"], cwd=source, check=True
+            )
             revision = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=source, check=True, text=True, capture_output=True
+                ["git", "rev-parse", "HEAD"],
+                cwd=source,
+                check=True,
+                text=True,
+                capture_output=True,
             ).stdout.strip()
             (source / "tracked.py").write_text("VERSION = 2\n", encoding="utf-8")
             (source / "untracked.py").write_text("UNTRACKED = True\n", encoding="utf-8")
@@ -322,14 +401,20 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
 
             self.assertEqual((destination / "tracked.py").read_text(), "VERSION = 1\n")
             self.assertFalse((destination / "untracked.py").exists())
-            self.assertFalse((destination / "benchmarks" / "semantic-pairs-v1").exists())
+            self.assertFalse(
+                (destination / "benchmarks" / "semantic-pairs-v1").exists()
+            )
             self.assertEqual(metadata["revision"], revision)
             self.assertRegex(metadata["tree"], r"^[0-9a-f]{40}$")
             self.assertIn("tracked.py", metadata["source_dirty_status_short"])
             self.assertFalse((destination / ".git").exists())
-            self.assertEqual(metadata["excluded_prefixes"], ["benchmarks/semantic-pairs-v1/"])
+            self.assertEqual(
+                metadata["excluded_prefixes"], ["benchmarks/semantic-pairs-v1/"]
+            )
 
-    def test_pair_classification_scores_explicit_positive_and_negative_judgments(self) -> None:
+    def test_pair_classification_scores_explicit_positive_and_negative_judgments(
+        self,
+    ) -> None:
         judgments = [
             {
                 "source": "fixture.alpha",
@@ -375,7 +460,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(result["categories"]["near_clone"]["fn"], 1)
         self.assertEqual(result["categories"]["lexical_hard_negative"]["fp"], 1)
 
-    def test_pair_classification_rejects_duplicate_or_conflicting_judgments(self) -> None:
+    def test_pair_classification_rejects_duplicate_or_conflicting_judgments(
+        self,
+    ) -> None:
         duplicate = [
             {"source": "fixture.a", "target": "fixture.b", "expected": True},
             {"source": "fixture.b", "target": "fixture.a", "expected": True},
@@ -408,7 +495,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIsNone(result["f1"])
         self.assertEqual(result["false_positive_rate"], 0.0)
 
-    def test_similarity_quality_fixture_has_versioned_pair_judgments_and_hashes(self) -> None:
+    def test_similarity_quality_fixture_has_versioned_pair_judgments_and_hashes(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fixture = BENCHMARK.create_similarity_quality_repo(Path(tmpdir))
             source = (Path(tmpdir) / "cbmq_similarity.go").read_text()
@@ -424,7 +513,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIn("cbmqValidateOrder", source)
         self.assertIn("cbmqValidateProfileDecoy", source)
 
-    def test_semantic_edges_quality_fixture_is_distinct_from_similarity_task(self) -> None:
+    def test_semantic_edges_quality_fixture_is_distinct_from_similarity_task(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fixture = BENCHMARK.create_semantic_edges_quality_repo(Path(tmpdir))
             source = (Path(tmpdir) / "cbmq_records.py").read_text()
@@ -438,7 +529,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertIn("cbmq_normalize_account_record", source)
         self.assertIn("cbmq_archive_record_decoy", source)
 
-    def test_pair_quality_mutation_replaces_exact_source_and_changes_judgments(self) -> None:
+    def test_pair_quality_mutation_replaces_exact_source_and_changes_judgments(
+        self,
+    ) -> None:
         for factory, expected_added, expected_removed in (
             (
                 BENCHMARK.create_similarity_quality_repo,
@@ -451,21 +544,34 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 ("cbmq_normalize_account_record", "cbmq_normalize_user_record"),
             ),
         ):
-            with self.subTest(factory=factory.__name__), tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                self.subTest(factory=factory.__name__),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
                 repo = Path(tmpdir)
                 fixture = factory(repo)
                 mutation = BENCHMARK.apply_pair_quality_mutation(repo, fixture)
 
-                self.assertEqual(mutation["changed_paths"], [fixture["source_paths"][0]])
+                self.assertEqual(
+                    mutation["changed_paths"], [fixture["source_paths"][0]]
+                )
                 self.assertNotEqual(mutation["before_sha256"], mutation["after_sha256"])
                 post_expected = {
-                    BENCHMARK.canonical_pair(item["source"], item["target"]): item["expected"]
+                    BENCHMARK.canonical_pair(item["source"], item["target"]): item[
+                        "expected"
+                    ]
                     for item in mutation["post_judgments"]
                 }
-                self.assertTrue(post_expected[BENCHMARK.canonical_pair(*expected_added)])
-                self.assertFalse(post_expected[BENCHMARK.canonical_pair(*expected_removed)])
+                self.assertTrue(
+                    post_expected[BENCHMARK.canonical_pair(*expected_added)]
+                )
+                self.assertFalse(
+                    post_expected[BENCHMARK.canonical_pair(*expected_removed)]
+                )
 
-    def test_relation_quality_oracle_scores_raw_query_rows_and_response_cost(self) -> None:
+    def test_relation_quality_oracle_scores_raw_query_rows_and_response_cost(
+        self,
+    ) -> None:
         calls = []
         original = BENCHMARK.run_tool_call_for_transport
 
@@ -476,7 +582,13 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 "response_bytes": 211,
                 "response_token_estimate": 53,
                 "response": {
-                    "columns": ["a.name", "b.name", "r.jaccard", "a.file_path", "b.file_path"],
+                    "columns": [
+                        "a.name",
+                        "b.name",
+                        "r.jaccard",
+                        "a.file_path",
+                        "b.file_path",
+                    ],
                     "rows": [
                         [
                             "cbmqValidateOrder",
@@ -523,17 +635,22 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(calls[0][0], "query_graph")
         self.assertIn("SIMILAR_TO", calls[0][1]["query"])
         self.assertEqual(calls[0][1]["format"], "json")
-        self.assertEqual(result["pair_classification"]["confusion"], {
-            "tp": 1,
-            "fp": 0,
-            "fn": 0,
-            "tn": 1,
-        })
+        self.assertEqual(
+            result["pair_classification"]["confusion"],
+            {
+                "tp": 1,
+                "fp": 0,
+                "fn": 0,
+                "tn": 1,
+            },
+        )
         self.assertTrue(result["passed"])
         self.assertEqual(result["response_quality"]["response_bytes"], 211)
         self.assertEqual(result["observed_pairs"][0]["score"], 0.984)
 
-    def test_pair_oracle_equality_is_order_independent_but_score_sensitive(self) -> None:
+    def test_pair_oracle_equality_is_order_independent_but_score_sensitive(
+        self,
+    ) -> None:
         incremental = {
             "observed_pairs": [
                 {"source": "b", "target": "a", "score": 0.87},
@@ -556,7 +673,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(len(unequal["incremental_only"]), 1)
         self.assertEqual(len(unequal["fresh_only"]), 1)
 
-    def test_pair_incremental_policy_observes_candidate_default_without_assuming_policy(self) -> None:
+    def test_pair_incremental_policy_observes_candidate_default_without_assuming_policy(
+        self,
+    ) -> None:
         stale_index = {"publish_kind": "incremental_exact"}
         stale_oracles = {
             "passed": False,
@@ -585,7 +704,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {"passed": True},
         )
         self.assertEqual(observed_eager["policy"], "candidate_default")
-        self.assertEqual(observed_eager["observed_behavior"], "immediate_pair_freshness")
+        self.assertEqual(
+            observed_eager["observed_behavior"], "immediate_pair_freshness"
+        )
         self.assertTrue(observed_eager["immediate_freshness_expected"])
         self.assertTrue(observed_eager["pair_freshness_met"])
         self.assertFalse(observed_eager["immediate_freshness_met"])
@@ -614,7 +735,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertTrue(eager["immediate_freshness_met"])
         self.assertTrue(eager["policy_conformance_met"])
 
-    def test_search_projection_observation_separates_identity_and_property_fields(self) -> None:
+    def test_search_projection_observation_separates_identity_and_property_fields(
+        self,
+    ) -> None:
         data = {
             "results": [
                 {
@@ -636,9 +759,13 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(observation["property_fields"], ["complexity", "fp"])
         self.assertEqual(observation["internal_fields"], ["fp"])
         self.assertFalse(observation["passed"])
-        self.assertEqual(observation["response_bytes"], len(BENCHMARK.canonical_response_bytes(data)))
+        self.assertEqual(
+            observation["response_bytes"], len(BENCHMARK.canonical_response_bytes(data))
+        )
 
-    def test_parse_list_project_counts_requires_strictly_increasing_positive_values(self) -> None:
+    def test_parse_list_project_counts_requires_strictly_increasing_positive_values(
+        self,
+    ) -> None:
         self.assertEqual(BENCHMARK.parse_list_project_counts("1,16,64"), [1, 16, 64])
         for invalid in ("", "0,1", "1,1", "16,1", "1,two"):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
@@ -648,7 +775,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             seed = Path(tmpdir) / "seed.db"
             clone = Path(tmpdir) / "clone.db"
-            with sqlite3.connect(seed) as con:
+            with closing(sqlite3.connect(seed)) as con, con:
                 con.executescript(
                     "CREATE TABLE projects(name TEXT PRIMARY KEY, root_path TEXT);"
                     "CREATE TABLE nodes(id INTEGER PRIMARY KEY, project TEXT);"
@@ -660,17 +787,25 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
 
             BENCHMARK.clone_list_project_db(seed, clone, "clone", "/clone")
 
-            with sqlite3.connect(seed) as con:
-                self.assertEqual(con.execute("SELECT name FROM projects").fetchone()[0], "seed")
-            with sqlite3.connect(clone) as con:
+            with closing(sqlite3.connect(seed)) as con:
+                self.assertEqual(
+                    con.execute("SELECT name FROM projects").fetchone()[0], "seed"
+                )
+            with closing(sqlite3.connect(clone)) as con:
                 self.assertEqual(
                     con.execute("SELECT name, root_path FROM projects").fetchone(),
                     ("clone", "/clone"),
                 )
-                self.assertEqual(con.execute("SELECT project FROM nodes").fetchone()[0], "clone")
-                self.assertEqual(con.execute("SELECT project FROM edges").fetchone()[0], "clone")
+                self.assertEqual(
+                    con.execute("SELECT project FROM nodes").fetchone()[0], "clone"
+                )
+                self.assertEqual(
+                    con.execute("SELECT project FROM edges").fetchone()[0], "clone"
+                )
 
-    def test_list_project_fixture_budget_enforces_cap_and_free_space_reserve(self) -> None:
+    def test_list_project_fixture_budget_enforces_cap_and_free_space_reserve(
+        self,
+    ) -> None:
         mib = 1024 * 1024
         budget = BENCHMARK.list_project_fixture_budget(
             seed_bytes=mib,
@@ -698,7 +833,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             disk_free_bytes=4 * 1024 * mib,
         )
         self.assertFalse(reserve["passed"])
-        self.assertEqual(reserve["reason"], "projected fixture violates free-space reserve")
+        self.assertEqual(
+            reserve["reason"], "projected fixture violates free-space reserve"
+        )
 
     def test_mcp_client_exit_reaps_process_streams_and_reader_threads(self) -> None:
         class FakeStream:
@@ -747,7 +884,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(stderr_thread.join_calls, 1)
         self.assertIsNone(client.proc)
 
-    def test_rank_quality_fixture_separates_graph_signal_from_lexical_order(self) -> None:
+    def test_rank_quality_fixture_separates_graph_signal_from_lexical_order(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             metadata = BENCHMARK.create_rank_quality_repo(Path(tmpdir))
             core = (Path(tmpdir) / "order_core.py").read_text()
@@ -883,9 +1022,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(
             quality["required_substrings"],
             [
-                '\"source\":\"dependency\"',
-                '\"package\":\"cbmbenchdep\"',
-                '\"read_only\":true',
+                '"source":"dependency"',
+                '"package":"cbmbenchdep"',
+                '"read_only":true',
             ],
         )
 
@@ -973,7 +1112,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(result["ndcg_at_5"], 0.0)
         self.assertEqual(len(result["matched_relevance"]), 5)
 
-    def test_frontier_fixture_counts_dependents_and_mutates_one_definition_file(self) -> None:
+    def test_frontier_fixture_counts_dependents_and_mutates_one_definition_file(
+        self,
+    ) -> None:
         cases = {
             "go_inbound_frontier": ("go", "leaf.go", "LeafExtra"),
             "python_inbound_frontier": ("python", "leaf.py", "leaf_extra"),
@@ -990,7 +1131,10 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             "rust_inbound_frontier": ("rust", "leaf.rs", "leaf_extra"),
         }
         for scenario, (language, changed_path, marker) in cases.items():
-            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                self.subTest(scenario=scenario),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
                 repo = Path(tmpdir)
                 metadata = BENCHMARK.create_inbound_frontier_repo(repo, language, 7)
                 changed = BENCHMARK.mutate_inbound_frontier_repo(repo, language)
@@ -1002,20 +1146,26 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                     self.assertEqual(metadata["incremental_contract"], "exact_frontier")
                     self.assertEqual(metadata["expected_minimum_affected_files"], 8)
                 else:
-                    self.assertEqual(metadata["incremental_contract"], "safe_full_rebuild")
+                    self.assertEqual(
+                        metadata["incremental_contract"], "safe_full_rebuild"
+                    )
                     self.assertEqual(metadata["expected_publish_kind"], "full")
                     self.assertEqual(metadata["expected_reason"], "scoped_lsp_gap")
                 self.assertEqual(changed, [changed_path])
                 self.assertIn(marker, (repo / changed_path).read_text(encoding="utf-8"))
                 for index in range(7):
-                    self.assertTrue((repo / metadata["dependent_paths"][index]).is_file())
+                    self.assertTrue(
+                        (repo / metadata["dependent_paths"][index]).is_file()
+                    )
 
     def test_frontier_catalog_matches_cross_file_resolver_languages(self) -> None:
         fixture_languages = {
             "c" if language == "c_header" else language
             for language in BENCHMARK.MATRIX_FRONTIER_SCENARIOS.values()
         }
-        self.assertEqual(fixture_languages, set(BENCHMARK.CROSS_FILE_RESOLVER_LANGUAGES))
+        self.assertEqual(
+            fixture_languages, set(BENCHMARK.CROSS_FILE_RESOLVER_LANGUAGES)
+        )
 
     def test_frontier_fixture_rejects_nonpositive_dependent_count(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1031,7 +1181,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertFalse(gate["passed"])
         self.assertEqual(gate["expected_minimum_affected_files"], 8)
         self.assertEqual(gate["observed_affected_files"], 1)
-        self.assertEqual(gate["reason"], "observed frontier is smaller than the fixture contract")
+        self.assertEqual(
+            gate["reason"], "observed frontier is smaller than the fixture contract"
+        )
 
     def test_frontier_gate_is_not_applicable_to_nonfrontier_scenarios(self) -> None:
         gate = BENCHMARK.frontier_coverage_gate({}, {"response": {}})
@@ -1071,7 +1223,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(gate["contract"], "configured_cap_fallback")
         self.assertEqual(gate["expected_minimum_affected_files"], 17)
 
-    def test_frontier_gate_rejects_cap_fallback_without_truncation_evidence(self) -> None:
+    def test_frontier_gate_rejects_cap_fallback_without_truncation_evidence(
+        self,
+    ) -> None:
         metadata = {"expected_minimum_affected_files": 17}
         incremental = {
             "publish_kind": "full",
@@ -1104,9 +1258,13 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {"auto_index_deps": "false"},
         )
 
-    def test_incremental_semantic_freshness_eager_profile_changes_only_refresh_policy(self) -> None:
+    def test_incremental_semantic_freshness_eager_profile_changes_only_refresh_policy(
+        self,
+    ) -> None:
         self.assertEqual(
-            BENCHMARK.resolve_config_overrides("incremental_semantic_freshness_eager", []),
+            BENCHMARK.resolve_config_overrides(
+                "incremental_semantic_freshness_eager", []
+            ),
             {"incremental_derived_refresh": "eager"},
         )
 
@@ -1143,13 +1301,18 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 },
                 "git_history": {"applicable": True, "reason": "available in fast mode"},
                 "http_links": {"applicable": True, "reason": "available in fast mode"},
-                "dependencies": {"applicable": True, "reason": "available in fast mode"},
+                "dependencies": {
+                    "applicable": True,
+                    "reason": "available in fast mode",
+                },
             },
         )
         self.assertTrue(
             all(
                 value["applicable"]
-                for value in BENCHMARK.index_mode_capability_applicability("full").values()
+                for value in BENCHMARK.index_mode_capability_applicability(
+                    "full"
+                ).values()
             )
         )
 
@@ -1213,9 +1376,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {
                 "expected_substring": "canonicalDependencyAPI",
                 "required_substrings": [
-                    '\"source\":\"dependency\"',
-                    '\"package\":\"cbmbenchdep\"',
-                    '\"read_only\":true',
+                    '"source":"dependency"',
+                    '"package":"cbmbenchdep"',
+                    '"read_only":true',
                 ],
                 "relevance": 3,
             }
@@ -1304,6 +1467,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertTrue(comparison["pre_reveal"]["classic_dispatch_parity"])
         self.assertFalse(comparison["pre_reveal"]["get_code_alias"]["schema_equal"])
         self.assertFalse(
+            comparison["pre_reveal"]["get_code_alias"]["validation_shape_equal"]
+        )
+        self.assertFalse(
             comparison["pre_reveal"]["get_code_alias"]["property_names_equal"]
         )
         self.assertEqual(
@@ -1312,7 +1478,21 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         )
         self.assertTrue(comparison["post_reveal"]["classic_name_parity"])
         self.assertTrue(comparison["post_reveal"]["classic_schema_parity"])
+        self.assertTrue(comparison["post_reveal"]["classic_contract_parity"])
         self.assertTrue(comparison["post_reveal"]["tools_list_changed_observed"])
+        capabilities = {
+            item["capability"]: item for item in comparison["capability_parity"]
+        }
+        self.assertTrue(
+            capabilities["structural_search"]["streamlined_pre_reveal_callable"]
+        )
+        self.assertTrue(
+            capabilities["source_retrieval"]["streamlined_pre_reveal_callable"]
+        )
+        self.assertIn(
+            "input/output schemas",
+            comparison["comparison_scope"]["advertised_parity"],
+        )
         self.assertTrue(comparison["passed"])
 
     def test_surface_parity_rejects_post_reveal_schema_drift(self) -> None:
@@ -1340,6 +1520,37 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         )
         self.assertFalse(comparison["passed"])
 
+    def test_surface_parity_rejects_post_reveal_protocol_contract_drift(self) -> None:
+        classic = [
+            {
+                "name": "search_graph",
+                "description": "search",
+                "inputSchema": {"type": "object"},
+                "outputSchema": {"type": "object"},
+                "annotations": {"readOnlyHint": True},
+            }
+        ]
+        post = [
+            {
+                **classic[0],
+                "annotations": {"readOnlyHint": False},
+            }
+        ]
+
+        comparison = BENCHMARK.compare_mcp_tool_surfaces(
+            classic,
+            post,
+            classic,
+            pre_dispatch={"search_graph": True},
+            list_changed_observed=True,
+        )
+
+        self.assertFalse(comparison["post_reveal"]["classic_contract_parity"])
+        self.assertEqual(
+            comparison["post_reveal"]["contract_mismatches"], ["search_graph"]
+        )
+        self.assertFalse(comparison["passed"])
+
     def test_explicit_config_override_takes_priority_over_profile(self) -> None:
         overrides = BENCHMARK.resolve_config_overrides(
             "minimal_indexing", ["rank_enabled=true", "auto_index_deps=true"]
@@ -1353,10 +1564,16 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(env["CBM_PROFILE"], "1")
         self.assertEqual(env["CBM_AUTO_INDEX"], "false")
 
-    def test_tool_result_separates_default_payload_quality_json_and_transport(self) -> None:
+    def test_tool_result_separates_default_payload_quality_json_and_transport(
+        self,
+    ) -> None:
         default_payload = b"total: 1\nresults[1]{name}:\n  alpha\n"
         result = BENCHMARK.build_tool_call_result(
-            {"name": "alpha", "items": [1, 2]}, "", 999, 12.5, False,
+            {"name": "alpha", "items": [1, 2]},
+            "",
+            999,
+            12.5,
+            False,
             default_payload,
         )
         canonical = b'{"items":[1,2],"name":"alpha"}'
@@ -1364,7 +1581,8 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(result["response_bytes"], len(default_payload))
         self.assertEqual(result["quality_response_bytes"], len(canonical))
         self.assertEqual(
-            result["response_token_estimate"], BENCHMARK.estimate_response_tokens(default_payload)
+            result["response_token_estimate"],
+            BENCHMARK.estimate_response_tokens(default_payload),
         )
         self.assertEqual(result["token_estimator"], "utf8_bytes_div_4_ceil")
         self.assertEqual(result["response_encoding"], "tool_default")
@@ -1376,11 +1594,18 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(BENCHMARK.cli_result_text(cli_stdout), toon)
         self.assertEqual(BENCHMARK.mcp_result_text(mcp_response), toon)
 
-    def test_mcp_tool_call_measures_default_payload_and_uses_json_for_quality(self) -> None:
+    def test_mcp_tool_call_measures_default_payload_and_uses_json_for_quality(
+        self,
+    ) -> None:
         class FakeClient:
             def call_tool_text(self, name, arguments):
                 self.default_call = (name, arguments)
-                return "total: 1\nresults[1]{name}:\n  alpha\n", "default log", 321, 7.25
+                return (
+                    "total: 1\nresults[1]{name}:\n  alpha\n",
+                    "default log",
+                    321,
+                    7.25,
+                )
 
             def call_tool(self, name, arguments):
                 self.quality_call = (name, arguments)
@@ -1473,12 +1698,17 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             )
         )
         result = BENCHMARK.build_index_result(
-            {"publish_kind": "full"}, stderr, stdout_bytes=10, elapsed_ms=100.0,
+            {"publish_kind": "full"},
+            stderr,
+            stdout_bytes=10,
+            elapsed_ms=100.0,
             include_logs=False,
         )
         self.assertEqual(result["peak_rss_mb"], 256)
 
-    def test_build_index_result_reads_final_peak_for_sequential_and_incremental_runs(self) -> None:
+    def test_build_index_result_reads_final_peak_for_sequential_and_incremental_runs(
+        self,
+    ) -> None:
         for marker in ("pipeline.done", "incremental.done"):
             with self.subTest(marker=marker):
                 result = BENCHMARK.build_index_result(
@@ -1515,7 +1745,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(len(result["measurement_log_markers"]), 2)
         self.assertNotIn("ignored detail", "\n".join(result["measurement_log_markers"]))
 
-    def test_build_index_result_archives_worker_log_before_worktree_cleanup(self) -> None:
+    def test_build_index_result_archives_worker_log_before_worktree_cleanup(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             logfile = root / "index.log"
@@ -1540,10 +1772,14 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             logfile.unlink()
 
             self.assertTrue(archived_path.is_file())
-            self.assertIn("msg=mem.phase", gzip.decompress(archived_path.read_bytes()).decode())
+            self.assertIn(
+                "msg=mem.phase", gzip.decompress(archived_path.read_bytes()).decode()
+            )
             self.assertEqual(artifact["source_name"], "index.log")
 
-    def test_build_index_result_records_dependency_phase_and_package_count(self) -> None:
+    def test_build_index_result_records_dependency_phase_and_package_count(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             logfile = Path(tmpdir) / "index.log"
             logfile.write_text(
@@ -1567,7 +1803,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 "packages_indexed": 6,
             },
         )
-        self.assertIn("sub=dep_auto_index", "\n".join(result["measurement_log_markers"]))
+        self.assertIn(
+            "sub=dep_auto_index", "\n".join(result["measurement_log_markers"])
+        )
 
     def test_build_index_result_attributes_cold_process_overhead_after_worker_total(
         self,
@@ -1603,7 +1841,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             },
         )
 
-    def test_build_index_result_marks_uninstrumented_dependency_phase_unknown(self) -> None:
+    def test_build_index_result_marks_uninstrumented_dependency_phase_unknown(
+        self,
+    ) -> None:
         result = BENCHMARK.build_index_result(
             {"publish_kind": "full"},
             "",
@@ -1689,8 +1929,11 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
 
     def test_build_index_result_uses_none_without_memory_markers(self) -> None:
         result = BENCHMARK.build_index_result(
-            {"publish_kind": "full"}, "level=info msg=pipeline.done elapsed_ms=80", 10,
-            100.0, False,
+            {"publish_kind": "full"},
+            "level=info msg=pipeline.done elapsed_ms=80",
+            10,
+            100.0,
+            False,
         )
         self.assertIsNone(result["peak_rss_mb"])
 
