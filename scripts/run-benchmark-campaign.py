@@ -393,6 +393,18 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 profile.get("config_overrides"),
                 f"profiles[{profile_index}].config_overrides",
             )
+            if config_profile == "default":
+                for key, claimed_value in capabilities.items():
+                    disabled = claimed_value is False or (
+                        isinstance(claimed_value, str)
+                        and claimed_value.strip().lower() == "false"
+                    )
+                    if disabled and overrides.get(key, "").strip().lower() != "false":
+                        raise ValueError(
+                            f"profiles[{profile_index}].capabilities claims {key}=false "
+                            "but the default profile does not apply that setting; add the "
+                            "same value to config_overrides"
+                        )
             if "incremental_exact_max_affected_paths" in overrides:
                 raise ValueError("exact cap belongs in scenarios[].exact_caps, not profile overrides")
             profile_environment = _string_map(
