@@ -177,6 +177,51 @@ class BenchmarkCampaignTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "binary_sha256 does not match"):
                 CAMPAIGN.expand_matrix_spec(spec)
 
+    def test_default_profile_rejects_disabled_capability_without_config_override(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            binary = root / "cbm"
+            binary.write_bytes(b"binary")
+            benchmark = root / "benchmark.py"
+            benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            spec = {
+                "schema_version": 1,
+                "harness_version": "capability-claims-v1",
+                "benchmark_script": str(benchmark),
+                "workload": "self_dogfood",
+                "repository_background": {
+                    "repo": str(root),
+                    "revision": "c" * 40,
+                    "tree": "d" * 40,
+                },
+                "cwd": str(root),
+                "repetitions": 1,
+                "transports": ["mcp"],
+                "candidates": [
+                    {
+                        "label": "candidate",
+                        "revision": "a" * 40,
+                        "binary": str(binary),
+                        "build": {"cflags": "-O2"},
+                    }
+                ],
+                "profiles": [
+                    {
+                        "label": "dependency-disabled",
+                        "config_profile": "default",
+                        "capabilities": {"auto_index_deps": "false"},
+                    }
+                ],
+                "scenarios": [{"name": "c_new_leaf"}],
+            }
+
+            with self.assertRaisesRegex(
+                ValueError, "capabilities claims auto_index_deps=false"
+            ):
+                CAMPAIGN.expand_matrix_spec(spec)
+
     def test_matrix_spec_expands_capability_quality_without_frontier_axes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
