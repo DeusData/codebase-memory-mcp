@@ -1013,6 +1013,12 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                 "route failed (expected /api/pan4-oracle)",
             ],
         )
+        markdown = SUMMARY.render_markdown([row])
+        self.assertIn("Graph error", markdown)
+        self.assertIn("Result / quality error", markdown)
+        self.assertIn("Run / lifecycle error", markdown)
+        self.assertIn("**GRAPH ERROR**", markdown)
+        self.assertIn("**RESULT ERROR**", markdown)
 
     def test_declared_stale_derived_views_are_not_core_correctness_failure(
         self,
@@ -1093,8 +1099,10 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertEqual(retained_row["lifecycle"], "retained by request 1/1")
         self.assertEqual(failed_row["lifecycle"], "CLEANUP FAILED 1/1")
+        self.assertEqual(failed_row["decision"], "REJECT: lifecycle cleanup")
         markdown = SUMMARY.render_markdown([retained_row, failed_row])
         self.assertIn("Evidence lifecycle", markdown)
+        self.assertIn("**CLEANUP ERROR**", markdown)
         self.assertNotIn("Cleanup |", markdown)
 
     def test_markdown_places_quality_before_performance(self) -> None:

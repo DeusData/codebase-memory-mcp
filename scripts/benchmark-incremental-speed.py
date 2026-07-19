@@ -3409,9 +3409,40 @@ def frontier_coverage_gate(
     return result
 
 
+def validate_isolated_cache_dir(cache_dir: Path) -> Path:
+    """Fail before a candidate can mutate a live or previously populated store.
+
+    Cross-version candidates may interpret newer SQLite metadata as corruption and
+    perform their own recovery. Every benchmark phase must therefore start from a
+    harness-owned empty directory, never the caller's active cache or a prior cell.
+    """
+    resolved = cache_dir.expanduser().resolve()
+    active_cache = os.environ.get("CBM_CACHE_DIR")
+    live_caches = {Path.home() / ".cache" / "codebase-memory-mcp"}
+    if active_cache:
+        live_caches.add(Path(active_cache).expanduser())
+    if any(resolved == path.resolve() for path in live_caches):
+        raise RuntimeError(
+            f"benchmark cache resolves to a live cache directory: {resolved}"
+        )
+    if resolved.is_dir():
+        existing = sorted(
+            path.name
+            for path in resolved.iterdir()
+            if path.is_file() and path.name.endswith(PROJECT_DB_SUFFIX)
+        )
+        if existing:
+            raise RuntimeError(
+                "benchmark cache contains an existing project database: "
+                + ", ".join(existing)
+            )
+    return resolved
+
+
 def build_env(cache_dir: Path) -> dict[str, str]:
+    isolated_cache = validate_isolated_cache_dir(cache_dir)
     env = dict(os.environ)
-    env["CBM_CACHE_DIR"] = str(cache_dir)
+    env["CBM_CACHE_DIR"] = str(isolated_cache)
     env["CBM_AUTO_INDEX"] = "false"
     env["CBM_CONTEXT_INJECTION"] = "false"
     # The supervisor retains successful worker logs only in profile mode. The

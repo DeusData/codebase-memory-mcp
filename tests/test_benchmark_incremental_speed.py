@@ -22,6 +22,25 @@ SPEC.loader.exec_module(BENCHMARK)
 
 
 class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+    def test_build_env_rejects_inherited_live_cache_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            live_cache = Path(tmpdir) / "live-cache"
+            live_cache.mkdir()
+            with mock.patch.dict(
+                os.environ, {"CBM_CACHE_DIR": str(live_cache)}, clear=False
+            ):
+                with self.assertRaisesRegex(RuntimeError, "live cache"):
+                    BENCHMARK.build_env(live_cache)
+
+    def test_build_env_rejects_cache_with_existing_project_database(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache = Path(tmpdir) / "candidate-cache"
+            cache.mkdir()
+            (cache / f"existing{BENCHMARK.PROJECT_DB_SUFFIX}").touch()
+
+            with self.assertRaisesRegex(RuntimeError, "existing project database"):
+                BENCHMARK.build_env(cache)
+
     def test_declared_stale_views_are_collected_from_tool_responses(self) -> None:
         oracles = {
             "search": {
