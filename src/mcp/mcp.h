@@ -20,6 +20,19 @@ typedef struct yyjson_mut_val yyjson_mut_val;   /* from yyjson.h */
 struct cbm_watcher;                         /* from watcher/watcher.h */
 struct cbm_config;                          /* from cli/cli.h */
 
+typedef enum {
+    CBM_MCP_TOOL_PROFILE_ALL = 0,
+    /* Restricted agent surfaces advertise and execute only inspection tools.
+     * Cache maintenance may still occur outside these tool calls, so these
+     * profiles are deliberately not named strictly read-only. */
+    CBM_MCP_TOOL_PROFILE_ANALYSIS = 1,
+    CBM_MCP_TOOL_PROFILE_SCOUT = 2,
+} cbm_mcp_tool_profile_t;
+
+int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
+                                    cbm_mcp_tool_profile_t *profile_out);
+bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile);
+
 /* ── JSON-RPC types ───────────────────────────────────────────── */
 
 /* JSON-RPC 2.0 standard error codes shared by parsers, dispatchers, and
@@ -115,6 +128,10 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name);
 /* Format the initialize response. params_json is the raw initialize params
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);
+
+/* Select the tool surface advertised by tools/list and enforced by dispatch. */
+void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv,
+                                     cbm_mcp_tool_profile_t profile);
 
 /* ── Tool argument helpers ────────────────────────────────────── */
 

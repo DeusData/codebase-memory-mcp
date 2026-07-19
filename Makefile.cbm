@@ -114,12 +114,15 @@ CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(EXTRA_CXXFLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
-CFLAGS_TEST = $(CFLAGS_COMMON) -g -O1 $(SANITIZE)
+EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
+	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
+	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1
+CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 $(SANITIZE)
 CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
-CFLAGS_TSAN = $(CFLAGS_COMMON) -g -O1 \
+CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 \
               $(TSAN_SANITIZE)
 CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
                 $(TSAN_SANITIZE)
@@ -143,7 +146,7 @@ LDFLAGS = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) $(STATIC_FLAG
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(LIBGIT2_LIBS) $(WIN32_LIBS)
 # nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement)
-CFLAGS_NOSAN  = $(CFLAGS_COMMON) -g -O1
+CFLAGS_NOSAN  = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1
 LDFLAGS_NOSAN = -lm -lstdc++ -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS)
 
 # ── Source files ─────────────────────────────────────────────────
@@ -186,6 +189,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/helpers.c \
     $(CBM_DIR)/lang_specs.c \
+    $(CBM_DIR)/macro_table.c \
+    $(CBM_DIR)/iris_export_xml.c \
     $(CBM_DIR)/service_patterns.c
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
@@ -302,7 +307,10 @@ GIT_SRCS = src/git/git_command.c \
     src/git/git_snapshot.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c
+CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
+	src/cli/agent_clients.c src/cli/agent_profiles.c \
+	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
+	src/cli/config_text_edit.c
 
 # UI module (graph visualization)
 UI_SRCS = \
@@ -474,7 +482,9 @@ TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/
 TEST_TRACES_SRCS = tests/test_traces.c
 
 
-TEST_CLI_SRCS = tests/test_cli.c
+TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
+	tests/test_config_json_like.c \
+	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
@@ -852,6 +862,20 @@ $(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS)
 
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
+
+# Parallel variant: every suite as its own process; identical gate quality
+# (see the ZERO-LOSS CONTRACT in scripts/run-tests-parallel.sh — union guard
+# against --list-suites + aggregated pass/fail/skip totals).
+test-par: $(BUILD_DIR)/test-runner
+	cd $(CURDIR) && bash scripts/run-tests-parallel.sh $(BUILD_DIR)/test-runner
+
+# Focused native development is intentionally a separate, explicit target so
+# an inherited TEST_SUITES value cannot silently narrow the gating test target.
+TEST_SUITES ?=
+test-focused: $(BUILD_DIR)/test-runner
+	@test -n "$(strip $(TEST_SUITES))" || \
+		(echo "TEST_SUITES is required for test-focused"; exit 2)
+	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
 
 # ── Cumulative bug-reproduction runner (RED by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)

@@ -51,7 +51,9 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          FILES=$(gh pr diff "$PR" --repo "$REPO" --name-only)
+          # The full .diff endpoint rejects large-but-valid PRs at 20k lines.
+          # The paginated files endpoint remains filename-only for this gate.
+          FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
           printf '%s\n' "$FILES"
           if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|scripts/build\.sh|scripts/smoke-test\.sh|scripts/env\.sh|Makefile\.cbm)'; then
             echo "product=true" >> "$GITHUB_OUTPUT"

@@ -25,6 +25,8 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
 #include "cbm.h"
+#include "arena.h"
+#include "iris_export_xml.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
@@ -536,6 +538,39 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                     hard_fail = true;
                 }
             }
+            continue;
+        }
+
+        /* ObjectScript Studio Export XML: transcode each <Class> to UDL and
+         * extract it as CBM_LANG_OBJECTSCRIPT_UDL. The XML→UDL mapping is 1:1,
+         * so the same UDL extractor handles the result. These files are not
+         * cached (their defs/edges are emitted directly here). */
+        if (lang == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+            CBMArena export_arena;
+            cbm_arena_init(&export_arena);
+            int class_count = 0;
+            char **udl_strings =
+                cbm_iris_export_to_udl(&export_arena, source, source_len, &class_count);
+            free(source);
+            for (int ci = 0; ci < class_count; ci++) {
+                CBMFileResult *xr = cbm_extract_file_with_options_ex(
+                    udl_strings[ci], (int)strlen(udl_strings[ci]), CBM_LANG_OBJECTSCRIPT_UDL,
+                    ctx->project_name, rel, cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
+                    cbm_pipeline_mode_extracts_macro_nodes(ctx->mode), ctx->macro_table, NULL);
+                if (!xr) {
+                    continue;
+                }
+                for (int d = 0; d < xr->defs.count; d++) {
+                    process_def(ctx, &xr->defs.items[d], rel);
+                    total_defs++;
+                }
+                total_calls += xr->calls.count;
+                total_imports += cbm_pipeline_create_import_edges_for_file(ctx, xr, rel, NULL);
+                create_channel_edges_for_file(ctx, xr, rel);
+                cbm_pipeline_create_env_configures_for_file(ctx, xr, rel);
+                cbm_free_result(xr);
+            }
+            cbm_arena_destroy(&export_arena);
             continue;
         }
 

@@ -206,8 +206,19 @@ void py_lsp_bind_imports(PyLSPContext *ctx) {
             // resolution checks the registry to upgrade to MODULE / class
             // / function as appropriate.
             t = cbm_type_named(ctx->arena, qn);
+        } else if (strchr(qn, '.') != NULL) {
+            // Dotted path whose tail does NOT match the local name: an
+            // ALIASED binding — `from X import Y as Z` (Z names function/
+            // class X.Y) or `import a.b as z` (z names module a.b). The
+            // CBMImport shape cannot distinguish the two, but NAMED(qn)
+            // covers both: phase 6 upgrades it to the registered function/
+            // class for the from-import and to MODULE for the module alias.
+            // Binding MODULE here made `g()` calls on `from m import f as g`
+            // resolve as calls on a module — lsp=MISS, and the whole CALLS
+            // edge was lost (#988).
+            t = cbm_type_named(ctx->arena, qn);
         } else {
-            // `import X` / `import X as Y` — bind to MODULE(X).
+            // `import X` / `import X as Y` (single segment) — MODULE(X).
             t = cbm_type_module(ctx->arena, qn);
         }
         py_scope_bind(ctx, local, t);
@@ -1910,11 +1921,23 @@ static void py_emit_call_for(PyLSPContext *ctx, TSNode call_node) {
             py_scope_restore(ctx, saved);
             return;
         }
-        // Constructor call (ClassName())
+        // Constructor call (ClassName()) — or a call through any other
+        // NAMED scope binding (aliased imports land here too).
         const CBMType *in_scope = cbm_scope_lookup(ctx->current_scope, fname);
         if (!cbm_type_is_unknown(in_scope) && in_scope->kind == CBM_TYPE_NAMED) {
             const char *qn = in_scope->data.named.qualified_name;
-            py_emit_resolved_call(ctx, qn, "lsp_constructor", 0.85f);
+            const char *tail = strrchr(qn, '.');
+            const char *qn_short = tail ? tail + 1 : qn;
+            if (strcmp(qn_short, fname) != 0) {
+                /* Aliased binding (`from m import f as g; g()`): the textual
+                 * callee ("g") differs from the resolved QN's tail ("f"), so
+                 * the pass join would never match them. Stash the textual
+                 * name in `reason` under a join-gated strategy, mirroring
+                 * lsp_dict_dispatch (see lsp_resolve.h) (#988). */
+                py_emit_resolved_call_reason(ctx, qn, "lsp_import_alias", 0.85f, fname);
+            } else {
+                py_emit_resolved_call(ctx, qn, "lsp_constructor", 0.85f);
+            }
             return;
         }
         // Module-local function

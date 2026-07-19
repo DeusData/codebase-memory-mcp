@@ -426,8 +426,12 @@ static void parse_pyproject_toml(const char *source, int source_len, const char 
     pkg_entries_push(entries, name, entry);
 
     /* Also register <name>/__init__ as alternative (no src/ prefix) */
-    snprintf(suffix, sizeof(suffix), "%s/__init__", name_copy);
-    char *alt_entry = build_entry_path(rel_path, suffix);
+    char *alt_entry = NULL;
+    if (name_copy) {
+        snprintf(suffix, sizeof(suffix), "%s/__init__", name_copy);
+        alt_entry = build_entry_path(rel_path, suffix);
+    }
+
     if (name_copy && alt_entry) {
         pkg_entries_push(entries, name_copy, alt_entry);
     } else {
@@ -1298,6 +1302,129 @@ static bool import_target_better(const cbm_gbuf_node_t *candidate, const cbm_gbu
     return strcmp(candidate_qn, current_qn) < 0;
 }
 
+static const char *path_leaf(const char *path) {
+    const char *leaf = path;
+    for (const char *p = path; p && *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            leaf = p + 1;
+        }
+    }
+    return leaf;
+}
+
+static bool is_header_include(const char *path) {
+    if (!path || !path[0]) {
+        return false;
+    }
+    static const char *const header_exts[] = {
+        ".h", ".hh", ".hpp", ".hxx", ".inc", ".inl", ".ipp", NULL,
+    };
+    size_t path_len = strlen(path);
+    for (const char *const *ext = header_exts; *ext; ext++) {
+        size_t ext_len = strlen(*ext);
+        if (path_len > ext_len && strcmp(path + path_len - ext_len, *ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_c_family_source(const char *source_rel) {
+    if (!source_rel || !source_rel[0]) {
+        return false;
+    }
+    static const char *const exts[] = {
+        ".c", ".cc", ".cpp", ".cxx", ".c++", ".h", ".hh", ".hpp", ".hxx", NULL,
+    };
+    size_t path_len = strlen(source_rel);
+    for (const char *const *ext = exts; *ext; ext++) {
+        size_t ext_len = strlen(*ext);
+        if (path_len > ext_len && strcmp(source_rel + path_len - ext_len, *ext) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const cbm_gbuf_node_t *resolve_exact_file_node(const cbm_pipeline_ctx_t *ctx,
+                                                       const char *file_path,
+                                                       const char *source_file_qn) {
+    if (!ctx || !file_path || !file_path[0]) {
+        return NULL;
+    }
+    const char *leaf = path_leaf(file_path);
+    if (!leaf || !leaf[0]) {
+        return NULL;
+    }
+
+    char stem[PKGMAP_PATH_BUF];
+    snprintf(stem, sizeof(stem), "%s", leaf);
+    char *last_dot = strrchr(stem, '.');
+    if (last_dot && last_dot != stem) {
+        *last_dot = '\0';
+    }
+
+    const char *names[] = {stem[0] ? stem : NULL, leaf};
+    const cbm_gbuf_node_t *best = NULL;
+    for (size_t ni = 0; ni < sizeof(names) / sizeof(names[0]); ni++) {
+        if (!names[ni] || !names[ni][0]) {
+            continue;
+        }
+        const cbm_gbuf_node_t **hits = NULL;
+        int hit_count = 0;
+        if (cbm_gbuf_find_by_name(ctx->gbuf, names[ni], &hits, &hit_count) != 0 || !hits) {
+            continue;
+        }
+        for (int i = 0; i < hit_count; i++) {
+            const cbm_gbuf_node_t *candidate = hits[i];
+            if (!candidate || !candidate->file_path ||
+                !ends_with(candidate->file_path, file_path) ||
+                !import_targetable_label(candidate->label)) {
+                continue;
+            }
+            if (source_file_qn && candidate->qualified_name &&
+                strcmp(candidate->qualified_name, source_file_qn) == 0) {
+                continue;
+            }
+            if (strcmp(candidate->label, "File") == 0) {
+                return candidate;
+            }
+            if (!best) {
+                best = candidate;
+            }
+        }
+        if (best) {
+            return best;
+        }
+    }
+    return NULL;
+}
+
+static const cbm_gbuf_node_t *resolve_header_include(const cbm_pipeline_ctx_t *ctx,
+                                                      const char *source_rel,
+                                                      const char *source_file_qn,
+                                                      const char *module_path) {
+    if (!is_c_family_source(source_rel) || !is_header_include(module_path)) {
+        return NULL;
+    }
+    const char *base = module_path;
+    if (base[0] == '.' && base[1] == '/') {
+        base += 2;
+    }
+    const cbm_gbuf_node_t *exact = resolve_exact_file_node(ctx, base, source_file_qn);
+    if (exact || !source_rel || !source_rel[0]) {
+        return exact;
+    }
+    char *dir = path_dirname(source_rel);
+    if (!dir) {
+        return NULL;
+    }
+    char candidate[PKGMAP_PATH_BUF];
+    snprintf(candidate, sizeof(candidate), "%s%s%s", dir, dir[0] ? "/" : "", base);
+    free(dir);
+    return resolve_exact_file_node(ctx, candidate, source_file_qn);
+}
+
 /* Resolve a sibling-file import: a bare path/name (no leading "./") that names
  * a file relative to the importer's directory.  This covers build/markup
  * grammars whose import string is a sibling filename or directory rather than a
@@ -1713,6 +1840,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(cbm_pipeline_ctx_t *ctx,
                                                         CBMHashTable *namespace_map) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
+    }
+
+    /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
+     * module nodes do not steal the edge target. */
+    const cbm_gbuf_node_t *header_target =
+        resolve_header_include(ctx, source_rel, source_file_qn, imp->module_path);
+    if (header_target) {
+        return header_target;
     }
 
     /* Strategy 1: module-path resolution → existing node (Python/TS/Go).

@@ -715,7 +715,7 @@ TEST(api_surface_classic_regression_gate) {
     restore_tool_mode(saved_mode);
     ASSERT_NOT_NULL(json);
 
-    ASSERT_EQ(15, tool_list_exact_count(json));
+    ASSERT_EQ(16, tool_list_exact_count(json));
     ASSERT(tool_list_has_exact_name(json, "index_repository"));
     ASSERT(tool_list_has_exact_name(json, "search_graph"));
     ASSERT(tool_list_has_exact_name(json, "query_graph"));
@@ -727,6 +727,7 @@ TEST(api_surface_classic_regression_gate) {
     ASSERT(tool_list_has_exact_name(json, "list_projects"));
     ASSERT(tool_list_has_exact_name(json, "delete_project"));
     ASSERT(tool_list_has_exact_name(json, "index_status"));
+    ASSERT(tool_list_has_exact_name(json, "check_index_coverage"));
     ASSERT(tool_list_has_exact_name(json, "detect_changes"));
     ASSERT(tool_list_has_exact_name(json, "manage_adr"));
     ASSERT(tool_list_has_exact_name(json, "ingest_traces"));
@@ -768,7 +769,7 @@ TEST(tool_mode_config_switches_live_server_surface) {
     ASSERT_EQ(cbm_config_set(writer_cfg, "tool_mode", "classic"), 0);
     char *classic = cbm_mcp_tools_list(srv);
     ASSERT_NOT_NULL(classic);
-    ASSERT_EQ(15, tool_list_exact_count(classic));
+    ASSERT_EQ(16, tool_list_exact_count(classic));
     ASSERT(tool_list_has_exact_name(classic, "index_repository"));
     ASSERT(!tool_list_has_exact_name(classic, "get_code"));
     free(classic);
@@ -811,7 +812,8 @@ TEST(hidden_tools_reveal_discoverable_tools) {
     ASSERT(tool_list_has_exact_name(after, "index_dependencies"));
     ASSERT(tool_list_has_exact_name(after, "trace_path"));
     ASSERT(tool_list_has_exact_name(after, "_hidden_tools"));
-    ASSERT_EQ(17, tool_list_exact_count(after));
+    ASSERT(tool_list_has_exact_name(after, "check_index_coverage"));
+    ASSERT_EQ(18, tool_list_exact_count(after));
     free(after);
 
     cbm_mcp_server_free(srv);
@@ -856,7 +858,8 @@ TEST(hidden_tools_payload_excludes_already_visible_configured_tools) {
     char *after = cbm_mcp_tools_list(srv);
     ASSERT_NOT_NULL(after);
     ASSERT(tool_list_has_exact_name(after, "get_architecture"));
-    ASSERT_EQ(17, tool_list_exact_count(after));
+    ASSERT(tool_list_has_exact_name(after, "check_index_coverage"));
+    ASSERT_EQ(18, tool_list_exact_count(after));
     free(after);
 
     cbm_mcp_server_free(srv);
@@ -886,7 +889,8 @@ TEST(streamlined_reveal_covers_classic_capabilities) {
         "index_repository", "search_graph", "query_graph", "trace_path",
         "get_code_snippet", "get_graph_schema", "get_architecture",
         "search_code", "list_projects", "delete_project", "index_status",
-        "detect_changes", "manage_adr", "ingest_traces", "index_dependencies",
+        "check_index_coverage", "detect_changes", "manage_adr", "ingest_traces",
+        "index_dependencies",
     };
     for (size_t i = 0; i < sizeof(classic_tools) / sizeof(classic_tools[0]); i++) {
         ASSERT(tool_list_has_exact_name(classic, classic_tools[i]));
@@ -1078,7 +1082,11 @@ TEST(revealed_advanced_tool_schema_matches_handlers) {
     ASSERT(!tool_schema_required_has(json, "get_graph_schema", "project"));
     ASSERT(!tool_schema_required_has(json, "get_architecture", "project"));
     ASSERT_NOT_NULL(strstr(json, "Graph edge creation from traces is not yet implemented"));
-    ASSERT_NOT_NULL(strstr(json, "Reserved for future multi-hop impact traversal"));
+    ASSERT(tool_schema_has_property(json, "detect_changes", "direction"));
+    ASSERT(tool_schema_has_property(json, "detect_changes", "limit"));
+    ASSERT(tool_schema_has_property(json, "detect_changes", "format"));
+    ASSERT_NOT_NULL(strstr(json, "one multi-source graph traversal"));
+    ASSERT_NULL(strstr(json, "Reserved for future multi-hop impact traversal"));
 
     free(json);
     cbm_mcp_server_free(srv);

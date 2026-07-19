@@ -470,6 +470,15 @@ int cbm_store_create_indexes(cbm_store_t *s);
 /* Force WAL checkpoint + PRAGMA optimize. */
 int cbm_store_checkpoint(cbm_store_t *s);
 
+/* #1083: the WAL size limit (journal_size_limit) applied to this write
+ * connection, in bytes; -1 = unlimited (SQLite default / pre-fix). */
+int64_t cbm_store_journal_size_limit(cbm_store_t *s);
+
+/* Opaque store generation for pagination-cursor staleness detection:
+ * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
+ * bumps on every index run. "legacy" for DBs predating store_meta. */
+int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
+
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)
  * when the variable is unset, malformed, or partially numeric. Negative
@@ -640,6 +649,12 @@ int cbm_store_insert_edge_batch_in_transaction(cbm_store_t *s, const cbm_edge_t 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
 
+/* Read the deterministic Function/Method CALLS subgraph for SCC analysis.
+ * The parallel arrays are caller-owned; *truncated distinguishes a complete
+ * max_edges-sized result from a bounded prefix. This operation is read-only. */
+int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
+                               int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated);
+
 /* Find edges by target node. */
 int cbm_store_find_edges_by_target(cbm_store_t *s, int64_t target_id, cbm_edge_t **out, int *count);
 
@@ -680,6 +695,14 @@ int cbm_store_upsert_file_hash(cbm_store_t *s, const char *project, const char *
 
 int cbm_store_get_file_hashes(cbm_store_t *s, const char *project, cbm_file_hash_t **out,
                               int *count);
+
+/* Fetch one exact file-hash record. The returned strings are heap-owned and
+ * must be released with cbm_store_clear_file_hash(). */
+int cbm_store_get_file_hash(cbm_store_t *s, const char *project, const char *rel_path,
+                            cbm_file_hash_t *out);
+
+/* Free heap-owned fields in one exact file-hash record and zero it. */
+void cbm_store_clear_file_hash(cbm_file_hash_t *hash);
 
 int cbm_store_delete_file_hash(cbm_store_t *s, const char *project, const char *rel_path);
 
@@ -941,16 +964,52 @@ typedef struct {
     const char *detail;
 } cbm_coverage_row_t;
 
+/* Metadata describing how completely one index run recorded the best-effort
+ * coverage signal. `recording_status` is "complete", "truncated", or
+ * "unavailable"; it is deliberately separate from hash_records_complete.
+ * Strings returned by cbm_store_coverage_meta_get are heap-owned. */
+typedef struct {
+    const char *project;
+    const char *generation;
+    const char *index_mode;
+    const char *recorded_at;
+    const char *recording_status;
+    int ignored_files_stored;
+    int ignored_files_total;
+    int coverage_version;
+    bool hash_records_complete;
+} cbm_coverage_meta_t;
+
 /* Replace the project's coverage rows in one transaction, then prune rows for
  * files absent from file_hashes (deleted from the repo). Call AFTER hashes
  * were persisted for the run. */
 int cbm_store_coverage_replace(cbm_store_t *s, const char *project, const cbm_coverage_row_t *rows,
                                int count);
 
+/* Replace coverage rows and their run metadata atomically. Passing NULL meta
+ * clears any older metadata so it cannot be mistaken for the new row set. */
+int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
+                                  const cbm_coverage_row_t *rows, int count,
+                                  const cbm_coverage_meta_t *meta);
+
 /* Fetch all coverage rows (ordered by rel_path). Caller frees via
  * cbm_store_free_coverage. */
 int cbm_store_coverage_get(cbm_store_t *s, const char *project, cbm_coverage_row_t **out,
                            int *count);
+
+/* Fetch coverage rows for one path. Exact rows are returned together with any
+ * not_indexed_dir ancestor that covers the path. */
+int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char *rel_path,
+                                cbm_coverage_row_t **out, int *count);
+
+/* Fetch coverage rows at/below a directory scope, plus a not_indexed_dir
+ * ancestor that covers the scope. Prefix matching is segment-boundary safe. */
+int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
+                                 cbm_coverage_row_t **out, int *count);
+
+/* Fetch/free the metadata paired with the current coverage row set. */
+int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);
+void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta);
 
 /* Name of the derived miss-graph shadow project ("<project>::missed").
  * cbm_store_coverage_replace materializes the coverage rows as a file-
@@ -985,6 +1044,15 @@ int cbm_store_bfs_overlay_view(cbm_store_t *s, const char *project, const char *
                                const char *direction, const char **edge_types,
                                int edge_type_count, int max_depth, int max_results,
                                cbm_traverse_result_t *out);
+
+/* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
+ * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
+ * seed set; canonical (hop,id) order; *truncated set when the max_results
+ * memory-safety ceiling was hit (counting is otherwise uncapped). */
+int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
+                        const char *direction, const char **edge_types, int edge_type_count,
+                        int max_depth, int max_results, cbm_traverse_result_t *out,
+                        bool *truncated);
 
 /* Free a traverse result's allocated memory. */
 void cbm_store_traverse_free(cbm_traverse_result_t *out);

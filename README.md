@@ -6,7 +6,7 @@
 [![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agents-11-purple)](https://github.com/DeusData/codebase-memory-mcp)
+[![Agents](https://img.shields.io/badge/agent_surfaces-43-purple)](https://github.com/DeusData/codebase-memory-mcp)
 [![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
@@ -100,7 +100,7 @@ Restart your coding agent. Say **"Index this project"** — done.
 The `install` command automatically strips macOS quarantine attributes and ad-hoc signs the binary — no manual `xattr`/`codesign` needed.
 </details>
 
-The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
+The `install` command auto-detects installed coding agents and configures their documented MCP entries plus durable instructions, skills, and lifecycle hooks where supported.
 
 ### Graph Visualization UI
 
@@ -145,7 +145,7 @@ The MCP server also checks for updates on startup and notifies on the first tool
 codebase-memory-mcp uninstall
 ```
 
-Removes all agent configs, skills, hooks, and instructions. Does not remove the binary or SQLite databases.
+Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and deleted only after confirmation.
 
 ## Features
 
@@ -364,7 +364,7 @@ allocator configurations.
 <details>
 <summary>If you prefer not to use the install command</summary>
 
-Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
+Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 
 ```json
 {
@@ -383,7 +383,11 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 
 ## Multi-Agent Support
 
-`install` auto-detects and configures all installed agents:
+`install` configures 43 client surfaces: 37 detected automatically and 6
+conditional or explicit. “Conditional” means the installer writes only when the
+documented platform or an explicit, already-existing config path proves the
+target is active. It never flips experimental feature flags, enables plugins,
+YOLO modes, global permission bypasses, or third-party instruction trust.
 
 | Agent | MCP Config | Instructions | Hooks |
 |-------|-----------|-------------|-------|

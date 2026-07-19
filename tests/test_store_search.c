@@ -8,6 +8,7 @@
 #include "test_helpers.h"
 #include <pagerank/pagerank.h>
 #include <store/store.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -1658,6 +1659,27 @@ TEST(store_impact_summary_empty) {
     PASS();
 }
 
+TEST(store_find_nodes_rejects_null_store_without_ub) {
+    cbm_node_t *nodes = (cbm_node_t *)(uintptr_t)1U;
+    int count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(NULL, "project", "name", &nodes, &count), CBM_STORE_ERR);
+    ASSERT_NULL(nodes);
+    ASSERT_EQ(count, 0);
+    nodes = (cbm_node_t *)(uintptr_t)1U;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(NULL, "project", "Function", &nodes, &count),
+              CBM_STORE_ERR);
+    ASSERT_NULL(nodes);
+    ASSERT_EQ(count, 0);
+    nodes = (cbm_node_t *)(uintptr_t)1U;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_nodes_by_file(NULL, "project", "file.c", &nodes, &count),
+              CBM_STORE_ERR);
+    ASSERT_NULL(nodes);
+    ASSERT_EQ(count, 0);
+    PASS();
+}
+
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
     RUN_TEST(store_search_by_name_pattern);
@@ -1730,4 +1752,5 @@ SUITE(store_search) {
     RUN_TEST(store_hop_to_risk_all_levels);
     RUN_TEST(store_risk_label_all_levels);
     RUN_TEST(store_impact_summary_empty);
+    RUN_TEST(store_find_nodes_rejects_null_store_without_ub);
 }

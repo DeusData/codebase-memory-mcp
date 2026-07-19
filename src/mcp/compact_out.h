@@ -51,4 +51,18 @@ void cbm_toon_cell_real(cbm_sb_t *sb, double v, bool first);
 void cbm_toon_cell_bool(cbm_sb_t *sb, bool v, bool first);
 void cbm_toon_row_end(cbm_sb_t *sb);
 
+/* Source compatibility for call sites merged from the short-lived tree
+ * spelling. Both names deliberately emit canonical TOON; the externally
+ * configured compact format remains `toon`, not a third response format. */
+#define cbm_tree_scalar_str cbm_toon_scalar_str
+#define cbm_tree_scalar_int cbm_toon_scalar_int
+#define cbm_tree_scalar_bool cbm_toon_scalar_bool
+#define cbm_tree_table_header cbm_toon_table_header
+#define cbm_tree_row_begin cbm_toon_row_begin
+#define cbm_tree_cell_str cbm_toon_cell_str
+#define cbm_tree_cell_int cbm_toon_cell_int
+#define cbm_tree_cell_real cbm_toon_cell_real
+#define cbm_tree_cell_bool cbm_toon_cell_bool
+#define cbm_tree_row_end cbm_toon_row_end
+
 #endif /* CBM_MCP_COMPACT_OUT_H */
