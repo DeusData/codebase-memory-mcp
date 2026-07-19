@@ -780,6 +780,79 @@ static int incr_classification_build(cbm_pipeline_t *p, cbm_store_t *store, cons
     return 0;
 }
 
+static bool incr_language_uses_objectscript_macros(CBMLanguage lang) {
+    return lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE ||
+           lang == CBM_LANG_OBJECTSCRIPT_EXPORT;
+}
+
+static bool incr_changed_objectscript_macro_context(const cbm_incr_classification_t *cls) {
+    if (!cls) {
+        return false;
+    }
+    for (int i = 0; i < cls->changed_file_count; i++) {
+        const cbm_file_info_t *file = &cls->changed_files[i];
+        if (file->language == CBM_LANG_OBJECTSCRIPT_ROUTINE &&
+            cbm_str_ends_with(file->rel_path, ".inc")) {
+            return true;
+        }
+    }
+    /* A deleted .inc no longer has a discoverable language. Only repositories
+     * containing ObjectScript sources expand below, so a BitBake-only .inc
+     * deletion does not add work. Renames are covered by this deletion arm. */
+    for (int i = 0; i < cls->deleted_count; i++) {
+        if (cbm_str_ends_with(cls->deleted[i], ".inc")) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The canonical ObjectScript macro table combines every discovered .inc and
+ * intentionally has no per-consumer dependency map. Therefore any .inc
+ * mutation can change any ObjectScript extraction result. Expand only that
+ * language family, then let the existing exact-route bounds choose a delta or
+ * the regular containment path. Other language increments remain O(changed). */
+static int incr_expand_objectscript_macro_consumers(const cbm_file_info_t *all_files,
+                                                     int all_file_count,
+                                                     cbm_incr_classification_t *cls) {
+    if (!all_files || all_file_count <= 0 || !cls ||
+        !incr_changed_objectscript_macro_context(cls)) {
+        return CBM_STORE_OK;
+    }
+
+    cbm_file_info_t *expanded = malloc((size_t)all_file_count * sizeof(*expanded));
+    if (!expanded) {
+        cbm_log_info("incremental.frontier.fallback", "reason", "alloc", "scope",
+                     "objectscript_macro_context");
+        return CBM_STORE_NOT_FOUND;
+    }
+    int expanded_count = cls->changed_file_count;
+    for (int i = 0; i < cls->changed_file_count; i++) {
+        expanded[i] = cls->changed_files[i];
+    }
+    for (int i = 0; i < all_file_count; i++) {
+        if (!cls->is_changed[i] &&
+            incr_language_uses_objectscript_macros(all_files[i].language)) {
+            expanded[expanded_count++] = all_files[i];
+            cls->is_changed[i] = true;
+        }
+    }
+    if (expanded_count == cls->changed_file_count) {
+        free(expanded);
+        return CBM_STORE_OK;
+    }
+
+    cbm_log_info("incremental.frontier", "reason", "objectscript_macro_context", "changed",
+                 itoa_buf_incr(cls->changed_file_count), "expanded",
+                 itoa_buf_incr(expanded_count));
+    cls->n_unchanged -= expanded_count - cls->changed_file_count;
+    free(cls->changed_files);
+    cls->changed_files = expanded;
+    cls->changed_file_count = expanded_count;
+    cls->n_changed = expanded_count;
+    return CBM_STORE_OK;
+}
+
 /* ── Inbound cross-file edge preservation (incremental correctness) ──
  *
  * The purge step (cbm_gbuf_delete_by_file) removes a changed file's nodes,
@@ -1179,9 +1252,7 @@ static int run_extract_resolve_inner(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *c
 
 static bool incr_changed_uses_objectscript(const cbm_file_info_t *files, int count) {
     for (int i = 0; files && i < count; i++) {
-        CBMLanguage lang = files[i].language;
-        if (lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE ||
-            lang == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+        if (incr_language_uses_objectscript_macros(files[i].language)) {
             return true;
         }
     }
@@ -2828,6 +2899,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         cbm_store_close(store);
         CBM_PROF_END_N("incremental", "TOTAL", t0, file_count);
         return 0;
+    }
+
+    if (incr_expand_objectscript_macro_consumers(files, file_count, &cls) != CBM_STORE_OK) {
+        incr_classification_free(&cls);
+        cbm_store_free_file_hashes(stored, stored_count);
+        cbm_store_close(store);
+        return CBM_NOT_FOUND;
     }
 
     if (incr_mark_dirty_classification(store, project, &cls) != CBM_STORE_OK) {
