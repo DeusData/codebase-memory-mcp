@@ -906,6 +906,17 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             required_pair_stage_missed = True
             break
     quality_target_missed = oracle_target_missed or required_pair_stage_missed
+    result_oracle_failed = any(
+        isinstance((case_oracles := case.get("oracles")), dict)
+        and any(
+            isinstance(oracle, dict)
+            and isinstance((quality := oracle.get("quality")), dict)
+            and quality.get("passed") is False
+            for name, oracle in case_oracles.items()
+            if name != "quality"
+        )
+        for case in cases
+    )
     missed_oracle_count = sum(1 for value in oracles if not value)
     explicit_ablation_miss = (
         bool(quality_miss_ablation_states)
@@ -927,10 +938,18 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         for detail in pair_quality_details
         if detail.get("capability_state") != "disabled"
     )
+    cleanup_failed = any(
+        isinstance((cleanup := report.get("cleanup")), dict)
+        and cleanup.get("requested") is True
+        and cleanup.get("removed") is not True
+        for report in reports
+    )
     if canonical_failed:
         decision = "REJECT: graph correctness"
     elif freshness_policy_failed:
         decision = "REJECT: freshness policy"
+    elif cleanup_failed:
+        decision = "REJECT: lifecycle cleanup"
     elif quality_target_missed and (capability_quality or explicit_ablation_miss):
         decision = "BELOW QUALITY TARGET"
     elif quality_target_missed:
@@ -1091,6 +1110,32 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     return {
         "candidate": label,
         "decision": decision,
+        "graph_error": (
+            "**GRAPH ERROR**"
+            if canonical_failed
+            else "**FRESHNESS ERROR**"
+            if freshness_policy_failed
+            else "none"
+        ),
+        "result_error": (
+            "**QUALITY TARGET MISS**"
+            if quality_target_missed and (capability_quality or explicit_ablation_miss)
+            else "**RESULT ERROR**"
+            if quality_target_missed or result_oracle_failed
+            else "none"
+        ),
+        "run_error": (
+            "**CLEANUP ERROR**"
+            if cleanup_failed
+            else "**PROCESSING ERROR**"
+            if case_passes
+            and not all(case_passes)
+            and not canonical_failed
+            and not (quality_target_missed or result_oracle_failed)
+            else "**EVIDENCE ERROR**"
+            if not cases
+            else "none"
+        ),
         "cases": ratio(sum(case_passes), len(case_passes)),
         "canonical": ratio(sum(canonical), len(canonical)),
         "core_graph": ratio(sum(core_graph), len(core_graph)),
@@ -1820,11 +1865,12 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         "# Codebase Memory performance and quality summary",
         "",
         "| Candidate | Decision | Overall quality† | Retrieval MRR | Pair F1 | Hit@1 | Hit@5 | nDCG@5 | "
-        "Core graph | Full graph freshness | Task success | Evidence counts (R/Core/Full/S) | "
+        "Core graph | Full graph freshness | Task success | Graph error | "
+        "Result / quality error | Run / lifecycle error | Evidence counts (R/Core/Full/S) | "
         "Response p50 bytes | Response p50 tokens* | Cold/default query p50 ms | "
         "Repeated JSON query p50 ms | Incremental p50 ms | "
         "Peak RSS MB | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -1842,6 +1888,9 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     display(row["core_graph_fidelity_score"], 3),
                     display(row["graph_fidelity_score"], 3),
                     display(row["task_success_score"], 3),
+                    display(row["graph_error"]),
+                    display(row["result_error"]),
+                    display(row["run_error"]),
                     display(
                         f"{row['quality_checks']} / {row['core_graph']} / "
                         f"{row['canonical']} / {row['oracles']}"
