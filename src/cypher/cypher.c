@@ -1836,23 +1836,33 @@ static void parse_unwind_clause(parser_t *p, cbm_query_t *q) {
         advance(p);
         char buf[CBM_SZ_2K] = "[";
         int blen = SKIP_ONE;
+        /* snprintf returns the length it WOULD have written, so a single
+         * oversized token (string literals lex up to CBM_SZ_4K-1) can push
+         * blen past sizeof(buf). Clamp after every write and guard the raw
+         * buf[blen++] stores, mirroring format_collect_list(). */
+        const int cap = (int)sizeof(buf);
         while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-            if (blen > SKIP_ONE) {
+            if (blen > SKIP_ONE && blen < cap - SKIP_ONE) {
                 buf[blen++] = ',';
             }
             if (check(p, TOK_STRING)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "\"%s\"", peek(p)->text);
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "\"%s\"", peek(p)->text);
                 advance(p);
             } else if (check(p, TOK_NUMBER)) {
-                blen += snprintf(buf + blen, sizeof(buf) - blen, "%s", peek(p)->text);
+                blen += snprintf(buf + blen, (size_t)(cap - blen), "%s", peek(p)->text);
                 advance(p);
             } else {
                 advance(p);
             }
+            if (blen >= cap) {
+                blen = cap - SKIP_ONE;
+            }
             match(p, TOK_COMMA);
         }
         expect(p, TOK_RBRACKET);
-        buf[blen++] = ']';
+        if (blen < cap - SKIP_ONE) {
+            buf[blen++] = ']';
+        }
         buf[blen] = '\0';
         q->unwind_expr = heap_strdup(buf);
     } else if (check(p, TOK_IDENT)) {

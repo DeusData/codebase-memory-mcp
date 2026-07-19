@@ -2762,6 +2762,51 @@ TEST(cypher_parse_unwind_var) {
     PASS();
 }
 
+/* Regression: an UNWIND literal list whose element is longer than the 2KB
+ * assembly buffer used to overflow the stack. snprintf reports the length it
+ * WOULD have written, so blen ran past sizeof(buf) and the trailing
+ * buf[blen++]=']' / buf[blen]='\0' wrote out of bounds (ASan: stack-buffer-
+ * overflow). The query text is agent-controlled via the MCP query tool. */
+TEST(cypher_parse_unwind_oversized_literal_no_overflow) {
+    char query[4096];
+    char big[3000];
+    memset(big, 'a', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    snprintf(query, sizeof(query), "UNWIND [\"%s\"] AS x MATCH (f) RETURN f.name", big);
+
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(query, &q, &err);
+    /* Must not crash and must produce a NUL-terminated, in-bounds expression. */
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->unwind_expr);
+    ASSERT_STR_EQ(q->unwind_alias, "x");
+    cbm_query_free(q);
+    PASS();
+}
+
+/* Regression: many oversized elements accumulate blen well past the buffer,
+ * which also underflowed the (size_t)(cap - blen) length passed to snprintf. */
+TEST(cypher_parse_unwind_many_elements_no_overflow) {
+    /* 200 elements (~20 chars each) accumulate well past the 2KB assembly
+     * buffer, which also underflowed the (size_t)(cap - blen) length. */
+    char query[8192];
+    int off = snprintf(query, sizeof(query), "UNWIND [");
+    for (int i = 0; i < 200; i++) {
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "%s\"element_value_%d\"",
+                        i ? "," : "", i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, "] AS x MATCH (f) RETURN f.name");
+
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse(query, &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q->unwind_expr);
+    cbm_query_free(q);
+    PASS();
+}
+
 /* ── Issue #389 group: Cypher feature reproductions ─────────────────
  * Each asserts the CORRECT behavior; a failure reproduces the bug. */
 
@@ -3218,6 +3263,8 @@ SUITE(cypher) {
     /* Phase 9: UNWIND */
     RUN_TEST(cypher_parse_unwind);
     RUN_TEST(cypher_parse_unwind_var);
+    RUN_TEST(cypher_parse_unwind_oversized_literal_no_overflow);
+    RUN_TEST(cypher_parse_unwind_many_elements_no_overflow);
     RUN_TEST(cypher_wide_return_projection_bounded);
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);
