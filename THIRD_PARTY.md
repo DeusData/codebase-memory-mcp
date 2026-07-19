@@ -59,6 +59,15 @@ License summary:
   original upstream authors' licenses — see the manifest for per-grammar
   provenance.
 
+### tree-sitter-vb-dotnet (VB.NET)
+
+- **Project:** [CodeAnt-AI/tree-sitter-vb-dotnet](https://github.com/CodeAnt-AI/tree-sitter-vb-dotnet)
+- **License:** MIT (declared in upstream `package.json`/`tree-sitter.json`; upstream ships no LICENSE file at the pinned commit — the vendored copy carries the standard MIT text for the declared license, per the `move`/`zsh` convention in the grammar manifest)
+- **Copyright:** (c) CodeAnt AI
+- **Vendored at:** `internal/cbm/vendored/grammars/vb_dotnet/`
+- **Pinned commit:** `cfca210`
+- **Notes:** The only tree-sitter grammar targeting VB.NET specifically (not VBA/VB6). Vendor-maintained; not in nvim-treesitter or Helix registries. No external scanner. `parser.c` is regenerated from a locally patched `grammar.js` (upstream at the pinned commit cannot parse next-line `Inherits`/`Implements`, `Handles` clauses, `AddHandler`/`RemoveHandler`/`RaiseEvent` statements, `As New`, member-level `#Region`, nested types, or attribute `_`-continuations). Local diff: `vb_dotnet/grammar.js.patch`; see MANIFEST.md for the re-vendor procedure.
+
 ### tree-sitter-objectscript (UDL + routine)
 
 - **Project:** [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript)
