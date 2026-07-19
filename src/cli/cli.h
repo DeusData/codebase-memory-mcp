@@ -334,6 +334,7 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 #define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
 #define CBM_CONFIG_TOOL_MODE "tool_mode"
+#define CBM_CONFIG_DEFAULT_RESPONSE_FORMAT "default_response_format"
 #define CBM_DEFAULT_QUERY_MAX_ROWS 100000
 #define CBM_DEFAULT_QUERY_MAX_ROWS_STR "100000"
 

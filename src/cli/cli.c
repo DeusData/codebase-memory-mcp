@@ -3218,6 +3218,11 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value) {
     if (!cfg || !key || !value) {
         return CLI_ERR;
     }
+    if (strcmp(key, CBM_CONFIG_DEFAULT_RESPONSE_FORMAT) == 0 &&
+        strcmp(value, CBM_MCP_OUTPUT_FORMAT_TOON) != 0 &&
+        strcmp(value, CBM_MCP_OUTPUT_FORMAT_JSON) != 0) {
+        return CLI_ERR;
+    }
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(cfg->db, "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -3512,6 +3517,13 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "list_projects, detect_changes, manage_adr, etc. "
      "You can also enable individual classic tools without switching modes: "
      "config set tool_index_repository true"},
+    {CBM_CONFIG_DEFAULT_RESPONSE_FORMAT, CBM_MCP_OUTPUT_FORMAT_TOON,
+     "CBM_DEFAULT_RESPONSE_FORMAT", "Tools",
+     "Default response encoding when a tool call omits format",
+     CBM_MCP_OUTPUT_FORMAT_TOON "|" CBM_MCP_OUTPUT_FORMAT_JSON,
+     "toon (default) returns compact tables across supported read tools. json preserves complete "
+     "object/array responses for programmatic and compatibility workflows. An explicit per-call "
+     "format always overrides this default."},
     {"context_injection", "true", "CBM_CONTEXT_INJECTION", "Tools",
      "Inject codebase schema and stats into the first tool response so the AI starts informed",
      "true|false",
