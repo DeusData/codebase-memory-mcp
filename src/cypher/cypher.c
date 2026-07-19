@@ -1606,7 +1606,9 @@ static int parse_return_item(parser_t *p, cbm_return_item_t *item) {
     return 0;
 }
 
-/* Parse ORDER BY field into r->order_by and r->order_dir */
+static void free_return_clause(cbm_return_clause_t *r);
+
+/* Parse one ORDER BY expression. */
 /* Parse aggregate function call for ORDER BY */
 static void parse_order_by_agg(parser_t *p, char *buf, size_t buf_sz) {
     const char *fn = agg_func_name(peek(p)->type);
@@ -1647,16 +1649,73 @@ static char *parse_order_by_expr(parser_t *p, char *buf, size_t buf_sz) {
     return buf;
 }
 
-static void parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
-    expect(p, TOK_BY);
-    char order_buf[CBM_SZ_256];
-    parse_order_by_expr(p, order_buf, sizeof(order_buf));
-    r->order_by = heap_strdup(order_buf);
-    if (match(p, TOK_ASC)) {
-        r->order_dir = heap_strdup("ASC");
-    } else if (match(p, TOK_DESC)) {
-        r->order_dir = heap_strdup("DESC");
+static int parse_order_by_clause(parser_t *p, cbm_return_clause_t *r) {
+    if (!expect(p, TOK_BY)) {
+        return CBM_NOT_FOUND;
     }
+    do {
+        if (r->order_count >= CBM_SZ_32) {
+            snprintf(p->error, sizeof(p->error), "ORDER BY supports at most %d expressions",
+                     CBM_SZ_32);
+            return CBM_NOT_FOUND;
+        }
+        if (r->order_count > 0 && !match(p, TOK_COMMA)) {
+            break;
+        }
+        char order_buf[CBM_SZ_256] = "";
+        parse_order_by_expr(p, order_buf, sizeof(order_buf));
+        if (!order_buf[0]) {
+            snprintf(p->error, sizeof(p->error), "expected ORDER BY expression");
+            return CBM_NOT_FOUND;
+        }
+        r->order_items = safe_realloc(r->order_items, (size_t)(r->order_count + SKIP_ONE) *
+                                                          sizeof(cbm_order_item_t));
+        cbm_order_item_t *item = &r->order_items[r->order_count++];
+        item->expression = heap_strdup(order_buf);
+        item->direction = NULL;
+        if (match(p, TOK_ASC)) {
+            item->direction = heap_strdup("ASC");
+        } else if (match(p, TOK_DESC)) {
+            item->direction = heap_strdup("DESC");
+        }
+    } while (check(p, TOK_COMMA));
+    return 0;
+}
+
+static bool order_expression_is_projected(const cbm_return_clause_t *r, const char *expression,
+                                          bool is_with) {
+    if (r->star) {
+        return true;
+    }
+    for (int i = 0; i < r->count; i++) {
+        const cbm_return_item_t *item = &r->items[i];
+        if (item->alias && strcmp(item->alias, expression) == 0) {
+            return true;
+        }
+        if (is_with && !item->func && !item->kase && !item->property) {
+            const char *node_name = item->alias ? item->alias : item->variable;
+            size_t node_len = node_name ? strlen(node_name) : 0;
+            if (node_len > 0 && strncmp(expression, node_name, node_len) == 0 &&
+                expression[node_len] == '.') {
+                return true;
+            }
+        }
+        char projected[CBM_SZ_256] = "";
+        if (item->func) {
+            snprintf(projected, sizeof(projected), "%s(%s)", item->func,
+                     item->variable ? item->variable : "");
+        } else if (item->kase) {
+            snprintf(projected, sizeof(projected), "CASE");
+        } else if (item->property) {
+            snprintf(projected, sizeof(projected), "%s.%s", item->variable, item->property);
+        } else if (item->variable) {
+            snprintf(projected, sizeof(projected), "%s", item->variable);
+        }
+        if (strcmp(projected, expression) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /* Parse RETURN/WITH clause (shared logic) */
@@ -1718,7 +1777,20 @@ static int parse_return_or_with(parser_t *p, cbm_return_clause_t **out, bool is_
 tail:
     /* Optional ORDER BY */
     if (match(p, TOK_ORDER)) {
-        parse_order_by_clause(p, r);
+        if (parse_order_by_clause(p, r) < 0) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
+        }
+        for (int i = 0; i < r->order_count; i++) {
+            if (!order_expression_is_projected(r, r->order_items[i].expression, is_with)) {
+                snprintf(p->error, sizeof(p->error),
+                         "ORDER BY expression '%s' is not projected; add it to %s or assign an "
+                         "alias and order by that alias",
+                         r->order_items[i].expression, is_with ? "WITH" : "RETURN");
+                free_return_clause(r);
+                return CBM_NOT_FOUND;
+            }
+        }
     }
 
     /* Optional SKIP */
@@ -1844,6 +1916,25 @@ static int parse_match_chain(parser_t *p, cbm_query_t *q, int *pat_cap) {
     return 0;
 }
 
+/* Parse a complete query from the current token through EOF and transfer its
+ * ownership to the caller. Both WITH stage chaining and UNION use this path so
+ * recursive cursor/error ownership cannot drift between the two constructs. */
+static int parse_query_remainder(parser_t *p, cbm_query_t **out) { // NOLINT(misc-no-recursion)
+    cbm_parse_result_t sub = {0};
+    if (cbm_parse(&p->tokens[p->pos], p->count - p->pos, &sub) < 0) {
+        if (sub.error) {
+            snprintf(p->error, sizeof(p->error), "%s", sub.error);
+        }
+        cbm_parse_free(&sub);
+        return CBM_NOT_FOUND;
+    }
+    *out = sub.query;
+    sub.query = NULL;
+    cbm_parse_free(&sub);
+    p->pos = p->count - SKIP_ONE;
+    return 0;
+}
+
 /* Parse post-WHERE clauses: additional MATCH, WITH, RETURN, UNION */
 static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recursion)
                             int *pat_cap) {
@@ -1866,6 +1957,29 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
         if (parse_where(p, &q->post_with_where) < 0) {
             return CBM_NOT_FOUND;
         }
+        /* WITH is a scope and cardinality boundary. Parse the following MATCH
+         * part as its own query stage so execution consumes the projected rows
+         * instead of rescanning the graph or retaining de-scoped variables. */
+        if (check(p, TOK_MATCH) || check(p, TOK_OPTIONAL)) {
+            if (parse_query_remainder(p, &q->next_stage) < 0) {
+                return CBM_NOT_FOUND;
+            }
+            /* UNION separates complete queries, not WITH stages. The recursive
+             * parser initially encounters it at the terminal stage; promote
+             * ownership to this query root so the existing UNION executor and
+             * destructor consume every branch exactly once. */
+            cbm_query_t *terminal = q->next_stage;
+            while (terminal->next_stage) {
+                terminal = terminal->next_stage;
+            }
+            if (terminal->union_next) {
+                q->union_next = terminal->union_next;
+                q->union_all = terminal->union_all;
+                terminal->union_next = NULL;
+                terminal->union_all = false;
+            }
+            return 0;
+        }
     }
     /* Optional RETURN */
     if (parse_return(p, &q->ret) < 0) {
@@ -1875,19 +1989,9 @@ static int parse_post_where(parser_t *p, cbm_query_t *q, // NOLINT(misc-no-recur
     if (check(p, TOK_UNION)) {
         advance(p);
         q->union_all = match(p, TOK_ALL);
-        cbm_parse_result_t sub = {0};
-        if (cbm_parse(&p->tokens[p->pos], p->count - p->pos, &sub) < 0) {
-            if (sub.error) {
-                snprintf(p->error, sizeof(p->error), "%s", sub.error);
-            }
-            cbm_parse_free(&sub);
+        if (parse_query_remainder(p, &q->union_next) < 0) {
             return CBM_NOT_FOUND;
         }
-        q->union_next = sub.query;
-        sub.query = NULL;
-        cbm_parse_free(&sub);
-        /* The recursive parser owns and validates the complete UNION tail. */
-        p->pos = p->count - SKIP_ONE;
     }
     return 0;
 }
@@ -2054,27 +2158,35 @@ static void free_return_clause(cbm_return_clause_t *r) {
         free(r->items[i].args);
     }
     free(r->items);
-    safe_str_free(&r->order_by);
-    safe_str_free(&r->order_dir);
+    for (int i = 0; i < r->order_count; i++) {
+        safe_str_free(&r->order_items[i].expression);
+        safe_str_free(&r->order_items[i].direction);
+    }
+    free(r->order_items);
     free(r);
 }
 
 void cbm_query_free(cbm_query_t *q) {
     while (q) {
-        cbm_query_t *next = q->union_next;
-        for (int i = 0; i < q->pattern_count; i++) {
-            free_pattern(&q->patterns[i]);
+        cbm_query_t *next_union = q->union_next;
+        cbm_query_t *stage = q;
+        while (stage) {
+            cbm_query_t *next_stage = stage->next_stage;
+            for (int i = 0; i < stage->pattern_count; i++) {
+                free_pattern(&stage->patterns[i]);
+            }
+            free(stage->patterns);
+            free(stage->pattern_optional);
+            free_where(stage->where);
+            free_where(stage->post_with_where);
+            free_return_clause(stage->with_clause);
+            free_return_clause(stage->ret);
+            safe_str_free(&stage->unwind_expr);
+            safe_str_free(&stage->unwind_alias);
+            free(stage);
+            stage = next_stage;
         }
-        free(q->patterns);
-        free(q->pattern_optional);
-        free_where(q->where);
-        free_where(q->post_with_where);
-        free_return_clause(q->with_clause);
-        free_return_clause(q->ret);
-        safe_str_free(&q->unwind_expr);
-        safe_str_free(&q->unwind_alias);
-        free(q);
-        q = next;
+        q = next_union;
     }
 }
 
@@ -2122,6 +2234,52 @@ typedef struct {
     const char *project; /* borrowed project filter for active overlay qn-keyed lookups */
     bool use_active_overlay_edges;
 } binding_t;
+
+static void binding_free(binding_t *b);
+
+/* Per-execution state: query execution is re-entrant across server threads,
+ * while a ceiling hit must never be reported by another request. */
+static _Thread_local int g_cypher_row_ceiling_hit = 0;
+
+/* Grow an owning binding array without losing the existing rows on OOM.
+ * The caller retains and frees the old allocation when growth fails. */
+static bool binding_array_reserve(binding_t **rows, int *capacity, int needed, int limit) {
+    if (needed <= *capacity) {
+        return true;
+    }
+    int next = *capacity > 0 ? *capacity : CYP_INIT_CAP8;
+    while (next < needed && next < limit) {
+        next = next > limit / PAIR_LEN ? limit : next * PAIR_LEN;
+    }
+    if (next < needed) {
+        return false;
+    }
+    void *grown = realloc(*rows, (size_t)next * sizeof(**rows));
+    if (!grown) {
+        return false;
+    }
+    *rows = grown;
+    *capacity = next;
+    return true;
+}
+
+/* Move one owned binding into a ceiling-bounded geometric array. On failure,
+ * release the row here so every caller has the same ownership contract. */
+static bool binding_array_append(binding_t **rows, int *count, int *capacity, int limit,
+                                 binding_t *row) {
+    if (*count >= limit) {
+        g_cypher_row_ceiling_hit = limit;
+        binding_free(row);
+        return false;
+    }
+    if (!binding_array_reserve(rows, capacity, *count + SKIP_ONE, limit)) {
+        binding_free(row);
+        return false;
+    }
+    (*rows)[(*count)++] = *row;
+    memset(row, 0, sizeof(*row));
+    return true;
+}
 
 /* Return a string field from a node by property name.  NULL-safe. */
 static const char *node_string_field(const cbm_node_t *n, const char *prop) {
@@ -2385,8 +2543,13 @@ static void binding_free(binding_t *b) {
 static void binding_copy(binding_t *dst, const binding_t *src) {
     dst->var_count = src->var_count;
     for (int i = 0; i < src->var_count; i++) {
-        dst->var_names[i] = src->var_names[i]; /* AST-owned, not freed */
+        /* Ordinary names are AST-borrowed. WITH virtual names instead alias
+         * the projected node's owned qualified_name; after deep-copying that
+         * node the copied binding must point at its own allocation. */
+        bool name_owned_by_node = src->var_names[i] == src->var_nodes[i].qualified_name;
         node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
+        dst->var_names[i] =
+            name_owned_by_node ? dst->var_nodes[i].qualified_name : src->var_names[i];
     }
     dst->edge_var_count = src->edge_var_count;
     for (int i = 0; i < src->edge_var_count; i++) {
@@ -3052,8 +3215,9 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_
  * `inbound` controls which end of the edge is the target id. */
 static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count, bool inbound,
                           const cbm_node_pattern_t *target_node, binding_t *b, const char *to_var,
-                          const char *rel_var, binding_t *new_bindings, int *new_count, int max_new,
-                          int *match_count) {
+                          const char *rel_var, binding_t **new_bindings, int *new_count,
+                          int *new_capacity, int max_new, int *match_count,
+                          const cbm_where_clause_t *pattern_where) {
     /* When the terminal node variable is ALREADY bound (e.g. the second pattern
      * `(c)-[:CALLS]->(f)` where `f` came from an earlier MATCH), we must FILTER
      * to edges that actually reach the bound node — not overwrite the caller's
@@ -3085,16 +3249,22 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
             binding_set_edge(&nb, rel_var, &edges[ei]);
         }
         node_fields_free(&found);
-        new_bindings[(*new_count)++] = nb;
-        (*match_count)++;
+        if (pattern_where && !eval_where(pattern_where, &nb)) {
+            binding_free(&nb);
+            continue;
+        }
+        if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+            (*match_count)++;
+        }
     }
 }
 
 static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count,
                                       const cbm_node_pattern_t *target_node, binding_t *b,
                                       const char *to_var, const char *rel_var,
-                                      binding_t *new_bindings, int *new_count, int max_new,
-                                      int *match_count) {
+                                      binding_t **new_bindings, int *new_count, int *new_capacity,
+                                      int max_new, int *match_count,
+                                      const cbm_where_clause_t *pattern_where) {
     cbm_node_t *bound_to = binding_get(b, to_var);
     const char *bound_to_qn =
         bound_to && bound_to->qualified_name && bound_to->qualified_name[0]
@@ -3122,8 +3292,13 @@ static void process_active_edge_nodes(cbm_store_edge_node_t *rows, int row_count
         if (rel_var) {
             binding_set_edge(&nb, rel_var, &rows[ri].edge);
         }
-        new_bindings[(*new_count)++] = nb;
-        (*match_count)++;
+        if (pattern_where && !eval_where(pattern_where, &nb)) {
+            binding_free(&nb);
+            continue;
+        }
+        if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+            (*match_count)++;
+        }
     }
 }
 
@@ -3137,8 +3312,9 @@ static _Thread_local int g_cypher_depth_clamped = 0;
 
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                              const char *to_var, binding_t *new_bindings, int *new_count,
-                              int max_new, int *match_count) {
+                              const char *to_var, binding_t **new_bindings, int *new_count,
+                              int *new_capacity, int max_new, int *match_count,
+                              const cbm_where_clause_t *pattern_where) {
     /* Clamp BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms to the
      * engine ceiling: an explicit N above the cap was previously honoured
      * verbatim, driving cbm_store_bfs to an unbounded hop count (#887). WARN on
@@ -3180,8 +3356,13 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                 binding_t nb = {0};
                 binding_copy(&nb, b);
                 binding_set(&nb, to_var, &hop->node);
-                new_bindings[(*new_count)++] = nb;
-                (*match_count)++;
+                if (pattern_where && !eval_where(pattern_where, &nb)) {
+                    binding_free(&nb);
+                    continue;
+                }
+                if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+                    (*match_count)++;
+                }
             }
         }
         cbm_store_traverse_free(&tr);
@@ -3203,8 +3384,13 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         binding_t nb = {0};
         binding_copy(&nb, b);
         binding_set(&nb, to_var, &hop->node);
-        new_bindings[(*new_count)++] = nb;
-        (*match_count)++;
+        if (pattern_where && !eval_where(pattern_where, &nb)) {
+            binding_free(&nb);
+            continue;
+        }
+        if (binding_array_append(new_bindings, new_count, new_capacity, max_new, &nb)) {
+            (*match_count)++;
+        }
     }
     cbm_store_traverse_free(&tr);
 }
@@ -3212,8 +3398,9 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
 /* Expand fixed-length (1-hop) relationship edges */
 static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                 cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
-                                const char *to_var, binding_t *new_bindings, int *new_count,
-                                int max_new, int *match_count) {
+                                const char *to_var, binding_t **new_bindings, int *new_count,
+                                int *new_capacity, int max_new, int *match_count,
+                                const cbm_where_clause_t *pattern_where) {
     bool is_inbound = rel->direction && strcmp(rel->direction, "inbound") == 0;
     bool is_any = rel->direction && strcmp(rel->direction, "any") == 0;
     const char *rel_var = rel->variable;
@@ -3230,7 +3417,8 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                                    direction, &rows, &row_count) ==
             CBM_STORE_OK) {
             process_active_edge_nodes(rows, row_count, target_node, b, to_var, rel_var,
-                                      new_bindings, new_count, max_new, match_count);
+                                      new_bindings, new_count, new_capacity, max_new, match_count,
+                                      pattern_where);
         }
         cbm_store_free_edge_nodes(rows, row_count);
         return;
@@ -3248,7 +3436,8 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                                                     &edge_count);
             }
             process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, max_new, match_count);
+                          new_bindings, new_count, new_capacity, max_new, match_count,
+                          pattern_where);
             cbm_store_free_edges(edges, edge_count);
         }
         if (is_any) {
@@ -3258,7 +3447,8 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                 cbm_store_find_edges_by_target_type(store, src->id, rel->types[ti], &edges,
                                                     &edge_count);
                 process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
-                              new_bindings, new_count, max_new, match_count);
+                              new_bindings, new_count, new_capacity, max_new, match_count,
+                              pattern_where);
                 cbm_store_free_edges(edges, edge_count);
             }
         }
@@ -3271,22 +3461,23 @@ static void expand_fixed_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
             cbm_store_find_edges_by_source(store, src->id, &edges, &edge_count);
         }
         process_edges(store, edges, edge_count, is_inbound, target_node, b, to_var, rel_var,
-                      new_bindings, new_count, max_new, match_count);
+                      new_bindings, new_count, new_capacity, max_new, match_count, pattern_where);
         cbm_store_free_edges(edges, edge_count);
         if (is_any) {
             edges = NULL;
             edge_count = 0;
             cbm_store_find_edges_by_target(store, src->id, &edges, &edge_count);
             process_edges(store, edges, edge_count, true, target_node, b, to_var, rel_var,
-                          new_bindings, new_count, max_new, match_count);
+                          new_bindings, new_count, new_capacity, max_new, match_count,
+                          pattern_where);
             cbm_store_free_edges(edges, edge_count);
         }
     }
 }
 
 static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_t **bindings,
-                                int *bind_count, const int *bind_cap, const char **var_name,
-                                bool is_optional) {
+                                int *bind_count, const char **var_name, bool is_optional,
+                                const cbm_where_clause_t *pattern_where) {
     for (int ri = 0; ri < pat->rel_count; ri++) {
         cbm_rel_pattern_t *rel = &pat->rels[ri];
         cbm_node_pattern_t *target_node = &pat->nodes[ri + SKIP_ONE];
@@ -3294,8 +3485,12 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
-        size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + SKIP_ONE;
-        binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+        int max_new = CYPHER_RESULT_CEILING;
+        int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
+        if (new_capacity > max_new) {
+            new_capacity = max_new;
+        }
+        binding_t *new_bindings = malloc((size_t)new_capacity * sizeof(binding_t));
         if (!new_bindings) {
             return;
         }
@@ -3309,14 +3504,17 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
             }
 
             int match_count = 0;
+            const cbm_where_clause_t *candidate_where =
+                (ri == pat->rel_count - SKIP_ONE) ? pattern_where : NULL;
 
-            int max_new = *bind_cap * CYP_GROWTH_10;
             if (is_variable_length) {
-                expand_var_length(store, rel, target_node, b, src, to_var, new_bindings, &new_count,
-                                  max_new, &match_count);
+                expand_var_length(store, rel, target_node, b, src, to_var, &new_bindings,
+                                  &new_count, &new_capacity, max_new, &match_count,
+                                  candidate_where);
             } else {
-                expand_fixed_length(store, rel, target_node, b, src, to_var, new_bindings,
-                                    &new_count, max_new, &match_count);
+                expand_fixed_length(store, rel, target_node, b, src, to_var, &new_bindings,
+                                    &new_count, &new_capacity, max_new, &match_count,
+                                    candidate_where);
             }
 
             /* OPTIONAL MATCH: keep binding with empty target if no matches */
@@ -3324,7 +3522,7 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                 binding_t nb = {0};
                 binding_copy(&nb, b);
                 /* Don't set to_var — it remains unbound; projection returns "" */
-                new_bindings[new_count++] = nb;
+                (void)binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb);
             }
         }
 
@@ -3342,14 +3540,15 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
 /* Find the column index for ORDER BY, checking both column names and aliases.
  * Returns -1 if not found. */
-static int rb_find_order_column(const result_builder_t *rb, const cbm_return_clause_t *ret) {
+static int rb_find_order_column(const result_builder_t *rb, const cbm_return_clause_t *ret,
+                                const char *expression) {
     for (int ci = 0; ci < rb->col_count; ci++) {
-        if (strcmp(rb->columns[ci], ret->order_by) == 0) {
+        if (strcmp(rb->columns[ci], expression) == 0) {
             return ci;
         }
     }
     for (int ci = 0; ci < ret->count; ci++) {
-        if (ret->items[ci].alias && strcmp(ret->items[ci].alias, ret->order_by) == 0) {
+        if (ret->items[ci].alias && strcmp(ret->items[ci].alias, expression) == 0) {
             return ci;
         }
     }
@@ -3358,51 +3557,109 @@ static int rb_find_order_column(const result_builder_t *rb, const cbm_return_cla
 
 /* Check whether a column contains numeric data by examining the first non-empty value */
 static bool rb_is_numeric_column(const result_builder_t *rb, int col) {
+    bool saw_value = false;
     for (int i = 0; i < rb->row_count; i++) {
         const char *v = rb->rows[i][col];
         if (v && *v) {
-            const char *p2 = (*v == '-') ? v + SKIP_ONE : v;
-            if (*p2 == '\0') {
+            char *end = NULL;
+            (void)strtod(v, &end);
+            if (end == v || *end != '\0') {
                 return false;
             }
-            for (; *p2; p2++) {
-                if (*p2 < '0' || *p2 > '9') {
-                    return false;
-                }
-            }
-            return true;
+            saw_value = true;
         }
     }
-    return false;
+    return saw_value;
+}
+
+static int rb_compare_ordered_rows(const char **a, const char **b, const int *columns,
+                                   const bool *numeric, const bool *descending, int key_count) {
+    for (int key = 0; key < key_count; key++) {
+        const char *av = a[columns[key]] ? a[columns[key]] : "";
+        const char *bv = b[columns[key]] ? b[columns[key]] : "";
+        bool a_null = av[0] == '\0';
+        bool b_null = bv[0] == '\0';
+        int cmp = 0;
+        if (a_null != b_null) {
+            cmp = a_null ? 1 : -1; /* null sorts last ascending */
+        } else if (!a_null && numeric[key]) {
+            double da = strtod(av, NULL);
+            double db = strtod(bv, NULL);
+            cmp = (da > db) - (da < db);
+        } else if (!a_null) {
+            cmp = strcmp(av, bv);
+        }
+        if (cmp != 0) {
+            return descending[key] ? -cmp : cmp;
+        }
+    }
+    return 0;
 }
 
 static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *ret) {
-    if (!ret->order_by) {
+    if (ret->order_count <= 0 || rb->row_count < PAIR_LEN) {
         return;
     }
-    int order_col = rb_find_order_column(rb, ret);
-    if (order_col < 0) {
+    int columns[CBM_SZ_32];
+    bool numeric[CBM_SZ_32];
+    bool descending[CBM_SZ_32];
+    int key_count = 0;
+    for (int i = 0; i < ret->order_count; i++) {
+        int col = rb_find_order_column(rb, ret, ret->order_items[i].expression);
+        if (col < 0) {
+            continue;
+        }
+        columns[key_count] = col;
+        numeric[key_count] = rb_is_numeric_column(rb, col);
+        descending[key_count] =
+            ret->order_items[i].direction && strcmp(ret->order_items[i].direction, "DESC") == 0;
+        key_count++;
+    }
+    if (key_count == 0) {
         return;
     }
 
-    bool desc = ret->order_dir && strcmp(ret->order_dir, "DESC") == 0;
-    bool numeric = rb_is_numeric_column(rb, order_col);
-    for (int i = 0; i < rb->row_count - SKIP_ONE; i++) {
-        for (int j = 0; j < rb->row_count - i - SKIP_ONE; j++) {
-            int cmp;
-            if (numeric) {
-                cmp = (int)strtol(rb->rows[j][order_col], NULL, CBM_DECIMAL_BASE) -
-                      (int)strtol(rb->rows[j + SKIP_ONE][order_col], NULL, CBM_DECIMAL_BASE);
-            } else {
-                cmp = strcmp(rb->rows[j][order_col], rb->rows[j + SKIP_ONE][order_col]);
+    const char ***scratch = malloc((size_t)rb->row_count * sizeof(*scratch));
+    if (!scratch) {
+        return;
+    }
+    const char ***src = rb->rows;
+    const char ***dst = scratch;
+    for (int width = SKIP_ONE; width < rb->row_count;) {
+        for (int left = 0; left < rb->row_count; left += width * PAIR_LEN) {
+            int mid = left + width < rb->row_count ? left + width : rb->row_count;
+            int right =
+                left + width * PAIR_LEN < rb->row_count ? left + width * PAIR_LEN : rb->row_count;
+            int i = left;
+            int j = mid;
+            int out = left;
+            while (i < mid && j < right) {
+                if (rb_compare_ordered_rows(src[i], src[j], columns, numeric, descending,
+                                            key_count) <= 0) {
+                    dst[out++] = src[i++];
+                } else {
+                    dst[out++] = src[j++];
+                }
             }
-            if (desc ? cmp < 0 : cmp > 0) {
-                const char **tmp = rb->rows[j];
-                rb->rows[j] = rb->rows[j + SKIP_ONE];
-                rb->rows[j + SKIP_ONE] = tmp;
+            while (i < mid) {
+                dst[out++] = src[i++];
+            }
+            while (j < right) {
+                dst[out++] = src[j++];
             }
         }
+        const char ***swap = src;
+        src = dst;
+        dst = swap;
+        if (width > rb->row_count / PAIR_LEN) {
+            break;
+        }
+        width *= PAIR_LEN;
     }
+    if (src != rb->rows) {
+        memcpy(rb->rows, src, (size_t)rb->row_count * sizeof(*rb->rows));
+    }
+    free(scratch);
 }
 
 static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
@@ -3706,24 +3963,106 @@ static void distinct_list_add(char ***list, int *count, const char *val) {
     (*list)[idx] = heap_strdup(val);
 }
 
-/* Sort bindings by a virtual variable using bubble sort */
-static void sort_bindings(binding_t *vbindings, int count, const char *key, bool desc) {
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        for (int j = 0; j < count - i - SKIP_ONE; j++) {
-            const char *va = binding_get_virtual(&vbindings[j], key, NULL);
-            const char *vb2 = binding_get_virtual(&vbindings[j + SKIP_ONE], key, NULL);
-            char *ea = NULL;
-            char *eb = NULL;
-            double da = strtod(va, &ea);
-            double db = strtod(vb2, &eb);
-            int cmp = (ea != va && eb != vb2) ? ((da > db) - (da < db)) : strcmp(va, vb2);
-            if (desc ? cmp < 0 : cmp > 0) {
-                binding_t tmp = vbindings[j];
-                vbindings[j] = vbindings[j + SKIP_ONE];
-                vbindings[j + SKIP_ONE] = tmp;
-            }
+static int compare_ordered_bindings(binding_t *a, binding_t *b, const cbm_order_item_t *keys,
+                                    int key_count) {
+    for (int key = 0; key < key_count; key++) {
+        const char *av = binding_get_virtual(a, keys[key].expression, NULL);
+        const char *bv = binding_get_virtual(b, keys[key].expression, NULL);
+        av = av ? av : "";
+        bv = bv ? bv : "";
+        bool a_null = av[0] == '\0';
+        bool b_null = bv[0] == '\0';
+        int cmp = 0;
+        if (a_null != b_null) {
+            cmp = a_null ? 1 : -1;
+        } else if (!a_null) {
+            char *a_end = NULL;
+            char *b_end = NULL;
+            double da = strtod(av, &a_end);
+            double db = strtod(bv, &b_end);
+            bool both_numeric = a_end != av && *a_end == '\0' && b_end != bv && *b_end == '\0';
+            cmp = both_numeric ? ((da > db) - (da < db)) : strcmp(av, bv);
+        }
+        if (cmp != 0) {
+            bool desc = keys[key].direction && strcmp(keys[key].direction, "DESC") == 0;
+            return desc ? -cmp : cmp;
         }
     }
+    return 0;
+}
+
+/* Stable bottom-up merge sort over integer row indices: O(rows log rows)
+ * comparisons and O(rows) integers. Sorting full binding_t values in scratch
+ * would duplicate every owned node/edge slot and materially inflate peak RSS. */
+static void sort_bindings(binding_t *bindings, int count, const cbm_order_item_t *keys,
+                          int key_count) {
+    if (count < PAIR_LEN || key_count <= 0) {
+        return;
+    }
+    int *order = malloc((size_t)count * sizeof(*order));
+    int *scratch = malloc((size_t)count * sizeof(*scratch));
+    if (!order || !scratch) {
+        free(order);
+        free(scratch);
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        order[i] = i;
+    }
+    int *src = order;
+    int *dst = scratch;
+    for (int width = SKIP_ONE; width < count;) {
+        for (int left = 0; left < count; left += width * PAIR_LEN) {
+            int mid = left + width < count ? left + width : count;
+            int right = left + width * PAIR_LEN < count ? left + width * PAIR_LEN : count;
+            int i = left;
+            int j = mid;
+            int out = left;
+            while (i < mid && j < right) {
+                if (compare_ordered_bindings(&bindings[src[i]], &bindings[src[j]], keys,
+                                             key_count) <= 0) {
+                    dst[out++] = src[i++];
+                } else {
+                    dst[out++] = src[j++];
+                }
+            }
+            while (i < mid) {
+                dst[out++] = src[i++];
+            }
+            while (j < right) {
+                dst[out++] = src[j++];
+            }
+        }
+        int *swap = src;
+        src = dst;
+        dst = swap;
+        if (width > count / PAIR_LEN) {
+            break;
+        }
+        width *= PAIR_LEN;
+    }
+    if (src != order) {
+        memcpy(order, src, (size_t)count * sizeof(*order));
+    }
+
+    /* Convert destination->source order into source->destination, then apply
+     * permutation cycles in-place with one binding_t temporary per swap. */
+    for (int destination = 0; destination < count; destination++) {
+        scratch[order[destination]] = destination;
+    }
+    for (int source = 0; source < count; source++) {
+        while (scratch[source] != source) {
+            int destination = scratch[source];
+            binding_t moved = bindings[source];
+            bindings[source] = bindings[destination];
+            bindings[destination] = moved;
+            int mapped = scratch[source];
+            scratch[source] = scratch[destination];
+            scratch[destination] = mapped;
+        }
+    }
+    free(order);
+    free(scratch);
 }
 
 /* Apply skip and limit to a binding array, freeing discarded entries */
@@ -3750,10 +4089,7 @@ static void bindings_skip_limit(binding_t *vbindings, int *count, int skip, int 
 
 /* Sort, skip, and limit binding array in-place */
 static void with_sort_skip_limit(const cbm_return_clause_t *wc, binding_t *vbindings, int *vcount) {
-    if (wc->order_by) {
-        bool wdesc = wc->order_dir && strcmp(wc->order_dir, "DESC") == 0;
-        sort_bindings(vbindings, *vcount, wc->order_by, wdesc);
-    }
+    sort_bindings(vbindings, *vcount, wc->order_items, wc->order_count);
     bindings_skip_limit(vbindings, vcount, wc->skip, wc->limit);
 }
 
@@ -3942,6 +4278,9 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         /* Carry the store so node_prop can re-fetch a carried node's properties
          * (and compute in_degree/out_degree) on the projected virtual binding. */
         vb.store = (bind_count > 0) ? bindings[0].store : NULL;
+        vb.project = (bind_count > 0) ? bindings[0].project : NULL;
+        vb.use_active_overlay_edges =
+            (bind_count > 0) ? bindings[0].use_active_overlay_edges : false;
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
@@ -3973,6 +4312,8 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
     for (int bi = 0; bi < bind_count; bi++) {
         binding_t vb = {0};
         vb.store = bindings[bi].store; /* so node_prop can re-fetch / compute on the projection */
+        vb.project = bindings[bi].project;
+        vb.use_active_overlay_edges = bindings[bi].use_active_overlay_edges;
         for (int ci = 0; ci < wc->count; ci++) {
             char name_buf[CBM_SZ_256];
             const char *alias = resolve_item_alias(&wc->items[ci], name_buf, sizeof(name_buf));
@@ -3980,6 +4321,15 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
             const char *val =
                 project_item(&bindings[bi], &wc->items[ci], func_buf, sizeof(func_buf));
             with_add_vbinding_var(&vb, alias, val);
+            /* A whole-node projection must remain a node binding across the
+             * WITH boundary. Retain its canonical id so the next MATCH stage
+             * can traverse from it and node_prop can re-fetch complete fields. */
+            if (!wc->items[ci].func && !wc->items[ci].property && vb.var_count > 0) {
+                cbm_node_t *carried = binding_get(&bindings[bi], wc->items[ci].variable);
+                if (carried) {
+                    vb.var_nodes[vb.var_count - SKIP_ONE].id = carried->id;
+                }
+            }
         }
         vbindings[(*vcount)++] = vb;
     }
@@ -4408,7 +4758,7 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && !ret->order_by && ret->skip <= 0) {
+    if (ret->limit > 0 && !ret->distinct && ret->order_count == 0 && ret->skip <= 0) {
         proj_cap = ret->limit;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
@@ -4467,22 +4817,49 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
 
 /* Cross-join node-only pattern into existing bindings */
 static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
-                             int extra_count, const char *nvar, bool opt) {
-    binding_t *new_bindings = malloc(((*bind_count * extra_count) + SKIP_ONE) * sizeof(binding_t));
+                             int extra_count, const char *nvar, bool opt,
+                             const cbm_where_clause_t *pattern_where) {
+    /* Bound intermediate cardinality at the engine's public result ceiling.
+     * This avoids signed multiplication overflow and keeps memory O(ceiling)
+     * while still scanning rejected candidates until a qualifying row exists. */
+    int max_new = CYPHER_RESULT_CEILING;
+    int new_cap = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
+    if (new_cap > max_new) {
+        new_cap = max_new;
+    }
+    binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
+    if (!new_bindings) {
+        return;
+    }
     int new_count = 0;
-    for (int bi = 0; bi < *bind_count; bi++) {
-        for (int ni = 0; ni < extra_count; ni++) {
+    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
+        int match_count = 0;
+        for (int ni = 0; ni < extra_count && new_count < max_new; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
+            if (pattern_where && !eval_where(pattern_where, &nb)) {
+                binding_free(&nb);
+                continue;
+            }
+            if (!binding_array_reserve(&new_bindings, &new_cap, new_count + SKIP_ONE, max_new)) {
+                binding_free(&nb);
+                goto cross_join_nodes_done;
+            }
             new_bindings[new_count++] = nb;
+            match_count++;
         }
-        if (opt && extra_count == 0) {
+        if (opt && match_count == 0 && new_count < max_new) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
+            if (!binding_array_reserve(&new_bindings, &new_cap, new_count + SKIP_ONE, max_new)) {
+                binding_free(&nb);
+                goto cross_join_nodes_done;
+            }
             new_bindings[new_count++] = nb;
         }
     }
+cross_join_nodes_done:
     for (int bi = 0; bi < *bind_count; bi++) {
         binding_free(&(*bindings)[bi]);
     }
@@ -4494,40 +4871,53 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
 /* Cross-join pattern-with-rels into existing bindings */
 static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, binding_t **bindings,
                                  int *bind_count, cbm_node_t *extra_nodes, int extra_count,
-                                 const char *nvar, bool opt) {
-    /* size_t arithmetic: bind_count * extra_count can exceed INT_MAX on large
-     * graphs (e.g. an unbound `c` scanned against ~29 K `f` bindings), wrapping
-     * the int product negative and yielding a tiny/garbage malloc → heap OOB
-     * write → SIGSEGV/SIGABRT (#627). */
-    size_t alloc_n =
-        (size_t)*bind_count * (size_t)extra_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
-    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+                                 const char *nvar, bool opt,
+                                 const cbm_where_clause_t *pattern_where) {
+    int max_new = CYPHER_RESULT_CEILING;
+    int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
+    if (new_capacity > max_new) {
+        new_capacity = max_new;
+    }
+    binding_t *new_bindings = malloc((size_t)new_capacity * sizeof(binding_t));
     if (!new_bindings) {
         return;
     }
     int new_count = 0;
-    for (int bi = 0; bi < *bind_count; bi++) {
-        for (int ni = 0; ni < extra_count; ni++) {
+    for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
+        for (int ni = 0; ni < extra_count && new_count < max_new; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
-            binding_t *tmp = malloc(PAIR_LEN * sizeof(binding_t));
+            binding_t *tmp = malloc(sizeof(binding_t));
+            if (!tmp) {
+                binding_free(&nb);
+                goto cross_join_rels_done;
+            }
             tmp[0] = nb;
             int tc = SKIP_ONE;
-            int tcap = SKIP_ONE;
             const char *tv = nvar;
-            expand_pattern_rels(store, patn, &tmp, &tc, &tcap, &tv, opt);
+            expand_pattern_rels(store, patn, &tmp, &tc, &tv, opt, pattern_where);
             for (int ti = 0; ti < tc; ti++) {
-                new_bindings[new_count++] = tmp[ti];
+                if (!binding_array_append(&new_bindings, &new_count, &new_capacity, max_new,
+                                          &tmp[ti])) {
+                    for (int rest = ti + SKIP_ONE; rest < tc; rest++) {
+                        binding_free(&tmp[rest]);
+                    }
+                    free(tmp);
+                    goto cross_join_rels_done;
+                }
             }
             free(tmp);
         }
         if (opt && extra_count == 0) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
-            new_bindings[new_count++] = nb;
+            if (!binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb)) {
+                goto cross_join_rels_done;
+            }
         }
     }
+cross_join_rels_done:
     for (int bi = 0; bi < *bind_count; bi++) {
         binding_free(&(*bindings)[bi]);
     }
@@ -4548,7 +4938,7 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
  * none — the correct dead-code semantics. */
 static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                                        binding_t **bindings, int *bind_count, const char *start_var,
-                                       bool opt) {
+                                       bool opt, const cbm_where_clause_t *pattern_where) {
     cbm_rel_pattern_t *rel = &patn->rels[0];
     const cbm_node_pattern_t *start_node = &patn->nodes[0];
     /* The relationship is written start-[r]->terminal. To enumerate the start
@@ -4557,13 +4947,16 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     /* (start)->(term): start = edge source = scan terminal's inbound edges. */
     bool scan_targets = !rel_inbound;
 
-    size_t alloc_n = (size_t)*bind_count * (size_t)CYP_GROWTH_10 + SKIP_ONE;
-    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    int max_new = CYPHER_RESULT_CEILING;
+    int new_capacity = *bind_count > CYP_INIT_CAP8 ? *bind_count : CYP_INIT_CAP8;
+    if (new_capacity > max_new) {
+        new_capacity = max_new;
+    }
+    binding_t *new_bindings = malloc((size_t)new_capacity * sizeof(binding_t));
     if (!new_bindings) {
         return;
     }
     int new_count = 0;
-    int max_new = (int)alloc_n;
 
     for (int bi = 0; bi < *bind_count && new_count < max_new; bi++) {
         binding_t *b = &(*bindings)[bi];
@@ -4585,8 +4978,8 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                                                            rel->type_count, direction, &rows,
                                                            &row_count) == CBM_STORE_OK) {
                     process_active_edge_nodes(rows, row_count, start_node, b, start_var,
-                                              rel->variable, new_bindings, &new_count, max_new,
-                                              &match_count);
+                                              rel->variable, &new_bindings, &new_count,
+                                              &new_capacity, max_new, &match_count, pattern_where);
                 }
                 cbm_store_free_edge_nodes(rows, row_count);
             }
@@ -4631,8 +5024,14 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
                             binding_set_edge(&nb, rel->variable, &edges[ei]);
                         }
                         node_fields_free(&found);
-                        new_bindings[new_count++] = nb;
-                        match_count++;
+                        if (pattern_where && !eval_where(pattern_where, &nb)) {
+                            binding_free(&nb);
+                            continue;
+                        }
+                        if (binding_array_append(&new_bindings, &new_count, &new_capacity, max_new,
+                                                 &nb)) {
+                            match_count++;
+                        }
                     }
                     cbm_store_free_edges(edges, edge_count);
                 }
@@ -4643,7 +5042,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
              * `WHERE <start> IS NULL` correctly identifies the no-edge case. */
             binding_t nb = {0};
             binding_copy(&nb, b);
-            new_bindings[new_count++] = nb;
+            (void)binding_array_append(&new_bindings, &new_count, &new_capacity, max_new, &nb);
         }
     }
 
@@ -4655,19 +5054,24 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     *bind_count = new_count;
 }
 
-/* Expand additional MATCH patterns (pi >= 1) */
-static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
-                                       int max_rows, cypher_node_scan_mode_t scan_mode,
-                                       binding_t **bindings, int *bind_count, int *bind_cap) {
-    for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
+/* Expand MATCH patterns from an existing row stream. The initial query starts
+ * at pattern 1 because pattern 0 seeds that stream from a node scan; a stage
+ * after WITH starts at pattern 0 and consumes only the projected bindings. */
+static void expand_patterns_from(cbm_store_t *store, cbm_query_t *q, int first_pattern,
+                                 const char *project, int max_rows,
+                                 cypher_node_scan_mode_t scan_mode, binding_t **bindings,
+                                 int *bind_count, int *bind_cap) {
+    for (int pi = first_pattern; pi < q->pattern_count; pi++) {
         cbm_pattern_t *patn = &q->patterns[pi];
         bool opt = q->pattern_optional[pi];
+        const cbm_where_clause_t *pattern_where =
+            (pi == q->pattern_count - SKIP_ONE) ? q->where : NULL;
         const char *nvar = patn->nodes[0].variable ? patn->nodes[0].variable : "_n_extra";
         bool start_bound = *bind_count > 0 && binding_get(&(*bindings)[0], nvar) != NULL;
 
         if (start_bound && patn->rel_count > 0) {
             const char *tv = nvar;
-            expand_pattern_rels(store, patn, bindings, bind_count, bind_cap, &tv, opt);
+            expand_pattern_rels(store, patn, bindings, bind_count, &tv, opt, pattern_where);
             continue;
         }
 
@@ -4679,7 +5083,8 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
             const char *term_var = patn->nodes[1].variable;
             bool term_bound = term_var && binding_get(&(*bindings)[0], term_var) != NULL;
             if (term_bound) {
-                expand_from_bound_terminal(store, patn, bindings, bind_count, nvar, opt);
+                expand_from_bound_terminal(store, patn, bindings, bind_count, nvar, opt,
+                                           pattern_where);
                 continue;
             }
         }
@@ -4689,12 +5094,59 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
         scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], scan_mode, &extra_nodes,
                            &extra_count);
         if (patn->rel_count == 0) {
-            cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
+            cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt,
+                             pattern_where);
         } else {
             cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count, nvar,
-                                 opt);
+                                 opt, pattern_where);
         }
         cbm_store_free_nodes(extra_nodes, extra_count);
+    }
+}
+
+static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, binding_t *bindings,
+                                  int bind_count, int max_rows, result_builder_t *rb);
+
+static bool query_where_is_optional_pattern_predicate(const cbm_query_t *q) {
+    if (!q || !q->where || q->pattern_count <= 0) {
+        return false;
+    }
+    int last = q->pattern_count - SKIP_ONE;
+    return q->pattern_optional[last];
+}
+
+/* Execute a MATCH stage that consumes bindings projected by a preceding WITH.
+ * Ownership of the binding array remains with the outer execute_single call;
+ * expansion/projection helpers replace it only after freeing the prior rows. */
+static void execute_bound_stage(cbm_store_t *store, cbm_query_t *q, const char *project,
+                                int max_rows, cypher_node_scan_mode_t scan_mode,
+                                binding_t **bindings, int *bind_count, result_builder_t *rb) {
+    while (q) {
+        int bind_cap = *bind_count;
+        if (bind_cap < max_rows) {
+            bind_cap = max_rows;
+        }
+        if (bind_cap < SKIP_ONE) {
+            bind_cap = SKIP_ONE;
+        }
+
+        expand_patterns_from(store, q, 0, project, max_rows, scan_mode, bindings, bind_count,
+                             &bind_cap);
+        if (q->where && !query_where_is_optional_pattern_predicate(q)) {
+            filter_bindings_where(q->where, *bindings, bind_count);
+        }
+        execute_with_clause(q, bindings, bind_count);
+        if (!q->next_stage) {
+            break;
+        }
+        q = q->next_stage;
+    }
+
+    rb_init(rb);
+    if (q->ret) {
+        execute_return_clause(q, q->ret, *bindings, *bind_count, max_rows, rb);
+    } else {
+        execute_default_projection(&q->patterns[0], *bindings, *bind_count, max_rows, rb);
     }
 }
 
@@ -4757,16 +5209,29 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         }
     }
 
+    /* OPTIONAL MATCH over an empty or fully predicate-rejected initial scan
+     * still produces one null-extended row. Keep graph/project context on the
+     * synthetic binding so later stages use the same store and overlay mode. */
+    if (q->pattern_optional[0] && bind_count == 0) {
+        binding_t b = {0};
+        b.store = store;
+        b.project = project;
+        b.use_active_overlay_edges = scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY;
+        bindings[bind_count++] = b;
+    }
+
     /* Step 2: Expand first pattern's relationships */
-    expand_pattern_rels(store, pat0, &bindings, &bind_count, &bind_cap, &var_name,
-                        q->pattern_optional[0]);
+    const cbm_where_clause_t *first_pattern_where = q->pattern_count == SKIP_ONE ? q->where : NULL;
+    expand_pattern_rels(store, pat0, &bindings, &bind_count, &var_name, q->pattern_optional[0],
+                        first_pattern_where);
 
     /* Step 2b: Additional patterns */
-    expand_additional_patterns(store, q, project, max_rows, scan_mode, &bindings, &bind_count,
-                               &bind_cap);
+    expand_patterns_from(store, q, SKIP_ONE, project, max_rows, scan_mode, &bindings, &bind_count,
+                         &bind_cap);
 
     /* Step 3: Late WHERE */
-    if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
+    if (q->where && !query_where_is_optional_pattern_predicate(q) &&
+        (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
         filter_bindings_where(q->where, bindings, &bind_count);
     }
 
@@ -4774,11 +5239,16 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     execute_with_clause(q, &bindings, &bind_count);
 
     /* Step 4: Project results */
-    rb_init(rb);
-    if (q->ret) {
-        execute_return_clause(q, q->ret, bindings, bind_count, max_rows, rb);
+    if (q->next_stage) {
+        execute_bound_stage(store, q->next_stage, project, max_rows, scan_mode, &bindings,
+                            &bind_count, rb);
     } else {
-        execute_default_projection(pat0, bindings, bind_count, max_rows, rb);
+        rb_init(rb);
+        if (q->ret) {
+            execute_return_clause(q, q->ret, bindings, bind_count, max_rows, rb);
+        } else {
+            execute_default_projection(pat0, bindings, bind_count, max_rows, rb);
+        }
     }
 
     for (int bi = 0; bi < bind_count; bi++) {
@@ -4802,9 +5272,12 @@ static bool cypher_return_requires_canonical_identity(const cbm_return_clause_t 
     if (!ret) {
         return false;
     }
-    if (ret->order_by &&
-        (strstr(ret->order_by, ".in_degree") || strstr(ret->order_by, ".out_degree"))) {
-        return false;
+    for (int i = 0; i < ret->order_count; i++) {
+        const char *expression = ret->order_items[i].expression;
+        if (expression &&
+            (strstr(expression, ".in_degree") || strstr(expression, ".out_degree"))) {
+            return false;
+        }
     }
     for (int i = 0; i < ret->count; i++) {
         /* Overlay rows do not have stable canonical node/edge ids until
@@ -4835,17 +5308,19 @@ static bool cypher_pattern_supports_active_relationships(const cbm_pattern_t *pa
 }
 
 static bool cypher_query_supports_active_nodes(const cbm_query_t *q) {
-    for (const cbm_query_t *cur = q; cur; cur = cur->union_next) {
-        for (int pi = 0; pi < cur->pattern_count; pi++) {
-            if (!cypher_pattern_supports_active_relationships(&cur->patterns[pi])) {
+    for (const cbm_query_t *root = q; root; root = root->union_next) {
+        for (const cbm_query_t *stage = root; stage; stage = stage->next_stage) {
+            for (int pi = 0; pi < stage->pattern_count; pi++) {
+                if (!cypher_pattern_supports_active_relationships(&stage->patterns[pi])) {
+                    return false;
+                }
+            }
+            if (cypher_where_requires_canonical_identity(stage->where) ||
+                cypher_where_requires_canonical_identity(stage->post_with_where) ||
+                cypher_return_requires_canonical_identity(stage->with_clause) ||
+                cypher_return_requires_canonical_identity(stage->ret)) {
                 return false;
             }
-        }
-        if (cypher_where_requires_canonical_identity(cur->where) ||
-            cypher_where_requires_canonical_identity(cur->post_with_where) ||
-            cypher_return_requires_canonical_identity(cur->with_clause) ||
-            cypher_return_requires_canonical_identity(cur->ret)) {
-            return false;
         }
     }
     return true;
@@ -4861,6 +5336,7 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
         *used_active_nodes = false;
     }
     g_cypher_depth_clamped = 0;
+    g_cypher_row_ceiling_hit = 0;
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
     }
@@ -4913,7 +5389,7 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     }
 
     /* Check ceiling */
-    if (rb.row_count >= CYPHER_RESULT_CEILING) {
+    if (g_cypher_row_ceiling_hit > 0 || rb.row_count >= CYPHER_RESULT_CEILING) {
         rb_free(&rb);
         cbm_query_free(q);
         out->error = heap_strdup("result exceeded row ceiling; use narrower filters or add LIMIT");
