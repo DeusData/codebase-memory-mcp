@@ -36,6 +36,19 @@ enum {
 /* MCP-defined server error codes layered on JSON-RPC. */
 enum { CBM_MCP_RESOURCE_NOT_FOUND = -32002 };
 
+/* Canonical tool-response encodings. These select serialization only: Cypher
+ * syntax and graph-schema patterns remain content, never a third format.
+ * Keep the wire strings and enum together so handlers, config, CLI, and tests
+ * cannot drift; an explicit tool argument takes precedence over the configured
+ * default. */
+#define CBM_MCP_OUTPUT_FORMAT_TOON "toon"
+#define CBM_MCP_OUTPUT_FORMAT_JSON "json"
+typedef enum {
+    CBM_MCP_OUTPUT_TOON = 0,
+    CBM_MCP_OUTPUT_JSON,
+    CBM_MCP_OUTPUT_INVALID,
+} cbm_mcp_output_format_t;
+
 typedef struct {
     const char *jsonrpc;    /* "2.0" */
     const char *method;     /* e.g. "initialize", "tools/call" */
