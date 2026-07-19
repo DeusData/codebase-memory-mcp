@@ -14075,14 +14075,22 @@ TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild) {
  * .inc file. Incremental extraction must therefore use the same repository-wide
  * macro context as a fresh build, even when only the consuming .cls changed.
  * Return through one cleanup block so a red assertion never leaks its store. */
-static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
+typedef enum {
+    OBJECTSCRIPT_MACRO_CHANGE_CONSUMER,
+    OBJECTSCRIPT_MACRO_CHANGE_INCLUDE,
+    OBJECTSCRIPT_MACRO_DELETE_INCLUDE,
+} objectscript_macro_change_t;
+
+static int run_incremental_objectscript_macro_oracle(objectscript_macro_change_t change,
+                                                      char *err, size_t err_sz) {
     int rc = -1;
     cbm_config_t *cfg = NULL;
     cbm_pipeline_t *pipeline = NULL;
     cbm_store_t *store = NULL;
     char *project = NULL;
     bool initial_call = false;
-    bool incremental_call = false;
+    bool incremental_validate_call = false;
+    bool incremental_reject_call = false;
     char *created = th_mktempdir("cbm_incr_objectscript_macro");
     if (!created) {
         snprintf(err, err_sz, "ObjectScript fixture directory creation failed");
@@ -14121,9 +14129,13 @@ static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
         goto cleanup;
     }
 
-    if (th_write_file(include_path,
-                      "ROUTINE MyApp.Macros [Type=INC]\n"
-                      "#define MyCheck(%sc) ##class(MyApp.Utils).Validate(%sc)\n") != 0) {
+    const char *include_initial =
+        "ROUTINE MyApp.Macros [Type=INC]\n"
+        "#define MyCheck(%sc) ##class(MyApp.Utils).Validate(%sc)\n";
+    const char *include_updated =
+        "ROUTINE MyApp.Macros [Type=INC]\n"
+        "#define MyCheck(%sc) ##class(MyApp.Utils).Reject(%sc)\n";
+    if (th_write_file(include_path, include_initial) != 0) {
         snprintf(err, err_sz, "ObjectScript include write failed");
         goto cleanup;
     }
@@ -14131,6 +14143,10 @@ static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
                       "Class MyApp.Utils Extends %RegisteredObject\n"
                       "{\n"
                       "ClassMethod Validate(sc As %Status) As %Status\n"
+                      "{\n"
+                      "    Quit sc\n"
+                      "}\n"
+                      "ClassMethod Reject(sc As %Status) As %Status\n"
                       "{\n"
                       "    Quit sc\n"
                       "}\n"
@@ -14202,9 +14218,20 @@ static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
         goto cleanup;
     }
 
-    if (th_write_file(caller_path, caller_updated) != 0) {
-        snprintf(err, err_sz, "updated ObjectScript class write failed");
-        goto cleanup;
+    if (change == OBJECTSCRIPT_MACRO_DELETE_INCLUDE) {
+        if (cbm_unlink(include_path) != 0) {
+            snprintf(err, err_sz, "ObjectScript include deletion failed");
+            goto cleanup;
+        }
+    } else {
+        const char *changed_path =
+            change == OBJECTSCRIPT_MACRO_CHANGE_INCLUDE ? include_path : caller_path;
+        const char *changed_source =
+            change == OBJECTSCRIPT_MACRO_CHANGE_INCLUDE ? include_updated : caller_updated;
+        if (th_write_file(changed_path, changed_source) != 0) {
+            snprintf(err, err_sz, "updated ObjectScript fixture write failed");
+            goto cleanup;
+        }
     }
     pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
     if (!pipeline) {
@@ -14216,7 +14243,8 @@ static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
         snprintf(err, err_sz, "incremental ObjectScript publication failed");
         goto cleanup;
     }
-    if (cbm_pipeline_publish_kind(pipeline) != CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT) {
+    if (change == OBJECTSCRIPT_MACRO_CHANGE_CONSUMER &&
+        cbm_pipeline_publish_kind(pipeline) != CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT) {
         snprintf(err, err_sz, "ObjectScript publication kind=%d reason=%s, expected exact",
                  cbm_pipeline_publish_kind(pipeline),
                  cbm_pipeline_publish_reason(pipeline) ? cbm_pipeline_publish_reason(pipeline)
@@ -14231,12 +14259,25 @@ static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
         snprintf(err, err_sz, "incremental ObjectScript store open failed");
         goto cleanup;
     }
-    incremental_call = cross_file_call_exists(store, project, "Run", "Validate");
+    incremental_validate_call = cross_file_call_exists(store, project, "Run", "Validate");
+    incremental_reject_call = cross_file_call_exists(store, project, "Run", "Reject");
     cbm_store_close(store);
     store = NULL;
-    if (!incremental_call) {
+    if (change == OBJECTSCRIPT_MACRO_CHANGE_CONSUMER && !incremental_validate_call) {
         snprintf(err, err_sz,
                  "incremental ObjectScript extraction lost an unchanged .inc macro call");
+        goto cleanup;
+    }
+    if (change == OBJECTSCRIPT_MACRO_CHANGE_INCLUDE &&
+        (incremental_validate_call || !incremental_reject_call)) {
+        snprintf(err, err_sz,
+                 "changed ObjectScript .inc did not invalidate and re-extract its consumer");
+        goto cleanup;
+    }
+    if (change == OBJECTSCRIPT_MACRO_DELETE_INCLUDE &&
+        (incremental_validate_call || incremental_reject_call)) {
+        snprintf(err, err_sz,
+                 "deleted ObjectScript .inc did not invalidate and re-extract its consumer");
         goto cleanup;
     }
 
@@ -14267,8 +14308,27 @@ cleanup:
 
 TEST(incremental_objectscript_unchanged_include_macro_matches_fresh_rebuild) {
     char err[CBM_SZ_8K] = {0};
-    if (run_incremental_objectscript_macro_oracle(err, sizeof(err)) != 0) {
+    if (run_incremental_objectscript_macro_oracle(OBJECTSCRIPT_MACRO_CHANGE_CONSUMER, err,
+                                                  sizeof(err)) != 0) {
         FAIL(err[0] ? err : "ObjectScript incremental macro oracle failed");
+    }
+    PASS();
+}
+
+TEST(incremental_objectscript_changed_include_reextracts_consumers) {
+    char err[CBM_SZ_8K] = {0};
+    if (run_incremental_objectscript_macro_oracle(OBJECTSCRIPT_MACRO_CHANGE_INCLUDE, err,
+                                                  sizeof(err)) != 0) {
+        FAIL(err[0] ? err : "ObjectScript include invalidation oracle failed");
+    }
+    PASS();
+}
+
+TEST(incremental_objectscript_deleted_include_reextracts_consumers) {
+    char err[CBM_SZ_8K] = {0};
+    if (run_incremental_objectscript_macro_oracle(OBJECTSCRIPT_MACRO_DELETE_INCLUDE, err,
+                                                  sizeof(err)) != 0) {
+        FAIL(err[0] ? err : "ObjectScript include deletion invalidation oracle failed");
     }
     PASS();
 }
@@ -18080,6 +18140,8 @@ SUITE(pipeline) {
     RUN_TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow);
     RUN_TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild);
     RUN_TEST(incremental_objectscript_unchanged_include_macro_matches_fresh_rebuild);
+    RUN_TEST(incremental_objectscript_changed_include_reextracts_consumers);
+    RUN_TEST(incremental_objectscript_deleted_include_reextracts_consumers);
     RUN_TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild);
     RUN_TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild);
     RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);
