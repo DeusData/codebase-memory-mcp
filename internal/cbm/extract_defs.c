@@ -2549,9 +2549,7 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                     if (paren) {
                         *paren = '\0';
                     }
-                    if (base[0]) {
-                        bases[base_count++] = base;
-                    }
+                    bases[base_count++] = base;
                 }
             }
         }
