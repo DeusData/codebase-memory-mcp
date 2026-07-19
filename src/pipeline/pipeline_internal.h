@@ -1089,6 +1089,11 @@ typedef struct {
     size_t retain_per_file_max_bytes;
 } cbm_parallel_extract_opts_t;
 
+/* Shared ObjectScript include context for sequential, parallel, and
+ * incremental extraction. The caller owns the returned table. */
+CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
+                                                const char *repo_path);
+
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts);

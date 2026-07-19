@@ -575,10 +575,14 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
 
         /* Extract */
-        CBMFileResult *result = cbm_extract_file_with_options(
+        /* The sequential definitions pass owns the result cache later reused by
+         * pass_calls. Pass the repository-wide ObjectScript table here; waiting
+         * until pass_calls is too late because a cache hit skips re-extraction
+         * and would retain unexpanded $$$ macro calls. */
+        CBMFileResult *result = cbm_extract_file_with_options_ex(
             source, source_len, lang, ctx->project_name, rel, cbm_pipeline_ctx_extract_timeout(ctx),
             NULL, NULL /* no extra defines or include paths */,
-            cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
+            cbm_pipeline_mode_extracts_macro_nodes(ctx->mode), ctx->macro_table, NULL);
         free(source);
 
         if (!result || result->has_error) {
