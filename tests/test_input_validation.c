@@ -804,6 +804,196 @@ TEST(config_compact_default_false) {
     PASS();
 }
 
+TEST(config_response_format_json_with_toon_override) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_DEFAULT_RESPONSE_FORMAT,
+                             CBM_MCP_OUTPUT_FORMAT_JSON),
+              0);
+    ASSERT_TRUE(cbm_config_set(cfg, CBM_CONFIG_DEFAULT_RESPONSE_FORMAT, "yaml") != 0);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    const char *query = "MATCH (n:Function) RETURN n.name LIMIT 2";
+    char *raw = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 2\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_EQ(resp[0], '{');
+    free(resp);
+
+    raw = cbm_mcp_handle_tool(srv, "get_graph_schema",
+                              "{\"project\":\"validation-test\"}");
+    resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_EQ(resp[0], '{');
+    free(resp);
+
+    char args[256];
+    snprintf(args, sizeof(args), "{\"query\":\"%s\",\"format\":\"toon\"}", query);
+    raw = cbm_mcp_handle_tool(srv, "query_graph", args);
+    resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "rows["));
+    ASSERT_TRUE(resp[0] != '{');
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(toon_first_response_context_is_native_toon) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"alpha\",\"limit\":2,\"format\":\"toon\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+
+    /* A TOON response must never contain a verbatim JSON subdocument. The
+     * first-response context keeps the same facts under explicit TOON keys. */
+    ASSERT_NULL(strstr(resp, "context: {"));
+    ASSERT_NULL(strstr(resp, "{\"_context\":"));
+    ASSERT_NOT_NULL(strstr(resp, "session_project: validation-test"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_status: ready"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_project: validation-test"));
+    ASSERT_NOT_NULL(strstr(resp, "_context_node_labels["));
+    ASSERT_NOT_NULL(strstr(resp, "_context_edge_types["));
+
+    free(resp);
+
+    /* Context is delivered once, while the lightweight session identity is
+     * retained on later TOON responses just as it is for JSON responses. */
+    raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"beta\",\"limit\":2,\"format\":\"toon\"}");
+    resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "session_project: validation-test"));
+    ASSERT_NULL(strstr(resp, "_context_status:"));
+    ASSERT_NULL(strstr(resp, "_context_node_labels["));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(toon_context_injection_config_is_respected) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_session_project(srv, "validation-test");
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, "context_injection", "false"), 0);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"alpha\",\"limit\":2,\"format\":\"toon\"}");
+    char *resp = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "session_project: validation-test"));
+    ASSERT_NULL(strstr(resp, "_context_status:"));
+    ASSERT_NULL(strstr(resp, "_context_node_labels["));
+    ASSERT_NULL(strstr(resp, "context: {"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
+TEST(graph_schema_formats_preserve_bounded_facts) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    static const char *const labels[] = {"Class", "Interface", "Method", "Field",
+                                         "Module", "Variable", "Enum", "Type"};
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        char name[64];
+        char qualified_name[128];
+        snprintf(name, sizeof(name), "SchemaNode%zu", i);
+        snprintf(qualified_name, sizeof(qualified_name), "validation-test.schema.%s", name);
+        cbm_node_t node = {.project = "validation-test",
+                           .label = labels[i],
+                           .name = name,
+                           .qualified_name = qualified_name,
+                           .file_path = "schema-fixture.c",
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 1,
+                           .properties_json = "{\"schema_fixture_property\":true}"};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+
+    char *raw = cbm_mcp_handle_tool(
+        srv, "get_graph_schema",
+        "{\"project\":\"validation-test\",\"format\":\"json\"}");
+    char *json = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(json);
+    ASSERT_EQ(json[0], '{');
+    ASSERT_NOT_NULL(strstr(json, "\"node_labels\""));
+    ASSERT_NOT_NULL(strstr(json, "\"properties\""));
+    ASSERT_NOT_NULL(strstr(json, "\"property_key_limit_per_label_or_type\":50"));
+    ASSERT_NOT_NULL(strstr(json, "\"relationship_pattern_limit\":50"));
+    ASSERT_NOT_NULL(strstr(json, "\"Function\""));
+    ASSERT_NOT_NULL(strstr(json, "\"CALLS\""));
+
+    raw = cbm_mcp_handle_tool(srv, "get_graph_schema",
+                              "{\"project\":\"validation-test\"}");
+    char *default_toon = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(default_toon);
+    ASSERT_TRUE(default_toon[0] != '{');
+    ASSERT_NOT_NULL(strstr(default_toon, "node_labels["));
+    free(default_toon);
+
+    raw = cbm_mcp_handle_tool(
+        srv, "get_graph_schema",
+        "{\"project\":\"validation-test\",\"format\":\"toon\"}");
+    char *toon = extract_text(raw);
+    free(raw);
+    ASSERT_NOT_NULL(toon);
+    ASSERT_TRUE(toon[0] != '{');
+    ASSERT_NOT_NULL(strstr(toon, "node_base_properties:"));
+    ASSERT_NOT_NULL(strstr(toon, "property_key_limit_per_label_or_type: 50"));
+    ASSERT_NOT_NULL(strstr(toon, "relationship_pattern_limit: 50"));
+    ASSERT_NOT_NULL(strstr(toon, "node_labels["));
+    ASSERT_NOT_NULL(strstr(toon, "edge_base_properties:"));
+    ASSERT_NOT_NULL(strstr(toon, "edge_types["));
+    ASSERT_NOT_NULL(strstr(toon, "relationship_patterns["));
+    ASSERT_NOT_NULL(strstr(toon, "MATCH (source:Function)-[:CALLS]->(target:Function)"));
+    ASSERT_NOT_NULL(strstr(toon, "Function"));
+    ASSERT_NOT_NULL(strstr(toon, "CALLS"));
+    ASSERT_TRUE(strlen(toon) < strlen(json));
+
+    free(toon);
+    free(json);
+    cbm_mcp_server_free(srv);
+    cleanup_validation_dir(tmp);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  Config: default_sort_by=calls
  * ══════════════════════════════════════════════════════════════════ */
@@ -1327,15 +1517,17 @@ TEST(config_context_injection_enabled_by_default) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
-    /* No config set → default is true → _context present on first call */
-    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
+    /* No config set → default is true → _context present on first call.
+     * format=json: pins the legacy JSON _context shape; default_response_format
+     * is toon, which delivers the same facts as native _context_* TOON fields. */
+    char *raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3,\"format\":\"json\"}");
     char *resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"_context\":"));
     free(resp);
 
     /* Second call: _context deduped (context_injected=true) */
-    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3}");
+    raw = cbm_mcp_handle_tool(srv, "search_graph", "{\"limit\":3,\"format\":\"json\"}");
     resp = extract_text(raw); free(raw);
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\"_context\":"));
@@ -1383,6 +1575,10 @@ void suite_input_validation(void) {
     RUN_TEST(summary_bool_alias);
     RUN_TEST(case_sensitive_graph_search);
     RUN_TEST(config_compact_default_false);
+    RUN_TEST(config_response_format_json_with_toon_override);
+    RUN_TEST(toon_first_response_context_is_native_toon);
+    RUN_TEST(toon_context_injection_config_is_respected);
+    RUN_TEST(graph_schema_formats_preserve_bounded_facts);
     RUN_TEST(config_default_sort_by_calls);
     RUN_TEST(trace_accepts_qualified_name_param);
     RUN_TEST(pattern_glob_wildcards_auto_convert);

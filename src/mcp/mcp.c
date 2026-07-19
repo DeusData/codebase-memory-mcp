@@ -1125,7 +1125,12 @@ static const tool_def_t TOOLS[] = {
      "labels/properties and LIMIT are optional efficiency aids. Server caps query_max_rows and "
      "query_max_output_bytes; raise only when needed. Dependency symbols use proj.dep.* and "
      "source:dependency; rank primary symbols first with "
-     "ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END.",
+     "ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END. "
+     "Supported read-only Cypher subset: MATCH/OPTIONAL MATCH, WHERE, WITH, UNWIND, RETURN, "
+     "DISTINCT, ORDER BY, SKIP, LIMIT, UNION/UNION ALL; node and relationship patterns; bounded "
+     "variable-length paths; property access, comparisons, regex, IN, IS NULL, EXISTS, boolean "
+     "logic, CASE; count/sum/avg/min/max/collect and supported scalar functions. Unsupported "
+     "syntax returns an error with a supported rewrite.",
      "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\",\"description\":\"Cypher "
      "query\"},\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to "
      "use the MCP server project derived from server CWD.\"},\"max_rows\":{\"type\":\"integer\","
@@ -1139,7 +1144,9 @@ static const tool_def_t TOOLS[] = {
      "\"graph\":{\"type\":\"string\","
      "\"enum\":[\"code\",\"missed\"],\"default\":\"code\",\"description\":\"Query the code "
      "graph or the best-effort graph of files not fully indexed.\"},\"format\":{\"type\":\"string\","
-     "\"enum\":[\"toon\",\"json\"],\"default\":\"toon\"}},\"required\":[\"query\"]}"},
+     "\"enum\":[\"toon\",\"json\"],\"default\":\"toon\",\"description\":\"Compact TOON rows by "
+     "default; json returns legacy objects. Omit to use default_response_format.\"}},"
+     "\"required\":[\"query\"]}"},
 
     {"trace_path", "Trace path",
      "Trace function call paths: who calls a function and what it calls. Prefer this for callers, "
@@ -1208,7 +1215,11 @@ static const tool_def_t TOOLS[] = {
      "Get the schema of the knowledge graph (node labels, edge types)",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
      "\"Indexed project name or repository directory. Omit to use the MCP server project derived "
-     "from server CWD; first use may auto-index it.\"}}}"},
+     "from server CWD; first use may auto-index it.\"},\"format\":{\"type\":\"string\","
+     "\"enum\":[\"toon\",\"json\"],\"default\":\"toon\",\"description\":"
+     "\"Compact TOON schema by default; json preserves the legacy object shape. Property keys "
+     "and observed relationship patterns report their discovery bounds. Omit to use "
+     "default_response_format.\"}}}"},
 
     {"get_architecture", "Get architecture",
      "Get high-level architecture overview: packages, services, dependencies, and project "
@@ -1227,7 +1238,9 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"Optional validated sections to include; omit for the default overview.\"},"
      "\"exclude\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Optional "
      "file-path globs to omit from key_functions, e.g. tests/** or vendor/**.\"},"
-     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\"}}}"},
+     "\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"description\":\"Compact TOON sections by default; json returns legacy objects. Omit to "
+     "use default_response_format.\"}}}"},
 
     {"search_code", "Search code",
      "Search source code in an indexed/current project with text or regex patterns. "
@@ -1253,7 +1266,9 @@ static const tool_def_t TOOLS[] = {
      "\"description\":\"compact=deduplicated matches, full=include source snippets, files=matching files only.\"},"
      "\"limit\":{\"type\":\"integer\",\"description\":\"Max "
      "results (configurable via search_limit config key). Set higher for exhaustive text search."
-     "\"},\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\"}},\"required\":["
+     "\"},\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"description\":\"Compact TOON matches by default; json returns legacy objects. Omit to "
+     "use default_response_format.\"}},\"required\":["
      "\"pattern\"]}"},
 
     {"list_projects", "List projects",
@@ -1391,12 +1406,14 @@ static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const 
 }
 
 /* Canonical tool serialization for classic, streamlined, and paged lists. */
-static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def_t *tool_def) {
+static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def_t *tool_def,
+                      const char *description_override) {
     yyjson_mut_val *tool = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_str(doc, tool, "name", tool_def->name);
     yyjson_mut_obj_add_str(doc, tool, "title",
                            tool_def->title ? tool_def->title : tool_def->name);
-    yyjson_mut_obj_add_str(doc, tool, "description", tool_def->description);
+    yyjson_mut_obj_add_str(doc, tool, "description",
+                           description_override ? description_override : tool_def->description);
     mcp_add_json_schema(doc, tool, "inputSchema", tool_def->input_schema);
     mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
     yyjson_mut_arr_add_val(tools, tool);
@@ -1951,6 +1968,14 @@ struct cbm_mcp_server {
     bool autoindex_failed; /* IX-1: true if last auto-index attempt failed */
     bool just_autoindexed; /* IX-3: true after auto-index completes, reset on next search */
     bool context_injected; /* true after first _context header sent (Phase 9) */
+    /* Request-thread-owned tools/list docstring. Graph workers may only mark
+     * it stale atomically; they must never read, replace, or free the pointer. */
+    char *query_graph_tool_description;
+    atomic_bool query_graph_tool_description_stale;
+    /* Set by any publication path (any thread); drained only by the request
+     * thread after it finishes writing a response. Best-effort: correctness
+     * never depends on delivery (query_graph_no_rows_hint self-heals). */
+    atomic_bool tools_list_changed_pending;
     bool hidden_tools_revealed; /* true after _hidden_tools requests real tools/list exposure */
     FILE *out_stream;          /* protocol output stream for notifications (set in server_run) */
     bool out_content_length_framed; /* true while handling Content-Length-framed requests */
@@ -2007,6 +2032,32 @@ static bool cbm_mcp_tool_mode_is_classic(cbm_mcp_server_t *srv) {
         ? cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined")
         : "streamlined";
     return strcmp(tool_mode, "classic") == 0;
+}
+
+static cbm_mcp_output_format_t cbm_mcp_response_format(cbm_mcp_server_t *srv,
+                                                       const char *args) {
+    char *override = cbm_mcp_get_string_arg(args, "format");
+    const char *value = override;
+    if (!value) {
+        value = cbm_config_get_effective(srv ? srv->config : NULL,
+                                         CBM_CONFIG_DEFAULT_RESPONSE_FORMAT,
+                                         CBM_MCP_OUTPUT_FORMAT_TOON);
+    }
+    cbm_mcp_output_format_t format = CBM_MCP_OUTPUT_INVALID;
+    if (value && strcmp(value, CBM_MCP_OUTPUT_FORMAT_TOON) == 0) {
+        format = CBM_MCP_OUTPUT_TOON;
+    } else if (value && strcmp(value, CBM_MCP_OUTPUT_FORMAT_JSON) == 0) {
+        format = CBM_MCP_OUTPUT_JSON;
+    }
+    free(override);
+    return format;
+}
+
+static char *cbm_mcp_invalid_response_format(void) {
+    return cbm_mcp_text_result(
+        "unsupported response format; use format='toon' or format='json', or set "
+        "default_response_format to toon or json",
+        true);
 }
 
 static bool cbm_mcp_tool_config_enabled(cbm_mcp_server_t *srv, const char *tool_name) {
@@ -2210,6 +2261,11 @@ static bool cbm_mcp_run_sync_auto_index(cbm_mcp_server_t *srv, const char *root_
     if (srv) {
         srv->autoindex_failed = (rc != 0);
         srv->just_autoindexed = (rc == 0);
+        if (rc == 0) {
+            /* One publication authority: store_stale + description_stale +
+             * pending list_changed together, not a handler-local flag. */
+            cbm_mcp_server_notify_index_published(srv);
+        }
     }
     if (rc != 0) {
         cbm_log_error("autoindex.failed", log_key, log_value ? log_value : "");
@@ -2239,6 +2295,254 @@ static bool mcp_tool_page_accept(mcp_tool_page_t *page) {
     return true;
 }
 
+/* Definitions live with the shared schema serializers below. The tools/list
+ * description reuses them so executable patterns and base-property factoring
+ * cannot drift from get_graph_schema. */
+static bool schema_property_in_base(const char *property, const char *const *base,
+                                    int base_count);
+static char *schema_relationship_pattern_text(const cbm_schema_relationship_t *pattern,
+                                              bool executable_match);
+static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project);
+
+static void schema_description_append_int(cbm_sb_t *sb, int value) {
+    char number[CBM_SZ_32];
+    snprintf(number, sizeof(number), "%d", value);
+    cbm_sb_append(sb, number);
+}
+
+static void schema_description_append_properties(cbm_sb_t *sb, char *const *properties,
+                                                 int property_count,
+                                                 const char *const *base, int base_count) {
+    bool first = true;
+    for (int i = 0; i < property_count; i++) {
+        if (schema_property_in_base(properties[i], base, base_count)) {
+            continue;
+        }
+        cbm_sb_append(sb, first ? "{" : ",");
+        cbm_sb_append(sb, properties[i]);
+        first = false;
+    }
+    if (!first) {
+        cbm_sb_append(sb, "}");
+    }
+}
+
+/* One schema-view selector shared by the tools/list description builder,
+ * handle_get_graph_schema, and build_resource_schema: prefer the active
+ * overlay view exactly when queries would see overlay rows, else canonical.
+ * Guarantees the advertised vocabulary can never diverge from the view
+ * queries actually run on, and ends the triplicated overlay_ready dance.
+ * out_overlay_summary/out_used_overlay/out_overlay_failed are optional
+ * (pass NULL when the caller does not report overlay freshness). */
+/* True when queries against project would run on the active overlay view:
+ * shared by mcp_get_current_schema and handle_query_graph so the two never
+ * drift on what "overlay ready" means. */
+static bool mcp_overlay_view_ready(cbm_store_t *store, const char *project,
+                                   cbm_store_overlay_node_view_summary_t *summary) {
+    return cbm_store_get_overlay_node_view_summary(store, project, summary) == CBM_STORE_OK &&
+           cbm_store_overlay_node_view_has_ready_rows(summary);
+}
+
+/* How much Cypher query-writing vocabulary a schema fetch returns. The
+ * language is Cypher (query_graph's read-only openCypher subset); the enum is
+ * named for what a caller can DO with the result, because that is the
+ * decision being made:
+ *
+ * MATCH_VOCABULARY — every label and edge type with its observed count, plus
+ * every observed (source_label)-[type]->(target_label) pattern: exactly the
+ * facts needed to compose executable MATCH clauses. Costs index-backed
+ * GROUP BYs plus one capped O(E) pattern join; never parses property JSON.
+ *
+ * FULL_QUERY_VOCABULARY — adds the per-label/per-type property keys needed to
+ * filter and project custom facts about a repo (WHERE n.key ..., RETURN
+ * n.key). The extra json_each discovery is O(total property rows) — minutes-
+ * scale on multi-million-node graphs — so only surfaces that actually render
+ * property keys (the query_graph docstring, get_graph_schema) may request it,
+ * and the docstring caches it once per publication. */
+typedef enum {
+    MCP_CYPHER_MATCH_VOCABULARY = 0,
+    MCP_CYPHER_FULL_QUERY_VOCABULARY,
+} mcp_cypher_vocabulary_t;
+
+static int mcp_get_current_schema(cbm_store_t *store, const char *project,
+                                  mcp_cypher_vocabulary_t vocabulary, cbm_schema_info_t *out,
+                                  cbm_store_overlay_node_view_summary_t *out_overlay_summary,
+                                  bool *out_used_overlay, bool *out_overlay_failed) {
+    bool with_props = vocabulary == MCP_CYPHER_FULL_QUERY_VOCABULARY;
+    if (out_used_overlay) {
+        *out_used_overlay = false;
+    }
+    if (out_overlay_failed) {
+        *out_overlay_failed = false;
+    }
+    if (!store) {
+        memset(out, 0, sizeof(*out));
+        return CBM_NOT_FOUND;
+    }
+    /* project may be NULL here: cbm_store_get_overlay_node_view_summary and
+     * get_schema_impl are both NULL-project-safe (empty/false result, no
+     * crash), matching every pre-refactor call site's tolerance. */
+    cbm_store_overlay_node_view_summary_t local_summary = {0};
+    cbm_store_overlay_node_view_summary_t *summary =
+        out_overlay_summary ? out_overlay_summary : &local_summary;
+    bool overlay_ready = mcp_overlay_view_ready(store, project, summary);
+    if (overlay_ready) {
+        int rc = with_props ? cbm_store_get_schema_overlay_view(store, project, out)
+                            : cbm_store_get_schema_counts_overlay_view(store, project, out);
+        if (rc == CBM_STORE_OK) {
+            if (out_used_overlay) {
+                *out_used_overlay = true;
+            }
+            return CBM_STORE_OK;
+        }
+        if (out_overlay_failed) {
+            *out_overlay_failed = true;
+        }
+    }
+    return with_props ? cbm_store_get_schema(store, project, out)
+                      : cbm_store_get_schema_counts(store, project, out);
+}
+
+/* Build the query_graph docstring once per published graph state. It belongs in
+ * MCP tools/list so reconnects and relists can restore actionable schema after
+ * context compaction; it must never be appended to tools/call results. Full
+ * property discovery is O(total property rows), so repeating it for every
+ * paged tools/list request would turn catalog discovery into a graph scan. The
+ * cache is request-thread owned; every graph mutation path must invalidate it,
+ * while background indexing may only flip the atomic stale bit. */
+static char *build_query_graph_tool_description(cbm_mcp_server_t *srv,
+                                                const tool_def_t *tool_def) {
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    cbm_sb_append(&sb, tool_def->description);
+    int node_base_count = 0;
+    int edge_base_count = 0;
+    const char *const *node_base =
+        cbm_store_schema_node_base_properties(&node_base_count);
+    const char *const *edge_base =
+        cbm_store_schema_edge_base_properties(&edge_base_count);
+    cbm_sb_append(&sb, " Node properties: ");
+    for (int i = 0; i < node_base_count; i++) {
+        cbm_sb_append(&sb, i ? ", " : "");
+        cbm_sb_append(&sb, node_base[i]);
+    }
+    cbm_sb_append(&sb, ". Relationship properties: ");
+    for (int i = 0; i < edge_base_count; i++) {
+        cbm_sb_append(&sb, i ? ", " : "");
+        cbm_sb_append(&sb, edge_base[i]);
+    }
+    cbm_sb_append(&sb, ".");
+    cbm_sb_append(&sb, " Discovery bounds: up to ");
+    schema_description_append_int(&sb, CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT);
+    cbm_sb_append(&sb, " extra property keys per label/type and ");
+    schema_description_append_int(&sb, CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT);
+    cbm_sb_append(&sb, " observed relationship patterns.");
+
+    /* Snapshot into a local buffer rather than aliasing srv->current_project
+     * directly: resolve_store() below may call reap_stale_store(), which
+     * frees srv->current_project mid-call when a deferred invalidation is
+     * pending (cbm_mcp_server_notify_index_published sets store_stale
+     * without touching current_project — the request thread reaps it on
+     * next use). Passing the live pointer through would free the very
+     * string resolve_store is still reading (use-after-free). */
+    char project_buf[CBM_SZ_256];
+    const char *project = NULL;
+    if (srv) {
+        const char *src = srv->current_project && srv->current_project[0]
+                              ? srv->current_project
+                              : (srv->session_project[0] ? srv->session_project : NULL);
+        if (src) {
+            snprintf(project_buf, sizeof(project_buf), "%s", src);
+            project = project_buf;
+        }
+    }
+    /* Lazily resolve the project's real store rather than trusting
+     * srv->store as-is: on the very first tools/list of a fresh session
+     * (before any tool call has resolved a project), srv->store is still
+     * the empty default in-memory store even though the project is
+     * already indexed on disk — silently producing an empty schema
+     * section. resolve_store is the same lazy-open used by every other
+     * handler and no-ops (fast path) once already resolved. */
+    cbm_store_t *store = srv ? resolve_store(srv, project) : NULL;
+    cbm_schema_info_t schema = {0};
+    if (!store || !project ||
+        mcp_get_current_schema(store, project, MCP_CYPHER_FULL_QUERY_VOCABULARY, &schema, NULL,
+                               NULL, NULL) !=
+            CBM_STORE_OK) {
+        return cbm_sb_finish(&sb);
+    }
+
+    cbm_sb_append(&sb, " Current project schema for ");
+    cbm_sb_append(&sb, project);
+    /* Notation legend, embedded in the description string itself so it is
+     * present in EVERY tools/list response (repeated relists, reconnects,
+     * post-compaction recovery — the delivery contract). It is spelled out
+     * here in the Labels header and the edge/pattern sections reuse the same
+     * name{extra property keys}[row count] notation, so the legend costs its
+     * bytes once per description, not once per section. */
+    cbm_sb_append(&sb, ". Labels name{extra property keys}[count]: ");
+    for (int i = 0; i < schema.node_label_count; i++) {
+        cbm_sb_append(&sb, i ? "; " : "");
+        cbm_sb_append(&sb, schema.node_labels[i].label);
+        schema_description_append_properties(&sb, schema.node_labels[i].properties,
+                                             schema.node_labels[i].property_count, node_base,
+                                             node_base_count);
+        cbm_sb_append(&sb, "[");
+        schema_description_append_int(&sb, schema.node_labels[i].count);
+        cbm_sb_append(&sb, "]");
+    }
+    cbm_sb_append(&sb, ". Edge types[count]: ");
+    for (int i = 0; i < schema.edge_type_count; i++) {
+        cbm_sb_append(&sb, i ? "; " : "");
+        cbm_sb_append(&sb, schema.edge_types[i].type);
+        schema_description_append_properties(&sb, schema.edge_types[i].properties,
+                                             schema.edge_types[i].property_count, edge_base,
+                                             edge_base_count);
+        cbm_sb_append(&sb, "[");
+        schema_description_append_int(&sb, schema.edge_types[i].count);
+        cbm_sb_append(&sb, "]");
+    }
+    cbm_sb_append(&sb, ". Observed executable patterns[count]: ");
+    for (int i = 0; i < schema.rel_pattern_count; i++) {
+        char *match = schema_relationship_pattern_text(&schema.rel_patterns[i], true);
+        if (!match) {
+            cbm_store_schema_free(&schema);
+            cbm_sb_free(&sb);
+            return NULL;
+        }
+        cbm_sb_append(&sb, i ? "; " : "");
+        cbm_sb_append(&sb, match);
+        cbm_sb_append(
+            &sb,
+            " RETURN source.qualified_name,target.qualified_name LIMIT 20 [");
+        schema_description_append_int(&sb, schema.rel_patterns[i].observed_count);
+        cbm_sb_append(&sb, "]");
+        free(match);
+    }
+    cbm_sb_append(
+        &sb,
+        ". These are examples, not restrictions: write a custom effective, computationally "
+        "efficient query for the current problem.");
+    cbm_store_schema_free(&schema);
+    return cbm_sb_finish(&sb);
+}
+
+static const char *query_graph_tool_description(cbm_mcp_server_t *srv,
+                                                const tool_def_t *tool_def) {
+    if (!srv) {
+        return tool_def->description;
+    }
+    if (atomic_exchange(&srv->query_graph_tool_description_stale, false)) {
+        free(srv->query_graph_tool_description);
+        srv->query_graph_tool_description = NULL;
+    }
+    if (!srv->query_graph_tool_description) {
+        srv->query_graph_tool_description = build_query_graph_tool_description(srv, tool_def);
+    }
+    return srv->query_graph_tool_description ? srv->query_graph_tool_description
+                                             : tool_def->description;
+}
+
 static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int limit,
                                       bool include_next_cursor) {
     bool classic = cbm_mcp_tool_mode_is_classic(srv);
@@ -2260,12 +2564,15 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
          * canonical tools in TOOLS[] prevents schema drift between modes. */
         for (int i = 0; i < TOOL_COUNT; i++) {
             if (is_streamlined_default_tool(TOOLS[i].name) && mcp_tool_page_accept(&page)) {
-                emit_tool(doc, tools, &TOOLS[i]);
+                const char *description = strcmp(TOOLS[i].name, "query_graph") == 0
+                                              ? query_graph_tool_description(srv, &TOOLS[i])
+                                              : NULL;
+                emit_tool(doc, tools, &TOOLS[i], description);
             }
         }
         for (int i = 0; i < STREAMLINED_TOOL_COUNT; i++) {
             if (mcp_tool_page_accept(&page)) {
-                emit_tool(doc, tools, &STREAMLINED_TOOLS[i]);
+                emit_tool(doc, tools, &STREAMLINED_TOOLS[i], NULL);
             }
         }
         /* Also emit individually-enabled tools, or every advanced tool after
@@ -2280,7 +2587,10 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
             }
             if (reveal_hidden || cbm_mcp_tool_config_enabled(srv, TOOLS[i].name)) {
                 if (mcp_tool_page_accept(&page)) {
-                    emit_tool(doc, tools, &TOOLS[i]);
+                    const char *description = strcmp(TOOLS[i].name, "query_graph") == 0
+                                                  ? query_graph_tool_description(srv, &TOOLS[i])
+                                                  : NULL;
+                    emit_tool(doc, tools, &TOOLS[i], description);
                 }
             }
         }
@@ -2324,7 +2634,10 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
          * name and the single canonical call-tracing tool. */
         for (int i = 0; i < TOOL_COUNT; i++) {
             if (mcp_tool_page_accept(&page)) {
-                emit_tool(doc, tools, &TOOLS[i]);
+                const char *description = strcmp(TOOLS[i].name, "query_graph") == 0
+                                              ? query_graph_tool_description(srv, &TOOLS[i])
+                                              : NULL;
+                emit_tool(doc, tools, &TOOLS[i], description);
             }
         }
     }
@@ -2412,11 +2725,13 @@ void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project) {
     }
     free(srv->current_project);
     srv->current_project = project ? heap_strdup(project) : NULL;
+    atomic_store(&srv->query_graph_tool_description_stale, true);
 }
 
 void cbm_mcp_server_set_session_project(cbm_mcp_server_t *srv, const char *name) {
     if (!srv || !name) return;
     snprintf(srv->session_project, sizeof(srv->session_project), "%s", name);
+    atomic_store(&srv->query_graph_tool_description_stale, true);
 }
 
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w) {
@@ -2536,6 +2851,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
         cbm_store_close(srv->store);
     }
     free(srv->current_project);
+    free(srv->query_graph_tool_description);
     free(srv->active_request_id_str);
     free(srv);
 }
@@ -2709,6 +3025,13 @@ static void *overlay_compaction_thread(void *arg) {
         } else {
             rc = CBM_STORE_NOT_FOUND;
         }
+    }
+
+    if (rc == CBM_STORE_OK && compacted > 0) {
+        /* Compaction moved overlay facts into canonical rows. Visible schema
+         * should be content-identical, but the description builder reads
+         * different tables afterward. Flags only. */
+        cbm_mcp_server_notify_index_published(srv);
     }
 
     cbm_mutex_lock(&srv->overlay_compaction_lock);
@@ -3338,9 +3661,14 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_int(doc, ctx, "nodes", nodes);
     yyjson_mut_obj_add_int(doc, ctx, "edges", edges);
 
-    /* Schema: node labels + edge types */
+    /* Schema: node labels + edge types. Counts-only: this context never emits
+     * property keys, and the full variant's json_each discovery is O(total
+     * property rows) — the wrong cost for the first response of a session.
+     * Overlay-aware via the shared selector so the first response can never
+     * advertise vocabulary query_graph would then contradict. */
     cbm_schema_info_t schema = {0};
-    cbm_store_get_schema(store, proj, &schema);
+    mcp_get_current_schema(store, proj, MCP_CYPHER_MATCH_VOCABULARY, &schema, NULL, NULL,
+                           NULL);
     yyjson_mut_val *label_arr = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.node_label_count; i++) {
         yyjson_mut_val *lbl = yyjson_mut_obj(doc);
@@ -3443,16 +3771,106 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "_context", ctx);
 }
 
+static void toon_append_mut_string(cbm_sb_t *sb, yyjson_mut_val *obj, const char *json_key,
+                                   const char *toon_key) {
+    yyjson_mut_val *value = yyjson_mut_obj_get(obj, json_key);
+    if (value && yyjson_mut_is_str(value)) {
+        cbm_toon_scalar_str(sb, toon_key, yyjson_mut_get_str(value));
+    }
+}
+
+static void toon_append_mut_int(cbm_sb_t *sb, yyjson_mut_val *obj, const char *json_key,
+                                const char *toon_key) {
+    yyjson_mut_val *value = yyjson_mut_obj_get(obj, json_key);
+    if (value && yyjson_mut_is_int(value)) {
+        cbm_toon_scalar_int(sb, toon_key, yyjson_mut_get_sint(value));
+    }
+}
+
+static void toon_append_context_count_table(cbm_sb_t *sb, yyjson_mut_val *ctx,
+                                            const char *json_key, const char *toon_key,
+                                            const char *name_key) {
+    yyjson_mut_val *array = yyjson_mut_obj_get(ctx, json_key);
+    if (!array || !yyjson_mut_is_arr(array)) {
+        return;
+    }
+    const char *columns[] = {name_key, "count"};
+    cbm_toon_table_header(sb, toon_key, (int)yyjson_mut_arr_size(array), columns, MCP_COL_2);
+    yyjson_mut_arr_iter iter;
+    yyjson_mut_arr_iter_init(array, &iter);
+    yyjson_mut_val *item = NULL;
+    while ((item = yyjson_mut_arr_iter_next(&iter))) {
+        yyjson_mut_val *name = yyjson_mut_obj_get(item, name_key);
+        yyjson_mut_val *count = yyjson_mut_obj_get(item, "count");
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(sb, name && yyjson_mut_is_str(name) ? yyjson_mut_get_str(name) : "",
+                          true);
+        cbm_toon_cell_int(sb, count && yyjson_mut_is_int(count) ? yyjson_mut_get_sint(count) : 0,
+                          false);
+        cbm_toon_row_end(sb);
+    }
+}
+
+static void toon_append_context_key_functions(cbm_sb_t *sb, yyjson_mut_val *ctx) {
+    yyjson_mut_val *array = yyjson_mut_obj_get(ctx, "key_functions");
+    if (!array || !yyjson_mut_is_arr(array)) {
+        return;
+    }
+    const char *columns[] = {"qualified_name", "pagerank"};
+    cbm_toon_table_header(sb, "_context_key_functions", (int)yyjson_mut_arr_size(array),
+                          columns, MCP_COL_2);
+    yyjson_mut_arr_iter iter;
+    yyjson_mut_arr_iter_init(array, &iter);
+    yyjson_mut_val *item = NULL;
+    while ((item = yyjson_mut_arr_iter_next(&iter))) {
+        yyjson_mut_val *qualified_name = yyjson_mut_obj_get(item, "qualified_name");
+        yyjson_mut_val *pagerank = yyjson_mut_obj_get(item, "pagerank");
+        double rank = 0.0;
+        if (pagerank && yyjson_mut_is_num(pagerank)) {
+            rank = yyjson_mut_get_num(pagerank);
+        } else if (pagerank && yyjson_mut_is_raw(pagerank)) {
+            rank = strtod(yyjson_mut_get_raw(pagerank), NULL);
+        }
+        cbm_toon_row_begin(sb);
+        cbm_toon_cell_str(
+            sb, qualified_name && yyjson_mut_is_str(qualified_name)
+                    ? yyjson_mut_get_str(qualified_name)
+                    : "",
+            true);
+        cbm_toon_cell_real(sb, rank, false);
+        cbm_toon_row_end(sb);
+    }
+}
+
+/* Serialize the format-neutral JSON context model as native TOON. Keeping
+ * construction in inject_context_once preserves one fact authority; this
+ * function owns only the TOON field mapping. */
+static void toon_append_context_model(cbm_sb_t *sb, yyjson_mut_val *root) {
+    toon_append_mut_string(sb, root, "session_project", "session_project");
+    yyjson_mut_val *ctx = yyjson_mut_obj_get(root, "_context");
+    if (!ctx || !yyjson_mut_is_obj(ctx)) {
+        return;
+    }
+    toon_append_mut_string(sb, ctx, "status", "_context_status");
+    toon_append_mut_string(sb, ctx, "hint", "_context_hint");
+    toon_append_mut_string(sb, ctx, "project", "_context_project");
+    toon_append_mut_int(sb, ctx, "nodes", "_context_nodes");
+    toon_append_mut_int(sb, ctx, "edges", "_context_edges");
+    toon_append_mut_int(sb, ctx, "ranked_nodes", "_context_ranked_nodes");
+    toon_append_mut_string(sb, ctx, "pagerank_computed_at",
+                           "_context_pagerank_computed_at");
+    toon_append_mut_string(sb, ctx, "detected_ecosystem", "_context_detected_ecosystem");
+    toon_append_context_count_table(sb, ctx, "node_labels", "_context_node_labels", "label");
+    toon_append_context_count_table(sb, ctx, "edge_types", "_context_edge_types", "type");
+    toon_append_context_key_functions(sb, ctx);
+}
+
 /* TOON-path context delivery: the TOON early-returns in handle_search_graph
  * bypass the yyjson response doc, which silently dropped the one-shot
  * `_context` header and `session_project` — the only reliable push channel
  * into the model (see the delivery-channel note above inject_context_once).
- * Reuse inject_context_once verbatim on a scratch doc so the config gate,
- * one-shot flag, and payload stay defined exactly once, then emit the result
- * as a single trailing `context: {…}` line. The value is a raw JSON fragment
- * (not TOON-quoted) on purpose: it is machine-parseable, greppable as
- * "_context":, and read once by the model. Emits nothing when the context was
- * already delivered and no session_project is set. */
+ * Build the facts once with inject_context_once, then serialize the mutable
+ * model as native TOON; never append the scratch JSON document verbatim. */
 static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_store_t *store,
                                      const char *context_project) {
     if (!sb || !srv) {
@@ -3466,13 +3884,7 @@ static void toon_append_context_once(cbm_sb_t *sb, cbm_mcp_server_t *srv, cbm_st
     yyjson_mut_doc_set_root(cdoc, croot);
     inject_context_once(cdoc, croot, srv, store, context_project);
     if (yyjson_mut_obj_size(croot) > 0) {
-        char *cjson = yyjson_mut_write(cdoc, 0, NULL);
-        if (cjson) {
-            cbm_sb_append(sb, "context: ");
-            cbm_sb_append(sb, cjson);
-            cbm_sb_append(sb, "\n");
-            free(cjson);
-        }
+        toon_append_context_model(sb, croot);
     }
     yyjson_mut_doc_free(cdoc);
 }
@@ -4155,7 +4567,237 @@ static bool store_has_adr(cbm_store_t *store, const char *project) {
     return true;
 }
 
+static bool schema_property_in_base(const char *property, const char *const *base,
+                                    int base_count) {
+    for (int i = 0; property && i < base_count; i++) {
+        if (strcmp(property, base[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Join the bounded property inventory without an additional output-buffer cap.
+ * The store-level discovery bound is reported separately to callers. */
+static char *schema_join_properties(char *const *properties, int property_count,
+                                    const char *const *base, int base_count,
+                                    bool extras_only) {
+    cbm_sb_t joined;
+    cbm_sb_init(&joined);
+    bool first = true;
+    for (int i = 0; i < property_count; i++) {
+        if (extras_only && schema_property_in_base(properties[i], base, base_count)) {
+            continue;
+        }
+        if (!first) {
+            cbm_sb_append(&joined, ";");
+        }
+        cbm_sb_append(&joined, properties[i]);
+        first = false;
+    }
+    return cbm_sb_finish(&joined);
+}
+
+static char *schema_join_static_properties(const char *const *properties, int property_count) {
+    return schema_join_properties((char *const *)properties, property_count, NULL, 0, false);
+}
+
+static char *schema_join_mut_string_array(yyjson_mut_val *array) {
+    cbm_sb_t joined;
+    cbm_sb_init(&joined);
+    bool first = true;
+    yyjson_mut_arr_iter iter;
+    yyjson_mut_val *item = NULL;
+    yyjson_mut_arr_iter_init(array, &iter);
+    while ((item = yyjson_mut_arr_iter_next(&iter))) {
+        const char *value = yyjson_mut_get_str(item);
+        if (!value) {
+            continue;
+        }
+        if (!first) {
+            cbm_sb_append(&joined, ";");
+        }
+        cbm_sb_append(&joined, value);
+        first = false;
+    }
+    return cbm_sb_finish(&joined);
+}
+
+static char *schema_relationship_pattern_text(const cbm_schema_relationship_t *pattern,
+                                              bool executable_match) {
+    if (!pattern || !pattern->source_label || !pattern->edge_type || !pattern->target_label) {
+        return NULL;
+    }
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    if (executable_match) {
+        cbm_sb_append(&sb, "MATCH (source:");
+        cbm_sb_append(&sb, pattern->source_label);
+        cbm_sb_append(&sb, ")-[:");
+        cbm_sb_append(&sb, pattern->edge_type);
+        cbm_sb_append(&sb, "]->(target:");
+        cbm_sb_append(&sb, pattern->target_label);
+        cbm_sb_append(&sb, ")");
+    } else {
+        char count[CBM_SZ_32];
+        snprintf(count, sizeof(count), "%d", pattern->observed_count);
+        cbm_sb_append(&sb, "(");
+        cbm_sb_append(&sb, pattern->source_label);
+        cbm_sb_append(&sb, ")-[");
+        cbm_sb_append(&sb, pattern->edge_type);
+        cbm_sb_append(&sb, "]->(");
+        cbm_sb_append(&sb, pattern->target_label);
+        cbm_sb_append(&sb, ") [");
+        cbm_sb_append(&sb, count);
+        cbm_sb_append(&sb, "x]");
+    }
+    return cbm_sb_finish(&sb);
+}
+
+static void schema_toon_append_freshness(cbm_sb_t *sb, yyjson_mut_val *root) {
+    yyjson_mut_val *freshness = yyjson_mut_obj_get(root, CBM_MCP_FRESHNESS_KEY);
+    if (!freshness || !yyjson_mut_is_obj(freshness)) {
+        return;
+    }
+    static const char *const string_keys[] = {
+        CBM_MCP_FRESHNESS_STATE_KEY, CBM_MCP_FRESHNESS_STALE_SCOPE_KEY,
+        CBM_MCP_FRESHNESS_READ_MODEL_KEY,
+    };
+    static const char *const integer_keys[] = {
+        CBM_MCP_FRESHNESS_DIRTY_PENDING_KEY, CBM_MCP_FRESHNESS_DIRTY_OVERLAY_READY_KEY,
+        "overlay_ready_generations", "active_file_tombstones", "canonical_nodes_visible",
+        "overlay_owned_nodes_visible", "total_nodes_visible",
+    };
+    char key[CBM_SZ_128];
+    for (size_t i = 0; i < sizeof(string_keys) / sizeof(string_keys[0]); i++) {
+        yyjson_mut_val *value = yyjson_mut_obj_get(freshness, string_keys[i]);
+        if (value && yyjson_mut_is_str(value)) {
+            snprintf(key, sizeof(key), "freshness_%s", string_keys[i]);
+            cbm_toon_scalar_str(sb, key, yyjson_mut_get_str(value));
+        }
+    }
+    for (size_t i = 0; i < sizeof(integer_keys) / sizeof(integer_keys[0]); i++) {
+        yyjson_mut_val *value = yyjson_mut_obj_get(freshness, integer_keys[i]);
+        if (value && yyjson_mut_is_int(value)) {
+            snprintf(key, sizeof(key), "freshness_%s", integer_keys[i]);
+            cbm_toon_scalar_int(sb, key, yyjson_mut_get_sint(value));
+        }
+    }
+    static const char *const array_keys[] = {CBM_MCP_FRESHNESS_STALE_VIEWS_KEY,
+                                             "active_sections"};
+    for (size_t i = 0; i < sizeof(array_keys) / sizeof(array_keys[0]); i++) {
+        yyjson_mut_val *value = yyjson_mut_obj_get(freshness, array_keys[i]);
+        if (value && yyjson_mut_is_arr(value)) {
+            char *joined = schema_join_mut_string_array(value);
+            if (joined) {
+                snprintf(key, sizeof(key), "freshness_%s", array_keys[i]);
+                cbm_toon_scalar_str(sb, key, joined);
+                free(joined);
+            }
+        }
+    }
+}
+
+static char *schema_to_toon(const cbm_schema_info_t *schema, yyjson_mut_val *root) {
+    /* Keep stable base properties factored once, followed by deterministically
+     * ordered label/type extras and executable observed patterns. JSON and TOON
+     * serializers consume the same structured facts; neither defines a second
+     * schema contract. */
+    cbm_sb_t sb;
+    cbm_sb_init(&sb);
+    int node_base_count = 0;
+    int edge_base_count = 0;
+    const char *const *node_base =
+        cbm_store_schema_node_base_properties(&node_base_count);
+    const char *const *edge_base =
+        cbm_store_schema_edge_base_properties(&edge_base_count);
+    char *node_base_text = schema_join_static_properties(node_base, node_base_count);
+    char *edge_base_text = schema_join_static_properties(edge_base, edge_base_count);
+    cbm_toon_scalar_str(&sb, "property_rule", "effective_properties=base_properties+extra_properties");
+    cbm_toon_scalar_int(&sb, "property_key_limit_per_label_or_type",
+                        CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT);
+    cbm_toon_scalar_int(&sb, "relationship_pattern_limit",
+                        CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT);
+    cbm_toon_scalar_str(&sb, "node_base_properties", node_base_text ? node_base_text : "");
+    const char *node_columns[] = {"label", "count", "extra_properties"};
+    cbm_toon_table_header(&sb, "node_labels", schema->node_label_count, node_columns, MCP_COL_3);
+    for (int i = 0; i < schema->node_label_count; i++) {
+        char *extra = schema_join_properties(schema->node_labels[i].properties,
+                                             schema->node_labels[i].property_count,
+                                             node_base, node_base_count, true);
+        cbm_toon_row_begin(&sb);
+        cbm_toon_cell_str(&sb, schema->node_labels[i].label, true);
+        cbm_toon_cell_int(&sb, schema->node_labels[i].count, false);
+        cbm_toon_cell_str(&sb, extra ? extra : "", false);
+        cbm_toon_row_end(&sb);
+        free(extra);
+    }
+    cbm_toon_scalar_str(&sb, "edge_base_properties", edge_base_text ? edge_base_text : "");
+    const char *edge_columns[] = {"type", "count", "extra_properties"};
+    cbm_toon_table_header(&sb, "edge_types", schema->edge_type_count, edge_columns, MCP_COL_3);
+    for (int i = 0; i < schema->edge_type_count; i++) {
+        char *extra = schema_join_properties(schema->edge_types[i].properties,
+                                             schema->edge_types[i].property_count,
+                                             edge_base, edge_base_count, true);
+        cbm_toon_row_begin(&sb);
+        cbm_toon_cell_str(&sb, schema->edge_types[i].type, true);
+        cbm_toon_cell_int(&sb, schema->edge_types[i].count, false);
+        cbm_toon_cell_str(&sb, extra ? extra : "", false);
+        cbm_toon_row_end(&sb);
+        free(extra);
+    }
+    const char *pattern_columns[] = {"match_pattern", "observed_count"};
+    cbm_toon_table_header(&sb, "relationship_patterns", schema->rel_pattern_count,
+                          pattern_columns, MCP_COL_2);
+    for (int i = 0; i < schema->rel_pattern_count; i++) {
+        char *match = schema_relationship_pattern_text(&schema->rel_patterns[i], true);
+        if (!match) {
+            free(node_base_text);
+            free(edge_base_text);
+            cbm_sb_free(&sb);
+            return NULL;
+        }
+        cbm_toon_row_begin(&sb);
+        cbm_toon_cell_str(&sb, match, true);
+        cbm_toon_cell_int(&sb, schema->rel_patterns[i].observed_count, false);
+        cbm_toon_row_end(&sb);
+        free(match);
+    }
+    free(node_base_text);
+    free(edge_base_text);
+
+    yyjson_mut_val *adr_present = yyjson_mut_obj_get(root, "adr_present");
+    if (adr_present && yyjson_mut_is_bool(adr_present)) {
+        cbm_toon_scalar_bool(&sb, "architecture_decision_record_present",
+                             yyjson_mut_get_bool(adr_present));
+    }
+    yyjson_mut_val *adr_hint = yyjson_mut_obj_get(root, "adr_hint");
+    if (adr_hint && yyjson_mut_is_str(adr_hint)) {
+        cbm_toon_scalar_str(&sb, "adr_hint", yyjson_mut_get_str(adr_hint));
+    }
+    schema_toon_append_freshness(&sb, root);
+    yyjson_mut_val *warnings = yyjson_mut_obj_get(root, "warnings");
+    if (warnings && yyjson_mut_is_arr(warnings)) {
+        const char *warning_columns[] = {"message"};
+        cbm_toon_table_header(&sb, "warnings", (int)yyjson_mut_arr_size(warnings),
+                              warning_columns, 1);
+        yyjson_mut_arr_iter iter;
+        yyjson_mut_val *warning = NULL;
+        yyjson_mut_arr_iter_init(warnings, &iter);
+        while ((warning = yyjson_mut_arr_iter_next(&iter))) {
+            cbm_toon_row_begin(&sb);
+            cbm_toon_cell_str(&sb, yyjson_mut_get_str(warning), true);
+            cbm_toon_row_end(&sb);
+        }
+    }
+    return cbm_sb_finish(&sb);
+}
+
 static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
+    if (response_format == CBM_MCP_OUTPUT_INVALID) {
+        return cbm_mcp_invalid_response_format();
+    }
     char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
@@ -4163,23 +4805,19 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     REQUIRE_STORE(store, project);
 
     cbm_store_overlay_node_view_summary_t overlay_summary = {0};
-    bool overlay_ready =
-        cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) == CBM_STORE_OK &&
-        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
     bool used_active_schema = false;
     bool active_schema_failed = false;
-
     cbm_schema_info_t schema = {0};
-    if (overlay_ready && cbm_store_get_schema_overlay_view(store, project, &schema) == CBM_STORE_OK) {
-        used_active_schema = true;
-    } else {
-        active_schema_failed = overlay_ready;
-        cbm_store_get_schema(store, project, &schema);
-    }
+    mcp_get_current_schema(store, project, MCP_CYPHER_FULL_QUERY_VOCABULARY, &schema,
+                           &overlay_summary, &used_active_schema, &active_schema_failed);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_int(doc, root, "property_key_limit_per_label_or_type",
+                           CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT);
+    yyjson_mut_obj_add_int(doc, root, "relationship_pattern_limit",
+                           CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT);
 
     yyjson_mut_val *labels = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.node_label_count; i++) {
@@ -4209,6 +4847,20 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     }
     yyjson_mut_obj_add_val(doc, root, "edge_types", types);
 
+    yyjson_mut_val *patterns = yyjson_mut_arr(doc);
+    for (int i = 0; i < schema.rel_pattern_count; i++) {
+        char *match = schema_relationship_pattern_text(&schema.rel_patterns[i], true);
+        yyjson_mut_val *pattern = yyjson_mut_obj(doc);
+        if (match) {
+            yyjson_mut_obj_add_strcpy(doc, pattern, "match_pattern", match);
+        }
+        yyjson_mut_obj_add_int(doc, pattern, "observed_count",
+                               schema.rel_patterns[i].observed_count);
+        yyjson_mut_arr_add_val(patterns, pattern);
+        free(match);
+    }
+    yyjson_mut_obj_add_val(doc, root, "relationship_patterns", patterns);
+
     /* SQLite is the canonical ADR backend shared by MCP and UI. Retain the
      * legacy file check so pre-migration installations still report truthfully. */
     bool adr_exists = store_has_adr(store, project);
@@ -4225,7 +4877,7 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
     if (!adr_exists) {
         yyjson_mut_obj_add_str(
             doc, root, "adr_hint",
-            "No ADR found. Use manage_adr(mode='update') to persist architectural "
+            "No architecture decision record (ADR) found. Use manage_adr(mode='update') to persist architectural "
             "decisions across MCP server runs. Run get_architecture(aspects=['all']) first.");
     }
 
@@ -4267,13 +4919,14 @@ static char *handle_get_graph_schema(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    char *json = yy_doc_to_str(doc);
+    char *payload = response_format == CBM_MCP_OUTPUT_TOON ? schema_to_toon(&schema, root)
+                                                           : yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     cbm_store_schema_free(&schema);
     free(project);
 
-    char *result = cbm_mcp_text_result(json, false);
-    free(json);
+    char *result = cbm_mcp_text_result(payload ? payload : "out of memory", payload == NULL);
+    free(payload);
     return result;
 }
 
@@ -5516,6 +6169,10 @@ static bool normalize_search_pattern(char **pattern, const char *field, char *er
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
+    if (response_format == CBM_MCP_OUTPUT_INVALID) {
+        return cbm_mcp_invalid_response_format();
+    }
     char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
@@ -5524,9 +6181,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
 
     /* TOON is the compact default; JSON remains available and is required
      * when connected-neighbor objects are requested. */
-    char *format_arg = cbm_mcp_get_string_arg(args, "format");
-    bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
-    free(format_arg);
+    bool legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
     if (cbm_mcp_get_bool_arg(args, "include_connected")) {
         legacy_json = true;
     }
@@ -6066,7 +6721,207 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* Bounded seen-set for hint accusations: dedups names across patterns,
+ * UNION branches, and EXISTS predicates, and skips re-probing duplicates.
+ * Capped at CBM_STORE_SCHEMA_HINT_VOCAB_LIMIT — names beyond it were never
+ * going to render usefully in the message anyway. Stores AST-owned pointers
+ * (label/type strings live in the parsed query), so the AST must outlive
+ * every hint_seen_add call — see the ast-lifetime note at its use site. */
+typedef struct {
+    const char *names[CBM_STORE_SCHEMA_HINT_VOCAB_LIMIT];
+    int count;
+} hint_seen_t;
+
+static bool hint_seen_add(hint_seen_t *seen, const char *name) {
+    for (int i = 0; i < seen->count; i++) {
+        if (strcmp(seen->names[i], name) == 0) {
+            return false; /* already handled */
+        }
+    }
+    if (seen->count < (int)(sizeof(seen->names) / sizeof(seen->names[0]))) {
+        seen->names[seen->count++] = name;
+    }
+    return true;
+}
+
+/* Recursively walks a WHERE expression tree for EXISTS predicate edge types.
+ * EXISTS { (var)-[:TYPE]->() } (op=="EXISTS") carries the type in cond.value
+ * (cypher.h); NULL means "any type" and is never probed. Appends
+ * comma-separated unobserved type names to `unknown`. */
+static void hint_walk_expr_exists_types(const cbm_expr_t *e, cbm_store_t *store,
+                                        const char *view_project, bool overlay_ready,
+                                        hint_seen_t *seen, cbm_sb_t *unknown,
+                                        int *unknown_count) {
+    if (!e) {
+        return;
+    }
+    if (e->type == EXPR_CONDITION) {
+        if (e->cond.op && strcmp(e->cond.op, "EXISTS") == 0 && e->cond.value &&
+            hint_seen_add(seen, e->cond.value) &&
+            !cbm_store_schema_type_observed(store, view_project, overlay_ready, e->cond.value)) {
+            cbm_sb_append(unknown, (*unknown_count)++ ? ", " : "");
+            cbm_sb_append(unknown, e->cond.value);
+        }
+        return;
+    }
+    hint_walk_expr_exists_types(e->left, store, view_project, overlay_ready, seen, unknown,
+                                unknown_count);
+    hint_walk_expr_exists_types(e->right, store, view_project, overlay_ready, seen, unknown,
+                                unknown_count);
+}
+
+static void hint_walk_where_exists_types(const cbm_where_clause_t *where, cbm_store_t *store,
+                                         const char *view_project, bool overlay_ready,
+                                         hint_seen_t *seen, cbm_sb_t *unknown,
+                                         int *unknown_count) {
+    if (!where) {
+        return;
+    }
+    hint_walk_expr_exists_types(where->root, store, view_project, overlay_ready, seen, unknown,
+                                unknown_count);
+}
+
+/* Appends up to CBM_STORE_SCHEMA_HINT_VOCAB_LIMIT observed labels then edge
+ * types from a counts-only (no json_each) schema read, so an "unknown
+ * label" hint also states what IS known. Never claims completeness. */
+/* Shared clamp/join/"(+more)" appender for hint_append_vocab_summary's two
+ * name lists (node labels, edge types) — kept as one bounded loop so wording
+ * for one list can never drift from the other. */
+static void hint_append_name_list(cbm_sb_t *msg, const char *title, int total,
+                                  const char *(*name_at)(const cbm_schema_info_t *, int),
+                                  const cbm_schema_info_t *schema) {
+    if (total <= 0) {
+        return;
+    }
+    int n = total < CBM_STORE_SCHEMA_HINT_VOCAB_LIMIT ? total : CBM_STORE_SCHEMA_HINT_VOCAB_LIMIT;
+    cbm_sb_append(msg, title);
+    for (int i = 0; i < n; i++) {
+        cbm_sb_append(msg, i ? ", " : "");
+        cbm_sb_append(msg, name_at(schema, i));
+    }
+    cbm_sb_append(msg, total > n ? " (+more)." : ".");
+}
+
+static const char *schema_label_at(const cbm_schema_info_t *s, int i) {
+    return s->node_labels[i].label;
+}
+
+static const char *schema_type_at(const cbm_schema_info_t *s, int i) {
+    return s->edge_types[i].type;
+}
+
+static void hint_append_vocab_summary(cbm_sb_t *msg, cbm_store_t *store, const char *view_project,
+                                      bool overlay_ready) {
+    cbm_schema_info_t schema = {0};
+    int rc = overlay_ready ? cbm_store_get_schema_counts_overlay_view(store, view_project, &schema)
+                           : cbm_store_get_schema_counts(store, view_project, &schema);
+    if (rc != CBM_STORE_OK) {
+        return;
+    }
+    hint_append_name_list(msg, " Known labels: ", schema.node_label_count, schema_label_at,
+                          &schema);
+    hint_append_name_list(msg, " Known edge types: ", schema.edge_type_count, schema_type_at,
+                          &schema);
+    cbm_store_schema_free(&schema);
+}
+
+/* Client/tool-neutral fallback used only when the just-executed query text
+ * cannot be reparsed for the vocabulary walk below. */
+static const char QUERY_GRAPH_NO_ROWS_FALLBACK_HINT[] =
+    "Query returned no results. Check that referenced labels, edge types, and "
+    "properties match the current project; the query_graph tool description "
+    "lists the current schema.";
+
+/* Self-healing zero-row hint: reparses the already-executed query
+ * (O(|query|); zero-row path only) and probes each referenced label/edge
+ * type with an indexed existence check against the SAME view the query ran
+ * on (canonical or active-overlay). Labels/types are called unobserved only
+ * on a definitive miss. Property names are never asserted unknown:
+ * discovery is capped (store.h) and observational, so property absence is
+ * unprovable here — fail open. Returns heap text the caller frees, or NULL
+ * to use the generic fallback hint above. */
+static char *query_graph_no_rows_hint(cbm_store_t *store, const char *view_project,
+                                      bool overlay_ready, const char *query) {
+    cbm_query_t *ast = NULL;
+    char *perr = NULL;
+    if (cbm_cypher_parse(query, &ast, &perr) != 0 || !ast) {
+        free(perr);
+        return NULL; /* executed queries reparse; degrade to generic hint */
+    }
+    if (ast->ret && ast->ret->limit == 0) {
+        cbm_query_free(ast); /* explicit LIMIT 0: zero rows by construction —
+                              * a vocabulary hint would be noise */
+        return NULL;
+    }
+
+    cbm_sb_t unknown;
+    cbm_sb_init(&unknown);
+    int unknown_count = 0;
+    /* Dedups names across patterns, UNION branches, and EXISTS predicates,
+     * and skips re-probing a name already resolved this call — otherwise
+     * "MATCH (a:Klass) MATCH (b:Klass) RETURN a" reads "Klass, Klass." to
+     * the calling model. */
+    hint_seen_t seen = {0};
+    for (const cbm_query_t *q = ast; q; q = q->union_next) {
+        for (int p = 0; p < q->pattern_count; p++) {
+            const cbm_pattern_t *pat = &q->patterns[p];
+            for (int n = 0; n < pat->node_count; n++) {
+                const char *label = pat->nodes[n].label;
+                if (label && hint_seen_add(&seen, label) &&
+                    !cbm_store_schema_label_observed(store, view_project, overlay_ready, label)) {
+                    cbm_sb_append(&unknown, unknown_count++ ? ", " : "");
+                    cbm_sb_append(&unknown, label);
+                }
+            }
+            for (int r = 0; r < pat->rel_count; r++) {
+                for (int t = 0; t < pat->rels[r].type_count; t++) {
+                    const char *type = pat->rels[r].types[t];
+                    if (type && hint_seen_add(&seen, type) &&
+                        !cbm_store_schema_type_observed(store, view_project, overlay_ready,
+                                                        type)) {
+                        cbm_sb_append(&unknown, unknown_count++ ? ", " : "");
+                        cbm_sb_append(&unknown, type);
+                    }
+                }
+            }
+        }
+        /* Edge types are also referenced OUTSIDE patterns: EXISTS predicates
+         * carry the type in cond.value. Walk both WHERE trees. */
+        hint_walk_where_exists_types(q->where, store, view_project, overlay_ready, &seen, &unknown,
+                                     &unknown_count);
+        hint_walk_where_exists_types(q->post_with_where, store, view_project, overlay_ready, &seen,
+                                     &unknown, &unknown_count);
+    }
+    cbm_query_free(ast);
+
+    cbm_sb_t msg;
+    cbm_sb_init(&msg);
+    if (unknown_count > 0) {
+        char *names = cbm_sb_finish(&unknown);
+        cbm_sb_append(&msg, "Unknown label or edge type: ");
+        cbm_sb_append(&msg, names ? names : "");
+        cbm_sb_append(&msg, ".");
+        free(names);
+        hint_append_vocab_summary(&msg, store, view_project, overlay_ready);
+        cbm_sb_append(&msg,
+                      " The query_graph tool description lists the current schema; "
+                      "request the tool list again if it may be out of date.");
+    } else {
+        cbm_sb_free(&unknown);
+        cbm_sb_append(&msg,
+                      "Query returned no results, but the referenced labels and edge types "
+                      "exist. A property name or value in a WHERE clause or other predicate "
+                      "may not match any row — verify property names and values against the "
+                      "schema in the query_graph tool description.");
+    }
+    return cbm_sb_finish(&msg);
+}
+
 static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
+    if (response_format == CBM_MCP_OUTPUT_INVALID) {
+        return cbm_mcp_invalid_response_format();
+    }
     /* B7: schema says "cypher" but handler read "query" — fix to read "cypher" first */
     char *query = cbm_mcp_get_string_arg(args, "cypher");
     if (!query) query = cbm_mcp_get_string_arg(args, "query"); /* backward compat */
@@ -6123,9 +6978,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
     cbm_store_overlay_node_view_summary_t overlay_summary = {0};
     bool overlay_ready =
-        !missed_graph && project &&
-        cbm_store_get_overlay_node_view_summary(store, project, &overlay_summary) == CBM_STORE_OK &&
-        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
+        !missed_graph && project && mcp_overlay_view_ready(store, project, &overlay_summary);
     bool used_active_cypher_nodes = false;
     cbm_cypher_result_t result = {0};
     int rc = overlay_ready
@@ -6144,9 +6997,7 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
 
     /* Preserve freshness diagnostics in JSON whenever overlays or dirty files
      * are involved; clean canonical queries use compact TOON by default. */
-    char *qg_format = cbm_mcp_get_string_arg(args, "format");
-    bool qg_legacy_json = qg_format && strcmp(qg_format, "json") == 0;
-    free(qg_format);
+    bool qg_legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
     int dirty_pending = 0;
     int dirty_overlay_ready = 0;
     bool has_dirty_counts =
@@ -6172,9 +7023,11 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_toon_scalar_str(&sb, "warning", result.warning);
         }
         if (result.row_count == 0) {
+            char *vocab_hint =
+                query_graph_no_rows_hint(store, cypher_project, overlay_ready, query);
             cbm_toon_scalar_str(&sb, "hint",
-                                "Query returned no results. Use get_graph_schema() to see "
-                                "available labels and edge types.");
+                                vocab_hint ? vocab_hint : QUERY_GRAPH_NO_ROWS_FALLBACK_HINT);
+            free(vocab_hint); /* TOON builder copies into the sb */
         }
         json = cbm_sb_finish(&sb);
     } else {
@@ -6205,10 +7058,14 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         }
 
         if (result.row_count == 0) {
-            yyjson_mut_obj_add_str(
-                doc, root, "hint",
-                "Query returned no results. Use get_graph_schema() to see available labels and "
-                "edge types.");
+            char *vocab_hint =
+                query_graph_no_rows_hint(store, cypher_project, overlay_ready, query);
+            /* add_strcpy: add_str stores the pointer without copying, and the
+             * heap hint is freed before yy_doc_to_str — that would be a
+             * use-after-free. */
+            yyjson_mut_obj_add_strcpy(doc, root, "hint",
+                                      vocab_hint ? vocab_hint : QUERY_GRAPH_NO_ROWS_FALLBACK_HINT);
+            free(vocab_hint);
         }
 
         add_query_graph_derived_warnings(doc, root, store, project, query, &result);
@@ -6577,6 +7434,14 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
     if (srv->watcher) {
         cbm_watcher_unwatch(srv->watcher, name);
     }
+    if (!is_error) {
+        /* The graph for `name` is gone (store closed / current_project freed
+         * above when it was the active project). A cached tools/list
+         * description could still advertise its schema. Never fires on the
+         * no-op/error path: nothing changed, so staling the cache would buy
+         * a full O(V+E+P) rediscovery for free. */
+        cbm_mcp_server_notify_index_published(srv);
+    }
 
     cbm_mem_collect(); /* return freed pages to OS after closing database */
 
@@ -6745,6 +7610,10 @@ static void arch_join_list(char *buf, size_t size, const char **items, int count
 }
 
 static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
+    if (response_format == CBM_MCP_OUTPUT_INVALID) {
+        return cbm_mcp_invalid_response_format();
+    }
     char *raw_project = get_store_project_arg(args);
     project_expand_t pe = {0};
     cbm_store_t *store = resolve_project_store(srv, raw_project, &pe);
@@ -6861,9 +7730,7 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
 
     /* Response encoding: TOON tables by default; format:"json" restores the
      * legacy per-item objects. */
-    char *arch_format = cbm_mcp_get_string_arg(args, "format");
-    bool arch_legacy_json = arch_format && strcmp(arch_format, "json") == 0;
-    free(arch_format);
+    bool arch_legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
 
     if (!arch_legacy_json) {
         cbm_sb_t sb;
@@ -6908,12 +7775,16 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             }
         }
         if (aspect_wanted(aspects_doc, aspects_arr, "routes") && schema.rel_pattern_count > 0) {
-            static const char *const pcols[] = {"pattern"};
-            cbm_toon_table_header(&sb, "relationship_patterns", schema.rel_pattern_count, pcols, 1);
+            static const char *const pcols[] = {"match_pattern", "observed_count"};
+            cbm_toon_table_header(&sb, "relationship_patterns", schema.rel_pattern_count, pcols,
+                                  MCP_COL_2);
             for (int i = 0; i < schema.rel_pattern_count; i++) {
+                char *match = schema_relationship_pattern_text(&schema.rel_patterns[i], true);
                 cbm_toon_row_begin(&sb);
-                cbm_toon_cell_str(&sb, schema.rel_patterns[i], true);
+                cbm_toon_cell_str(&sb, match ? match : "", true);
+                cbm_toon_cell_int(&sb, schema.rel_patterns[i].observed_count, false);
                 cbm_toon_row_end(&sb);
+                free(match);
             }
         }
         if (arch.language_count > 0) {
@@ -7177,7 +8048,11 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     if (aspect_wanted(aspects_doc, aspects_arr, "routes") && schema.rel_pattern_count > 0) {
         yyjson_mut_val *pats = yyjson_mut_arr(doc);
         for (int i = 0; i < schema.rel_pattern_count; i++) {
-            yyjson_mut_arr_add_str(doc, pats, schema.rel_patterns[i]);
+            char *display = schema_relationship_pattern_text(&schema.rel_patterns[i], false);
+            if (display) {
+                yyjson_mut_arr_add_strcpy(doc, pats, display);
+                free(display);
+            }
         }
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", pats);
     }
@@ -7781,6 +8656,10 @@ static int clamp_mcp_depth(int depth, const char *tool_name) {
 }
 
 static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
+    if (response_format == CBM_MCP_OUTPUT_INVALID) {
+        return cbm_mcp_invalid_response_format();
+    }
     char *func_name = cbm_mcp_get_string_arg(args, "function_name");
     char *qn_input = cbm_mcp_get_string_arg(args, "qualified_name"); /* cross-tool chaining */
     char *raw_project = get_store_project_arg(args);
@@ -8010,9 +8889,7 @@ static char *handle_trace_path(cbm_mcp_server_t *srv, const char *args) {
 
     /* Response encoding: TOON tables by default; format:"json" restores the
      * legacy verbose per-hop objects. */
-    char *trace_format = cbm_mcp_get_string_arg(args, "format");
-    bool trace_legacy_json = trace_format && strcmp(trace_format, "json") == 0;
-    free(trace_format);
+    bool trace_legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
 
     /* Extract edge_types here — after all early returns — to avoid memory leaks.
      * free_string_array(NULL) is NULL-safe.
@@ -8747,6 +9624,8 @@ void cbm_mcp_server_notify_index_published(cbm_mcp_server_t *srv) {
      * mid-query on the same handle. The request thread consumes the flag in
      * resolve_store()/resolve_resource_store() and closes/reopens there. */
     atomic_store(&srv->store_stale, true);
+    atomic_store(&srv->query_graph_tool_description_stale, true);
+    atomic_store(&srv->tools_list_changed_pending, true);
 }
 
 /* Request-thread half of the deferred invalidation above: close the cached
@@ -9298,6 +10177,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                 store, project_name, srv->config, graph_changed, deps_reindexed,
                 cbm_rank_refresh_publish_from_pipeline(publish_kind, incremental_fallback));
             CBM_PROF_END("index_repository", "rank_refresh", prof_index_rank_refresh);
+            /* In-process publish must meet the same freshness contract as the
+             * supervised worker path (which notifies at all its exits). */
+            cbm_mcp_server_notify_index_published(srv);
             CBM_PROF_START(prof_index_counts);
             int nodes = cbm_store_count_nodes(store, project_name);
             int edges = cbm_store_count_edges(store, project_name);
@@ -11089,6 +11971,10 @@ static bool compile_path_filter(const char *filter, cbm_regex_t *re) {
 }
 
 static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
+    cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
+    if (response_format == CBM_MCP_OUTPUT_INVALID) {
+        return cbm_mcp_invalid_response_format();
+    }
     char *pattern = cbm_mcp_get_string_arg(args, "pattern");
     char *project = get_project_arg(args);
     char *file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
@@ -11448,9 +12334,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
         get_dirty_file_counts(srv->store, project, &dirty_pending, &dirty_overlay_ready);
     }
 
-    char *sc_format = cbm_mcp_get_string_arg(args, "format");
-    bool sc_legacy_json = sc_format && strcmp(sc_format, "json") == 0;
-    free(sc_format);
+    bool sc_legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
     bool needs_freshness_json = overlay_ready_for_code || dirty_pending > 0 ||
                                 dirty_overlay_ready > 0;
     char *result = NULL;
@@ -12109,6 +12993,9 @@ static char *handle_index_dependencies(cbm_mcp_server_t *srv, const char *args) 
     /* Recompute rank views after adding dependency nodes unless the coupled
      * PageRank/LinkRank/node-degree capability is disabled. */
     (void)cbm_pagerank_compute_with_config(store, project, srv->config);
+    /* Dependency sub-projects and cross-boundary edges changed the queryable
+     * vocabulary (project.dep.* labels/types/patterns). */
+    cbm_mcp_server_notify_index_published(srv);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -12419,6 +13306,7 @@ static void *autoindex_thread(void *arg) {
                 cbm_rank_refresh_publish_from_pipeline(publish_kind, incremental_fallback));
             cbm_store_close(store);
         }
+        cbm_mcp_server_notify_index_published(srv);
 
         cbm_log_info("autoindex.done", "project", srv->session_project);
         register_watcher_if_enabled(srv);
@@ -12823,21 +13711,11 @@ static void build_resource_schema(yyjson_mut_doc *doc, yyjson_mut_val *root,
     }
 
     cbm_store_overlay_node_view_summary_t overlay_summary = {0};
-    bool overlay_ready =
-        proj && cbm_store_get_overlay_node_view_summary(store, proj, &overlay_summary) ==
-                    CBM_STORE_OK &&
-        cbm_store_overlay_node_view_has_ready_rows(&overlay_summary);
     bool used_active_schema = false;
     bool active_schema_failed = false;
-
     cbm_schema_info_t schema = {0};
-    if (overlay_ready &&
-        cbm_store_get_schema_counts_overlay_view(store, proj, &schema) == CBM_STORE_OK) {
-        used_active_schema = true;
-    } else {
-        active_schema_failed = overlay_ready;
-        cbm_store_get_schema_counts(store, proj, &schema);
-    }
+    mcp_get_current_schema(store, proj, MCP_CYPHER_MATCH_VOCABULARY, &schema,
+                           &overlay_summary, &used_active_schema, &active_schema_failed);
 
     yyjson_mut_val *label_arr = yyjson_mut_arr(doc);
     for (int i = 0; i < schema.node_label_count; i++) {
@@ -13025,7 +13903,7 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         add_overlay_active_architecture_freshness(
             doc, root, store, proj, true, true, true, false,
             "codebase://architecture used active overlay node rows for languages, entry_points, "
-            "and routes; total_nodes, total_edges, key_functions, and relationship_patterns "
+            "routes, and relationship_patterns; total_nodes, total_edges, and key_functions "
             "remain canonical or stale until active views or compaction are available.");
     bool overlay_limitation_reported =
         !active_architecture_reported &&
@@ -13086,13 +13964,23 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         free(sql);
     }
 
-    /* Relationship patterns from schema */
+    /* Relationship patterns from schema. Counts-only: the counts variant
+     * collects rel_patterns too (the pattern join sits outside the with_props
+     * gates in get_schema_impl), and this resource never displays property
+     * keys — so the full json_each discovery would be pure waste here.
+     * Overlay-aware via the shared selector, matching every other MCP schema
+     * surface. */
     cbm_schema_info_t schema = {0};
-    cbm_store_get_schema(store, proj, &schema);
+    mcp_get_current_schema(store, proj, MCP_CYPHER_MATCH_VOCABULARY, &schema, NULL, NULL,
+                           NULL);
     if (schema.rel_pattern_count > 0) {
         yyjson_mut_val *rp_arr = yyjson_mut_arr(doc);
         for (int i = 0; i < schema.rel_pattern_count; i++) {
-            yyjson_mut_arr_add_strcpy(doc, rp_arr, schema.rel_patterns[i]);
+            char *display = schema_relationship_pattern_text(&schema.rel_patterns[i], false);
+            if (display) {
+                yyjson_mut_arr_add_strcpy(doc, rp_arr, display);
+                free(display);
+            }
         }
         yyjson_mut_obj_add_val(doc, root, "relationship_patterns", rp_arr);
     }
@@ -13466,6 +14354,30 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     return out;
 }
 
+/* Best-effort tools/list_changed delivery: correctness never depends on
+ * this (query_graph_no_rows_hint self-heals a stale description). Never
+ * emit before the client has received at least one tools/list response.
+ * The server tracks no explicit MCP `initialize`-handshake-complete state,
+ * so "query_graph_tool_description built" — set only inside a served
+ * tools/list — is the narrowest existing proxy for that gate. */
+static bool mcp_tools_list_already_served(const cbm_mcp_server_t *srv) {
+    return srv && srv->query_graph_tool_description != NULL;
+}
+
+/* Drain a pending list_changed notification strictly AFTER the response
+ * write so notification and response bytes never interleave (single-
+ * threaded writes preserved: background publication threads only ever set
+ * the flag via cbm_mcp_server_notify_index_published; only the request
+ * thread reaches this drain and calls send_notification). The
+ * atomic_exchange coalesces any burst of publications into one
+ * notification, and a client relist does not itself re-set the flag. */
+static void mcp_drain_tools_list_changed(cbm_mcp_server_t *srv) {
+    if (mcp_tools_list_already_served(srv) &&
+        atomic_exchange(&srv->tools_list_changed_pending, false)) {
+        send_notification(srv, "notifications/tools/list_changed");
+    }
+}
+
 /* Handle a Content-Length-framed message (LSP-style transport).
  * Reads headers, body, processes request, writes framed response. */
 static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *out, char **line,
@@ -13495,6 +14407,7 @@ static void handle_content_length_frame(cbm_mcp_server_t *srv, FILE *in, FILE *o
     if (resp) {
         write_protocol_json(out, resp, true);
         free(resp);
+        mcp_drain_tools_list_changed(srv);
     }
 }
 
@@ -13642,6 +14555,10 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
             srv->out_content_length_framed = false;
             write_protocol_json(out, resp, false);
             free(resp);
+            /* Drain AFTER the response so notification and response bytes
+             * never interleave; single-threaded writes preserved
+             * (background threads only ever set the pending flag). */
+            mcp_drain_tools_list_changed(srv);
         }
     }
 
