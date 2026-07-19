@@ -2524,6 +2524,50 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
         }
         return NULL;
     }
+    // VB.NET: `Inherits A` / `Implements I1, I2` clauses are children of the
+    // class/interface/structure block; each clause holds `type` children.
+    // Generic `(Of T)` suffixes are stripped like the '<' strip elsewhere.
+    if (lang == CBM_LANG_VISUALBASIC) {
+        const char *bases[MAX_BASES];
+        int base_count = 0;
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
+            TSNode clause = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(clause);
+            if (strcmp(ck, "inherits_clause") != 0 && strcmp(ck, "implements_clause") != 0) {
+                continue;
+            }
+            uint32_t tc = ts_node_named_child_count(clause);
+            for (uint32_t j = 0; j < tc && base_count < MAX_BASES_MINUS_1; j++) {
+                TSNode ty = ts_node_named_child(clause, j);
+                if (strcmp(ts_node_type(ty), "type") != 0) {
+                    continue;
+                }
+                char *base = cbm_node_text(a, ty, source);
+                if (base && base[0]) {
+                    char *paren = strchr(base, '(');
+                    if (paren) {
+                        *paren = '\0';
+                    }
+                    if (base[0]) {
+                        bases[base_count++] = base;
+                    }
+                }
+            }
+        }
+        if (base_count > 0) {
+            const char **result =
+                (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
+            if (result) {
+                for (int i = 0; i < base_count; i++) {
+                    result[i] = bases[i];
+                }
+                result[base_count] = NULL;
+                return result;
+            }
+        }
+        return NULL;
+    }
     // Languages whose heritage is not exposed via a tree-sitter field need
     // dedicated walkers; the generic field/keyword path mis-captures them.
     if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
@@ -4301,6 +4345,17 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             label = "Interface";
         }
     }
+    // VB.NET: the block-kind names are grammar-specific (interface_block,
+    // enum_block); Module/Structure blocks stay "Class" (a VB Module is a
+    // static-class-like container; Structure matches the C# struct→Class
+    // labeling so .NET sibling languages agree).
+    if (ctx->language == CBM_LANG_VISUALBASIC) {
+        if (strcmp(kind, "interface_block") == 0) {
+            label = "Interface";
+        } else if (strcmp(kind, "enum_block") == 0) {
+            label = "Enum";
+        }
+    }
     // Rust/Swift/D: a struct is a distinct kind from a class — emit the precise
     // "Struct" label rather than collapsing it to "Class". Scoped to these three
     // grammar/LSP languages. Rust's struct node is `struct_item`; D's is
@@ -4463,6 +4518,11 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     // Squirrel: class_declaration has no body field — member_declaration nodes
     // (each wrapping a function_declaration) are direct children of the class.
     if (lang == CBM_LANG_SQUIRREL) {
+        return class_node;
+    }
+    // VB.NET: class_block/module_block/structure_block/interface_block have no
+    // body wrapper — member declarations are direct children of the block node.
+    if (lang == CBM_LANG_VISUALBASIC) {
         return class_node;
     }
     // Smali: field_definition nodes are direct children of class_definition (no
@@ -4643,6 +4703,11 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     return null_node;
 }
 
+// Push a single method definition with a pre-resolved name (for members whose
+// name is not a tree node, e.g. VB.NET `Sub New` constructors).
+static void push_method_def_named(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
+                                  const char *class_qn, const CBMLangSpec *spec, char *name);
+
 // Push a single method definition
 static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
                             const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
@@ -4652,6 +4717,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (!name || !name[0]) {
         return;
     }
+    push_method_def_named(ctx, child, class_node, class_qn, spec, name);
+}
+
+static void push_method_def_named(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
+                                  const char *class_qn, const CBMLangSpec *spec, char *name) {
+    CBMArena *a = ctx->arena;
 
     const char *method_qn = cbm_arena_sprintf(a, "%s.%s", class_qn, name);
 
@@ -4841,6 +4912,15 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             if (!ts_node_is_null(constructor_name)) {
                 push_method_def(ctx, method_node, class_node, class_qn, spec, constructor_name);
             }
+            continue;
+        }
+
+        // VB.NET: `Sub New` constructors carry no name node (the New keyword is
+        // an anonymous token) — emit as Method "New" under the class QN.
+        if (ctx->language == CBM_LANG_VISUALBASIC &&
+            strcmp(ts_node_type(method_node), "constructor_declaration") == 0) {
+            char *ctor_name = cbm_arena_sprintf(ctx->arena, "New");
+            push_method_def_named(ctx, method_node, class_node, class_qn, spec, ctor_name);
             continue;
         }
 
@@ -6517,6 +6597,69 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
             }
         }
 
+        /* VB.NET shapes:
+         *   - field_declaration > variable_declarator(name, as_clause(type)) —
+         *     possibly several declarators per line (`Dim a, b As Integer`)
+         *   - property_declaration carries name + as_clause directly.
+         * The declared type lives inside the as_clause, not a "type" field on
+         * the declaration node, so the generic paths below never match. */
+        if (ctx->language == CBM_LANG_VISUALBASIC) {
+            const char *ck = ts_node_type(child);
+            uint32_t vnc = ts_node_named_child_count(child);
+            for (uint32_t k = 0; k < vnc; k++) {
+                TSNode part = ts_node_named_child(child, k);
+                TSNode vb_name_node = {0};
+                TSNode holder = part;
+                if (strcmp(ck, "property_declaration") == 0) {
+                    /* One def per property: name + as_clause are on `child`. */
+                    vb_name_node = ts_node_child_by_field_name(child, TS_FIELD("name"));
+                    holder = child;
+                } else if (strcmp(ts_node_type(part), "variable_declarator") == 0) {
+                    vb_name_node = ts_node_child_by_field_name(part, TS_FIELD("name"));
+                } else {
+                    continue;
+                }
+                if (ts_node_is_null(vb_name_node)) {
+                    continue;
+                }
+                char *vb_name = cbm_node_text(a, vb_name_node, ctx->source);
+                if (!vb_name || !vb_name[0]) {
+                    continue;
+                }
+                char *vb_type = NULL;
+                TSNode asc = cbm_find_child_by_kind(holder, "as_clause");
+                if (!ts_node_is_null(asc)) {
+                    TSNode ty = ts_node_child_by_field_name(asc, TS_FIELD("type"));
+                    if (ts_node_is_null(ty)) {
+                        /* `As New T(...)` shorthand: type is inside the new field */
+                        TSNode nw = ts_node_child_by_field_name(asc, TS_FIELD("new"));
+                        if (!ts_node_is_null(nw)) {
+                            ty = ts_node_child_by_field_name(nw, TS_FIELD("type"));
+                        }
+                    }
+                    if (!ts_node_is_null(ty)) {
+                        vb_type = cbm_node_text(a, ty, ctx->source);
+                    }
+                }
+                CBMDefinition vdef;
+                memset(&vdef, 0, sizeof(vdef));
+                vdef.name = vb_name;
+                vdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, vb_name);
+                vdef.label = "Field";
+                vdef.file_path = ctx->rel_path;
+                vdef.parent_class = class_qn;
+                vdef.return_type = vb_type;
+                vdef.start_line = ts_node_start_point(child).row + TS_LINE_OFFSET;
+                vdef.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
+                vdef.is_exported = cbm_is_exported(vb_name, ctx->language);
+                cbm_defs_push(&ctx->result->defs, a, vdef);
+                if (strcmp(ck, "property_declaration") == 0) {
+                    break; /* single def; do not repeat per accessor child */
+                }
+            }
+            continue;
+        }
+
         /* Locate the field's "type" + name node. Two shapes:
          *   - direct (Java/Go/Rust/C/C++):
          *       field_declaration .type=identifier .declarator=variable_declarator(.name)
@@ -6876,7 +7019,12 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
      * independent spelling list omitted valid containers such as Scala's
      * `template_body` and Solidity's contract body.  Methods were extracted
      * once by extract_class_methods(), then the generic walk descended through
-     * the unrecognized body and extracted them again as free functions. */
+     * the unrecognized body and extracted them again as free functions.
+     * VB.NET's class_block/module_block/etc. have no body wrapper — this
+     * already routes through find_class_body's CBM_LANG_VISUALBASIC branch,
+     * which returns the class node itself, so push_nested_class_nodes below
+     * runs on `node` directly and members are not re-walked (and
+     * double-extracted) as top-level functions by the fallback below. */
     /* Smali's class node is itself the member container.  Method extraction
      * currently preserves Smali's established file-level Function contract,
      * so the generic walk must still visit those direct method_definition
