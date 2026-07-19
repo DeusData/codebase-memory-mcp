@@ -6550,8 +6550,10 @@ TEST(cli_config_registry_includes_query_max_rows) {
     ASSERT_NOT_NULL(found);
     ASSERT_STR_EQ(found->default_val, CBM_DEFAULT_QUERY_MAX_ROWS_STR);
     ASSERT_STR_EQ(found->range, "0-1000000");
+    ASSERT_NOT_NULL(strstr(found->description, "result-row cap"));
     ASSERT_NOT_NULL(strstr(found->description, "query_graph"));
-    ASSERT_NOT_NULL(strstr(found->guidance, "upstream"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "without changing which rows match"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "may lower but not bypass this cap"));
     PASS();
 }
 
