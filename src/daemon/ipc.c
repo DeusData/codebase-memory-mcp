@@ -3248,6 +3248,7 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
 #endif
 #include <windows.h>
 #include <aclapi.h>
+#include <sddl.h>
 #include <fcntl.h>
 #include <io.h>
 #include <shlobj.h>
@@ -3961,9 +3962,18 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
                 : security->is_well_known_sid((PSID)sid, WinWorldSid)       ? "Everyone"
                 : security->is_well_known_sid((PSID)sid, WinInteractiveSid) ? "INTERACTIVE"
                                                                             : "other";
+            /* Print the raw SID too: an "other" class is a specific account,
+             * and only its string form identifies the harness/profile leak. */
+            wchar_t *sid_text = NULL;
+            char sid_utf8[96] = "<unprintable>";
+            if (ConvertSidToStringSidW((PSID)sid, &sid_text) && sid_text) {
+                (void)WideCharToMultiByte(CP_UTF8, 0, sid_text, -1, sid_utf8, (int)sizeof(sid_utf8),
+                                          NULL, NULL);
+                LocalFree(sid_text);
+            }
             ipc_validation_detail_set(
-                "DACL entry %lu grants mutation rights 0x%08lx to untrusted identity (%s)",
-                (unsigned long)index, (unsigned long)(ace->Mask & mutation), sid_class);
+                "DACL entry %lu grants mutation rights 0x%08lx to untrusted identity (%s %s)",
+                (unsigned long)index, (unsigned long)(ace->Mask & mutation), sid_class, sid_utf8);
             secure = false;
         }
     }
