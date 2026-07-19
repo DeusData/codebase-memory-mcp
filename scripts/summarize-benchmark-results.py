@@ -24,6 +24,14 @@ def percentile(values: list[float], quantile: float) -> float | None:
     return float(ordered[index])
 
 
+def repeated_query_elapsed_ms(oracle: dict[str, Any]) -> float | None:
+    summary = oracle.get("repeated_json_latency_ms")
+    if isinstance(summary, dict) and isinstance(summary.get("median"), (int, float)):
+        return float(summary["median"])
+    elapsed = oracle.get("elapsed_ms")
+    return float(elapsed) if isinstance(elapsed, (int, float)) else None
+
+
 def ratio(passed: int, applicable: int) -> str:
     return f"{passed}/{applicable}" if applicable else "n/a"
 
@@ -741,6 +749,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     speedups: list[float] = []
     peak_rss: list[int] = []
     query_latency_ms: list[float] = []
+    cold_query_latency_ms: list[float] = []
     query_response_bytes: list[float] = []
     query_response_tokens: list[float] = []
     quality_passed = 0
@@ -845,7 +854,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
                 if not isinstance(oracle, dict):
                     continue
                 if isinstance(oracle.get("elapsed_ms"), (int, float)):
-                    query_latency_ms.append(float(oracle["elapsed_ms"]))
+                    cold_query_latency_ms.append(float(oracle["elapsed_ms"]))
+                repeated_elapsed = repeated_query_elapsed_ms(oracle)
+                if repeated_elapsed is not None:
+                    query_latency_ms.append(repeated_elapsed)
                 if isinstance(oracle.get("response_bytes"), (int, float)):
                     query_response_bytes.append(float(oracle["response_bytes"]))
                 if isinstance(oracle.get("response_token_estimate"), (int, float)):
@@ -859,7 +871,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             if not isinstance(response_quality, dict):
                 continue
             if isinstance(response_quality.get("elapsed_ms"), (int, float)):
-                query_latency_ms.append(float(response_quality["elapsed_ms"]))
+                cold_query_latency_ms.append(float(response_quality["elapsed_ms"]))
+            repeated_elapsed = repeated_query_elapsed_ms(response_quality)
+            if repeated_elapsed is not None:
+                query_latency_ms.append(repeated_elapsed)
             if isinstance(response_quality.get("response_bytes"), (int, float)):
                 query_response_bytes.append(float(response_quality["response_bytes"]))
             if isinstance(
@@ -1097,6 +1112,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "query_response_p50_bytes": percentile(query_response_bytes, 0.50),
         "query_response_p50_tokens": percentile(query_response_tokens, 0.50),
         "query_latency_p50_ms": percentile(query_latency_ms, 0.50),
+        "cold_query_latency_p50_ms": percentile(cold_query_latency_ms, 0.50),
         "query_observations": len(query_latency_ms),
         "query_range_ms": (min(query_latency_ms), max(query_latency_ms))
         if query_latency_ms
@@ -1805,9 +1821,10 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
         "",
         "| Candidate | Decision | Overall quality† | Retrieval MRR | Pair F1 | Hit@1 | Hit@5 | nDCG@5 | "
         "Core graph | Full graph freshness | Task success | Evidence counts (R/Core/Full/S) | "
-        "Response p50 bytes | Response p50 tokens* | Query p50 ms | Incremental p50 ms | "
+        "Response p50 bytes | Response p50 tokens* | Cold/default query p50 ms | "
+        "Repeated JSON query p50 ms | Incremental p50 ms | "
         "Peak RSS MB | Pareto |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in rows:
         lines.append(
@@ -1831,6 +1848,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
                     ),
                     display(row["query_response_p50_bytes"]),
                     display(row["query_response_p50_tokens"]),
+                    display(row["cold_query_latency_p50_ms"]),
                     display(row["query_latency_p50_ms"]),
                     display(row["incremental_p50_ms"]),
                     display(row["peak_rss_mb"]),
@@ -1996,7 +2014,8 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "## Observation ranges",
             "",
             "| Candidate | Incremental n | Incremental p50 ms | Incremental min–max ms | "
-            "Query n | Query p50 ms | Query min–max ms | Full n | Full p50 ms | Full min–max ms |",
+            "Query n | Repeated JSON query p50 ms | Repeated JSON min–max ms | "
+            "Full n | Full p50 ms | Full min–max ms |",
             "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
         )
     )

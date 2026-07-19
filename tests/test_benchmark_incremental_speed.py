@@ -1624,6 +1624,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self,
     ) -> None:
         class FakeClient:
+            def __init__(self):
+                self.quality_calls = []
+
             def call_tool_text(self, name, arguments):
                 self.default_call = (name, arguments)
                 return (
@@ -1634,8 +1637,9 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
                 )
 
             def call_tool(self, name, arguments):
-                self.quality_call = (name, arguments)
-                return {"results": [{"name": "alpha"}]}, "quality log", 654, 2.5
+                self.quality_calls.append((name, arguments))
+                elapsed = (2.5, 0.5, 0.75)[len(self.quality_calls) - 1]
+                return {"results": [{"name": "alpha"}]}, "quality log", 654, elapsed
 
         client = FakeClient()
         result = BENCHMARK.run_mcp_tool_call(
@@ -1646,11 +1650,22 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             client.default_call, ("search_graph", {"name_pattern": "alpha"})
         )
         self.assertEqual(
-            client.quality_call,
-            ("search_graph", {"name_pattern": "alpha", "format": "json"}),
+            client.quality_calls,
+            [
+                ("search_graph", {"name_pattern": "alpha", "format": "json"}),
+                ("search_graph", {"name_pattern": "alpha", "format": "json"}),
+                ("search_graph", {"name_pattern": "alpha", "format": "json"}),
+            ],
         )
         self.assertEqual(result["elapsed_ms"], 7.25)
         self.assertEqual(result["quality_probe_elapsed_ms"], 2.5)
+        self.assertEqual(result["repeated_json_trials_ms"], [2.5, 0.5, 0.75])
+        self.assertEqual(
+            result["repeated_json_latency_ms"],
+            {"count": 3, "min": 0.5, "median": 0.75, "max": 2.5},
+        )
+        self.assertTrue(result["repeated_json_payloads_byte_equal"])
+        self.assertEqual(len(result["repeated_json_response_sha256"]), 3)
         self.assertEqual(result["transport_response_bytes"], 321)
         self.assertEqual(result["response_encoding"], "tool_default")
         self.assertEqual(result["response"]["results"][0]["name"], "alpha")

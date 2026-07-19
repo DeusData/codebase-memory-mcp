@@ -27,6 +27,43 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_query_summary_separates_cold_default_from_repeated_json_latency(
+        self,
+    ) -> None:
+        item = report(
+            {
+                "passed": True,
+                "initial_fast_full": {"elapsed_ms": 100},
+                "incremental": {"elapsed_ms": 10},
+                "fresh_fast_full_after_change": {"elapsed_ms": 90},
+                "canonical_graph": {"equal": True},
+                "graph_gate": {"passed": True},
+                "oracles": {
+                    "probe": {
+                        "elapsed_ms": 120.0,
+                        "repeated_json_latency_ms": {
+                            "count": 3,
+                            "min": 2.0,
+                            "median": 3.0,
+                            "max": 90.0,
+                        },
+                        "response_bytes": 80,
+                    },
+                    "quality": {
+                        "applicable_count": 1,
+                        "passed_count": 1,
+                        "score": 1.0,
+                    },
+                    "passed": True,
+                },
+            }
+        )
+
+        row = SUMMARY.summarize_group("candidate", [item])
+
+        self.assertEqual(row["cold_query_latency_p50_ms"], 120.0)
+        self.assertEqual(row["query_latency_p50_ms"], 3.0)
+
     def test_semantic_pair_lifecycle_reports_expected_deferred_freshness_without_failure(
         self,
     ) -> None:
