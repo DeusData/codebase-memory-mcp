@@ -2092,6 +2092,23 @@ def declared_stale_views(oracles: dict[str, Any]) -> list[str]:
     return sorted(views)
 
 
+def persisted_stale_views(db_path: Path, project: str) -> list[str]:
+    """Read global derived-view state from the canonical SQLite freshness ledger."""
+    uri = f"{db_path.resolve().as_uri()}?mode=ro"
+    try:
+        with closing(sqlite3.connect(uri, uri=True)) as con:
+            rows = con.execute(
+                "SELECT view_name FROM derived_view_state "
+                "WHERE project = ? AND status = 'stale' ORDER BY view_name",
+                (project,),
+            )
+            return [str(row[0]) for row in rows if row[0]]
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
+
+
 def is_incremental_publish_kind(publish_kind: str) -> bool:
     return publish_kind in {
         PUBLISH_INCREMENTAL_NOOP,
@@ -5399,7 +5416,10 @@ def run_self_dogfood_case(
             )
         full_db = find_project_db(cache_dir)
         canonical = compare_canonical_graph(incremental_snapshot, full_db, project)
-        stale_views = declared_stale_views(oracles)
+        stale_views = sorted(
+            set(declared_stale_views(oracles))
+            | set(persisted_stale_views(incremental_snapshot, project))
+        )
         freshness_scoped = compare_graph_excluding_declared_stale_views(
             incremental_snapshot, full_db, project, stale_views
         )
