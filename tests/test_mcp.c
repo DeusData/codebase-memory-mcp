@@ -1319,10 +1319,12 @@ TEST(tool_get_graph_schema_uses_ready_overlay_schema) {
     ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
               CBM_STORE_OK);
 
+    /* format=json: this test pins the legacy JSON schema shape (escaped
+     * "label":"Class" etc below); default_response_format is toon. */
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"get_graph_schema\","
-             "\"arguments\":{\"project\":\"graph-schema-overlay\"}}}");
+             "\"arguments\":{\"project\":\"graph-schema-overlay\",\"format\":\"json\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NULL(strstr(resp, "\\\"label\\\":\\\"Function\\\""));
     ASSERT_NOT_NULL(strstr(resp, "\\\"label\\\":\\\"Class\\\""));
@@ -1338,6 +1340,87 @@ TEST(tool_get_graph_schema_uses_ready_overlay_schema) {
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
 
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* T14 (schema call-graph audit 2026-07-19): the first-response _context must
+ * read the same overlay-aware view as query_graph and get_graph_schema. RED
+ * against the pre-fix inject_context_once, which read canonical-only
+ * cbm_store_get_schema and could advertise a label (Function below) whose
+ * rows are all tombstoned in the active overlay — vocabulary query_graph
+ * would then contradict on the very next call. Same overlay fixture shape as
+ * tool_get_graph_schema_uses_ready_overlay_schema above. */
+TEST(first_response_context_uses_ready_overlay_schema) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "context-overlay";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/context-overlay"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_mcp_server_set_session_project(srv, proj);
+
+    cbm_node_t old_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "OldContextSchema",
+                         .qualified_name = "context.overlay.OldContextSchema",
+                         .file_path = "src/main.c"};
+    cbm_node_t stable = {.project = proj,
+                         .label = "Class",
+                         .name = "StableContextSchema",
+                         .qualified_name = "context.overlay.StableContextSchema",
+                         .file_path = "src/stable.c"};
+    int64_t old_fn_id = cbm_store_upsert_node(st, &old_fn);
+    int64_t stable_id = cbm_store_upsert_node(st, &stable);
+    ASSERT_GT(old_fn_id, 0);
+    ASSERT_GT(stable_id, 0);
+    cbm_edge_t old_edge = {.project = proj,
+                           .source_id = old_fn_id,
+                           .target_id = stable_id,
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &old_edge), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_class = {.project = proj,
+                              .label = "Class",
+                              .name = "FreshContextSchema",
+                              .qualified_name = "context.overlay.FreshContextSchema",
+                              .file_path = "src/main.c",
+                              .properties_json = "{}"};
+    cbm_store_delta_edge_t fresh_edge = {.source_qn = "context.overlay.FreshContextSchema",
+                                         .target_qn = "context.overlay.StableContextSchema",
+                                         .type = "HANDLES",
+                                         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &fresh_class,
+                                    .node_count = 1,
+                                    .edges = &fresh_edge,
+                                    .edge_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    /* Zero-match pattern: results stay empty so every label/type string in
+     * the response comes from _context, not from result rows. format=json
+     * pins the legacy _context shape. */
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"name_pattern\":\"zzz_no_such_symbol\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\\\"_context\\\":"));
+    /* Overlay view: Function rows are tombstoned, CALLS edge lost its
+     * source; Class and HANDLES are the active vocabulary. */
+    ASSERT_NOT_NULL(strstr(resp, "Class"));
+    ASSERT_NOT_NULL(strstr(resp, "HANDLES"));
+    ASSERT_NULL(strstr(resp, "\\\"label\\\":\\\"Function\\\""));
+    ASSERT_NULL(strstr(resp, "CALLS"));
+    free(resp);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -4538,7 +4621,10 @@ TEST(resource_architecture_uses_ready_overlay_summaries) {
     ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"mixed_active_nodes_canonical_summaries\\\""));
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_sections\\\":[\\\"languages\\\",\\\"entry_points\\\",\\\"routes\\\"]"));
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
-    ASSERT_NOT_NULL(strstr(resp, "total_nodes, total_edges, key_functions, and relationship_patterns"));
+    /* relationship_patterns moved to the overlay-aware selector (ISSUE-4);
+     * the disclosure must list only the summaries that stay canonical. */
+    ASSERT_NOT_NULL(strstr(resp, "routes, and relationship_patterns"));
+    ASSERT_NOT_NULL(strstr(resp, "total_nodes, total_edges, and key_functions"));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -4590,6 +4676,79 @@ TEST(resource_schema_uses_ready_overlay_counts) {
     ASSERT_NOT_NULL(strstr(resp, "\\\"read_model\\\":\\\"overlay_active_graph\\\""));
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_sections\\\":[\\\"node_labels\\\",\\\"edge_types\\\"]"));
     ASSERT_NOT_NULL(strstr(resp, "\\\"active_file_tombstones\\\":1"));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* T15 (schema call-graph audit 2026-07-19): codebase://architecture's
+ * relationship_patterns must come from the overlay-aware selector. RED
+ * against the pre-fix build_resource_architecture, which read canonical-only
+ * cbm_store_get_schema and would advertise a (Function)-[CALLS]->(Class)
+ * pattern whose only source row is tombstoned in the active overlay. */
+TEST(resource_arch_rel_patterns_use_ready_overlay) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *proj = "resource-arch-patterns-overlay";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/resource-arch-patterns-overlay"),
+              CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    cbm_node_t old_fn = {.project = proj,
+                         .label = "Function",
+                         .name = "OldPatternSource",
+                         .qualified_name = "resource.arch.patterns.OldPatternSource",
+                         .file_path = "src/main.c"};
+    cbm_node_t stable = {.project = proj,
+                         .label = "Class",
+                         .name = "StablePatternTarget",
+                         .qualified_name = "resource.arch.patterns.StablePatternTarget",
+                         .file_path = "src/stable.c"};
+    int64_t old_fn_id = cbm_store_upsert_node(st, &old_fn);
+    int64_t stable_id = cbm_store_upsert_node(st, &stable);
+    ASSERT_GT(old_fn_id, 0);
+    ASSERT_GT(stable_id, 0);
+    cbm_edge_t old_edge = {.project = proj,
+                           .source_id = old_fn_id,
+                           .target_id = stable_id,
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &old_edge), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(st, proj, 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_node_t fresh_class = {.project = proj,
+                              .label = "Class",
+                              .name = "FreshPatternSource",
+                              .qualified_name = "resource.arch.patterns.FreshPatternSource",
+                              .file_path = "src/main.c",
+                              .properties_json = "{}"};
+    cbm_store_delta_edge_t fresh_edge = {.source_qn = "resource.arch.patterns.FreshPatternSource",
+                                         .target_qn = "resource.arch.patterns.StablePatternTarget",
+                                         .type = "HANDLES",
+                                         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_store_file_delta_t delta = {.project = proj,
+                                    .rel_path = "src/main.c",
+                                    .generation = 1,
+                                    .nodes = &fresh_class,
+                                    .node_count = 1,
+                                    .edges = &fresh_edge,
+                                    .edge_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(st, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":101,\"method\":\"resources/read\","
+             "\"params\":{\"uri\":\"codebase://architecture\"}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"contents\""));
+    /* Active-view pattern present; tombstoned-source pattern absent. */
+    ASSERT_NOT_NULL(strstr(resp, "HANDLES"));
+    ASSERT_NULL(strstr(resp, "CALLS"));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -6058,8 +6217,11 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     ASSERT_NULL(strstr(resp, "\"isError\":true"));
     free(resp);
 
-    /* ADR presence metadata must read the same canonical SQLite backend. */
-    resp = cbm_mcp_handle_tool(srv, "get_graph_schema", "{\"project\":\"adr-unify\"}");
+    /* ADR presence metadata must read the same canonical SQLite backend.
+     * format=json: this test pins the legacy JSON "adr_present" shape;
+     * default_response_format is toon. */
+    resp = cbm_mcp_handle_tool(srv, "get_graph_schema",
+                               "{\"project\":\"adr-unify\",\"format\":\"json\"}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\\\"adr_present\\\":true"));
     ASSERT_NULL(strstr(resp, "adr_hint"));
@@ -8142,6 +8304,596 @@ TEST(mcp_hidden_tools_reveal_frames_list_changed) {
     fclose(in_fp);
     PASS();
 }
+
+/* RED against the pre-Change-2 cbm_mcp_server_notify_index_published, which
+ * only marked cache-staleness atomics and never queued a notification (its
+ * one caller was the hidden-tools reveal path above, not the general
+ * publication authority every index/autoindex/delete/dependency pathway
+ * calls). This drives the notify function directly — the same entry point
+ * every stage-2 publication call site uses — rather than through
+ * _hidden_tools, so it proves the general pending-flag/drain mechanism
+ * independent of that one call site. Two notify() calls before any request
+ * is processed must still coalesce into exactly one notification (no
+ * notification storm), and it must arrive only once tools/list has been
+ * served (mcp_tools_list_already_served), never before. */
+TEST(mcp_notify_index_published_sends_list_changed_once) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_notify_index_published(srv);
+    cbm_mcp_server_notify_index_published(srv); /* two publishers racing */
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    const char *msgs =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    const char *resp1 = strstr(buf, "\"id\":1");
+    const char *notif = strstr(buf, "notifications/tools/list_changed");
+    ASSERT_NOT_NULL(resp1);
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    ASSERT_NOT_NULL(notif);
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+    /* Drain contract: notification bytes strictly follow the first served
+     * tools/list response — never interleaved before it. */
+    ASSERT_TRUE(notif > resp1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
+/* Inverse of the above: the handshake-proxy's actual promise is that a
+ * session which publishes but never serves a tools/list emits ZERO
+ * notifications — untested until now. A single non-tools/list request
+ * (ping) must leave mcp_tools_list_already_served's gate closed. */
+TEST(mcp_notify_before_any_tools_list_suppressed) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_notify_index_published(srv);
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    const char *msgs = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    rewind(out_fp);
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 0);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
+/* Coverage-matrix gap (stage 2, Change 7): RED against the pre-Change-7
+ * handle_delete_project, which closed the store and freed current_project
+ * but never staled the cached description — a client that deleted a
+ * project kept seeing its schema forever. Seeds a real on-disk project .db
+ * at the exact path project_db_path() resolves (cache_dir/<project>.db) so
+ * the assertion can require "status":"deleted" — proving the mutating
+ * delete branch actually ran, not just the unconditional-notify shortcut
+ * a not-found project would also hit. */
+TEST(mcp_delete_project_sends_list_changed) {
+    const char *project = "mcp_delete_project_sends_list_changed_fixture";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+
+    cbm_store_t *seed = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(seed);
+    ASSERT_EQ(cbm_store_upsert_project(seed, project, "/tmp/delete-project-fixture"),
+              CBM_STORE_OK);
+    cbm_node_t seed_node = {.project = project,
+                            .label = "Function",
+                            .name = "seed_fn",
+                            .qualified_name = "mcp_delete_project_sends_list_changed_fixture.seed_fn",
+                            .file_path = "seed.go"};
+    ASSERT_GT(cbm_store_upsert_node(seed, &seed_node), 0);
+    cbm_store_close(seed);
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    char msgs[CBM_SZ_1K];
+    int n = snprintf(msgs, sizeof(msgs),
+                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                     "\"params\":{\"name\":\"delete_project\",\"arguments\":{\"project\":\"%s\"}}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n",
+                     project);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(msgs));
+    ssize_t written = write(fds[1], msgs, (size_t)n);
+    ASSERT_TRUE(written == (ssize_t)n);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(buf, "\"status\":\"deleted\""));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
+/* ISSUE-1 (fragility audit 2026-07-18): deleting a project that was never
+ * indexed (no .db file) is a no-op, not a mutation — it must NOT invalidate
+ * the tools/list description cache or queue a list_changed notification.
+ * Sibling of mcp_delete_project_sends_list_changed, which proves the
+ * positive (real delete) direction; this proves the gate stays closed on
+ * the no-op/error direction. */
+TEST(mcp_delete_project_noop_sends_no_list_changed) {
+    const char *project = "mcp_delete_project_noop_no_list_changed_fixture";
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+
+    char msgs[CBM_SZ_1K];
+    int n = snprintf(msgs, sizeof(msgs),
+                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                     "\"params\":{\"name\":\"delete_project\",\"arguments\":{\"project\":\"%s\"}}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n",
+                     project);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(msgs));
+    ssize_t written = write(fds[1], msgs, (size_t)n);
+    ASSERT_TRUE(written == (ssize_t)n);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    /* isError responses carry only the escaped "text" field (no
+     * structuredContent — cbm_mcp_text_result only adds that on the
+     * non-error path), so the literal unescaped "status":"not_found" never
+     * appears; match the unescaped status value instead. */
+    ASSERT_NOT_NULL(strstr(buf, "not_found"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 0);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
+
+/* Coverage-matrix gap (stage 2, Change 5): RED against the pre-Change-5
+ * in-process handle_index_repository, which published a new graph via the
+ * degraded (non-supervised) path without staling the cached description.
+ * index_supervisor_gate_requires_marked_host_issue845 above proves an
+ * unmarked host (this test binary, absent cbm_index_supervisor_mark_host())
+ * always takes this in-process branch, so no supervisor env juggling is
+ * needed here. */
+TEST(mcp_index_repository_inprocess_sends_list_changed) {
+    char tmp_dir[CBM_SZ_256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s/cbm-idx5-repo-XXXXXX", cbm_resolve_cache_dir());
+    ASSERT_TRUE(cbm_mkdtemp(tmp_dir));
+    char src_path[CBM_SZ_512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *seed_fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(seed_fp);
+    fputs("def main():\n    return 'ok'\n", seed_fp);
+    fclose(seed_fp);
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    char msgs[CBM_SZ_1K];
+    int n = snprintf(msgs, sizeof(msgs),
+                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                     "\"params\":{\"name\":\"index_repository\","
+                     "\"arguments\":{\"repo_path\":\"%s\",\"mode\":\"fast\"}}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n",
+                     tmp_dir);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(msgs));
+    ssize_t written = write(fds[1], msgs, (size_t)n);
+    ASSERT_TRUE(written == (ssize_t)n);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_NOT_NULL(strstr(buf, "\"status\":\"indexed\""));
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    th_rmtree(tmp_dir);
+    PASS();
+}
+
+/* Coverage-matrix gap (stage 2, Change 6): RED against the pre-Change-6
+ * background autoindex_thread (rc==0 branch), which published a fresh graph
+ * from initialize-driven session auto-index without staling the cached
+ * description. cbm_mcp_server_join_autoindex waits deterministically for
+ * the background thread instead of sleeping/polling. */
+TEST(mcp_autoindex_thread_sends_list_changed) {
+    char tmp_dir[CBM_SZ_256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s/cbm-idx6-repo-XXXXXX", cbm_resolve_cache_dir());
+    ASSERT_TRUE(cbm_mkdtemp(tmp_dir));
+    char src_path[CBM_SZ_512];
+    snprintf(src_path, sizeof(src_path), "%s/main.py", tmp_dir);
+    FILE *seed_fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(seed_fp);
+    fputs("def main():\n    return 'ok'\n", seed_fp);
+    fclose(seed_fp);
+
+    char old_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(cbm_getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(cbm_chdir(tmp_dir), 0);
+
+    cbm_config_t *cfg = cbm_config_open(tmp_dir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+    cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false");
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    const char *init_msg =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+        "\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{}}}\n";
+    ssize_t written = write(fds[1], init_msg, strlen(init_msg));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+    fclose(in_fp);
+
+    /* Deterministic wait for the background publish instead of a sleep. */
+    (void)cbm_mcp_server_join_autoindex(srv);
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+
+    int fds2[2];
+    ASSERT_EQ(pipe(fds2), 0);
+    const char *list_msgs = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n"
+                            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n";
+    written = write(fds2[1], list_msgs, strlen(list_msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds2[1]);
+    FILE *in_fp2 = fdopen(fds2[0], "r");
+    ASSERT_NOT_NULL(in_fp2);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    rc = cbm_mcp_server_run(srv, in_fp2, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp2);
+    cbm_config_close(cfg);
+    th_rmtree(tmp_dir);
+    PASS();
+}
+
+/* Coverage-matrix gap (stage 2, Change 8): RED against the pre-Change-8
+ * handle_index_dependencies, which mutated project.dep.* graphs and
+ * cross-boundary edges without staling the cached description. The notify
+ * call sits after the unconditional cbm_pagerank_compute_with_config at the
+ * end of the handler, so a project with zero real dependencies still
+ * reaches it. */
+TEST(mcp_index_dependencies_sends_list_changed) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "mcp_index_dependencies_sends_list_changed_fixture";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/index-deps-fixture"),
+              CBM_STORE_OK);
+
+    char empty_dir[CBM_SZ_256];
+    snprintf(empty_dir, sizeof(empty_dir), "%s/cbm-idx8-deps-XXXXXX", cbm_resolve_cache_dir());
+    ASSERT_TRUE(cbm_mkdtemp(empty_dir));
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    char msgs[CBM_SZ_1K];
+    int n = snprintf(msgs, sizeof(msgs),
+                     "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                     "\"params\":{\"name\":\"index_dependencies\","
+                     "\"arguments\":{\"project\":\"%s\",\"packages\":[\"nonexistent-pkg\"],"
+                     "\"source_paths\":[\"%s\"]}}}\n"
+                     "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/list\",\"params\":{}}\n",
+                     project, empty_dir);
+    ASSERT_TRUE(n > 0 && (size_t)n < sizeof(msgs));
+    ssize_t written = write(fds[1], msgs, (size_t)n);
+    ASSERT_TRUE(written == (ssize_t)n);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":1"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":2"));
+    ASSERT_NOT_NULL(strstr(buf, "\"id\":3"));
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    th_rmtree(empty_dir);
+    PASS();
+}
+
+/* Coverage-matrix gap (stage 2, Change 10): RED against the pre-Change-10
+ * overlay_compaction_thread, which promoted a ready overlay generation to
+ * canonical rows without staling the cached description — overlay facts
+ * became canonical but the advertised schema never caught up. Builds one
+ * minimal base generation plus a ready, compactable overlay generation
+ * directly on the store (same idiom as
+ * tests/test_store_nodes.c:store_compact_ready_overlay_generations_respects_batch_limit)
+ * rather than running a full pipeline. */
+TEST(mcp_overlay_compaction_sends_list_changed) {
+    enum { MCP_OC_BASE_GENERATION = 1, MCP_OC_MAX_GENERATIONS = 10 };
+    const char *project = "mcp_overlay_compaction_sends_list_changed_fixture";
+
+    /* overlay_compaction_thread reopens the store from disk via
+     * project_db_path() (it runs independently of any in-memory srv store),
+     * so the fixture must be a real on-disk .db at that exact path — an
+     * in-memory-only store here makes the worker fail with
+     * CBM_STORE_NOT_FOUND. */
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/overlay-compact-fixture"),
+              CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, MCP_OC_BASE_GENERATION);
+
+    cbm_node_t base_node = {
+        .project = project,
+        .label = "Function",
+        .name = "base_fn",
+        .qualified_name = "mcp_overlay_compaction_sends_list_changed_fixture.base_fn",
+        .file_path = "base.go"};
+    cbm_store_file_delta_t base_delta = {.project = project,
+                                         .rel_path = "base.go",
+                                         .generation = generation,
+                                         .nodes = &base_node,
+                                         .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_file_delta(store, &base_delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(store, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(
+        cbm_store_reserve_overlay_generation(store, project, generation, &overlay_generation),
+        CBM_STORE_OK);
+    cbm_store_file_delta_t delete_base = {.project = project,
+                                          .rel_path = "base.go",
+                                          .generation = generation,
+                                          .derived_view_name = CBM_STORE_DERIVED_VIEW_NODES_FTS,
+                                          .derived_status = CBM_STORE_DERIVED_STATUS_COMPLETE};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(store, &delete_base, overlay_generation),
+              CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+
+    ASSERT_TRUE(cbm_mcp_server_start_overlay_compaction(srv, project, MCP_OC_MAX_GENERATIONS));
+    int compacted = 0;
+    ASSERT_EQ(cbm_mcp_server_join_overlay_compaction(srv, &compacted), 0);
+    ASSERT_TRUE(compacted > 0);
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    const char *msgs = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n"
+                       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}\n";
+    ssize_t written = write(fds[1], msgs, strlen(msgs));
+    ASSERT_TRUE(written > 0);
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    ASSERT_NOT_NULL(in_fp);
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(out_fp);
+
+    signal(SIGALRM, alarm_handler);
+    alarm(MCP_STDIO_TEST_TIMEOUT_SECONDS);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    alarm(0);
+    signal(SIGALRM, SIG_DFL);
+    ASSERT_EQ(rc, 0);
+
+    ASSERT_EQ(fseek(out_fp, 0, SEEK_END), 0);
+    long out_len = ftell(out_fp);
+    ASSERT_TRUE(out_len > 0);
+    rewind(out_fp);
+    char *buf = malloc((size_t)out_len + 1);
+    ASSERT_NOT_NULL(buf);
+    size_t nread = fread(buf, 1, (size_t)out_len, out_fp);
+    buf[nread] = '\0';
+
+    ASSERT_EQ(count_substr_mcp(buf, "notifications/tools/list_changed"), 1);
+
+    free(buf);
+    cbm_mcp_server_free(srv);
+    fclose(out_fp);
+    fclose(in_fp);
+    PASS();
+}
 #endif /* !_WIN32 */
 
 /* Issue #235: passing an unrecognised project name to a tool crashed the
@@ -10109,6 +10861,7 @@ SUITE(mcp) {
     RUN_TEST(resolve_store_leaves_foreign_sqlite_db_untouched);
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_get_graph_schema_uses_ready_overlay_schema);
+    RUN_TEST(first_response_context_uses_ready_overlay_schema);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
@@ -10168,6 +10921,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_uses_overlay_active_file_summaries);
     RUN_TEST(resource_architecture_uses_ready_overlay_summaries);
     RUN_TEST(resource_schema_uses_ready_overlay_counts);
+    RUN_TEST(resource_arch_rel_patterns_use_ready_overlay);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
@@ -10259,6 +11013,14 @@ SUITE(mcp) {
     RUN_TEST(mcp_stdio_output_has_only_jsonrpc_messages);
     RUN_TEST(mcp_hidden_tools_reveal_sends_list_changed);
     RUN_TEST(mcp_hidden_tools_reveal_frames_list_changed);
+    RUN_TEST(mcp_notify_index_published_sends_list_changed_once);
+    RUN_TEST(mcp_notify_before_any_tools_list_suppressed);
+    RUN_TEST(mcp_delete_project_sends_list_changed);
+    RUN_TEST(mcp_delete_project_noop_sends_no_list_changed);
+    RUN_TEST(mcp_index_repository_inprocess_sends_list_changed);
+    RUN_TEST(mcp_autoindex_thread_sends_list_changed);
+    RUN_TEST(mcp_index_dependencies_sends_list_changed);
+    RUN_TEST(mcp_overlay_compaction_sends_list_changed);
 #endif
 
     /* Snippet resolution (port of snippet_test.go) */

@@ -486,7 +486,7 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 - **Aggregates**: `count` (+`DISTINCT`), `sum`, `avg`, `min`, `max`, `collect`.
 - **Functions**: `labels`, `type`, `id`, `keys`, `properties`; `toLower/toUpper/toString/toInteger/toFloat/toBoolean`; `size`, `length`, `trim/ltrim/rtrim`, `reverse`; `coalesce`, `substring`, `replace`, `left`, `right`.
 
-Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported functions, list/map literals, comprehensions, path functions, parameters) **fails with a clear `unsupported …` error** rather than returning empty results.
+Anything outside this subset (write/`MERGE`/`CALL` clauses, unsupported functions, list/map literals, comprehensions, path functions, parameters) **fails with a clear `unsupported …` error** rather than returning empty results. Valid queries that match zero rows return a hint naming any label or relationship type not present in that project's graph, plus a short summary of the vocabulary that is.
 
 ## Ignoring Files
 
@@ -501,6 +501,7 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on startup/first use
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set default_response_format json  # full JSON objects instead of compact TOON tables
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 

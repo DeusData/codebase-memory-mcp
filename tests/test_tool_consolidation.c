@@ -213,6 +213,378 @@ TEST(streamlined_mode_shows_default_user_tools) {
     PASS();
 }
 
+TEST(query_graph_description_repeats_current_executable_schema) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "schema_docstring";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/schema-docstring"), CBM_STORE_OK);
+
+    cbm_node_t source = {.project = project,
+                         .label = "Function",
+                         .name = "source",
+                         .qualified_name = "schema_docstring.source",
+                         .file_path = "schema.c",
+                         .properties_json = "{\"complexity\":2}"};
+    cbm_node_t target = {.project = project,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "schema_docstring.target",
+                         .file_path = "schema.c"};
+    int64_t source_id = cbm_store_upsert_node(store, &source);
+    int64_t target_id = cbm_store_upsert_node(store, &target);
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_edge_t edge = {.project = project,
+                       .source_id = source_id,
+                       .target_id = target_id,
+                       .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char *saved_mode = save_tool_mode();
+    for (int mode = 0; mode < 2; mode++) {
+        if (mode == 1) {
+            cbm_setenv("CBM_TOOL_MODE", "classic", 1);
+        }
+        for (int relist = 0; relist < 2; relist++) {
+            char *tools = cbm_mcp_tools_list(srv);
+            ASSERT_NOT_NULL(tools);
+            ASSERT_NOT_NULL(strstr(tools, "Supported read-only Cypher subset"));
+            ASSERT_NOT_NULL(strstr(tools, "Node properties: name, qualified_name, file_path"));
+            ASSERT_NOT_NULL(strstr(tools, "complexity"));
+            ASSERT_NOT_NULL(strstr(
+                tools, "MATCH (source:Function)-[:CALLS]->(target:Function)"));
+            free(tools);
+        }
+    }
+    restore_tool_mode(saved_mode);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 1\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "Supported read-only Cypher subset"));
+    ASSERT_NULL(strstr(response, "Node properties: name, qualified_name, file_path"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression (dogfood 2026-07-18): the very first tools/list of a fresh
+ * session for an already-indexed project must show the real schema, not
+ * an empty one. build_query_graph_tool_description previously trusted
+ * srv->store as-is; on a fresh cbm_mcp_server_new(NULL) srv->store is the
+ * empty default in-memory store until some tool call lazily resolves the
+ * real on-disk project store via resolve_store — but session_project is
+ * set independently (e.g. from CWD at server startup) with no such
+ * resolution, so the schema section silently rendered empty. Reproduces
+ * by seeding a REAL on-disk .db (not cbm_mcp_server_store) and setting
+ * only the session project name before the first tools/list call. */
+TEST(query_graph_description_populated_on_cold_start_tools_list) {
+    const char *project = "cold_start_schema_docstring";
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/cold-start-schema-docstring"),
+              CBM_STORE_OK);
+    cbm_node_t source = {.project = project,
+                         .label = "Function",
+                         .name = "source",
+                         .qualified_name = "cold_start_schema_docstring.source",
+                         .file_path = "schema.c"};
+    cbm_node_t target = {.project = project,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "cold_start_schema_docstring.target",
+                         .file_path = "schema.c"};
+    int64_t source_id = cbm_store_upsert_node(store, &source);
+    int64_t target_id = cbm_store_upsert_node(store, &target);
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_edge_t edge = {
+        .project = project, .source_id = source_id, .target_id = target_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    /* Only the session project NAME is set (mirrors startup deriving it
+     * from CWD) — srv->store deliberately never touches the real DB before
+     * this first tools/list call. */
+    cbm_mcp_server_set_session_project(srv, project);
+
+    char *tools = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(tools);
+    ASSERT_NULL(
+        strstr(tools, "Labels name{extra property keys}[count]: . Edge types[count]: ."));
+    ASSERT_NOT_NULL(strstr(tools, "MATCH (source:Function)-[:CALLS]->(target:Function)"));
+    free(tools);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* RED against the pre-Change-1 zero-row hint (mcp.c handle_query_graph),
+ * which unconditionally recommended get_graph_schema() — a tool hidden from
+ * the streamlined default surface (is_streamlined_default_tool) — and never
+ * named which label/type failed to match. Streamlined mode is this server's
+ * default (server_default_mode_shows_streamlined_tools above), so this is
+ * the mode a default client actually sees. */
+TEST(query_graph_zero_row_hint_names_no_hidden_tool) {
+    char *saved_mode = save_tool_mode();
+    cbm_setenv("CBM_TOOL_MODE", "streamlined", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "hint_no_hidden_tool";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/hint-no-hidden-tool"), CBM_STORE_OK);
+
+    cbm_node_t known = {.project = project,
+                        .label = "Function",
+                        .name = "known",
+                        .qualified_name = "hint_no_hidden_tool.known",
+                        .file_path = "hint.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &known), 0);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "query_graph",
+        "{\"query\":\"MATCH (n:NoSuchLabel) RETURN n.name LIMIT 5\"}");
+    ASSERT_NOT_NULL(response);
+    /* Hidden in streamlined mode: recommending it points at an uncallable tool. */
+    ASSERT_NULL(strstr(response, "get_graph_schema"));
+    /* Names the actual unobserved vocabulary instead of a generic sentence. */
+    ASSERT_NOT_NULL(strstr(response, "NoSuchLabel"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    restore_tool_mode(saved_mode);
+    PASS();
+}
+
+/* T3 (fragility audit 2026-07-18): hints on graph="missed" must probe the
+ * shadow project's rows (cbm_store_coverage_shadow_project: "<project>::
+ * missed"), never the canonical project — a regression here would
+ * false-accuse a label that exists only in the missed view, or fail to
+ * accuse one that is truly absent from it. */
+TEST(query_graph_missed_graph_hint_probes_shadow_project) {
+    const char *project = "missed_hint_probe";
+
+    /* resolve_project_store always reopens the project by name from its
+     * on-disk .db (project_db_path) when an explicit "project" arg is
+     * given — it never falls back to reusing an in-memory-only store — so
+     * the fixture must be a real file at that path (same lesson as
+     * mcp_delete_project_sends_list_changed / the overlay-compaction fix). */
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/missed-hint-probe"), CBM_STORE_OK);
+
+    /* Canonical project: Route exists, File does not. */
+    cbm_node_t canonical_route = {.project = project,
+                                  .label = "Route",
+                                  .name = "/api",
+                                  .qualified_name = "missed_hint_probe./api",
+                                  .file_path = "routes.py"};
+    ASSERT_GT(cbm_store_upsert_node(store, &canonical_route), 0);
+
+    /* Shadow project: File exists, Route does not. nodes.project has an FK
+     * to projects(name) (foreign_keys=ON) — the shadow project needs its
+     * own row first, exactly as the real writer does it (store.c
+     * cov_rebuild_shadow_graph, cbm_store_upsert_project(s, covproj, "")). */
+    char shadow_project[CBM_SZ_256];
+    cbm_store_coverage_shadow_project(shadow_project, sizeof(shadow_project), project);
+    ASSERT_EQ(cbm_store_upsert_project(store, shadow_project, ""), CBM_STORE_OK);
+    cbm_node_t shadow_file = {.project = shadow_project,
+                              .label = "File",
+                              .name = "unindexed.py",
+                              .qualified_name = "unindexed.py",
+                              .file_path = "unindexed.py"};
+    ASSERT_GT(cbm_store_upsert_node(store, &shadow_file), 0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args_file[CBM_SZ_512];
+    snprintf(args_file, sizeof(args_file),
+            "{\"query\":\"MATCH (n:File) WHERE n.name = 'absent.py' RETURN n.name LIMIT 5\","
+            "\"project\":\"%s\",\"graph\":\"missed\"}",
+            project);
+    char *resp_file = cbm_mcp_handle_tool(srv, "query_graph", args_file);
+    ASSERT_NOT_NULL(resp_file);
+    /* File IS observed in the shadow view: these zero rows come from the
+     * WHERE predicate matching nothing, not an unknown label — must not
+     * accuse it. */
+    ASSERT_NULL(strstr(resp_file, "Unknown label or edge type: File"));
+    free(resp_file);
+
+    char args_route[CBM_SZ_512];
+    snprintf(args_route, sizeof(args_route),
+            "{\"query\":\"MATCH (n:Route) RETURN n.name LIMIT 5\",\"project\":\"%s\","
+            "\"graph\":\"missed\"}",
+            project);
+    char *resp_route = cbm_mcp_handle_tool(srv, "query_graph", args_route);
+    ASSERT_NOT_NULL(resp_route);
+    /* Route exists canonically but not in the shadow view: correct to
+     * accuse it for the view this query actually ran on. */
+    ASSERT_NOT_NULL(strstr(resp_route, "Route"));
+    free(resp_route);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* T4 (fragility audit 2026-07-18): an indexed-but-empty project (row
+ * exists, zero nodes/edges) must not crash and must not print a hollow
+ * "Known labels: ." artifact — silence about vocabulary is acceptable when
+ * there is none. */
+TEST(query_graph_hint_on_empty_project_no_crash_no_false_vocab) {
+    const char *project = "empty_hint_probe";
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/empty-hint-probe"), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_256];
+    snprintf(args, sizeof(args),
+            "{\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 5\",\"project\":\"%s\"}", project);
+    char *resp = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Function"));    /* named in the hint */
+    ASSERT_NULL(strstr(resp, "Known labels: .")); /* no empty-list artifact */
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* T5 (fragility audit 2026-07-18): implements the corrected Change-1 TDD
+ * gate — TOON and JSON must name the same unobserved labels/types
+ * (semantic parity), not byte-identical hint strings (the serializers
+ * escape/quote differently). */
+TEST(query_graph_zero_row_hint_parity_across_formats) {
+    const char *project = "hint_format_parity";
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/hint-format-parity"), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    const char *formats[] = {"toon", "json"};
+    for (int i = 0; i < 2; i++) {
+        char args[CBM_SZ_512];
+        snprintf(args, sizeof(args),
+                "{\"query\":\"MATCH (a:NoSuchLabel)-[r:NO_SUCH_TYPE]->(b) RETURN a\","
+                "\"project\":\"%s\",\"format\":\"%s\"}",
+                project, formats[i]);
+        char *resp = cbm_mcp_handle_tool(srv, "query_graph", args);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "NoSuchLabel"));
+        ASSERT_NOT_NULL(strstr(resp, "NO_SUCH_TYPE"));
+        free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* T12 (fragility audit 2026-07-18, ISSUE-2): the same unobserved label
+ * referenced in multiple patterns or UNION branches must be named ONCE in
+ * the hint, not once per occurrence — "Klass, Klass." reads as a bug to
+ * the calling model even though it is cosmetic. */
+TEST(query_graph_hint_dedupes_repeated_unknown_names) {
+    const char *project = "hint_dedup_probe";
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/hint-dedup-probe"), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args),
+            "{\"query\":\"MATCH (a:Klass) MATCH (b:Klass) RETURN a UNION "
+            "MATCH (a:Klass) RETURN a\",\"project\":\"%s\"}",
+            project);
+    char *resp = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Klass"));
+    /* Exactly one mention: "Klass, Klass" is the red condition. */
+    ASSERT_NULL(strstr(resp, "Klass, Klass"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* T13 (edge-case review 2026-07-18): hint_walk_where_exists_types /
+ * hint_walk_expr_exists_types probe edge types named inside EXISTS { ... }
+ * predicates in WHERE (and, via post_with_where, a WITH...WHERE tail) —
+ * previously untested. An unobserved type referenced only this way must
+ * still be named in the zero-row hint. */
+TEST(query_graph_hint_names_unknown_type_in_exists_predicate) {
+    const char *project = "hint_exists_predicate_probe";
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cbm_resolve_cache_dir(), project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/hint-exists-predicate-probe"),
+              CBM_STORE_OK);
+    cbm_node_t fn = {.project = project,
+                     .label = "Function",
+                     .name = "f",
+                     .qualified_name = "hint_exists_predicate_probe.f",
+                     .file_path = "f.py"};
+    ASSERT_GT(cbm_store_upsert_node(store, &fn), 0);
+    cbm_store_close(store);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_512];
+    /* Plain (not "NOT") EXISTS: with zero NONEXISTENT_TYPE edges in the
+     * store, this predicate is false for every row, so the query itself
+     * returns zero rows — the condition the hint path needs to fire. */
+    snprintf(args, sizeof(args),
+            "{\"query\":\"MATCH (f:Function) WHERE EXISTS { (f)-[:NONEXISTENT_TYPE]->() } "
+            "RETURN f.name\",\"project\":\"%s\"}",
+            project);
+    char *resp = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "NONEXISTENT_TYPE"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(server_default_mode_shows_streamlined_tools) {
     /* New server default is streamlined mode unless CBM_TOOL_MODE/config opts
      * into classic. */
@@ -872,9 +1244,12 @@ TEST(search_graph_slug_project_sets_session_context) {
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
+    /* format=json: this test pins the legacy JSON "nodes":1 count shape;
+     * default_response_format is toon. */
     char *result = cbm_mcp_handle_tool(
         srv, "search_graph",
-        "{\"project\":\"_tc_ctx_slug_\",\"name_pattern\":\"tc_ctx_slug_fn\",\"limit\":1}");
+        "{\"project\":\"_tc_ctx_slug_\",\"name_pattern\":\"tc_ctx_slug_fn\",\"limit\":1,"
+        "\"format\":\"json\"}");
     ASSERT_NOT_NULL(result);
     ASSERT_NOT_NULL(strstr(result, "session_project"));
     ASSERT_NOT_NULL(strstr(result, "_tc_ctx_slug_"));
@@ -1019,11 +1394,13 @@ TEST(first_response_has_context_header) {
 }
 
 TEST(context_has_schema_info) {
-    /* _context should include node_labels and edge_types arrays */
+    /* _context should include node_labels and edge_types arrays.
+     * format=json: pins the legacy JSON _context shape; default_response_format
+     * is toon, which delivers the same facts as native _context_* TOON fields. */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     char *result = cbm_mcp_handle_tool(srv, "search_graph",
-        "{\"name_pattern\":\"x\"}");
+        "{\"name_pattern\":\"x\",\"format\":\"json\"}");
     ASSERT_NOT_NULL(result);
     /* In-memory store has schema tables → should see these fields (escaped JSON key) */
     ASSERT_NOT_NULL(strstr(result, "\\\"_context\\\":"));
@@ -1375,9 +1752,11 @@ TEST(no_initialize_defaults_to_legacy_behavior) {
     /* Server with no initialize call → defaults to legacy (no resources) */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
-    /* Call tool directly without initialize → should get _context (legacy) */
+    /* Call tool directly without initialize → should get _context (legacy).
+     * format=json: pins the legacy JSON _context shape; default_response_format
+     * is toon, which delivers the same facts as native _context_* TOON fields. */
     char *r = cbm_mcp_handle_tool(srv, "search_graph",
-        "{\"name_pattern\":\"x\"}");
+        "{\"name_pattern\":\"x\",\"format\":\"json\"}");
     ASSERT_NOT_NULL(r);
     ASSERT_NOT_NULL(strstr(r, "\\\"_context\\\":"));
     free(r);
@@ -2939,6 +3318,14 @@ SUITE(tool_consolidation) {
     RUN_TEST(all_tools_have_object_inputSchema);
     /* Tool visibility */
     RUN_TEST(streamlined_mode_shows_default_user_tools);
+    RUN_TEST(query_graph_description_repeats_current_executable_schema);
+    RUN_TEST(query_graph_description_populated_on_cold_start_tools_list);
+    RUN_TEST(query_graph_zero_row_hint_names_no_hidden_tool);
+    RUN_TEST(query_graph_missed_graph_hint_probes_shadow_project);
+    RUN_TEST(query_graph_hint_on_empty_project_no_crash_no_false_vocab);
+    RUN_TEST(query_graph_zero_row_hint_parity_across_formats);
+    RUN_TEST(query_graph_hint_dedupes_repeated_unknown_names);
+    RUN_TEST(query_graph_hint_names_unknown_type_in_exists_predicate);
     RUN_TEST(server_default_mode_shows_streamlined_tools);
     RUN_TEST(api_surface_default_streamlined_regression_gate);
     RUN_TEST(api_surface_classic_regression_gate);

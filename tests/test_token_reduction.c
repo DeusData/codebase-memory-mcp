@@ -581,10 +581,20 @@ TEST(search_graph_compact_defaults_to_true) {
     const char *hdr = strstr(resp, "results[3]{qn,label,file,lines,in,out}:\n");
     ASSERT_NOT_NULL(hdr);
     ASSERT_NOT_NULL(strstr(resp, "\n  sp-test.main.main,Function,main.py,1-5,"));
-    /* Header count matches the actual number of indented rows. */
+    /* Header count matches the actual number of indented rows in THIS table.
+     * Stop at the first non-indented line: the first-response _context header
+     * (native TOON) appends its own 2-space-indented sub-tables right after
+     * this one, so an unbounded "\n  " scan would double-count their rows. */
     int rows = 0;
-    for (const char *p = hdr; (p = strstr(p, "\n  ")) != NULL; p += 3)
+    const char *row_start = strchr(hdr, '\n');
+    ASSERT_NOT_NULL(row_start);
+    row_start++;
+    while (strncmp(row_start, "  ", 2) == 0) {
         rows++;
+        const char *next = strchr(row_start, '\n');
+        if (!next) break;
+        row_start = next + 1;
+    }
     ASSERT_EQ(rows, 3);
     /* Compact default: no verbose JSON "name" field anywhere. */
     ASSERT_NULL(strstr(resp, "\"name\""));

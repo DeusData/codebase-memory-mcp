@@ -88,6 +88,7 @@ Important keys (run `config list` for the complete registry):
 | `semantic_edges_enabled` | `true` | Create semantic-related edges in applicable index modes. |
 | `githistory_enabled` | `true` | Create Git co-change coupling edges. |
 | `httplinks_enabled` | `true` | Link HTTP clients to discovered routes. |
+| `default_response_format` | `toon` | Tool-response encoding when a call omits `format`: `toon` (compact tables) or `json` (full objects). A per-call `format` argument always wins. |
 
 ### Named presets
 
