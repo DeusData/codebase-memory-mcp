@@ -23,6 +23,7 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_OK 0
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
+#define CBM_INDEX_FORMAT_VERSION 1
 
 /* ── Data structures ────────────────────────────────────────────── */
 
@@ -76,6 +77,13 @@ void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *ou
 /* Get distinct file paths for a project. Caller must free each out[i] and out itself.
  * Returns CBM_STORE_OK or CBM_STORE_ERR. */
 int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *count);
+
+/* Persisted index-format identity. Bump when a change alters the QN scheme
+ * or node identity of an already-written graph, so an old DB is routed
+ * through the full-reindex path instead of producing a mixed graph.
+ * 1 = File QNs keep the file extension (#769). */
+int cbm_store_get_format_version(cbm_store_t *s, int *out);
+int cbm_store_set_format_version(cbm_store_t *s, int version);
 
 /* Get caller/callee names for a node (CALLS/HTTP_CALLS/ASYNC_CALLS edges).
  * Returns 0 on success. Caller must free each out_callers[i]/out_callees[i]

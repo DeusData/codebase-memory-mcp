@@ -357,7 +357,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_index_format.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 

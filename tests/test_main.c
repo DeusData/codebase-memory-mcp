@@ -213,6 +213,7 @@ extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
 extern void suite_index_resilience(void);
+extern void suite_index_format(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
@@ -386,6 +387,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(index_resilience);
     RUN_SELECTED_SUITE(fqn);
     RUN_SELECTED_SUITE(route_canon);

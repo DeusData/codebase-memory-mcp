@@ -643,11 +643,11 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
-                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
-                             const cbm_coverage_meta_t *meta_template) {
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                            cbm_file_info_t *files, int file_count,
+                            const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                            const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
+                            const cbm_coverage_meta_t *meta_template) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -662,11 +662,19 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
-
+    bool format_stamped = true;
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
         bool hash_records_complete = persist_hashes(hash_store, project, files, file_count,
                                                     mode_skipped, mode_skipped_count);
+
+        /* #769: cbm_writer_open truncates and rebuilds the DB file from
+         * scratch on every dump, so the format version written by the last
+         * full index is gone by the time we get here. */
+        if (cbm_store_set_format_version(hash_store, CBM_INDEX_FORMAT_VERSION) != CBM_STORE_OK) {
+            cbm_log_error("incremental.err", "msg", "persist_format_version", "project", project);
+            format_stamped = false;
+        }
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
@@ -705,6 +713,8 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
     if (repo_path && cbm_artifact_exists(repo_path)) {
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
+
+    return format_stamped ? 0 : CBM_NOT_FOUND;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -1010,13 +1020,14 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = 1,
     };
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, &coverage_meta);
+    int dp_rc =
+        dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                         mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
-    return 0;
+    return dp_rc;
 }

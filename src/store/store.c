@@ -2918,6 +2918,36 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
     return CBM_STORE_OK;
 }
 
+/* ── Index format version (PRAGMA user_version) ─────────────────── */
+
+int cbm_store_get_format_version(cbm_store_t *s, int *out) {
+    if (!s || !s->db || !out) {
+        return CBM_STORE_ERR;
+    }
+    *out = 0;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA user_version;", CBM_NOT_FOUND, &stmt, NULL) !=
+        SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        *out = sqlite3_column_int(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return CBM_STORE_OK;
+}
+
+/* PRAGMA values cannot be bound; format the integer constant in. Writes, so
+ * only call on a read-write connection (never from configure_pragmas). */
+int cbm_store_set_format_version(cbm_store_t *s, int version) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    char sql[ST_BUF_64];
+    snprintf(sql, sizeof(sql), "PRAGMA user_version = %d;", version);
+    return exec_sql(s, sql);
+}
+
 /* ── Node neighbor names ──────────────────────────────────────── */
 
 static int query_neighbor_names(sqlite3 *db, const char *sql, int64_t node_id, int limit,
