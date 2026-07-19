@@ -532,7 +532,7 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
     static const char *expected[] = {"all",      "overview",   "structure", "dependencies",
                                      "routes",   "languages",  "packages",  "entry_points",
                                      "hotspots", "boundaries", "layers",    "file_tree",
-                                     "clusters"};
+                                     "clusters", "cycles"};
     size_t expected_count = sizeof(expected) / sizeof(expected[0]);
     ASSERT_EQ(yyjson_arr_size(enum_arr), expected_count);
     for (size_t i = 0; i < expected_count; i++) {
@@ -1090,6 +1090,203 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
 static char *extract_text_content(const char *mcp_result);
 
+/* callers_total/callees_total must count what the caller can enumerate: with
+ * include_tests=false (default) test-file rows are hidden from the table, so
+ * the totals must apply the same filter — a raw visited_count overstated the
+ * set (field-eval agent read callers_total=175 against 2 visible rows and
+ * distrusted the tool). */
+TEST(tool_trace_totals_respect_test_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "totproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/tot");
+
+    cbm_node_t tgt = {.project = proj,
+                      .label = "Function",
+                      .name = "tgt",
+                      .qualified_name = "totproj.a.tgt",
+                      .file_path = "a.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    int64_t tid = cbm_store_upsert_node(st, &tgt);
+    ASSERT_GT(tid, 0);
+    cbm_node_t prod = {.project = proj,
+                       .label = "Function",
+                       .name = "prod_caller",
+                       .qualified_name = "totproj.a.prod_caller",
+                       .file_path = "a.c",
+                       .start_line = 10,
+                       .end_line = 15};
+    int64_t pid = cbm_store_upsert_node(st, &prod);
+    ASSERT_GT(pid, 0);
+    cbm_node_t tst = {.project = proj,
+                      .label = "Function",
+                      .name = "test_caller",
+                      .qualified_name = "totproj.t.test_caller",
+                      .file_path = "tests/test_x.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    int64_t xid = cbm_store_upsert_node(st, &tst);
+    ASSERT_GT(xid, 0);
+    cbm_edge_t e1 = {.project = proj, .source_id = pid, .target_id = tid, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e1), 0);
+    cbm_edge_t e2 = {.project = proj, .source_id = xid, .target_id = tid, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e2), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"totproj\","
+             "\"function_name\":\"tgt\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 1")); /* test row filtered */
+    free(inner);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"totproj\","
+             "\"function_name\":\"tgt\",\"direction\":\"inbound\",\"include_tests\":true}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 2")); /* both visible now */
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* SCC condensation (get_architecture aspect "cycles"): a 3-function CALLS
+ * cycle A->B->C->A must be reported as one circular dependency of size 3 with
+ * all three members; a separate acyclic chain (D->E) must NOT appear. The
+ * aspect is opt-in — a default get_architecture call must NOT compute it. */
+TEST(tool_get_architecture_cycles_detects_scc) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "cycproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/cyc");
+
+    const char *names[5] = {"A", "B", "C", "D", "E"};
+    int64_t id[5];
+    for (int i = 0; i < 5; i++) {
+        char qn[32];
+        snprintf(qn, sizeof(qn), "cycproj.m.%s", names[i]);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = names[i],
+                        .qualified_name = qn,
+                        .file_path = "m.c",
+                        .start_line = i + 1,
+                        .end_line = i + 2};
+        id[i] = cbm_store_upsert_node(st, &n);
+        ASSERT_GT(id[i], 0);
+    }
+    /* cycle A->B->C->A, plus acyclic D->E */
+    struct {
+        int f;
+        int t;
+    } e[] = {{0, 1}, {1, 2}, {2, 0}, {3, 4}};
+    for (size_t i = 0; i < sizeof(e) / sizeof(e[0]); i++) {
+        cbm_edge_t ed = {
+            .project = proj, .source_id = id[e[i].f], .target_id = id[e[i].t], .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &ed), 0);
+    }
+
+    /* opt-in cycles aspect */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"get_architecture\",\"arguments\":{\"project\":\"cycproj\","
+             "\"aspects\":[\"cycles\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "cycles: 1")); /* exactly one SCC of size>1 */
+    ASSERT_NOT_NULL(strstr(inner, "cycproj.m.A"));
+    ASSERT_NOT_NULL(strstr(inner, "cycproj.m.B"));
+    ASSERT_NOT_NULL(strstr(inner, "cycproj.m.C"));
+    ASSERT_NULL(strstr(inner, "cycproj.m.D")); /* acyclic node not in any cycle */
+    free(inner);
+    free(resp);
+
+    /* default call (no aspects) must NOT run the scan. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"get_architecture\",\"arguments\":{\"project\":\"cycproj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "cycles:"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Context-bomb guard: get_code_snippet on a whole-file node (a Module/File
+ * span) used to read the ENTIRE file into one response — a field-eval agent
+ * that fell back to a Module snippet pulled ~400KB in a single call. The read
+ * must clip at MCP_SNIPPET_MAX_LINES and flag source_clipped, while the exact
+ * start/end range stays in the response for a targeted re-read. */
+TEST(tool_get_code_snippet_clips_whole_file_node) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_snipcap_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    cbm_mkdir(proj_dir);
+    char src_path[600];
+    snprintf(src_path, sizeof(src_path), "%s/big.py", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    enum { BIG_LINES = 2000 };
+    for (int i = 0; i < BIG_LINES; i++) {
+        fprintf(fp, "line_%04d = %d  # padding to blow up an unclipped read\n", i, i);
+    }
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "test-project";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, proj_dir);
+
+    cbm_node_t mod = {0};
+    mod.project = proj;
+    mod.label = "Module";
+    mod.name = "big";
+    mod.qualified_name = "test-project.big";
+    mod.file_path = "big.py";
+    mod.start_line = 1;
+    mod.end_line = BIG_LINES;
+    ASSERT_GT(cbm_store_upsert_node(st, &mod), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"get_code_snippet\",\"arguments\":{\"project\":\"test-project\","
+             "\"qualified_name\":\"test-project.big\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"source_clipped\":true"));
+    /* The whole 2000-line file (~100KB) must NOT be in the response. */
+    ASSERT_TRUE(strlen(inner) < 60000);
+    /* The last line must be absent (clipped), the first present. */
+    ASSERT_NOT_NULL(strstr(inner, "line_0000"));
+    ASSERT_NULL(strstr(inner, "line_1999"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(tool_search_graph_includes_node_properties) {
     /* Node properties are OPT-IN columns in the default TOON output: the
      * default row is qn/label/file/lines/degrees only, `fields` adds the
@@ -1110,8 +1307,8 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "results[")); /* TOON table header */
-    ASSERT_NOT_NULL(strstr(inner, "{qn,label,file,lines,in,out}"));
+    ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
+    ASSERT_NOT_NULL(strstr(inner, "(rows: name label lines in out;"));
     ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
     ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
     ASSERT_NULL(strstr(inner, "is_exported"));
@@ -1127,23 +1324,31 @@ TEST(tool_search_graph_includes_node_properties) {
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "{qn,label,file,lines,in,out,signature}"));
+    ASSERT_NOT_NULL(strstr(inner, "(rows: name label lines in out signature;"));
+    /* values with spaces are QUOTED so column positions survive */
+    ASSERT_NOT_NULL(strstr(inner, "\"func HandleRequest() error\""));
     ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
     free(inner);
     free(resp);
 
-    /* format:"json" keeps the legacy verbose objects intact. */
+    /* format:"json" = json-stringified tree: same grouped model, column-
+     * ordered row arrays — never per-row key envelopes or property blobs.
+     * fields adds columns there too. */
     resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\","
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
-             "\"name_pattern\":\"HandleRequest\",\"format\":\"json\",\"limit\":5}}}");
+             "\"name_pattern\":\"HandleRequest\",\"format\":\"json\","
+             "\"fields\":[\"signature\"],\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"signature\""));
-    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
-    ASSERT_NOT_NULL(strstr(inner, "is_exported"));
+    ASSERT_NOT_NULL(strstr(inner, "\"qn_prefix\"")); /* grouped tree model */
+    ASSERT_NOT_NULL(strstr(inner, "\"cols\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"signature\""));      /* requested column */
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest")); /* its value */
+    ASSERT_NULL(strstr(inner, "is_exported"));            /* blob never spills */
     free(inner);
     free(resp);
 
@@ -1185,7 +1390,7 @@ TEST(tool_output_byte_budgets) {
     ASSERT_NOT_NULL(resp);
     inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "callees["));
+    ASSERT_NOT_NULL(strstr(inner, "callees:"));
     ASSERT_LT((int)strlen(inner), 800);
     free(inner);
     free(resp);
@@ -1236,6 +1441,187 @@ TEST(tool_search_graph_toon_never_leaks_internal_fields) {
     ASSERT_NOT_NULL(strstr(inner, "complexity"));
     free(inner);
     free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_lean_defaults_schema_and_status) {
+    /* GUARDS for the lean-default contract (TOON round 2):
+     * 1. get_graph_schema must not advertise the blocked internal fields
+     *    (fp/sp/bt) — the server refuses to emit them, so listing them in the
+     *    schema invited agents to request fields they can never get.
+     * 2. index_status omits the git context block unless verbose:true — the
+     *    worktree/shadow path variants only matter when debugging where an
+     *    index lives. */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    cbm_node_t n = {0};
+    n.project = "test-project";
+    n.label = "Function";
+    n.name = "schemaCarrier";
+    n.qualified_name = "test-project.src.schemaCarrier";
+    n.file_path = "src/sc.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{\"fp\":\"x\",\"sp\":\"y\",\"bt\":\"z\",\"complexity\":3}";
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"get_graph_schema\","
+                                   "\"arguments\":{\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "Function"));   /* non-vacuous: label present */
+    ASSERT_NOT_NULL(strstr(inner, "complexity")); /* obtainable property listed */
+    ASSERT_NULL(strstr(inner, "\"fp\""));         /* blocked fields not advertised */
+    ASSERT_NULL(strstr(inner, "\"sp\""));
+    ASSERT_NULL(strstr(inner, "\"bt\""));
+    free(inner);
+    free(resp);
+
+    /* index_status: no git block by default... */
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":49,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"index_status\","
+                                      "\"arguments\":{\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
+    ASSERT_NULL(strstr(inner, "\"git\""));
+    free(inner);
+    free(resp);
+
+    /* ...and present with verbose:true. */
+    resp = cbm_mcp_server_handle(srv,
+                                 "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\","
+                                 "\"params\":{\"name\":\"index_status\","
+                                 "\"arguments\":{\"project\":\"test-project\",\"verbose\":true}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"git\""));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── Tool-output regression suite (gating) ──────────────────────────
+ * Context-explosion detector: flags the measured smells that re-introduce
+ * token bloat into default outputs, independent of any specific tool:
+ *   1. blocked internal fields (fp/sp/bt) appearing anywhere;
+ *   2. repeated-key JSON envelopes — the same key emitted per row instead of
+ *      a header-once table (the un-TOONed enumeration smell; detect_changes
+ *      shipped 4,787x3 of these = 416KB);
+ *   3. embedded prose notes/hints beyond one line (~220 chars) — long prose
+ *      belongs in tool descriptions or docs, not repeated per response.
+ * Returns NULL when clean, else a static description of the violation. */
+static const char *output_explosion_smell(const char *inner) {
+    static const char *row_keys[] = {
+        "\"name\":", "\"label\":", "\"file\":", "\"path\":", "\"qualified_name\":", "\"qn\":"};
+    if (strstr(inner, "\"fp\":") || strstr(inner, "\"sp\":") || strstr(inner, "\"bt\":")) {
+        return "blocked internal field (fp/sp/bt) leaked into output";
+    }
+    for (size_t k = 0; k < sizeof(row_keys) / sizeof(row_keys[0]); k++) {
+        int n = 0;
+        for (const char *p = strstr(inner, row_keys[k]); p && n <= 32;
+             p = strstr(p + 1, row_keys[k])) {
+            n++;
+        }
+        if (n > 32) {
+            return "repeated-key envelope (>32x same JSON key) — emit a header-once table";
+        }
+    }
+    for (const char *p = strstr(inner, "\"note\":\""); p; p = strstr(p + 1, "\"note\":\"")) {
+        const char *end = strchr(p + 9, '"');
+        while (end && end[-1] == '\\') {
+            end = strchr(end + 1, '"');
+        }
+        if (end && end - (p + 9) > 220) {
+            return "embedded note exceeds one line (~220 chars)";
+        }
+    }
+    return NULL;
+}
+
+/* Run one tool call on the fixture server, apply the explosion detector and
+ * an absolute byte ceiling, and require a semantic-floor marker so trimming
+ * can never hollow the response out either. */
+static const char *check_tool_output(cbm_mcp_server_t *srv, const char *req, int ceiling,
+                                     const char *floor_marker) {
+    char *resp = cbm_mcp_server_handle(srv, req);
+    if (!resp) {
+        return "no response";
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    if (!inner) {
+        return "no text content";
+    }
+    static char why[256];
+    const char *smell = output_explosion_smell(inner);
+    if (smell) {
+        snprintf(why, sizeof(why), "%s", smell);
+        free(inner);
+        return why;
+    }
+    if ((int)strlen(inner) >= ceiling) {
+        snprintf(why, sizeof(why), "output %d B >= ceiling %d B", (int)strlen(inner), ceiling);
+        free(inner);
+        return why;
+    }
+    if (floor_marker && !strstr(inner, floor_marker)) {
+        snprintf(why, sizeof(why), "semantic floor missing: %s", floor_marker);
+        free(inner);
+        return why;
+    }
+    free(inner);
+    return NULL;
+}
+
+TEST(tool_output_regression_gate) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    struct {
+        const char *req;
+        int ceiling;
+        const char *floor;
+    } cases[] = {
+        {"{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"search_graph\",\"arguments\":{\"project\":\"test-project\","
+         "\"name_pattern\":\".*\",\"limit\":50}}}",
+         6000, "results:"},
+        {"{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"get_graph_schema\",\"arguments\":{\"project\":\"test-project\"}}}",
+         6000, "node_labels"},
+        {"{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"index_status\",\"arguments\":{\"project\":\"test-project\"}}}",
+         7000, "\"status\""},
+        {"{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"test-project\","
+         "\"function_name\":\"HandleRequest\",\"direction\":\"both\"}}}",
+         1500, "callees:"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *why = check_tool_output(srv, cases[i].req, cases[i].ceiling, cases[i].floor);
+        if (why) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "case %d: %s", (int)i, why);
+            FAIL(msg);
+        }
+    }
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
@@ -1558,14 +1944,17 @@ TEST(tool_check_index_coverage_surfaces_lookup_errors) {
 }
 
 TEST(tool_index_status_includes_git_metadata) {
+    /* The git context block moved behind verbose:true (lean-default contract,
+     * TOON round 2) — this test pins the verbose path's content; the default-
+     * omission guard lives in tool_lean_defaults_schema_and_status. */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp =
-        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"index_status\","
-                                   "\"arguments\":{\"project\":\"test-project\"}}}");
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\","
+             "\"arguments\":{\"project\":\"test-project\",\"verbose\":true}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -1654,6 +2043,223 @@ TEST(tool_trace_call_path_ambiguous) {
     ASSERT_NULL(strstr(inner, "\"callees\""));
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Multi-seed union hop semantics: bfs_union_same_name deduped visited nodes
+ * keep-FIRST-seen, so a node reached at hop 2 from the first seed kept hop 2
+ * even when the second seed reaches it at hop 1. hop feeds risk_labels and
+ * (soon) pagination watermarks — it must be the MINIMUM across seeds, matching
+ * the single-BFS MIN(hop) semantics (#797). */
+TEST(tool_trace_union_records_min_hop_across_seeds) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dualproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dual");
+
+    /* One real definition + one body-less stub (start==end) — the #546/#650
+     * shape pick_resolved_node resolves WITHOUT ambiguity while
+     * bfs_union_same_name still traverses both. Seed A (real def, lower id,
+     * traversed first) reaches tgt only via mid (hop 2); the stub seed B
+     * reaches tgt directly (hop 1). */
+    cbm_node_t sa = {.project = proj,
+                     .label = "Function",
+                     .name = "dual",
+                     .qualified_name = "dualproj.a.dual",
+                     .file_path = "a.c",
+                     .start_line = 1,
+                     .end_line = 50};
+    cbm_node_t sb = {.project = proj,
+                     .label = "Function",
+                     .name = "dual",
+                     .qualified_name = "dualproj.b.dual",
+                     .file_path = "b.d.ts",
+                     .start_line = 1,
+                     .end_line = 1};
+    cbm_node_t mid = {.project = proj,
+                      .label = "Function",
+                      .name = "mid",
+                      .qualified_name = "dualproj.c.mid",
+                      .file_path = "c.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    cbm_node_t tgt = {.project = proj,
+                      .label = "Function",
+                      .name = "tgt",
+                      .qualified_name = "dualproj.c.tgt",
+                      .file_path = "c.c",
+                      .start_line = 10,
+                      .end_line = 15};
+    int64_t ida = cbm_store_upsert_node(st, &sa);
+    int64_t idb = cbm_store_upsert_node(st, &sb);
+    int64_t idm = cbm_store_upsert_node(st, &mid);
+    int64_t idt = cbm_store_upsert_node(st, &tgt);
+    ASSERT_GT(ida, 0);
+    ASSERT_GT(idb, 0);
+    ASSERT_GT(idm, 0);
+    ASSERT_GT(idt, 0);
+    cbm_edge_t e1 = {.project = proj, .source_id = ida, .target_id = idm, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = proj, .source_id = idm, .target_id = idt, .type = "CALLS"};
+    cbm_edge_t e3 = {.project = proj, .source_id = idb, .target_id = idt, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e1), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &e2), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &e3), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"dual\",\"project\":\"dualproj\","
+             "\"direction\":\"outbound\",\"depth\":3}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    /* tgt is one hop from seed B — the union must record hop 1, not seed A's 2. */
+    ASSERT_NOT_NULL(strstr(inner, "  tgt 1"));
+    ASSERT_NULL(strstr(inner, "  tgt 2"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Exactly-once trace pagination: 12 callees paged at limit=5 must yield
+ * 5+5+2 rows with every callee appearing on exactly one page, exact totals
+ * on every page, and a final page without a cursor. Stale and mismatched
+ * cursors must fail with teaching errors, never silently restart. */
+TEST(tool_trace_pagination_exactly_once) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "pageproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/page");
+
+    cbm_node_t hub = {.project = proj,
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "pageproj.h.hub",
+                      .file_path = "h.c",
+                      .start_line = 1,
+                      .end_line = 9};
+    int64_t hid = cbm_store_upsert_node(st, &hub);
+    ASSERT_GT(hid, 0);
+    enum { CALLEES = 12 };
+    for (int i = 0; i < CALLEES; i++) {
+        char nm[16];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "c%02d", i);
+        snprintf(qn, sizeof(qn), "pageproj.m.c%02d", i);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = nm,
+                        .qualified_name = qn,
+                        .file_path = "m.c",
+                        .start_line = 1,
+                        .end_line = 3};
+        int64_t nid = cbm_store_upsert_node(st, &n);
+        ASSERT_GT(nid, 0);
+        cbm_edge_t e = {.project = proj, .source_id = hid, .target_id = nid, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+    }
+
+    char pages[3][4096];
+    char tok[192] = "";
+    int npages = 0;
+    for (; npages < 3; npages++) {
+        char req[640];
+        if (tok[0]) {
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{"
+                     "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+                     "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,"
+                     "\"cursor\":\"%s\"}}}",
+                     tok);
+        } else {
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{"
+                     "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+                     "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5}}}");
+        }
+        char *resp = cbm_mcp_server_handle(srv, req);
+        ASSERT_NOT_NULL(resp);
+        char *inner = extract_text_content(resp);
+        free(resp);
+        ASSERT_NOT_NULL(inner);
+        snprintf(pages[npages], sizeof(pages[npages]), "%s", inner);
+        ASSERT_NOT_NULL(strstr(inner, "callees_total: 12")); /* exact total, every page */
+        const char *nx = strstr(inner, "next: ");
+        if (nx) {
+            const char *e = strchr(nx + 6, '\n');
+            size_t tl = e ? (size_t)(e - (nx + 6)) : strlen(nx + 6);
+            ASSERT_TRUE(tl < sizeof(tok));
+            memcpy(tok, nx + 6, tl);
+            tok[tl] = '\0';
+        } else {
+            tok[0] = '\0';
+        }
+        free(inner);
+        if (!tok[0]) {
+            npages++;
+            break;
+        }
+    }
+    ASSERT_EQ(npages, 3); /* 5 + 5 + 2 */
+    /* Exactly-once: every callee appears on exactly ONE page. */
+    for (int i = 0; i < CALLEES; i++) {
+        char qn[48];
+        snprintf(qn, sizeof(qn), "  c%02d 1\n", i);
+        int seen = 0;
+        for (int p = 0; p < 3; p++) {
+            if (strstr(pages[p], qn)) {
+                seen++;
+            }
+        }
+        ASSERT_EQ(seen, 1);
+    }
+    /* Final page carries no cursor. */
+    ASSERT_NULL(strstr(pages[2], "next: "));
+
+    /* Params mismatch: replay a page-2-era cursor with a different depth. */
+    const char *nx1 = strstr(pages[0], "next: ");
+    ASSERT_NOT_NULL(nx1);
+    char tok1[192];
+    const char *e1 = strchr(nx1 + 6, '\n');
+    size_t tl1 = e1 ? (size_t)(e1 - (nx1 + 6)) : strlen(nx1 + 6);
+    memcpy(tok1, nx1 + 6, tl1);
+    tok1[tl1] = '\0';
+    char req2[640];
+    snprintf(req2, sizeof(req2),
+             "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,\"depth\":2,"
+             "\"cursor\":\"%s\"}}}",
+             tok1);
+    char *resp = cbm_mcp_server_handle(srv, req2);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "cursor_params_mismatch"));
+    free(inner);
+
+    /* Stale: an index run (upsert_project bumps the generation) invalidates
+     * outstanding cursors with a loud, actionable error. */
+    cbm_store_upsert_project(st, proj, "/tmp/page");
+    snprintf(req2, sizeof(req2),
+             "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,"
+             "\"cursor\":\"%s\"}}}",
+             tok1);
+    resp = cbm_mcp_server_handle(srv, req2);
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "stale_cursor"));
+    free(inner);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1985,7 +2591,7 @@ TEST(tool_get_architecture_emits_populated_sections) {
      * those existed before #281. The "entry_points" array only appears
      * when cbm_store_get_architecture is actually called and its result
      * is serialized — which is exactly what #281 wires up. */
-    ASSERT_NOT_NULL(strstr(inner, "entry_points["));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
     ASSERT_NOT_NULL(strstr(inner, "main"));
 
     free(inner);
@@ -2038,8 +2644,8 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     ASSERT_NOT_NULL(resp_all);
     char *inner_all = extract_text_content(resp_all);
     ASSERT_NOT_NULL(inner_all);
-    ASSERT_NOT_NULL(strstr(inner_all, "entry_points["));
-    ASSERT_NOT_NULL(strstr(inner_all, "file_tree["));
+    ASSERT_NOT_NULL(strstr(inner_all, "entry_points:"));
+    ASSERT_NOT_NULL(strstr(inner_all, "file_tree:"));
     free(inner_all);
     free(resp_all);
 
@@ -2052,9 +2658,9 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "entry_points["));
-    ASSERT_NOT_NULL(strstr(inner, "node_labels["));
-    ASSERT_NULL(strstr(inner, "file_tree["));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
+    ASSERT_NOT_NULL(strstr(inner, "node_labels:"));
+    ASSERT_NULL(strstr(inner, "file_tree:"));
 
     free(inner);
     free(resp);
@@ -2135,7 +2741,7 @@ TEST(tool_get_architecture_accepts_project_name_alias_issue640) {
     /* RED before the alias: inner is the "project not found" error.
      * GREEN after: the alias resolves and architecture sections surface. */
     ASSERT_NULL(strstr(inner, "project not found"));
-    ASSERT_NOT_NULL(strstr(inner, "entry_points["));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
 
     free(inner);
     free(resp);
@@ -6402,8 +7008,13 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_trace_totals_respect_test_filter);
+    RUN_TEST(tool_get_architecture_cycles_detects_scc);
+    RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
+    RUN_TEST(tool_lean_defaults_schema_and_status);
+    RUN_TEST(tool_output_regression_gate);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
@@ -6420,6 +7031,8 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
+    RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);

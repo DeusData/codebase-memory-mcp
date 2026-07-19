@@ -368,9 +368,23 @@ static char *ha_format_context(const char *envelope, const char *token, bool *is
         yyjson_doc_free(edoc);
         return NULL;
     }
+    /* json-tree shape: {total, cols, groups:[{qn_prefix, file,
+     * rows:[[name,label,lines,in,out],...]}]}. The full qualified name is
+     * qn_prefix + "." + row[0]; label is row[1]; file lives on the group. */
     yyjson_val *iroot = yyjson_doc_get_root(idoc);
-    yyjson_val *results = yyjson_obj_get(iroot, "results");
-    size_t nres = (results && yyjson_is_arr(results)) ? yyjson_arr_size(results) : 0;
+    yyjson_val *groups = yyjson_obj_get(iroot, "groups");
+    size_t nres = 0;
+    size_t gidx;
+    size_t gmax;
+    yyjson_val *g;
+    if (groups && yyjson_is_arr(groups)) {
+        yyjson_arr_foreach(groups, gidx, gmax, g) {
+            yyjson_val *rows = yyjson_obj_get(g, "rows");
+            if (rows && yyjson_is_arr(rows)) {
+                nres += yyjson_arr_size(rows);
+            }
+        }
+    }
     if (nres == 0) {
         yyjson_doc_free(idoc);
         yyjson_doc_free(edoc);
@@ -389,26 +403,37 @@ static char *ha_format_context(const char *envelope, const char *token, bool *is
                        "(structured context; your search results below are "
                        "unaffected):",
                        nres, token);
-    size_t idx;
-    size_t maxn;
-    yyjson_val *r;
-    yyjson_arr_foreach(results, idx, maxn, r) {
-        if (off < 0 || off >= 3900) {
-            break;
+    yyjson_arr_foreach(groups, gidx, gmax, g) {
+        const char *prefix = ha_obj_str(g, "qn_prefix");
+        const char *fp = ha_obj_str(g, "file");
+        yyjson_val *rows = yyjson_obj_get(g, "rows");
+        if (!rows || !yyjson_is_arr(rows)) {
+            continue;
         }
-        const char *qn = ha_obj_str(r, "qualified_name");
-        const char *nm = ha_obj_str(r, "name");
-        const char *fp = ha_obj_str(r, "file_path");
-        const char *lb = ha_obj_str(r, "label");
-        const char *disp = (qn && qn[0]) ? qn : (nm ? nm : "");
-        char safe_disp[HA_METADATA_CAP];
-        char safe_path[HA_METADATA_CAP];
-        char safe_label[HA_METADATA_CAP];
-        ha_sanitize_metadata(disp, safe_disp, sizeof(safe_disp));
-        ha_sanitize_metadata(fp, safe_path, sizeof(safe_path));
-        ha_sanitize_metadata(lb, safe_label, sizeof(safe_label));
-        off += snprintf(text + off, (size_t)(4096 - off), "\n- %s  %s%s%s", safe_disp, safe_path,
-                        safe_label[0] ? "  " : "", safe_label);
+        size_t ridx;
+        size_t rmax;
+        yyjson_val *row;
+        yyjson_arr_foreach(rows, ridx, rmax, row) {
+            if (off < 0 || off >= 3900) {
+                break;
+            }
+            const char *nm = yyjson_get_str(yyjson_arr_get(row, 0));
+            const char *lb = yyjson_get_str(yyjson_arr_get(row, 1));
+            char disp[HA_METADATA_CAP];
+            if (prefix && prefix[0] && nm && nm[0]) {
+                snprintf(disp, sizeof(disp), "%s.%s", prefix, nm);
+            } else {
+                snprintf(disp, sizeof(disp), "%s", nm ? nm : "");
+            }
+            char safe_disp[HA_METADATA_CAP];
+            char safe_path[HA_METADATA_CAP];
+            char safe_label[HA_METADATA_CAP];
+            ha_sanitize_metadata(disp, safe_disp, sizeof(safe_disp));
+            ha_sanitize_metadata(fp, safe_path, sizeof(safe_path));
+            ha_sanitize_metadata(lb, safe_label, sizeof(safe_label));
+            off += snprintf(text + off, (size_t)(4096 - off), "\n- %s  %s%s%s", safe_disp,
+                            safe_path, safe_label[0] ? "  " : "", safe_label);
+        }
     }
 
     yyjson_doc_free(idoc);
@@ -1220,6 +1245,15 @@ char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char 
     char *json = ha_lifecycle_json_from_root(yyjson_doc_get_root(doc), forced_event, dialect);
     yyjson_doc_free(doc);
     return json;
+}
+
+/* Test seam: run the real envelope->additionalContext formatter. Couples the
+ * test suite to the ACTUAL search_graph response shape — a format change that
+ * breaks this parser breaks a test locally, not just the Windows CI guard. */
+char *cbm_hook_augment_format_context_for_testing(const char *envelope, const char *token,
+                                                  bool *is_error) {
+    bool dummy = false;
+    return ha_format_context(envelope, token, is_error ? is_error : &dummy);
 }
 
 char *cbm_hook_augment_tool_json_for_testing(const char *input, const char *dialect_name,

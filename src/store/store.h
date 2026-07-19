@@ -262,6 +262,15 @@ int cbm_store_create_indexes(cbm_store_t *s);
 /* Force WAL checkpoint + PRAGMA optimize. */
 int cbm_store_checkpoint(cbm_store_t *s);
 
+/* #1083: the WAL size limit (journal_size_limit) applied to this write
+ * connection, in bytes; -1 = unlimited (SQLite default / pre-fix). */
+int64_t cbm_store_journal_size_limit(cbm_store_t *s);
+
+/* Opaque store generation for pagination-cursor staleness detection:
+ * "u<db_uid>g<mutation_gen>" — db_uid is minted per DB file, mutation_gen
+ * bumps on every index run. "legacy" for DBs predating store_meta. */
+int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
+
 /* Resolve the mmap_size pragma value applied to on-disk stores from the
  * CBM_SQLITE_MMAP_SIZE environment variable. Defaults to 67108864 (64 MB)
  * when the variable is unset, malformed, or partially numeric. Negative
@@ -358,6 +367,13 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e);
 
 /* Insert edges in batch. */
 int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int count);
+
+/* Fetch all CALLS edges among Function/Method nodes for a project as parallel
+ * (source_id, target_id) arrays (caller frees both). For SCC / cycle analysis.
+ * Stops at max_edges and sets *truncated — never a silent cap. Returns
+ * CBM_STORE_OK (or _ERR); *count is the number returned. */
+int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
+                               int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated);
 
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
@@ -490,6 +506,15 @@ void cbm_store_search_free(cbm_search_output_t *out);
 
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out);
+
+/* Multi-source BFS from ALL seed ids at once (one CTE, temp-table anchored).
+ * Seeds are EXCLUDED from the result (impact semantics); MIN(hop) across the
+ * seed set; canonical (hop,id) order; *truncated set when the max_results
+ * memory-safety ceiling was hit (counting is otherwise uncapped). */
+int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
+                        const char *direction, const char **edge_types, int edge_type_count,
+                        int max_depth, int max_results, cbm_traverse_result_t *out,
+                        bool *truncated);
 
 /* Free a traverse result's allocated memory. */
 void cbm_store_traverse_free(cbm_traverse_result_t *out);

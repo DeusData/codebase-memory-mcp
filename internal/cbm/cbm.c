@@ -956,6 +956,101 @@ static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMD
     regs->count = kept;
 }
 
+/* #1071: a function-like macro invocation whose argument is a type token
+ * (e.g. ALLOC(int, n)) makes tree-sitter's C/C++ grammar emit an ERROR node — it
+ * parses `int` in expression position — which would be recorded as a parse_partial
+ * coverage gap. But the macro is #defined in THIS file, so nothing is actually
+ * missing from the graph; it's a benign call the grammar can't parse without the
+ * preprocessor. True if the [start_line, end_line] span contains a call `NAME(` to
+ * a file-defined function-like macro (Macro label + a parameter signature). */
+static bool cbm_span_is_macro_invocation(const char *src, int src_len, uint32_t start_line,
+                                         uint32_t end_line, const CBMDefArray *defs) {
+    if (!src || src_len <= 0 || !defs || start_line == 0 || end_line < start_line) {
+        return false;
+    }
+    int span_start = 0;
+    uint32_t line = 1;
+    while (span_start < src_len && line < start_line) {
+        if (src[span_start++] == '\n') {
+            line++;
+        }
+    }
+    if (line != start_line) {
+        return false;
+    }
+    int span_end = span_start;
+    while (span_end < src_len && line <= end_line) {
+        if (src[span_end++] == '\n') {
+            line++;
+        }
+    }
+    for (int di = 0; di < defs->count; di++) {
+        const CBMDefinition *d = &defs->items[di];
+        /* Function-like macros only: an object-like macro (#define PI 3.14) has no
+         * parameter signature and can't be mistaken for a call. */
+        if (!d->label || strcmp(d->label, "Macro") != 0 || !d->signature || !d->name ||
+            !d->name[0]) {
+            continue;
+        }
+        int nlen = (int)strlen(d->name);
+        for (int pos = span_start; pos + nlen <= span_end; pos++) {
+            if (strncmp(src + pos, d->name, (size_t)nlen) != 0 ||
+                (pos > 0 && cbm_identifier_char(src[pos - 1])) ||
+                (pos + nlen < src_len && cbm_identifier_char(src[pos + nlen]))) {
+                continue;
+            }
+            int open = pos + nlen;
+            while (open < span_end && isspace((unsigned char)src[open])) {
+                open++;
+            }
+            if (open < span_end && src[open] == '(') {
+                return true; /* NAME( ... ) — an invocation of this file's macro */
+            }
+        }
+    }
+    return false;
+}
+
+/* True if [rs, re] is fully enclosed by an extracted callable definition (a
+ * Function/Method body). A macro invocation INSIDE a real function body is an
+ * expression-level use where nothing is missing (#1071). A TOP-LEVEL invocation
+ * is different: the macro may itself expand to a definition that the original
+ * span doesn't contain (#949), which must stay flagged. Restricting the #1071
+ * suppression to in-body calls keeps that #949 gap honest and fails safe. */
+static bool cbm_region_inside_callable(uint32_t rs, uint32_t re, const CBMDefArray *defs) {
+    for (int i = 0; i < defs->count; i++) {
+        const CBMDefinition *d = &defs->items[i];
+        if (!d->label) {
+            continue;
+        }
+        if (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0 &&
+            strcmp(d->label, "Constructor") != 0 && strcmp(d->label, "Destructor") != 0) {
+            continue;
+        }
+        if (d->start_line <= rs && d->end_line >= re && d->end_line > d->start_line) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void cbm_subtract_macro_invocation_regions(cbm_error_regions_t *regs,
+                                                  const CBMDefArray *defs, const char *src,
+                                                  int src_len) {
+    int kept = 0;
+    for (int i = 0; i < regs->count; i++) {
+        bool benign =
+            cbm_span_is_macro_invocation(src, src_len, regs->starts[i], regs->ends[i], defs) &&
+            cbm_region_inside_callable(regs->starts[i], regs->ends[i], defs);
+        if (!benign) {
+            regs->starts[kept] = regs->starts[i];
+            regs->ends[kept] = regs->ends[i];
+            kept++;
+        }
+    }
+    regs->count = kept;
+}
+
 /* Serialize collected regions as "start-end,start-end,..." into the arena. */
 static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *regs) {
     if (regs->count <= 0) {
@@ -1410,6 +1505,9 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             cbm_collect_error_regions(root, &regs);
         }
         cbm_subtract_recovered_regions(&regs, &result->defs);
+        /* #1071: don't flag a benign function-like-macro call (defined in-file)
+         * that tree-sitter can't parse without the preprocessor. */
+        cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
         if (regs.count > 0) {
             result->parse_incomplete = true;
             result->error_region_count = regs.count;

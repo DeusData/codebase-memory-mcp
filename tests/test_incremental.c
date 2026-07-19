@@ -1860,11 +1860,35 @@ TEST(tool_detect_changes_default) {
     double ms;
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
     TOOL_OK(r, ms);
-    /* Must have changed_files array and changed_count */
-    ASSERT(resp_has_key(r, "changed_files"));
-    ASSERT(resp_has_key(r, "changed_count"));
-    ASSERT(resp_has_key(r, "impacted_symbols"));
-    ASSERT(resp_has_key(r, "depth"));
+    /* New tree contract: base + direction scalars, a changed_files section,
+     * and the seed/impact accounting. (The old changed_count/impacted_symbols/
+     * depth keys are gone — impact is now a real traversal, not bare names.) */
+    ASSERT(strstr(r, "changed_files:") != NULL);
+    ASSERT(strstr(r, "direction:") != NULL);
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    free(r);
+    PASS();
+}
+
+/* The blast radius is a REAL traversal now: default inbound gives transitive
+ * callers of the changed symbols with an exact impacted_total and a module
+ * rollup. Fixture diff may be empty (shallow clone at HEAD) — the sections and
+ * their accounting must still be present and internally consistent. */
+TEST(tool_detect_changes_impact_shape) {
+    double ms;
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT(strstr(r, "direction: inbound") != NULL); /* default = blast radius */
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    /* format:"json" returns the same model as structured JSON. */
+    free(r);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"base_branch\":\"HEAD\",\"format\":\"json\"}",
+                        g_project);
+    TOOL_OK(r, ms);
+    ASSERT(resp_has_key(r, "impacted_total"));
+    ASSERT(resp_has_key(r, "direction"));
     free(r);
     PASS();
 }
@@ -3100,6 +3124,7 @@ SUITE(incremental) {
 
     /* Phase 15: detect_changes */
     RUN_TEST(tool_detect_changes_default);
+    RUN_TEST(tool_detect_changes_impact_shape);
     RUN_TEST(tool_detect_changes_custom_branch);
     RUN_TEST(tool_detect_changes_since);
     RUN_TEST(tool_detect_changes_since_precedence);

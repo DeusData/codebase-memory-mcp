@@ -26,6 +26,10 @@ enum {
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
+    /* #1083: warn when a PASSIVE checkpoint sees a WAL this large (frames) but
+     * can't reset it — ~1 GiB at a 4 KiB page, far past the healthy ~1000-frame
+     * autocheckpoint, so it only fires under genuine starvation. */
+    ST_WAL_STARVE_WARN_FRAMES = 262144,
     /* file: URI for the immutable read-only fallback. A path is at most
      * CBM_SZ_1K; percent-encoding can triple it, plus the "file://" prefix,
      * the "?immutable=1" suffix and a leading '/'. */
@@ -429,6 +433,20 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory, bool read_only) {
          * May fail with SQLITE_BUSY if another process holds a lock. */
         (void)sqlite3_exec(s->db, "PRAGMA wal_checkpoint(PASSIVE)", NULL, NULL, NULL);
         rc = exec_sql(s, "PRAGMA synchronous = NORMAL;");
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
+        /* #1083: bound the WAL file so a checkpoint-starved log is physically
+         * reclaimed the next time a checkpoint can reset it. Our checkpoints are
+         * all PASSIVE (they never ftruncate — see cbm_store_checkpoint's SIGBUS
+         * note), so without a size limit the -wal file only ever grows; a
+         * journal_size_limit truncates it back to N bytes on the next successful
+         * reset. N is far above the healthy WAL (~4 MiB under the default
+         * 1000-page autocheckpoint), so normal indexing never triggers
+         * truncate/regrow churn — it only fires after abnormal growth. We do NOT
+         * use a TRUNCATE checkpoint: its ftruncate(fd,0) can raise SIGBUS in a
+         * sibling process that has the DB mmap'd on macOS. */
+        rc = exec_sql(s, "PRAGMA journal_size_limit = 268435456;"); /* 256 MiB */
         if (rc != CBM_STORE_OK) {
             return rc;
         }
@@ -1073,12 +1091,48 @@ int cbm_store_checkpoint(cbm_store_t *s) {
      * SIGBUS in a sibling process that has the DB mmap'd through SQLite
      * when it next faults a page in the now-shorter region.
      * See https://www.sqlite.org/c3ref/c_checkpoint_full.html */
-    int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+    int wal_frames = 0;
+    int checkpointed = 0;
+    int rc = sqlite3_wal_checkpoint_v2(s->db, NULL, SQLITE_CHECKPOINT_PASSIVE, &wal_frames,
+                                       &checkpointed);
     if (rc != SQLITE_OK) {
         store_set_error_sqlite(s, "checkpoint");
         return CBM_STORE_ERR;
     }
+    /* #1083: a large WAL that a PASSIVE checkpoint can't fully reset — because
+     * concurrent readers hold marks — is the checkpoint-starvation signal. Warn
+     * so an operator can see it (and the driving processes) before the -wal file
+     * fills the disk; journal_size_limit only reclaims once a reset succeeds.
+     * wal_frames = frames in the WAL, checkpointed = frames reclaimed this pass. */
+    if (wal_frames >= ST_WAL_STARVE_WARN_FRAMES && checkpointed < wal_frames) {
+        char frames_buf[ST_BUF_16];
+        char ckpt_buf[ST_BUF_16];
+        snprintf(frames_buf, sizeof(frames_buf), "%d", wal_frames);
+        snprintf(ckpt_buf, sizeof(ckpt_buf), "%d", checkpointed);
+        cbm_log_warn("store.wal.starving", "wal_frames", frames_buf, "checkpointed", ckpt_buf,
+                     "hint",
+                     "concurrent readers block the WAL reset — the -wal file keeps growing");
+    }
     return exec_sql(s, "PRAGMA optimize;");
+}
+
+/* #1083: the WAL size limit configured on this (write) connection, in bytes.
+ * -1 means unlimited (SQLite's default — the pre-fix behavior). Per-connection
+ * and not persisted, so it can only be read on the connection that set it. */
+int64_t cbm_store_journal_size_limit(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return -1;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA journal_size_limit;", -1, &stmt, NULL) != SQLITE_OK) {
+        return -1;
+    }
+    int64_t limit = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        limit = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return limit;
 }
 
 /* ── Dump ───────────────────────────────────────────────────────── */
@@ -1172,6 +1226,51 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
         store_set_error_sqlite(s, "upsert_project");
         return CBM_STORE_ERR;
     }
+
+    /* Store generation for cursor staleness (pagination): db_uid is a random
+     * identity minted once per DB FILE (a full reindex publishes a fresh file
+     * via the writer, which carries no store_meta — the first upsert_project
+     * on the opened store seeds a NEW uid, so cursors minted against the old
+     * file can never validate against the rebuilt one, whose node ids all
+     * differ). mutation_gen increments on every project upsert — the choke
+     * point every index run (full, incremental, watcher) passes through.
+     * Created here rather than in the byte-level writer: adding a table to
+     * its hand-built sqlite_master is rootpage surgery for zero benefit. */
+    (void)sqlite3_exec(s->db,
+                       "CREATE TABLE IF NOT EXISTS store_meta (k TEXT PRIMARY KEY, v TEXT);"
+                       "INSERT OR IGNORE INTO store_meta VALUES"
+                       "('db_uid', lower(hex(randomblob(8))));"
+                       "INSERT OR IGNORE INTO store_meta VALUES('mutation_gen','0');"
+                       "UPDATE store_meta SET v = CAST(CAST(v AS INTEGER)+1 AS TEXT) "
+                       "WHERE k='mutation_gen';",
+                       NULL, NULL, NULL);
+    return CBM_STORE_OK;
+}
+
+/* Opaque store generation for pagination cursors: "u<db_uid>g<mutation_gen>",
+ * or "legacy" when the DB predates store_meta (read-only opens never create
+ * it). A cursor whose embedded generation mismatches the store's current one
+ * is stale — the graph may have changed under it. */
+int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz) {
+    if (!s || !s->db || !buf || bufsz == 0) {
+        return CBM_STORE_ERR;
+    }
+    snprintf(buf, bufsz, "legacy");
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT (SELECT v FROM store_meta WHERE k='db_uid'),"
+                           "       (SELECT v FROM store_meta WHERE k='mutation_gen');",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK; /* pre-migration DB: stable "legacy" generation */
+    }
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *uid = (const char *)sqlite3_column_text(stmt, 0);
+        const char *gen = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (uid && gen) {
+            snprintf(buf, bufsz, "u%sg%s", uid, gen);
+        }
+    }
+    sqlite3_finalize(stmt);
     return CBM_STORE_OK;
 }
 
@@ -1745,6 +1844,76 @@ static void bind_proj_and_type(sqlite3_stmt *stmt, const void *data) {
     const bind_proj_type_t *b = data;
     bind_text(stmt, SKIP_ONE, b->project);
     bind_text(stmt, ST_COL_2, b->type);
+}
+
+int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
+                               int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated) {
+    if (out_src) {
+        *out_src = NULL;
+    }
+    if (out_tgt) {
+        *out_tgt = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (truncated) {
+        *truncated = false;
+    }
+    if (!s || !s->db || !project || !out_src || !out_tgt || !count) {
+        return CBM_STORE_ERR;
+    }
+    /* CALLS edges whose BOTH endpoints are callable defs — the call graph the
+     * SCC pass condenses. Ordered for determinism. LIMIT max_edges + 1 so a
+     * full result is distinguishable from a truncated one. */
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT e.source_id, e.target_id FROM edges e "
+                           "JOIN nodes ns ON ns.id = e.source_id "
+                           "JOIN nodes nt ON nt.id = e.target_id "
+                           "WHERE e.project = ?1 AND e.type = 'CALLS' "
+                           "  AND ns.label IN ('Function','Method') "
+                           "  AND nt.label IN ('Function','Method') "
+                           "ORDER BY e.source_id, e.target_id LIMIT ?2;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "fetch_call_edges prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    sqlite3_bind_int(stmt, 2, max_edges > 0 ? max_edges + SKIP_ONE : CBM_NOT_FOUND);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    int64_t *src = malloc((size_t)cap * sizeof(int64_t));
+    int64_t *tgt = malloc((size_t)cap * sizeof(int64_t));
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (max_edges > 0 && n >= max_edges) {
+            if (truncated) {
+                *truncated = true; /* the sentinel row proves there are more */
+            }
+            break;
+        }
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            src = safe_realloc(src, (size_t)cap * sizeof(int64_t));
+            tgt = safe_realloc(tgt, (size_t)cap * sizeof(int64_t));
+        }
+        src[n] = sqlite3_column_int64(stmt, 0);
+        tgt[n] = sqlite3_column_int64(stmt, 1);
+        n++;
+    }
+    sqlite3_finalize(stmt);
+    if (scan_rc != SQLITE_DONE && scan_rc != SQLITE_ROW) {
+        free(src);
+        free(tgt);
+        store_set_error_sqlite(s, "fetch_call_edges scan");
+        return CBM_STORE_ERR;
+    }
+    *out_src = src;
+    *out_tgt = tgt;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out,
@@ -3420,9 +3589,12 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     int limit = params->limit > 0 ? params->limit : CBM_DEFAULT_SEARCH_LIMIT;
     int offset = params->offset;
     const char *name_col = has_degree_filter ? "name" : "n.name";
+    const char *id_col = has_degree_filter ? "id" : "n.id";
     char order_limit[CBM_SZ_128];
-    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s LIMIT %d OFFSET %d", name_col, limit,
-             offset);
+    /* (name, id) is a unique total order — names are non-unique, and without
+     * the tie-break offset pages are not contractually stable across calls. */
+    snprintf(order_limit, sizeof(order_limit), " ORDER BY %s, %s LIMIT %d OFFSET %d", name_col,
+             id_col, limit, offset);
     strncat(sql, order_limit, sizeof(sql) - strlen(sql) - 1);
 
     /* Execute count query */
@@ -3511,19 +3683,34 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
                              int visited_count, const char *types_clause, const char **edge_types,
                              int edge_type_count, cbm_edge_info_t **out_edges,
                              int *out_edge_count) {
-    /* Build ID set: root + all visited */
-    char id_set[CBM_SZ_4K];
-    int ilen = snprintf(id_set, sizeof(id_set), "%lld", (long long)start_id);
-    if (ilen >= (int)sizeof(id_set)) {
-        ilen = (int)sizeof(id_set) - SKIP_ONE;
+    *out_edges = NULL;
+    *out_edge_count = 0;
+
+    /* Visited-ID set via a per-connection TEMP table. The previous approach
+     * interpolated the ids into a fixed 4KB SQL string: past ~1000 visited
+     * nodes the list was cut MID-NUMBER, the SQL failed to prepare, and every
+     * trace edge silently vanished (and a luckier cut could match an
+     * unrelated node). TEMP tables live in the connection's temp db, so this
+     * works on read-only query connections too. */
+    if (sqlite3_exec(s->db,
+                     "CREATE TEMP TABLE IF NOT EXISTS bfs_ids (id INTEGER PRIMARY KEY);"
+                     "DELETE FROM bfs_ids;",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK; /* best-effort: nodes without edges beat an error */
     }
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(s->db, "INSERT OR IGNORE INTO bfs_ids(id) VALUES (?1)", CBM_NOT_FOUND,
+                           &ins, NULL) != SQLITE_OK) {
+        return CBM_STORE_OK;
+    }
+    sqlite3_bind_int64(ins, SKIP_ONE, start_id);
+    (void)sqlite3_step(ins);
     for (int i = 0; i < visited_count; i++) {
-        ilen += snprintf(id_set + ilen, sizeof(id_set) - (size_t)ilen, ",%lld",
-                         (long long)visited[i].node.id);
-        if (ilen >= (int)sizeof(id_set)) {
-            ilen = (int)sizeof(id_set) - SKIP_ONE;
-        }
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, SKIP_ONE, visited[i].node.id);
+        (void)sqlite3_step(ins);
     }
+    sqlite3_finalize(ins);
 
     char edge_sql[ST_SQL_BUF];
     snprintf(edge_sql, sizeof(edge_sql),
@@ -3531,9 +3718,10 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
              "FROM edges e "
              "JOIN nodes n1 ON n1.id = e.source_id "
              "JOIN nodes n2 ON n2.id = e.target_id "
-             "WHERE e.source_id IN (%s) AND e.target_id IN (%s) "
+             "WHERE e.source_id IN (SELECT id FROM bfs_ids) "
+             "AND e.target_id IN (SELECT id FROM bfs_ids) "
              "AND e.type IN (%s)",
-             id_set, id_set, types_clause);
+             types_clause);
 
     sqlite3_stmt *estmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &estmt, NULL);
@@ -3654,7 +3842,9 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "JOIN nodes n ON n.id = bfs.node_id "
              "WHERE bfs.hop > 0 " /* exclude root at hop 0 (self via a loop still appears) */
              "GROUP BY n.id "
-             "ORDER BY hop "
+             /* (hop, id) is a unique total order — deterministic pagination
+              * watermarks and reproducible trace output depend on it. */
+             "ORDER BY hop, n.id "
              "LIMIT %d;",
              (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
 
@@ -3710,6 +3900,132 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         out->edge_count = 0;
     }
 
+    return CBM_STORE_OK;
+}
+
+/* Multi-source BFS: one recursive CTE anchored on ALL seeds (via a temp
+ * table — never a per-seed loop, which re-walks overlapping hub subgraphs
+ * seed_count times). Semantics for impact analysis:
+ *   - shortest-path MIN(hop) across the whole seed set;
+ *   - SEEDS ARE EXCLUDED from the result: a seed reached from another seed
+ *     (changed files call each other constantly) is not "impact";
+ *   - uncapped counting up to max_results as a memory-safety ceiling only —
+ *     *truncated reports when it was hit (never a silent cap);
+ *   - canonical (hop, id) order.
+ * No root node and no edge collection — impact wants the reached set. */
+int cbm_store_bfs_multi(cbm_store_t *s, const int64_t *seed_ids, int seed_count,
+                        const char *direction, const char **edge_types, int edge_type_count,
+                        int max_depth, int max_results, cbm_traverse_result_t *out,
+                        bool *truncated) {
+    memset(out, 0, sizeof(*out));
+    if (truncated) {
+        *truncated = false;
+    }
+    if (!s || !s->db || !seed_ids || seed_count <= 0) {
+        return CBM_STORE_ERR;
+    }
+
+    if (sqlite3_exec(s->db,
+                     "CREATE TEMP TABLE IF NOT EXISTS bfs_seeds (id INTEGER PRIMARY KEY);"
+                     "DELETE FROM bfs_seeds;",
+                     NULL, NULL, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "bfs_multi seeds");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(s->db, "INSERT OR IGNORE INTO bfs_seeds(id) VALUES (?1)", CBM_NOT_FOUND,
+                           &ins, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "bfs_multi seed insert");
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < seed_count; i++) {
+        sqlite3_reset(ins);
+        sqlite3_bind_int64(ins, SKIP_ONE, seed_ids[i]);
+        (void)sqlite3_step(ins);
+    }
+    sqlite3_finalize(ins);
+
+    char types_clause[CBM_SZ_512];
+    bfs_build_types_clause(edge_type_count, types_clause, (int)sizeof(types_clause));
+
+    const char *join_cond;
+    const char *next_id;
+    bool is_inbound = (direction != NULL) && (strcmp(direction, "inbound") == 0);
+    if (is_inbound) {
+        join_cond = "e.target_id = bfs.node_id";
+        next_id = "e.source_id";
+    } else {
+        join_cond = "e.source_id = bfs.node_id";
+        next_id = "e.target_id";
+    }
+
+    char sql[CBM_SZ_4K];
+    snprintf(sql, sizeof(sql),
+             "WITH RECURSIVE bfs(node_id, hop) AS ("
+             "  SELECT id, 0 FROM bfs_seeds"
+             "  UNION"
+             "  SELECT %s, bfs.hop + 1"
+             "  FROM bfs"
+             "  JOIN edges e ON %s"
+             "  WHERE e.type IN (%s) AND bfs.hop < %d"
+             ")"
+             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+             "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
+             "FROM bfs "
+             "JOIN nodes n ON n.id = bfs.node_id "
+             /* hop > 0 excludes the anchors themselves; the NOT IN excludes a
+              * seed REACHED from another seed at hop > 0 (leak-back). */
+             "WHERE bfs.hop > 0 AND bfs.node_id NOT IN (SELECT id FROM bfs_seeds) "
+             "GROUP BY n.id "
+             "ORDER BY hop, n.id "
+             "LIMIT %d;",
+             next_id, join_cond, types_clause, max_depth, max_results + SKIP_ONE);
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "bfs_multi prepare");
+        return CBM_STORE_ERR;
+    }
+    if (edge_type_count > 0) {
+        for (int i = 0; i < edge_type_count; i++) {
+            bind_text(stmt, i + SKIP_ONE, edge_types[i]);
+        }
+    } else {
+        bind_text(stmt, SKIP_ONE, "CALLS");
+    }
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_hop_t *visited = malloc(cap * sizeof(cbm_node_hop_t));
+    int scan_rc16;
+    while ((scan_rc16 = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n > max_results) {
+            break; /* ceiling + 1 row fetched: report truncation below */
+        }
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            visited = safe_realloc(visited, cap * sizeof(cbm_node_hop_t));
+        }
+        scan_node(stmt, &visited[n].node);
+        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        n++;
+    }
+    bool aborted = (scan_rc16 != SQLITE_DONE && scan_rc16 != SQLITE_ROW);
+    if (n > max_results) {
+        /* Free the sentinel row and flag the ceiling. */
+        n = max_results;
+        cbm_node_free_fields(&visited[n].node);
+        if (truncated) {
+            *truncated = true;
+        }
+    }
+    sqlite3_finalize(stmt);
+    out->visited = visited;
+    out->visited_count = n;
+    if (aborted) {
+        store_set_error_sqlite(s, "bfs_multi row scan aborted");
+        return CBM_STORE_ERR;
+    }
     return CBM_STORE_OK;
 }
 

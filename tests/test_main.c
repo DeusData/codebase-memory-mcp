@@ -166,11 +166,20 @@ static bool suite_requested(const char *name) {
     return requested;
 }
 
-#define RUN_SELECTED_SUITE(name)      \
-    do {                              \
-        if (suite_requested(#name)) { \
-            RUN_SUITE(name);          \
-        }                             \
+/* --list-suites: print every registered suite name, one per line, without
+ * running anything. The list and the run share this ONE macro table, so the
+ * list can never drift from what actually executes — shard runners (make
+ * test-par, the CI shard matrix) enumerate suites from here and their union
+ * guard compares against it. */
+static bool g_list_only = false;
+
+#define RUN_SELECTED_SUITE(name)             \
+    do {                                     \
+        if (g_list_only) {                   \
+            printf("%s\n", #name);           \
+        } else if (suite_requested(#name)) { \
+            RUN_SUITE(name);                 \
+        }                                    \
     } while (0)
 
 /* Forward declarations of suite functions */
@@ -273,7 +282,9 @@ extern void suite_semantic(void);
 extern void suite_ast_profile(void);
 extern void suite_slab_alloc(void);
 extern void suite_simhash(void);
-extern void suite_stack_overflow(void);
+extern void suite_stack_overflow_a(void);
+extern void suite_stack_overflow_b(void);
+extern void suite_stack_overflow_c(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
 
@@ -308,16 +319,23 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    g_suite_argc = argc;
-    g_suite_argv = argv;
-    if (argc > 1) {
+    if (argc == 2 && strcmp(argv[1], "--list-suites") == 0) {
+        g_list_only = true;
+        g_suite_argc = 1; /* no suite-name args to match */
+    } else {
+        g_suite_argc = argc;
+        g_suite_argv = argv;
+    }
+    if (g_suite_argc > 1) {
         g_suite_arg_matched = calloc((size_t)argc, sizeof(*g_suite_arg_matched));
         if (!g_suite_arg_matched) {
             fprintf(stderr, "Failed to allocate test-suite argument tracking\n");
             return 1;
         }
     }
-    printf("\n  codebase-memory-mcp  C test suite\n");
+    if (!g_list_only) {
+        printf("\n  codebase-memory-mcp  C test suite\n");
+    }
 
     /* Foundation */
     RUN_SELECTED_SUITE(arena);
@@ -454,8 +472,11 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(ast_profile);
     RUN_SELECTED_SUITE(simhash);
 
-    /* Stack overflow regression (GitHub #199) */
-    RUN_SELECTED_SUITE(stack_overflow);
+    /* Stack overflow regression (GitHub #199) — split a/b/c so no single
+     * suite serializes a parallel run (each ~1/3 of the old wall time). */
+    RUN_SELECTED_SUITE(stack_overflow_a);
+    RUN_SELECTED_SUITE(stack_overflow_b);
+    RUN_SELECTED_SUITE(stack_overflow_c);
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);
@@ -480,6 +501,12 @@ int main(int argc, char **argv) {
 
     RUN_SELECTED_SUITE(incremental);
 
+    if (g_list_only) {
+        fflush(stdout);
+        cbm_kind_in_set_free_cache();
+        sqlite3_shutdown();
+        return 0;
+    }
     bool any_suite_matched = false;
     for (int i = 1; i < g_suite_argc; i++) {
         any_suite_matched = any_suite_matched || g_suite_arg_matched[i];

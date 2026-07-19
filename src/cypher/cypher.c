@@ -2163,8 +2163,13 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
     } fields[] = {
         {"name", offsetof(cbm_node_t, name)},
         {"qualified_name", offsetof(cbm_node_t, qualified_name)},
+        /* Aliases: field-eval agents reach for the short names, and a miss
+         * used to return a silent empty column costing a round-trip. */
+        {"qn", offsetof(cbm_node_t, qualified_name)},
         {"label", offsetof(cbm_node_t, label)},
         {"file_path", offsetof(cbm_node_t, file_path)},
+        {"file", offsetof(cbm_node_t, file_path)},
+        {"path", offsetof(cbm_node_t, file_path)},
     };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         if (strcmp(prop, fields[i].key) == 0) {

@@ -195,8 +195,9 @@ echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 if ! TRACE=$(cli trace_path --project "$PROJECT" --function-name compute --direction inbound --depth 1); then
   echo "FAIL: trace_path (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-# trace_path default output is TOON: the callers[N]{...} header carries the count
-CALLERS=$(echo "$TRACE" | sed -n 's/^callers\[\([0-9]*\)\].*/\1/p' | head -1)
+# trace_path default output is the tree format: callers_total carries the
+# exact reachable count (test files excluded by default)
+CALLERS=$(echo "$TRACE" | sed -n 's/^callers_total: \([0-9]*\).*/\1/p' | head -1)
 CALLERS=${CALLERS:-0}
 if [ "$CALLERS" -lt 1 ]; then
   echo "FAIL: trace_path found 0 callers for 'compute'"
@@ -278,7 +279,7 @@ cyp_first_cell() {
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
   # metacharacters {}|=~<>" need no JSON escaping.
   cli query_graph --project "$PROJECT" --query "$1" |
-    sed -n '/^rows\[/{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
+    sed -n '/^rows: /{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -366,7 +367,7 @@ LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
 
 # NOT EXISTS dead-code query (functions with no caller)
 CYPHER_NX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name")
-NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows\[[0-9]+\]\{' && echo "True" || echo "False")
+NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows: [0-9]+' && echo "True" || echo "False")
 [ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
 
 # CASE expression in RETURN
@@ -390,7 +391,7 @@ if ! ARCH=$(cli get_architecture --project "$PROJECT" --aspects clusters); then
   echo "FAIL: get_architecture (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 # get_architecture default output is TOON: clusters[N]{...} header carries the count
-NCLUST=$(echo "$ARCH" | sed -n 's/^clusters\[\([0-9]*\)\].*/\1/p' | head -1)
+NCLUST=$(echo "$ARCH" | sed -n 's/^clusters: \([0-9]*\).*/\1/p' | head -1)
 NCLUST=${NCLUST:-0}
 if [ "$NCLUST" -lt 1 ]; then
   echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
@@ -431,7 +432,7 @@ echo "=== Phase 3h: CLI input-mode guards (flags / stdin / --args-file / --help 
 assert_json_obj() { python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d,dict) else 1)" 2>/dev/null; }
 # search_graph emits TOON by default: a results/semantic table header proves
 # the tool parsed its typed flags and produced a well-formed response.
-assert_toon_table() { grep -qE '^(results|semantic)\[[0-9]+\]\{'; }
+assert_toon_table() { grep -qE '^(results|semantic): [0-9]+'; }
 
 # B1: INTEGER flag — --limit is schema-typed integer; must parse and answer.
 if ! IM_INT=$(cli search_graph --project "$PROJECT" --name-pattern compute --limit 5); then
@@ -458,7 +459,7 @@ fi
 if ! IM_ARR=$(cli search_graph --project "$PROJECT" --semantic-query send --semantic-query publish); then
   echo "FAIL B3: search_graph repeated --semantic-query exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_ARR" | grep -qE '^semantic\[[0-9]+\]\{'; then
+if echo "$IM_ARR" | grep -qE '^semantic: [0-9]+'; then
   echo "OK B3: ARRAY flag (repeated --semantic-query) → semantic TOON table"
 else
   echo "FAIL B3: repeated --semantic-query did not produce a semantic table"; echo "$IM_ARR" | head -c 300; exit 1

@@ -580,6 +580,178 @@ TEST(integ_store_bfs_traversal) {
     PASS();
 }
 
+/* bfs_collect_edges built its visited-ID set into a fixed 4KB string: past
+ * ~340-1100 visited nodes (id-width dependent) the id list was SILENTLY cut,
+ * so trace edges (and data_flow args) vanished — and a partially-written id
+ * could even match an UNRELATED node, admitting wrong edges. GUARD: a star of
+ * 1200 callers (id string ≈ 4.6KB) must surface every edge. RED on the fixed
+ * buffer, GREEN with the temp-table join. */
+TEST(store_bfs_edges_survive_large_visited_set) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "star", "/tmp/star"), CBM_STORE_OK);
+
+    cbm_node_t hub = {0};
+    hub.project = "star";
+    hub.label = "Function";
+    hub.name = "hub";
+    hub.qualified_name = "star.hub";
+    hub.file_path = "hub.c";
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    ASSERT_GT(hub_id, 0);
+
+    enum { SPOKES = 1200 };
+    for (int i = 0; i < SPOKES; i++) {
+        char nm[32];
+        char qn[64];
+        snprintf(nm, sizeof(nm), "caller_%04d", i);
+        snprintf(qn, sizeof(qn), "star.caller_%04d", i);
+        cbm_node_t sp = {0};
+        sp.project = "star";
+        sp.label = "Function";
+        sp.name = nm;
+        sp.qualified_name = qn;
+        sp.file_path = "spokes.c";
+        int64_t sid = cbm_store_upsert_node(s, &sp);
+        ASSERT_GT(sid, 0);
+        cbm_edge_t e = {0};
+        e.project = "star";
+        e.source_id = sid;
+        e.target_id = hub_id;
+        e.type = "CALLS";
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0); /* returns the edge id */
+    }
+
+    cbm_traverse_result_t tr = {0};
+    ASSERT_EQ(cbm_store_bfs(s, hub_id, "inbound", NULL, 0, 1, SPOKES + 10, &tr), CBM_STORE_OK);
+    ASSERT_EQ(tr.visited_count, SPOKES);
+    /* Every caller->hub edge must be collected — none silently dropped. */
+    ASSERT_EQ(tr.edge_count, SPOKES);
+
+    cbm_store_traverse_free(&tr);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Multi-source BFS is the substrate for detect_changes impact analysis. Its
+ * contract (challenger's flagged traps): (1) ONE traversal over ALL seeds,
+ * not seed_count separate walks; (2) seeds EXCLUDED from the result even when
+ * reachable from another seed (changed files call each other — that is not
+ * "downstream impact"); (3) MIN(hop) across the whole seed set; (4) uncapped
+ * counting up to the memory ceiling, which sets *truncated when hit. Fixture:
+ * two seeds A, B; A->mid->leaf, B->leaf (leaf is hop 1 from B, hop 2 from A),
+ * and A->B directly (B reachable from A). Impact set must be {mid, leaf} with
+ * leaf at hop 1, and must NOT contain A or B. */
+TEST(store_bfs_multi_excludes_seeds_and_takes_min_hop) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "impact", "/tmp/impact"), CBM_STORE_OK);
+
+    int64_t ids[4];
+    const char *names[4] = {"A", "B", "mid", "leaf"};
+    for (int i = 0; i < 4; i++) {
+        char qn[32];
+        snprintf(qn, sizeof(qn), "impact.%s", names[i]);
+        cbm_node_t n = {.project = "impact",
+                        .label = "Function",
+                        .name = names[i],
+                        .qualified_name = qn,
+                        .file_path = "m.c",
+                        .start_line = 1,
+                        .end_line = 5};
+        ids[i] = cbm_store_upsert_node(s, &n);
+        ASSERT_GT(ids[i], 0);
+    }
+    int64_t A = ids[0];
+    int64_t B = ids[1];
+    int64_t mid = ids[2];
+    int64_t leaf = ids[3];
+    struct {
+        int64_t from;
+        int64_t to;
+    } edges[] = {{A, mid}, {mid, leaf}, {B, leaf}, {A, B}};
+    for (size_t i = 0; i < sizeof(edges) / sizeof(edges[0]); i++) {
+        cbm_edge_t e = {.project = "impact",
+                        .source_id = edges[i].from,
+                        .target_id = edges[i].to,
+                        .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    }
+
+    int64_t seeds[2] = {A, B};
+    cbm_traverse_result_t tr = {0};
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_bfs_multi(s, seeds, 2, "outbound", NULL, 0, 5, 100, &tr, &truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(truncated);
+
+    /* Impact set = {mid, leaf}; A and B (seeds) excluded even though B is
+     * reachable from A. */
+    ASSERT_EQ(tr.visited_count, 2);
+    int seen_mid = 0;
+    int seen_leaf = 0;
+    int leaf_hop = -1;
+    for (int i = 0; i < tr.visited_count; i++) {
+        int64_t id = tr.visited[i].node.id;
+        ASSERT_TRUE(id != A && id != B); /* seeds never in the result */
+        if (id == mid) {
+            seen_mid = 1;
+        }
+        if (id == leaf) {
+            seen_leaf = 1;
+            leaf_hop = tr.visited[i].hop;
+        }
+    }
+    ASSERT_TRUE(seen_mid && seen_leaf);
+    ASSERT_EQ(leaf_hop, 1); /* MIN(hop): 1 from B, not 2 from A */
+    cbm_store_traverse_free(&tr);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The memory-safety ceiling reports truncation instead of silently capping.
+ * A star of N callees from one seed, ceiling = N/2, must return exactly N/2
+ * rows with *truncated = true. */
+TEST(store_bfs_multi_reports_truncation_at_ceiling) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "cap", "/tmp/cap"), CBM_STORE_OK);
+    cbm_node_t hub = {.project = "cap",
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "cap.hub",
+                      .file_path = "h.c",
+                      .start_line = 1,
+                      .end_line = 2};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    ASSERT_GT(hub_id, 0);
+    enum { N = 40, CEIL = 20 };
+    for (int i = 0; i < N; i++) {
+        char qn[32];
+        snprintf(qn, sizeof(qn), "cap.c%02d", i);
+        cbm_node_t n = {.project = "cap",
+                        .label = "Function",
+                        .name = qn + 4,
+                        .qualified_name = qn,
+                        .file_path = "c.c",
+                        .start_line = 1,
+                        .end_line = 2};
+        int64_t nid = cbm_store_upsert_node(s, &n);
+        ASSERT_GT(nid, 0);
+        cbm_edge_t e = {.project = "cap", .source_id = hub_id, .target_id = nid, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+    }
+    cbm_traverse_result_t tr = {0};
+    bool truncated = false;
+    ASSERT_EQ(cbm_store_bfs_multi(s, &hub_id, 1, "outbound", NULL, 0, 5, CEIL, &tr, &truncated),
+              CBM_STORE_OK);
+    ASSERT_EQ(tr.visited_count, CEIL);
+    ASSERT_TRUE(truncated);
+    cbm_store_traverse_free(&tr);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* #411: index_repository silently drops entire subtrees with no record.
  * Moderate/fast mode applies FAST_SKIP_DIRS (tools/scripts/bin/docs/...) and ALL
  * modes apply ALWAYS_SKIP_DIRS (node_modules/...), so files are excluded from the
@@ -667,6 +839,9 @@ SUITE(integration) {
     RUN_TEST(integ_store_search_by_degree);
     RUN_TEST(integ_store_find_by_file);
     RUN_TEST(integ_store_bfs_traversal);
+    RUN_TEST(store_bfs_edges_survive_large_visited_set);
+    RUN_TEST(store_bfs_multi_excludes_seeds_and_takes_min_hop);
+    RUN_TEST(store_bfs_multi_reports_truncation_at_ceiling);
 
     /* Pipeline API tests (no db needed) */
     RUN_TEST(integ_pipeline_fqn_compute);

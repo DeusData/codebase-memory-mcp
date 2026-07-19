@@ -86,6 +86,62 @@ TEST(store_open_with_mmap_disabled) {
     PASS();
 }
 
+/* #1083: on-disk write connections must bound the WAL via journal_size_limit
+ * so a checkpoint-starved log is physically reclaimed once a checkpoint can
+ * reset it. On main this is UNSET (-1 = unlimited), so the -wal file only ever
+ * grows (all our checkpoints are PASSIVE and never ftruncate). Read the pragma
+ * back on the SAME connection — it's per-connection and not persisted. */
+TEST(journal_size_limit_bounds_wal_issue1083) {
+    char tmp_path[256];
+    snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_test_jsl_%d.db", cbm_tmpdir(), (int)getpid());
+    unlink(tmp_path);
+
+    cbm_store_t *s = cbm_store_open_path(tmp_path);
+    ASSERT(s != NULL);
+    /* 256 MiB — far above the healthy WAL (~4 MiB), so no truncate/regrow churn
+     * in normal operation; it only fires after abnormal (starved) growth. */
+    ASSERT(cbm_store_journal_size_limit(s) == (int64_t)268435456);
+    cbm_store_close(s);
+
+    unlink(tmp_path);
+    char tmp_wal[300];
+    char tmp_shm[300];
+    snprintf(tmp_wal, sizeof(tmp_wal), "%s-wal", tmp_path);
+    snprintf(tmp_shm, sizeof(tmp_shm), "%s-shm", tmp_path);
+    unlink(tmp_wal);
+    unlink(tmp_shm);
+    PASS();
+}
+
+/* Pagination-cursor generation: minted per DB file, bumped per index run.
+ * Same store + reads only -> stable; upsert_project (every index run's choke
+ * point) -> changes; two distinct DB files can never share a generation even
+ * at the same counter value (random db_uid). */
+TEST(store_generation_tracks_mutations) {
+    char g1[128];
+    char g2[128];
+    char g3[128];
+    cbm_store_t *a = cbm_store_open_memory();
+    ASSERT(a != NULL);
+    ASSERT_EQ(cbm_store_upsert_project(a, "p", "/tmp/p"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(a, g1, sizeof(g1)), CBM_STORE_OK);
+    ASSERT(strncmp(g1, "u", 1) == 0); /* seeded, not legacy */
+    ASSERT_EQ(cbm_store_generation(a, g2, sizeof(g2)), CBM_STORE_OK);
+    ASSERT(strcmp(g1, g2) == 0); /* reads are stable */
+    ASSERT_EQ(cbm_store_upsert_project(a, "p", "/tmp/p"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_generation(a, g3, sizeof(g3)), CBM_STORE_OK);
+    ASSERT(strcmp(g1, g3) != 0); /* index run bumps */
+
+    cbm_store_t *b = cbm_store_open_memory();
+    ASSERT(b != NULL);
+    ASSERT_EQ(cbm_store_upsert_project(b, "p", "/tmp/p"), CBM_STORE_OK);
+    char gb[128];
+    ASSERT_EQ(cbm_store_generation(b, gb, sizeof(gb)), CBM_STORE_OK);
+    ASSERT(strcmp(g1, gb) != 0); /* distinct DBs never alias (random uid) */
+    cbm_store_close(a);
+    cbm_store_close(b);
+    PASS();
+}
 
 /* #896: a row-scan that dies mid-stream (SQLITE_CORRUPT) must surface a
  * loud store error, not masquerade as a clean end of results. Counts are
@@ -107,8 +163,7 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
         char qn[256];
         snprintf(name, sizeof(name), "corrupt_probe_fn_%04d", i);
         snprintf(qn, sizeof(qn),
-                 "corr.some.rather.long.module.path.to.fill.table.pages.%s_padding_padding",
-                 name);
+                 "corr.some.rather.long.module.path.to.fill.table.pages.%s_padding_padding", name);
         cbm_node_t n = {.project = "corr",
                         .label = "Function",
                         .name = name,
@@ -147,8 +202,8 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
     cbm_store_t *s2 = cbm_store_open_path(db_path);
     ASSERT_NOT_NULL(s2);
     /* The scan must CROSS the corrupt band: request every row. */
-    cbm_search_params_t all_params = {.project = "corr", .label = "Function",
-                                      .limit = CORRUPT_NODES};
+    cbm_search_params_t all_params = {
+        .project = "corr", .label = "Function", .limit = CORRUPT_NODES};
     cbm_search_output_t out2 = {0};
     int rc_search = cbm_store_search(s2, &all_params, &out2);
     if (rc_search == CBM_STORE_OK && out2.count == CORRUPT_NODES) {
@@ -179,6 +234,8 @@ TEST(corrupt_page_scan_returns_error_not_truncation) {
 }
 
 SUITE(store_pragmas) {
+    RUN_TEST(journal_size_limit_bounds_wal_issue1083);
+    RUN_TEST(store_generation_tracks_mutations);
     RUN_TEST(corrupt_page_scan_returns_error_not_truncation);
     RUN_TEST(mmap_size_default_when_unset);
     RUN_TEST(mmap_size_zero_disables_mmap);

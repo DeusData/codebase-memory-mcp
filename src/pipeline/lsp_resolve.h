@@ -174,6 +174,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
                    strcmp(rc->strategy, "lsp_method_ref_ctor") == 0 ||
                    strcmp(rc->strategy, "lsp_method_ref_ctor_synth") == 0 ||
                    strcmp(rc->strategy, "lsp_dict_dispatch") == 0 ||
+                   strcmp(rc->strategy, "lsp_import_alias") == 0 ||
                    strcmp(rc->strategy, "lsp_destructor") == 0 ||
                    strcmp(rc->strategy, "php_method_dynamic") == 0) &&
                   strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0)) {

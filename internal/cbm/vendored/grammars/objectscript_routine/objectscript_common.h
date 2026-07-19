@@ -332,7 +332,7 @@ static bool ObjectScript_Core_Scanner_lex_marker_fenced_text(
       lexer->mark_end(lexer);
       advance(lexer);
 
-      uint8_t i = 0;
+      int i = 0;
       while (i < reverse_marker_len && !lexer->eof(lexer)
              && lexer->lookahead == reverse_marker[i]) {
         advance(lexer);
@@ -588,7 +588,7 @@ ObjectScript_Core_Scanner_scan(struct ObjectScript_Core_Scanner *scanner,
       return false;
     }
     scanner->js_marker_buffer_reversed_len = scanner->html_marker_buffer_len;
-    for (uint8_t i = 0; i < scanner->html_marker_buffer_len; i++) {
+    for (int i = 0; i < scanner->html_marker_buffer_len; i++) {
       if (scanner->html_marker_buffer[scanner->html_marker_buffer_len - 1 - i] == '[') {
         scanner->js_marker_buffer_reversed[i] = ']';
       }

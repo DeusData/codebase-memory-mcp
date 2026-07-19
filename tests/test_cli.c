@@ -13,6 +13,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
@@ -1412,6 +1413,10 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     char *saved_appdata = save_test_env("APPDATA");
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolvers prefer XDG */
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
 #ifdef _WIN32
@@ -1431,6 +1436,7 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("APPDATA", saved_appdata);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
     test_rmdir_r(tmpdir);
     if (rc != 0 || !removed)
         FAIL("VS Code uninstall must remove MCP entries from every existing profile");
@@ -2952,8 +2958,20 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         FAIL("cbm_mkdtemp failed");
 
     const char *const env_names[] = {
-        "HOME",         "PATH",           "CLAUDE_CONFIG_DIR", "CODEX_HOME", "QWEN_HOME",
-        "COPILOT_HOME", "CLINE_DATA_DIR", "KIRO_HOME",         "VIBE_HOME",  "OPENCODE_CONFIG",
+        "HOME",
+        "PATH",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "QWEN_HOME",
+        "COPILOT_HOME",
+        "CLINE_DATA_DIR",
+        "KIRO_HOME",
+        "VIBE_HOME",
+        "OPENCODE_CONFIG",
+        /* Linux path resolvers prefer $XDG_CONFIG_HOME over $HOME/.config;
+         * CI runners export it, so an isolated-process run resolved OUTSIDE
+         * the fixture home (green only via env leaked from earlier suites). */
+        "XDG_CONFIG_HOME",
     };
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
@@ -6910,6 +6928,48 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     PASS();
 }
 
+/* The PreToolUse augmenter parses search_graph's format:"json" payload to
+ * build additionalContext. This test feeds it the REAL envelope from a live
+ * in-memory server, so any drift between the response shape and the parser
+ * fails HERE — not only in the Windows CI guard (which caught exactly that:
+ * the json-tree reshape left the parser reading a key that no longer exists,
+ * and the hook silently emitted nothing). */
+TEST(cli_hook_augment_context_tracks_search_json_shape) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "hookproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/hookproj");
+    cbm_node_t n = {.project = proj,
+                    .label = "Function",
+                    .name = "someIndexedSymbol",
+                    .qualified_name = "hookproj.mod.someIndexedSymbol",
+                    .file_path = "mod.py",
+                    .start_line = 1,
+                    .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    /* The exact request ha_build_args produces: format:"json". */
+    char *envelope =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"hookproj\",\"name_pattern\":\".*someIndexedSymbol.*\","
+                            "\"limit\":5,\"format\":\"json\"}");
+    ASSERT_NOT_NULL(envelope);
+
+    bool is_error = true;
+    char *ctx =
+        cbm_hook_augment_format_context_for_testing(envelope, "someIndexedSymbol", &is_error);
+    ASSERT_FALSE(is_error);
+    ASSERT_NOT_NULL(ctx); /* one hit MUST produce context — empty = broken hook */
+    ASSERT_NOT_NULL(strstr(ctx, "someIndexedSymbol"));
+    ASSERT_NOT_NULL(strstr(ctx, "mod.py"));
+    free(ctx);
+    free(envelope);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(cli_hook_augment_lifecycle_output_contract) {
     static const struct {
         const char *event;
@@ -7743,7 +7803,12 @@ TEST(cli_detect_agents_finds_zed) {
 #endif
     test_mkdirp(dir);
 
+    char *saved_xdg = save_test_env("XDG_CONFIG_HOME");
+    char xdg_dir[640];
+    snprintf(xdg_dir, sizeof(xdg_dir), "%s/.config", tmpdir);
+    cbm_setenv("XDG_CONFIG_HOME", xdg_dir, 1); /* Linux resolver prefers XDG */
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    restore_test_env("XDG_CONFIG_HOME", saved_xdg);
     ASSERT_TRUE(agents.zed);
 
     test_rmdir_r(tmpdir);
@@ -9819,6 +9884,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
+    RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);

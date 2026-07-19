@@ -359,7 +359,9 @@ TEST(index_parse_partial_reported) {
     ASSERT_TRUE(found_split);
     const char *note = yyjson_get_str(yyjson_obj_get(pp, "note"));
     ASSERT_NOT_NULL(note);
-    ASSERT_NOT_NULL(strstr(note, "guarantee"));
+    /* Lean-note contract: best-effort framing + pointer to the full record. */
+    ASSERT_NOT_NULL(strstr(note, "best-effort"));
+    ASSERT_NOT_NULL(strstr(note, "logfile"));
 
     /* Logfile lists it under the distinct phase. */
     const char *logfile = yyjson_get_str(yyjson_obj_get(sc, "logfile"));
@@ -591,7 +593,9 @@ TEST(index_not_indexed_by_design_reported) {
     ASSERT_TRUE(found_secret);
     const char *note = yyjson_get_str(yyjson_obj_get(ni, "note"));
     ASSERT_NOT_NULL(note);
-    ASSERT_NOT_NULL(strstr(note, "BY DESIGN"));
+    /* Lean-note contract: deliberate-exclusion framing + pointer to the record. */
+    ASSERT_NOT_NULL(strstr(note, "by design"));
+    ASSERT_NOT_NULL(strstr(note, "logfile"));
 
     /* The gitignored DIR is in the excluded subtrees list. */
     yyjson_val *excluded = yyjson_obj_get(sc, "excluded");

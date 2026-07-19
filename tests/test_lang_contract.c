@@ -1207,6 +1207,41 @@ TEST(contract_edge_imports_alias_resolves_real_file_issue767) {
     PASS();
 }
 
+/* True if a CALLS edge exists whose source QN ends with `src_suffix` and
+ * target QN ends with `tgt_suffix`. */
+static int calls_edge_between(cbm_store_t *store, const char *project, const char *src_suffix,
+                              const char *tgt_suffix) {
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_type(store, project, "CALLS", &edges, &n) != CBM_STORE_OK)
+        return 0;
+    int found = 0;
+    size_t ssl = strlen(src_suffix);
+    size_t tsl = strlen(tgt_suffix);
+    for (int i = 0; i < n && !found; i++) {
+        cbm_node_t s, t;
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &s) != CBM_STORE_OK)
+            continue;
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &t) != CBM_STORE_OK) {
+            cbm_node_free_fields(&s);
+            continue;
+        }
+        const char *sq = s.qualified_name;
+        const char *tq = t.qualified_name;
+        if (sq && tq) {
+            size_t sql = strlen(sq);
+            size_t tql = strlen(tq);
+            if (sql >= ssl && strcmp(sq + sql - ssl, src_suffix) == 0 && tql >= tsl &&
+                strcmp(tq + tql - tsl, tgt_suffix) == 0)
+                found = 1;
+        }
+        cbm_node_free_fields(&s);
+        cbm_node_free_fields(&t);
+    }
+    cbm_store_free_edges(edges, n);
+    return found;
+}
+
 /* #999: URLs in CI/tooling configs (.pre-commit-config.yaml, .github/
  * workflows) are repository references for TOOLING, not endpoints this
  * service exposes. They must not mint __route__infra__ Route nodes — the
@@ -1325,6 +1360,55 @@ static int calls_edge_targets(cbm_store_t *store, const char *project, const cha
     }
     cbm_store_free_edges(edges, n);
     return found;
+}
+
+/* #988: `from m import f as g; g()` produced NO CALLS edge — the Python LSP
+ * bound the alias as MODULE("m.f") (the from-style heuristic keys on the
+ * local name matching the module-path tail, which an alias never does), so
+ * the call missed, and the registry fallback did not cover the minimal
+ * two-file shape either. The alias must resolve exactly like the plain
+ * import. The other import forms are pinned alongside as invariance guards
+ * (all resolve on main today and must keep resolving). */
+TEST(contract_edge_python_aliased_import_call_resolves_issue988) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"m.py", "def f(x):\n    return x + 1\n"},
+        {"pkg/__init__.py", ""},
+        {"pkg/dm.py", "def h(x):\n    return x\n"},
+        {"caller_alias.py", "from m import f as g\n"
+                            "\n"
+                            "def use_alias(x):\n"
+                            "    return g(x)\n"},
+        {"caller_plain.py", "from m import f\n"
+                            "\n"
+                            "def use_plain(x):\n"
+                            "    return f(x)\n"},
+        {"caller_modalias.py", "import m as mm\n"
+                               "\n"
+                               "def use_modalias(x):\n"
+                               "    return mm.f(x)\n"},
+        {"caller_dotalias.py", "import pkg.dm as dz\n"
+                               "\n"
+                               "def use_dotalias(x):\n"
+                               "    return dz.h(x)\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 7);
+    ASSERT_TRUE(store != NULL);
+    int alias = calls_edge_between(store, lp.project, ".use_alias", ".m.f");
+    int plain = calls_edge_between(store, lp.project, ".use_plain", ".m.f");
+    int modalias = calls_edge_between(store, lp.project, ".use_modalias", ".m.f");
+    int dotalias = calls_edge_between(store, lp.project, ".use_dotalias", ".pkg.dm.h");
+    if (!alias || !plain || !modalias || !dotalias) {
+        fprintf(stderr,
+                "  [988] FAIL alias=%d plain=%d modalias=%d dotalias=%d (all import forms "
+                "must produce the CALLS edge)\n",
+                alias, plain, modalias, dotalias);
+    }
+    ASSERT_TRUE(alias); /* the #988 bug: aliased from-import call lost */
+    ASSERT_TRUE(plain);
+    ASSERT_TRUE(modalias);
+    ASSERT_TRUE(dotalias);
+    lang_cleanup(&lp, store);
+    PASS();
 }
 
 /* #871: a CommonJS require() binding shadowed call resolution. `const doThing
@@ -1572,6 +1656,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_workspaces_imports_issue408);
     RUN_TEST(contract_edge_imports_alias_no_phantom_folder_edge_issue767);
     RUN_TEST(contract_edge_imports_alias_resolves_real_file_issue767);
+    RUN_TEST(contract_edge_python_aliased_import_call_resolves_issue988);
     RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
     RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
