@@ -5687,6 +5687,52 @@ TEST(incremental_detects_changed_file) {
     PASS();
 }
 
+TEST(incremental_aborts_when_previous_coverage_is_unreadable) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    /* Simulate an unreadable prior coverage generation while leaving the
+     * graph and file hashes healthy enough to otherwise run incrementally. */
+    ASSERT_EQ(
+        cbm_store_exec(s, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
+        CBM_STORE_OK);
+    cbm_store_close(s);
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "\nfunc MustNotBeIndexed() int { return 7 }\n");
+    fclose(f);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+
+    /* Failure happens before the dump/replacement boundary, preserving the
+     * original graph rather than publishing a falsely complete generation. */
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_detects_deleted_file) {
     /* Full index, delete a file, re-index → deleted file's nodes removed */
     if (setup_incremental_repo() != 0) {
@@ -6731,7 +6777,9 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     ASSERT_TRUE(cbm_mem_over_budget());
 
     cbm_pp_bp_nap_cycles_reset();
-    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/backpressure.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     int rc = cbm_pipeline_run(p);
     long cycles = cbm_pp_bp_nap_cycles();
@@ -7044,6 +7092,7 @@ SUITE(pipeline) {
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);

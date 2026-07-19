@@ -5,8 +5,8 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
 [![Tests](https://img.shields.io/badge/tests-5604_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-158-orange)](https://github.com/DeusData/codebase-memory-mcp)
-[![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-9_languages-blue)](#hybrid-lsp)
-[![Agents](https://img.shields.io/badge/agents-11-purple)](https://github.com/DeusData/codebase-memory-mcp)
+[![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
+[![Agents](https://img.shields.io/badge/agent_surfaces-43-purple)](https://github.com/DeusData/codebase-memory-mcp)
 [![Pure C](https://img.shields.io/badge/pure_C-zero_dependencies-blue)](https://github.com/DeusData/codebase-memory-mcp)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/DeusData/codebase-memory-mcp/badge)](https://scorecard.dev/viewer/?uri=github.com/DeusData/codebase-memory-mcp)
@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, and Rust — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. Zero dependencies. Plug and play across 43 supported automatic/conditional client surfaces.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -34,10 +34,10 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys. Download → `install` → restart agent → done.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
-- **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — configures MCP entries, instruction files, and pre-tool hooks for each.
+- **43 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
@@ -100,7 +100,7 @@ Restart your coding agent. Say **"Index this project"** — done.
 The `install` command automatically strips macOS quarantine attributes and ad-hoc signs the binary — no manual `xattr`/`codesign` needed.
 </details>
 
-The `install` command auto-detects all installed coding agents and configures MCP server entries, instruction files, skills, and pre-tool hooks for each.
+The `install` command auto-detects installed coding agents and configures their documented MCP entries plus durable instructions, skills, and lifecycle hooks where supported.
 
 ### Graph Visualization UI
 
@@ -145,7 +145,7 @@ The MCP server also checks for updates on startup and notifies on the first tool
 codebase-memory-mcp uninstall
 ```
 
-Removes all agent configs, skills, hooks, and instructions. Does not remove the binary or SQLite databases.
+Removes owned agent config entries, skills, hooks, instructions, and the installed binary. Existing graph indexes are listed and deleted only after confirmation.
 
 ## Features
 
@@ -186,7 +186,7 @@ Removes all agent configs, skills, hooks, and instructions. Does not remove the 
 - **158 vendored tree-sitter grammars** compiled into the binary
 - **Generic package / module resolution** — bare specifiers like `@myorg/pkg`, `github.com/foo/bar`, `use my_crate::foo` resolved via manifest scanning (`package.json`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `composer.json`, `pubspec.yaml`, `pom.xml`, `build.gradle`, `mix.exs`, `*.gemspec`)
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, Kustomize overlays as graph nodes
-- **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, and Rust — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer (parameter binding, return-type inference, generic substitution, JSX component dispatch, JSDoc inference for plain JS files, namespace + trait + late-static-binding resolution for PHP, file-scoped namespaces + records + LINQ method syntax for C#, class-hierarchy + overload + lambda resolution for Java, extension-function + scope-function resolution for Kotlin, trait-method + UFCS resolution for Rust)
+- **[Hybrid LSP semantic type resolution](#hybrid-lsp)** for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — a lightweight C implementation of language type-resolution algorithms, structurally inspired by and compatible with major language servers including tsserver / typescript-go, pyright, gopls, Roslyn, Eclipse JDT, and rust-analyzer (parameter binding, return-type inference, generic substitution, JSX component dispatch, JSDoc inference for plain JS files, namespace + trait + late-static-binding resolution for PHP, file-scoped namespaces + records + LINQ method syntax for C#, class-hierarchy + overload + lambda resolution for Java, extension-function + scope-function resolution for Kotlin, trait-method + UFCS resolution for Rust)
 - **RAM-first pipeline**: LZ4 compression, in-memory SQLite, single dump at end. Memory released after.
 
 ### Distribution & operation
@@ -351,7 +351,7 @@ scripts/build.sh --with-ui          # with graph visualization
 <details>
 <summary>If you prefer not to use the install command</summary>
 
-Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
+Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 
 ```json
 {
@@ -364,39 +364,160 @@ Add to `~/.claude/.mcp.json` (global) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 14 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
 
 </details>
 
 ## Multi-Agent Support
 
-`install` auto-detects and configures all installed agents:
+`install` configures 43 client surfaces: 37 detected automatically and 6
+conditional or explicit. “Conditional” means the installer writes only when the
+documented platform or an explicit, already-existing config path proves the
+target is active. It never flips experimental feature flags, enables plugins,
+YOLO modes, global permission bypasses, or third-party instruction trust.
 
-| Agent | MCP Config | Instructions | Hooks |
-|-------|-----------|-------------|-------|
-| Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob graph augment, non-blocking) |
-| Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | SessionStart reminder |
-| Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep reminder) + SessionStart reminder |
-| Zed | `settings.json` (JSONC) | — | — |
-| OpenCode | `opencode.json` | `AGENTS.md` | — |
-| Antigravity | `.gemini/config/mcp_config.json` (shared) | `antigravity-cli/AGENTS.md` | SessionStart reminder |
-| Aider | — | `CONVENTIONS.md` | — |
-| KiloCode | `mcp_settings.json` | `~/.kilocode/rules/` | — |
-| VS Code | `Code/User/mcp.json` | — | — |
-| OpenClaw | `openclaw.json` | — | — |
-| Kiro | `.kiro/settings/mcp.json` | — | — |
+Where a client has a documented custom-agent format, the installer creates three
+exact-owned definitions from one canonical contract:
 
-**Hooks are structurally non-blocking** (exit code 0, every failure path).
-For Claude Code, the `PreToolUse` hook intercepts `Grep`/`Glob` (never `Read` —
-gating `Read` breaks the read-before-edit invariant) and, when the search
-token matches indexed symbols, injects them as `additionalContext` via
-`search_graph` so the agent gets structured context alongside its normal
-search results. For Codex, Gemini CLI, and Antigravity, a `SessionStart` hook
-injects a one-line code-discovery reminder as session context (Gemini CLI also
-keeps its `BeforeTool` reminder).
-The installed Claude shim file is named `cbm-code-discovery-gate` for
-backward compatibility with existing installs; despite the legacy name it
-never gates and never blocks.
+- **Scout (Tier 1)** — about 3–4 narrow calls for fast positive, provisional discovery; no absence, exhaustive-impact, or dead-code claims.
+- **Verify (Tier 2, default)** — task-directed graph evidence, exact source checks, path coverage for every cited file, and scope coverage before negative claims.
+- **Auditor (Tier 3)** — bounded scope, current index generation, complete relevant pagination, broader relationship checks, and explicit unresolved limitations.
+
+Every direct tier batches `check_index_coverage` for its evidence paths and reads
+flagged ranges or skipped/excluded files directly. A clean coverage result means
+only “no recorded gap,” never proof of completeness. Clients without safe child
+MCP access receive the same three tiers as parent-handoff agents; the parent must
+supply project, generation, pagination state, graph evidence, and coverage
+results. Updates migrate only byte-identical prior Verify definitions and never
+overwrite user-modified agents.
+
+| Agent | Activation | MCP config | Durable context / augmentation |
+|-------|------------|------------|--------------------------------|
+| Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`, and post-`Read` coverage |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | `AGENTS.md`, skill, three read-only agents; `SessionStart` + `SubagentStart` |
+| Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
+| Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
+| OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents |
+| Antigravity | Detected | `.gemini/config/mcp_config.json` | `.gemini/GEMINI.md` |
+| Aider | Detected | — | `CONVENTIONS.md` via `.aider.conf.yml` |
+| KiloCode | Detected | `.config/kilo/kilo.jsonc` | Rule + three graph-tool subagents with deny-by-default permissions |
+| VS Code | Detected | platform `Code/User/mcp.json` | `~/.copilot/skills`, three read-only agents, `sessionStart` + `subagentStart` |
+| Cursor | Detected | `.cursor/mcp.json` | Skill + three read-only parent-handoff agents; context hooks withheld because session injection races and `readonly` blocks MCP |
+| Windsurf | Detected | `~/.codeium/windsurf/mcp_config.json` | Always-on `global_rules.md` |
+| Augment / Auggie | Detected | `~/.augment/settings.json` | Rule, three read-only handoff subagents, `SessionStart` + post-`view` coverage |
+| OpenClaw | Detected | `$OPENCLAW_CONFIG_PATH` or state `openclaw.json` | Active-workspace `AGENTS.md` + `TOOLS.md`; compaction reinjection |
+| Kiro | Detected | `$KIRO_HOME/settings/mcp.json` | Steering, skill, three JSON agents with isolated Scout/Analysis-profile MCP and explicit graph-tool selectors (`includeMcpJson: false`) |
+| Junie | Detected | `.junie/mcp/mcp.json` | Skill + three graph subagents for EAP-capable builds; Scout and Analysis server aliases hard-limit the tier tool surfaces; no ineffective EAP `SessionStart` hook |
+| Hermes | Detected | `$HERMES_HOME/config.yaml` | Skill + fail-open `pre_llm_call` context augmentation |
+| OpenHands | Detected | `.openhands/mcp.json` | Shared `.agents/skills/codebase-memory/SKILL.md` |
+| Cline | Detected | `~/.cline/mcp.json` + `${CLINE_DATA_DIR:-~/.cline/data}/settings/cline_mcp_settings.json` | Rule + skill; automatic file hooks withheld because they auto-activate and their output is not reliably consumed; child agents cannot use MCP |
+| Warp | Detected, skill only | UI, Warp Drive, or per invocation (manual) | Shared `~/.agents/skills/codebase-memory/SKILL.md` |
+| Qwen Code | Detected | `.qwen/settings.json` | `QWEN.md`, skill, three explicit read/graph-tool agents; `SessionStart`, `SubagentStart`, and post-`ReadFile` coverage |
+| GitHub Copilot CLI | Detected | `$COPILOT_HOME/mcp-config.json` | Instructions, skill, three read-only agents; `sessionStart` + `subagentStart` |
+| Factory Droid | Detected | `.factory/mcp.json` | `AGENTS.md`, skill, three droids with exact per-tier graph-tool lists (without additive whole-server exposure); `SessionStart` + post-`Read` coverage on macOS/Linux, withheld on Windows |
+| Crush | Detected | `.config/crush/crush.json` | Managed context path with explicit parent-to-child handoff |
+| Goose | Detected | `.config/goose/config.yaml` | `.goosehints` |
+| Mistral Vibe | Detected | `$VIBE_HOME/config.toml` | `AGENTS.md`, skill, and three matched agent/prompt pairs with explicit read-only graph-tool allowlists |
+| Qoder CLI | Detected | `~/.qoder/settings.json` | Skill, three directly MCP-attached agents with named-server scoping and exact per-tier graph-tool lists; `SessionStart`, `SubagentStart`, and post-`Read` coverage, including documented PowerShell execution on Windows |
+| Kimi Code CLI | Detected | `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code`) | Same-root `AGENTS.md` + skill; fail-open `UserPromptSubmit` hook in `config.toml` |
+| GitLab Duo CLI | Detected | `$GLAB_CONFIG_DIR/duo/mcp.json` or platform fallback | Fail-open user `SessionStart` on macOS/Linux; hook withheld on Windows; no experimental global skill enablement |
+| Rovo Dev CLI | Detected | configured override or `~/.rovodev/mcp.json` | Global `AGENTS.md`, skill + three read-only handoff subagents; no undocumented hook |
+| Amp | Detected | `~/.config/agents/skills/codebase-memory/mcp.json` | Colocated skill + `~/.config/amp/AGENTS.md`; no plugin |
+| Devin CLI / Local | Detected | `~/.config/devin/config.json` (platform app-data path on Windows) | Same-root `AGENTS.md` + skill; macOS/Linux `UserPromptSubmit` + `PostCompaction`, and `SessionStart` only when Claude does not already provide it; hooks withheld on Windows |
+| Tabnine | Detected | `~/.tabnine/mcp_servers.json` | MCP only; no experimental/YOLO setting |
+| Continue / cn | Conditional | Existing `~/.continue/config.yaml` or `$CBM_CONTINUE_CONFIG_PATH` | MCP only |
+| Visual Studio | Conditional, Windows | `~/.mcp.json` | MCP only |
+| TRAE | Conditional | Existing `$CBM_TRAE_CONFIG_PATH` | MCP only |
+| Roo Code | Conditional | Existing `$CBM_ROO_CONFIG_PATH` | MCP only |
+| Amazon Q Developer IDE | Detected | `~/.aws/amazonq/default.json` (preserves an existing `agents/default.json` or legacy `mcp.json`) | MCP only |
+| CodeBuddy Code CLI | Detected | `~/.codebuddy/.mcp.json` (preserves an active deprecated/legacy file) | `CODEBUDDY.md`, skill, three read-only graph agents; beta hooks are not auto-installed |
+| IBM Bob Shell | Detected by `bob` | `~/.bob/mcp_settings.json` | Shared rule; no invented hook or agent |
+| Pochi | Detected | `~/.pochi/config.jsonc` (`mcp`) | `README.pochi.md`, skill, and three `readFile`-only parent-handoff agents |
+| Pi | Detected | — | `~/.pi/agent/AGENTS.md` + skill; MCP/subagents require an explicit reviewed extension |
+| IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
+| Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
+
+### Sessions, compaction, and subagents
+
+Hooks installed by this project are fail-open and context-only. Claude Code's
+`PreToolUse` observes `Grep`/`Glob` and injects matching graph symbols as
+`additionalContext`; `PostToolUse` on `Read` adds targeted coverage context when
+the graph could not fully parse or index that file. It never denies or replaces
+the requested tool call.
+
+Claude Code, Codex CLI, Qwen Code, GitHub Copilot CLI, and VS Code's Copilot
+runtime receive paired session/subagent context where the vendor exposes a
+documented context-output contract. Codex users must review and trust installed
+hooks through `/hooks`; changing a hook definition changes its trust hash, so an
+update can require re-trust. Qoder uses `SessionStart`, `SubagentStart`, and
+post-`Read` coverage, including its documented PowerShell executor on Windows.
+Kimi uses `UserPromptSubmit`, while Hermes uses `pre_llm_call`; both retain their
+documented Windows execution paths. Devin installs
+`UserPromptSubmit` and `PostCompaction` on macOS/Linux and adds `SessionStart`
+only when Claude's equivalent managed hook is not present. GitLab Duo gets a
+narrowly scoped macOS/Linux user `SessionStart` entry on its experimental hook
+surface. GitLab Duo, Devin, and Factory hooks are withheld on Windows
+because those vendors do not document a deterministic shell/executor contract
+there. Gemini CLI, Factory Droid, and Augment also add documented post-read/view
+coverage context but expose no equivalent documented child-start context.
+
+For runtimes without a stable context-producing lifecycle event, durable files
+carry the contract across fresh sessions and compaction: verify the graph project
+and index freshness, query structural facts in the parent, then pass the project,
+qualified symbols, paths, and call-chain evidence in every delegated task.
+Claude, Codex, Gemini, Kiro, Qwen, Copilot, CodeBuddy, OpenCode, Kilo, Vibe,
+Qoder, Junie, and Factory receive Scout, Verify, and Auditor graph profiles.
+Kiro embeds this MCP server with `--tool-profile scout` for Scout and
+`--tool-profile analysis` for Verify/Auditor. Junie registers equivalent named
+server aliases because its subagent schema filters by server rather than by
+individual tool. Both process profiles use positive allowlists: Scout exposes
+seven fast inspection tools, Analysis exposes eleven, and future or mutating
+tools remain unavailable until explicitly reviewed. If either Junie alias
+collides with user configuration, the installer preserves it and installs
+parent-handoff profiles instead. Qoder combines its documented named-server
+selection with exact tier-specific MCP tool IDs. Factory uses exact registered
+MCP tool IDs without its additive `mcpServers` field, which would expose the
+whole server. Codex, Kilo, Vibe, and other capable formats likewise enumerate
+the narrowest supported tool set. Rovo, Cursor, Augment, Pochi, and Cline use parent handoff where direct
+child MCP is unavailable or unsafe; Pochi is limited to `readFile`, and Cline
+child agents cannot use MCP.
+
+Cline's file hooks auto-activate when present, and current Cline does not
+reliably consume their context output, so automatic adapters are withheld and
+older owned adapters are cleaned up. CodeBuddy's beta, version-gated hooks are
+not auto-installed. Junie's EAP
+`SessionStart` output is documented as ignored, so no context hook is installed.
+Junie custom agents remain EAP-dependent. Qoder can resolve higher-priority
+project or plugin agents before user agents with the same name; reload the
+client after installation or profile changes.
+Cursor context
+hooks are withheld: session context injection has a known race, `subagentStart`
+is control-only, and read-only subagents cannot safely receive MCP access. Rovo
+has no documented session context-output hook, and Bob
+documents neither a suitable hook nor a custom-agent surface. Those surfaces are
+not approximated with invented augmentation. Kimi plugins, Amp plugins, and
+GitLab experimental global skills remain opt-in.
+
+OpenClaw reinjects the `Codebase Knowledge Graph (codebase-memory-mcp)` AGENTS
+section after compaction and places the same guidance in `TOOLS.md`, the bootstrap
+files inherited by its subagents. Automatic augmentation covers the active/default
+workspace. Separate `agents.list[].workspace` directories require making that
+workspace active for installation or copying the managed block there.
+
+The installed Claude shim is named `cbm-code-discovery-gate` for backward
+compatibility; despite the legacy name, it never gates or blocks.
+
+### Manual or UI-managed integrations
+
+These are intentionally not counted as automatic installs: Qodo MCP is added
+through its UI and may be governed by enterprise allowlists; Warp MCP is managed
+through Warp Drive/UI or per invocation (only the shared skill is automatic);
+JetBrains AI Assistant / ACP is IDE-managed; GitHub Copilot coding agent, Jules,
+and CodeRabbit are cloud/repository-managed; Replit exposes a remote/service
+integration rather than a stable local user-global client; BLACKBOX AI does not
+document a stable arbitrary user-global MCP/instruction/agent schema; Plandex has
+no stable global registry safe to mutate; and SWE-agent uses explicit YAML and is
+no longer a suitable automatic global target.
 
 ## CLI Mode
 
@@ -559,6 +680,7 @@ codebase-memory-mcp ships a **lightweight C implementation of language type-reso
 | **Java** *(new in v0.8.0)* | imports (single-type, on-demand, static), class hierarchies with `this` / `super` dispatch, generics, annotations, overload matching by arity and parameter types, lambdas / method references bound to functional interfaces, field-type inference, common JDK stdlib |
 | **Kotlin** *(new in v0.8.0)* | imports + same-package resolution, classes / objects / companion objects, extension functions, data classes, nullable-type unwrapping, scope functions (`let` / `apply` / `run` / `also` / `with`), infix calls, common stdlib |
 | **Rust** *(new in v0.8.0)* | `use` declarations + module paths, `impl` blocks and trait methods, struct fields, generics with trait bounds, operator-trait desugaring, derive-macro method synthesis, UFCS static paths, common std prelude |
+| **Perl** | packages + `@ISA` / `use parent` / `use base` inheritance with method-resolution-order dispatch, `SUPER::` calls, Exporter (`use Foo qw(...)`) import maps, `bless` / `ref($class)\|\|$class` self-type inference, qualified `Pkg::sub` static calls, curated perlfunc + CPAN OOP stdlib; unresolved receivers emit no edge (zero-edge guarantee) |
 
 **Two-layer architecture:**
 
@@ -584,8 +706,8 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (14 tools, JSON-RPC 2.0, session detection, auto-index)
-  cli/                Install/uninstall/update/config (10 agents, hooks, instructions)
+  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
+  cli/                Install/uninstall/update/config (43 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
   cypher/             Cypher query lexer, parser, planner, executor

@@ -1059,9 +1059,96 @@ TEST(grpc_no_phantom_route_from_plain_var_issue294) {
     PASS();
 }
 
+/* ── Shared "::" normalization in cbm_pipeline_find_lsp_resolution (QA F3) ─
+ *
+ * The last-"::"-segment normalization in lsp_resolve.h widens matching for
+ * qualified static callees (Perl `Pkg::sub`, C++ `Ns::fn`, etc.) across ALL
+ * languages, not just Perl. These tests lock the intended behavior directly
+ * against cbm_pipeline_find_lsp_resolution: (1) a qualified static call still
+ * resolves to the right resolved entry, and (2) the theoretical
+ * mis-attribution edge case (two same-named subs from different namespaces) is
+ * bounded by caller-QN equality + the confidence floor. */
+static CBMResolvedCall make_rc(const char *caller, const char *callee, float conf) {
+    CBMResolvedCall rc;
+    memset(&rc, 0, sizeof(rc));
+    rc.caller_qn = caller;
+    rc.callee_qn = callee;
+    rc.strategy = "test";
+    rc.confidence = conf;
+    return rc;
+}
+
+static CBMCall make_call(const char *enclosing, const char *callee_name) {
+    CBMCall c;
+    memset(&c, 0, sizeof(c));
+    c.enclosing_func_qn = enclosing;
+    c.callee_name = callee_name;
+    return c;
+}
+
+TEST(lsp_resolve_qualified_static_call_normalizes_colons) {
+    /* A qualified static call `Pkg::sub` (callee_name keeps the package
+     * prefix) must still match a resolved entry whose callee_qn short-name is
+     * the bare `sub`. This is the cross-language "::"-normalization contract. */
+    CBMResolvedCall items[] = {
+        make_rc("proj.mod.caller", "proj.Pkg.sub", 0.9f),
+    };
+    CBMResolvedCallArray arr = {items, 1, 1};
+    CBMCall call = make_call("proj.mod.caller", "Pkg::sub");
+    const CBMResolvedCall *hit = cbm_pipeline_find_lsp_resolution(&arr, &call, false);
+    ASSERT(hit != NULL);
+    ASSERT(strcmp(hit->callee_qn, "proj.Pkg.sub") == 0);
+
+    /* A bare call (no "::") to the same short name resolves identically —
+     * normalization must not regress the common case. */
+    CBMCall bare = make_call("proj.mod.caller", "sub");
+    const CBMResolvedCall *bare_hit = cbm_pipeline_find_lsp_resolution(&arr, &bare, false);
+    ASSERT(bare_hit != NULL);
+    ASSERT(strcmp(bare_hit->callee_qn, "proj.Pkg.sub") == 0);
+    PASS();
+}
+
+TEST(lsp_resolve_misattribution_is_bounded) {
+    /* Two same-named subs from different namespaces (A::foo, B::foo) resolved
+     * within the same enclosing function. Both resolved short-names normalize
+     * to `foo`, so a textual `B::foo` matches both by short-name — the
+     * theoretical mis-attribution. The function bounds this: it returns the
+     * highest-confidence match (deterministic, never both), and the bound is
+     * enforced by caller-QN equality + the confidence floor. */
+    CBMResolvedCall items[] = {
+        make_rc("proj.mod.caller", "proj.A.foo", 0.7f),
+        make_rc("proj.mod.caller", "proj.B.foo", 0.9f),
+        /* Below the confidence floor: must be ignored entirely. */
+        make_rc("proj.mod.caller", "proj.C.foo", 0.3f),
+        /* Different caller: must never match regardless of short-name. */
+        make_rc("proj.mod.other", "proj.D.foo", 0.95f),
+    };
+    CBMResolvedCallArray arr = {items, 4, 4};
+    CBMCall call = make_call("proj.mod.caller", "B::foo");
+    const CBMResolvedCall *hit = cbm_pipeline_find_lsp_resolution(&arr, &call, false);
+    ASSERT(hit != NULL);
+    /* Highest-confidence qualifying entry wins; the cross-caller 0.95 entry is
+     * excluded by caller-QN equality, the 0.3 entry by the floor. */
+    ASSERT(strcmp(hit->callee_qn, "proj.B.foo") == 0);
+
+    /* The cross-caller high-confidence entry only matches its own caller. */
+    CBMCall other = make_call("proj.mod.other", "D::foo");
+    const CBMResolvedCall *other_hit = cbm_pipeline_find_lsp_resolution(&arr, &other, false);
+    ASSERT(other_hit != NULL);
+    ASSERT(strcmp(other_hit->callee_qn, "proj.D.foo") == 0);
+
+    /* A caller with no qualifying entry resolves to nothing (no widening can
+     * manufacture an edge across callers). */
+    CBMCall absent = make_call("proj.mod.absent", "foo");
+    ASSERT(cbm_pipeline_find_lsp_resolution(&arr, &absent, false) == NULL);
+    PASS();
+}
+
 /* ── Suite Registration ──────────────────────────────────────────── */
 
 SUITE(parallel) {
+    RUN_TEST(lsp_resolve_qualified_static_call_normalizes_colons);
+    RUN_TEST(lsp_resolve_misattribution_is_bounded);
     RUN_TEST(grpc_service_name_preserves_service_suffix_issue294);
     RUN_TEST(grpc_no_phantom_route_from_plain_var_issue294);
     /* Graph buffer merge/shared-ID tests */

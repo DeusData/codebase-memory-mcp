@@ -4,6 +4,7 @@
  * Covers: JSON-RPC parsing, MCP protocol, tool dispatch, tool handlers.
  */
 #include "../src/foundation/compat.h"
+#include <sqlite3.h>
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
@@ -16,10 +17,10 @@
 #include <store/store.h>
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
-#include <string.h>
-#include <stdlib.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h> /* chmod / stat for read-only query reproductions */
 #ifdef _WIN32
 #include <direct.h>
@@ -32,10 +33,45 @@
 #define cbm_getcwd getcwd
 #endif
 
+static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
+    yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *result = root ? yyjson_obj_get(root, "result") : NULL;
+    yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+    bool found = false;
+    if (tools && yyjson_is_arr(tools)) {
+        size_t index, max;
+        yyjson_val *tool;
+        yyjson_arr_foreach(tools, index, max, tool) {
+            yyjson_val *name = yyjson_obj_get(tool, "name");
+            if (name && yyjson_is_str(name) && strcmp(yyjson_get_str(name), expected_name) == 0) {
+                found = true;
+                break;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return found;
+}
+
+static size_t mcp_response_tool_count(const char *response) {
+    yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *result = root ? yyjson_obj_get(root, "result") : NULL;
+    yyjson_val *tools = result ? yyjson_obj_get(result, "tools") : NULL;
+    size_t count = tools && yyjson_is_arr(tools) ? yyjson_arr_size(tools) : 0U;
+    yyjson_doc_free(doc);
+    return count;
+}
+
 static char mcp_log_buf[4096];
+static bool mcp_saw_autoindex_log;
 
 static void mcp_capture_log(const char *line) {
     snprintf(mcp_log_buf, sizeof(mcp_log_buf), "%s", line ? line : "");
+    if (line && strstr(line, "msg=autoindex.")) {
+        mcp_saw_autoindex_log = true;
+    }
 }
 
 static bool response_contains_json_fragment(const char *response, const char *fragment) {
@@ -214,6 +250,10 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "capabilities"));
     ASSERT_NOT_NULL(strstr(json, "tools"));
     ASSERT_NOT_NULL(strstr(json, "\"listChanged\":false"));
+    ASSERT_NOT_NULL(strstr(json, "\"prompts\":{\"listChanged\":false}"));
+    ASSERT_NOT_NULL(strstr(json, "\"instructions\":"));
+    ASSERT_NOT_NULL(strstr(json, "search_graph"));
+    ASSERT_NOT_NULL(strstr(json, "auto-refresh"));
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
     free(json);
 
@@ -240,7 +280,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* Should contain all tools, including the targeted coverage gate. */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -252,6 +292,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "list_projects"));
     ASSERT_NOT_NULL(strstr(json, "delete_project"));
     ASSERT_NOT_NULL(strstr(json, "index_status"));
+    ASSERT_NOT_NULL(strstr(json, "check_index_coverage"));
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
@@ -264,8 +305,87 @@ TEST(mcp_tools_list_latest_metadata) {
     ASSERT_NOT_NULL(json);
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Search graph\""));
     ASSERT_NOT_NULL(strstr(json, "\"title\":\"Index repository\""));
+    ASSERT_NOT_NULL(strstr(json, "\"title\":\"Check index coverage\""));
     ASSERT_NOT_NULL(strstr(json, "\"outputSchema\":{\"type\":\"object\""));
     ASSERT_NOT_NULL(strstr(json, "\"additionalProperties\":true"));
+    free(json);
+    PASS();
+}
+
+TEST(mcp_tools_have_behavior_annotations) {
+    struct {
+        const char *name;
+        bool read_only;
+        bool destructive;
+        bool idempotent;
+        bool open_world;
+    } expected[] = {
+        {"index_repository", false, false, true, false},
+        /* These query tools can reach resolve_store(), whose corrupt-store
+         * recovery quarantines/removes database files. Keep the annotations
+         * conservative until query resolution is strictly non-mutating. */
+        {"search_graph", false, true, true, false},
+        {"query_graph", false, true, true, false},
+        {"trace_path", false, true, true, false},
+        {"get_code_snippet", false, true, true, false},
+        {"get_graph_schema", false, true, true, false},
+        {"get_architecture", false, true, true, false},
+        {"search_code", false, true, true, false},
+        {"list_projects", true, false, true, false},
+        {"delete_project", false, true, true, false},
+        {"index_status", false, true, true, false},
+        {"check_index_coverage", false, true, true, false},
+        {"detect_changes", false, true, true, false},
+        {"manage_adr", false, true, false, false},
+        {"ingest_traces", false, false, false, false},
+    };
+
+    char *json = cbm_mcp_tools_list();
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_NOT_NULL(tools);
+    ASSERT_EQ(yyjson_arr_size(tools), sizeof(expected) / sizeof(expected[0]));
+
+    size_t matched = 0;
+    yyjson_arr_iter iter;
+    yyjson_arr_iter_init(tools, &iter);
+    yyjson_val *tool;
+    while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+        yyjson_val *name_val = yyjson_obj_get(tool, "name");
+        yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+        ASSERT_NOT_NULL(name_val);
+        ASSERT_NOT_NULL(annotations);
+        ASSERT_TRUE(yyjson_is_obj(annotations));
+
+        const char *name = yyjson_get_str(name_val);
+        bool found = false;
+        for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+            if (strcmp(name, expected[i].name) != 0) {
+                continue;
+            }
+            yyjson_val *read_only = yyjson_obj_get(annotations, "readOnlyHint");
+            yyjson_val *destructive = yyjson_obj_get(annotations, "destructiveHint");
+            yyjson_val *idempotent = yyjson_obj_get(annotations, "idempotentHint");
+            yyjson_val *open_world = yyjson_obj_get(annotations, "openWorldHint");
+            ASSERT_TRUE(yyjson_is_bool(read_only));
+            ASSERT_TRUE(yyjson_is_bool(destructive));
+            ASSERT_TRUE(yyjson_is_bool(idempotent));
+            ASSERT_TRUE(yyjson_is_bool(open_world));
+            ASSERT_EQ(yyjson_get_bool(read_only), expected[i].read_only);
+            ASSERT_EQ(yyjson_get_bool(destructive), expected[i].destructive);
+            ASSERT_EQ(yyjson_get_bool(idempotent), expected[i].idempotent);
+            ASSERT_EQ(yyjson_get_bool(open_world), expected[i].open_world);
+            found = true;
+            matched++;
+            break;
+        }
+        ASSERT_TRUE(found);
+    }
+
+    ASSERT_EQ(matched, sizeof(expected) / sizeof(expected[0]));
+    yyjson_doc_free(doc);
     free(json);
     PASS();
 }
@@ -412,7 +532,7 @@ TEST(mcp_get_architecture_aspects_schema_enum_pr560) {
     static const char *expected[] = {"all",      "overview",   "structure", "dependencies",
                                      "routes",   "languages",  "packages",  "entry_points",
                                      "hotspots", "boundaries", "layers",    "file_tree",
-                                     "clusters"};
+                                     "clusters", "cycles"};
     size_t expected_count = sizeof(expected) / sizeof(expected[0]);
     ASSERT_EQ(yyjson_arr_size(enum_arr), expected_count);
     for (size_t i = 0; i < expected_count; i++) {
@@ -447,10 +567,10 @@ TEST(mcp_text_result) {
     PASS();
 }
 
-TEST(mcp_text_result_skips_structured_content_for_plain_text) {
+TEST(mcp_text_result_wraps_plain_text_as_structured_content) {
     char *json = cbm_mcp_text_result("plain text", false);
     ASSERT_NOT_NULL(json);
-    ASSERT_NULL(strstr(json, "\"structuredContent\""));
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"text\":\"plain text\"}"));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":false"));
     free(json);
     PASS();
@@ -469,6 +589,7 @@ TEST(mcp_cancel_matches_request_id) {
 TEST(mcp_text_result_error) {
     char *json = cbm_mcp_text_result("something failed", true);
     ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"error\":\"something failed\"}"));
     ASSERT_NOT_NULL(strstr(json, "\"isError\":true"));
     ASSERT_NOT_NULL(strstr(json, "something failed"));
     free(json);
@@ -621,6 +742,237 @@ TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor) {
     PASS();
 }
 
+TEST(server_handle_analysis_profile_filters_and_rejects_mutators) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_tool_profile(srv, CBM_MCP_TOOL_PROFILE_ANALYSIS);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":219,\"method\":\"initialize\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "analysis tool profile"));
+    ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
+    ASSERT_NULL(strstr(resp, "index_repository"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":220,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    static const char *const analysis_tools[] = {
+        "search_graph",     "query_graph",          "trace_path",     "get_code_snippet",
+        "get_graph_schema", "get_architecture",     "search_code",    "list_projects",
+        "index_status",     "check_index_coverage", "detect_changes",
+    };
+    ASSERT_EQ(mcp_response_tool_count(resp), sizeof(analysis_tools) / sizeof(analysis_tools[0]));
+    for (size_t i = 0U; i < sizeof(analysis_tools) / sizeof(analysis_tools[0]); i++) {
+        ASSERT_TRUE(mcp_response_has_exact_tool(resp, analysis_tools[i]));
+    }
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":221,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"delete_project\","
+                                      "\"arguments\":{\"project\":\"anything\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not available in the analysis tool profile"));
+    ASSERT_NOT_NULL(strstr(resp, "isError"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_scout_profile_exposes_only_the_fast_tier) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_tool_profile(srv, CBM_MCP_TOOL_PROFILE_SCOUT);
+    mcp_saw_autoindex_log = false;
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":222,\"method\":\"initialize\",\"params\":{}}");
+    cbm_log_set_sink(NULL);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "scout tool profile"));
+    ASSERT_NOT_NULL(strstr(resp, "check_index_coverage"));
+    ASSERT_NULL(strstr(resp, "index_repository"));
+    ASSERT_FALSE(mcp_saw_autoindex_log);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":223,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_EQ(mcp_response_tool_count(resp), 7U);
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "search_graph"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "trace_path"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_code_snippet"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "get_architecture"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "list_projects"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "index_status"));
+    ASSERT_TRUE(mcp_response_has_exact_tool(resp, "check_index_coverage"));
+    ASSERT_FALSE(mcp_response_has_exact_tool(resp, "query_graph"));
+    ASSERT_FALSE(mcp_response_has_exact_tool(resp, "search_code"));
+    ASSERT_FALSE(mcp_response_has_exact_tool(resp, "get_graph_schema"));
+    ASSERT_FALSE(mcp_response_has_exact_tool(resp, "detect_changes"));
+    ASSERT_FALSE(mcp_response_has_exact_tool(resp, "index_repository"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":224,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"query_graph\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not available in the scout tool profile"));
+    ASSERT_NOT_NULL(strstr(resp, "isError"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(analysis_profile_arguments_fail_closed_and_disable_http) {
+    cbm_mcp_tool_profile_t profile = CBM_MCP_TOOL_PROFILE_ALL;
+    const char *no_profile[] = {"codebase-memory-mcp"};
+    const char *analysis_equals[] = {"codebase-memory-mcp", "--tool-profile=analysis"};
+    const char *analysis_pair[] = {"codebase-memory-mcp", "--tool-profile", "analysis"};
+    const char *scout_equals[] = {"codebase-memory-mcp", "--tool-profile=scout"};
+    const char *unknown_equals[] = {"codebase-memory-mcp", "--tool-profile=analaysis"};
+    const char *unknown_pair[] = {"codebase-memory-mcp", "--tool-profile", "all"};
+    const char *missing_value[] = {"codebase-memory-mcp", "--tool-profile"};
+
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(1, no_profile, &profile), 0);
+    ASSERT_EQ(profile, CBM_MCP_TOOL_PROFILE_ALL);
+    ASSERT_TRUE(cbm_mcp_tool_profile_allows_http(profile));
+
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(2, analysis_equals, &profile), 0);
+    ASSERT_EQ(profile, CBM_MCP_TOOL_PROFILE_ANALYSIS);
+    ASSERT_FALSE(cbm_mcp_tool_profile_allows_http(profile));
+
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(3, analysis_pair, &profile), 0);
+    ASSERT_EQ(profile, CBM_MCP_TOOL_PROFILE_ANALYSIS);
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(2, scout_equals, &profile), 0);
+    ASSERT_EQ(profile, CBM_MCP_TOOL_PROFILE_SCOUT);
+    ASSERT_FALSE(cbm_mcp_tool_profile_allows_http(profile));
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(2, unknown_equals, &profile), -1);
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(3, unknown_pair, &profile), -1);
+    ASSERT_EQ(cbm_mcp_parse_tool_profile_args(2, missing_value, &profile), -1);
+    PASS();
+}
+
+TEST(hook_windows_path_containment_is_case_insensitive_and_segment_safe) {
+    ASSERT_TRUE(cbm_hook_path_contains_for_testing("C:/Repo", "c:/repo/src/main.c", true));
+    ASSERT_FALSE(cbm_hook_path_contains_for_testing("C:/Repo", "c:/repository/src/main.c", true));
+    ASSERT_FALSE(cbm_hook_path_contains_for_testing("C:/Repo", "c:/repo/src/main.c", false));
+    PASS();
+}
+
+TEST(server_handle_prompts_list_workflows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":203,\"method\":\"prompts/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"id\":203"));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"explore_codebase\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"review_change_impact\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"project\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"question\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"change\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"base_branch\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"required\":true"));
+    ASSERT_NULL(strstr(resp, "\"nextCursor\""));
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_prompts_get_workflows) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":204,\"method\":\"prompts/get\","
+             "\"params\":{\"name\":\"explore_codebase\",\"arguments\":{"
+             "\"project\":\"payments\",\"question\":\"How are refunds routed?\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"role\":\"user\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"type\":\"text\""));
+    ASSERT_NOT_NULL(strstr(resp, "payments"));
+    ASSERT_NOT_NULL(strstr(resp, "How are refunds routed?"));
+    ASSERT_NOT_NULL(strstr(resp, "search_graph"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_path"));
+    ASSERT_NOT_NULL(strstr(resp, "get_code_snippet"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":205,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                   "\"project\":\"payments\",\"change\":\"refund retry policy\","
+                                   "\"base_branch\":\"develop\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "refund retry policy"));
+    ASSERT_NOT_NULL(strstr(resp, "develop"));
+    ASSERT_NOT_NULL(strstr(resp, "detect_changes"));
+    ASSERT_NOT_NULL(strstr(resp, "trace_path"));
+    ASSERT_NOT_NULL(strstr(resp, "include_tests"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(server_handle_prompts_get_validates_arguments) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":206,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"unknown\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid prompt name"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":207,\"method\":\"prompts/get\","
+                                      "\"params\":{\"name\":\"explore_codebase\",\"arguments\":{"
+                                      "\"project\":\"payments\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Missing required prompt arguments"));
+    free(resp);
+
+    /* Optional means it may be omitted, not that an explicitly invalid value
+     * may be silently substituted. */
+    resp = cbm_mcp_server_handle(srv,
+                                 "{\"jsonrpc\":\"2.0\",\"id\":208,\"method\":\"prompts/get\","
+                                 "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                 "\"project\":\"payments\",\"change\":\"refund retry policy\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"error\""));
+    ASSERT_NOT_NULL(strstr(resp, "base_branch \\\"main\\\""));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":209,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                   "\"project\":\"payments\",\"change\":\"refund retry policy\","
+                                   "\"base_branch\":\"\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid prompt arguments"));
+    free(resp);
+
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":210,\"method\":\"prompts/get\","
+                                   "\"params\":{\"name\":\"review_change_impact\",\"arguments\":{"
+                                   "\"project\":\"payments\",\"change\":\"refund retry policy\","
+                                   "\"base_branch\":17}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(resp, "Invalid prompt arguments"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(server_handle_logs_request_without_params) {
     mcp_log_buf[0] = '\0';
     CBMLogLevel prev_level = cbm_log_get_level();
@@ -738,30 +1090,538 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
 static char *extract_text_content(const char *mcp_result);
 
+/* callers_total/callees_total must count what the caller can enumerate: with
+ * include_tests=false (default) test-file rows are hidden from the table, so
+ * the totals must apply the same filter — a raw visited_count overstated the
+ * set (field-eval agent read callers_total=175 against 2 visible rows and
+ * distrusted the tool). */
+TEST(tool_trace_totals_respect_test_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "totproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/tot");
+
+    cbm_node_t tgt = {.project = proj,
+                      .label = "Function",
+                      .name = "tgt",
+                      .qualified_name = "totproj.a.tgt",
+                      .file_path = "a.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    int64_t tid = cbm_store_upsert_node(st, &tgt);
+    ASSERT_GT(tid, 0);
+    cbm_node_t prod = {.project = proj,
+                       .label = "Function",
+                       .name = "prod_caller",
+                       .qualified_name = "totproj.a.prod_caller",
+                       .file_path = "a.c",
+                       .start_line = 10,
+                       .end_line = 15};
+    int64_t pid = cbm_store_upsert_node(st, &prod);
+    ASSERT_GT(pid, 0);
+    cbm_node_t tst = {.project = proj,
+                      .label = "Function",
+                      .name = "test_caller",
+                      .qualified_name = "totproj.t.test_caller",
+                      .file_path = "tests/test_x.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    int64_t xid = cbm_store_upsert_node(st, &tst);
+    ASSERT_GT(xid, 0);
+    cbm_edge_t e1 = {.project = proj, .source_id = pid, .target_id = tid, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e1), 0);
+    cbm_edge_t e2 = {.project = proj, .source_id = xid, .target_id = tid, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e2), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":90,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"totproj\","
+             "\"function_name\":\"tgt\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 1")); /* test row filtered */
+    free(inner);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"totproj\","
+             "\"function_name\":\"tgt\",\"direction\":\"inbound\",\"include_tests\":true}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callers_total: 2")); /* both visible now */
+    free(inner);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* SCC condensation (get_architecture aspect "cycles"): a 3-function CALLS
+ * cycle A->B->C->A must be reported as one circular dependency of size 3 with
+ * all three members; a separate acyclic chain (D->E) must NOT appear. The
+ * aspect is opt-in — a default get_architecture call must NOT compute it. */
+TEST(tool_get_architecture_cycles_detects_scc) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "cycproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/cyc");
+
+    const char *names[5] = {"A", "B", "C", "D", "E"};
+    int64_t id[5];
+    for (int i = 0; i < 5; i++) {
+        char qn[32];
+        snprintf(qn, sizeof(qn), "cycproj.m.%s", names[i]);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = names[i],
+                        .qualified_name = qn,
+                        .file_path = "m.c",
+                        .start_line = i + 1,
+                        .end_line = i + 2};
+        id[i] = cbm_store_upsert_node(st, &n);
+        ASSERT_GT(id[i], 0);
+    }
+    /* cycle A->B->C->A, plus acyclic D->E */
+    struct {
+        int f;
+        int t;
+    } e[] = {{0, 1}, {1, 2}, {2, 0}, {3, 4}};
+    for (size_t i = 0; i < sizeof(e) / sizeof(e[0]); i++) {
+        cbm_edge_t ed = {
+            .project = proj, .source_id = id[e[i].f], .target_id = id[e[i].t], .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &ed), 0);
+    }
+
+    /* opt-in cycles aspect */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"get_architecture\",\"arguments\":{\"project\":\"cycproj\","
+             "\"aspects\":[\"cycles\"]}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "cycles: 1")); /* exactly one SCC of size>1 */
+    ASSERT_NOT_NULL(strstr(inner, "cycproj.m.A"));
+    ASSERT_NOT_NULL(strstr(inner, "cycproj.m.B"));
+    ASSERT_NOT_NULL(strstr(inner, "cycproj.m.C"));
+    ASSERT_NULL(strstr(inner, "cycproj.m.D")); /* acyclic node not in any cycle */
+    free(inner);
+    free(resp);
+
+    /* default call (no aspects) must NOT run the scan. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"get_architecture\",\"arguments\":{\"project\":\"cycproj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "cycles:"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Context-bomb guard: get_code_snippet on a whole-file node (a Module/File
+ * span) used to read the ENTIRE file into one response — a field-eval agent
+ * that fell back to a Module snippet pulled ~400KB in a single call. The read
+ * must clip at MCP_SNIPPET_MAX_LINES and flag source_clipped, while the exact
+ * start/end range stays in the response for a targeted re-read. */
+TEST(tool_get_code_snippet_clips_whole_file_node) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_snipcap_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char proj_dir[512];
+    snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    cbm_mkdir(proj_dir);
+    char src_path[600];
+    snprintf(src_path, sizeof(src_path), "%s/big.py", proj_dir);
+    FILE *fp = fopen(src_path, "w");
+    ASSERT_NOT_NULL(fp);
+    enum { BIG_LINES = 2000 };
+    for (int i = 0; i < BIG_LINES; i++) {
+        fprintf(fp, "line_%04d = %d  # padding to blow up an unclipped read\n", i, i);
+    }
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "test-project";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, proj_dir);
+
+    cbm_node_t mod = {0};
+    mod.project = proj;
+    mod.label = "Module";
+    mod.name = "big";
+    mod.qualified_name = "test-project.big";
+    mod.file_path = "big.py";
+    mod.start_line = 1;
+    mod.end_line = BIG_LINES;
+    ASSERT_GT(cbm_store_upsert_node(st, &mod), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"get_code_snippet\",\"arguments\":{\"project\":\"test-project\","
+             "\"qualified_name\":\"test-project.big\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"source_clipped\":true"));
+    /* The whole 2000-line file (~100KB) must NOT be in the response. */
+    ASSERT_TRUE(strlen(inner) < 60000);
+    /* The last line must be absent (clipped), the first present. */
+    ASSERT_NOT_NULL(strstr(inner, "line_0000"));
+    ASSERT_NULL(strstr(inner, "line_1999"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(tool_search_graph_includes_node_properties) {
-    /* search_graph results must surface each node's properties_json
-     * payload so callers don't have to round-trip through get_code_snippet
-     * just to read them. The setup_snippet_server inserts HandleRequest
-     * with a signature/return_type/is_exported property blob; this test
-     * pins that those keys reach the MCP response. */
+    /* Node properties are OPT-IN columns in the default TOON output: the
+     * default row is qn/label/file/lines/degrees only, `fields` adds the
+     * requested property columns, and format:"json" restores the legacy
+     * verbose objects with the full property blob. The setup_snippet_server
+     * inserts HandleRequest with a signature/return_type/is_exported blob. */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
+    /* Default TOON: compact table, no property spill. */
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"search_graph\","
              "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
              "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
     ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\":{\"text\":"));
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    /* Properties from HandleRequest's properties_json must appear. */
-    ASSERT_NOT_NULL(strstr(inner, "signature"));
-    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
-    ASSERT_NOT_NULL(strstr(inner, "is_exported"));
+    ASSERT_NOT_NULL(strstr(inner, "results:")); /* TOON table header */
+    ASSERT_NOT_NULL(strstr(inner, "(rows: name label lines in out;"));
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest"));
+    ASSERT_NULL(strstr(inner, "func HandleRequest")); /* signature not spilled */
+    ASSERT_NULL(strstr(inner, "is_exported"));
     free(inner);
     free(resp);
+
+    /* fields:["signature"] adds the column + values. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "(rows: name label lines in out signature;"));
+    /* values with spaces are QUOTED so column positions survive */
+    ASSERT_NOT_NULL(strstr(inner, "\"func HandleRequest() error\""));
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest"));
+    free(inner);
+    free(resp);
+
+    /* format:"json" = json-stringified tree: same grouped model, column-
+     * ordered row arrays — never per-row key envelopes or property blobs.
+     * fields adds columns there too. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":44,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"format\":\"json\","
+             "\"fields\":[\"signature\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"qn_prefix\"")); /* grouped tree model */
+    ASSERT_NOT_NULL(strstr(inner, "\"cols\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"rows\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"signature\""));      /* requested column */
+    ASSERT_NOT_NULL(strstr(inner, "func HandleRequest")); /* its value */
+    ASSERT_NULL(strstr(inner, "is_exported"));            /* blob never spills */
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_output_byte_budgets) {
+    /* GUARD: absolute byte ceilings on default tool outputs. Re-bloat (e.g.
+     * a property blob sneaking back into row emission — the fp field alone
+     * is ~450B/hit) blows these ceilings immediately. The numbers are
+     * generous vs the measured compact outputs (search hit rows ≈ 90B) but
+     * far below the legacy verbose sizes (≈1.5KB/hit). */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* search_graph: 1-hit search must stay under 600B. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":46,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"label\":\"Function\","
+             "\"name_pattern\":\"HandleRequest\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "HandleRequest")); /* non-vacuous: hit present */
+    ASSERT_LT((int)strlen(inner), 600);
+    free(inner);
+    free(resp);
+
+    /* trace_path: single-hop trace on the fixture must stay under 800B. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":47,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"project\":\"test-project\",\"function_name\":\"HandleRequest\","
+             "\"direction\":\"both\",\"depth\":2}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "callees:"));
+    ASSERT_LT((int)strlen(inner), 800);
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_search_graph_toon_never_leaks_internal_fields) {
+    /* The similarity/semantic pipeline intermediates (fp minhash hex, sp
+     * structural profile, bt body-token bag) dominated the legacy payload
+     * (~45%) and carry zero agent value. GUARD: they never appear in TOON
+     * output — not by default and not even when explicitly requested via
+     * fields (blocklist). */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    /* A node whose properties carry the internal fields with sentinels. */
+    cbm_node_t n = {0};
+    n.project = "test-project";
+    n.label = "Function";
+    n.name = "fpCarrier";
+    n.qualified_name = "test-project.src.fpCarrier";
+    n.file_path = "src/fp.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{\"fp\":\"FPSENTINEL00\",\"sp\":\"SPSENTINEL00\","
+                        "\"bt\":\"BTSENTINEL00\",\"complexity\":7}";
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"name_pattern\":\"fpCarrier\","
+             "\"fields\":[\"fp\",\"sp\",\"bt\",\"complexity\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "fpCarrier"));
+    ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "SPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "BTSENTINEL00"));
+    /* Non-blocked requested field still comes through. */
+    ASSERT_NOT_NULL(strstr(inner, "complexity"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_lean_defaults_schema_and_status) {
+    /* GUARDS for the lean-default contract (TOON round 2):
+     * 1. get_graph_schema must not advertise the blocked internal fields
+     *    (fp/sp/bt) — the server refuses to emit them, so listing them in the
+     *    schema invited agents to request fields they can never get.
+     * 2. index_status omits the git context block unless verbose:true — the
+     *    worktree/shadow path variants only matter when debugging where an
+     *    index lives. */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    cbm_node_t n = {0};
+    n.project = "test-project";
+    n.label = "Function";
+    n.name = "schemaCarrier";
+    n.qualified_name = "test-project.src.schemaCarrier";
+    n.file_path = "src/sc.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{\"fp\":\"x\",\"sp\":\"y\",\"bt\":\"z\",\"complexity\":3}";
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":48,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"get_graph_schema\","
+                                   "\"arguments\":{\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "Function"));   /* non-vacuous: label present */
+    ASSERT_NOT_NULL(strstr(inner, "complexity")); /* obtainable property listed */
+    ASSERT_NULL(strstr(inner, "\"fp\""));         /* blocked fields not advertised */
+    ASSERT_NULL(strstr(inner, "\"sp\""));
+    ASSERT_NULL(strstr(inner, "\"bt\""));
+    free(inner);
+    free(resp);
+
+    /* index_status: no git block by default... */
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":49,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"index_status\","
+                                      "\"arguments\":{\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"status\""));
+    ASSERT_NULL(strstr(inner, "\"git\""));
+    free(inner);
+    free(resp);
+
+    /* ...and present with verbose:true. */
+    resp = cbm_mcp_server_handle(srv,
+                                 "{\"jsonrpc\":\"2.0\",\"id\":50,\"method\":\"tools/call\","
+                                 "\"params\":{\"name\":\"index_status\","
+                                 "\"arguments\":{\"project\":\"test-project\",\"verbose\":true}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"git\""));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* ── Tool-output regression suite (gating) ──────────────────────────
+ * Context-explosion detector: flags the measured smells that re-introduce
+ * token bloat into default outputs, independent of any specific tool:
+ *   1. blocked internal fields (fp/sp/bt) appearing anywhere;
+ *   2. repeated-key JSON envelopes — the same key emitted per row instead of
+ *      a header-once table (the un-TOONed enumeration smell; detect_changes
+ *      shipped 4,787x3 of these = 416KB);
+ *   3. embedded prose notes/hints beyond one line (~220 chars) — long prose
+ *      belongs in tool descriptions or docs, not repeated per response.
+ * Returns NULL when clean, else a static description of the violation. */
+static const char *output_explosion_smell(const char *inner) {
+    static const char *row_keys[] = {
+        "\"name\":", "\"label\":", "\"file\":", "\"path\":", "\"qualified_name\":", "\"qn\":"};
+    if (strstr(inner, "\"fp\":") || strstr(inner, "\"sp\":") || strstr(inner, "\"bt\":")) {
+        return "blocked internal field (fp/sp/bt) leaked into output";
+    }
+    for (size_t k = 0; k < sizeof(row_keys) / sizeof(row_keys[0]); k++) {
+        int n = 0;
+        for (const char *p = strstr(inner, row_keys[k]); p && n <= 32;
+             p = strstr(p + 1, row_keys[k])) {
+            n++;
+        }
+        if (n > 32) {
+            return "repeated-key envelope (>32x same JSON key) — emit a header-once table";
+        }
+    }
+    for (const char *p = strstr(inner, "\"note\":\""); p; p = strstr(p + 1, "\"note\":\"")) {
+        const char *end = strchr(p + 9, '"');
+        while (end && end[-1] == '\\') {
+            end = strchr(end + 1, '"');
+        }
+        if (end && end - (p + 9) > 220) {
+            return "embedded note exceeds one line (~220 chars)";
+        }
+    }
+    return NULL;
+}
+
+/* Run one tool call on the fixture server, apply the explosion detector and
+ * an absolute byte ceiling, and require a semantic-floor marker so trimming
+ * can never hollow the response out either. */
+static const char *check_tool_output(cbm_mcp_server_t *srv, const char *req, int ceiling,
+                                     const char *floor_marker) {
+    char *resp = cbm_mcp_server_handle(srv, req);
+    if (!resp) {
+        return "no response";
+    }
+    char *inner = extract_text_content(resp);
+    free(resp);
+    if (!inner) {
+        return "no text content";
+    }
+    static char why[256];
+    const char *smell = output_explosion_smell(inner);
+    if (smell) {
+        snprintf(why, sizeof(why), "%s", smell);
+        free(inner);
+        return why;
+    }
+    if ((int)strlen(inner) >= ceiling) {
+        snprintf(why, sizeof(why), "output %d B >= ceiling %d B", (int)strlen(inner), ceiling);
+        free(inner);
+        return why;
+    }
+    if (floor_marker && !strstr(inner, floor_marker)) {
+        snprintf(why, sizeof(why), "semantic floor missing: %s", floor_marker);
+        free(inner);
+        return why;
+    }
+    free(inner);
+    return NULL;
+}
+
+TEST(tool_output_regression_gate) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    struct {
+        const char *req;
+        int ceiling;
+        const char *floor;
+    } cases[] = {
+        {"{\"jsonrpc\":\"2.0\",\"id\":70,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"search_graph\",\"arguments\":{\"project\":\"test-project\","
+         "\"name_pattern\":\".*\",\"limit\":50}}}",
+         6000, "results:"},
+        {"{\"jsonrpc\":\"2.0\",\"id\":71,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"get_graph_schema\",\"arguments\":{\"project\":\"test-project\"}}}",
+         6000, "node_labels"},
+        {"{\"jsonrpc\":\"2.0\",\"id\":72,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"index_status\",\"arguments\":{\"project\":\"test-project\"}}}",
+         7000, "\"status\""},
+        {"{\"jsonrpc\":\"2.0\",\"id\":73,\"method\":\"tools/call\",\"params\":{"
+         "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"test-project\","
+         "\"function_name\":\"HandleRequest\",\"direction\":\"both\"}}}",
+         1500, "callees:"},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *why = check_tool_output(srv, cases[i].req, cases[i].ceiling, cases[i].floor);
+        if (why) {
+            char msg[320];
+            snprintf(msg, sizeof(msg), "case %d: %s", (int)i, why);
+            FAIL(msg);
+        }
+    }
 
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
@@ -814,12 +1674,41 @@ TEST(tool_search_graph_query_honors_file_pattern_issue552) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"search_mode\":\"bm25\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"file_path\":\"src/lib/status.c\""));
+    ASSERT_NOT_NULL(strstr(inner, "search_mode: bm25"));
+    ASSERT_NOT_NULL(strstr(inner, "src/lib/status.c"));
     ASSERT_NULL(strstr(inner, "src/components/status.c"));
 
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Resource discovery methods this server doesn't populate must return EMPTY
+ * lists, not -32601 Method-not-found: clients like Cline probe them on connect
+ * and surface the errors as a failed connection (#958). */
+TEST(mcp_resource_discovery_methods_return_empty_lists) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    struct {
+        const char *method;
+        const char *want;
+    } cases[] = {
+        {"resources/list", "\"resources\":[]"},
+        {"resources/templates/list", "\"resourceTemplates\":[]"},
+    };
+    for (int i = 0; i < 2; i++) {
+        char reqbuf[256];
+        snprintf(reqbuf, sizeof(reqbuf), "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"%s\"}",
+                 100 + i, cases[i].method);
+        char *resp = cbm_mcp_server_handle(srv, reqbuf);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NULL(strstr(resp, "Method not found"));
+        ASSERT_NOT_NULL(strstr(resp, cases[i].want));
+        free(resp);
+    }
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -854,15 +1743,218 @@ TEST(tool_index_status_no_project) {
     PASS();
 }
 
+/* Reproduce the exact-file false negative in the current Read hook: index_status
+ * intentionally caps each coverage category at 500 entries, so a later path is
+ * absent even though the authoritative index_coverage table contains it.  The
+ * targeted coverage tool must query that table rather than scan the capped
+ * presentation response. */
+TEST(tool_check_index_coverage_finds_path_beyond_status_cap) {
+    enum { ROW_COUNT = 502 };
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *project = "coverage-cap-regression";
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/coverage-cap-regression"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    char (*paths)[64] = calloc(ROW_COUNT, sizeof(*paths));
+    cbm_coverage_row_t *rows = calloc(ROW_COUNT, sizeof(*rows));
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(rows);
+    for (int i = 0; i < ROW_COUNT; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "src/partial-%04d.c", i);
+        rows[i].rel_path = paths[i];
+        rows[i].kind = "parse_partial";
+        rows[i].detail = i == ROW_COUNT - 1 ? "777-790" : "1-2";
+        ASSERT_EQ(cbm_store_upsert_file_hash(st, project, paths[i], "fixture", i + 1, 10),
+                  CBM_STORE_OK);
+    }
+    ASSERT_EQ(cbm_store_coverage_replace(st, project, rows, ROW_COUNT), CBM_STORE_OK);
+
+    char *status =
+        cbm_mcp_handle_tool(srv, "index_status", "{\"project\":\"coverage-cap-regression\"}");
+    ASSERT_NOT_NULL(status);
+    char *status_inner = extract_text_content(status);
+    ASSERT_NOT_NULL(status_inner);
+    ASSERT_NOT_NULL(strstr(status_inner, "\"truncated\":true"));
+    ASSERT_NULL(strstr(status_inner, "src/partial-0501.c"));
+    free(status_inner);
+    free(status);
+
+    char *coverage = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-cap-regression\",\"paths\":[\"src/partial-0501.c\"]}");
+    ASSERT_NOT_NULL(coverage);
+    char *coverage_inner = extract_text_content(coverage);
+    ASSERT_NOT_NULL(coverage_inner);
+    ASSERT_NOT_NULL(strstr(coverage_inner, "src/partial-0501.c"));
+    ASSERT_NOT_NULL(strstr(coverage_inner, "\"status\":\"partial\""));
+    ASSERT_NOT_NULL(strstr(coverage_inner, "777-790"));
+
+    free(coverage_inner);
+    free(coverage);
+    free(rows);
+    free(paths);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, "test-project", "main.go", "", 0, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(st, "test-project", "src/skip.c", "", 0, 0), CBM_STORE_OK);
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "main.go", .kind = "parse_partial", .detail = "3-4,9"},
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+        {.rel_path = "src/skip.c", .kind = "oversized", .detail = "file exceeds cap"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(st, "test-project", rows, 3), CBM_STORE_OK);
+
+    char *coverage =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"test-project\","
+                            "\"paths\":[\"main.go\",\"generated/pkg/a.c\",\"../escape.c\"],"
+                            "\"scopes\":[\".\"]}");
+    ASSERT_NOT_NULL(coverage);
+    char *inner = extract_text_content(coverage);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"path\":\"main.go\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"partial\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"start\":3"));
+    ASSERT_NOT_NULL(strstr(inner, "\"end\":4"));
+    ASSERT_NOT_NULL(strstr(inner, "\"start\":9"));
+    ASSERT_NOT_NULL(strstr(inner, "generated/pkg/a.c"));
+    ASSERT_NOT_NULL(strstr(inner, "not_indexed_dir"));
+    ASSERT_NOT_NULL(strstr(inner, "outside_project"));
+    ASSERT_NOT_NULL(strstr(inner, "src/skip.c"));
+    ASSERT_NOT_NULL(strstr(inner, "file exceeds cap"));
+    ASSERT_NOT_NULL(strstr(inner, "best_effort"));
+
+    free(inner);
+    free(coverage);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+static int write_coverage_meta(cbm_store_t *store, const char *generation,
+                               const char *recording_status) {
+    cbm_coverage_meta_t meta = {
+        .generation = generation,
+        .index_mode = "fast",
+        .recorded_at = "2026-07-12T00:00:00Z",
+        .recording_status = recording_status,
+        .ignored_files_stored = 0,
+        .ignored_files_total = 0,
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    return cbm_store_coverage_replace_ex(store, "test-project", NULL, 0, &meta);
+}
+
+TEST(tool_check_index_coverage_rejects_stale_generation) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(write_coverage_meta(store, "stale-generation", "complete"), CBM_STORE_OK);
+
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"]}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"generation_matches\":false"));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"coverage_unavailable\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"read_source_and_reindex\""));
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    ASSERT_EQ(write_coverage_meta(store, project.indexed_at, "complete"), CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture", 0, 0),
+              CBM_STORE_OK);
+
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"]}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"generation_matches\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"freshness\":\"metadata_changed\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"recommended_action\":\"read_source_and_reindex\""));
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_check_index_coverage_surfaces_lookup_errors) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_project_t project = {0};
+    ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
+    ASSERT_EQ(write_coverage_meta(store, project.indexed_at, "complete"), CBM_STORE_OK);
+    cbm_project_free_fields(&project);
+    ASSERT_EQ(
+        cbm_store_exec(store, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
+        CBM_STORE_OK);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"test-project\",\"paths\":[\"main.go\"],\"scopes\":[\".\"]}");
+    ASSERT_NOT_NULL(response);
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"coverage_lookup\":\"error\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"status\":\"coverage_unavailable\""));
+    ASSERT_NULL(strstr(inner, "\"status\":\"no_recorded_issue\""));
+
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 TEST(tool_index_status_includes_git_metadata) {
+    /* The git context block moved behind verbose:true (lean-default contract,
+     * TOON round 2) — this test pins the verbose path's content; the default-
+     * omission guard lives in tool_lean_defaults_schema_and_status. */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    char *resp =
-        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"index_status\","
-                                   "\"arguments\":{\"project\":\"test-project\"}}}");
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":16,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"index_status\","
+             "\"arguments\":{\"project\":\"test-project\",\"verbose\":true}}}");
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
@@ -951,6 +2043,223 @@ TEST(tool_trace_call_path_ambiguous) {
     ASSERT_NULL(strstr(inner, "\"callees\""));
     free(inner);
     free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Multi-seed union hop semantics: bfs_union_same_name deduped visited nodes
+ * keep-FIRST-seen, so a node reached at hop 2 from the first seed kept hop 2
+ * even when the second seed reaches it at hop 1. hop feeds risk_labels and
+ * (soon) pagination watermarks — it must be the MINIMUM across seeds, matching
+ * the single-BFS MIN(hop) semantics (#797). */
+TEST(tool_trace_union_records_min_hop_across_seeds) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "dualproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/dual");
+
+    /* One real definition + one body-less stub (start==end) — the #546/#650
+     * shape pick_resolved_node resolves WITHOUT ambiguity while
+     * bfs_union_same_name still traverses both. Seed A (real def, lower id,
+     * traversed first) reaches tgt only via mid (hop 2); the stub seed B
+     * reaches tgt directly (hop 1). */
+    cbm_node_t sa = {.project = proj,
+                     .label = "Function",
+                     .name = "dual",
+                     .qualified_name = "dualproj.a.dual",
+                     .file_path = "a.c",
+                     .start_line = 1,
+                     .end_line = 50};
+    cbm_node_t sb = {.project = proj,
+                     .label = "Function",
+                     .name = "dual",
+                     .qualified_name = "dualproj.b.dual",
+                     .file_path = "b.d.ts",
+                     .start_line = 1,
+                     .end_line = 1};
+    cbm_node_t mid = {.project = proj,
+                      .label = "Function",
+                      .name = "mid",
+                      .qualified_name = "dualproj.c.mid",
+                      .file_path = "c.c",
+                      .start_line = 1,
+                      .end_line = 5};
+    cbm_node_t tgt = {.project = proj,
+                      .label = "Function",
+                      .name = "tgt",
+                      .qualified_name = "dualproj.c.tgt",
+                      .file_path = "c.c",
+                      .start_line = 10,
+                      .end_line = 15};
+    int64_t ida = cbm_store_upsert_node(st, &sa);
+    int64_t idb = cbm_store_upsert_node(st, &sb);
+    int64_t idm = cbm_store_upsert_node(st, &mid);
+    int64_t idt = cbm_store_upsert_node(st, &tgt);
+    ASSERT_GT(ida, 0);
+    ASSERT_GT(idb, 0);
+    ASSERT_GT(idm, 0);
+    ASSERT_GT(idt, 0);
+    cbm_edge_t e1 = {.project = proj, .source_id = ida, .target_id = idm, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = proj, .source_id = idm, .target_id = idt, .type = "CALLS"};
+    cbm_edge_t e3 = {.project = proj, .source_id = idb, .target_id = idt, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e1), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &e2), 0);
+    ASSERT_GT(cbm_store_insert_edge(st, &e3), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"dual\",\"project\":\"dualproj\","
+             "\"direction\":\"outbound\",\"depth\":3}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    /* tgt is one hop from seed B — the union must record hop 1, not seed A's 2. */
+    ASSERT_NOT_NULL(strstr(inner, "  tgt 1"));
+    ASSERT_NULL(strstr(inner, "  tgt 2"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Exactly-once trace pagination: 12 callees paged at limit=5 must yield
+ * 5+5+2 rows with every callee appearing on exactly one page, exact totals
+ * on every page, and a final page without a cursor. Stale and mismatched
+ * cursors must fail with teaching errors, never silently restart. */
+TEST(tool_trace_pagination_exactly_once) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "pageproj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/page");
+
+    cbm_node_t hub = {.project = proj,
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "pageproj.h.hub",
+                      .file_path = "h.c",
+                      .start_line = 1,
+                      .end_line = 9};
+    int64_t hid = cbm_store_upsert_node(st, &hub);
+    ASSERT_GT(hid, 0);
+    enum { CALLEES = 12 };
+    for (int i = 0; i < CALLEES; i++) {
+        char nm[16];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "c%02d", i);
+        snprintf(qn, sizeof(qn), "pageproj.m.c%02d", i);
+        cbm_node_t n = {.project = proj,
+                        .label = "Function",
+                        .name = nm,
+                        .qualified_name = qn,
+                        .file_path = "m.c",
+                        .start_line = 1,
+                        .end_line = 3};
+        int64_t nid = cbm_store_upsert_node(st, &n);
+        ASSERT_GT(nid, 0);
+        cbm_edge_t e = {.project = proj, .source_id = hid, .target_id = nid, .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+    }
+
+    char pages[3][4096];
+    char tok[192] = "";
+    int npages = 0;
+    for (; npages < 3; npages++) {
+        char req[640];
+        if (tok[0]) {
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{"
+                     "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+                     "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,"
+                     "\"cursor\":\"%s\"}}}",
+                     tok);
+        } else {
+            snprintf(req, sizeof(req),
+                     "{\"jsonrpc\":\"2.0\",\"id\":80,\"method\":\"tools/call\",\"params\":{"
+                     "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+                     "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5}}}");
+        }
+        char *resp = cbm_mcp_server_handle(srv, req);
+        ASSERT_NOT_NULL(resp);
+        char *inner = extract_text_content(resp);
+        free(resp);
+        ASSERT_NOT_NULL(inner);
+        snprintf(pages[npages], sizeof(pages[npages]), "%s", inner);
+        ASSERT_NOT_NULL(strstr(inner, "callees_total: 12")); /* exact total, every page */
+        const char *nx = strstr(inner, "next: ");
+        if (nx) {
+            const char *e = strchr(nx + 6, '\n');
+            size_t tl = e ? (size_t)(e - (nx + 6)) : strlen(nx + 6);
+            ASSERT_TRUE(tl < sizeof(tok));
+            memcpy(tok, nx + 6, tl);
+            tok[tl] = '\0';
+        } else {
+            tok[0] = '\0';
+        }
+        free(inner);
+        if (!tok[0]) {
+            npages++;
+            break;
+        }
+    }
+    ASSERT_EQ(npages, 3); /* 5 + 5 + 2 */
+    /* Exactly-once: every callee appears on exactly ONE page. */
+    for (int i = 0; i < CALLEES; i++) {
+        char qn[48];
+        snprintf(qn, sizeof(qn), "  c%02d 1\n", i);
+        int seen = 0;
+        for (int p = 0; p < 3; p++) {
+            if (strstr(pages[p], qn)) {
+                seen++;
+            }
+        }
+        ASSERT_EQ(seen, 1);
+    }
+    /* Final page carries no cursor. */
+    ASSERT_NULL(strstr(pages[2], "next: "));
+
+    /* Params mismatch: replay a page-2-era cursor with a different depth. */
+    const char *nx1 = strstr(pages[0], "next: ");
+    ASSERT_NOT_NULL(nx1);
+    char tok1[192];
+    const char *e1 = strchr(nx1 + 6, '\n');
+    size_t tl1 = e1 ? (size_t)(e1 - (nx1 + 6)) : strlen(nx1 + 6);
+    memcpy(tok1, nx1 + 6, tl1);
+    tok1[tl1] = '\0';
+    char req2[640];
+    snprintf(req2, sizeof(req2),
+             "{\"jsonrpc\":\"2.0\",\"id\":81,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,\"depth\":2,"
+             "\"cursor\":\"%s\"}}}",
+             tok1);
+    char *resp = cbm_mcp_server_handle(srv, req2);
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "cursor_params_mismatch"));
+    free(inner);
+
+    /* Stale: an index run (upsert_project bumps the generation) invalidates
+     * outstanding cursors with a loud, actionable error. */
+    cbm_store_upsert_project(st, proj, "/tmp/page");
+    snprintf(req2, sizeof(req2),
+             "{\"jsonrpc\":\"2.0\",\"id\":82,\"method\":\"tools/call\",\"params\":{"
+             "\"name\":\"trace_call_path\",\"arguments\":{\"project\":\"pageproj\","
+             "\"function_name\":\"hub\",\"direction\":\"outbound\",\"limit\":5,"
+             "\"cursor\":\"%s\"}}}",
+             tok1);
+    resp = cbm_mcp_server_handle(srv, req2);
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "stale_cursor"));
+    free(inner);
+
     cbm_mcp_server_free(srv);
     PASS();
 }
@@ -1057,9 +2366,10 @@ TEST(tool_trace_call_path_depth_clamped) {
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
 
-    /* Reached within the ceiling (proves the traversal ran) but clamped at 15. */
-    ASSERT_NOT_NULL(strstr(inner, "\"n15\""));
-    ASSERT_NULL(strstr(inner, "\"n16\""));
+    /* Reached within the ceiling (proves the traversal ran) but clamped at 15.
+     * TOON rows carry bare QNs, so match the names unquoted. */
+    ASSERT_NOT_NULL(strstr(inner, "n15"));
+    ASSERT_NULL(strstr(inner, "n16"));
 
     free(inner);
     free(resp);
@@ -1281,7 +2591,7 @@ TEST(tool_get_architecture_emits_populated_sections) {
      * those existed before #281. The "entry_points" array only appears
      * when cbm_store_get_architecture is actually called and its result
      * is serialized — which is exactly what #281 wires up. */
-    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
     ASSERT_NOT_NULL(strstr(inner, "main"));
 
     free(inner);
@@ -1334,8 +2644,8 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     ASSERT_NOT_NULL(resp_all);
     char *inner_all = extract_text_content(resp_all);
     ASSERT_NOT_NULL(inner_all);
-    ASSERT_NOT_NULL(strstr(inner_all, "\"entry_points\""));
-    ASSERT_NOT_NULL(strstr(inner_all, "\"file_tree\""));
+    ASSERT_NOT_NULL(strstr(inner_all, "entry_points:"));
+    ASSERT_NOT_NULL(strstr(inner_all, "file_tree:"));
     free(inner_all);
     free(resp_all);
 
@@ -1348,9 +2658,9 @@ TEST(tool_get_architecture_overview_compact_subset_pr560) {
     ASSERT_NOT_NULL(resp);
     char *inner = extract_text_content(resp);
     ASSERT_NOT_NULL(inner);
-    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
-    ASSERT_NOT_NULL(strstr(inner, "\"node_labels\""));
-    ASSERT_NULL(strstr(inner, "\"file_tree\""));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
+    ASSERT_NOT_NULL(strstr(inner, "node_labels:"));
+    ASSERT_NULL(strstr(inner, "file_tree:"));
 
     free(inner);
     free(resp);
@@ -1431,7 +2741,7 @@ TEST(tool_get_architecture_accepts_project_name_alias_issue640) {
     /* RED before the alias: inner is the "project not found" error.
      * GREEN after: the alias resolves and architecture sections surface. */
     ASSERT_NULL(strstr(inner, "project not found"));
-    ASSERT_NOT_NULL(strstr(inner, "\"entry_points\""));
+    ASSERT_NOT_NULL(strstr(inner, "entry_points:"));
 
     free(inner);
     free(resp);
@@ -1476,6 +2786,105 @@ TEST(tool_search_graph_accepts_project_name_alias_issue640) {
     free(inner);
     free(resp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* #1025: agents pass the repo FOLDER name ("codebase-memory-mcp"), but
+ * indexed project names derive from the full path
+ * (E:\project\graph\x -> "E-project-graph-x"), so exact lookup fails with
+ * "project not found" while list_projects clearly shows the project. A
+ * passed name that matches exactly ONE indexed project as a segment-aligned
+ * tail ("-<name>" suffix) must resolve to it; zero or several matches keep
+ * the existing error. Runs against real cache-dir .db files (the resolution
+ * scans filenames), so this test indexes real fixtures under an overridden
+ * CBM_CACHE_DIR. */
+static void i1025_write_repo(const char *dir, const char *fn_name) {
+    char path[CBM_SZ_512];
+    snprintf(path, sizeof(path), "%s/mod.py", dir);
+    FILE *f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "def %s(x):\n    return x + 1\n", fn_name);
+    fclose(f);
+}
+
+TEST(tool_project_arg_resolves_unique_tail_issue1025) {
+    char repo_a[CBM_SZ_256];
+    char repo_b[CBM_SZ_256];
+    char repo_c[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo_a, sizeof(repo_a), "/tmp/cbm-i1025a-XXXXXX");
+    snprintf(repo_b, sizeof(repo_b), "/tmp/cbm-i1025b-XXXXXX");
+    snprintf(repo_c, sizeof(repo_c), "/tmp/cbm-i1025c-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i1025d-XXXXXX");
+    if (!cbm_mkdtemp(repo_a) || !cbm_mkdtemp(repo_b) || !cbm_mkdtemp(repo_c) ||
+        !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    i1025_write_repo(repo_a, "unique_tail_target");
+    i1025_write_repo(repo_b, "amb_one");
+    i1025_write_repo(repo_c, "amb_two");
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"E-project-graph-suffix1025\"}",
+             repo_a);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"F-alpha-amb1025\"}", repo_b);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"name\":\"G-beta-amb1025\"}", repo_c);
+    r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* 1. Unique tail resolves (RED today: "project not found"). */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"suffix1025\",\"name_pattern\":\".*target.*\"}");
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1025] FAIL unique tail did not resolve: %.200s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "unique_tail_target"));
+    free(r);
+
+    /* 2. Ambiguous tail stays an error (never guess between projects). */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"amb1025\",\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    /* 3. Exact full name keeps working unchanged. */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"E-project-graph-suffix1025\","
+                            "\"name_pattern\":\".*target.*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(repo_a);
+    th_rmtree(repo_b);
+    th_rmtree(repo_c);
+    th_rmtree(cache);
     PASS();
 }
 
@@ -1539,18 +2948,23 @@ TEST(tool_get_architecture_path_scoping) {
 
     ASSERT_NOT_NULL(strstr(inner_scoped, "root_total_nodes"));
     ASSERT_NOT_NULL(strstr(inner_scoped, "scoped_total_nodes"));
-    ASSERT_NOT_NULL(strstr(inner_scoped, "\"path\""));
+    ASSERT_NOT_NULL(strstr(inner_scoped, "path: "));
     ASSERT_NOT_NULL(strstr(inner_scoped, "hoa"));
     ASSERT_NULL(strstr(inner_scoped, "Django"));
 
     int root_nodes = 0;
     int scoped_nodes = 0;
-    const char *rt = strstr(inner_scoped, "\"root_total_nodes\":");
-    const char *stn = strstr(inner_scoped, "\"scoped_total_nodes\":");
+    /* TOON scalar form (`key: N`) with JSON fallback for format:"json". */
+    const char *rt = strstr(inner_scoped, "root_total_nodes: ");
+    const char *stn = strstr(inner_scoped, "scoped_total_nodes: ");
     if (rt) {
+        sscanf(rt, "root_total_nodes: %d", &root_nodes);
+    } else if ((rt = strstr(inner_scoped, "\"root_total_nodes\":")) != NULL) {
         sscanf(rt, "\"root_total_nodes\":%d", &root_nodes);
     }
     if (stn) {
+        sscanf(stn, "scoped_total_nodes: %d", &scoped_nodes);
+    } else if ((stn = strstr(inner_scoped, "\"scoped_total_nodes\":")) != NULL) {
         sscanf(stn, "\"scoped_total_nodes\":%d", &scoped_nodes);
     }
     ASSERT_TRUE(root_nodes > scoped_nodes);
@@ -1753,6 +3167,9 @@ TEST(search_code_scoped_path_with_spaces_issue687) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_TRUE(grep_matches > 0);
 
@@ -1826,6 +3243,9 @@ TEST(search_code_scoped_path_with_cjk_root_issue903) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_TRUE(grep_matches > 0);
 
@@ -1944,6 +3364,9 @@ TEST(search_code_path_filter_prefilter_keeps_matches) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_EQ(grep_matches, 1);
 
@@ -1982,12 +3405,17 @@ TEST(search_code_path_filter_matches_nothing) {
     const char *g = strstr(inner, "\"total_grep_matches\":");
     if (g) {
         sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        /* TOON scalar form — the search_code compact default. */
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
     }
     ASSERT_EQ(grep_matches, 0);
     int results = -1;
     const char *r = strstr(inner, "\"total_results\":");
     if (r) {
         sscanf(r, "\"total_results\":%d", &results);
+    } else if ((r = strstr(inner, "total_results: ")) != NULL) {
+        sscanf(r, "total_results: %d", &results);
     }
     ASSERT_EQ(results, 0);
     ASSERT_TRUE(strstr(inner, "handler.go") == NULL);
@@ -2046,7 +3474,7 @@ TEST(search_code_literal_pipe_warns_issue282) {
                                    "\"arguments\":{\"pattern\":\"HandleRequest|Nope\","
                                    "\"regex\":false,\"project\":\"test-project\"}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "warnings"));   /* surfaced, not silent */
+    ASSERT_NOT_NULL(strstr(resp, "warning"));    /* surfaced, not silent */
     ASSERT_NOT_NULL(strstr(resp, "regex=true")); /* the hint names the fix */
     ASSERT_NOT_NULL(strstr(resp, "elapsed_ms")); /* timing is reported */
     free(resp);
@@ -2938,9 +4366,11 @@ TEST(snippet_exact_qn) {
     ASSERT_NOT_NULL(strstr(resp, "\"source\""));
     /* Exact match should NOT have match_method */
     ASSERT_NULL(strstr(resp, "\"match_method\""));
-    /* Enriched properties */
-    ASSERT_NOT_NULL(strstr(resp, "\"signature\":\"func HandleRequest() error\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"return_type\":\"error\""));
+    /* No property-blob spill: the source IS the payload (signature and
+     * docstring are literally in it); metrics live behind search_graph
+     * fields=[...]. */
+    ASSERT_NULL(strstr(resp, "\"signature\""));
+    ASSERT_NULL(strstr(resp, "\"return_type\""));
     /* Caller/callee counts: 0 callers, 2 callees */
     ASSERT_NOT_NULL(strstr(resp, "\"callers\":0"));
     ASSERT_NOT_NULL(strstr(resp, "\"callees\":2"));
@@ -3082,6 +4512,11 @@ TEST(snippet_fuzzy_suggestions) {
 /* ── TestSnippet_EnrichedProperties ───────────────────────────── */
 
 TEST(snippet_enriched_properties) {
+    /* GUARD (inverted since the compact-output change): the snippet response
+     * carries the verbatim source plus location/degree/coverage metadata and
+     * NOTHING from the node's property blob — no signature/return_type/
+     * is_exported duplication, and never the fp/sp/bt similarity internals
+     * (41% of the legacy response). */
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
@@ -3090,9 +4525,12 @@ TEST(snippet_enriched_properties) {
         call_snippet(srv, "{\"qualified_name\":\"test-project.cmd.server.main.HandleRequest\","
                           "\"project\":\"test-project\"}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "\"signature\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"return_type\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"is_exported\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"source\""));
+    ASSERT_NULL(strstr(resp, "\"signature\""));
+    ASSERT_NULL(strstr(resp, "\"return_type\""));
+    ASSERT_NULL(strstr(resp, "\"is_exported\""));
+    ASSERT_NULL(strstr(resp, "\"fp\""));
+    ASSERT_NULL(strstr(resp, "\"bt\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -3950,6 +5388,81 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     PASS();
 }
 
+/* ── #1044: a "<name>::missed" shadow row must not hide the project ──
+ *
+ * The miss-graph pass inserts a second `projects` row ("<name>::missed") so
+ * its nodes satisfy the FK on nodes.project. db_internal_project_name
+ * required the projects table to hold EXACTLY ONE row, so any project with
+ * a miss graph vanished from list_projects and the graph UI, and the
+ * fallback-scan resolve path failed.
+ *
+ * RED on buggy code / GREEN on the fix:
+ *   A. list_projects still advertises "delta1044" while the shadow row exists.
+ *   B. the shadow name itself is never advertised.
+ *   C. search_graph(project="delta1044") still resolves and returns the node.
+ */
+TEST(tool_list_projects_ignores_missed_shadow_issue1044) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-issue1044-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS(); /* skip if mkdtemp fails — not a #1044 signal */
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    ASSERT_TRUE(issue704_make_db(cache, "delta1044.db", "delta1044", "deltaFunc1044"));
+
+    /* Add the shadow row exactly the way the miss-graph pass does. */
+    char db_path[700];
+    snprintf(db_path, sizeof(db_path), "%s/delta1044.db", cache);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    ASSERT_EQ(cbm_store_upsert_project(st, "delta1044::missed", ""), CBM_STORE_OK);
+    cbm_store_close(st);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* ── A + B: primary advertised, shadow hidden ─────────────────── */
+    char *list =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(strstr(list, "delta1044")); /* RED before: db skipped as ghost */
+    ASSERT_NULL(strstr(list, "::missed"));      /* shadow never advertised */
+    free(list);
+
+    /* ── C: the project still resolves and returns its node ───────── */
+    char *q = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"delta1044\",\"name_pattern\":\"deltaFunc1044\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(q);
+    ASSERT_NOT_NULL(strstr(q, "deltaFunc1044"));
+    ASSERT_NULL(strstr(q, "not found"));
+    free(q);
+
+    cbm_mcp_server_free(srv);
+
+    /* ── cleanup ───────────────────────────────────────────────────── */
+    if (saved_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
+        free(saved_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    cbm_unlink(db_path);
+    char side1044[740];
+    snprintf(side1044, sizeof(side1044), "%s-wal", db_path);
+    cbm_unlink(side1044);
+    snprintf(side1044, sizeof(side1044), "%s-shm", db_path);
+    cbm_unlink(side1044);
+    cbm_rmdir(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  QUERY STORE READ-ONLY  (data-integrity reproductions)
  *
@@ -4719,6 +6232,231 @@ static int idxpar_recovery_check(const char *repo_dir) {
 }
 #endif /* !_WIN32 */
 
+/* #773: SIGABRT (invalid free in ts_stack_delete via
+ * cbm_destroy_thread_parser) on the SECOND index_repository in one server
+ * process, once both repos take the PARALLEL path (~30+ files). The
+ * supervisor masks this on the default MCP path (fresh worker process per
+ * index); the in-process pipeline — CBM_INDEX_SUPERVISOR=0, and every
+ * embedded/test consumer — dies. Forked child so the abort cannot kill the
+ * runner; ASan legs print the exact bad free. */
+enum {
+    IDX773_OK = 0,
+    IDX773_FIRST_FAILED = 71,  /* first index didn't return indexed */
+    IDX773_SECOND_FAILED = 72, /* second index didn't return indexed */
+};
+
+#ifndef _WIN32
+static void idx773_write_py_repo(const char *dir, int files, int variant) {
+    for (int i = 0; i < files; i++) {
+        char path[CBM_SZ_512];
+        snprintf(path, sizeof(path), "%s/mod_%d_%03d.py", dir, variant, i);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            continue;
+        }
+        fprintf(f,
+                "class Handler%d:\n"
+                "    def run(self, x):\n"
+                "        return self.helper(x) + %d\n"
+                "    def helper(self, x):\n"
+                "        for i in range(10):\n"
+                "            x += i\n"
+                "        return x\n"
+                "\n"
+                "def main_%d(x):\n"
+                "    return Handler%d().run(x)\n",
+                i, i, i, i);
+        fclose(f);
+    }
+}
+
+static int idx773_double_index_check(const char *dir_a, const char *dir_b) {
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return IDX773_FIRST_FAILED;
+    }
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", dir_a);
+    char *r1 = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool ok1 = r1 && strstr(r1, "indexed") != NULL;
+    free(r1);
+    if (!ok1) {
+        cbm_mcp_server_free(srv);
+        return IDX773_FIRST_FAILED;
+    }
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"full\"}", dir_b);
+    char *r2 = cbm_mcp_handle_tool(srv, "index_repository", args); /* SIGABRT here (RED) */
+    bool ok2 = r2 && strstr(r2, "indexed") != NULL;
+    free(r2);
+    cbm_mcp_server_free(srv);
+    return ok2 ? IDX773_OK : IDX773_SECOND_FAILED;
+}
+#endif /* !_WIN32 */
+
+/* #898: the SEQUENTIAL pipeline emitted malformed JSON for brokered
+ * ASYNC_CALLS edges ("broker":"bullmq} — missing closing quote) and stored
+ * the RAW broker/method string as the synthesized Route node's properties
+ * (literally `bullmq` instead of {"broker":"bullmq"}). json_extract over
+ * those rows errors, generated-column indexes fail, and PRAGMA quick_check
+ * aborts with "malformed JSON" — which since the artifact deep-integrity
+ * check also means such caches are refused at import. The parallel path
+ * was correct; both pipelines must emit identical, valid JSON. */
+TEST(sequential_service_edge_props_are_valid_json_issue898) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_seq898_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("mkdtemp failed");
+    }
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_seq898_cache_XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp);
+        FAIL("cache mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[CBM_SZ_512];
+    snprintf(src_path, sizeof(src_path), "%s/queue.py", tmp);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    /* celery.Celery("tasks") resolves through the import map to a QN the
+     * service-pattern table classifies as ASYNC with broker "celery". */
+    fputs("import celery\n"
+          "\n"
+          "def enqueue():\n"
+          "    celery.Celery(\"tasks\")\n",
+          f);
+    fclose(f);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    free(resp);
+
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    struct sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(db);
+
+    /* Non-vacuous: the fixture must actually produce a brokered edge. */
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS';", -1,
+                                 &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int async_edges = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_TRUE(async_edges >= 1);
+
+    /* THE BUG: malformed properties on edges (broker quote) and Route nodes
+     * (raw string). Every properties blob must be valid JSON. */
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                 "AND properties != '' AND json_valid(properties)=0;",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int bad_edges = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(bad_edges, 0);
+
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count(*) FROM nodes WHERE properties IS NOT NULL "
+                                 "AND properties != '' AND json_valid(properties)=0;",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int bad_nodes = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_EQ(bad_nodes, 0);
+
+    /* Pipeline parity: the broker must be extractable exactly like the
+     * parallel path emits it. */
+    ASSERT_EQ(sqlite3_prepare_v2(db,
+                                 "SELECT count(*) FROM edges WHERE type='ASYNC_CALLS' AND "
+                                 "json_extract(properties,'$.broker')='celery';",
+                                 -1, &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int brokered = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_TRUE(brokered >= 1);
+
+    cbm_mcp_server_free(srv);
+    char *project = cbm_project_name_from_path(tmp);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    unlink(src_path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+TEST(index_second_inprocess_run_survives_issue773) {
+#ifdef _WIN32
+    SKIP_PLATFORM("fork-isolated crash guard (POSIX-only)");
+#else
+    char dir_a[CBM_SZ_256];
+    char dir_b[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(dir_a, sizeof(dir_a), "/tmp/cbm-idx773a-XXXXXX");
+    snprintf(dir_b, sizeof(dir_b), "/tmp/cbm-idx773b-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idx773c-XXXXXX");
+    if (!cbm_mkdtemp(dir_a) || !cbm_mkdtemp(dir_b) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    /* Trigger shape: run 1 small enough for the SEQUENTIAL path (parses on
+     * the calling thread, mimalloc epoch), run 2 large enough for the
+     * PARALLEL path (switches the global ts allocator to the slab). */
+    idx773_write_py_repo(dir_a, 5, 0);
+    idx773_write_py_repo(dir_b, 60, 1);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(180); /* generous: two full parallel indexes */
+        _exit(idx773_double_index_check(dir_a, dir_b));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+
+    if (signalled) {
+        printf("    child killed by signal %d (SIGABRT = the #773 invalid free)\n", sig);
+    } else if (code != IDX773_OK) {
+        printf("    child exit code %d (71=first index failed, 72=second failed)\n", code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDX773_OK);
+    PASS();
+#endif
+}
+
 TEST(index_recovery_parallel_quarantines_crasher) {
 #ifdef _WIN32
     SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
@@ -5213,12 +6951,13 @@ SUITE(mcp) {
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_latest_metadata);
+    RUN_TEST(mcp_tools_have_behavior_annotations);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_ingest_traces_items_disallow_additional_properties_issue731);
     RUN_TEST(mcp_get_architecture_aspects_schema_enum_pr560);
     RUN_TEST(mcp_text_result);
-    RUN_TEST(mcp_text_result_skips_structured_content_for_plain_text);
+    RUN_TEST(mcp_text_result_wraps_plain_text_as_structured_content);
     RUN_TEST(mcp_cancel_matches_request_id);
     RUN_TEST(mcp_text_result_error);
 
@@ -5249,6 +6988,13 @@ SUITE(mcp) {
     RUN_TEST(server_handle_initialized_notification);
     RUN_TEST(server_handle_tools_list);
     RUN_TEST(server_handle_tools_list_defaults_to_all_tools_and_accepts_cursor);
+    RUN_TEST(server_handle_analysis_profile_filters_and_rejects_mutators);
+    RUN_TEST(server_handle_scout_profile_exposes_only_the_fast_tier);
+    RUN_TEST(analysis_profile_arguments_fail_closed_and_disable_http);
+    RUN_TEST(hook_windows_path_containment_is_case_insensitive_and_segment_safe);
+    RUN_TEST(server_handle_prompts_list_workflows);
+    RUN_TEST(server_handle_prompts_get_workflows);
+    RUN_TEST(server_handle_prompts_get_validates_arguments);
     RUN_TEST(server_handle_logs_request_without_params);
     RUN_TEST(server_handle_unknown_method);
 
@@ -5262,16 +7008,31 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
+    RUN_TEST(tool_trace_totals_respect_test_filter);
+    RUN_TEST(tool_get_architecture_cycles_detects_scc);
+    RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
+    RUN_TEST(tool_lean_defaults_schema_and_status);
+    RUN_TEST(tool_output_regression_gate);
+    RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
+    RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
+    RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
+    RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
+    RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
+    RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
+    RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);
 
     /* Tool handlers with validation */
     RUN_TEST(tool_trace_call_path_not_found);
     RUN_TEST(tool_trace_missing_function_name);
     RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_union_records_min_hop_across_seeds);
+    RUN_TEST(tool_trace_pagination_exactly_once);
     RUN_TEST(tool_trace_call_path_prefers_definition);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
@@ -5283,6 +7044,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_rejects_unknown_aspect_pr560);
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
+    RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 
@@ -5311,6 +7073,8 @@ SUITE(mcp) {
     RUN_TEST(index_repository_cli_name_override_issue823);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
+    RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
+    RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);
     RUN_TEST(tool_manage_adr_not_found_rich_error);
     RUN_TEST(tool_manage_adr_get_accepts_abs_path);
@@ -5365,6 +7129,7 @@ SUITE(mcp) {
     RUN_TEST(tool_bad_project_name_no_overflow_issue235);
     RUN_TEST(tool_bad_project_error_valid_json_issue235);
     RUN_TEST(tool_resolve_store_by_internal_name_issue704);
+    RUN_TEST(tool_list_projects_ignores_missed_shadow_issue1044);
 
     /* auto_watch gate (distilled from PR #625) */
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);

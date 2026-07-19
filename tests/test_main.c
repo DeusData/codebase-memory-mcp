@@ -9,6 +9,7 @@ int tf_fail_count = 0;
 int tf_skip_count = 0;
 
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "foundation/compat.h"    /* cbm_setenv — #845 supervisor kill switch */
 #include "foundation/compat_fs.h" /* cbm_fopen — worker response file */
 #include "foundation/mem.h"       /* cbm_mem_init — worker budget */
@@ -23,6 +24,32 @@ int tf_skip_count = 0;
 #ifdef _WIN32
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
 #endif
+
+/* Test handlers that exercise the production index_repository flow must never
+ * inherit the user's real cache. Individual tests may temporarily override
+ * this sentinel and restore it; atexit removes anything left behind by an
+ * assertion that returns before fixture cleanup. */
+static char tf_home_sentinel[512];
+
+static void tf_cleanup_cache_sentinel(void) {
+    if (tf_home_sentinel[0]) {
+        th_rmtree(tf_home_sentinel);
+    }
+}
+
+static bool tf_setup_cache_sentinel(void) {
+    snprintf(tf_home_sentinel, sizeof(tf_home_sentinel), "/tmp/cbm-test-home-XXXXXX");
+    if (!cbm_mkdtemp(tf_home_sentinel)) {
+        return false;
+    }
+    /* Legacy integration fixtures derive DB paths from HOME, while production
+     * cache_dir() prefers CBM_CACHE_DIR. A private HOME plus no inherited cache
+     * override keeps both conventions pointed at the same isolated tree. */
+    cbm_setenv("HOME", tf_home_sentinel, 1);
+    cbm_unsetenv("CBM_CACHE_DIR");
+    atexit(tf_cleanup_cache_sentinel);
+    return true;
+}
 
 /* #832 guard support: when the index supervisor spawns THIS binary as
  * `<self> cli --index-worker index_repository <args_json> --response-out <file>`
@@ -123,24 +150,36 @@ static int tf_maybe_run_socket_probe(int argc, char **argv) {
 
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
+static bool *g_suite_arg_matched = NULL;
 
 static bool suite_requested(const char *name) {
     if (g_suite_argc <= 1) {
         return true;
     }
+    bool requested = false;
     for (int i = 1; i < g_suite_argc; i++) {
         if (strcmp(g_suite_argv[i], name) == 0) {
-            return true;
+            g_suite_arg_matched[i] = true;
+            requested = true;
         }
     }
-    return false;
+    return requested;
 }
 
-#define RUN_SELECTED_SUITE(name)      \
-    do {                              \
-        if (suite_requested(#name)) { \
-            RUN_SUITE(name);          \
-        }                             \
+/* --list-suites: print every registered suite name, one per line, without
+ * running anything. The list and the run share this ONE macro table, so the
+ * list can never drift from what actually executes — shard runners (make
+ * test-par, the CI shard matrix) enumerate suites from here and their union
+ * guard compares against it. */
+static bool g_list_only = false;
+
+#define RUN_SELECTED_SUITE(name)             \
+    do {                                     \
+        if (g_list_only) {                   \
+            printf("%s\n", #name);           \
+        } else if (suite_requested(#name)) { \
+            RUN_SUITE(name);                 \
+        }                                    \
     } while (0)
 
 /* Forward declarations of suite functions */
@@ -187,6 +226,7 @@ extern void suite_c_lsp(void);
 extern void suite_php_lsp(void);
 extern void suite_cs_lsp(void);
 extern void suite_cs_lsp_bench(void);
+extern void suite_perl_lsp(void);
 extern void suite_scope(void);
 extern void suite_type_rep(void);
 extern void suite_py_lsp(void);
@@ -206,6 +246,12 @@ extern void suite_traces(void);
 extern void suite_configlink(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
+extern void suite_agent_clients(void);
+extern void suite_agent_profiles(void);
+extern void suite_config_json_like(void);
+extern void suite_config_toml_edit(void);
+extern void suite_config_yaml_edit(void);
+extern void suite_config_text_edit(void);
 extern void suite_system_info(void);
 extern void suite_worker_pool(void);
 extern void suite_parallel(void);
@@ -236,7 +282,9 @@ extern void suite_semantic(void);
 extern void suite_ast_profile(void);
 extern void suite_slab_alloc(void);
 extern void suite_simhash(void);
-extern void suite_stack_overflow(void);
+extern void suite_stack_overflow_a(void);
+extern void suite_stack_overflow_b(void);
+extern void suite_stack_overflow_c(void);
 extern void suite_dump_verify(void);
 extern void suite_dump_verify_io(void);
 
@@ -266,10 +314,28 @@ int main(int argc, char **argv) {
      * binary as `<self> cli --index-worker …` and recursively re-run suites.
      * A test that exercises the supervisor must explicitly re-enable it. */
     cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+    if (!tf_setup_cache_sentinel()) {
+        fprintf(stderr, "failed to create isolated test cache\n");
+        return 2;
+    }
 
-    g_suite_argc = argc;
-    g_suite_argv = argv;
-    printf("\n  codebase-memory-mcp  C test suite\n");
+    if (argc == 2 && strcmp(argv[1], "--list-suites") == 0) {
+        g_list_only = true;
+        g_suite_argc = 1; /* no suite-name args to match */
+    } else {
+        g_suite_argc = argc;
+        g_suite_argv = argv;
+    }
+    if (g_suite_argc > 1) {
+        g_suite_arg_matched = calloc((size_t)argc, sizeof(*g_suite_arg_matched));
+        if (!g_suite_arg_matched) {
+            fprintf(stderr, "Failed to allocate test-suite argument tracking\n");
+            return 1;
+        }
+    }
+    if (!g_list_only) {
+        printf("\n  codebase-memory-mcp  C test suite\n");
+    }
 
     /* Foundation */
     RUN_SELECTED_SUITE(arena);
@@ -344,6 +410,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(php_lsp);
     RUN_SELECTED_SUITE(cs_lsp);
     RUN_SELECTED_SUITE(cs_lsp_bench);
+    RUN_SELECTED_SUITE(perl_lsp);
     RUN_SELECTED_SUITE(py_lsp);
     RUN_SELECTED_SUITE(kotlin_lsp);
     RUN_SELECTED_SUITE(rust_lsp);
@@ -370,6 +437,12 @@ int main(int argc, char **argv) {
 
     /* CLI (install, update, config) */
     RUN_SELECTED_SUITE(cli);
+    RUN_SELECTED_SUITE(agent_clients);
+    RUN_SELECTED_SUITE(agent_profiles);
+    RUN_SELECTED_SUITE(config_json_like);
+    RUN_SELECTED_SUITE(config_toml_edit);
+    RUN_SELECTED_SUITE(config_yaml_edit);
+    RUN_SELECTED_SUITE(config_text_edit);
 
     /* System info + worker pool (parallelism) */
     RUN_SELECTED_SUITE(system_info);
@@ -399,8 +472,11 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(ast_profile);
     RUN_SELECTED_SUITE(simhash);
 
-    /* Stack overflow regression (GitHub #199) */
-    RUN_SELECTED_SUITE(stack_overflow);
+    /* Stack overflow regression (GitHub #199) — split a/b/c so no single
+     * suite serializes a parallel run (each ~1/3 of the old wall time). */
+    RUN_SELECTED_SUITE(stack_overflow_a);
+    RUN_SELECTED_SUITE(stack_overflow_b);
+    RUN_SELECTED_SUITE(stack_overflow_c);
 
     /* Integration (end-to-end) */
     RUN_SELECTED_SUITE(integration);
@@ -424,6 +500,29 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(grammar_probe_g);
 
     RUN_SELECTED_SUITE(incremental);
+
+    if (g_list_only) {
+        fflush(stdout);
+        cbm_kind_in_set_free_cache();
+        sqlite3_shutdown();
+        return 0;
+    }
+    bool any_suite_matched = false;
+    for (int i = 1; i < g_suite_argc; i++) {
+        any_suite_matched = any_suite_matched || g_suite_arg_matched[i];
+    }
+    fflush(stdout);
+    for (int i = 1; i < g_suite_argc; i++) {
+        if (!g_suite_arg_matched[i]) {
+            fprintf(stderr, "Unknown test suite: %s\n", g_suite_argv[i]);
+            tf_fail_count++;
+        }
+    }
+    if (g_suite_argc > 1 && !any_suite_matched) {
+        fprintf(stderr, "No matching test suites requested\n");
+    }
+    free(g_suite_arg_matched);
+    g_suite_arg_matched = NULL;
 
     /* Release process-lifetime caches so LeakSanitizer reports no leaks. */
     cbm_kind_in_set_free_cache();

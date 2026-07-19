@@ -22,7 +22,11 @@ typedef struct cbm_watcher cbm_watcher_t;
 
 /* ── Index callback ─────────────────────────────────────────────── */
 
-/* Called when file changes are detected. Return 0 on success, -1 on error.
+/* Called when file changes are detected. Return 0 on success, a POSITIVE
+ * value when the reindex was skipped and should be retried on the next poll
+ * (e.g. another pipeline holds the lock), negative on error. Only a 0 return
+ * commits the watcher's change baselines — a skipped or failed reindex keeps
+ * the change pending so it is retried, never silently lost (#937).
  * project_name: project identifier
  * root_path: absolute path to the repository root */
 typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);

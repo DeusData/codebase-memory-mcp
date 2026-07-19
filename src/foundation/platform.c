@@ -304,6 +304,42 @@ extern char **environ;
 #endif
 
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+#ifdef _WIN32
+    /* #996 Layer 2: _environ holds ANSI-code-page bytes, NOT UTF-8. A
+     * non-ASCII value (USERPROFILE of C:\Users\Kovács János, or a Greek/CJK
+     * CBM_CACHE_DIR) arrives here either mojibake'd or with unrepresentable
+     * characters replaced by '?', which is INVALID in Windows paths — every
+     * downstream wide-safe file API then fails no matter how correct it is.
+     * Read the value wide and convert to genuine UTF-8, matching the
+     * UTF-8-path convention the rest of the codebase (cbm_fopen, _wmkdir,
+     * SQLite VFS) already assumes. */
+    {
+        wchar_t wname[CBM_SZ_256];
+        int wn = MultiByteToWideChar(CP_UTF8, 0, name, -1, wname, CBM_SZ_256);
+        if (wn > 0) {
+            wchar_t wval[CBM_SZ_2K];
+            DWORD got = GetEnvironmentVariableW(wname, wval, CBM_SZ_2K);
+            if (got > 0 && got < CBM_SZ_2K) {
+                char *utf8 = cbm_wide_to_utf8(wval);
+                if (utf8) {
+                    snprintf(buf, buf_sz, "%s", utf8);
+                    free(utf8);
+                    return buf;
+                }
+            }
+            if (got == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+                if (fallback) {
+                    snprintf(buf, buf_sz, "%s", fallback);
+                    return buf;
+                }
+                buf[0] = '\0';
+                return NULL;
+            }
+        }
+        /* Conversion trouble (oversized value, allocation) — fall through to
+         * the ANSI scan below rather than failing outright. */
+    }
+#endif
     char **env = CBM_ENVIRON;
     if (env) {
         size_t nlen = strlen(name);

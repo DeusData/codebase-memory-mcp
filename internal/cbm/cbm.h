@@ -164,13 +164,16 @@ typedef enum {
     CBM_LANG_APEX,
     CBM_LANG_SOQL,
     CBM_LANG_SOSL,
-    CBM_LANG_KUSTOMIZE, // kustomization.yaml — Kubernetes overlay tool
-    CBM_LANG_K8S,       // Generic Kubernetes manifest (apiVersion: detected)
-    CBM_LANG_PINE,      // Pine Script (TradingView indicator / strategy language)
-    CBM_LANG_QML,       // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
-    CBM_LANG_CFSCRIPT,  // CFML script dialect (.cfc components — Lucee/ColdFusion)
-    CBM_LANG_CFML,      // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
-    CBM_LANG_MOJO,      // Mojo
+    CBM_LANG_KUSTOMIZE,            // kustomization.yaml — Kubernetes overlay tool
+    CBM_LANG_K8S,                  // Generic Kubernetes manifest (apiVersion: detected)
+    CBM_LANG_PINE,                 // Pine Script (TradingView indicator / strategy language)
+    CBM_LANG_QML,                  // Qt QML (Qt Modeling Language — declarative UI + embedded JS)
+    CBM_LANG_CFSCRIPT,             // CFML script dialect (.cfc components — Lucee/ColdFusion)
+    CBM_LANG_CFML,                 // CFML tag dialect (.cfm templates — Lucee/ColdFusion)
+    CBM_LANG_MOJO,                 // Mojo
+    CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
+    CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
+    CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -499,6 +502,24 @@ typedef struct {
     int count;
 } CBMStringConstantMap;
 
+// Forward declaration: ObjectScript macro table (defined in macro_table.h).
+typedef struct CBMMacroTable CBMMacroTable;
+
+// Method-return-type table for ObjectScript variable type inference. Populated
+// from definition nodes (method QN -> declared return type) so a later
+// `Set x = obj.Method()` can resolve x's class.
+#define CBM_RETURN_TYPE_TABLE_CAP 2048
+
+typedef struct {
+    const char *method_qn;
+    const char *return_type;
+} CBMReturnTypeEntry;
+
+typedef struct {
+    CBMReturnTypeEntry entries[CBM_RETURN_TYPE_TABLE_CAP];
+    int count;
+} CBMReturnTypeTable;
+
 typedef struct {
     CBMArena *arena;
     CBMFileResult *result;
@@ -509,9 +530,11 @@ typedef struct {
     const char *rel_path;
     const char *module_qn;
     TSNode root;
-    EFCache ef_cache;                      // enclosing function cache
-    const char *enclosing_class_qn;        // for nested class QN computation
-    CBMStringConstantMap string_constants; // module-level NAME = "value" pairs
+    EFCache ef_cache;                            // enclosing function cache
+    const char *enclosing_class_qn;              // for nested class QN computation
+    CBMStringConstantMap string_constants;       // module-level NAME = "value" pairs
+    const CBMMacroTable *macro_table;            // ObjectScript $$$macro table (NULL if none)
+    const CBMReturnTypeTable *return_type_table; // ObjectScript method return types (NULL if none)
 } CBMExtractCtx;
 
 // --- Public API ---
@@ -559,6 +582,18 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL
                                 const char **include_paths  // NULL-terminated, or NULL
+);
+
+// Pipeline-internal variant of cbm_extract_file() carrying ObjectScript
+// per-project tables (macro table + method-return-type table). The public
+// cbm_extract_file() is a thin wrapper that passes NULL, NULL for both.
+CBMFileResult *cbm_extract_file_ex(
+    const char *source, int source_len, CBMLanguage language, const char *project,
+    const char *rel_path, int64_t timeout_micros,
+    const char **extra_defines,                 // NULL-terminated, or NULL
+    const char **include_paths,                 // NULL-terminated, or NULL
+    const CBMMacroTable *macro_table,           // ObjectScript macros, or NULL
+    const CBMReturnTypeTable *return_type_table // OS return types, or NULL
 );
 
 // Free all memory associated with a result.

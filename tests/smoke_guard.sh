@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # smoke_guard.sh — Smoke test for guard and ghost-file invariants.
 #
-# Verifies two properties across all 5 guarded query handlers:
+# Verifies two properties across all 6 guarded query handlers:
 #   1. Each handler returns a guard error for unknown/unindexed projects.
 #   2. No ghost .db file is created for the unknown project name.
 #
@@ -38,7 +38,11 @@ check_handler() {
     local args="$2"
     echo "[smoke_guard] Invoking $handler with project='$FAKE_PROJECT'..."
     local response
-    response="$("$BINARY" cli "$handler" "$args" 2>/dev/null)"
+    # Guard errors intentionally return a non-zero CLI status. Keep `set -e`
+    # from terminating before the response and ghost-file assertions run.
+    if response="$("$BINARY" cli "$handler" "$args" 2>&1)"; then
+        :
+    fi
     echo "[smoke_guard] Response: $response"
 
     # For a missing .db file, cbm_store_open_path_query returns NULL so
@@ -61,12 +65,13 @@ check_handler() {
     fi
 }
 
-# ── Step 3: Test all 5 guarded handlers ───────────────────────────
+# ── Step 3: Test all 6 guarded handlers ───────────────────────────
 check_handler "search_graph" "{\"project\":\"$FAKE_PROJECT\",\"name_pattern\":\".*\"}"
 check_handler "query_graph"  "{\"project\":\"$FAKE_PROJECT\",\"query\":\"MATCH (n) RETURN n LIMIT 1\"}"
 check_handler "get_graph_schema" "{\"project\":\"$FAKE_PROJECT\"}"
 check_handler "trace_call_path" "{\"project\":\"$FAKE_PROJECT\",\"function_name\":\"main\",\"direction\":\"both\",\"depth\":1}"
 check_handler "get_code_snippet" "{\"project\":\"$FAKE_PROJECT\",\"qualified_name\":\"main\"}"
+check_handler "check_index_coverage" "{\"project\":\"$FAKE_PROJECT\",\"paths\":[\"src/main.c\"]}"
 
 # ── Step 4: Final result ──────────────────────────────────────────
 if [ "$FAILURES" -gt 0 ]; then
@@ -74,5 +79,5 @@ if [ "$FAILURES" -gt 0 ]; then
     exit 1
 fi
 
-echo "[smoke_guard] All checks passed (5 handlers, guard + ghost-file invariants)."
+echo "[smoke_guard] All checks passed (6 handlers, guard + ghost-file invariants)."
 exit 0

@@ -52,6 +52,38 @@ TEST(fqn_compute_basic_c) {
     PASS();
 }
 
+/* #1077/#964: File-node QNs (name=="__file__") must preserve the FULL filename
+ * so sibling files sharing a stem get DISTINCT nodes. Extension stripping is
+ * kept for module/symbol QNs (name!=__file__) — load-bearing for C/C++
+ * declaration↔definition resolution. */
+TEST(fqn_file_qn_preserves_dotfile_variants_issue1077) {
+    /* .env / .env.local / .env.production all stripped to ".env" before,
+     * colliding so only one File node survived per directory. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env", "__file__"), "proj..env.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env.local", "__file__"),
+               "proj..env.local.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".env.production", "__file__"),
+               "proj..env.production.__file__");
+    PASS();
+}
+
+TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964) {
+    /* NodeController.h and NodeController.cpp both stripped to
+     * "NodeController", so the header's File node was merged into the .cpp's. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "NodeController.h", "__file__"),
+               "proj.NodeController.h.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "NodeController.cpp", "__file__"),
+               "proj.NodeController.cpp.__file__");
+    PASS();
+}
+
+TEST(fqn_module_qn_still_strips_extension) {
+    /* The MODULE/symbol QN keeps stripping — unchanged by the File-QN fix. */
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "core.c", "init"), "proj.core.init");
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "NodeController.cpp"), "proj.NodeController");
+    PASS();
+}
+
 TEST(fqn_compute_basic_rs) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib.rs", "new"), "proj.lib.new");
     PASS();
@@ -559,6 +591,9 @@ SUITE(fqn) {
     RUN_TEST(fqn_compute_basic_ts);
     RUN_TEST(fqn_compute_basic_js);
     RUN_TEST(fqn_compute_basic_c);
+    RUN_TEST(fqn_file_qn_preserves_dotfile_variants_issue1077);
+    RUN_TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964);
+    RUN_TEST(fqn_module_qn_still_strips_extension);
     RUN_TEST(fqn_compute_basic_rs);
 
     /* fqn_compute: nested paths */

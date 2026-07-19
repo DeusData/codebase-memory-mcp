@@ -642,6 +642,168 @@ TEST(watcher_no_change_no_reindex) {
     PASS();
 }
 
+/* #937: a PERSISTENTLY dirty worktree must reindex ONCE per distinct dirty
+ * state, not on every poll. The watcher used to treat "tree is dirty" as
+ * "tree changed", so an idle repo with one uncommitted file re-triggered a
+ * full reindex (and its DB/artifact rewrite) every poll cycle — the reported
+ * 1 TB/day write amplification. A dirty-state signature (porcelain entries +
+ * per-file size/mtime) must gate the trigger: same signature → no reindex;
+ * editing a dirty file again, or reverting the tree to clean, are NEW states
+ * that must each trigger exactly one reindex. */
+TEST(watcher_dirty_state_reindexes_once_issue937) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_amp_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    cbm_watcher_watch(w, "amp-repo", tmpdir);
+    index_call_count = 0;
+
+    /* Baseline (clean tree) */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Dirty the tree once (uncommitted modification). */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "modified\n");
+    }
+    cbm_watcher_touch(w, "amp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1); /* new dirty state → one reindex */
+
+    /* Idle polls on the SAME dirty state must not re-trigger. */
+    for (int i = 0; i < 3; i++) {
+        cbm_watcher_touch(w, "amp-repo");
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(index_call_count, 1); /* was 4 before the fix: one per poll */
+
+    /* Editing the dirty file AGAIN is a new state (size changes). */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "modified again\n");
+    }
+    cbm_watcher_touch(w, "amp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
+
+    /* Same-state polls stay quiet again. */
+    cbm_watcher_touch(w, "amp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
+
+    /* Reverting to a clean tree changes on-disk content (back to HEAD) —
+     * that is a new state and must reindex exactly once. */
+    wt_git(tmpdir, "checkout -- file.txt");
+    cbm_watcher_touch(w, "amp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 3);
+
+    /* Stable clean tree: quiet. */
+    cbm_watcher_touch(w, "amp-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 3);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* #937 companion: a change whose reindex FAILS (or is skipped busy) must be
+ * retried on the next poll. The watcher used to commit the new HEAD at CHECK
+ * time, so a commit observed while the pipeline was busy/failing was recorded
+ * as seen and never indexed — a silent lost update. Baselines (HEAD and dirty
+ * signature) may only be committed after a SUCCESSFUL reindex. */
+static int failing_index_calls = 0;
+static int failing_index_fail_first_n = 0;
+static int failing_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    failing_index_calls++;
+    if (failing_index_calls <= failing_index_fail_first_n) {
+        return -1; /* simulated pipeline failure */
+    }
+    return 0;
+}
+
+TEST(watcher_failed_reindex_retries_issue937) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_rty_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[300];
+        th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, failing_index_callback, NULL);
+
+    cbm_watcher_watch(w, "rty-repo", tmpdir);
+    failing_index_calls = 0;
+    failing_index_fail_first_n = 1; /* first reindex attempt fails */
+
+    /* Baseline (clean tree) */
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 0);
+
+    /* HEAD moves (new commit). */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "world\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m add-world");
+
+    /* First poll: change detected, reindex attempt FAILS. */
+    cbm_watcher_touch(w, "rty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 1);
+
+    /* The failed change must NOT have been recorded as seen: the next poll
+     * retries and succeeds. Before the fix, the new HEAD was stored at check
+     * time and the commit was silently lost (calls stayed at 1). */
+    cbm_watcher_touch(w, "rty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 2);
+
+    /* Successful reindex commits the baseline: no further triggers. */
+    cbm_watcher_touch(w, "rty-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(failing_index_calls, 2);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 TEST(watcher_multiple_projects) {
     /* Create two temporary git repos */
     char tmpdirA[256];
@@ -893,8 +1055,11 @@ TEST(watcher_git_removed_no_crash) {
 }
 
 TEST(watcher_continued_dirty) {
-    /* If working tree stays dirty, each poll should re-trigger reindex.
-     * Port of repeated git sentinel detection behavior. */
+    /* A tree that STAYS dirty re-triggers only when the dirty state itself
+     * changes (#937): repeat polls over the untouched state are quiet, a
+     * further edit re-triggers, and the cleaning commit triggers once more
+     * (HEAD move + tree back to clean). Historically this test asserted one
+     * reindex per poll while dirty — that WAS the #937 write amplification. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -932,7 +1097,17 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty — should detect again */
+    /* Still dirty but UNCHANGED — must stay quiet (#937) */
+    cbm_watcher_touch(w, "cont-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* A further edit is a NEW dirty state — detect again */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "dirtier\n");
+    }
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 2);
@@ -1914,6 +2089,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_detects_dirty_worktree);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
+    RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
+    RUN_TEST(watcher_failed_reindex_retries_issue937);
     RUN_TEST(watcher_multiple_projects);
 
     /* Non-git project */

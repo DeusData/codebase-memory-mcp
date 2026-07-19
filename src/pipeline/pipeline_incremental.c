@@ -70,6 +70,19 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 #endif
 }
 
+static const char *incr_mode_name(int mode) {
+    switch (mode) {
+    case CBM_MODE_FULL:
+        return "full";
+    case CBM_MODE_MODERATE:
+        return "moderate";
+    case CBM_MODE_FAST:
+        return "fast";
+    default:
+        return "unknown";
+    }
+}
+
 /* ── File classification ─────────────────────────────────────────── */
 
 /* Classify discovered files against stored hashes using mtime+size.
@@ -445,7 +458,7 @@ static void incr_free_edge_capture(cbm_edge_capture_t *cap) {
  * indexed at all (forced re-parse on the next run for current-files,
  * potential orphaned-node revival for mode_skipped). The warning surface
  * is the only signal that something went wrong. */
-static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
+static bool persist_hashes(cbm_store_t *store, const char *project, cbm_file_info_t *files,
                            int file_count, const cbm_file_hash_t *mode_skipped,
                            int mode_skipped_count) {
     int current_failed = 0;
@@ -456,6 +469,7 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
     for (int i = 0; i < file_count; i++) {
         struct stat st;
         if (stat(files[i].path, &st) != 0) {
+            current_failed++;
             continue;
         }
         int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
@@ -498,6 +512,7 @@ static void persist_hashes(cbm_store_t *store, const char *project, cbm_file_inf
         cbm_log_warn("incremental.persist_summary", "current_failed", itoa_buf(current_failed),
                      "mode_skipped_failed", itoa_buf(ms_failed));
     }
+    return current_failed == 0 && ms_failed == 0;
 }
 
 /* ── Registry seed visitor ────────────────────────────────────────── */
@@ -631,7 +646,8 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
 static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
                              cbm_file_info_t *files, int file_count,
                              const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count) {
+                             const char *repo_path, const cbm_coverage_row_t *cov, int cov_count,
+                             const cbm_coverage_meta_t *meta_template) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
@@ -649,13 +665,23 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
 
     cbm_store_t *hash_store = cbm_store_open_path(db_path);
     if (hash_store) {
-        persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
+        bool hash_records_complete = persist_hashes(hash_store, project, files, file_count,
+                                                    mode_skipped, mode_skipped_count);
 
         /* Coverage rows (#963): re-write the merged set into the rebuilt DB
          * (AFTER hashes, so the deleted-file prune sees the live file set). */
-        if (cov_count > 0 &&
-            cbm_store_coverage_replace(hash_store, project, cov, cov_count) != CBM_STORE_OK) {
+        cbm_project_t project_info = {0};
+        bool have_project_info =
+            cbm_store_get_project(hash_store, project, &project_info) == CBM_STORE_OK;
+        cbm_coverage_meta_t meta = meta_template ? *meta_template : (cbm_coverage_meta_t){0};
+        meta.generation = have_project_info ? project_info.indexed_at : NULL;
+        meta.hash_records_complete = hash_records_complete;
+        if (cbm_store_coverage_replace_ex(hash_store, project, cov, cov_count, &meta) !=
+            CBM_STORE_OK) {
             cbm_log_error("incremental.err", "msg", "persist_coverage", "project", project);
+        }
+        if (have_project_info) {
+            cbm_project_free_fields(&project_info);
         }
 
         /* FTS5 rebuild after incremental dump.  The btree dump path bypasses
@@ -741,7 +767,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * still open) so entries for files NOT re-extracted this run survive. */
     cbm_coverage_row_t *old_cov = NULL;
     int old_cov_count = 0;
-    (void)cbm_store_coverage_get(store, project, &old_cov, &old_cov_count);
+    if (cbm_store_coverage_get(store, project, &old_cov, &old_cov_count) != CBM_STORE_OK) {
+        cbm_log_error("incremental.err", "msg", "coverage_read_failed", "project", project);
+        cbm_store_free_coverage(old_cov, old_cov_count);
+        free(is_changed);
+        for (int i = 0; i < deleted_count; i++) {
+            free(deleted[i]);
+        }
+        free(deleted);
+        free_mode_skipped(mode_skipped, mode_skipped_count);
+        cbm_store_close(store);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
 
     /* Build list of changed files */
     cbm_file_info_t *changed_files =
@@ -848,8 +885,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     for (int i = 0; i < ci; i++) {
         char *file_qn = cbm_pipeline_fqn_compute(project, changed_files[i].rel_path, "__file__");
         if (file_qn) {
-            cbm_gbuf_upsert_node(existing, "File", changed_files[i].rel_path, file_qn,
-                                 changed_files[i].rel_path, 0, 0, "{}");
+            /* #994: the name must be the BASENAME with extension props,
+             * mirroring the full build's File node (pipeline.c) — upserts
+             * match by QN, so any other name here renames the node in place
+             * and the incremental graph diverges from a full build. */
+            const char *rel = changed_files[i].rel_path;
+            const char *slash = strrchr(rel, '/');
+            const char *basename = slash ? slash + SKIP_ONE : rel;
+            char props[CBM_SZ_256];
+            const char *ext = strrchr(basename, '.');
+            snprintf(props, sizeof(props), "{\"extension\":\"%s\"}", ext ? ext : "");
+            cbm_gbuf_upsert_node(existing, "File", basename, file_qn, rel, 0, 0, props);
             free(file_qn);
         }
     }
@@ -857,6 +903,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     run_extract_resolve(&ctx, changed_files, ci);
     cbm_pipeline_pass_k8s(&ctx, changed_files, ci);
     run_postpasses(&ctx, changed_files, ci, project);
+
+    /* Free ObjectScript tables built by pass_calls during run_extract_resolve. */
+    if (ctx.return_type_table) {
+        for (int i = 0; i < ctx.return_type_table->count; i++) {
+            free((void *)ctx.return_type_table->entries[i].return_type);
+        }
+        free((void *)ctx.return_type_table);
+        ctx.return_type_table = NULL;
+    }
+    if (ctx.macro_table) {
+        free((void *)ctx.macro_table);
+        ctx.macro_table = NULL;
+    }
 
     /* Coverage rows (#963): merge = previous FAILURE rows for files NOT
      * re-extracted this run + this run's fresh entries (changed files replace
@@ -875,13 +934,15 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_get_excluded(p, &run_excluded, &run_excluded_count);
     cbm_ignored_file_t *run_ignored = NULL;
     int run_ignored_count = 0;
-    cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, NULL);
+    int run_ignored_total = 0;
+    cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
     int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
     }
+    bool coverage_rows_available = cov_cap == 0 || cov != NULL;
     if (cov) {
         CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
         for (int i = 0; i < ci; i++) {
@@ -938,8 +999,19 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * covers incremental reindexes, not just full ones. */
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
+    int index_mode = cbm_pipeline_get_mode(p);
+    cbm_coverage_meta_t coverage_meta = {
+        .index_mode = incr_mode_name(index_mode),
+        .recording_status =
+            !coverage_rows_available
+                ? "unavailable"
+                : (run_ignored_total > run_ignored_count ? "truncated" : "complete"),
+        .ignored_files_stored = run_ignored_count,
+        .ignored_files_total = run_ignored_total,
+        .coverage_version = 1,
+    };
     dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n);
+                     mode_skipped_count, cbm_pipeline_repo_path(p), cov, cov_n, &coverage_meta);
     free(cov);
     cbm_store_free_coverage(old_cov, old_cov_count);
     free_mode_skipped(mode_skipped, mode_skipped_count);

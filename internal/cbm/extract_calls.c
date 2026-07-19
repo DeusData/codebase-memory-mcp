@@ -2,11 +2,13 @@
 #include "arena.h" // CBMArena, cbm_arena_sprintf
 #include "helpers.h"
 #include "lang_specs.h"
+#include "macro_table.h"
 #include "extract_unified.h"
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
-#include "tree_sitter/api.h" // TSNode, ts_node_*
-#include <stdint.h>          // uint32_t
+#include "service_patterns.h" // cbm_service_pattern_route_method (#952)
+#include "tree_sitter/api.h"  // TSNode, ts_node_*
+#include <stdint.h>           // uint32_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -463,7 +465,8 @@ static char *extract_scripting_callee(CBMArena *a, TSNode node, const char *sour
         if (ts_node_is_null(func_node)) {
             func_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
         }
-        return ts_node_is_null(func_node) ? NULL : cbm_node_text(a, func_node, source);
+        char *pn = ts_node_is_null(func_node) ? NULL : cbm_node_text(a, func_node, source);
+        return pn;
     }
     if (lang == CBM_LANG_KOTLIN && ts_node_child_count(node) > 0) {
         return cbm_node_text(a, ts_node_child(node, 0), source);
@@ -1160,11 +1163,185 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
             return c;
         }
     }
+    if (lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+        // ##class(Pkg.Class).Method() -> "Pkg.Class.Method"
+        if (strcmp(nk, "class_method_call") == 0) {
+            TSNode class_ref = cbm_find_child_by_kind(node, "class_ref");
+            TSNode method_name = cbm_find_child_by_kind(node, "method_name");
+            if (!ts_node_is_null(class_ref) && !ts_node_is_null(method_name)) {
+                TSNode cname = cbm_find_child_by_kind(class_ref, "class_name");
+                if (ts_node_is_null(cname)) {
+                    return NULL;
+                }
+                char *cls = cbm_node_text(a, cname, source);
+                if (!cls || !cls[0]) {
+                    return NULL;
+                }
+                TSNode mname_ident = ts_node_named_child_count(method_name) > 0
+                                         ? ts_node_named_child(method_name, 0)
+                                         : (TSNode){0};
+                if (ts_node_is_null(mname_ident)) {
+                    return cls;
+                }
+                char *meth = cbm_node_text(a, mname_ident, source);
+                if (!meth || !meth[0]) {
+                    return cls;
+                }
+                return cbm_arena_sprintf(a, "%s.%s", cls, meth);
+            }
+            return NULL;
+        }
+        // $$label^routine extrinsic / routine tag call -> the line_ref text
+        if (strcmp(nk, "routine_tag_call") == 0) {
+            TSNode line_ref = cbm_find_child_by_kind(node, "line_ref");
+            if (!ts_node_is_null(line_ref)) {
+                return cbm_node_text(a, line_ref, source);
+            }
+            return NULL;
+        }
+        // $$$Macro(...) -> raw "$$$Name" callee (expanded later in handle_calls)
+        if (strcmp(nk, "macro") == 0) {
+            char *raw = cbm_node_text(a, node, source);
+            if (!raw || raw[0] != '$' || raw[1] != '$' || raw[2] != '$') {
+                return NULL;
+            }
+            char *name_start = raw + 3;
+            char *paren = strchr(name_start, '(');
+            if (paren) {
+                *paren = '\0';
+            }
+            if (!name_start[0]) {
+                return NULL;
+            }
+            return cbm_arena_sprintf(a, "$$$%s", name_start);
+        }
+        return NULL;
+    }
 
     return extract_scripting_callee(a, node, source, lang, nk);
 }
 
 // Extract callee name from a call node
+/* #952: compose Laravel group prefixes into a route path. Walks UP from a
+ * route-registration call: every enclosing anonymous function that is the
+ * argument of a `->group(...)` member call contributes the `prefix('...')`
+ * (or `Route::prefix('...')`) found on that group call's receiver chain.
+ * Chain methods that don't shape the path (middleware, name, as, domain)
+ * are skipped. Outer groups accumulate before inner ones; nested groups
+ * compose left-to-right. Returns the composed path (arena) or NULL when no
+ * enclosing group carries a prefix. */
+enum { PHP_GROUP_WALK_MAX = 64, PHP_PREFIX_PARTS_MAX = 8 };
+
+static const char *php_chain_prefix_arg(CBMArena *a, TSNode call_node, const char *source) {
+    /* call_node is a member_call_expression / scoped_call_expression whose
+     * name is `prefix`; return its first string argument (unquoted). */
+    TSNode args = ts_node_child_by_field_name(call_node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        TSNode inner = arg;
+        if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
+            inner = ts_node_named_child(arg, 0);
+        }
+        if (strcmp(ts_node_type(inner), "string") == 0 ||
+            strcmp(ts_node_type(inner), "encapsed_string") == 0) {
+            char *txt = cbm_node_text(a, inner, source);
+            if (txt && txt[0]) {
+                size_t len = strlen(txt);
+                if (len >= 2 && (txt[0] == '\'' || txt[0] == '"')) {
+                    txt[len - 1] = '\0';
+                    txt++;
+                }
+                return txt[0] ? txt : NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
+static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const char *source) {
+    const char *parts[PHP_PREFIX_PARTS_MAX];
+    int part_count = 0;
+    TSNode cur = ts_node_parent(node);
+    for (int depth = 0; depth < PHP_GROUP_WALK_MAX && !ts_node_is_null(cur); depth++) {
+        if (strcmp(ts_node_type(cur), "anonymous_function") == 0 ||
+            strcmp(ts_node_type(cur), "arrow_function") == 0) {
+            /* Is this closure the argument of a ->group(...) call? Walk to
+             * the enclosing call and check its method name. */
+            TSNode p = ts_node_parent(cur);
+            while (!ts_node_is_null(p) && strcmp(ts_node_type(p), "member_call_expression") != 0 &&
+                   strcmp(ts_node_type(p), "scoped_call_expression") != 0) {
+                if (strcmp(ts_node_type(p), "statement") == 0 ||
+                    strcmp(ts_node_type(p), "expression_statement") == 0) {
+                    break; /* left the argument position */
+                }
+                p = ts_node_parent(p);
+            }
+            if (!ts_node_is_null(p) && (strcmp(ts_node_type(p), "member_call_expression") == 0 ||
+                                        strcmp(ts_node_type(p), "scoped_call_expression") == 0)) {
+                TSNode gname = ts_node_child_by_field_name(p, TS_FIELD("name"));
+                char *gtxt = ts_node_is_null(gname) ? NULL : cbm_node_text(a, gname, source);
+                if (gtxt && strcmp(gtxt, "group") == 0) {
+                    /* Scan the receiver chain for prefix('...'). */
+                    TSNode recv = ts_node_child_by_field_name(p, TS_FIELD("object"));
+                    for (int hops = 0; hops < PHP_GROUP_WALK_MAX && !ts_node_is_null(recv);
+                         hops++) {
+                        const char *rk = ts_node_type(recv);
+                        if (strcmp(rk, "member_call_expression") == 0 ||
+                            strcmp(rk, "scoped_call_expression") == 0) {
+                            TSNode rname = ts_node_child_by_field_name(recv, TS_FIELD("name"));
+                            char *rtxt =
+                                ts_node_is_null(rname) ? NULL : cbm_node_text(a, rname, source);
+                            if (rtxt && strcmp(rtxt, "prefix") == 0) {
+                                const char *pf = php_chain_prefix_arg(a, recv, source);
+                                if (pf && part_count < PHP_PREFIX_PARTS_MAX) {
+                                    parts[part_count++] = pf; /* inner-first */
+                                }
+                                break;
+                            }
+                            recv = ts_node_child_by_field_name(recv, TS_FIELD("object"));
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        cur = ts_node_parent(cur);
+    }
+    if (part_count == 0) {
+        return NULL;
+    }
+    /* parts[] is inner-first; compose outer-first. Ensure exactly one '/'
+     * between segments and a leading '/'. */
+    char buf[CBM_SZ_256];
+    size_t pos = 0;
+    for (int i = part_count - 1; i >= 0; i--) {
+        const char *seg = parts[i];
+        while (*seg == '/') {
+            seg++;
+        }
+        size_t sl = strlen(seg);
+        if (sl == 0) {
+            continue;
+        }
+        if (pos + sl + 2 >= sizeof(buf)) {
+            return NULL; /* oversized — leave path un-prefixed */
+        }
+        buf[pos++] = '/';
+        memcpy(buf + pos, seg, sl);
+        pos += sl;
+        while (pos > 1 && buf[pos - 1] == '/') {
+            pos--; /* strip trailing slash per segment */
+        }
+    }
+    buf[pos] = '\0';
+    return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
+}
+
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang) {
     // Lean 4: skip type-position applies
     if (lang == CBM_LANG_LEAN && strcmp(ts_node_type(node), "apply") == 0) {
@@ -1203,6 +1380,31 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
                 char *rt = cbm_node_text(a, recv, source);
                 if (rt && rt[0]) {
                     return rt;
+                }
+            }
+        }
+    }
+
+    /* #952: PHP facade route registrations (`Route::get(...)`, a
+     * scoped_call_expression) must carry the scope in the callee text — the
+     * empty-resolution route fallback keys on the "::get" suffix table, and
+     * the bare "get" that generic field resolution would return deliberately
+     * never matches (every $obj->get() would become a route). Runs BEFORE
+     * field-based resolution, which short-circuits on the `name` field.
+     * Gated to the literal `Route` scope AND a route-method match: any other
+     * scope (Cache::get) would suffix-match "::get" too and mint junk routes
+     * from slash-prefixed keys. Known limitation: aliased facade imports are
+     * not recognized. */
+    if (lang == CBM_LANG_PHP && strcmp(ts_node_type(node), "scoped_call_expression") == 0) {
+        TSNode scope = ts_node_child_by_field_name(node, TS_FIELD("scope"));
+        TSNode mname = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        if (!ts_node_is_null(scope) && !ts_node_is_null(mname)) {
+            char *sc = cbm_node_text(a, scope, source);
+            char *mn = cbm_node_text(a, mname, source);
+            if (sc && mn && strcmp(sc, "Route") == 0) {
+                char *qual = cbm_arena_sprintf(a, "%s::%s", sc, mn);
+                if (qual && cbm_service_pattern_route_method(qual) != NULL) {
+                    return qual;
                 }
             }
         }
@@ -1866,6 +2068,72 @@ static void extract_java_method_reference(CBMExtractCtx *ctx, TSNode node, const
     cbm_calls_push(&ctx->result->calls, ctx->arena, call);
 }
 
+// ObjectScript: resolve `var.Method(...)` / `..Property.Method(...)` instance
+// calls against the per-method variable type map. Returns arena "Class.Method"
+// or NULL if the receiver's type is unknown.
+static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const char *source,
+                                                os_type_map_t *type_map) {
+    TSNode receiver = {0};
+    TSNode oref = {0};
+    const char *nk_first = NULL;
+    for (uint32_t i = 0; i < ts_node_named_child_count(node); i++) {
+        TSNode child = ts_node_named_child(node, i);
+        const char *ck = ts_node_type(child);
+        if (strcmp(ck, "lvn") == 0 || strcmp(ck, "variable") == 0) {
+            receiver = child;
+        } else if (strcmp(ck, "relative_dot_property") == 0) {
+            receiver = child;
+            nk_first = "relative_dot_property";
+        } else if (strcmp(ck, "oref_method") == 0) {
+            oref = child;
+        }
+    }
+    if (ts_node_is_null(oref)) {
+        return NULL;
+    }
+    TSNode method_name_node = cbm_find_child_by_kind(oref, "method_name");
+    if (ts_node_is_null(method_name_node)) {
+        return NULL;
+    }
+    TSNode mn_ident = ts_node_named_child_count(method_name_node) > 0
+                          ? ts_node_named_child(method_name_node, 0)
+                          : (TSNode){0};
+    if (ts_node_is_null(mn_ident)) {
+        return NULL;
+    }
+    char *method = cbm_node_text(a, mn_ident, source);
+    if (!method || !method[0]) {
+        return NULL;
+    }
+    if (ts_node_is_null(receiver)) {
+        return NULL;
+    }
+    char *var_text = NULL;
+    if (nk_first && strcmp(nk_first, "relative_dot_property") == 0) {
+        TSNode prop_name = cbm_find_child_by_kind(receiver, "member_name");
+        if (!ts_node_is_null(prop_name)) {
+            char *pname = cbm_node_text(a, prop_name, source);
+            if (pname && pname[0]) {
+                var_text = cbm_arena_sprintf(a, "..%s", pname);
+            }
+        }
+        if (!var_text) {
+            var_text = cbm_node_text(a, receiver, source);
+        }
+    } else {
+        var_text = cbm_node_text(a, receiver, source);
+    }
+    if (!var_text || !var_text[0]) {
+        return NULL;
+    }
+    for (int i = 0; i < type_map->count; i++) {
+        if (strcasecmp(type_map->entries[i].var_name, var_text) == 0) {
+            return cbm_arena_sprintf(a, "%s.%s", type_map->entries[i].class_name, method);
+        }
+    }
+    return NULL;
+}
+
 void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, WalkState *state) {
     if (!spec->call_node_types || !spec->call_node_types[0]) {
         return;
@@ -1873,6 +2141,56 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
 
     if (cbm_kind_in_set(node, spec->call_node_types)) {
         char *callee = extract_callee_name(ctx->arena, node, ctx->source, ctx->language);
+
+        // ObjectScript: var.Method() / ..Property.Method() instance dispatch.
+        if (!callee &&
+            (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
+             ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) &&
+            strcmp(ts_node_type(node), "method_call") == 0) {
+            callee = resolve_objectscript_instance_call(ctx->arena, node, ctx->source,
+                                                        &state->os_type_map);
+        }
+
+        // ObjectScript: ..Method() oref self-call resolves against the enclosing class.
+        if (!callee &&
+            (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
+             ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) &&
+            strcmp(ts_node_type(node), "relative_dot_method") == 0 && state->enclosing_class_qn &&
+            state->enclosing_class_qn[0]) {
+            TSNode oref = cbm_find_child_by_kind(node, "oref_method");
+            if (!ts_node_is_null(oref)) {
+                TSNode mname_node = cbm_find_child_by_kind(oref, "method_name");
+                if (!ts_node_is_null(mname_node)) {
+                    TSNode ident = ts_node_named_child_count(mname_node) > 0
+                                       ? ts_node_named_child(mname_node, 0)
+                                       : (TSNode){0};
+                    if (!ts_node_is_null(ident)) {
+                        char *mname = cbm_node_text(ctx->arena, ident, ctx->source);
+                        if (mname && mname[0]) {
+                            callee = cbm_arena_sprintf(ctx->arena, "%s.%s",
+                                                       state->enclosing_class_qn, mname);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ObjectScript: expand a $$$Macro callee via the macro table.
+        if (callee && callee[0] == '$' && callee[1] == '$' && callee[2] == '$' &&
+            ctx->macro_table) {
+            const char *macro_name = callee + 3;
+            const CBMMacroEntry *entry = cbm_macro_table_find(ctx->macro_table, macro_name);
+            if (entry) {
+                if (entry->resolved_callee) {
+                    callee = cbm_arena_strdup(ctx->arena, entry->resolved_callee);
+                } else if (entry->expansion) {
+                    callee = cbm_macro_extract_callee(ctx->arena, entry->expansion);
+                } else {
+                    callee = NULL;
+                }
+            }
+        }
+
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
         if (callee && callee[0] &&
@@ -1917,12 +2235,65 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            // ObjectScript stores args under oref_method/method_args, not the
+            // generic "arguments" field.
+            if (ts_node_is_null(args) && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
+                                          ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE)) {
+                TSNode oref = cbm_find_child_by_kind(node, "oref_method");
+                if (!ts_node_is_null(oref)) {
+                    args = cbm_find_child_by_kind(oref, "method_args");
+                }
+                if (ts_node_is_null(args)) {
+                    args = cbm_find_child_by_kind(node, "method_args");
+                }
+            }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
+                /* #952: routes registered inside Laravel `prefix()->group()`
+                 * closures must carry the composed path — the resolve passes
+                 * only see the flat CBMCall, so the enclosing chain can only
+                 * be read here where the AST still exists. */
+                if (ctx->language == CBM_LANG_PHP && call.first_string_arg &&
+                    call.first_string_arg[0] == '/' && call.callee_name &&
+                    cbm_service_pattern_route_method(call.callee_name) != NULL) {
+                    const char *gp = php_group_prefix_for_call(ctx->arena, node, ctx->source);
+                    if (gp && gp[0]) {
+                        const char *rel = call.first_string_arg;
+                        while (*rel == '/') {
+                            rel++;
+                        }
+                        call.first_string_arg =
+                            rel[0] ? cbm_arena_sprintf(ctx->arena, "%s/%s", gp, rel)
+                                   : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
+                    }
+                }
                 if (call.first_string_arg && call.first_string_arg[0] == '/') {
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
-                extract_call_args(ctx, args, &call);
+                if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
+                    ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+                    for (uint32_t ai = 0;
+                         ai < ts_node_named_child_count(args) && call.arg_count < CBM_MAX_CALL_ARGS;
+                         ai++) {
+                        TSNode achild = ts_node_named_child(args, ai);
+                        const char *ack = ts_node_type(achild);
+                        if (strcmp(ack, "bracket") == 0) {
+                            continue;
+                        }
+                        if (strcmp(ack, "method_arg") != 0) {
+                            continue;
+                        }
+                        CBMCallArg *ca = &call.args[call.arg_count];
+                        memset(ca, 0, sizeof(*ca));
+                        ca->index = call.arg_count;
+                        ca->expr = cbm_node_text(ctx->arena, achild, ctx->source);
+                        if (ca->expr && ca->expr[0]) {
+                            call.arg_count++;
+                        }
+                    }
+                } else {
+                    extract_call_args(ctx, args, &call);
+                }
             }
 
             cbm_calls_push(&ctx->result->calls, ctx->arena, call);

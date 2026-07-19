@@ -7,9 +7,16 @@ set -euo pipefail
 # Phase 2: Index a small multi-language project
 # Phase 3: Verify node/edge counts, search, and trace
 #
-# Usage: smoke-test.sh <binary-path>
+# Usage: smoke-test.sh <binary-path> [--agent-config-only]
+# The explicit optional mode runs only version + agent config install/uninstall
+# checks (useful when validating installer-only changes).
 
-BINARY="${1:?usage: smoke-test.sh <binary-path>}"
+BINARY="${1:?usage: smoke-test.sh <binary-path> [--agent-config-only]}"
+SMOKE_MODE="${2:-}"
+if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
+  echo "usage: smoke-test.sh <binary-path> [--agent-config-only]" >&2
+  exit 2
+fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 TMPDIR=$(mktemp -d)
 DRYRUN_HOME=""
@@ -31,6 +38,7 @@ if ! echo "$OUTPUT" | grep -qE 'v?[0-9]+\.[0-9]+|dev'; then
 fi
 echo "OK"
 
+if [ "$SMOKE_MODE" != "--agent-config-only" ]; then
 echo ""
 echo "=== Phase 2: index test project ==="
 
@@ -174,7 +182,9 @@ PROJECT=$(echo "$RESULT" | python3 -c "import json,sys; d=json.loads(sys.stdin.r
 if ! SEARCH=$(cli search_graph --project "$PROJECT" --name-pattern compute); then
   echo "FAIL: search_graph (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-TOTAL=$(echo "$SEARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
+# search_graph default output is TOON (key: value scalars + header/rows tables)
+TOTAL=$(echo "$SEARCH" | sed -n 's/^total: //p' | head -1)
+TOTAL=${TOTAL:-0}
 if [ "$TOTAL" -lt 1 ]; then
   echo "FAIL: search_graph for 'compute' returned 0 results"
   exit 1
@@ -185,7 +195,10 @@ echo "OK: search_graph found $TOTAL result(s) for 'compute'"
 if ! TRACE=$(cli trace_path --project "$PROJECT" --function-name compute --direction inbound --depth 1); then
   echo "FAIL: trace_path (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-CALLERS=$(echo "$TRACE" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('callers',[])))" 2>/dev/null || echo "0")
+# trace_path default output is the tree format: callers_total carries the
+# exact reachable count (test files excluded by default)
+CALLERS=$(echo "$TRACE" | sed -n 's/^callers_total: \([0-9]*\).*/\1/p' | head -1)
+CALLERS=${CALLERS:-0}
 if [ "$CALLERS" -lt 1 ]; then
   echo "FAIL: trace_path found 0 callers for 'compute'"
   exit 1
@@ -207,7 +220,8 @@ echo "OK: schema has $LABELS node labels"
 if ! FOLDERS=$(cli search_graph --project "$PROJECT" --label Folder); then
   echo "FAIL: search_graph --label Folder exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-FOLDER_COUNT=$(echo "$FOLDERS" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(d.get('total',0))" 2>/dev/null || echo "0")
+FOLDER_COUNT=$(echo "$FOLDERS" | sed -n 's/^total: //p' | head -1)
+FOLDER_COUNT=${FOLDER_COUNT:-0}
 if [ "$FOLDER_COUNT" -lt 2 ]; then
   echo "FAIL: expected at least 2 Folder nodes (src, src/pkg), got $FOLDER_COUNT"
   exit 1
@@ -217,7 +231,8 @@ echo "OK: $FOLDER_COUNT Folder nodes (init.py didn't clobber them)"
 # 3d-cypher: query_graph Cypher capabilities
 # #238 WITH DISTINCT — all functions share label "Function" → collapses to 1 row.
 CYPHER_WD=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WITH DISTINCT f.label AS lbl RETURN lbl")
-WD_ROWS=$(echo "$CYPHER_WD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+WD_ROWS=$(echo "$CYPHER_WD" | sed -n 's/^total: //p' | head -1)
+WD_ROWS=${WD_ROWS:-0}
 if [ "$WD_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WITH DISTINCT returned 0 rows"
   echo "$CYPHER_WD"
@@ -227,7 +242,8 @@ echo "OK: query_graph WITH DISTINCT returned $WD_ROWS row(s)"
 
 # #241 WHERE label test — f:Function is true for every Function node.
 CYPHER_LBL=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE f:Function RETURN f.name")
-LBL_ROWS=$(echo "$CYPHER_LBL" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+LBL_ROWS=$(echo "$CYPHER_LBL" | sed -n 's/^total: //p' | head -1)
+LBL_ROWS=${LBL_ROWS:-0}
 if [ "$LBL_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WHERE label-test returned 0 rows"
   echo "$CYPHER_LBL"
@@ -237,7 +253,8 @@ echo "OK: query_graph WHERE f:Function returned $LBL_ROWS row(s)"
 
 # #242 label alternation — (n:Function|Module) seeds either label.
 CYPHER_ALT=$(cli query_graph --project "$PROJECT" --query "MATCH (n:Function|Module) RETURN n.name")
-ALT_ROWS=$(echo "$CYPHER_ALT" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+ALT_ROWS=$(echo "$CYPHER_ALT" | sed -n 's/^total: //p' | head -1)
+ALT_ROWS=${ALT_ROWS:-0}
 if [ "$ALT_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph label alternation returned 0 rows"
   echo "$CYPHER_ALT"
@@ -247,7 +264,8 @@ echo "OK: query_graph (n:Function|Module) returned $ALT_ROWS row(s)"
 
 # #239 count(DISTINCT) — must parse and return a single aggregate row.
 CYPHER_CD=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) RETURN count(DISTINCT f.label)")
-CD_ROWS=$(echo "$CYPHER_CD" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+CD_ROWS=$(echo "$CYPHER_CD" | sed -n 's/^total: //p' | head -1)
+CD_ROWS=${CD_ROWS:-0}
 if [ "$CD_ROWS" -ne 1 ]; then
   echo "FAIL: query_graph count(DISTINCT) expected 1 row, got $CD_ROWS"
   echo "$CYPHER_CD"
@@ -261,7 +279,7 @@ cyp_first_cell() {
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
   # metacharacters {}|=~<>" need no JSON escaping.
   cli query_graph --project "$PROJECT" --query "$1" |
-    python3 -c "import json,sys; d=json.loads(sys.stdin.read()); rows=d.get('rows',[]); print(rows[0][0] if rows and rows[0] else '')" 2>/dev/null || echo ""
+    sed -n '/^rows: /{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -316,7 +334,8 @@ echo "OK: query_graph coalesce(f.nonesuch, f.name) = $COALV"
 
 # EXISTS { } pattern predicate (edge-type-specific existence)
 CYPHER_EX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE EXISTS { (f)-[:CALLS]->() } RETURN f.name")
-EX_ROWS=$(echo "$CYPHER_EX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+EX_ROWS=$(echo "$CYPHER_EX" | sed -n 's/^total: //p' | head -1)
+EX_ROWS=${EX_ROWS:-0}
 if [ "$EX_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph EXISTS{} predicate returned 0 rows"; echo "$CYPHER_EX"; exit 1
 fi
@@ -324,7 +343,8 @@ echo "OK: query_graph EXISTS { (f)-[:CALLS]->() } returned $EX_ROWS row(s)"
 
 # =~ regex match in WHERE
 CYPHER_RX=$(cli query_graph --project "$PROJECT" --query 'MATCH (f:Function) WHERE f.name =~ ".+" RETURN f.name')
-RX_ROWS=$(echo "$CYPHER_RX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('rows',[])))" 2>/dev/null || echo "0")
+RX_ROWS=$(echo "$CYPHER_RX" | sed -n 's/^total: //p' | head -1)
+RX_ROWS=${RX_ROWS:-0}
 if [ "$RX_ROWS" -lt 1 ]; then
   echo "FAIL: query_graph WHERE =~ regex returned 0 rows"; echo "$CYPHER_RX"; exit 1
 fi
@@ -347,7 +367,7 @@ LEFTV=$(cyp_first_cell 'MATCH (f:Function) RETURN left(f.name, 3) AS l LIMIT 1')
 
 # NOT EXISTS dead-code query (functions with no caller)
 CYPHER_NX=$(cli query_graph --project "$PROJECT" --query "MATCH (f:Function) WHERE NOT EXISTS { (f)<-[:CALLS]-() } RETURN f.name")
-NX_OK=$(echo "$CYPHER_NX" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print('rows' in d)" 2>/dev/null || echo "False")
+NX_OK=$(echo "$CYPHER_NX" | grep -qE '^rows: [0-9]+' && echo "True" || echo "False")
 [ "$NX_OK" = "True" ] && echo "OK: query_graph NOT EXISTS dead-code query executed" || { echo "FAIL: NOT EXISTS query"; echo "$CYPHER_NX" | head -c 300; exit 1; }
 
 # CASE expression in RETURN
@@ -370,7 +390,9 @@ esac
 if ! ARCH=$(cli get_architecture --project "$PROJECT" --aspects clusters); then
   echo "FAIL: get_architecture (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-NCLUST=$(echo "$ARCH" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('clusters',[])))" 2>/dev/null || echo "0")
+# get_architecture default output is TOON: clusters[N]{...} header carries the count
+NCLUST=$(echo "$ARCH" | sed -n 's/^clusters: \([0-9]*\).*/\1/p' | head -1)
+NCLUST=${NCLUST:-0}
 if [ "$NCLUST" -lt 1 ]; then
   echo "FAIL: get_architecture returned 0 community clusters"; echo "$ARCH" | head -c 400; exit 1
 fi
@@ -378,11 +400,23 @@ echo "OK: get_architecture returned $NCLUST community cluster(s)"
 
 # 3g: search_code — basic search reports elapsed_ms + matches
 SC=$(cli search_code --project "$PROJECT" --pattern cbm_ --mode compact --limit 5)
-echo "$SC" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); assert 'elapsed_ms' in d; print('OK: search_code elapsed_ms='+str(d['elapsed_ms'])+' total_grep_matches='+str(d.get('total_grep_matches')))" 2>/dev/null || { echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1; }
+# compact mode emits TOON scalars: `elapsed_ms: N` + `total_grep_matches: N`
+SC_ELAPSED=$(echo "$SC" | sed -n 's/^elapsed_ms: //p' | head -1)
+SC_GREPM=$(echo "$SC" | sed -n 's/^total_grep_matches: //p' | head -1)
+if [ -n "$SC_ELAPSED" ]; then
+  echo "OK: search_code elapsed_ms=$SC_ELAPSED total_grep_matches=${SC_GREPM:-0}"
+else
+  echo "FAIL: search_code basic / no elapsed_ms"; echo "$SC" | head -c 400; exit 1
+fi
 
 # 3g: search_code — literal '|' under regex=false must surface a warning (#282)
 SCW=$(cli search_code --project "$PROJECT" --pattern "cbm_init|cbm_nope" --regex false --limit 5)
-echo "$SCW" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); w=' '.join(d.get('warnings',[])); assert 'regex=true' in w; print('OK: search_code literal-| warning surfaced')" 2>/dev/null || { echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1; }
+# TOON scalar `warning: ... regex=true ...`
+if echo "$SCW" | grep -q "regex=true"; then
+  echo "OK: search_code literal-| warning surfaced"
+else
+  echo "FAIL: search_code literal-| warning missing"; echo "$SCW" | head -c 400; exit 1
+fi
 
 # 3g: search_code — '&' in file_pattern accepted, not rejected as invalid (#272)
 SCA=$(cli search_code --project "$PROJECT" --pattern cbm_ --file-pattern "*R&D*.c" --limit 5)
@@ -396,36 +430,39 @@ echo "=== Phase 3h: CLI input-mode guards (flags / stdin / --args-file / --help 
 
 # Small helper: assert its stdin is a JSON object (exit non-zero otherwise).
 assert_json_obj() { python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d,dict) else 1)" 2>/dev/null; }
+# search_graph emits TOON by default: a results/semantic table header proves
+# the tool parsed its typed flags and produced a well-formed response.
+assert_toon_table() { grep -qE '^(results|semantic): [0-9]+'; }
 
-# B1: INTEGER flag — --limit is schema-typed integer; must parse to valid JSON.
+# B1: INTEGER flag — --limit is schema-typed integer; must parse and answer.
 if ! IM_INT=$(cli search_graph --project "$PROJECT" --name-pattern compute --limit 5); then
   echo "FAIL B1: search_graph --limit 5 exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_INT" | assert_json_obj; then
-  echo "OK B1: INTEGER flag (--limit 5) parsed → valid JSON"
+if echo "$IM_INT" | assert_toon_table; then
+  echo "OK B1: INTEGER flag (--limit 5) parsed → TOON results table"
 else
-  echo "FAIL B1: --limit 5 did not produce valid JSON"; echo "$IM_INT" | head -c 300; exit 1
+  echo "FAIL B1: --limit 5 did not produce a TOON results table"; echo "$IM_INT" | head -c 300; exit 1
 fi
 
 # B2: BOOLEAN bare flag — --exclude-entry-points with no value → true; must succeed.
 if ! IM_BOOL=$(cli search_graph --project "$PROJECT" --exclude-entry-points); then
   echo "FAIL B2: search_graph --exclude-entry-points exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_BOOL" | assert_json_obj; then
+if echo "$IM_BOOL" | assert_toon_table; then
   echo "OK B2: BOOLEAN bare flag (--exclude-entry-points) → success"
 else
-  echo "FAIL B2: --exclude-entry-points did not produce valid JSON"; echo "$IM_BOOL" | head -c 300; exit 1
+  echo "FAIL B2: --exclude-entry-points did not produce a TOON results table"; echo "$IM_BOOL" | head -c 300; exit 1
 fi
 
 # B3: ARRAY flag — repeated --semantic-query accumulates into a JSON array.
-# semantic_results may be empty (index-mode dependent); only assert valid JSON.
+# Semantic-only calls emit ONLY the semantic table (may be empty, header stays).
 if ! IM_ARR=$(cli search_graph --project "$PROJECT" --semantic-query send --semantic-query publish); then
   echo "FAIL B3: search_graph repeated --semantic-query exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
-if echo "$IM_ARR" | assert_json_obj; then
-  echo "OK B3: ARRAY flag (repeated --semantic-query) → valid JSON"
+if echo "$IM_ARR" | grep -qE '^semantic: [0-9]+'; then
+  echo "OK B3: ARRAY flag (repeated --semantic-query) → semantic TOON table"
 else
-  echo "FAIL B3: repeated --semantic-query did not produce valid JSON"; echo "$IM_ARR" | head -c 300; exit 1
+  echo "FAIL B3: repeated --semantic-query did not produce a semantic table"; echo "$IM_ARR" | head -c 300; exit 1
 fi
 
 # B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
@@ -843,30 +880,79 @@ echo "OK: get_code_snippet via MCP"
 
 rm -f "$MCP_SC_INPUT" "$MCP_SC_OUTPUT"
 
+fi
+
 echo ""
 echo "=== Phase 8: agent config install E2E ==="
 
-# Set up isolated HOME with stub agent directories
+# Set up an isolated HOME. Directory-only agents get only the root required for
+# detection; CLI-detected agents use stubs below so install must create their
+# config parents from scratch.
 FAKE_HOME=$(mktemp -d)
 mkdir -p "$FAKE_HOME/.claude"
 mkdir -p "$FAKE_HOME/.codex"
 mkdir -p "$FAKE_HOME/.gemini/antigravity-cli"
-mkdir -p "$FAKE_HOME/.openclaw"
-mkdir -p "$FAKE_HOME/.kilocode/rules"
-mkdir -p "$FAKE_HOME/.config/opencode"
+mkdir -p "$FAKE_HOME/.junie"
+mkdir -p "$FAKE_HOME/.cursor"
+mkdir -p "$FAKE_HOME/.codeium/windsurf"
+mkdir -p "$FAKE_HOME/.qoder"
+mkdir -p "$FAKE_HOME/.pi/agent"
+mkdir -p "$FAKE_HOME/.warp"
+mkdir -p "$FAKE_HOME/.cline"
+mkdir -p "$FAKE_HOME/.codebuddy"
+mkdir -p "$FAKE_HOME/.bob/rules"
+mkdir -p "$FAKE_HOME/.pochi"
+mkdir -p "$FAKE_HOME/.rovodev"
+mkdir -p "$FAKE_HOME/.aws/amazonq"
+CUSTOM_KIMI_HOME="$FAKE_HOME/vendor-kimi"
+ROO_CFG="$FAKE_HOME/explicit/roo.json"
+mkdir -p "$CUSTOM_KIMI_HOME" "$(dirname "$ROO_CFG")"
 if [ "$(uname -s)" = "Darwin" ]; then
   mkdir -p "$FAKE_HOME/Library/Application Support/Zed"
-  mkdir -p "$FAKE_HOME/Library/Application Support/Code/User"
-  mkdir -p "$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings"
+  mkdir -p "$FAKE_HOME/Library/Application Support/Code/User/profiles/smoke-profile"
+  VSCODE_PROFILE_CFG="$FAKE_HOME/Library/Application Support/Code/User/profiles/smoke-profile/mcp.json"
 elif [[ "${BINARY:-}" == *.exe ]]; then
-  mkdir -p "$FAKE_HOME/AppData/Local/Zed"
-  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User"
-  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings"
+  mkdir -p "$FAKE_HOME/AppData/Roaming/Zed"
+  mkdir -p "$FAKE_HOME/AppData/Roaming/Code/User/profiles/smoke-profile"
+  VSCODE_PROFILE_CFG="$FAKE_HOME/AppData/Roaming/Code/User/profiles/smoke-profile/mcp.json"
 else
   mkdir -p "$FAKE_HOME/.config/zed"
-  mkdir -p "$FAKE_HOME/.config/Code/User"
-  mkdir -p "$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings"
+  mkdir -p "$FAKE_HOME/.config/Code/User/profiles/smoke-profile"
+  VSCODE_PROFILE_CFG="$FAKE_HOME/.config/Code/User/profiles/smoke-profile/mcp.json"
 fi
+if [[ "$BINARY" == *.exe ]]; then
+  GITLAB_DIR="$FAKE_HOME/AppData/Roaming/GitLab/duo"
+  GITLAB_HOOKS="$GITLAB_DIR/hooks.json"
+  DEVIN_DIR="$FAKE_HOME/AppData/Roaming/devin"
+else
+  GITLAB_DIR="$FAKE_HOME/.config/gitlab/duo"
+  GITLAB_HOOKS="$FAKE_HOME/.gitlab/duo/hooks.json"
+  DEVIN_DIR="$FAKE_HOME/.config/devin"
+fi
+GITLAB_MCP="$GITLAB_DIR/mcp.json"
+DEVIN_CONFIG="$DEVIN_DIR/config.json"
+DEVIN_INSTRUCTIONS="$DEVIN_DIR/AGENTS.md"
+DEVIN_SKILL="$DEVIN_DIR/skills/codebase-memory/SKILL.md"
+CODEBUDDY_MCP="$FAKE_HOME/.codebuddy/.mcp.json"
+CODEBUDDY_INSTRUCTIONS="$FAKE_HOME/.codebuddy/CODEBUDDY.md"
+CODEBUDDY_SKILL="$FAKE_HOME/.codebuddy/skills/codebase-memory/SKILL.md"
+CODEBUDDY_AGENT="$FAKE_HOME/.codebuddy/agents/codebase-memory.md"
+CODEBUDDY_SETTINGS="$FAKE_HOME/.codebuddy/settings.json"
+BOB_IDE_MCP="$FAKE_HOME/.bob/mcp.json"
+BOB_SHELL_MCP="$FAKE_HOME/.bob/mcp_settings.json"
+BOB_RULE="$FAKE_HOME/.bob/rules/codebase-memory.md"
+BOB_SKILL="$FAKE_HOME/.bob/skills/codebase-memory/SKILL.md"
+BOB_AGENT="$FAKE_HOME/.bob/agents/codebase-memory.md"
+POCHI_MCP="$FAKE_HOME/.pochi/config.jsonc"
+POCHI_INSTRUCTIONS="$FAKE_HOME/.pochi/README.pochi.md"
+POCHI_SKILL="$FAKE_HOME/.pochi/skills/codebase-memory/SKILL.md"
+POCHI_AGENT="$FAKE_HOME/.pochi/agents/codebase-memory.md"
+ROVO_MCP="$FAKE_HOME/.rovodev/mcp.json"
+ROVO_INSTRUCTIONS="$FAKE_HOME/.rovodev/AGENTS.md"
+ROVO_SKILL="$FAKE_HOME/.rovodev/skills/codebase-memory/SKILL.md"
+ROVO_AGENT="$FAKE_HOME/.rovodev/subagents/codebase-memory.md"
+AMAZON_Q_MCP="$FAKE_HOME/.aws/amazonq/default.json"
+mkdir -p "$GITLAB_DIR" "$(dirname "$GITLAB_HOOKS")" "$DEVIN_DIR"
 mkdir -p "$FAKE_HOME/.local/bin"
 # Copy binary with correct name for platform
 if [[ "$BINARY" == *.exe ]]; then
@@ -876,13 +962,40 @@ else
   cp "$BINARY" "$FAKE_HOME/.local/bin/codebase-memory-mcp"
   SELF_PATH="$FAKE_HOME/.local/bin/codebase-memory-mcp"
 fi
-printf '#!/bin/sh\necho stub\n' > "$FAKE_HOME/.local/bin/aider" && chmod +x "$FAKE_HOME/.local/bin/aider" 2>/dev/null || true
-printf '#!/bin/sh\necho stub\n' > "$FAKE_HOME/.local/bin/opencode" && chmod +x "$FAKE_HOME/.local/bin/opencode" 2>/dev/null || true
+create_agent_stub() {
+  local name="$1"
+  if [[ "$BINARY" == *.exe ]]; then
+    printf '@echo off\r\n' > "$FAKE_HOME/.local/bin/$name.cmd"
+  else
+    printf '#!/bin/sh\necho stub\n' > "$FAKE_HOME/.local/bin/$name"
+    chmod +x "$FAKE_HOME/.local/bin/$name"
+  fi
+}
+for AGENT_CLI in aider opencode kilo openclaw kiro-cli hermes openhands cline qwen droid crush goose vibe auggie bob rovodev; do
+  create_agent_stub "$AGENT_CLI"
+done
 
 # Pre-existing configs (verify merge, not overwrite)
 echo '{"existingKey": true}' > "$FAKE_HOME/.claude.json"
 echo '{"existingKey": true}' > "$FAKE_HOME/.gemini/settings.json"
+echo '{"theme": "dark"}' > "$FAKE_HOME/.qoder/settings.json"
+echo '# Personal Kimi guidance' > "$CUSTOM_KIMI_HOME/AGENTS.md"
+printf 'theme = "dark"\n' > "$CUSTOM_KIMI_HOME/config.toml"
+echo '{"keep": "roo"}' > "$ROO_CFG"
 printf '[existing_section]\nline_from_user = true\n' > "$FAKE_HOME/.codex/config.toml"
+echo '{"hooksEnabled": false, "keep": "cline"}' > "$FAKE_HOME/.cline/settings.json"
+echo '{"keep": "gitlab-mcp"}' > "$GITLAB_MCP"
+echo '{"keep": "gitlab-hooks", "hooks": {"SessionStart": [{"matcher": "startup", "hooks": [{"type": "command", "command": "/usr/bin/user-hook", "timeout": 9}]}]}}' > "$GITLAB_HOOKS"
+echo '{"theme_mode": "dark"}' > "$DEVIN_CONFIG"
+echo '# Personal Devin guidance' > "$DEVIN_INSTRUCTIONS"
+echo '{"keep": "codebuddy"}' > "$CODEBUDDY_MCP"
+echo '# Personal CodeBuddy guidance' > "$CODEBUDDY_INSTRUCTIONS"
+echo '{"keep": "bob-ide"}' > "$BOB_IDE_MCP"
+echo '{"keep": "bob-shell"}' > "$BOB_SHELL_MCP"
+echo '# Personal Bob guidance' > "$BOB_RULE"
+printf '{\n  // Personal Pochi setting\n  "keep": "pochi"\n}\n' > "$POCHI_MCP"
+echo '# Personal Pochi guidance' > "$POCHI_INSTRUCTIONS"
+echo '# Personal Rovo guidance' > "$ROVO_INSTRUCTIONS"
 
 # Run install — override platform config dirs so cbm_app_config_dir() and
 # cbm_app_local_dir() resolve to FAKE_HOME paths on all platforms.
@@ -890,17 +1003,123 @@ HOME="$FAKE_HOME" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
+  KIMI_CODE_HOME="$CUSTOM_KIMI_HOME" \
+  CBM_ROO_CONFIG_PATH="$ROO_CFG" \
   PATH="$FAKE_HOME/.local/bin:$PATH" \
   "$BINARY" install -y 2>&1 || true
 
 # Helper for JSON validation (pipe file to python — avoids MSYS2 path translation issues)
 json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""; }
 
-# Helper: compare command paths (handles Windows D:\... vs POSIX /tmp/... mismatch)
+# Helper: compare exact paths across native Windows and MSYS2 spellings.
+exact_path_match() {
+  local first="${1%$'\r'}"
+  local second="${2%$'\r'}"
+  [ "$first" = "$second" ] && return 0
+  if command -v cygpath >/dev/null 2>&1; then
+    first=$(cygpath -am "$first" 2>/dev/null || true)
+    second=$(cygpath -am "$second" 2>/dev/null || true)
+    first=$(printf '%s' "$first" | tr '[:upper:]' '[:lower:]')
+    second=$(printf '%s' "$second" | tr '[:upper:]' '[:lower:]')
+    [ -n "$first" ] && [ "$first" = "$second" ] && return 0
+  fi
+  return 1
+}
+
+# Command paths retain a basename fallback for platforms without a native path
+# converter. Configuration references use exact_path_match instead.
 path_match() {
-  [ "$1" = "$2" ] && return 0
+  exact_path_match "$1" "$2" && return 0
   [ "$(basename "$1" 2>/dev/null)" = "$(basename "$2" 2>/dev/null)" ] && return 0
   return 1
+}
+
+json_instructions_contain_path() {
+  local config="$1"
+  local expected="$2"
+  local candidate
+  while IFS= read -r -d '' candidate; do
+    exact_path_match "$candidate" "$expected" && return 0
+  done < <(cat "$config" 2>/dev/null | python3 -c \
+    "import json,sys; d=json.load(sys.stdin); sys.stdout.buffer.write(b''.join(p.encode('utf-8') + b'\\0' for p in d.get('instructions', []) if isinstance(p, str)))" \
+    2>/dev/null)
+  return 1
+}
+
+# Validate the common Scout/Verify/Auditor contract once for every documented
+# profile dialect. Dialect-specific schema checks remain below where useful.
+assert_tier_profile_set() {
+  local label="$1"
+  local directory="$2"
+  local suffix="$3"
+  local access="$4"
+  local spec slug tier file
+  for spec in \
+    "codebase-memory-scout|Tier 1" \
+    "codebase-memory|Tier 2" \
+    "codebase-memory-auditor|Tier 3"; do
+    slug=${spec%%|*}
+    tier=${spec##*|}
+    file="$directory/$slug$suffix"
+    if [ ! -f "$file" ]; then
+      echo "FAIL 8aw: $label $tier profile missing: $file"
+      exit 1
+    fi
+    if { ! grep -Fq "$tier" "$file" 2>/dev/null && ! grep -Fq "$slug" "$file" 2>/dev/null; } ||
+       ! grep -q 'check_index_coverage' "$file" 2>/dev/null ||
+       grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$file" 2>/dev/null; then
+      echo "FAIL 8aw: $label $tier profile identity, coverage, or mutator contract is wrong"
+      exit 1
+    fi
+    if [ "$access" = "direct" ]; then
+      if ! grep -Fq 'source read/grep fallback' "$file" 2>/dev/null; then
+        echo "FAIL 8aw: $label $tier direct profile lacks source fallback"
+        exit 1
+      fi
+    elif ! grep -q 'parent agent must supply' "$file" 2>/dev/null ||
+         ! grep -q 'must not call or claim access to MCP' "$file" 2>/dev/null ||
+         grep -qE '(mcpServers|mcp__codebase-memory-mcp__|mcp_codebase-memory-mcp_|@codebase-memory-mcp/|codebase-memory-mcp/)' "$file" 2>/dev/null; then
+      echo "FAIL 8aw: $label $tier handoff profile exposes child MCP or lacks parent evidence"
+      exit 1
+    fi
+  done
+}
+
+assert_tier_profile_set_removed() {
+  local label="$1"
+  local directory="$2"
+  local suffix="$3"
+  local slug file
+  for slug in codebase-memory-scout codebase-memory codebase-memory-auditor; do
+    file="$directory/$slug$suffix"
+    if [ -e "$file" ]; then
+      echo "FAIL 9n-i: owned $label tier profile remains: $file"
+      exit 1
+    fi
+  done
+}
+
+assert_tier_prompt_set() {
+  local label="$1"
+  local directory="$2"
+  local suffix="$3"
+  local spec slug tier file
+  for spec in \
+    "codebase-memory-scout|Tier 1" \
+    "codebase-memory|Tier 2" \
+    "codebase-memory-auditor|Tier 3"; do
+    slug=${spec%%|*}
+    tier=${spec##*|}
+    file="$directory/$slug$suffix"
+    if [ ! -f "$file" ] ||
+       ! grep -Fq "$tier" "$file" 2>/dev/null ||
+       ! grep -q 'check_index_coverage' "$file" 2>/dev/null ||
+       ! grep -Fq 'source read/grep fallback' "$file" 2>/dev/null ||
+       grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$file" 2>/dev/null; then
+      echo "FAIL 8aw: $label $tier prompt contract is wrong"
+      exit 1
+    fi
+  done
 }
 
 # 8a: Claude Code MCP (new path) — correct command
@@ -921,50 +1140,83 @@ if [ "$EXISTING" != "True" ]; then
 fi
 echo "OK 8b: .claude.json preserved existing keys"
 
-# 8c: Claude Code MCP (legacy path)
-CMD=$(json_get "$FAKE_HOME/.claude/.mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
-if ! path_match "$CMD" "$SELF_PATH"; then
-  echo "FAIL 8c: .claude/.mcp.json command='$CMD'"
+# 8c: Claude Code must not create the undocumented nested legacy path.
+if [ -f "$FAKE_HOME/.claude/.mcp.json" ] && cat "$FAKE_HOME/.claude/.mcp.json" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if 'codebase-memory-mcp' in d.get('mcpServers', {}) else 1)
+" 2>/dev/null; then
+  echo "FAIL 8c: install recreated undocumented .claude/.mcp.json entry"
   exit 1
 fi
-echo "OK 8c: Claude Code MCP (.claude/.mcp.json)"
+echo "OK 8c: undocumented nested Claude MCP path absent"
 
-# 8d: Claude Code hooks — matcher must be exactly "Grep|Glob|Read" (no Search).
-# Read is matched for the indexing-coverage note (#963); safe against the old
-# issue-#362 gate hazard because the augmenter is structurally non-blocking
-# (always exit 0, additionalContext only). This assertion locks in the exact
-# matcher to prevent both regressions (Read dropped again) and creep (Search
-# or catch-all matchers sneaking back).
+# 8c-i: Claude gets a dedicated exact-tool graph subagent in addition to the
+# catch-all SubagentStart context hook.
+CLAUDE_AGENT="$FAKE_HOME/.claude/agents/codebase-memory.md"
+if ! grep -q '^mcpServers: \[codebase-memory-mcp\]$' "$CLAUDE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__search_graph' "$CLAUDE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CLAUDE_AGENT" 2>/dev/null ||
+   ! grep -q '^permissionMode: plan$' "$CLAUDE_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$CLAUDE_AGENT" 2>/dev/null; then
+  echo "FAIL 8c-i: Claude exact-tool graph subagent missing or over-privileged"
+  exit 1
+fi
+echo "OK 8c-i: Claude exact-tool graph subagent"
+
+# 8d: Claude Code hooks keep search augmentation and read-coverage reporting
+# separate: PreToolUse matches exactly Grep|Glob, while PostToolUse matches
+# exactly Read. Neither hook may grow a Search or catch-all matcher.
 if ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-hooks = d.get('hooks', {}).get('PreToolUse', [])
-ok = any(h.get('matcher') == 'Grep|Glob|Read' for h in hooks)
-bad = any('Search' in str(h.get('matcher', '')) for h in hooks)
+all_hooks = d.get('hooks', {})
+pre = all_hooks.get('PreToolUse', [])
+post = all_hooks.get('PostToolUse', [])
+ok = (any(h.get('matcher') == 'Grep|Glob' for h in pre) and
+      any(h.get('matcher') == 'Read' for h in post))
+bad = any('Search' in str(h.get('matcher', '')) for h in pre + post)
 sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
-  echo "FAIL 8d: PreToolUse hook matcher is not exactly 'Grep|Glob|Read'"
+  echo "FAIL 8d: Claude search/read hook matchers are not exact"
   exit 1
 fi
-echo "OK 8d: Claude Code PreToolUse hook (matcher=Grep|Glob|Read)"
+echo "OK 8d: Claude Code PreToolUse Grep|Glob + PostToolUse Read"
 
 # 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
-if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
-  GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate"
-  if [ ! -x "$GATE_SCRIPT" ]; then
-    echo "FAIL 8e: shim script not executable or missing"
-    exit 1
-  fi
-  if grep -q 'exit 2' "$GATE_SCRIPT"; then
-    echo "FAIL 8e: shim contains 'exit 2' — must never block"
-    exit 1
-  fi
-  if ! grep -q 'hook-augment' "$GATE_SCRIPT"; then
-    echo "FAIL 8e: shim missing 'hook-augment' delegation"
-    exit 1
-  fi
-  echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
+# #929: Windows installs a .cmd script (extensionless bash shims triggered the
+# Open-With dialog); the old `!= "MINGW64_NT"` gate never matched the real
+# uname (MINGW64_NT-10.0-...), so this check silently ran the POSIX branch on
+# Windows. Branch by platform prefix instead.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate.cmd"
+    if [ ! -f "$GATE_SCRIPT" ]; then
+      echo "FAIL 8e: .cmd shim missing on Windows"
+      exit 1
+    fi
+    if [ -f "$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate" ]; then
+      echo "FAIL 8e: legacy extensionless shim still installed on Windows"
+      exit 1
+    fi
+    ;;
+  *)
+    GATE_SCRIPT="$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate"
+    if [ ! -x "$GATE_SCRIPT" ]; then
+      echo "FAIL 8e: shim script not executable or missing"
+      exit 1
+    fi
+    ;;
+esac
+if grep -q 'exit 2' "$GATE_SCRIPT"; then
+  echo "FAIL 8e: shim contains 'exit 2' — must never block"
+  exit 1
 fi
+if ! grep -q 'hook-augment' "$GATE_SCRIPT"; then
+  echo "FAIL 8e: shim missing 'hook-augment' delegation"
+  exit 1
+fi
+echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
 
 # 8f-8h: Codex TOML
 if ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$FAKE_HOME/.codex/config.toml"; then
@@ -1001,17 +1253,17 @@ if ! cat "$FAKE_HOME/.gemini/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 hooks = d.get('hooks', {}).get('BeforeTool', [])
-# Matcher must be exactly 'google_search|grep_search' (no read_file). The
+# Matcher must be exactly 'google_web_search|grep_search' (no read_file). The
 # old matcher gated the agent's read tool — consistent with the Claude fix
 # we remove it here too.
-ok = any(h.get('matcher') == 'google_search|grep_search' for h in hooks)
+ok = any(h.get('matcher') == 'google_web_search|grep_search' for h in hooks)
 bad = any('read_file' in str(h.get('matcher', '')) for h in hooks)
 sys.exit(0 if (ok and not bad) else 1)
 " 2>/dev/null; then
-  echo "FAIL 8l: Gemini BeforeTool hook matcher must be 'google_search|grep_search' (no read_file)"
+  echo "FAIL 8l: Gemini BeforeTool hook matcher must be 'google_web_search|grep_search' (no read_file)"
   exit 1
 fi
-echo "OK 8l: Gemini BeforeTool hook (matcher=google_search|grep_search)"
+echo "OK 8l: Gemini BeforeTool hook (matcher=google_web_search|grep_search)"
 
 # 8m: Gemini instructions
 if [ ! -f "$FAKE_HOME/.gemini/GEMINI.md" ]; then
@@ -1020,11 +1272,27 @@ if [ ! -f "$FAKE_HOME/.gemini/GEMINI.md" ]; then
 fi
 echo "OK 8m: Gemini instructions"
 
+# 8m-i: Gemini dedicated graph subagent uses an explicit built-in + MCP tool
+# allowlist; omitted tools would inherit every parent tool.
+GEMINI_AGENT="$FAKE_HOME/.gemini/agents/codebase-memory.md"
+if ! grep -q '^name: codebase-memory$' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q '^kind: local$' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q 'search_graph' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q 'graph project' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q '^tools:' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp_codebase-memory-mcp_search_graph' "$GEMINI_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp_codebase-memory-mcp_check_index_coverage' "$GEMINI_AGENT" 2>/dev/null ||
+   grep -qE 'mcp_codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$GEMINI_AGENT" 2>/dev/null; then
+  echo "FAIL 8m-i: Gemini dedicated graph subagent is incomplete"
+  exit 1
+fi
+echo "OK 8m-i: Gemini dedicated graph subagent"
+
 # 8n: Zed MCP
 if [ "$(uname -s)" = "Darwin" ]; then
   ZED_CFG="$FAKE_HOME/Library/Application Support/Zed/settings.json"
 elif [[ "$BINARY" == *.exe ]]; then
-  ZED_CFG="$FAKE_HOME/AppData/Local/Zed/settings.json"
+  ZED_CFG="$FAKE_HOME/AppData/Roaming/Zed/settings.json"
 else
   ZED_CFG="$FAKE_HOME/.config/zed/settings.json"
 fi
@@ -1038,6 +1306,17 @@ if [ -f "$ZED_CFG" ]; then
 else
   echo "SKIP 8n: Zed config not created (detection may have failed)"
 fi
+if [[ "$BINARY" == *.exe ]]; then
+  ZED_INSTR="$FAKE_HOME/AppData/Roaming/Zed/AGENTS.md"
+else
+  ZED_INSTR="$FAKE_HOME/.config/zed/AGENTS.md"
+fi
+if ! grep -q 'Codebase Memory' "$ZED_INSTR" 2>/dev/null ||
+   ! grep -q 'search_graph' "$ZED_INSTR" 2>/dev/null; then
+  echo "FAIL 8n-i: Zed durable AGENTS.md missing"
+  exit 1
+fi
+echo "OK 8n-i: Zed durable instructions"
 
 # 8o-p: OpenCode MCP + instructions
 # OpenCode detection requires binary on PATH — may not be found on Windows
@@ -1057,19 +1336,20 @@ else
   echo "SKIP 8o-p: OpenCode not detected (binary not on PATH)"
 fi
 
-# 8q-r: Antigravity (2026 layout: shared ~/.gemini/config/mcp_config.json,
-# instructions under ~/.gemini/antigravity-cli/)
+# 8q-r: Antigravity (shared MCP config and global GEMINI.md instructions).
 CMD=$(json_get "$FAKE_HOME/.gemini/config/mcp_config.json" "d['mcpServers']['codebase-memory-mcp']['command']")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8q: Antigravity command='$CMD'"
   exit 1
 fi
 echo "OK 8q: Antigravity MCP"
-if [ ! -f "$FAKE_HOME/.gemini/antigravity-cli/AGENTS.md" ]; then
-  echo "FAIL 8r: Antigravity AGENTS.md missing"
+if [ ! -f "$FAKE_HOME/.gemini/GEMINI.md" ] ||
+   [ -f "$FAKE_HOME/.gemini/antigravity-cli/AGENTS.md" ] ||
+   [ -f "$FAKE_HOME/.gemini/antigravity-cli/settings.json" ]; then
+  echo "FAIL 8r: Antigravity global instructions or legacy cleanup is wrong"
   exit 1
 fi
-echo "OK 8r: Antigravity instructions"
+echo "OK 8r: Antigravity global instructions; undocumented legacy files absent"
 
 # 8s: Aider instructions (detection requires binary on PATH)
 if [ -f "$FAKE_HOME/CONVENTIONS.md" ]; then
@@ -1077,32 +1357,49 @@ if [ -f "$FAKE_HOME/CONVENTIONS.md" ]; then
     echo "FAIL 8s: Aider CONVENTIONS.md missing content"
     exit 1
   fi
+  if ! grep -Fq 'CONVENTIONS.md' "$FAKE_HOME/.aider.conf.yml"; then
+    echo "FAIL 8s: .aider.conf.yml does not load installed CONVENTIONS.md"
+    exit 1
+  fi
   echo "OK 8s: Aider instructions"
 else
   echo "SKIP 8s: Aider not detected (binary not on PATH)"
 fi
 
-# 8t: KiloCode MCP
-if [ "$(uname -s)" = "Darwin" ]; then
-  KILO_CFG="$FAKE_HOME/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
-elif [[ "$BINARY" == *.exe ]]; then
-  KILO_CFG="$FAKE_HOME/AppData/Roaming/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
-else
-  KILO_CFG="$FAKE_HOME/.config/Code/User/globalStorage/kilocode.kilo-code/settings/mcp_settings.json"
-fi
-CMD=$(json_get "$KILO_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
+# 8t: KiloCode standalone config (modern JSONC schema).
+KILO_CFG="$FAKE_HOME/.config/kilo/kilo.jsonc"
+CMD=$(json_get "$KILO_CFG" "d['mcp']['codebase-memory-mcp']['command'][0]")
 if ! path_match "$CMD" "$SELF_PATH"; then
   echo "FAIL 8t: KiloCode command='$CMD'"
   exit 1
 fi
 echo "OK 8t: KiloCode MCP"
 
-# 8u: KiloCode instructions
-if [ ! -f "$FAKE_HOME/.kilocode/rules/codebase-memory-mcp.md" ]; then
+# 8u: KiloCode rules file and explicit instructions reference.
+KILO_RULE="$FAKE_HOME/.config/kilo/rules/codebase-memory-mcp.md"
+if [ ! -f "$KILO_RULE" ]; then
   echo "FAIL 8u: KiloCode rules file missing"
   exit 1
 fi
-echo "OK 8u: KiloCode instructions"
+if ! json_instructions_contain_path "$KILO_CFG" "$KILO_RULE"; then
+  KILO_REFS=$(json_get "$KILO_CFG" "repr(d.get('instructions', []))")
+  printf "DEBUG 8u: expected=%q refs=%s\n" "$KILO_RULE" "$KILO_REFS"
+  echo "FAIL 8u: KiloCode config does not load its installed rule"
+  exit 1
+fi
+KILO_AGENT="$FAKE_HOME/.config/kilo/agents/codebase-memory.md"
+if ! grep -q '^mode: subagent$' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"*": deny' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_search_graph": allow' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_get_code_snippet": allow' "$KILO_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_check_index_coverage": allow' "$KILO_AGENT" 2>/dev/null ||
+   grep -Fq '"codebase-memory-mcp_*": allow' "$KILO_AGENT" 2>/dev/null ||
+   grep -qE 'codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$KILO_AGENT" 2>/dev/null ||
+   grep -qE '^  (edit|bash|shell): allow$' "$KILO_AGENT" 2>/dev/null; then
+  echo "FAIL 8u: KiloCode global read-only subagent is missing or over-permissive"
+  exit 1
+fi
+echo "OK 8u: KiloCode instructions + permission-gated global subagent"
 
 # 8v: VS Code MCP
 if [ "$(uname -s)" = "Darwin" ]; then
@@ -1118,6 +1415,12 @@ if ! path_match "$CMD" "$SELF_PATH"; then
   exit 1
 fi
 echo "OK 8v: VS Code MCP"
+CMD=$(json_get "$VSCODE_PROFILE_CFG" "d['servers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH"; then
+  echo "FAIL 8v-i: VS Code profile command='$CMD'"
+  exit 1
+fi
+echo "OK 8v-i: VS Code profile MCP"
 
 # 8w: OpenClaw MCP
 CMD=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "d['mcp']['servers']['codebase-memory-mcp']['command']")
@@ -1126,19 +1429,661 @@ if ! path_match "$CMD" "$SELF_PATH"; then
   exit 1
 fi
 ENABLED=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "d['mcp']['servers']['codebase-memory-mcp'].get('enabled')")
-if [ "$ENABLED" != "True" ]; then
-  echo "FAIL 8w: OpenClaw enabled='$ENABLED'"
+if [ "$ENABLED" = "False" ]; then
+  echo "FAIL 8w: fresh OpenClaw entry is unexpectedly disabled"
   exit 1
 fi
-echo "OK 8w: OpenClaw MCP"
+echo "OK 8w: OpenClaw MCP (client-default enabled policy preserved)"
+for OPENCLAW_CONTEXT in \
+  "$FAKE_HOME/.openclaw/workspace/AGENTS.md" \
+  "$FAKE_HOME/.openclaw/workspace/TOOLS.md"; do
+  if ! grep -q '^## Codebase Knowledge Graph (codebase-memory-mcp)$' "$OPENCLAW_CONTEXT" 2>/dev/null ||
+     ! grep -q 'subagent' "$OPENCLAW_CONTEXT" 2>/dev/null; then
+    echo "FAIL 8w-i: OpenClaw durable context missing in $OPENCLAW_CONTEXT"
+    exit 1
+  fi
+done
+OPENCLAW_COMPACTION=$(json_get "$FAKE_HOME/.openclaw/openclaw.json" "str('Codebase Knowledge Graph (codebase-memory-mcp)' in d['agents']['defaults']['compaction']['postCompactionSections'])")
+if [ "$OPENCLAW_COMPACTION" != "True" ]; then
+  echo "FAIL 8w-i: OpenClaw compaction reinjection missing"
+  exit 1
+fi
+echo "OK 8w-i: OpenClaw session, compaction, and subagent context"
 
-# 8x: Consolidated skill (old 4-skill dirs cleaned up, replaced by 1)
+# 8w-ii: Kiro MCP + always-on steering.
+CMD=$(json_get "$FAKE_HOME/.kiro/settings/mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+KIRO_AGENT="$FAKE_HOME/.kiro/agents/codebase-memory.json"
+KIRO_AGENT_CMD=$(json_get "$KIRO_AGENT" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! path_match "$KIRO_AGENT_CMD" "$SELF_PATH" ||
+   ! grep -q 'search_graph' "$FAKE_HOME/.kiro/steering/codebase-memory.md" 2>/dev/null ||
+   ! cat "$KIRO_AGENT" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+tools = d.get('tools', [])
+server = d.get('mcpServers', {}).get('codebase-memory-mcp', {})
+ok = (d.get('name') == 'codebase-memory' and tools[:3] == ['read', 'grep', 'glob'] and
+      '@codebase-memory-mcp/search_graph' in tools and
+      '@codebase-memory-mcp/check_index_coverage' in tools and
+      all('@codebase-memory-mcp/' + name not in tools for name in
+          ('index_repository', 'delete_project', 'manage_adr', 'ingest_traces')) and
+      '@codebase-memory-mcp' not in tools and d.get('includeMcpJson') is False and
+      set(d.get('mcpServers', {})) == {'codebase-memory-mcp'} and
+      server.get('args') == ['--tool-profile', 'analysis'] and
+      'search_graph' in d.get('prompt', ''))
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+  echo "FAIL 8w-ii: Kiro MCP, steering, or isolated graph agent missing"
+  exit 1
+fi
+echo "OK 8w-ii: Kiro MCP + steering + isolated exact-tool graph agent"
+
+# 8x: Hermes Agent YAML MCP mapping
+if ! grep -q '^mcp_servers:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   ! grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   ! grep -Fq "$SELF_PATH" "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null; then
+  echo "FAIL 8x: Hermes MCP mapping missing or malformed"
+  exit 1
+fi
+echo "OK 8x: Hermes Agent MCP"
+if ! grep -q '^name: codebase-memory$' "$FAKE_HOME/.hermes/skills/codebase-memory/SKILL.md" 2>/dev/null ||
+   ! grep -q 'delegate_task' "$FAKE_HOME/.hermes/skills/codebase-memory/SKILL.md" 2>/dev/null ||
+   ! grep -q '`context`' "$FAKE_HOME/.hermes/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+  echo "FAIL 8x-i: Hermes delegation skill missing"
+  exit 1
+fi
+echo "OK 8x-i: Hermes durable delegation skill"
+if ! grep -q '^hooks:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   ! grep -q '^  pre_llm_call:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   ! grep -q 'hook-augment' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   ! grep -q -- '--dialect hermes' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null; then
+  echo "FAIL 8x-ii: Hermes pre_llm_call context hook missing"
+  exit 1
+fi
+echo "OK 8x-ii: Hermes pre_llm_call context hook"
+
+# 8y: OpenHands MCP
+CMD=$(json_get "$FAKE_HOME/.openhands/mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH"; then
+  echo "FAIL 8y: OpenHands command='$CMD'"
+  exit 1
+fi
+echo "OK 8y: OpenHands MCP"
+if ! grep -q '^name: codebase-memory$' "$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md" 2>/dev/null ||
+   ! grep -q 'trace_path' "$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+  echo "FAIL 8y-i: OpenHands shared skill missing"
+  exit 1
+fi
+echo "OK 8y-i: OpenHands shared skill"
+
+# 8z: Cline CLI + IDE MCP and rules
+CLINE_RULE="$FAKE_HOME/.cline/rules/codebase-memory-mcp.md"
+for CLINE_CFG in "$FAKE_HOME/.cline/mcp.json" \
+                 "$FAKE_HOME/.cline/data/settings/cline_mcp_settings.json"; do
+  CMD=$(json_get "$CLINE_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
+  if ! path_match "$CMD" "$SELF_PATH"; then
+    echo "FAIL 8z: Cline command='$CMD' in $CLINE_CFG"
+    exit 1
+  fi
+done
+if [ ! -f "$CLINE_RULE" ]; then
+  echo "FAIL 8z: Cline rule missing"
+  exit 1
+fi
+CLINE_SETTINGS="$FAKE_HOME/.cline/settings.json"
+CLINE_ENABLED=$(json_get "$CLINE_SETTINGS" "d.get('hooksEnabled')")
+CLINE_KEEP=$(json_get "$CLINE_SETTINGS" "d.get('keep', '')")
+if [ "$CLINE_ENABLED" != "False" ] || [ "$CLINE_KEEP" != "cline" ]; then
+  echo "FAIL 8z: Cline hook enable state or foreign settings changed"
+  exit 1
+fi
+for CLINE_EVENT in TaskStart TaskResume UserPromptSubmit PreCompact; do
+  if [[ "$BINARY" == *.exe ]]; then
+    CLINE_HOOK="$FAKE_HOME/.cline/hooks/$CLINE_EVENT.ps1"
+  else
+    CLINE_HOOK="$FAKE_HOME/.cline/hooks/$CLINE_EVENT"
+  fi
+  if [ -e "$CLINE_HOOK" ]; then
+    echo "FAIL 8z: unsupported Cline $CLINE_EVENT automatic hook was installed"
+    exit 1
+  fi
+done
+echo "OK 8z: Cline MCP + instructions; unreliable automatic hooks withheld"
+
+# 8aa: Qwen Code MCP + instructions
+CMD=$(json_get "$FAKE_HOME/.qwen/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH" || [ ! -f "$FAKE_HOME/.qwen/QWEN.md" ]; then
+  echo "FAIL 8aa: Qwen Code integration incomplete"
+  exit 1
+fi
+if ! grep -q 'SessionStart' "$FAKE_HOME/.qwen/settings.json" 2>/dev/null ||
+   ! grep -q 'SubagentStart' "$FAKE_HOME/.qwen/settings.json" 2>/dev/null ||
+   ! grep -q 'hook-augment' "$FAKE_HOME/.qwen/settings.json" 2>/dev/null; then
+  echo "FAIL 8aa: Qwen lifecycle hooks missing"
+  exit 1
+fi
+echo "OK 8aa: Qwen Code MCP + instructions"
+
+# 8ab: VS Code-only installs receive Copilot durable context without inventing
+# a Copilot CLI MCP config. No copilot executable is present in the fixture.
+if cat "$FAKE_HOME/.copilot/mcp-config.json" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(0 if 'codebase-memory-mcp' in d.get('mcpServers', {}) else 1)
+" 2>/dev/null; then
+  echo "FAIL 8ab: VS Code-only install created a Copilot CLI MCP entry"
+  exit 1
+fi
+COPILOT_SKILL="$FAKE_HOME/.copilot/skills/codebase-memory/SKILL.md"
+COPILOT_AGENT="$FAKE_HOME/.copilot/agents/codebase-memory.agent.md"
+if ! grep -q 'search_graph' "$COPILOT_SKILL" 2>/dev/null ||
+   ! grep -q '^tools:' "$COPILOT_AGENT" 2>/dev/null ||
+   ! grep -q 'codebase-memory-mcp/trace_path' "$COPILOT_AGENT" 2>/dev/null ||
+   grep -qE '^  - (edit|shell|bash|codebase-memory-mcp/(index_repository|delete_project|manage_adr|ingest_traces))$' "$COPILOT_AGENT" 2>/dev/null; then
+  echo "FAIL 8ab: VS Code-only durable skill or read-only agent is wrong"
+  exit 1
+fi
+echo "OK 8ab: VS Code-only durable skill + read-only agent; no CLI MCP config"
+COPILOT_HOOKS="$FAKE_HOME/.copilot/hooks/codebase-memory-mcp.json"
+if ! grep -q 'sessionStart' "$COPILOT_HOOKS" 2>/dev/null ||
+   ! grep -q 'subagentStart' "$COPILOT_HOOKS" 2>/dev/null ||
+   ! grep -q 'powershell' "$COPILOT_HOOKS" 2>/dev/null ||
+   ! grep -q 'timeoutSec' "$COPILOT_HOOKS" 2>/dev/null; then
+  echo "FAIL 8ab-i: Copilot lifecycle hook manifest missing"
+  exit 1
+fi
+echo "OK 8ab-i: VS Code SessionStart + SubagentStart hooks"
+
+# 8ac: Factory Droid stdio MCP schema
+CMD=$(json_get "$FAKE_HOME/.factory/mcp.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+FACTORY_TYPE=$(json_get "$FAKE_HOME/.factory/mcp.json" "d['mcpServers']['codebase-memory-mcp']['type']")
+if ! path_match "$CMD" "$SELF_PATH" || [ "$FACTORY_TYPE" != "stdio" ]; then
+  echo "FAIL 8ac: Factory Droid MCP schema is wrong"
+  exit 1
+fi
+echo "OK 8ac: Factory Droid MCP (disabled policy left user-controlled)"
+if ! grep -q 'search_graph' "$FAKE_HOME/.factory/AGENTS.md" 2>/dev/null; then
+  echo "FAIL 8ac-i: Factory durable instructions missing"
+  exit 1
+fi
+FACTORY_MATCHER_COUNT=$(grep -c '"matcher"' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null || true)
+if [[ "$BINARY" == *.exe ]]; then
+  if grep -q 'hook-augment' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null; then
+    echo "FAIL 8ac-i: Factory hook installed on Windows without a documented shell contract"
+    exit 1
+  fi
+  echo "OK 8ac-i: Factory durable instructions; Windows hook withheld"
+elif ! grep -q 'SessionStart' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     ! grep -q 'PostToolUse' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     ! grep -q 'Read' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     ! grep -q 'hook-augment' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     ! grep -q 'timeout' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+     [ "$FACTORY_MATCHER_COUNT" != "1" ]; then
+  echo "FAIL 8ac-i: Factory SessionStart/PostToolUse Read hooks missing or malformed"
+  exit 1
+else
+  echo "OK 8ac-i: Factory durable instructions + SessionStart/PostToolUse Read"
+fi
+FACTORY_AGENT="$FAKE_HOME/.factory/droids/codebase-memory.md"
+if ! grep -q '^tools: \["Read", "LS", "Grep", "Glob",' "$FACTORY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__search_graph' "$FACTORY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$FACTORY_AGENT" 2>/dev/null ||
+   grep -q '^mcpServers:' "$FACTORY_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$FACTORY_AGENT" 2>/dev/null; then
+  echo "FAIL 8ac-ii: Factory exact-tool Verify droid missing or over-privileged"
+  exit 1
+fi
+echo "OK 8ac-ii: Factory exact-tool Verify droid"
+
+# 8ad: Crush stdio MCP schema + instructions
+CMD=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp']['command']")
+CRUSH_TYPE=$(json_get "$FAKE_HOME/.config/crush/crush.json" "d['mcp']['codebase-memory-mcp']['type']")
+CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p).endswith('codebase-memory.md') for p in d['options']['context_paths']))")
+if ! path_match "$CMD" "$SELF_PATH" || [ "$CRUSH_TYPE" != "stdio" ] ||
+   [ "$CRUSH_CONTEXT" != "True" ] ||
+   ! grep -q 'does not inherit MCP access' "$FAKE_HOME/.config/crush/codebase-memory.md" 2>/dev/null; then
+  echo "FAIL 8ad: Crush integration incomplete"
+  exit 1
+fi
+echo "OK 8ad: Crush MCP + instructions"
+
+# 8ae: Goose YAML extension
+if [[ "$BINARY" == *.exe ]]; then
+  GOOSE_CFG="$FAKE_HOME/AppData/Roaming/Block/goose/config/config.yaml"
+else
+  GOOSE_CFG="$FAKE_HOME/.config/goose/config.yaml"
+fi
+if ! grep -q '^extensions:' "$GOOSE_CFG" 2>/dev/null ||
+   ! grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
+   ! grep -Fq "$SELF_PATH" "$GOOSE_CFG" 2>/dev/null; then
+  echo "FAIL 8ae: Goose extension missing or malformed"
+  exit 1
+fi
+echo "OK 8ae: Goose MCP extension"
+if ! grep -q 'search_graph' "$FAKE_HOME/.config/goose/.goosehints" 2>/dev/null ||
+   ! grep -q 'subagent' "$FAKE_HOME/.config/goose/.goosehints" 2>/dev/null; then
+  echo "FAIL 8ae-i: Goose durable hints missing"
+  exit 1
+fi
+echo "OK 8ae-i: Goose durable hints"
+
+# 8af: Mistral Vibe TOML array table
+if ! grep -q '^\[\[mcp_servers\]\]' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
+   ! grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null ||
+   ! grep -Fq "$SELF_PATH" "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
+  echo "FAIL 8af: Mistral Vibe MCP table missing or malformed"
+  exit 1
+fi
+echo "OK 8af: Mistral Vibe MCP"
+if ! grep -q 'search_graph' "$FAKE_HOME/.vibe/AGENTS.md" 2>/dev/null ||
+   ! grep -q 'subagent' "$FAKE_HOME/.vibe/AGENTS.md" 2>/dev/null; then
+  echo "FAIL 8af-i: Vibe durable AGENTS.md missing"
+  exit 1
+fi
+VIBE_AGENT="$FAKE_HOME/.vibe/agents/codebase-memory.toml"
+VIBE_PROMPT="$FAKE_HOME/.vibe/prompts/codebase-memory.md"
+if ! grep -q '^agent_type = "subagent"$' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq 'enabled_tools = ["read_file", "grep_search", "codebase-memory-mcp_search_graph"' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_get_code_snippet"' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -Fq '"codebase-memory-mcp_check_index_coverage"' "$VIBE_AGENT" 2>/dev/null ||
+   grep -Fq '"codebase-memory-mcp_*"' "$VIBE_AGENT" 2>/dev/null ||
+   grep -qE 'codebase-memory-mcp_(index_repository|delete_project|manage_adr|ingest_traces)' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -q '^system_prompt_id = "codebase-memory"$' "$VIBE_AGENT" 2>/dev/null ||
+   ! grep -q 'search_graph' "$VIBE_PROMPT" 2>/dev/null ||
+   ! grep -q 'Never edit files or perform state-changing actions' "$VIBE_PROMPT" 2>/dev/null; then
+  echo "FAIL 8af-i: Vibe global subagent or prompt missing"
+  exit 1
+fi
+echo "OK 8af-i: Vibe durable instructions + graph-only subagent and prompt"
+
+# 8ag: Windsurf MCP + always-on global rules.
+CMD=$(json_get "$FAKE_HOME/.codeium/windsurf/mcp_config.json" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! grep -q 'search_graph' "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" 2>/dev/null ||
+   ! grep -q 'subagent' "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" 2>/dev/null; then
+  echo "FAIL 8ag: Windsurf MCP or global rules missing"
+  exit 1
+fi
+WINDSURF_RULE_BYTES=$(wc -c < "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md")
+if [ "$WINDSURF_RULE_BYTES" -gt 6000 ]; then
+  echo "FAIL 8ag: Windsurf global rules exceed the 6000-character limit"
+  exit 1
+fi
+echo "OK 8ag: Windsurf MCP + global rules"
+
+# 8ah: Augment/Auggie MCP, durable rule, dedicated subagent, and matcher-free
+# SessionStart hook.
+AUGMENT_SETTINGS="$FAKE_HOME/.augment/settings.json"
+AUGMENT_RULE="$FAKE_HOME/.augment/rules/codebase-memory.md"
+AUGMENT_AGENT="$FAKE_HOME/.augment/agents/codebase-memory.md"
+if [[ "$BINARY" == *.exe ]]; then
+  AUGMENT_SCRIPT="$FAKE_HOME/.augment/hooks/codebase-memory-session.ps1"
+else
+  AUGMENT_SCRIPT="$FAKE_HOME/.augment/hooks/codebase-memory-session.sh"
+fi
+CMD=$(json_get "$AUGMENT_SETTINGS" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! grep -q 'search_graph' "$AUGMENT_RULE" 2>/dev/null ||
+   ! grep -q '^name: codebase-memory$' "$AUGMENT_AGENT" 2>/dev/null ||
+   ! grep -q 'graph project' "$AUGMENT_AGENT" 2>/dev/null ||
+   ! grep -q 'hook-augment' "$AUGMENT_SCRIPT" 2>/dev/null ||
+   ! grep -q 'SessionStart' "$AUGMENT_SCRIPT" 2>/dev/null; then
+  echo "FAIL 8ah: Augment/Auggie MCP, context, subagent, or wrapper missing"
+  exit 1
+fi
+if ! cat "$AUGMENT_SETTINGS" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+entries = d.get('hooks', {}).get('SessionStart', [])
+owned = [e for e in entries if any('codebase-memory-session' in str(h.get('command', '')) for h in e.get('hooks', []))]
+ok = owned and all('matcher' not in e for e in owned) and any(h.get('timeout') == 5000 for e in owned for h in e.get('hooks', []))
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+  echo "FAIL 8ah: Augment/Auggie SessionStart must be matcher-free with timeout 5000"
+  exit 1
+fi
+if [[ "$BINARY" != *.exe ]] && [ ! -x "$AUGMENT_SCRIPT" ]; then
+  echo "FAIL 8ah: Augment/Auggie SessionStart wrapper is not executable"
+  exit 1
+fi
+echo "OK 8ah: Augment/Auggie MCP + SessionStart + subagent"
+
+# 8ai: Consolidated skill installed without recursively deleting legacy content.
 SKILL_FILE="$FAKE_HOME/.claude/skills/codebase-memory/SKILL.md"
 if [ ! -s "$SKILL_FILE" ]; then
-  echo "FAIL 8x: skill codebase-memory missing or empty"
+  echo "FAIL 8ai: skill codebase-memory missing or empty"
   exit 1
 fi
-echo "OK 8x: skill installed"
+echo "OK 8ai: skill installed"
+
+# 8aj: Qoder MCP, skill, directly attached read-only graph agent, and current
+# lifecycle/read hooks. Legacy UserPromptSubmit is removed during migration.
+QODER_SETTINGS="$FAKE_HOME/.qoder/settings.json"
+QODER_SKILL="$FAKE_HOME/.qoder/skills/codebase-memory/SKILL.md"
+QODER_AGENT="$FAKE_HOME/.qoder/agents/codebase-memory.md"
+CMD=$(json_get "$QODER_SETTINGS" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! grep -q 'search_graph' "$QODER_SKILL" 2>/dev/null ||
+   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q '^mcpServers:$' "$QODER_AGENT" 2>/dev/null ||
+   ! grep -q '^  - codebase-memory-mcp$' "$QODER_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$QODER_AGENT" 2>/dev/null ||
+   grep -q 'parent agent' "$QODER_AGENT" 2>/dev/null; then
+  echo "FAIL 8aj: Qoder MCP, skill, or exact-tool Verify agent missing"
+  exit 1
+fi
+if [[ "$BINARY" == *.exe ]]; then
+  QODER_EXPECTED_SHELL="powershell"
+else
+  QODER_EXPECTED_SHELL=""
+fi
+if ! cat "$QODER_SETTINGS" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+all_hooks = d.get('hooks', {})
+expected = {
+    'SessionStart': 'startup|resume|clear|compact|new',
+    'SubagentStart': '*',
+    'PostToolUse': 'Read',
+}
+ok = d.get('theme') == 'dark' and 'UserPromptSubmit' not in all_hooks
+for event, matcher in expected.items():
+    entries = all_hooks.get(event, [])
+    ok = ok and len(entries) == 1 and entries[0].get('matcher') == matcher
+    hooks = entries[0].get('hooks', []) if entries else []
+    ok = ok and len(hooks) == 1
+    if hooks:
+        hook = hooks[0]
+        ok = (ok and '--dialect qoder' in hook.get('command', '') and
+              hook.get('timeout') == 5 and
+              hook.get('shell', '') == '$QODER_EXPECTED_SHELL')
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+  echo "FAIL 8aj: Qoder lifecycle/read hooks missing or malformed"
+  exit 1
+fi
+echo "OK 8aj: Qoder MCP + direct graph agent + lifecycle/read hooks"
+
+# 8ak: Kimi honors KIMI_CODE_HOME for MCP and durable parent/subagent context.
+KIMI_MCP="$CUSTOM_KIMI_HOME/mcp.json"
+KIMI_SKILL="$CUSTOM_KIMI_HOME/skills/codebase-memory/SKILL.md"
+KIMI_CONFIG="$CUSTOM_KIMI_HOME/config.toml"
+CMD=$(json_get "$KIMI_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+KIMI_HOOK_COUNT=$(grep -cF '[[hooks]]' "$KIMI_CONFIG" 2>/dev/null || true)
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! grep -q '^# Personal Kimi guidance$' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
+   ! grep -q 'search_graph' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$KIMI_SKILL" 2>/dev/null ||
+   ! grep -q '^theme = "dark"$' "$KIMI_CONFIG" 2>/dev/null ||
+   [ "$KIMI_HOOK_COUNT" != "1" ] ||
+   ! grep -q '^event = "UserPromptSubmit"$' "$KIMI_CONFIG" 2>/dev/null ||
+   ! grep -q -- '--dialect kimi' "$KIMI_CONFIG" 2>/dev/null ||
+   ! grep -q '^timeout = 5$' "$KIMI_CONFIG" 2>/dev/null ||
+   grep -q 'SessionStart' "$KIMI_CONFIG" 2>/dev/null ||
+   grep -q 'SubagentStart' "$KIMI_CONFIG" 2>/dev/null; then
+  echo "FAIL 8ak: custom KIMI_CODE_HOME MCP, durable context, or managed prompt hook missing"
+  exit 1
+fi
+echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hook"
+
+# 8al: Pi has documented instructions and skill, but no invented MCP config.
+PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
+PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
+if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
+   [ -e "$FAKE_HOME/.pi/agent/mcp.json" ]; then
+  echo "FAIL 8al: Pi durable context missing or unsupported MCP config created"
+  exit 1
+fi
+echo "OK 8al: Pi durable context only (no MCP config)"
+
+# 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
+WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
+if ! grep -q 'Sessions and Subagents' "$WARP_SKILL" 2>/dev/null ||
+   [ -e "$FAKE_HOME/.warp/mcp.json" ] ||
+   [ -e "$FAKE_HOME/.config/warp-terminal/mcp.json" ]; then
+  echo "FAIL 8am: Warp shared skill missing or unsupported MCP config created"
+  exit 1
+fi
+echo "OK 8am: Warp shared skill only (MCP remains manual)"
+
+# 8an: Junie receives its MCP config, skill, and dedicated restricted-server
+# graph agent.
+# SessionStart augmentation remains withheld because current EAP docs say its
+# additionalContext output is ignored.
+JUNIE_MCP="$FAKE_HOME/.junie/mcp/mcp.json"
+JUNIE_SKILL="$FAKE_HOME/.junie/skills/codebase-memory/SKILL.md"
+JUNIE_AGENT="$FAKE_HOME/.junie/agents/codebase-memory.md"
+CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+JUNIE_SCOUT_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-scout']['command']")
+JUNIE_ANALYSIS_CMD=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-analysis']['command']")
+JUNIE_SCOUT_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-scout']['args']")
+JUNIE_ANALYSIS_ARGS=$(json_get "$JUNIE_MCP" "d['mcpServers']['codebase-memory-analysis']['args']")
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! path_match "$JUNIE_SCOUT_CMD" "$SELF_PATH" ||
+   ! path_match "$JUNIE_ANALYSIS_CMD" "$SELF_PATH" ||
+   [ "$JUNIE_SCOUT_ARGS" != "['--tool-profile=scout']" ] ||
+   [ "$JUNIE_ANALYSIS_ARGS" != "['--tool-profile=analysis']" ] ||
+   ! grep -q 'Sessions and Subagents' "$JUNIE_SKILL" 2>/dev/null ||
+   ! grep -q 'description: "Default task-directed graph verification' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'tools: \["Read", "Grep", "Glob"\]' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'mcpServers: \["codebase-memory-analysis"\]' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'hard-enforces the analysis tool profile' "$JUNIE_AGENT" 2>/dev/null ||
+   ! grep -q 'check_index_coverage' "$JUNIE_AGENT" 2>/dev/null ||
+   grep -qE '(index_repository|delete_project|manage_adr|ingest_traces)' "$JUNIE_AGENT" 2>/dev/null ||
+   grep -q '"Bash"' "$JUNIE_AGENT" 2>/dev/null; then
+  echo "FAIL 8an: Junie MCP, skill, or restricted-server Verify agent missing"
+  exit 1
+fi
+echo "OK 8an: Junie MCP + skill + restricted-server Verify agent"
+
+# 8ao: Conditional registry clients install only when an explicit config exists.
+CMD=$(json_get "$ROO_CFG" "d['mcpServers']['codebase-memory-mcp']['command']")
+ROO_KEEP=$(json_get "$ROO_CFG" "d.get('keep', '')")
+if ! path_match "$CMD" "$SELF_PATH" || [ "$ROO_KEEP" != "roo" ]; then
+  echo "FAIL 8ao: explicit Roo config was not merged safely"
+  exit 1
+fi
+echo "OK 8ao: explicit conditional Roo config merged safely"
+
+# 8ap: GitLab Duo uses its documented MCP path. The optional SessionStart
+# augmenter is Unix-only and must preserve a pre-existing user hook.
+CMD=$(json_get "$GITLAB_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+GITLAB_KEEP=$(json_get "$GITLAB_MCP" "d.get('keep', '')")
+if ! path_match "$CMD" "$SELF_PATH" || [ "$GITLAB_KEEP" != "gitlab-mcp" ]; then
+  echo "FAIL 8ap: GitLab Duo MCP is incomplete"
+  exit 1
+fi
+if [[ "$BINARY" == *.exe ]]; then
+  if ! cat "$GITLAB_HOOKS" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+entries = d.get('hooks', {}).get('SessionStart', [])
+hooks = [h for entry in entries for h in entry.get('hooks', [])]
+owned = [h for h in hooks if 'hook-augment' in str(h.get('command', ''))]
+user = [h for h in hooks if h.get('command') == '/usr/bin/user-hook']
+ok = (d.get('keep') == 'gitlab-hooks' and not owned and len(user) == 1 and
+      'enable-project-hooks' not in str(d))
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+    echo "FAIL 8ap: GitLab Windows hook was not withheld or user hook changed"
+    exit 1
+  fi
+  echo "OK 8ap: GitLab Duo MCP + preserved user hook; Windows augmentation withheld"
+elif ! cat "$GITLAB_HOOKS" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+entries = d.get('hooks', {}).get('SessionStart', [])
+hooks = [h for entry in entries for h in entry.get('hooks', [])]
+owned = [h for h in hooks if 'hook-augment' in str(h.get('command', ''))]
+user = [h for h in hooks if h.get('command') == '/usr/bin/user-hook']
+ok = (d.get('keep') == 'gitlab-hooks' and len(owned) == 1 and
+      owned[0].get('timeout') == 5 and len(user) == 1 and
+      'enable-project-hooks' not in str(d))
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+  echo "FAIL 8ap: GitLab Duo SessionStart hook is incomplete"
+  exit 1
+else
+  echo "OK 8ap: GitLab Duo MCP + preserved user hook + SessionStart augmentation"
+fi
+
+# 8aq: Devin receives MCP and durable context. On Unix, its prompt/compaction
+# augmentations are installed while SessionStart is inherited from Claude in
+# this fixture; on Windows all optional hooks are withheld.
+CMD=$(json_get "$DEVIN_CONFIG" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$CMD" "$SELF_PATH" ||
+   ! grep -q '^# Personal Devin guidance$' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'search_graph' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$DEVIN_SKILL" 2>/dev/null; then
+  echo "FAIL 8aq: Devin MCP, AGENTS.md, or skill missing"
+  exit 1
+fi
+if [[ "$BINARY" == *.exe ]]; then
+  if grep -q -- '--dialect devin' "$DEVIN_CONFIG" 2>/dev/null; then
+    echo "FAIL 8aq: Devin hook installed on Windows without a documented executor contract"
+    exit 1
+  fi
+  echo "OK 8aq: Devin MCP + durable AGENTS.md/skill; Windows hooks withheld"
+elif ! cat "$DEVIN_CONFIG" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+all_hooks = d.get('hooks', {})
+ok = d.get('theme_mode') == 'dark' and 'SubagentStart' not in all_hooks
+for event in ('UserPromptSubmit', 'PostCompaction'):
+    hooks = [h for entry in all_hooks.get(event, []) for h in entry.get('hooks', [])]
+    owned = [h for h in hooks if '--dialect devin' in str(h.get('command', ''))]
+    ok = ok and len(owned) == 1 and owned[0].get('timeout') == 5
+session_hooks = [h for entry in all_hooks.get('SessionStart', []) for h in entry.get('hooks', [])]
+ok = ok and not any('--dialect devin' in str(h.get('command', '')) for h in session_hooks)
+owned_total = sum(str(all_hooks.get(event, [])).count('--dialect devin')
+                  for event in ('SessionStart', 'UserPromptSubmit', 'PostCompaction'))
+ok = ok and owned_total == 2
+sys.exit(0 if ok else 1)
+" 2>/dev/null ||
+   ! grep -q 'SessionStart' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
+   ! grep -q 'cbm-code-discovery-gate' "$FAKE_HOME/.claude/settings.json" 2>/dev/null; then
+  echo "FAIL 8aq: Devin hooks are not deduplicated against Claude SessionStart"
+  exit 1
+else
+  echo "OK 8aq: Devin MCP + prompt/compaction hooks + inherited Claude SessionStart"
+fi
+
+# 8ar: CodeBuddy Code CLI uses the current .mcp.json and durable skill/agent
+# surfaces. Beta settings hooks remain untouched.
+CMD=$(json_get "$CODEBUDDY_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+CODEBUDDY_KEEP=$(json_get "$CODEBUDDY_MCP" "d.get('keep', '')")
+if ! path_match "$CMD" "$SELF_PATH" || [ "$CODEBUDDY_KEEP" != "codebuddy" ] ||
+   ! grep -q '^# Personal CodeBuddy guidance$' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'search_graph' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$CODEBUDDY_SKILL" 2>/dev/null ||
+   ! grep -q '^permissionMode: plan$' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   grep -qE 'mcp__codebase-memory-mcp__(index_repository|delete_project|manage_adr|ingest_traces)' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   grep -q '^tools:$' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   grep -q 'mcp__codebase-memory__search_graph' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   ! grep -q '^skills: codebase-memory$' "$CODEBUDDY_AGENT" 2>/dev/null ||
+   [ -e "$CODEBUDDY_SETTINGS" ]; then
+  echo "FAIL 8ar: CodeBuddy current MCP, durable context, or read-only agent missing"
+  exit 1
+fi
+echo "OK 8ar: CodeBuddy .mcp.json + CODEBUDDY.md + skill/agent; no beta hooks"
+
+# 8as: Bob IDE is conditional on its existing mcp.json while Bob Shell is
+# detected from the bob executable. Both share rules; only the IDE gets a skill.
+BOB_IDE_CMD=$(json_get "$BOB_IDE_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+BOB_SHELL_CMD=$(json_get "$BOB_SHELL_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+BOB_IDE_KEEP=$(json_get "$BOB_IDE_MCP" "d.get('keep', '')")
+BOB_SHELL_KEEP=$(json_get "$BOB_SHELL_MCP" "d.get('keep', '')")
+if ! path_match "$BOB_IDE_CMD" "$SELF_PATH" ||
+   ! path_match "$BOB_SHELL_CMD" "$SELF_PATH" ||
+   [ "$BOB_IDE_KEEP" != "bob-ide" ] || [ "$BOB_SHELL_KEEP" != "bob-shell" ] ||
+   ! grep -q '^# Personal Bob guidance$' "$BOB_RULE" 2>/dev/null ||
+   ! grep -q 'search_graph' "$BOB_RULE" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$BOB_SKILL" 2>/dev/null ||
+   [ -e "$BOB_AGENT" ]; then
+  echo "FAIL 8as: Bob IDE/Shell MCP, shared rules, or IDE skill is wrong"
+  exit 1
+fi
+echo "OK 8as: Bob IDE conditional MCP + Bob Shell MCP + shared rules/IDE skill"
+
+# 8at: Pochi keeps JSONC user content while adding the current mcp root. Its
+# handoff agent is intentionally limited to readFile because MCP allowlist names
+# are not documented for child agents.
+POCHI_CMD=$(sed '/^[[:space:]]*\/\//d' "$POCHI_MCP" 2>/dev/null | python3 -c "import json,sys; print(json.load(sys.stdin)['mcp']['codebase-memory-mcp']['command'])" 2>/dev/null || echo "")
+POCHI_TOOL_COUNT=$(grep -c '^  - ' "$POCHI_AGENT" 2>/dev/null || true)
+if ! path_match "$POCHI_CMD" "$SELF_PATH" ||
+   ! grep -q 'Personal Pochi setting' "$POCHI_MCP" 2>/dev/null ||
+   ! grep -q '"keep": "pochi"' "$POCHI_MCP" 2>/dev/null ||
+   ! grep -q '^# Personal Pochi guidance$' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'search_graph' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$POCHI_SKILL" 2>/dev/null ||
+   ! grep -q '^  - readFile$' "$POCHI_AGENT" 2>/dev/null ||
+   [ "$POCHI_TOOL_COUNT" != "1" ] ||
+   ! grep -q 'parent agent' "$POCHI_AGENT" 2>/dev/null ||
+   grep -qE '^  - (writeFile|editFile|execute|bash|shell)$' "$POCHI_AGENT" 2>/dev/null ||
+   grep -q 'mcpServers:' "$POCHI_AGENT" 2>/dev/null; then
+  echo "FAIL 8at: Pochi JSONC MCP, durable context, or readFile-only agent missing"
+  exit 1
+fi
+echo "OK 8at: Pochi config.jsonc + README/skill + readFile-only handoff agent"
+
+# 8au: Rovo's documented global AGENTS.md memory complements its skill and
+# handoff subagent; no undocumented lifecycle hook is invented.
+ROVO_CMD=$(json_get "$ROVO_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$ROVO_CMD" "$SELF_PATH" ||
+   ! grep -q '^# Personal Rovo guidance$' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'search_graph' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q 'Sessions and Subagents' "$ROVO_SKILL" 2>/dev/null ||
+   ! grep -q 'parent agent' "$ROVO_AGENT" 2>/dev/null ||
+   [ -e "$FAKE_HOME/.rovodev/hooks.json" ]; then
+  echo "FAIL 8au: Rovo MCP, global memory, skill, or handoff agent is incomplete"
+  exit 1
+fi
+echo "OK 8au: Rovo MCP + global memory + skill/handoff agent"
+
+# 8av: The dedicated Amazon Q IDE page uses root default.json. Existing
+# agents/default.json and mcp.json remain compatibility fallbacks.
+AMAZON_Q_CMD=$(json_get "$AMAZON_Q_MCP" "d['mcpServers']['codebase-memory-mcp']['command']")
+if ! path_match "$AMAZON_Q_CMD" "$SELF_PATH" ||
+   [ -e "$FAKE_HOME/.aws/amazonq/agents/default.json" ] ||
+   [ -e "$FAKE_HOME/.aws/amazonq/mcp.json" ]; then
+  echo "FAIL 8av: Amazon Q IDE canonical default.json selection is wrong"
+  exit 1
+fi
+echo "OK 8av: Amazon Q IDE canonical default.json"
+
+# 8aw: Every supported profile dialect installs the complete tier matrix. This
+# complements the detailed Verify checks above without duplicating each schema.
+assert_tier_profile_set "Claude" "$FAKE_HOME/.claude/agents" ".md" "direct"
+assert_tier_profile_set "Codex" "$FAKE_HOME/.codex/agents" ".toml" "direct"
+assert_tier_profile_set "Gemini" "$FAKE_HOME/.gemini/agents" ".md" "direct"
+if [ -f "$FAKE_HOME/.config/opencode/opencode.json" ]; then
+  assert_tier_profile_set "OpenCode" "$FAKE_HOME/.config/opencode/agents" ".md" "direct"
+fi
+assert_tier_profile_set "Kilo" "$FAKE_HOME/.config/kilo/agents" ".md" "direct"
+assert_tier_profile_set "Cursor" "$FAKE_HOME/.cursor/agents" ".md" "handoff"
+assert_tier_profile_set "Kiro" "$FAKE_HOME/.kiro/agents" ".json" "direct"
+assert_tier_profile_set "Junie" "$FAKE_HOME/.junie/agents" ".md" "direct"
+assert_tier_profile_set "Augment" "$FAKE_HOME/.augment/agents" ".md" "handoff"
+assert_tier_profile_set "Qwen" "$FAKE_HOME/.qwen/agents" ".md" "direct"
+assert_tier_profile_set "Factory" "$FAKE_HOME/.factory/droids" ".md" "direct"
+assert_tier_profile_set "Vibe" "$FAKE_HOME/.vibe/agents" ".toml" "direct"
+assert_tier_prompt_set "Vibe" "$FAKE_HOME/.vibe/prompts" ".md"
+for VIBE_SLUG in codebase-memory-scout codebase-memory codebase-memory-auditor; do
+  if ! grep -Fq "system_prompt_id = \"$VIBE_SLUG\"" "$FAKE_HOME/.vibe/agents/$VIBE_SLUG.toml" 2>/dev/null; then
+    echo "FAIL 8aw: Vibe agent/prompt identifier mismatch for $VIBE_SLUG"
+    exit 1
+  fi
+done
+assert_tier_profile_set "Copilot" "$FAKE_HOME/.copilot/agents" ".agent.md" "direct"
+assert_tier_profile_set "Qoder" "$FAKE_HOME/.qoder/agents" ".md" "direct"
+assert_tier_profile_set "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md" "direct"
+assert_tier_profile_set "Pochi" "$FAKE_HOME/.pochi/agents" ".md" "handoff"
+assert_tier_profile_set "Rovo" "$FAKE_HOME/.rovodev/subagents" ".md" "handoff"
+echo "OK 8aw: all supported Scout/Verify/Auditor profile sets"
 
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
@@ -1148,6 +2093,8 @@ HOME="$FAKE_HOME" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
+  KIMI_CODE_HOME="$CUSTOM_KIMI_HOME" \
+  CBM_ROO_CONFIG_PATH="$ROO_CFG" \
   PATH="$FAKE_HOME/.local/bin:$PATH" \
   "$BINARY" uninstall -y -n 2>&1 || true
 
@@ -1168,7 +2115,7 @@ else
 fi
 
 # 9c: Legacy MCP removed
-if cat "$FAKE_HOME/.claude/.mcp.json" 2>/dev/null | python3 -c "
+if [ ! -f "$FAKE_HOME/.claude/.mcp.json" ] || cat "$FAKE_HOME/.claude/.mcp.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 sys.exit(1 if 'codebase-memory-mcp' in d.get('mcpServers', {}) else 0)
@@ -1179,17 +2126,26 @@ else
   exit 1
 fi
 
-# 9d: Hooks removed
+# 9d: All Claude hook registrations and owned scripts removed
 if cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-hooks = d.get('hooks', {}).get('PreToolUse', [])
-found = any('cbm-code-discovery-gate' in str(h) for h in hooks)
+hooks = d.get('hooks', {})
+found = any('cbm-code-discovery-gate' in str(h) or
+            'cbm-session-reminder' in str(h) or
+            'cbm-subagent-reminder' in str(h)
+            for entries in hooks.values() for h in entries)
 sys.exit(1 if found else 0)
 " 2>/dev/null; then
-  echo "OK 9d: PreToolUse hook removed"
+  for HOOK_SCRIPT in cbm-code-discovery-gate cbm-session-reminder cbm-subagent-reminder; do
+    if [ -e "$FAKE_HOME/.claude/hooks/$HOOK_SCRIPT" ]; then
+      echo "FAIL 9d: owned hook script still present: $HOOK_SCRIPT"
+      exit 1
+    fi
+  done
+  echo "OK 9d: lifecycle/tool hooks and owned scripts removed"
 else
-  echo "FAIL 9d: PreToolUse hook still present"
+  echo "FAIL 9d: Claude hook registration still present"
   exit 1
 fi
 
@@ -1219,37 +2175,267 @@ else
   echo "FAIL 9g-i: Gemini uninstall verification failed"
   exit 1
 fi
+if [ -e "$GEMINI_AGENT" ]; then
+  echo "FAIL 9g-ii: Gemini dedicated graph subagent remains"
+  exit 1
+fi
+echo "OK 9g-ii: Gemini dedicated graph subagent removed"
 
-# 9j: VS Code
-if cat "$VSCODE_CFG" 2>/dev/null | python3 -c "
+# 9j: VS Code default and profile configs
+for VSCODE_CHECK in "$VSCODE_CFG" "$VSCODE_PROFILE_CFG"; do
+  if ! cat "$VSCODE_CHECK" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 sys.exit(1 if 'codebase-memory-mcp' in d.get('servers', {}) else 0)
 " 2>/dev/null; then
-  echo "OK 9j: VS Code MCP removed"
-else
-  echo "FAIL 9j: VS Code MCP still present"
-  exit 1
-fi
+    echo "FAIL 9j: VS Code MCP still present in $VSCODE_CHECK"
+    exit 1
+  fi
+done
+echo "OK 9j: VS Code default and profile MCP removed"
 
 # 9k: OpenClaw
 if cat "$FAKE_HOME/.openclaw/openclaw.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-sys.exit(1 if 'codebase-memory-mcp' in d.get('mcp', {}).get('servers', {}) else 0)
+has_mcp = 'codebase-memory-mcp' in d.get('mcp', {}).get('servers', {})
+sections = d.get('agents', {}).get('defaults', {}).get('compaction', {}).get('postCompactionSections', [])
+sys.exit(1 if has_mcp or 'Codebase Knowledge Graph (codebase-memory-mcp)' in sections else 0)
 " 2>/dev/null; then
-  echo "OK 9k: OpenClaw MCP removed"
+  if grep -q 'codebase-memory-mcp:start' "$FAKE_HOME/.openclaw/workspace/AGENTS.md" 2>/dev/null ||
+     grep -q 'codebase-memory-mcp:start' "$FAKE_HOME/.openclaw/workspace/TOOLS.md" 2>/dev/null; then
+    echo "FAIL 9k: OpenClaw workspace context remains"
+    exit 1
+  fi
+  echo "OK 9k: OpenClaw MCP, compaction, and workspace context removed"
 else
   echo "FAIL 9k: OpenClaw MCP still present"
   exit 1
 fi
 
-# 9l: Skills removed (consolidated skill dir)
-if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ]; then
-  echo "FAIL 9l: skills not removed"
+# 9l: JSON-based new agents and modern Kilo are cleaned without deleting files.
+for SPEC in \
+  "$QODER_SETTINGS|mcpServers" \
+  "$KIMI_MCP|mcpServers" \
+  "$GITLAB_MCP|mcpServers" \
+  "$DEVIN_CONFIG|mcpServers" \
+  "$CODEBUDDY_MCP|mcpServers" \
+  "$BOB_IDE_MCP|mcpServers" \
+  "$BOB_SHELL_MCP|mcpServers" \
+  "$JUNIE_MCP|mcpServers" \
+  "$ROVO_MCP|mcpServers" \
+  "$AMAZON_Q_MCP|mcpServers" \
+  "$ROO_CFG|mcpServers" \
+  "$FAKE_HOME/.openhands/mcp.json|mcpServers" \
+  "$FAKE_HOME/.cline/mcp.json|mcpServers" \
+  "$FAKE_HOME/.cline/data/settings/cline_mcp_settings.json|mcpServers" \
+  "$FAKE_HOME/.qwen/settings.json|mcpServers" \
+  "$FAKE_HOME/.factory/mcp.json|mcpServers" \
+  "$AUGMENT_SETTINGS|mcpServers" \
+  "$FAKE_HOME/.config/crush/crush.json|mcp" \
+  "$FAKE_HOME/.config/kilo/kilo.jsonc|mcp" \
+  "$FAKE_HOME/.codeium/windsurf/mcp_config.json|mcpServers"; do
+  CFG=${SPEC%%|*}
+  ROOT=${SPEC##*|}
+  if ! cat "$CFG" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+sys.exit(1 if 'codebase-memory-mcp' in d.get('$ROOT', {}) else 0)
+" 2>/dev/null; then
+    echo "FAIL 9l: MCP entry remains in $CFG"
+    exit 1
+  fi
+done
+if ! cat "$JUNIE_MCP" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+servers = d.get('mcpServers', {})
+names = {'codebase-memory-mcp', 'codebase-memory-scout', 'codebase-memory-analysis'}
+sys.exit(1 if names.intersection(servers) else 0)
+" 2>/dev/null; then
+  echo "FAIL 9l: Junie default or restricted MCP alias remains"
   exit 1
 fi
-echo "OK 9l: skills removed"
+POCHI_MCP_AFTER=$(sed '/^[[:space:]]*\/\//d' "$POCHI_MCP" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print('present' if 'codebase-memory-mcp' in d.get('mcp', {}) else 'absent')
+" 2>/dev/null || echo "invalid")
+if [ "$POCHI_MCP_AFTER" != "absent" ]; then
+  echo "FAIL 9l: Pochi MCP entry remains or config.jsonc became invalid"
+  exit 1
+fi
+if grep -q 'hook-augment' "$QODER_SETTINGS" 2>/dev/null ||
+   grep -q -- '--dialect kimi' "$KIMI_CONFIG" 2>/dev/null ||
+   grep -q 'hook-augment' "$GITLAB_HOOKS" 2>/dev/null ||
+   grep -q -- '--dialect devin' "$DEVIN_CONFIG" 2>/dev/null ||
+   grep -q 'hook-augment' "$FAKE_HOME/.qwen/settings.json" 2>/dev/null ||
+   grep -q 'hook-augment' "$FAKE_HOME/.copilot/hooks/codebase-memory-mcp.json" 2>/dev/null ||
+   grep -q 'hook-augment' "$FAKE_HOME/.factory/hooks.json" 2>/dev/null ||
+   grep -q 'codebase-memory-session' "$AUGMENT_SETTINGS" 2>/dev/null ||
+   [ -e "$AUGMENT_AGENT" ] || [ -e "$AUGMENT_SCRIPT" ]; then
+  echo "FAIL 9l: lifecycle hook entry remains"
+  exit 1
+fi
+for CLINE_EVENT in TaskStart TaskResume UserPromptSubmit PreCompact; do
+  if [[ "$BINARY" == *.exe ]]; then
+    CLINE_HOOK="$FAKE_HOME/.cline/hooks/$CLINE_EVENT.ps1"
+  else
+    CLINE_HOOK="$FAKE_HOME/.cline/hooks/$CLINE_EVENT"
+  fi
+  if [ -e "$CLINE_HOOK" ]; then
+    echo "FAIL 9l: owned Cline $CLINE_EVENT hook remains"
+    exit 1
+  fi
+done
+if [ "$(json_get "$ROO_CFG" "d.get('keep', '')")" != "roo" ]; then
+  echo "FAIL 9l: explicit Roo config lost its user key"
+  exit 1
+fi
+if CRUSH_CONTEXT=$(json_get "$FAKE_HOME/.config/crush/crush.json" "str(any(str(p).endswith('codebase-memory.md') for p in d.get('options', {}).get('context_paths', [])))") &&
+   [ "$CRUSH_CONTEXT" = "True" ]; then
+  echo "FAIL 9l: Crush context path remains"
+  exit 1
+fi
+if json_instructions_contain_path "$KILO_CFG" "$KILO_RULE"; then
+  echo "FAIL 9l: Kilo instruction reference remains"
+  exit 1
+fi
+if [ "$(json_get "$CLINE_SETTINGS" "d.get('hooksEnabled')")" != "False" ] ||
+   [ "$(json_get "$CLINE_SETTINGS" "d.get('keep', '')")" != "cline" ] ||
+   [ "$(json_get "$GITLAB_MCP" "d.get('keep', '')")" != "gitlab-mcp" ] ||
+   [ "$(json_get "$DEVIN_CONFIG" "d.get('theme_mode', '')")" != "dark" ] ||
+   [ "$(json_get "$CODEBUDDY_MCP" "d.get('keep', '')")" != "codebuddy" ] ||
+   [ "$(json_get "$BOB_IDE_MCP" "d.get('keep', '')")" != "bob-ide" ] ||
+   [ "$(json_get "$BOB_SHELL_MCP" "d.get('keep', '')")" != "bob-shell" ] ||
+   ! grep -q '^theme = "dark"$' "$KIMI_CONFIG" 2>/dev/null ||
+   grep -qF '[[hooks]]' "$KIMI_CONFIG" 2>/dev/null ||
+   ! grep -q 'Personal Pochi setting' "$POCHI_MCP" 2>/dev/null ||
+   ! grep -q '"keep": "pochi"' "$POCHI_MCP" 2>/dev/null; then
+  echo "FAIL 9l: uninstall changed foreign agent settings"
+  exit 1
+fi
+if ! cat "$GITLAB_HOOKS" 2>/dev/null | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+entries = d.get('hooks', {}).get('SessionStart', [])
+hooks = [h for entry in entries for h in entry.get('hooks', [])]
+ok = (d.get('keep') == 'gitlab-hooks' and
+      any(h.get('command') == '/usr/bin/user-hook' for h in hooks) and
+      all('hook-augment' not in str(h.get('command', '')) for h in hooks))
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
+  echo "FAIL 9l: GitLab uninstall lost or changed the user's SessionStart hook"
+  exit 1
+fi
+echo "OK 9l: JSON agents, lifecycle hooks, and Kilo cleaned; foreign settings preserved"
+
+# 9m: YAML/TOML new agents are cleaned.
+if grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   grep -q '^  pre_llm_call:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
+   grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
+   grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
+  echo "FAIL 9m: YAML/TOML MCP entry remains"
+  exit 1
+fi
+if grep -Fq 'CONVENTIONS.md' "$FAKE_HOME/.aider.conf.yml" 2>/dev/null; then
+  echo "FAIL 9m: Aider still loads removed conventions"
+  exit 1
+fi
+echo "OK 9m: Hermes, Goose, Vibe, and Aider cleaned"
+
+# 9m-i: Durable managed blocks are removed without deleting user files.
+for CONTEXT_FILE in \
+  "$ZED_INSTR" \
+  "$FAKE_HOME/.kiro/steering/codebase-memory.md" \
+  "$FAKE_HOME/.factory/AGENTS.md" \
+  "$AUGMENT_RULE" \
+  "$FAKE_HOME/.config/crush/codebase-memory.md" \
+  "$FAKE_HOME/.config/goose/.goosehints" \
+  "$KILO_RULE" \
+  "$CLINE_RULE" \
+  "$FAKE_HOME/.vibe/AGENTS.md" \
+  "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" \
+  "$DEVIN_INSTRUCTIONS" \
+  "$CODEBUDDY_INSTRUCTIONS" \
+  "$BOB_RULE" \
+  "$POCHI_INSTRUCTIONS" \
+  "$ROVO_INSTRUCTIONS" \
+  "$CUSTOM_KIMI_HOME/AGENTS.md" \
+  "$PI_INSTRUCTIONS"; do
+  if grep -q 'codebase-memory-mcp:start' "$CONTEXT_FILE" 2>/dev/null; then
+    echo "FAIL 9m-i: managed instructions remain in $CONTEXT_FILE"
+    exit 1
+  fi
+done
+if ! grep -q '^# Personal Kimi guidance$' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null; then
+  echo "FAIL 9m-i: uninstall lost custom Kimi instructions"
+  exit 1
+fi
+if ! grep -q '^# Personal Devin guidance$' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q '^# Personal CodeBuddy guidance$' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q '^# Personal Bob guidance$' "$BOB_RULE" 2>/dev/null ||
+   ! grep -q '^# Personal Pochi guidance$' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
+   ! grep -q '^# Personal Rovo guidance$' "$ROVO_INSTRUCTIONS" 2>/dev/null; then
+  echo "FAIL 9m-i: uninstall lost foreign durable instructions"
+  exit 1
+fi
+echo "OK 9m-i: durable instruction blocks removed"
+
+# 9n: Skills removed (consolidated skill dir)
+if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.hermes/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.agents/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.qoder/skills/codebase-memory" ] ||
+   [ -d "$CUSTOM_KIMI_HOME/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.pi/agent/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.junie/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.rovodev/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.copilot/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.vibe/skills/codebase-memory" ] ||
+   [ -e "$DEVIN_SKILL" ] ||
+   [ -e "$CODEBUDDY_SKILL" ] ||
+   [ -e "$BOB_SKILL" ] ||
+   [ -e "$POCHI_SKILL" ] ||
+   [ -e "$QODER_AGENT" ] ||
+   [ -e "$JUNIE_AGENT" ] ||
+   [ -e "$ROVO_AGENT" ] ||
+   [ -e "$KIRO_AGENT" ] ||
+   [ -e "$CLAUDE_AGENT" ] ||
+   [ -e "$FACTORY_AGENT" ] ||
+   [ -e "$COPILOT_AGENT" ] ||
+   [ -e "$KILO_AGENT" ] ||
+   [ -e "$VIBE_AGENT" ] ||
+   [ -e "$VIBE_PROMPT" ] ||
+   [ -e "$CODEBUDDY_AGENT" ] ||
+   [ -e "$POCHI_AGENT" ] ||
+   [ -e "$BOB_AGENT" ]; then
+  echo "FAIL 9n: skills or owned agents not removed"
+  exit 1
+fi
+echo "OK 9n: skills removed"
+
+# 9n-i: Uninstall removes every owned tier sibling, not only the historical
+# Verify filename checked by the legacy variables above.
+assert_tier_profile_set_removed "Claude" "$FAKE_HOME/.claude/agents" ".md"
+assert_tier_profile_set_removed "Codex" "$FAKE_HOME/.codex/agents" ".toml"
+assert_tier_profile_set_removed "Gemini" "$FAKE_HOME/.gemini/agents" ".md"
+assert_tier_profile_set_removed "OpenCode" "$FAKE_HOME/.config/opencode/agents" ".md"
+assert_tier_profile_set_removed "Kilo" "$FAKE_HOME/.config/kilo/agents" ".md"
+assert_tier_profile_set_removed "Cursor" "$FAKE_HOME/.cursor/agents" ".md"
+assert_tier_profile_set_removed "Kiro" "$FAKE_HOME/.kiro/agents" ".json"
+assert_tier_profile_set_removed "Junie" "$FAKE_HOME/.junie/agents" ".md"
+assert_tier_profile_set_removed "Augment" "$FAKE_HOME/.augment/agents" ".md"
+assert_tier_profile_set_removed "Qwen" "$FAKE_HOME/.qwen/agents" ".md"
+assert_tier_profile_set_removed "Factory" "$FAKE_HOME/.factory/droids" ".md"
+assert_tier_profile_set_removed "Vibe" "$FAKE_HOME/.vibe/agents" ".toml"
+assert_tier_profile_set_removed "Vibe prompt" "$FAKE_HOME/.vibe/prompts" ".md"
+assert_tier_profile_set_removed "Copilot" "$FAKE_HOME/.copilot/agents" ".agent.md"
+assert_tier_profile_set_removed "Qoder" "$FAKE_HOME/.qoder/agents" ".md"
+assert_tier_profile_set_removed "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md"
+assert_tier_profile_set_removed "Pochi" "$FAKE_HOME/.pochi/agents" ".md"
+assert_tier_profile_set_removed "Rovo" "$FAKE_HOME/.rovodev/subagents" ".md"
+echo "OK 9n-i: all owned Scout/Verify/Auditor profile sets removed"
 
 echo ""
 echo "--- Phase 9b: adversarial install/uninstall tests ---"
@@ -1326,6 +2512,12 @@ if [ "$(uname -s)" != "MINGW64_NT" ] 2>/dev/null; then
 fi
 
 rm -rf "$FAKE_HOME" "$EMPTY_HOME"
+
+if [ "$SMOKE_MODE" = "--agent-config-only" ]; then
+  echo ""
+  echo "OK: agent config install/uninstall smoke test passed"
+  exit 0
+fi
 
 echo ""
 echo "=== Phase 10: binary security E2E ==="

@@ -435,8 +435,12 @@ static const char *DROP_INDEXES_SQL = "DROP INDEX IF EXISTS idx_nodes_label;"
 /* ── Export helpers ───────────────────────────────────────────────── */
 
 /* Prepare a stripped DB copy for best-quality export.
- * VACUUM INTO → drop indexes → VACUUM. Returns malloc'd buffer or NULL. */
-static char *prepare_stripped_db(const char *db_path, size_t *out_size) {
+ * VACUUM INTO → (optionally) drop indexes → VACUUM. Returns malloc'd buffer
+ * or NULL. VACUUM INTO runs on BOTH quality levels: it is the consistent
+ * snapshot — the store runs in WAL mode, so raw main-file bytes miss
+ * committed transactions still in the -wal and can be mid-checkpoint torn
+ * (#895). Only the index-stripping is BEST-only. */
+static char *prepare_snapshot_db(const char *db_path, size_t *out_size, bool strip_indexes) {
     char tmp_path[CBM_SZ_4K];
     snprintf(tmp_path, sizeof(tmp_path), "%s/cbm_artifact_tmp.db", cbm_tmpdir());
     cbm_unlink(tmp_path);
@@ -464,12 +468,14 @@ static char *prepare_stripped_db(const char *db_path, size_t *out_size) {
         return NULL;
     }
 
-    /* Strip indexes from the copy for better compression. */
-    sqlite3 *tmp_db = NULL;
-    if (sqlite3_open_v2(tmp_path, &tmp_db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK) {
-        sqlite3_exec(tmp_db, DROP_INDEXES_SQL, NULL, NULL, NULL);
-        sqlite3_exec(tmp_db, "VACUUM;", NULL, NULL, NULL);
-        sqlite3_close(tmp_db);
+    /* Strip indexes from the copy for better compression (BEST only). */
+    if (strip_indexes) {
+        sqlite3 *tmp_db = NULL;
+        if (sqlite3_open_v2(tmp_path, &tmp_db, SQLITE_OPEN_READWRITE, NULL) == SQLITE_OK) {
+            sqlite3_exec(tmp_db, DROP_INDEXES_SQL, NULL, NULL, NULL);
+            sqlite3_exec(tmp_db, "VACUUM;", NULL, NULL, NULL);
+            sqlite3_close(tmp_db);
+        }
     }
 
     char *data = read_file_alloc(tmp_path, out_size);
@@ -519,9 +525,12 @@ int cbm_artifact_export(const char *db_path, const char *repo_path, const char *
 
     if (quality == CBM_ARTIFACT_BEST) {
         compression_level = ART_ZSTD_BEST;
-        db_data = prepare_stripped_db(db_path, &db_size);
+        db_data = prepare_snapshot_db(db_path, &db_size, true);
     } else {
-        db_data = read_file_alloc(db_path, &db_size);
+        /* FAST keeps zstd-3 and its indexes, but still snapshots via
+         * VACUUM INTO: the raw main-file bytes of a live WAL store are a
+         * torn copy (#895). */
+        db_data = prepare_snapshot_db(db_path, &db_size, false);
     }
 
     if (!db_data || db_size == 0) {
@@ -689,8 +698,10 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
         return CBM_NOT_FOUND;
     }
 
-    /* Integrity check — refuse corrupted artifacts */
-    if (!cbm_store_check_integrity(store)) {
+    /* Deep integrity check — refuse corrupted artifacts. The shallow check
+     * only sanity-checks the projects table, so page-corrupted (torn)
+     * artifacts installed cleanly (#895); quick_check catches them. */
+    if (!cbm_store_check_integrity_deep(store)) {
         cbm_log_error("artifact.import", "err", "integrity_check_failed");
         cbm_store_close(store);
         cbm_unlink(tmp_path);
@@ -699,7 +710,11 @@ int cbm_artifact_import(const char *repo_path, const char *cache_db_path) {
 
     cbm_store_close(store);
 
-    /* Atomic rename to final path */
+    /* Atomic rename to final path. Drop the DESTINATION's leftover
+     * -wal/-shm first: the import cleans the tmp file's sidecars, but a
+     * stale WAL next to the cache path would be replayed on top of the
+     * imported file at the next open (#897). */
+    cbm_remove_db_sidecars(cache_db_path);
     if (rename(tmp_path, cache_db_path) != 0) {
         cbm_log_error("artifact.import", "err", "rename_to_cache");
         cbm_unlink(tmp_path);

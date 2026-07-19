@@ -345,6 +345,48 @@ inv_index_status_cli() {
     fi
 }
 
+# ── #773: second in-process index must not SIGABRT ─────────────────────────
+# Sequential run 1 (mimalloc-epoch parser on the calling thread) followed by
+# parallel run 2 (global ts allocator switched to the slab). The stale-parser
+# teardown used to free mi pointers through slab_free -> plain free() and
+# libmalloc aborted. ASan builds mask the allocator seam — this guard needs
+# the REAL binary.
+inv_second_index_inprocess() {
+    local base
+    base=$(mktemp -d "${TMPDIR:-/tmp}/cbm_inv773.XXXXXX")
+    mkdir -p "$base/dirA" "$base/dirB"
+    local i
+    for i in 1 2 3 4 5; do
+        printf 'class H%s:\n    def run(self, x):\n        return x + %s\n' "$i" "$i" > "$base/dirA/m$i.py"
+    done
+    for i in $(seq 1 60); do
+        printf 'def u_%s(y):\n    return y * %s\n' "$i" "$i" > "$base/dirB/u$i.py"
+    done
+    local infile="$base/in.jsonl"
+    {
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"inv773","version":"1"}}}'
+        printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized"}'
+        printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_repository","arguments":{"repo_path":"%s/dirA","mode":"full"}}}\n' "$base"
+        printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index_repository","arguments":{"repo_path":"%s/dirB","mode":"full"}}}\n' "$base"
+    } > "$infile"
+    # Re-open stdin from the file INSIDE the child: run_bounded's no-timeout
+    # fallback backgrounds the command, and background jobs get /dev/null
+    # stdin (POSIX), which would EOF the server before it answers.
+    run_bounded 120 env CBM_INDEX_SUPERVISOR=0 sh -c 'exec "$1" < "$2"' _ "$BINARY" "$infile"
+    local rc="$RB_RC"
+    local out="$RB_OUT"
+    rm -rf "$base"
+    if [ "$rc" -gt 128 ]; then
+        fail "second-index-inprocess" "server died (signal $((rc-128))) on the second in-process index (#773)"
+        return
+    fi
+    if printf '%s' "$out" | grep -q '"id":2' && printf '%s' "$out" | grep -q '"id":3'; then
+        pass "second-index-inprocess (both runs answered, no abort)"
+    else
+        fail "second-index-inprocess" "missing response (id2/id3) rc=$rc"
+    fi
+}
+
 # ══════════════════════════════════════════════════════════════════════════
 #  MCP STDIO SERVER LIFECYCLE
 # ══════════════════════════════════════════════════════════════════════════
@@ -1007,6 +1049,7 @@ inv_empty_repo_cli
 inv_garbage_files_cli
 inv_crasher_skipped_cli
 inv_hanger_skipped_cli
+inv_second_index_inprocess
 
 # MCP server-lifecycle invariants (one shared server instance).
 inv_mcp_initialize

@@ -1668,8 +1668,268 @@ TEST(store_coverage_roundtrip_prune_shadow) {
     PASS();
 }
 
+TEST(store_coverage_targeted_path_and_scope_lookup) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-targeted", "/tmp/coverage-targeted"),
+              CBM_STORE_OK);
+
+    /* Failure rows need live-file hash records so coverage_replace does not
+     * correctly prune them as deleted. By-design exclusions have no hashes. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-targeted", "src/partial.c", "", 10, 20),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-targeted", "src/skipped.c", "", 11, 21),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-targeted", "src2/other.c", "", 12, 22),
+              CBM_STORE_OK);
+
+    cbm_coverage_row_t rows[] = {
+        {.rel_path = "src/partial.c", .kind = "parse_partial", .detail = "7-9"},
+        {.rel_path = "src/skipped.c", .kind = "oversized", .detail = "too large"},
+        {.rel_path = "src2/other.c", .kind = "extract", .detail = "parser failed"},
+        {.rel_path = "generated", .kind = "not_indexed_dir", .detail = "excluded subtree"},
+        {.rel_path = "secret.c", .kind = "not_indexed_file", .detail = "gitignore"},
+    };
+    ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-targeted", rows, 5), CBM_STORE_OK);
+
+    cbm_coverage_row_t *got = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(s, "coverage-targeted", "src/partial.c", &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].rel_path, "src/partial.c");
+    ASSERT_STR_EQ(got[0].kind, "parse_partial");
+    ASSERT_STR_EQ(got[0].detail, "7-9");
+    cbm_store_free_coverage(got, count);
+
+    /* A file below an excluded directory inherits that directory row. */
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(s, "coverage-targeted", "generated/nested/file.c", &got,
+                                          &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].rel_path, "generated");
+    ASSERT_STR_EQ(got[0].kind, "not_indexed_dir");
+    cbm_store_free_coverage(got, count);
+
+    /* Prefixes must stop at path-segment boundaries. */
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(
+        cbm_store_coverage_get_path(s, "coverage-targeted", "generated2/file.c", &got, &count),
+        CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_coverage(got, count);
+
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_scope(s, "coverage-targeted", "src", &got, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(got[0].rel_path, "src/partial.c");
+    ASSERT_STR_EQ(got[1].rel_path, "src/skipped.c");
+    cbm_store_free_coverage(got, count);
+
+    /* A scope nested below an excluded directory still reports its ancestor. */
+    got = NULL;
+    count = 0;
+    ASSERT_EQ(
+        cbm_store_coverage_get_scope(s, "coverage-targeted", "generated/nested", &got, &count),
+        CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(got[0].rel_path, "generated");
+    cbm_store_free_coverage(got, count);
+
+    cbm_file_hash_t hash = {0};
+    ASSERT_EQ(cbm_store_get_file_hash(s, "coverage-targeted", "src/partial.c", &hash),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(hash.project, "coverage-targeted");
+    ASSERT_STR_EQ(hash.rel_path, "src/partial.c");
+    ASSERT_EQ(hash.mtime_ns, 10);
+    ASSERT_EQ(hash.size, 20);
+    cbm_store_clear_file_hash(&hash);
+    ASSERT_NULL(hash.project);
+    ASSERT_NULL(hash.rel_path);
+    ASSERT_NULL(hash.sha256);
+
+    ASSERT_EQ(cbm_store_get_file_hash(s, "coverage-targeted", "missing.c", &hash),
+              CBM_STORE_NOT_FOUND);
+    cbm_store_clear_file_hash(&hash);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_meta_zero_row_truncation_and_delete) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-meta", "/tmp/coverage-meta"), CBM_STORE_OK);
+
+    cbm_coverage_meta_t write_meta = {
+        .generation = "generation-42",
+        .index_mode = "fast",
+        .recording_status = "truncated",
+        .ignored_files_stored = 2000,
+        .ignored_files_total = 2501,
+        .coverage_version = 1,
+        .hash_records_complete = false,
+    };
+    /* Metadata is meaningful even when the authoritative miss set is empty. */
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-meta", NULL, 0, &write_meta),
+              CBM_STORE_OK);
+
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-meta", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_coverage(rows, count);
+
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-meta", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.project, "coverage-meta");
+    ASSERT_STR_EQ(got.generation, "generation-42");
+    ASSERT_NOT_NULL(got.recorded_at);
+    ASSERT_STR_EQ(got.index_mode, "fast");
+    ASSERT_STR_EQ(got.recording_status, "truncated");
+    ASSERT_EQ(got.ignored_files_stored, 2000);
+    ASSERT_EQ(got.ignored_files_total, 2501);
+    ASSERT_EQ(got.coverage_version, 1);
+    ASSERT_FALSE(got.hash_records_complete);
+    cbm_store_coverage_meta_clear(&got);
+    ASSERT_NULL(got.project);
+    ASSERT_NULL(got.generation);
+    ASSERT_NULL(got.recorded_at);
+    ASSERT_NULL(got.index_mode);
+    ASSERT_NULL(got.recording_status);
+
+    /* Replacing through the compatibility wrapper clears possibly-stale meta. */
+    ASSERT_EQ(cbm_store_coverage_replace(s, "coverage-meta", NULL, 0), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-meta", &got), CBM_STORE_NOT_FOUND);
+    cbm_store_coverage_meta_clear(&got);
+
+    /* Recreate metadata and a missed-graph node, then project deletion must
+     * remove the table rows, metadata, and the derived ::missed project. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-meta", "bad.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t failure = {.rel_path = "bad.c", .kind = "parse_partial", .detail = "1-2"};
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-meta", &failure, 1, &write_meta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_delete_project(s, "coverage-meta"), CBM_STORE_OK);
+
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-meta", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_coverage(rows, count);
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-meta", &got), CBM_STORE_NOT_FOUND);
+    cbm_store_coverage_meta_clear(&got);
+    cbm_project_t shadow = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "coverage-meta::missed", &shadow), CBM_STORE_NOT_FOUND);
+    cbm_project_free_fields(&shadow);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_replace_rejects_invalid_row_arguments) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-invalid", "/tmp/coverage-invalid"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-invalid", "kept.c", "", 1, 1), CBM_STORE_OK);
+    cbm_coverage_row_t kept = {.rel_path = "kept.c", .kind = "parse_partial", .detail = "3-4"};
+    cbm_coverage_meta_t original_meta = {
+        .generation = "before-invalid-call",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-invalid", &kept, 1, &original_meta),
+              CBM_STORE_OK);
+
+    cbm_coverage_meta_t replacement_meta = original_meta;
+    replacement_meta.generation = "must-not-commit";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-invalid", &kept, -1, &replacement_meta),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-invalid", NULL, 1, &replacement_meta),
+              CBM_STORE_ERR);
+
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-invalid", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].rel_path, "kept.c");
+    ASSERT_STR_EQ(rows[0].detail, "3-4");
+    cbm_store_free_coverage(rows, count);
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-invalid", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "before-invalid-call");
+    cbm_store_coverage_meta_clear(&got);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "coverage-shadow", "/tmp/coverage-shadow"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-shadow", "old.c", "", 1, 1), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(s, "coverage-shadow", "new.c", "", 2, 2), CBM_STORE_OK);
+
+    cbm_coverage_row_t old_row = {
+        .rel_path = "old.c", .kind = "parse_partial", .detail = "old-detail"};
+    cbm_coverage_meta_t old_meta = {
+        .generation = "old-generation",
+        .index_mode = "full",
+        .recording_status = "complete",
+        .coverage_version = 1,
+        .hash_records_complete = true,
+    };
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-shadow", &old_row, 1, &old_meta),
+              CBM_STORE_OK);
+    int old_shadow_nodes = cbm_store_count_nodes(s, "coverage-shadow::missed");
+    ASSERT_GT(old_shadow_nodes, 0);
+
+    /* Force only the derived-view rebuild to fail. The authoritative rows,
+     * metadata, and prior shadow graph must remain one atomic generation. */
+    ASSERT_EQ(cbm_store_exec(s, "CREATE TRIGGER fail_missed_insert BEFORE INSERT ON nodes "
+                                "WHEN NEW.project = 'coverage-shadow::missed' "
+                                "BEGIN SELECT RAISE(ABORT, 'forced missed shadow failure'); END;"),
+              CBM_STORE_OK);
+
+    cbm_coverage_row_t new_row = {
+        .rel_path = "new.c", .kind = "parse_partial", .detail = "new-detail"};
+    cbm_coverage_meta_t new_meta = old_meta;
+    new_meta.generation = "new-generation";
+    ASSERT_EQ(cbm_store_coverage_replace_ex(s, "coverage-shadow", &new_row, 1, &new_meta),
+              CBM_STORE_ERR);
+
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(s, "coverage-shadow", &rows, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].rel_path, "old.c");
+    ASSERT_STR_EQ(rows[0].detail, "old-detail");
+    cbm_store_free_coverage(rows, count);
+
+    cbm_coverage_meta_t got = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(s, "coverage-shadow", &got), CBM_STORE_OK);
+    ASSERT_STR_EQ(got.generation, "old-generation");
+    cbm_store_coverage_meta_clear(&got);
+    ASSERT_EQ(cbm_store_count_nodes(s, "coverage-shadow::missed"), old_shadow_nodes);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 SUITE(store_nodes) {
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
+    RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
+    RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);
+    RUN_TEST(store_coverage_replace_rejects_invalid_row_arguments);
+    RUN_TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails);
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);

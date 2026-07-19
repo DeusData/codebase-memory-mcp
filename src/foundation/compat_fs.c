@@ -392,17 +392,25 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return f;
 }
 
+static bool cbm_windows_mkdir_component(wchar_t *path) {
+    if (_wmkdir(path) != 0 && errno != EEXIST) {
+        return false;
+    }
+    DWORD attributes = GetFileAttributesW(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0U &&
+           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+}
+
 bool cbm_mkdir_p(const char *path, int mode) {
     (void)mode;
+    if (!path || path[0] == '\0') {
+        return false;
+    }
     wchar_t *wpath = cbm_utf8_to_wide(path);
     if (!wpath) {
         return false;
     }
 
-    if (_wmkdir(wpath) == 0) {
-        free(wpath);
-        return true;
-    }
     size_t wlen = wcslen(wpath);
     wchar_t *tmp = (wchar_t *)malloc((wlen + 1) * sizeof(wchar_t));
     if (!tmp) {
@@ -410,14 +418,35 @@ bool cbm_mkdir_p(const char *path, int mode) {
         return false;
     }
     wmemcpy(tmp, wpath, wlen + 1);
-    for (wchar_t *p = tmp + SKIP_ONE; *p; p++) {
-        if (*p == L'/' || *p == L'\\') {
-            *p = L'\0';
-            _wmkdir(tmp);
-            *p = L'\\';
+    size_t start = wlen > 0U && (tmp[0] == L'/' || tmp[0] == L'\\') ? 1U : 0U;
+    if (wlen >= 3U && tmp[1] == L':' && (tmp[2] == L'/' || tmp[2] == L'\\')) {
+        start = 3U;
+    } else if (wlen >= 2U && (tmp[0] == L'/' || tmp[0] == L'\\') &&
+               (tmp[1] == L'/' || tmp[1] == L'\\')) {
+        size_t separators = 0U;
+        start = 2U;
+        while (start < wlen && separators < 2U) {
+            if (tmp[start] == L'/' || tmp[start] == L'\\') {
+                separators++;
+            }
+            start++;
         }
     }
-    bool ok = _wmkdir(tmp) == 0 || GetLastError() == ERROR_ALREADY_EXISTS;
+    bool ok = true;
+    for (wchar_t *p = tmp + start; ok && *p; p++) {
+        if (*p == L'/' || *p == L'\\') {
+            if (p == tmp || p[-1] == L'/' || p[-1] == L'\\') {
+                continue;
+            }
+            wchar_t separator = *p;
+            *p = L'\0';
+            ok = cbm_windows_mkdir_component(tmp);
+            *p = separator;
+        }
+    }
+    if (ok) {
+        ok = cbm_windows_mkdir_component(tmp);
+    }
     free(tmp);
     free(wpath);
     return ok;
@@ -584,6 +613,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -656,24 +686,82 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
-bool cbm_mkdir_p(const char *path, int mode) {
-    /* Try direct mkdir first */
-    if (mkdir(path, (mode_t)mode) == 0) {
-        return true;
+static int cbm_open_directory_component(int parent, const char *component, int flags) {
+    int descriptor = openat(parent, component, flags);
+#if defined(O_NOFOLLOW) && defined(AT_SYMLINK_NOFOLLOW)
+    if (descriptor < 0) {
+        struct stat state;
+        if (fstatat(parent, component, &state, AT_SYMLINK_NOFOLLOW) == 0 &&
+            S_ISLNK(state.st_mode) && state.st_uid == 0U) {
+            descriptor = openat(parent, component, flags & ~O_NOFOLLOW);
+        }
     }
-    /* Walk path and create each component */
+#endif
+    return descriptor;
+}
+
+bool cbm_mkdir_p(const char *path, int mode) {
+    if (!path || path[0] == '\0') {
+        return false;
+    }
     char *tmp = strdup(path);
     if (!tmp) {
         return false;
     }
-    for (char *p = tmp + SKIP_ONE; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(tmp, (mode_t)mode); /* ignore intermediate errors */
-            *p = '/';
+
+    int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+    int directory = open(path[0] == '/' ? "/" : ".", flags);
+    if (directory < 0) {
+        free(tmp);
+        return false;
+    }
+
+    bool ok = true;
+    char *cursor = tmp;
+    while (*cursor == '/') {
+        cursor++;
+    }
+    while (ok && *cursor) {
+        char *separator = strchr(cursor, '/');
+        if (separator) {
+            *separator = '\0';
+        }
+        if (cursor[0] != '\0' && strcmp(cursor, ".") != 0) {
+            int next = cbm_open_directory_component(directory, cursor, flags);
+            if (next < 0 && errno == ENOENT) {
+                if (mkdirat(directory, cursor, (mode_t)mode) != 0 && errno != EEXIST) {
+                    ok = false;
+                } else {
+                    next = cbm_open_directory_component(directory, cursor, flags);
+                }
+            }
+            if (ok && next < 0) {
+                ok = false;
+            }
+            if (ok) {
+                (void)close(directory);
+                directory = next;
+            }
+        }
+        if (!separator) {
+            break;
+        }
+        *separator = '/';
+        cursor = separator + 1;
+        while (*cursor == '/') {
+            cursor++;
         }
     }
-    bool ok = (mkdir(tmp, (mode_t)mode) == 0 || errno == EEXIST) != 0;
+    (void)close(directory);
     free(tmp);
     return ok;
 }
@@ -713,3 +801,93 @@ int cbm_exec_no_shell(const char *const *argv) {
 }
 
 #endif /* _WIN32 */
+
+/* Canonicalize an EXISTING path (collapse `..`, resolve per-OS): realpath on
+ * POSIX; on Windows a wide-path GetFileAttributesW existence check +
+ * GetFullPathNameW. The previous callers used the ANSI CRT (_access/
+ * _fullpath) on UTF-8 input — locale-dependent by construction: on a CJK
+ * system codepage (e.g. Big5) the UTF-8 bytes of a CJK path re-decode into
+ * different characters and canonicalization corrupts the path (#973).
+ * Returns 0 when the path does not exist or cannot be resolved. */
+int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz == 0) {
+        return 0;
+    }
+#ifdef _WIN32
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return 0;
+    }
+    if (GetFileAttributesW(wpath) == INVALID_FILE_ATTRIBUTES) {
+        free(wpath);
+        return 0;
+    }
+    enum { CANON_WIDE_MAX = 4096 };
+    wchar_t wfull[CANON_WIDE_MAX];
+    DWORD n = GetFullPathNameW(wpath, CANON_WIDE_MAX, wfull, NULL);
+    free(wpath);
+    if (n == 0 || n >= CANON_WIDE_MAX) {
+        return 0;
+    }
+    char *utf8 = cbm_wide_to_utf8(wfull);
+    if (!utf8) {
+        return 0;
+    }
+    size_t len = strlen(utf8);
+    if (len >= out_sz) {
+        free(utf8);
+        return 0;
+    }
+    memcpy(out, utf8, len + 1);
+    free(utf8);
+    return 1;
+#else
+    /* Callers pass >= 4K buffers (>= PATH_MAX on our platforms). */
+    return realpath(path, out) != NULL;
+#endif
+}
+
+/* rename() with overwrite semantics on every platform: POSIX rename already
+ * replaces atomically; Windows rename fails with EEXIST when the target
+ * exists, so use write-through MoveFileExW(MOVEFILE_REPLACE_EXISTING) there
+ * (wide paths — raw MoveFileExA would re-mangle non-ASCII cache paths). */
+int cbm_rename_replace(const char *src, const char *dst) {
+#ifdef _WIN32
+    wchar_t *wsrc = cbm_utf8_to_wide(src);
+    wchar_t *wdst = cbm_utf8_to_wide(dst);
+    int ret = CBM_NOT_FOUND;
+    if (wsrc && wdst) {
+        ret =
+            MoveFileExW(wsrc, wdst,
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED | MOVEFILE_WRITE_THROUGH)
+                ? 0
+                : CBM_NOT_FOUND;
+    }
+    free(wsrc);
+    free(wdst);
+    return ret;
+#else
+    return rename(src, dst);
+#endif
+}
+
+/* Remove a SQLite database's -wal/-shm sidecars (both platforms). Any code
+ * path that installs a FRESH database file where a previous generation lived
+ * must remove them before the new generation can be opened: SQLite decides
+ * whether to replay a WAL purely from the sidecar's own header/checksums, so
+ * a leftover WAL can splice old-generation pages into the new file (#897). */
+void cbm_remove_db_sidecars(const char *db_path) {
+    if (!db_path || !db_path[0]) {
+        return;
+    }
+    enum { SIDECAR_PATH_MAX = 4096 };
+    char side[SIDECAR_PATH_MAX];
+    int n = snprintf(side, sizeof(side), "%s-wal", db_path);
+    if (n > 0 && (size_t)n < sizeof(side)) {
+        (void)cbm_unlink(side);
+    }
+    n = snprintf(side, sizeof(side), "%s-shm", db_path);
+    if (n > 0 && (size_t)n < sizeof(side)) {
+        (void)cbm_unlink(side);
+    }
+}

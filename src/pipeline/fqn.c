@@ -5,6 +5,7 @@
  * Handles Python __init__.py, JS/TS index.{js,ts}, path separators.
  */
 #include "pipeline/pipeline.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform.h"
 
@@ -116,7 +117,19 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
 
     char *path = strdup(rel_path ? rel_path : "");
     cbm_normalize_path_sep(path);
-    strip_file_extension(path);
+    /* #1077/#964: File-node QNs (name=="__file__") must preserve the full
+     * filename so sibling files sharing a stem get DISTINCT nodes — e.g.
+     * .env / .env.local / .env.production (which all strip to ".env" and
+     * collide, so only one survives per directory), and a C/C++ header vs
+     * its same-stem .cpp. Extension stripping stays for MODULE/symbol QNs
+     * (name==NULL or a symbol): that stem unification is load-bearing for
+     * C/C++ declaration↔definition cross-file resolution. All 26 __file__
+     * QN sites route through here, so creation and every lookup stay
+     * consistent. */
+    bool is_file_qn = name && strcmp(name, "__file__") == 0;
+    if (!is_file_qn) {
+        strip_file_extension(path);
+    }
 
     const char *segments[CBM_SZ_256];
     int seg_count = 0;
@@ -410,17 +423,12 @@ char *cbm_project_name_from_path(const char *abs_path) {
 
     char real[CBM_SZ_4K];
     const char *name_path = abs_path;
-#ifdef _WIN32
-    if (_access(abs_path, 0) == 0 && _fullpath(real, abs_path, sizeof(real))) {
+    /* Wide-path canonicalization — the ANSI _access/_fullpath pair corrupted
+     * CJK paths on CJK-locale Windows (#973). */
+    if (cbm_canonical_path(abs_path, real, sizeof(real))) {
         cbm_normalize_path_sep(real);
         name_path = real;
     }
-#else
-    if (realpath(abs_path, real)) {
-        cbm_normalize_path_sep(real);
-        name_path = real;
-    }
-#endif
 
     /* Work on mutable copy */
     char *path = strdup(name_path);

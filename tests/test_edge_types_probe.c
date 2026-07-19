@@ -222,6 +222,63 @@ static cbm_store_t *et_index_parallel(EtProj *lp, const EtFile *meaningful, int 
     return et_index_files(lp, files, n);
 }
 
+/* #1085: count CALLS edges whose target node has `name`, indexing via the
+ * PARALLEL path (et_index_parallel pads to >50 files). The parallel resolver
+ * used to drop the edge whenever the LSP resolved a callee but its target QN
+ * wasn't a gbuf node (JSX component imported through a tsconfig `paths` alias:
+ * the TS LSP resolves the element ref to an alias-path QN that never matches a
+ * def node) — sequential kept the edge via the registry import_map fallback,
+ * so the two pipelines disagreed and ~21% of a Next.js call graph vanished on
+ * the default (parallel) path. Needs >50 files to reproduce. */
+static int et_calls_to_name_parallel(const EtFile *meaningful, int n_mean, const char *name) {
+    EtProj lp;
+    cbm_store_t *store = et_index_parallel(&lp, meaningful, n_mean);
+    int hits = 0;
+    if (store) {
+        cbm_edge_t *edges = NULL;
+        int n = 0;
+        if (cbm_store_find_edges_by_type(store, lp.project, "CALLS", &edges, &n) == CBM_STORE_OK) {
+            for (int i = 0; i < n; i++) {
+                cbm_node_t tgt;
+                if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) != CBM_STORE_OK)
+                    continue;
+                if (tgt.name && strcmp(tgt.name, name) == 0)
+                    hits++;
+                cbm_node_free_fields(&tgt);
+            }
+            cbm_store_free_edges(edges, n);
+        }
+    }
+    et_cleanup(&lp, store);
+    return hits;
+}
+
+TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085) {
+    static const EtFile f[] = {
+        {"tsconfig.json",
+         "{ \"compilerOptions\": { \"baseUrl\": \".\", "
+         "\"paths\": { \"@/*\": [\"./src/*\"] } } }\n"},
+        {"src/components/ui/kpi-card.tsx",
+         "export function KpiCard({ label }: { label: string }) {\n"
+         "  return <div>{label}</div>;\n}\n"},
+        {"src/app/dashboard-a.tsx",
+         "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
+         "export function DashboardA() {\n  return <KpiCard label=\"a\" />;\n}\n"},
+        {"src/app/dashboard-b.tsx",
+         "import { KpiCard } from \"@/components/ui/kpi-card\";\n"
+         "export function DashboardB() {\n  return <KpiCard label=\"b\" />;\n}\n"}};
+    /* RED before the fix: 0 (parallel drops alias-JSX). GREEN: both renders
+     * resolve, exactly as the sequential path already does. */
+    int hits = et_calls_to_name_parallel(f, 4, "KpiCard");
+    if (hits < 2) {
+        fprintf(stderr, "  [1085] FAIL CALLS->KpiCard on parallel path = %d (expected >= 2); "
+                        "alias-imported JSX component edges dropped\n",
+                hits);
+    }
+    ASSERT_TRUE(hits >= 2);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  HANDLES — route→handler across web frameworks
  *
@@ -381,6 +438,31 @@ TEST(handles_spring_kotlin) {
     PASS();
 }
 
+/* JAX-RS (Java): the verb (@GET) and the path (@Path) are sibling
+ * annotations, and the class-level @Path must prefix method-level paths.
+ * Reproduce-first (#1005): the first-mapping-annotation scan dropped every
+ * method-level @Path, collapsing all methods onto a single "/" Route node;
+ * only the exact Route-name set catches that through the emission dedup. */
+TEST(handles_jaxrs_java) {
+    static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
+    static const EtFile f[] = {
+        {"WidgetResource.java",
+         "package com.example;\n\n"
+         "import jakarta.ws.rs.GET;\n"
+         "import jakarta.ws.rs.Path;\n\n"
+         "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
+         "    @GET\n"
+         "    public String list() {\n"
+         "        return \"widgets\";\n    }\n\n"
+         "    @GET\n"
+         "    @Path(\"/count\")\n"
+         "    public String count() {\n"
+         "        return \"42\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* ASP.NET Minimal API (C#) — route registration via static MapGet/MapPost calls
  * with identifier handlers, under a Microsoft/AspNetCore path so the resolved
  * callee QN carries the "MapGet"/"Microsoft.AspNetCore" route-reg substrings.
@@ -432,6 +514,52 @@ TEST(handles_laravel_php) {
          "Route::get('/users', 'showUsers');\n"
          "Route::post('/users', 'storeUser');\n"}};
     ASSERT_TRUE(et_edge_present(f, 2, "HANDLES", 1));
+    PASS();
+}
+
+/* #952: facade-style Laravel — the ONLY style real apps use, since the
+ * Illuminate facade lives in vendor/ and is never indexed. The callee of
+ * `Route::get(...)` (scoped_call_expression) was extracted as bare "get", so
+ * the empty-resolution route fallback ("::get" suffix table) never engaged
+ * and NO Route node minted — not even for flat registrations. Grouped routes
+ * additionally need the enclosing `prefix('/x')->group(...)` chain composed
+ * (same class as Spring's #734). Exact-set assertion distinguishes
+ * prefix-dropped from missing entirely. */
+TEST(handles_laravel_facade_routes_issue952) {
+    static const char *routes[] = {"/api/welcome", "/users/me", "/users/login",
+                                   "/companies/tenants/list", NULL};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n\n"
+         "Route::get('/api/welcome', WelcomeController::class);\n"
+         "Route::prefix('/users')->middleware(DomainCheckMiddleware::class)"
+         "->group(function (): void {\n"
+         "    Route::get('/me', GetCurrentUserController::class);\n"
+         "    Route::post('/login', LoginUserController::class);\n"
+         "});\n"
+         "Route::prefix('companies')->group(function (): void {\n"
+         "    Route::prefix('tenants')->group(function (): void {\n"
+         "        Route::get('/list', ListTenantsController::class);\n"
+         "    });\n"
+         "});\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* #952 inverse guard: a non-router static call whose method name collides
+ * with a route verb (Cache::get) must NOT mint a Route node — the callee
+ * qualification is route-table-gated and the path gate requires a leading
+ * slash. */
+TEST(handles_laravel_facade_no_junk_routes_issue952) {
+    static const char *routes[] = {"/real", NULL};
+    static const EtFile f[] = {
+        {"routes/api.php",
+         "<?php\nuse Illuminate\\Support\\Facades\\Route;\n"
+         "use Illuminate\\Support\\Facades\\Cache;\n\n"
+         "Route::get('/real', RealController::class);\n"
+         "$v = Cache::get('users.count');\n"
+         "$w = Cache::get('/leading/slash/key');\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
     PASS();
 }
 
@@ -1442,7 +1570,8 @@ TEST(override_go_interface) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(edge_types_probe) {
-    /* HANDLES — route→handler across web frameworks (8 frameworks) */
+    /* HANDLES — route→handler across web frameworks */
+    RUN_TEST(calls_jsx_component_via_tsconfig_alias_parallel_issue1085);
     RUN_TEST(handles_flask_python);
     RUN_TEST(handles_fastapi_python);
     RUN_TEST(handles_drf_action_python);
@@ -1451,8 +1580,11 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
     RUN_TEST(handles_spring_kotlin);
+    RUN_TEST(handles_jaxrs_java);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
+    RUN_TEST(handles_laravel_facade_routes_issue952);
+    RUN_TEST(handles_laravel_facade_no_junk_routes_issue952);
     RUN_TEST(handles_rails_ruby);
     RUN_TEST(handles_actix_rust);
 

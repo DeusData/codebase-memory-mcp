@@ -755,10 +755,18 @@ static void expr_free(cbm_expr_t *e) {
             safe_str_free(&cur->cond.property);
             safe_str_free(&cur->cond.op);
             safe_str_free(&cur->cond.value);
+            safe_str_free(&cur->cond.coalesce_default);
             for (int i = 0; i < cur->cond.in_value_count; i++) {
                 safe_str_free(&cur->cond.in_values[i]);
             }
             free(cur->cond.in_values);
+            safe_str_free(&cur->cond.func);
+            for (int i = 0; i < cur->cond.arg_count; i++) {
+                safe_str_free(&cur->cond.args[i].variable);
+                safe_str_free(&cur->cond.args[i].property);
+                safe_str_free(&cur->cond.args[i].literal);
+            }
+            free(cur->cond.args);
         }
         if (cur->right) {
             if (top < EXPR_FREE_STACK) {
@@ -837,6 +845,37 @@ static const char *unsupported_clause_error(cbm_token_type_t type) {
 
 /* Forward declarations for recursive descent */
 static cbm_expr_t *parse_or_expr(parser_t *p);
+/* Multi-arg scalar function support, shared with the RETURN-item parser (#874) */
+static bool is_multiarg_func_call(parser_t *p);
+static int parse_multiarg_func_item(parser_t *p, cbm_return_item_t *item);
+
+/* Free a multi-arg function argument array. */
+static void func_args_free(cbm_func_arg_t *args, int count) {
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&args[i].variable);
+        safe_str_free(&args[i].property);
+        safe_str_free(&args[i].literal);
+    }
+    free(args);
+}
+
+/* Free the fields of a partially-parsed multi-arg function item. */
+static void func_item_fields_free(cbm_return_item_t *item) {
+    safe_str_free(&item->variable);
+    safe_str_free(&item->property);
+    safe_str_free(&item->func);
+    func_args_free(item->args, item->arg_count);
+    item->args = NULL;
+    item->arg_count = 0;
+}
+
+/* Free the function-call fields of a WHERE condition (#874). */
+static void cond_func_fields_free(cbm_condition_t *c) {
+    safe_str_free(&c->func);
+    func_args_free(c->args, c->arg_count);
+    c->args = NULL;
+    c->arg_count = 0;
+}
 
 /* Parse IN [val, val, ...] list. Returns expr_leaf or NULL on error. */
 static cbm_expr_t *parse_in_list(parser_t *p, cbm_condition_t *c) {
@@ -1007,6 +1046,134 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     return expr_leaf(c);
 }
 
+/* Parse the operator + value tail shared by every condition subject
+ * (var[.prop] and multi-arg functions like coalesce(...)): IS [NOT] NULL,
+ * IN [...], or a comparison operator with a literal value. */
+static cbm_expr_t *parse_condition_op(parser_t *p, cbm_condition_t *c) {
+    /* IS NULL / IS NOT NULL */
+    if (check(p, TOK_IS)) {
+        advance(p);
+        if (match(p, TOK_NOT)) {
+            c->op = heap_strdup("IS NOT NULL");
+            expect(p, TOK_NULL_KW);
+        } else {
+            expect(p, TOK_NULL_KW);
+            c->op = heap_strdup("IS NULL");
+        }
+        return expr_leaf(*c);
+    }
+
+    /* IN [...] */
+    if (check(p, TOK_IN)) {
+        cbm_expr_t *e = parse_in_list(p, c);
+        if (!e) {
+            cond_func_fields_free(c);
+        }
+        return e;
+    }
+
+    /* Standard operators */
+    c->op = parse_comparison_op(p);
+    if (!c->op) {
+        snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
+        cond_func_fields_free(c);
+        safe_str_free(&c->variable);
+        safe_str_free(&c->property);
+        safe_str_free(&c->coalesce_default);
+        return NULL;
+    }
+
+    /* Value */
+    if (check(p, TOK_STRING) || check(p, TOK_NUMBER)) {
+        c->value = heap_strdup(advance(p)->text);
+    } else if (check(p, TOK_TRUE)) {
+        advance(p);
+        c->value = heap_strdup("true");
+    } else if (check(p, TOK_FALSE)) {
+        advance(p);
+        c->value = heap_strdup("false");
+    } else {
+        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
+        cond_func_fields_free(c);
+        safe_str_free(&c->variable);
+        safe_str_free(&c->property);
+        safe_str_free(&c->op);
+        safe_str_free(&c->coalesce_default);
+        return NULL;
+    }
+
+    return expr_leaf(*c);
+}
+
+/* parse_condition_lhs result: the label-test form is a complete condition. */
+enum { COND_LHS_COMPLETE = 1 };
+
+/* Parse the left-hand side of a WHERE condition into c.
+ * Returns CBM_NOT_FOUND on error, 0 when an operator/value should follow, and
+ * COND_LHS_COMPLETE when the condition is already complete (label test). */
+static int parse_condition_lhs(parser_t *p, cbm_condition_t *c) {
+    if (is_multiarg_func_call(p)) {
+        /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
+         * Reuse the RETURN-item parser, then move ownership into the condition. */
+        cbm_return_item_t fitem;
+        memset(&fitem, 0, sizeof(fitem));
+        if (parse_multiarg_func_item(p, &fitem) < 0) {
+            func_item_fields_free(&fitem);
+            return CBM_NOT_FOUND;
+        }
+        c->variable = fitem.variable;
+        c->property = fitem.property;
+        c->func = fitem.func;
+        c->args = fitem.args;
+        c->arg_count = fitem.arg_count;
+        return 0;
+    }
+
+    if (check(p, TOK_IDENT) && p->pos + SKIP_ONE < p->count &&
+        p->tokens[p->pos + SKIP_ONE].type == TOK_LPAREN) {
+        /* Unrecognised function call in WHERE — fail loudly with the supported
+         * set instead of the misleading "unexpected operator" (#874). */
+        snprintf(p->error, sizeof(p->error),
+                 "unsupported function '%s' in WHERE (supported: coalesce, substring, replace, "
+                 "left, right)",
+                 peek(p)->text);
+        return CBM_NOT_FOUND;
+    }
+
+    const cbm_token_t *var = expect(p, TOK_IDENT);
+    if (!var) {
+        return CBM_NOT_FOUND;
+    }
+
+    /* Label test: WHERE n:Label (openCypher, #241). Modelled as a leaf with
+     * op="HAS_LABEL" and value=Label, evaluated against the bound node's label. */
+    if (check(p, TOK_COLON)) {
+        advance(p);
+        const cbm_token_t *lbl = expect(p, TOK_IDENT);
+        if (!lbl) {
+            return CBM_NOT_FOUND;
+        }
+        c->variable = heap_strdup(var->text);
+        c->op = heap_strdup("HAS_LABEL");
+        c->value = heap_strdup(lbl->text);
+        return COND_LHS_COMPLETE;
+    }
+
+    if (match(p, TOK_DOT)) {
+        const cbm_token_t *prop = expect(p, TOK_IDENT);
+        if (!prop) {
+            return CBM_NOT_FOUND;
+        }
+        c->variable = heap_strdup(var->text);
+        c->property = heap_strdup(prop->text);
+    } else {
+        /* No dot: bare alias (e.g. post-WITH variable like "cnt") */
+        c->variable = heap_strdup(var->text);
+        c->property = NULL;
+    }
+    return 0;
+}
+
 static cbm_expr_t *parse_condition_expr(parser_t *p) {
     /* Check for NOT prefix at condition level (e.g. NOT n.name CONTAINS "x") */
     bool negated = match(p, TOK_NOT);
@@ -1016,86 +1183,19 @@ static cbm_expr_t *parse_condition_expr(parser_t *p) {
         return parse_exists_predicate(p, negated);
     }
 
-    const cbm_token_t *var = expect(p, TOK_IDENT);
-    if (!var) {
-        return NULL;
-    }
-
     cbm_condition_t c = {0};
     c.negated = negated;
 
-    /* Label test: WHERE n:Label (openCypher, #241). Modelled as a leaf with
-     * op="HAS_LABEL" and value=Label, evaluated against the bound node's label. */
-    if (check(p, TOK_COLON)) {
-        advance(p);
-        const cbm_token_t *lbl = expect(p, TOK_IDENT);
-        if (!lbl) {
-            return NULL;
-        }
-        c.variable = heap_strdup(var->text);
-        c.op = heap_strdup("HAS_LABEL");
-        c.value = heap_strdup(lbl->text);
+    int lhs_rc = parse_condition_lhs(p, &c);
+    if (lhs_rc < 0) {
+        return NULL;
+    }
+    if (lhs_rc > 0) {
+        /* HAS_LABEL leaf — complete condition, no operator follows */
         return expr_leaf(c);
     }
 
-    if (match(p, TOK_DOT)) {
-        const cbm_token_t *prop = expect(p, TOK_IDENT);
-        if (!prop) {
-            return NULL;
-        }
-        c.variable = heap_strdup(var->text);
-        c.property = heap_strdup(prop->text);
-    } else {
-        /* No dot: bare alias (e.g. post-WITH variable like "cnt") */
-        c.variable = heap_strdup(var->text);
-        c.property = NULL;
-    }
-
-    /* IS NULL / IS NOT NULL */
-    if (check(p, TOK_IS)) {
-        advance(p);
-        if (match(p, TOK_NOT)) {
-            c.op = heap_strdup("IS NOT NULL");
-            expect(p, TOK_NULL_KW);
-        } else {
-            expect(p, TOK_NULL_KW);
-            c.op = heap_strdup("IS NULL");
-        }
-        return expr_leaf(c);
-    }
-
-    /* IN [...] */
-    if (check(p, TOK_IN)) {
-        return parse_in_list(p, &c);
-    }
-
-    /* Standard operators */
-    c.op = parse_comparison_op(p);
-    if (!c.op) {
-        snprintf(p->error, sizeof(p->error), "unexpected operator at pos %d", peek(p)->pos);
-        safe_str_free(&c.variable);
-        safe_str_free(&c.property);
-        return NULL;
-    }
-
-    /* Value */
-    if (check(p, TOK_STRING) || check(p, TOK_NUMBER)) {
-        c.value = heap_strdup(advance(p)->text);
-    } else if (check(p, TOK_TRUE)) {
-        advance(p);
-        c.value = heap_strdup("true");
-    } else if (check(p, TOK_FALSE)) {
-        advance(p);
-        c.value = heap_strdup("false");
-    } else {
-        snprintf(p->error, sizeof(p->error), "expected value at pos %d", peek(p)->pos);
-        safe_str_free(&c.variable);
-        safe_str_free(&c.property);
-        safe_str_free(&c.op);
-        return NULL;
-    }
-
-    return expr_leaf(c);
+    return parse_condition_op(p, &c);
 }
 
 /* Atom: ( expr ) | condition */
@@ -1949,6 +2049,8 @@ static void free_where(cbm_where_clause_t *w) {
             safe_str_free(&w->conditions[i].in_values[j]);
         }
         free(w->conditions[i].in_values);
+        safe_str_free(&w->conditions[i].func);
+        func_args_free(w->conditions[i].args, w->conditions[i].arg_count);
     }
     free(w->conditions);
     safe_str_free(&w->op);
@@ -2061,8 +2163,13 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
     } fields[] = {
         {"name", offsetof(cbm_node_t, name)},
         {"qualified_name", offsetof(cbm_node_t, qualified_name)},
+        /* Aliases: field-eval agents reach for the short names, and a miss
+         * used to return a silent empty column costing a round-trip. */
+        {"qn", offsetof(cbm_node_t, qualified_name)},
         {"label", offsetof(cbm_node_t, label)},
         {"file_path", offsetof(cbm_node_t, file_path)},
+        {"file", offsetof(cbm_node_t, file_path)},
+        {"path", offsetof(cbm_node_t, file_path)},
     };
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         if (strcmp(prop, fields[i].key) == 0) {
@@ -2184,15 +2291,49 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
         p++;
     }
     if (*p == '"') {
-        /* String value */
+        /* String value — honor backslash escapes: without this, an embedded \"
+         * cuts the value short at the first escaped quote. */
         p++;
         size_t i = 0;
         while (*p && *p != '"' && i < buf_sz - SKIP_ONE) {
+            if (*p == '\\' && p[SKIP_ONE] && i + SKIP_ONE < buf_sz - SKIP_ONE) {
+                buf[i++] = *p++; /* keep the escape pair intact */
+            }
             buf[i++] = *p++;
         }
         buf[i] = '\0';
+    } else if (*p == '[' || *p == '{') {
+        /* Array/object value — copy the whole balanced construct. A scan-to-comma
+         * truncates at the first comma INSIDE the value: e.g. a decorators array
+         * ["@Roles('OWNER', 'ADMIN')","@Get()"] came back as ["@Roles('OWNER'. */
+        char open = *p;
+        char close = (open == '[') ? ']' : '}';
+        int depth = 0;
+        int in_str = 0;
+        size_t i = 0;
+        while (*p && i < buf_sz - SKIP_ONE) {
+            char c = *p;
+            if (in_str) {
+                if (c == '\\' && p[SKIP_ONE] && i + SKIP_ONE < buf_sz - SKIP_ONE) {
+                    buf[i++] = *p++; /* escape pair stays intact */
+                } else if (c == '"') {
+                    in_str = 0;
+                }
+            } else if (c == '"') {
+                in_str = 1;
+            } else if (c == open) {
+                depth++;
+            } else if (c == close) {
+                depth--;
+            }
+            buf[i++] = *p++;
+            if (!in_str && depth == 0) {
+                break; /* outer bracket closed */
+            }
+        }
+        buf[i] = '\0';
     } else {
-        /* Numeric or other value */
+        /* Numeric or other scalar value */
         size_t i = 0;
         while (*p && *p != ',' && *p != '}' && *p != ' ' && i < buf_sz - SKIP_ONE) {
             buf[i++] = *p++;
@@ -2338,8 +2479,26 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
     b->var_count++;
 }
 
+static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *item, char *buf,
+                                      size_t bufsz);
+
 /* Resolve the actual property value for a condition from a binding */
 static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b) {
+    /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
+     * Evaluated through the same code path as RETURN projections. The value is
+     * consumed by eval_condition before any other condition is resolved, so a
+     * single thread-local buffer per call is safe. */
+    if (c->func) {
+        static _Thread_local char func_buf[CBM_SZ_512];
+        cbm_return_item_t item = {0};
+        item.variable = c->variable;
+        item.property = c->property;
+        item.func = c->func;
+        item.args = c->args;
+        item.arg_count = c->arg_count;
+        return eval_multiarg_func(b, &item, func_buf, sizeof(func_buf));
+    }
+
     cbm_edge_t *e = binding_get_edge(b, c->variable);
     if (e) {
         return edge_prop(e, c->property);
@@ -2444,6 +2603,11 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
     }
 
     const char *actual = resolve_condition_value(c, b);
+    /* coalesce(var.prop, literal) (#874): a missing/empty property value
+     * falls back to the literal default before the operator runs. */
+    if (c->coalesce_default && (!actual || actual[0] == '\0')) {
+        actual = c->coalesce_default;
+    }
     if (!actual) {
         return true;
     }
@@ -2598,6 +2762,49 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 /* Hard ceiling: queries returning more than this trigger an error instead of data.
  * Prevents accidental multi-GB JSON payloads from unbounded MATCH (n) RETURN n. */
 #define CYPHER_RESULT_CEILING 100000
+
+/* Wall-clock execution deadline (#601). The row ceiling above only fires once
+ * rows exist, but an unbounded `OPTIONAL MATCH` over the full node set (or a
+ * GROUP BY with ~one group per node) does O(bindings x groups) work and can run
+ * for minutes — exhausting RAM/CPU — before a single row is produced, so the
+ * ceiling never trips and the caller just hangs. A monotonic deadline aborts
+ * such runaway queries with a clear, actionable error. Checked (throttled) in
+ * the scan, expansion and aggregation hot loops. */
+#define CYPHER_DEADLINE_BUDGET_MS 30000  /* 30s: generous for legit heavy queries */
+#define CYPHER_DEADLINE_CHECK_MASK 0x3FF /* sample the clock every 1024 iterations */
+
+static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
+static _Thread_local bool g_cypher_timed_out = false;
+static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
+
+static void cypher_deadline_arm(void) {
+    g_cypher_timed_out = false;
+    int64_t budget = g_cypher_deadline_override_ms >= 0 ? g_cypher_deadline_override_ms
+                                                        : CYPHER_DEADLINE_BUDGET_MS;
+    g_cypher_deadline_ms = cbm_now_ms() + (uint64_t)budget;
+}
+
+/* True once the query has run past its wall-clock budget. Sticky: after the
+ * first trip every subsequent call returns true, so later loops short-circuit. */
+static bool cypher_deadline_exceeded(void) {
+    if (g_cypher_timed_out) {
+        return true;
+    }
+    if (g_cypher_deadline_ms == 0) {
+        return false;
+    }
+    if (cbm_now_ms() >= g_cypher_deadline_ms) {
+        g_cypher_timed_out = true;
+        return true;
+    }
+    return false;
+}
+
+/* Test-only: force the execution budget (ms) for subsequent queries on this
+ * thread. 0 = trip on the first hot-loop check; <0 restores the default. */
+void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
+    g_cypher_deadline_override_ms = budget_ms;
+}
 
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
 
@@ -2893,6 +3100,13 @@ static void process_edges(cbm_store_t *store, cbm_edge_t *edges, int edge_count,
 }
 
 /* Expand variable-length relationship via BFS */
+/* Set when a variable-length hop range is clamped to the engine ceiling
+ * during the CURRENT execution; cbm_cypher_execute turns it into
+ * result->warning so callers can tell "clamped" from "no such path" (#797). */
+/* C11 _Thread_local directly: cypher.c stays windows.h-free (compat.h pulls
+ * in windows.h, whose legacy `far` macro breaks this file's identifiers). */
+static _Thread_local int g_cypher_depth_clamped = 0;
+
 static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
                               cbm_node_pattern_t *target_node, binding_t *b, cbm_node_t *src,
                               const char *to_var, binding_t *new_bindings, int *new_count,
@@ -2909,6 +3123,7 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
         snprintf(req_buf, sizeof(req_buf), "%d", max_depth);
         snprintf(cap_buf, sizeof(cap_buf), "%d", depth_cap);
         cbm_log_warn("cypher.depth_capped", "requested", req_buf, "cap", cap_buf);
+        g_cypher_depth_clamped = depth_cap; /* surfaced as result->warning (#797) */
         max_depth = depth_cap;
     }
     cbm_traverse_result_t tr = {0};
@@ -2995,6 +3210,11 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                                 int *bind_count, const int *bind_cap, const char **var_name,
                                 bool is_optional) {
     for (int ri = 0; ri < pat->rel_count; ri++) {
+        /* #601: stop expanding further hops once the wall-clock budget is spent
+         * (an unbounded expansion is exactly what blows up here). */
+        if (cypher_deadline_exceeded()) {
+            return;
+        }
         cbm_rel_pattern_t *rel = &pat->rels[ri];
         cbm_node_pattern_t *target_node = &pat->nodes[ri + SKIP_ONE];
         const char *to_var = target_node->variable ? target_node->variable : "_n_t";
@@ -3009,6 +3229,9 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         int new_count = 0;
 
         for (int bi = 0; bi < *bind_count; bi++) {
+            if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+                break;
+            }
             binding_t *b = &(*bindings)[bi];
             cbm_node_t *src = binding_get(b, *var_name);
             if (!src) {
@@ -4052,6 +4275,11 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
     int agg_count = 0;
 
     for (int bi = 0; bi < bind_count; bi++) {
+        /* #601: grouping is O(bindings x groups) — the dominant cost on a
+         * whole-graph GROUP BY. Abort if we blow the wall-clock budget. */
+        if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+            break;
+        }
         char key[CBM_SZ_1K] = "";
         const char *vals[CBM_SZ_32];
         char valbufs[CBM_SZ_32][CBM_SZ_512];
@@ -4420,6 +4648,9 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
 
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
+        if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
+            break;
+        }
         binding_t b = {0};
         b.store = store;
         binding_set(&b, var_name, &scanned[i]);
@@ -4467,6 +4698,8 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
+    g_cypher_depth_clamped = 0;
+    cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
     }
@@ -4510,6 +4743,18 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
         rb_apply_distinct(&rb);
     }
 
+    /* #601: abort a runaway query that blew the wall-clock budget before it can
+     * return a misleading partial result. Checked before the row ceiling. */
+    if (g_cypher_timed_out) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error =
+            heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
+                        "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
+                        "add LIMIT");
+        return CBM_NOT_FOUND;
+    }
+
     /* Check ceiling */
     if (rb.row_count >= CYPHER_RESULT_CEILING) {
         rb_free(&rb);
@@ -4522,6 +4767,14 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     out->col_count = rb.col_count;
     out->rows = rb.rows;
     out->row_count = rb.row_count;
+    if (g_cypher_depth_clamped > 0) {
+        char wbuf[CBM_SZ_256];
+        snprintf(wbuf, sizeof(wbuf),
+                 "variable-length hop range clamped to the engine ceiling (%d) — an empty "
+                 "result may mean \"clamped\", not \"no such path\"",
+                 g_cypher_depth_clamped);
+        out->warning = heap_strdup(wbuf);
+    }
 
     cbm_query_free(q);
     return 0;
@@ -4531,6 +4784,8 @@ void cbm_cypher_result_free(cbm_cypher_result_t *r) {
     if (!r) {
         return;
     }
+    free(r->warning);
+    r->warning = NULL;
     for (int i = 0; i < r->col_count; i++) {
         safe_str_free(&r->columns[i]);
     }

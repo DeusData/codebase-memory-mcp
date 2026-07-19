@@ -23,11 +23,157 @@
 #endif
 
 #include <string.h>
+#include <stdio.h>
 #include <sys/stat.h>
+
+static char *security_read_file(const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (!file || fseek(file, 0, SEEK_END) != 0) {
+        if (file)
+            fclose(file);
+        return NULL;
+    }
+    long size = ftell(file);
+    if (size < 0 || fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        return NULL;
+    }
+    char *content = (char *)malloc((size_t)size + 1U);
+    if (!content || fread(content, 1U, (size_t)size, file) != (size_t)size) {
+        free(content);
+        fclose(file);
+        return NULL;
+    }
+    content[size] = '\0';
+    fclose(file);
+    return content;
+}
+
+static void security_normalize_crlf(char *content) {
+    if (!content) {
+        return;
+    }
+    char *read_cursor = content;
+    char *write_cursor = content;
+    while (*read_cursor) {
+        if (read_cursor[0] == '\r' && read_cursor[1] == '\n') {
+            read_cursor++;
+        }
+        *write_cursor++ = *read_cursor++;
+    }
+    *write_cursor = '\0';
+}
+
+TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed) {
+    FILE *checksums = fopen("scripts/vendored-checksums.txt", "r");
+    ASSERT_NOT_NULL(checksums);
+    char line[4096];
+    size_t entries = 0U;
+    while (fgets(line, sizeof(line), checksums)) {
+        char hash[65];
+        char path[3900];
+        if (sscanf(line, "%64s %3899s", hash, path) != 2)
+            continue;
+        ASSERT_EQ(strlen(hash), 64U);
+        ASSERT(strncmp(path, "vendored/", strlen("vendored/")) == 0);
+        entries++;
+    }
+    fclose(checksums);
+    ASSERT(entries > 0U);
+
+    char *script = security_read_file("scripts/security-vendored.sh");
+    ASSERT_NOT_NULL(script);
+    security_normalize_crlf(script);
+    ASSERT_NOT_NULL(strstr(script, "MISSING=$((MISSING + 1))\n        CONTENT_DRIFT=1"));
+    ASSERT_NOT_NULL(
+        strstr(script,
+               "if [[ $CHECKED -eq 0 ]]; then\n    echo \"BLOCKED: checksum manifest verified zero "
+               "files\"\n    STRUCTURAL_FAIL=1"));
+    free(script);
+    PASS();
+}
 
 /* ══════════════════════════════════════════════════════════════════
  *  SHELL INJECTION PREVENTION
  * ══════════════════════════════════════════════════════════════════ */
+
+#ifndef _WIN32
+
+static const char *security_vendored_fixture_manifest =
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  "
+    "vendored/yyjson/safe.c\n";
+
+static int security_make_vendored_fixture(char *root, size_t root_size,
+                                          const char *extra_relative_path,
+                                          const char *extra_content) {
+    if (!root || root_size == 0U || !extra_relative_path || !extra_content)
+        return -1;
+
+    int n = snprintf(root, root_size, "%s/cbm_vendored_security_XXXXXX", cbm_tmpdir());
+    if (n < 0 || (size_t)n >= root_size || !cbm_mkdtemp(root))
+        return -1;
+
+    char *script = security_read_file("scripts/security-vendored.sh");
+    if (!script) {
+        th_cleanup(root);
+        return -1;
+    }
+
+    int rc = 0;
+    if (th_write_file(TH_PATH(root, "scripts/security-vendored.sh"), script) != 0 ||
+        th_write_file(TH_PATH(root, "scripts/vendored-checksums.txt"),
+                      security_vendored_fixture_manifest) != 0 ||
+        th_write_file(TH_PATH(root, "vendored/yyjson/safe.c"), "") != 0 ||
+        th_write_file(TH_PATH(root, extra_relative_path), extra_content) != 0) {
+        rc = -1;
+    }
+    free(script);
+
+    if (rc != 0)
+        th_cleanup(root);
+    return rc;
+}
+
+TEST(vendored_integrity_rejects_unmanifested_source) {
+    char root[1024];
+    ASSERT_EQ(security_make_vendored_fixture(root, sizeof(root), "vendored/yyjson/unmanifested.h",
+                                             "#define CBM_SAFE_EXTRA 1\n"),
+              0);
+
+    char script_path[1200];
+    snprintf(script_path, sizeof(script_path), "%s/scripts/security-vendored.sh", root);
+    const char *argv[] = {"bash", script_path, NULL};
+    int rc = cbm_exec_no_shell(argv);
+    th_cleanup(root);
+
+    ASSERT_NEQ(rc, 0);
+    PASS();
+}
+
+TEST(vendored_integrity_update_refuses_dangerous_source_without_manifest_mutation) {
+    char root[1024];
+    ASSERT_EQ(security_make_vendored_fixture(root, sizeof(root), "vendored/yyjson/danger.c",
+                                             "int danger(void) { return system(\"true\"); }\n"),
+              0);
+
+    char script_path[1200];
+    char manifest_path[1200];
+    snprintf(script_path, sizeof(script_path), "%s/scripts/security-vendored.sh", root);
+    snprintf(manifest_path, sizeof(manifest_path), "%s/scripts/vendored-checksums.txt", root);
+    const char *argv[] = {"bash", script_path, "--update", NULL};
+    int rc = cbm_exec_no_shell(argv);
+    char *manifest_after = security_read_file(manifest_path);
+    int manifest_preserved =
+        manifest_after && strcmp(manifest_after, security_vendored_fixture_manifest) == 0;
+    free(manifest_after);
+    th_cleanup(root);
+
+    ASSERT_NEQ(rc, 0);
+    ASSERT_TRUE(manifest_preserved);
+    PASS();
+}
+
+#endif /* !_WIN32 */
 
 TEST(shell_rejects_single_quote) {
     ASSERT_FALSE(cbm_validate_shell_arg("foo'bar"));
@@ -390,15 +536,15 @@ TEST(exec_no_shell_captures_exit_code) {
  * ────────────────────────────────────────────────────────────────── */
 
 /* Assert that cbm_build_cmdline(argv) produces `expected` (wide). */
-#define ASSERT_CMDLINE(argv, expected)                                                     \
-    do {                                                                                   \
-        wchar_t *_cl = cbm_build_cmdline(argv);                                             \
-        ASSERT_NOT_NULL(_cl);                                                               \
-        if (wcscmp(_cl, (expected)) != 0) {                                                \
-            free(_cl);                                                                      \
-            FAIL("cbm_build_cmdline produced an unexpected command line");                  \
-        }                                                                                   \
-        free(_cl);                                                                          \
+#define ASSERT_CMDLINE(argv, expected)                                     \
+    do {                                                                   \
+        wchar_t *_cl = cbm_build_cmdline(argv);                            \
+        ASSERT_NOT_NULL(_cl);                                              \
+        if (wcscmp(_cl, (expected)) != 0) {                                \
+            free(_cl);                                                     \
+            FAIL("cbm_build_cmdline produced an unexpected command line"); \
+        }                                                                  \
+        free(_cl);                                                         \
     } while (0)
 
 TEST(cmdline_taskkill_filter_is_single_quoted_token) {
@@ -464,7 +610,7 @@ TEST(cmdline_utf8_arg_is_widened_not_latin1) {
      * not survive as U+00C3 U+00A9. The embedded space also forces
      * quoting, so this pins both quoting and correct widening at once. */
     const char *argv[] = {"cd", "caf\xc3\xa9 dir", NULL};
-    const wchar_t expected[] = {L'c', L'd', L' ',  L'"', L'c', L'a',  L'f',
+    const wchar_t expected[] = {L'c',   L'd', L' ', L'"', L'c', L'a', L'f',
                                 0x00E9, L' ', L'd', L'i', L'r', L'"', L'\0'};
     ASSERT_CMDLINE(argv, expected);
     PASS();
@@ -586,7 +732,7 @@ TEST(popen_isolates_listening_socket) {
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(0x7F000001); /* 127.0.0.1 */
-    addr.sin_port = 0;                         /* ephemeral */
+    addr.sin_port = 0;                        /* ephemeral */
     ASSERT_EQ(bind(ls, (struct sockaddr *)&addr, sizeof(addr)), 0);
     ASSERT_EQ(listen(ls, 1), 0);
     /* Winsock sockets are inheritable by default; make it explicit so a _popen
@@ -622,6 +768,11 @@ TEST(popen_isolates_listening_socket) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(security) {
+    RUN_TEST(vendored_integrity_manifest_is_relocatable_and_fail_closed);
+#ifndef _WIN32
+    RUN_TEST(vendored_integrity_rejects_unmanifested_source);
+    RUN_TEST(vendored_integrity_update_refuses_dangerous_source_without_manifest_mutation);
+#endif
     /* Shell injection prevention */
     RUN_TEST(shell_rejects_single_quote);
     RUN_TEST(shell_rejects_dollar_subst);

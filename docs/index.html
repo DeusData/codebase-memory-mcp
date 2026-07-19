@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents</title>
-    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. Works with 11 agents including Claude Code, Codex CLI, Gemini CLI, Cursor, and Zed.">
+    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Single static C binary, zero dependencies. One command configures 43 automatic/conditional client surfaces.">
     <meta name="keywords" content="MCP server, code intelligence, knowledge graph, tree-sitter, Hybrid LSP, semantic code search, code embeddings, code clone detection, cross-repo analysis, data-flow analysis, Claude Code, Codex CLI, Gemini CLI, Cursor, Zed, code exploration, token reduction, call graph, dead code detection">
     <meta name="author" content="DeusData">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
@@ -56,7 +56,7 @@
       "featureList": [
         "Indexes 158 programming languages via vendored tree-sitter grammars",
         "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
-        "14 MCP tools for structural search, call-path tracing, and Cypher graph queries",
+        "15 MCP tools for structural search, call-path tracing, targeted coverage checks, and Cypher graph queries",
         "Semantic vector code search via bundled nomic-embed-code embeddings (no API key, fully local)",
         "Semantic graph edges (SEMANTICALLY_RELATED) and near-clone detection (SIMILAR_TO, MinHash + LSH)",
         "Cross-service linking for HTTP, gRPC, GraphQL, tRPC, and pub/sub channels with confidence scoring",
@@ -68,7 +68,7 @@
         "Infrastructure-as-code indexing for Dockerfiles, Kubernetes, and Kustomize",
         "Built-in 3D graph visualization UI",
         "Auto-sync background watcher for incremental re-indexing",
-        "One-command install for 11 AI coding agents"
+        "One command configures 43 automatic/conditional client surfaces"
       ],
       "author": {
         "@type": "Organization",
@@ -157,7 +157,7 @@
           "name": "Which AI coding agents work with codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "A single install command configures 11 agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro. Any MCP-compatible client can use the server."
+            "text": "A single install command configures 43 automatic/conditional client surfaces. The 37 detected surfaces are Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi. Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody are conditional or explicit integrations. Qodo, Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI, Plandex, and SWE-agent require manual, UI, cloud, or repository-managed setup and are not counted among the 43."
           }
         },
         {
@@ -450,7 +450,7 @@
             <div class="stat"><div class="number">~120x</div><div class="label">fewer tokens</div></div>
             <div class="stat"><div class="number">158</div><div class="label">languages</div></div>
             <div class="stat"><div class="number">3 min</div><div class="label">Linux kernel index</div></div>
-            <div class="stat"><div class="number">11</div><div class="label">agents supported</div></div>
+            <div class="stat"><div class="number">43</div><div class="label">client surfaces</div></div>
         </div>
         <div class="cta-buttons">
             <a href="https://github.com/DeusData/codebase-memory-mcp" class="cta-primary">View on GitHub</a>
@@ -521,15 +521,54 @@
         <div class="install-block">
             <span class="comment"># 1. One-line install (macOS / Linux). Add --ui for the 3D graph UI.</span><br>
             <span class="cmd">curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash</span><br><br>
-            <span class="comment"># 2. The installer auto-detects and configures every installed agent.</span><br><br>
+            <span class="comment"># 2. The installer configures detected clients; explicit flags cover conditional clients.</span><br><br>
             <span class="comment"># 3. Restart your agent, then say:</span><br>
             <span class="cmd">"Index this project"</span>
         </div>
         <p class="muted">
-            One command configures all 11 supported agents: Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,
-            Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro — with MCP entries, instruction files, and
-            pre-tool hooks for each. Windows users run <code>install.ps1</code>. Also available via
-            <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
+            One command configures 43 automatic/conditional client surfaces. <strong>Detected automatically (37):</strong>
+            Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor,
+            Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code,
+            GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI,
+            GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE,
+            CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi.
+        </p>
+        <p class="muted">
+            <strong>Conditional or explicit (6):</strong> Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE,
+            and Sourcegraph Cody. <strong>Manual, UI, cloud, or repository-managed (not counted):</strong> Qodo,
+            Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI,
+            Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection
+            remains manual. Windows users run <code>install.ps1</code>. Also available via <code>npm</code>,
+            <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
+        </p>
+        <p class="muted">
+            Lifecycle installation follows documented context contracts: Qoder uses <code>SessionStart</code>,
+            <code>SubagentStart</code>, and post-<code>Read</code> coverage, including its documented Windows
+            PowerShell executor. Kimi uses <code>UserPromptSubmit</code>;
+            on macOS/Linux, GitLab Duo gets a fail-open user <code>SessionStart</code>, while Devin gets
+            <code>UserPromptSubmit</code>, <code>PostCompaction</code>, and a deduplicated <code>SessionStart</code>
+            when Claude does not already provide it. GitLab Duo, Devin, and Factory hooks are withheld on
+            Windows where no deterministic shell/executor contract is documented. Cline's auto-activating file hooks
+            are withheld because their context output is not reliably consumed; CodeBuddy's beta hooks are not
+            auto-installed; Junie's EAP
+            <code>SessionStart</code> output is documented as ignored; and Cursor context hooks are withheld because
+            the documented events cannot safely provide race-free MCP context to read-only subagents.
+        </p>
+        <p class="muted">
+            Documented custom-agent formats receive three exact-owned evidence tiers: Scout for narrow provisional
+            discovery, Verify as the task-directed default, and Auditor for bounded, paginated, current-generation
+            verification. Every direct tier calls <code>check_index_coverage</code> for cited paths and relevant scopes,
+            then reads flagged ranges or skipped files directly. Kiro and Junie use positive-allowlist
+            <code>--tool-profile scout</code> and <code>--tool-profile analysis</code> server surfaces;
+            Junie selects dedicated named aliases because its subagent schema filters by server.
+            Qoder combines named-server selection with exact tier-specific MCP tool IDs. Factory uses
+            exact registered tool IDs without its additive whole-server <code>mcpServers</code> field.
+            A foreign Junie alias is preserved and causes the installed profiles to fail closed to parent handoff.
+            Cursor, Rovo, Augment, Pochi, and Cline use explicit
+            parent handoff where direct child MCP is unavailable or unsafe; Pochi is limited to <code>readFile</code>.
+            Neither IBM Bob surface receives an invented hook or custom agent. Amazon Q Developer
+            IDE defaults to <code>~/.aws/amazonq/default.json</code> while preserving either existing documented
+            alternative.
         </p>
     </section>
 
@@ -699,8 +738,8 @@
                 <p>An optional UI binary serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
-                <h3>14 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>manage_adr</code>, and 7 more.</p>
+                <h3>15 MCP tools</h3>
+                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>check_index_coverage</code>, <code>manage_adr</code>, and 7 more.</p>
             </div>
             <div class="feature">
                 <h3>Cypher graph queries</h3>

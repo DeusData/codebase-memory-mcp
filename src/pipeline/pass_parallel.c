@@ -87,6 +87,9 @@ enum { PP_CSHARP_M_PREFIX_LEN = 2 };
 #include "foundation/compat_regex.h"
 #include "foundation/limits.h"
 #include "cbm.h"
+#include "arena.h"
+#include "macro_table.h"
+#include "iris_export_xml.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
@@ -708,6 +711,9 @@ typedef struct {
      * While set, pulls skip the nap (the designed soft overshoot); the cheap
      * over-budget probe re-arms the gate once RSS drains under budget. */
     _Atomic int bp_futile;
+
+    const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
+    const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
 } extract_ctx_t;
 
 /* Cap on the number of index.file_oversized WARN lines (the full list still goes
@@ -880,8 +886,38 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        CBMFileResult *result = cbm_extract_file(source, source_len, fi->language, ec->project_name,
-                                                 fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
+        /* ObjectScript Studio Export XML: transcode each <Class> to UDL and
+         * extract directly into the local gbuf (the per-file cache holds a single
+         * result, so multi-class Export files are processed inline here). */
+        if (fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+            CBMArena ea;
+            cbm_arena_init(&ea);
+            int cc = 0;
+            char **udls = cbm_iris_export_to_udl(&ea, source, source_len, &cc);
+            for (int ci = 0; ci < cc; ci++) {
+                CBMFileResult *xr =
+                    cbm_extract_file_ex(udls[ci], (int)strlen(udls[ci]), CBM_LANG_OBJECTSCRIPT_UDL,
+                                        ec->project_name, fi->rel_path, CBM_EXTRACT_BUDGET, NULL,
+                                        NULL, ec->macro_table, ec->return_type_table);
+                if (!xr) {
+                    continue;
+                }
+                for (int d = 0; d < xr->defs.count; d++) {
+                    CBMDefinition *def = &xr->defs.items[d];
+                    if (def->qualified_name && def->name) {
+                        insert_def_into_gbuf(ws, fi, def);
+                    }
+                }
+                cbm_free_result(xr);
+            }
+            cbm_arena_destroy(&ea);
+            free_source(source);
+            continue;
+        }
+
+        CBMFileResult *result = cbm_extract_file_ex(
+            source, source_len, fi->language, ec->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
+            NULL, NULL, ec->macro_table, ec->return_type_table);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -1035,6 +1071,10 @@ static void log_extract_mem_stats(int worker_count) {
     }
 }
 
+/* Forward declaration: macro table builder lives in pipeline.c (shared path). */
+CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
+                                                const char *repo_path);
+
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts) {
@@ -1067,7 +1107,13 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     CBM_PROF_START(t_init);
     cbm_init();
 
-    /* Slab allocator for tree-sitter (thread-safe via TLS). */
+    /* Slab allocator for tree-sitter (thread-safe via TLS). Destroy any
+     * parser this thread still holds BEFORE switching the global ts
+     * allocator: a parser created in the mimalloc epoch (sequential run,
+     * watcher tick) must be freed by the allocator that created it, or its
+     * teardown after the switch routes mi pointers into plain free()
+     * (#773). */
+    cbm_destroy_thread_parser();
     cbm_slab_install();
     CBM_PROF_END("parallel_extract", "1_init_libs", t_init);
 
@@ -1105,6 +1151,10 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
      * sequential merge loop below). */
     pp_err_list_t *err_lists = calloc((size_t)worker_count, sizeof(pp_err_list_t));
 
+    /* ObjectScript macro table (NULL when no .inc include files present). */
+    CBMMacroTable *pp_macro_table =
+        cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+
     extract_ctx_t ec = {
         .files = files,
         .sorted = sorted,
@@ -1121,6 +1171,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .retain_sources = resolved_opts.retain_sources,
         .retain_total_budget_bytes = resolved_opts.retain_total_budget_bytes,
         .retain_per_file_max_bytes = resolved_opts.retain_per_file_max_bytes,
+        .macro_table = pp_macro_table,
+        .return_type_table = ctx->return_type_table,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
@@ -1171,6 +1223,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     cbm_aligned_free(workers);
     free(sorted);
+    cbm_macro_table_free(pp_macro_table); /* ObjectScript macro table (NULL-safe) */
 
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;
@@ -2221,10 +2274,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         if (lsp) {
             /* Canonicalise to the gbuf node's QN so res.qualified_name matches
              * the gbuf even when the cross-file fallback had to prefix the
-             * project name. If neither lookup hits, leave res.qualified_name
-             * empty — the LSP was confident but its target isn't in the gbuf
-             * (external/unindexed), so drop the edge rather than fall back to
-             * the registry resolver, matching prior single-lookup semantics. */
+             * project name. */
             lsp_target = cbm_pipeline_lsp_target_node(rc->main_gbuf, rc->project_name,
                                                       lsp->callee_qn, allow_tail);
             if (lsp_target) {
@@ -2234,7 +2284,19 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 res.candidate_count = 1;
                 ws->lsp_overrides++;
             }
-        } else {
+        }
+        /* #1085: fall back to the registry resolver whenever the LSP did not
+         * yield a gbuf-resolvable target — whether no LSP resolution existed,
+         * OR the LSP was confident but its callee_qn isn't a node in the gbuf
+         * (the JSX-via-tsconfig-alias case: the TS LSP resolves the element
+         * ref to an alias-path QN that never matches a def node, so lsp_target
+         * is NULL). The old `else` ran the registry ONLY when lsp was null, so
+         * an LSP-with-unresolvable-target dropped the edge outright — silently
+         * losing every alias-imported JSX component edge on the parallel path
+         * (~21% of a Next.js call graph) while the sequential pass, which falls
+         * THROUGH to the registry here, kept them. This restores seq/parallel
+         * parity via the import_map / unique_name resolution. */
+        if (!res.qualified_name || !res.qualified_name[0]) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }

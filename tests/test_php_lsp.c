@@ -568,6 +568,62 @@ TEST(phplsp_trait_self_use_terminates) {
     PASS();
 }
 
+/* ── 23c. Regression #765: trait name collides with an aliased import ──
+ *
+ * `use Vendor\Pkg\Auditable as AuditableBase;` + `trait Auditable { use
+ * AuditableBase; ... }` — the composed alias canonicalizes (via short-name
+ * fallback) onto the ENCLOSING trait itself, which is the same
+ * self-flattening loop as 23b arriving through the import alias: each
+ * copied method re-matched the flatten filter while the registry grew,
+ * OOM-ing the indexer (reported at 40+ GB). Guarded by the #920 pair
+ * (self-flatten short-circuit + snapshotted loop bound); this fixture is
+ * the exact reproducer from issue #765 and hung/OOM'd before those. */
+TEST(phplsp_trait_aliased_import_name_collision_terminates) {
+    const char *src = "<?php\n"
+                      "namespace App\\Demo;\n"
+                      "\n"
+                      "use Vendor\\Pkg\\Auditable as AuditableBase;\n"
+                      "\n"
+                      "trait Auditable {\n"
+                      "    use AuditableBase;\n"
+                      "\n"
+                      "    function f() { $x = 1; return $x; }\n"
+                      "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── 23d. Regression #951: class shares its short name with an aliased
+ * trait import ──
+ *
+ * `use App\Functions\Delivery as Delivery_Trait;` + `class Delivery { use
+ * Delivery_Trait; ... }` — resolving the composed alias falls back to the
+ * short name and lands on the LOCAL CLASS `Delivery`, so the class is
+ * flattened into itself (class_qn == canonical target QN): the same loop
+ * as 23b/23c reached through a class/trait short-name collision. Reported
+ * as an indexer OOM kill (exit 137) in issue #951. The two-file original
+ * reduces to this single-file form because the trait's definition being
+ * unavailable is exactly what forces the short-name fallback. */
+TEST(phplsp_class_aliased_trait_name_collision_terminates) {
+    const char *src = "<?php\n"
+                      "namespace App\\Modules\\Foo;\n"
+                      "\n"
+                      "use App\\Functions\\Delivery as Delivery_Trait;\n"
+                      "\n"
+                      "class Delivery {\n"
+                      "    use Delivery_Trait;\n"
+                      "\n"
+                      "    public function run(): void {\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_php(src);
+    ASSERT(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 24. Match expression result type ──────────────────────────── */
 
 TEST(phplsp_match_result_type) {
@@ -5186,6 +5242,8 @@ SUITE(php_lsp) {
     RUN_TEST(phplsp_phpdoc_method_class_tag);
     RUN_TEST(phplsp_trait_method_flattened);
     RUN_TEST(phplsp_trait_self_use_terminates);
+    RUN_TEST(phplsp_trait_aliased_import_name_collision_terminates);
+    RUN_TEST(phplsp_class_aliased_trait_name_collision_terminates);
     RUN_TEST(phplsp_match_result_type);
     RUN_TEST(phplsp_ternary_result_type);
     RUN_TEST(phplsp_method_chain_depth_three);

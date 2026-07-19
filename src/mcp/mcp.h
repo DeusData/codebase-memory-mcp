@@ -91,8 +91,28 @@ char *cbm_mcp_get_arguments(const char *params_json);
 
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
+typedef enum {
+    CBM_MCP_TOOL_PROFILE_ALL = 0,
+    /* Agent-facing restricted surfaces: only explicitly allowlisted inspection
+     * tools are advertised or callable. Internal cache maintenance may still
+     * write, so these are intentionally not named strictly read-only modes. */
+    CBM_MCP_TOOL_PROFILE_ANALYSIS = 1,
+    CBM_MCP_TOOL_PROFILE_SCOUT = 2,
+} cbm_mcp_tool_profile_t;
+
+/* Parse the process-level tool-profile flag. Explicit malformed or unknown
+ * values fail closed with -1; absence selects the full default surface. */
+int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
+                                    cbm_mcp_tool_profile_t *profile_out);
+
+/* Restricted servers must not start a second unrestricted HTTP/RPC surface. */
+bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile);
+
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
+
+/* Select the tool surface exposed by tools/list and enforced by dispatch. */
+void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv, cbm_mcp_tool_profile_t profile);
 
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);

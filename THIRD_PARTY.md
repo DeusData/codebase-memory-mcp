@@ -13,6 +13,17 @@ The tree-sitter C runtime is vendored in `internal/cbm/vendored/ts_runtime/`.
 - **License:** MIT
 - **Copyright:** (c) 2018–2024 Max Brunsfeld
 
+**Local modification** (`internal/cbm/vendored/ts_runtime/src/stack.c`, #913): a
+single CBM patch bounds the recursive ambiguity-merge in `stack_node_add_link`
+at `CBM_TS_STACK_MERGE_MAX_DEPTH` (512). Deeply nested grammar-ambiguous input
+(e.g. Perl `f(f(f(...)))`) otherwise recurses once per level on the native C
+stack and overflows it during parsing (SIGSEGV on the ~1 MB Windows thread
+stack, and even the 8 MB POSIX stack at extreme depth) before any extractor
+runs. Past the cap the ambiguity is left on the GLR stack instead of merged —
+still a valid parse, never a wrong one — mirroring the existing
+`MAX_LINK_COUNT` bail-out. The change is clearly marked `// CBM patch:` inline.
+**On re-vendor (e.g. ts_runtime → 0.26.x): re-apply this bound.**
+
 The shared scanner helpers in `internal/cbm/vendored/common/` (`scanner.h`,
 `tag.h`) originate from
 [tree-sitter-html](https://github.com/tree-sitter/tree-sitter-html) (MIT,
@@ -47,6 +58,15 @@ License summary:
   `dotenv`, `pine`, `qml`) are self-maintained forks that retain their
   original upstream authors' licenses — see the manifest for per-grammar
   provenance.
+
+### tree-sitter-objectscript (UDL + routine)
+
+- **Project:** [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript)
+- **License:** MIT
+- **Copyright:** (c) 2025 InterSystems Corporation
+- **Vendored at:** `internal/cbm/vendored/grammars/objectscript_udl/`, `internal/cbm/vendored/grammars/objectscript_routine/`
+- **Pinned commit:** `a7ffcdf`
+- **Notes:** InterSystems-maintained grammar for the ObjectScript language (InterSystems IRIS / Caché). Vendor-maintained; not in nvim-treesitter or Helix registries. Each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (verbatim copy of upstream `common/scanner.h`).
 
 ## Vendored C/C++ Libraries
 

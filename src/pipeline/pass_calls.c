@@ -248,13 +248,19 @@ static int64_t create_svc_route_node(cbm_pipeline_ctx_t *ctx, const char *url, c
         prefix = broker ? broker : "async";
     }
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", prefix, qpath);
-    const char *rp;
-    if (svc == CBM_SVC_HTTP) {
-        rp = method ? method : "{}";
+    /* Valid-JSON route properties, byte-identical to the parallel path's
+     * build_service_route. The old code stored the RAW method/broker string
+     * (literally `bullmq`), which broke json_extract, the edges generated
+     * columns, and PRAGMA quick_check on every such cache (#898). */
+    char route_props[CBM_SZ_256];
+    if (method) {
+        snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method);
+    } else if (broker) {
+        snprintf(route_props, sizeof(route_props), "{\"broker\":\"%s\"}", broker);
     } else {
-        rp = broker ? broker : "{}";
+        snprintf(route_props, sizeof(route_props), "{}");
     }
-    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, rp);
+    return cbm_gbuf_upsert_node(ctx->gbuf, "Route", url, route_qn, "", 0, 0, route_props);
 }
 
 /* Insert an edge, splicing the call-site line (,"line":N) in before the closing
@@ -362,15 +368,23 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     char esc_url[CBM_SZ_256];
     cbm_json_escape(esc_callee, sizeof(esc_callee), call->callee_name);
     cbm_json_escape(esc_url, sizeof(esc_url), url_or_topic);
+    /* Incremental build mirroring the parallel path's
+     * emit_http_async_service_edge: the old single format string closed the
+     * method value's quote but not the broker's, emitting
+     * "broker":"bullmq} on EVERY brokered ASYNC_CALLS edge — and its fixup
+     * only handled truncation, which never fires in the normal case (#898). */
     char props[CBM_SZ_512];
-    snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"%s%s%s%s%s}", esc_callee,
-             esc_url, method ? ",\"method\":\"" : "", method ? method : "", method ? "\"" : "",
-             broker ? ",\"broker\":\"" : "", broker ? broker : "");
-    if (broker) {
-        size_t plen = strlen(props);
-        if (plen > 0 && props[plen - SKIP_ONE] != '}') {
-            snprintf(props + plen - 1, sizeof(props) - plen + SKIP_ONE, "\"}");
-        }
+    int n = snprintf(props, sizeof(props), "{\"callee\":\"%s\",\"url_path\":\"%s\"", esc_callee,
+                     esc_url);
+    if (method && n > 0 && (size_t)n < sizeof(props)) {
+        n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"method\":\"%s\"", method);
+    }
+    if (broker && n > 0 && (size_t)n < sizeof(props)) {
+        n += snprintf(props + n, sizeof(props) - (size_t)n, ",\"broker\":\"%s\"", broker);
+    }
+    if (n > 0 && (size_t)n < sizeof(props) - 1) {
+        props[n] = '}';
+        props[n + 1] = '\0';
     }
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
 }
@@ -511,6 +525,18 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
          * Native `fetch()` (#856) belongs here too, not in the substring
          * tables above: it only counts as the global API once resolution has
          * already failed to find a local/imported `fetch` definition. */
+        /* Route registration on an unresolvable callee (#952): facade-style
+         * Laravel (`Route::get('/x', ...)`) — the facade class lives in
+         * vendor/ and is never indexed, so resolution is ALWAYS empty in real
+         * apps. Classify by callee suffix + path-shaped first arg, exactly
+         * like the parallel path's callee_suffix fallback; without this the
+         * sequential path minted zero Route nodes for such files. */
+        if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                      imp_count);
+            return SKIP_ONE;
+        }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
         if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
             esvc = CBM_SVC_HTTP;
@@ -589,6 +615,83 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     return SKIP_ONE;
 }
 
+/* ObjectScript: build a method-QN -> return-type table from the Method nodes
+ * already in the graph buffer (definitions pass ran first). Scalar return types
+ * (%String, %Integer, ...) are skipped since they cannot host method dispatch.
+ * Returns NULL when no usable entries exist. Caller owns the heap table. */
+static CBMReturnTypeTable *build_return_type_table(const cbm_gbuf_t *gbuf) {
+    if (!gbuf) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t **method_nodes = NULL;
+    int method_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Method", &method_nodes, &method_count) != 0 ||
+        method_count <= 0 || !method_nodes) {
+        return NULL;
+    }
+
+    CBMReturnTypeTable *rtt = (CBMReturnTypeTable *)calloc(1, sizeof(CBMReturnTypeTable));
+    if (!rtt) {
+        return NULL;
+    }
+
+    static const char *scalar_types[] = {"%String",    "%Integer", "%Float", "%Boolean",
+                                         "%Status",    "%Numeric", "%Date",  "%Time",
+                                         "%TimeStamp", "%Binary",  NULL};
+
+    for (int i = 0; i < method_count && rtt->count < CBM_RETURN_TYPE_TABLE_CAP; i++) {
+        const cbm_gbuf_node_t *n = method_nodes[i];
+        if (!n->qualified_name || !n->properties_json) {
+            continue;
+        }
+
+        const char *p = strstr(n->properties_json, "\"return_type\":");
+        if (!p) {
+            continue;
+        }
+        p += 14; /* strlen("\"return_type\":") */
+        while (*p == ' ') {
+            p++;
+        }
+        if (*p != '"') {
+            continue;
+        }
+        p++;
+        const char *end = strchr(p, '"');
+        if (!end) {
+            continue;
+        }
+        int rtlen = (int)(end - p);
+        if (rtlen <= 0 || rtlen > 255) {
+            continue;
+        }
+
+        char rt_buf[256];
+        memcpy(rt_buf, p, (size_t)rtlen);
+        rt_buf[rtlen] = '\0';
+
+        bool is_scalar = false;
+        for (int si = 0; scalar_types[si]; si++) {
+            if (strcmp(rt_buf, scalar_types[si]) == 0) {
+                is_scalar = true;
+                break;
+            }
+        }
+        if (is_scalar) {
+            continue;
+        }
+
+        rtt->entries[rtt->count].method_qn = n->qualified_name;
+        rtt->entries[rtt->count].return_type = strdup(rt_buf);
+        rtt->count++;
+    }
+    if (rtt->count == 0) {
+        free(rtt);
+        return NULL;
+    }
+    return rtt;
+}
+
 static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
                                            const cbm_file_info_t *fi, bool *owned) {
     *owned = false;
@@ -600,8 +703,9 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file(src, slen, fi->language, ctx->project_name, fi->rel_path,
-                                        CBM_EXTRACT_BUDGET, NULL, NULL);
+    CBMFileResult *r = cbm_extract_file_ex(src, slen, fi->language, ctx->project_name, fi->rel_path,
+                                           CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
+                                           ctx->return_type_table);
     free(src);
     if (r) {
         *owned = true;
@@ -611,6 +715,16 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
 
 int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count) {
     cbm_log_info("pass.start", "pass", "calls", "files", itoa_log(file_count));
+
+    /* ObjectScript: build the method-return-type table from the definitions
+     * already in the graph buffer so `Set x = obj.Method()` can resolve x's
+     * class for subsequent x.Method() dispatch. NULL if no Method nodes. */
+    if (!ctx->return_type_table) {
+        CBMReturnTypeTable *rtt = build_return_type_table(ctx->gbuf);
+        if (rtt) {
+            ctx->return_type_table = rtt;
+        }
+    }
 
     int total_calls = 0;
     int resolved = 0;

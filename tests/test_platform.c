@@ -132,6 +132,13 @@ TEST(platform_default_workers_env_unset) {
     PASS();
 }
 
+TEST(platform_system_info) {
+    cbm_system_info_t info = cbm_system_info();
+    ASSERT_GT(info.total_cores, 0);
+    ASSERT_GT(info.total_ram, 0);
+    PASS();
+}
+
 /* ── cgroup-aware detection (Linux only) ─────────────────────────── */
 
 #ifdef __linux__
@@ -316,6 +323,7 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(platform_system_info);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);
     RUN_TEST(cgroup_v2_cpu_quota_rounds_up);

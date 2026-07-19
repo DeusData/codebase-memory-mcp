@@ -26,6 +26,11 @@
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
+/* Incremental integrity failure: abort the run and preserve the existing DB.
+ * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
+ * "no incremental route; continue with a full index" sentinel. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
+
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
  * handlers rendezvous on the same Route QN regardless of framework syntax.
@@ -110,6 +115,14 @@ typedef struct {
      * resolve. */
     CBMArena seq_cross_arena;
     bool seq_cross_arena_live;
+
+    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
+     * no ObjectScript include files were found). Owned by pipeline.c. */
+    const CBMMacroTable *macro_table;
+
+    /* ObjectScript method-return-type table built from extracted definitions
+     * (NULL until pass_calls builds it). Owned by pipeline.c. */
+    const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
 static inline int cbm_pipeline_relpath_is_excluded(const char *rel_path, char *const *excluded_dirs,
