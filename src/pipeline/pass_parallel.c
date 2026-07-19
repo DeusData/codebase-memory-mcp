@@ -1046,10 +1046,6 @@ static void log_extract_mem_stats(int worker_count) {
     }
 }
 
-/* Forward declaration: macro table builder lives in pipeline.c (shared path). */
-CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
-                                                const char *repo_path);
-
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts) {
@@ -1139,9 +1135,14 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         return CBM_NOT_FOUND;
     }
 
-    /* ObjectScript macro table (NULL when no .inc include files present). */
-    CBMMacroTable *pp_macro_table =
-        cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+    /* Incremental callers may supply a repository-wide table because `files`
+     * is only the changed slice. Full indexing builds and owns its table here. */
+    CBMMacroTable *owned_macro_table = NULL;
+    const CBMMacroTable *pp_macro_table = (const CBMMacroTable *)ctx->macro_table;
+    if (!pp_macro_table) {
+        owned_macro_table = cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+        pp_macro_table = owned_macro_table;
+    }
 
     extract_ctx_t ec = {
         .files = files,
@@ -1219,7 +1220,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     cbm_aligned_free(workers);
     free(sorted);
-    cbm_macro_table_free(pp_macro_table); /* ObjectScript macro table (NULL-safe) */
+    cbm_macro_table_free(owned_macro_table); /* NULL when the caller owns the table */
 
     if (atomic_load(ctx->cancelled) ||
         atomic_load_explicit(&ec.worker_failed, memory_order_relaxed) != 0 || merge_rc != 0) {

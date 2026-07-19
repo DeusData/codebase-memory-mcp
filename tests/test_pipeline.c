@@ -14071,6 +14071,208 @@ TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild) {
     PASS();
 }
 
+/* ObjectScript calls can be introduced by $$$ macros declared in an unchanged
+ * .inc file. Incremental extraction must therefore use the same repository-wide
+ * macro context as a fresh build, even when only the consuming .cls changed.
+ * Return through one cleanup block so a red assertion never leaks its store. */
+static int run_incremental_objectscript_macro_oracle(char *err, size_t err_sz) {
+    int rc = -1;
+    cbm_config_t *cfg = NULL;
+    cbm_pipeline_t *pipeline = NULL;
+    cbm_store_t *store = NULL;
+    char *project = NULL;
+    bool initial_call = false;
+    bool incremental_call = false;
+    char *created = th_mktempdir("cbm_incr_objectscript_macro");
+    if (!created) {
+        snprintf(err, err_sz, "ObjectScript fixture directory creation failed");
+        return -1;
+    }
+    char root[CBM_PATH_MAX];
+    int n = snprintf(root, sizeof(root), "%s", created);
+    if (n <= 0 || (size_t)n >= sizeof(root)) {
+        snprintf(err, err_sz, "ObjectScript fixture path overflow");
+        th_rmtree(created);
+        return -1;
+    }
+
+    char include_path[CBM_PATH_MAX];
+    char caller_path[CBM_PATH_MAX];
+    char utils_path[CBM_PATH_MAX];
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(include_path, sizeof(include_path), "%s/Macros.inc", root);
+    if (n <= 0 || (size_t)n >= sizeof(include_path)) {
+        snprintf(err, err_sz, "ObjectScript include path overflow");
+        goto cleanup;
+    }
+    n = snprintf(caller_path, sizeof(caller_path), "%s/Caller.cls", root);
+    if (n <= 0 || (size_t)n >= sizeof(caller_path)) {
+        snprintf(err, err_sz, "ObjectScript class path overflow");
+        goto cleanup;
+    }
+    n = snprintf(utils_path, sizeof(utils_path), "%s/Utils.cls", root);
+    if (n <= 0 || (size_t)n >= sizeof(utils_path)) {
+        snprintf(err, err_sz, "ObjectScript utility path overflow");
+        goto cleanup;
+    }
+    n = snprintf(db_path, sizeof(db_path), "%s/graph.db", root);
+    if (n <= 0 || (size_t)n >= sizeof(db_path)) {
+        snprintf(err, err_sz, "ObjectScript database path overflow");
+        goto cleanup;
+    }
+
+    if (th_write_file(include_path,
+                      "ROUTINE MyApp.Macros [Type=INC]\n"
+                      "#define MyCheck(%sc) ##class(MyApp.Utils).Validate(%sc)\n") != 0) {
+        snprintf(err, err_sz, "ObjectScript include write failed");
+        goto cleanup;
+    }
+    if (th_write_file(utils_path,
+                      "Class MyApp.Utils Extends %RegisteredObject\n"
+                      "{\n"
+                      "ClassMethod Validate(sc As %Status) As %Status\n"
+                      "{\n"
+                      "    Quit sc\n"
+                      "}\n"
+                      "}\n") != 0) {
+        snprintf(err, err_sz, "ObjectScript utility class write failed");
+        goto cleanup;
+    }
+    const char *caller_initial =
+        "Include Macros\n"
+        "Class MyApp.Caller Extends %RegisteredObject\n"
+        "{\n"
+        "Method Run(sc As %Status) As %Status\n"
+        "{\n"
+        "    If $$$MyCheck(sc) { Quit sc }\n"
+        "    Quit $$$OK\n"
+        "}\n"
+        "}\n";
+    const char *caller_updated =
+        "Include Macros\n"
+        "Class MyApp.Caller Extends %RegisteredObject\n"
+        "{\n"
+        "Method Run(sc As %Status) As %Status\n"
+        "{\n"
+        "    Set touched = 1\n"
+        "    If $$$MyCheck(sc) { Quit sc }\n"
+        "    Quit $$$OK\n"
+        "}\n"
+        "}\n";
+    if (th_write_file(caller_path, caller_initial) != 0) {
+        snprintf(err, err_sz, "initial ObjectScript class write failed");
+        goto cleanup;
+    }
+
+    cfg = incremental_test_config(root);
+    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                               CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER) != 0) {
+        snprintf(err, err_sz, "ObjectScript incremental config setup failed");
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "initial ObjectScript pipeline allocation failed");
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "initial ObjectScript full publication failed");
+        goto cleanup;
+    }
+    project = cbm_strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+    if (!project) {
+        snprintf(err, err_sz, "ObjectScript project allocation failed");
+        goto cleanup;
+    }
+
+    store = cbm_store_open_path(db_path);
+    if (!store) {
+        snprintf(err, err_sz, "initial ObjectScript store open failed");
+        goto cleanup;
+    }
+    initial_call = cross_file_call_exists(store, project, "Run", "Validate");
+    cbm_store_close(store);
+    store = NULL;
+    if (!initial_call) {
+        snprintf(err, err_sz,
+                 "full ObjectScript pipeline did not resolve the macro-supplied local call");
+        goto cleanup;
+    }
+
+    if (th_write_file(caller_path, caller_updated) != 0) {
+        snprintf(err, err_sz, "updated ObjectScript class write failed");
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "incremental ObjectScript pipeline allocation failed");
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "incremental ObjectScript publication failed");
+        goto cleanup;
+    }
+    if (cbm_pipeline_publish_kind(pipeline) != CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT) {
+        snprintf(err, err_sz, "ObjectScript publication kind=%d reason=%s, expected exact",
+                 cbm_pipeline_publish_kind(pipeline),
+                 cbm_pipeline_publish_reason(pipeline) ? cbm_pipeline_publish_reason(pipeline)
+                                                       : "");
+        goto cleanup;
+    }
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+
+    store = cbm_store_open_path(db_path);
+    if (!store) {
+        snprintf(err, err_sz, "incremental ObjectScript store open failed");
+        goto cleanup;
+    }
+    incremental_call = cross_file_call_exists(store, project, "Run", "Validate");
+    cbm_store_close(store);
+    store = NULL;
+    if (!incremental_call) {
+        snprintf(err, err_sz,
+                 "incremental ObjectScript extraction lost an unchanged .inc macro call");
+        goto cleanup;
+    }
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        root, db_path, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        snprintf(err, err_sz, "%s",
+                 diff_err[0] ? diff_err
+                             : "incremental ObjectScript macro graph differed from fresh rebuild");
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    free(project);
+    cbm_config_close(cfg);
+    const char *artifact_dir = getenv("CBM_TEST_ARTIFACT_DIR");
+    if (rc != 0 && artifact_dir && artifact_dir[0] != '\0') {
+        printf("    [incremental-objectscript-artifact] %s\n", root);
+    } else {
+        th_rmtree(root);
+    }
+    return rc;
+}
+
+TEST(incremental_objectscript_unchanged_include_macro_matches_fresh_rebuild) {
+    char err[CBM_SZ_8K] = {0};
+    if (run_incremental_objectscript_macro_oracle(err, sizeof(err)) != 0) {
+        FAIL(err[0] ? err : "ObjectScript incremental macro oracle failed");
+    }
+    PASS();
+}
+
 TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -17877,6 +18079,7 @@ SUITE(pipeline) {
     RUN_TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild);
     RUN_TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow);
     RUN_TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild);
+    RUN_TEST(incremental_objectscript_unchanged_include_macro_matches_fresh_rebuild);
     RUN_TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild);
     RUN_TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild);
     RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);

@@ -1031,7 +1031,8 @@ static void incr_release_seq_cross_arena(cbm_pipeline_ctx_t *ctx) {
 }
 
 /* Run parallel or sequential extract+resolve for changed files. */
-static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci) {
+static int run_extract_resolve_inner(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files,
+                                     int ci) {
     struct timespec t;
 
     /* Per-file LSP always runs. Sequential scoped increments run the reusable
@@ -1167,16 +1168,40 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
 
     sequential_cleanup:
-        /* Cross-language registries own interned names borrowed by the calls,
-         * usages, and semantic passes. Release them only after the final
-         * borrower, including every injected-failure path. */
-        incr_release_seq_cross_arena(ctx);
-        cbm_pipeline_release_objectscript_tables(ctx);
+        /* The outer wrapper releases cross-language registries and ObjectScript
+         * tables after this final borrower on both success and failure. */
         if (rc != 0) {
             return rc;
         }
     }
     return 0;
+}
+
+static bool incr_changed_uses_objectscript(const cbm_file_info_t *files, int count) {
+    for (int i = 0; files && i < count; i++) {
+        CBMLanguage lang = files[i].language;
+        if (lang == CBM_LANG_OBJECTSCRIPT_UDL || lang == CBM_LANG_OBJECTSCRIPT_ROUTINE ||
+            lang == CBM_LANG_OBJECTSCRIPT_EXPORT) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A changed ObjectScript file can expand a $$$ macro from an unchanged .inc.
+ * Build that context from the full discovered file set, but only for
+ * ObjectScript increments so other languages retain O(changed-files) setup.
+ * This wrapper owns every table and cross-language arena on all return paths. */
+static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_files, int ci,
+                               cbm_file_info_t *all_files, int all_file_count) {
+    if (incr_changed_uses_objectscript(changed_files, ci)) {
+        ctx->macro_table =
+            cbm_build_macro_table_from_files(all_files, all_file_count, ctx->repo_path);
+    }
+    int rc = run_extract_resolve_inner(ctx, changed_files, ci);
+    incr_release_seq_cross_arena(ctx);
+    cbm_pipeline_release_objectscript_tables(ctx);
+    return rc;
 }
 
 /* Run post-extraction passes (tests, decorator tags, configlink). */
@@ -1740,7 +1765,8 @@ static bool incr_overlay_requires_canonical_structure_publish(cbm_store_t *store
 
 static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
                                          const char *project, cbm_file_info_t *changed_files,
-                                         int changed_count, int deleted_count,
+                                         int changed_count, cbm_file_info_t *all_files,
+                                         int all_file_count, int deleted_count,
                                          const char *pass_fingerprint, int *applied) {
     if (applied) {
         *applied = 0;
@@ -1869,7 +1895,7 @@ static int incr_try_overlay_upsert_route(cbm_pipeline_t *p, cbm_store_t *store,
         }
     }
 
-    rc = run_extract_resolve(&ctx, changed_files, changed_count);
+    rc = run_extract_resolve(&ctx, changed_files, changed_count, all_files, all_file_count);
     if (rc != 0) {
         cbm_pipeline_set_publish_reason(p, "overlay_extract_resolve");
         cbm_log_info("incremental.overlay.fallback", "reason", "extract_resolve", "rc",
@@ -2246,7 +2272,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
     }
     CBM_PROF_END_N("incremental_exact", "2_ensure_structure", t_exact_structure, exact_count);
     CBM_PROF_START(t_exact_extract_resolve);
-    rc = run_extract_resolve(&ctx, exact_files, exact_count);
+    rc = run_extract_resolve(&ctx, exact_files, exact_count, all_files, all_file_count);
     CBM_PROF_END_N("incremental_exact", "3_extract_resolve", t_exact_extract_resolve, exact_count);
     if (rc != 0) {
         cbm_pipeline_set_publish_reason(p, "extract_resolve");
@@ -2834,8 +2860,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         return 0;
     }
 
-    (void)incr_try_overlay_upsert_route(p, store, project, changed_files, ci, cls.deleted_count,
-                                        pass_fingerprint, &exact_applied);
+    (void)incr_try_overlay_upsert_route(p, store, project, changed_files, ci, files, file_count,
+                                        cls.deleted_count, pass_fingerprint, &exact_applied);
     if (exact_applied) {
         int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
         if (coverage_rc != CBM_STORE_OK) {
@@ -3074,7 +3100,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                        excluded_dirs, excluded_count);
         cbm_pipeline_set_pkgmap(incremental_pkgmap);
         ctx.pkgmap_preseeded = true;
-        pipeline_rc = run_extract_resolve(&ctx, changed_files, ci);
+        pipeline_rc = run_extract_resolve(&ctx, changed_files, ci, files, file_count);
         ctx.pkgmap_preseeded = false;
         if (cbm_pipeline_get_pkgmap() == incremental_pkgmap) {
             cbm_pipeline_set_pkgmap(NULL);

@@ -4878,6 +4878,7 @@ TEST(objectscript_macro_expand_local) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_call(r, "MyApp.Utils.Validate"));
+    ASSERT(has_call_enclosing(r, "MyApp.Utils.Validate", "MyApp.Caller.Run", NULL));
     cbm_free_result(r);
     cbm_arena_destroy(&arena);
     PASS();
