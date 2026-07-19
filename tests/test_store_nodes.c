@@ -1847,6 +1847,28 @@ TEST(store_overlay_file_delta_publish_rejects_failed_generation) {
     PASS();
 }
 
+typedef struct {
+    bool saw_active_node_candidates;
+    bool saw_direct_canonical_count;
+} overlay_summary_sql_trace_t;
+
+static int overlay_summary_sql_trace(unsigned trace_type, void *context, void *statement,
+                                     void *sql_text) {
+    (void)statement;
+    if (trace_type != SQLITE_TRACE_STMT || !context || !sql_text) {
+        return 0;
+    }
+    overlay_summary_sql_trace_t *trace = context;
+    const char *sql = sql_text;
+    if (strstr(sql, "active_node_candidates")) {
+        trace->saw_active_node_candidates = true;
+    }
+    if (strstr(sql, "SELECT COUNT(*) FROM nodes WHERE project")) {
+        trace->saw_direct_canonical_count = true;
+    }
+    return 0;
+}
+
 TEST(store_overlay_node_view_summary_counts_latest_ready_overlay) {
     enum { BASE_GENERATION = 1 };
     cbm_store_t *s = cbm_store_open_memory();
@@ -1868,13 +1890,22 @@ TEST(store_overlay_node_view_summary_counts_latest_ready_overlay) {
     ASSERT_GT(cbm_store_upsert_node(s, &old_main), 0);
     ASSERT_GT(cbm_store_upsert_node(s, &stable), 0);
 
+    overlay_summary_sql_trace_t trace = {0};
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, overlay_summary_sql_trace, &trace),
+              SQLITE_OK);
+
     cbm_store_overlay_node_view_summary_t summary = {0};
     ASSERT_EQ(cbm_store_get_overlay_node_view_summary(s, "test", &summary), CBM_STORE_OK);
+    ASSERT_FALSE(trace.saw_active_node_candidates);
+    ASSERT_TRUE(trace.saw_direct_canonical_count);
     ASSERT_EQ(summary.overlay_ready_generations, 0);
     ASSERT_EQ(summary.active_file_tombstones, 0);
     ASSERT_EQ(summary.canonical_nodes_visible, 2);
     ASSERT_EQ(summary.overlay_owned_nodes_visible, 0);
     ASSERT_EQ(summary.total_nodes_visible, 2);
+    ASSERT_EQ(sqlite3_trace_v2(db, 0, NULL, NULL), SQLITE_OK);
 
     int64_t first_overlay = 0;
     ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "test", BASE_GENERATION, &first_overlay),

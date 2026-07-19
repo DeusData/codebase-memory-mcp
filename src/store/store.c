@@ -7974,6 +7974,28 @@ int cbm_store_get_overlay_node_view_summary(cbm_store_t *s, const char *project,
         return CBM_STORE_ERR;
     }
 
+    /* The active-node CTE ranks every canonical and overlay node to resolve
+     * qualified-name ownership. Most reads have no published overlay, where
+     * that O(nodes log nodes) work cannot change the canonical view. Reuse the
+     * indexed generation counter as the exact gate, then reuse the canonical
+     * node counter so clean-project reads remain O(nodes) without window
+     * materialization. A ready generation must still take the complete CTE
+     * below because tombstones and overlay ownership change exact counts. */
+    int ready_generations = 0;
+    if (cbm_store_count_overlay_generations(s, project, CBM_STORE_OVERLAY_STATUS_READY,
+                                            &ready_generations) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (ready_generations == 0) {
+        int canonical_nodes = cbm_store_count_nodes(s, project);
+        if (canonical_nodes < 0) {
+            return CBM_STORE_ERR;
+        }
+        out->canonical_nodes_visible = canonical_nodes;
+        out->total_nodes_visible = canonical_nodes;
+        return CBM_STORE_OK;
+    }
+
     char active_cte[ST_SQL_BUF];
     if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
         CBM_STORE_OK) {
