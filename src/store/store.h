@@ -331,6 +331,17 @@ typedef struct {
 
 /* ── Schema introspection ───────────────────────────────────────── */
 
+/* Public discovery bounds shared by the store, MCP descriptions, and
+ * serializers. They are safety bounds, not completeness guarantees. Callers
+ * must not claim a complete inventory unless the result also proves it was not
+ * truncated; keep these definitions centralized until paged or incrementally
+ * maintained schema metadata replaces the bounded scans. */
+#define CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT 50
+#define CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT 50
+/* Bound on labels/types listed in a self-healing zero-row hint summary.
+ * Observational only — never implies the summary is complete. */
+#define CBM_STORE_SCHEMA_HINT_VOCAB_LIMIT 12
+
 typedef struct {
     const char *label;
     int count;
@@ -346,12 +357,18 @@ typedef struct {
 } cbm_type_count_t;
 
 typedef struct {
+    const char *source_label;
+    const char *edge_type;
+    const char *target_label;
+    int observed_count;
+} cbm_schema_relationship_t;
+
+typedef struct {
     cbm_label_count_t *node_labels;
     int node_label_count;
     cbm_type_count_t *edge_types;
     int edge_type_count;
-    /* relationship patterns like "(Function)-[CALLS]->(Function) [123x]" */
-    const char **rel_patterns;
+    cbm_schema_relationship_t *rel_patterns;
     int rel_pattern_count;
     const char **sample_func_names;
     int sample_func_count;
@@ -564,6 +581,18 @@ int cbm_store_list_symbol_scope_qns_by_qns(cbm_store_t *s, const char *project,
 /* Count nodes in project. Returns count or CBM_STORE_ERR. */
 int cbm_store_count_nodes(cbm_store_t *s, const char *project);
 int cbm_store_count_nodes_scoped(cbm_store_t *s, const char *project, const char *path);
+
+/* Observational existence probes for zero-row hint/recovery paths.
+ * O(log N) via idx_nodes_label/idx_edges_type; never scans property JSON.
+ * include_overlay must match the view the caller's query ran on (the
+ * overlay branch reuses the same active-view CTE as get_schema_overlay_impl
+ * so a hint can never contradict a row the query could see). Fail-open: any
+ * non-definitive outcome (NULL args, prepare/step failure) returns true
+ * (observed) — only a definitive miss returns false. */
+bool cbm_store_schema_label_observed(cbm_store_t *s, const char *project,
+                                     bool include_overlay, const char *label);
+bool cbm_store_schema_type_observed(cbm_store_t *s, const char *project,
+                                    bool include_overlay, const char *type);
 
 /* True when path is a non-empty architecture scope after normalization. */
 bool cbm_store_arch_path_scoped(const char *path);
@@ -995,6 +1024,35 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
+/* Canonical relational columns present on every schema label/type. Returned
+ * arrays have static lifetime; callers must not modify or free them. */
+const char *const *cbm_store_schema_node_base_properties(int *out_count);
+const char *const *cbm_store_schema_edge_base_properties(int *out_count);
+
+/* Declared registry of extra JSON property keys extractors and optional
+ * passes CAN emit on a node/edge, beyond the base relational columns above.
+ * Verified 2026-07-18: every key is a compile-time string literal at its
+ * writer call site (one indirection exists in pass_cross_repo.c's
+ * build_cross_props, which passes the key through a parameter, but every
+ * current call site still supplies a literal). States what CAN appear —
+ * capability provenance for newcomers; whether a key occurs in a given
+ * project remains data-derived via get_schema. Sorted and deduplicated.
+ *
+ * Four places must stay in sync — see the maintenance contract on the
+ * table definitions in store.c for the full rule:
+ *   - every .c file under src/pipeline/ and src/git/: the property-JSON
+ *     writers that are this registry's actual source of truth (every
+ *     "key": literal and every append_json_string/append_json_str_array
+ *     call site).
+ *   - store.c (schema_declared_node_property_keys /
+ *     schema_declared_edge_property_keys): the tables themselves.
+ *   - store.h (here): these accessor declarations.
+ *   - tests/test_schema_declared_property_keys.c: contract-tests the
+ *     tables against indexed mixed-language fixtures and asserts sorted/
+ *     duplicate-free. */
+const char *const *cbm_store_schema_declared_node_property_keys(int *out_count);
+const char *const *cbm_store_schema_declared_edge_property_keys(int *out_count);
+
 int cbm_store_get_schema(cbm_store_t *s, const char *project, cbm_schema_info_t *out);
 
 /* Like cbm_store_get_schema but skips per-label/per-type JSON property-key
@@ -1005,9 +1063,6 @@ int cbm_store_get_schema_overlay_view(cbm_store_t *s, const char *project,
                                       cbm_schema_info_t *out);
 int cbm_store_get_schema_counts_overlay_view(cbm_store_t *s, const char *project,
                                              cbm_schema_info_t *out);
-int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
-                                       cbm_schema_info_t *out);
-
 int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, const char *path,
                                        cbm_schema_info_t *out);
 

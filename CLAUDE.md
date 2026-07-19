@@ -6,6 +6,10 @@ the established path over adding a parallel one. New abstractions should close a
 and fit the repo's ownership, allocation, threading, logging, portability, protocol I/O,
 and naming patterns.
 
+Adding a new node/edge JSON property key in `src/pipeline/*.c` or `src/git/*.c`? Add it to
+the declared registry in `src/store/store.c`/`store.h` (`schema_declared_node_property_keys`/
+`schema_declared_edge_property_keys`) or `tests/test_schema_declared_property_keys.c` will fail.
+
 ## Build & Test (C server)
 
 All C targets use `Makefile.cbm`:

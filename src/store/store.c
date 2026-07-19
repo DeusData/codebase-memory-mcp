@@ -472,8 +472,6 @@ static void iso_now(char *buf, size_t sz) {
                          // timestamp always fits in caller-provided buffers
 }
 
-/* ── Schema ─────────────────────────────────────────────────────── */
-
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
@@ -10962,29 +10960,287 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
-enum { SCHEMA_MAX_JSON_KEYS = 50, SCHEMA_REL_PATTERN_LIMIT = 50 };
+#define CBM_SCHEMA_STRINGIFY_INNER(value) #value
+#define CBM_SCHEMA_STRINGIFY(value) CBM_SCHEMA_STRINGIFY_INNER(value)
 
 typedef struct {
     int index;
     const char *text;
 } schema_text_bind_t;
 
-static const char *schema_node_base_cols[] = {"name", "qualified_name", "file_path",
-                                              "start_line", "end_line"};
-static const char *schema_edge_base_cols[] = {"source_id", "target_id"};
+static const char *const schema_node_base_cols[] = {"name", "qualified_name", "file_path",
+                                                    "start_line", "end_line"};
+static const char *const schema_edge_base_cols[] = {"source_id", "target_id"};
+
+const char *const *cbm_store_schema_node_base_properties(int *out_count) {
+    if (out_count) {
+        *out_count = (int)(sizeof(schema_node_base_cols) / sizeof(schema_node_base_cols[0]));
+    }
+    return schema_node_base_cols;
+}
+
+const char *const *cbm_store_schema_edge_base_properties(int *out_count) {
+    if (out_count) {
+        *out_count = (int)(sizeof(schema_edge_base_cols) / sizeof(schema_edge_base_cols[0]));
+    }
+    return schema_edge_base_cols;
+}
+
+/* Declared registry of extra node/edge property keys (see store.h). Verified
+ * 2026-07-18 against every properties-JSON writer in src/pipeline and
+ * src/git; sorted, deduplicated, and contract-tested in
+ * tests/test_schema_declared_property_keys.c against indexed mixed-language
+ * fixtures. A key present on both a node and an edge (e.g. "method" on a
+ * Route node and an HTTP_CALLS edge; the git-context Branch node/HAS_BRANCH
+ * edge pair) is listed in both tables — the registry states what CAN appear
+ * per entity kind, not a single-owner mapping.
+ *
+ * Maintenance contract (four places, see the matching note on the
+ * accessor declarations in store.h:1032+): every JSON property key
+ * literal written by a pipeline pass, extractor, or git-context writer
+ * (grep for `append_json_string`/`append_json_str_array` calls and inline
+ * `"key":` literals under src/pipeline and src/git) must have a row here
+ * for the entity kind(s) it can appear on. Adding a new emitted key
+ * without adding it here makes it "undeclared" and fails
+ * tests/test_schema_declared_property_keys.c the next time a fixture
+ * observes it. Keep each table sorted (strcmp order) and duplicate-free —
+ * both are asserted by that test — and keep the trailing comment on each
+ * row naming the writer, since that is the only per-key provenance this
+ * registry keeps. */
+static const char *const schema_declared_node_property_keys[] = {
+    "alloc_in_loop",         /* pass_definitions: def-node loop-analysis metric */
+    "base_classes",          /* pass_definitions: def-node array */
+    "base_sha",               /* git_context: Branch node / HAS_BRANCH edge */
+    "branch",                 /* git_context: Branch node / HAS_BRANCH edge */
+    "broker",                 /* pass_route_nodes: Route node; also ASYNC_CALLS/INFRA_MAPS edge */
+    "bt",                     /* pass_definitions: body-token AST profile */
+    "canonical_root",         /* git_context: Branch node / HAS_BRANCH edge */
+    "change_count",           /* pass_githistory: File node temporal metadata */
+    "cognitive",              /* pass_definitions: def-node metric (Function/Method) */
+    "complexity",             /* pass_definitions: def-node metric, all def labels */
+    "decorator_tags",         /* pass_enrichment: post-flush decorator auto-tagging (array) */
+    "decorators",             /* pass_definitions: def-node array */
+    "docstring",              /* pass_definitions: def-node text */
+    "env_key",                /* pass_definitions: EnvVar node */
+    "extension",              /* pipeline structure pass + pass_githistory: File node */
+    "external",               /* pass_k8s: Chart/Package node (bool) */
+    "fp",                     /* pass_definitions: MinHash fingerprint hex */
+    "git_common_dir",         /* git_context: Branch node / HAS_BRANCH edge */
+    "handler",                /* pass_httplinks: Route node; also HANDLES edge */
+    "head_sha",               /* git_context: Branch node / HAS_BRANCH edge */
+    "is_detached",            /* git_context: Branch node / HAS_BRANCH edge */
+    "is_entry_point",         /* language extractors */
+    "is_exported",            /* language extractors */
+    "is_git",                 /* git_context: Branch node / HAS_BRANCH edge */
+    "is_test",                /* pass_definitions: def-node metric, all labels */
+    "is_worktree",            /* git_context: Branch node / HAS_BRANCH edge */
+    "key_path",               /* pipeline infra pass: Route node YAML key-path */
+    "last_modified",          /* pass_githistory: File node temporal metadata */
+    "linear_scan_in_loop",    /* pass_definitions: def-node loop-analysis metric */
+    "lines",                  /* pass_definitions: def-node metric, all labels */
+    "loop_count",             /* pass_definitions: def-node metric (Function/Method) */
+    "loop_depth",             /* pass_definitions: def-node metric (Function/Method) */
+    "max_access_depth",       /* pass_definitions: def-node metric */
+    "method",                 /* pass_route_nodes: Route node; also HTTP/GRPC edges */
+    "param_count",            /* pass_definitions: def-node metric */
+    "param_names",            /* pass_definitions: def-node array */
+    "param_types",            /* pass_definitions: def-node array */
+    "parent_class",           /* pass_definitions: def-node text */
+    "path",                   /* pass_httplinks: Route node registered path */
+    "protocol",               /* pass_httplinks: Route node detected wire protocol */
+    "recursion_in_loop",      /* pass_definitions: def-node loop-analysis metric */
+    "recursive",              /* pass_complexity: Tier-B interprocedural complexity */
+    "return_type",            /* pass_definitions: def-node text */
+    "root_exists",            /* git_context: Branch node / HAS_BRANCH edge */
+    "route_method",           /* pass_definitions: def-node text */
+    "route_path",             /* pass_definitions: def-node text */
+    "self_recursive",         /* pass_definitions: def-node metric (Function/Method) */
+    "service",                /* pass_route_nodes: Route node; also GRPC_CALLS/INFRA_MAPS edge */
+    "signature",              /* pass_definitions: def-node text */
+    "source",                 /* pass_route_nodes/pass_k8s/pipeline: node provenance tag */
+    "sp",                     /* pass_definitions: AST structural profile */
+    "transitive_loop_depth",  /* pass_complexity: Tier-B interprocedural complexity */
+    "transport",              /* pass_definitions: Channel node; also EMITS/LISTENS_ON edge */
+    "unguarded_recursion",    /* pass_definitions: def-node loop-analysis metric */
+    "worktree_root",          /* git_context: Branch node / HAS_BRANCH edge */
+};
+
+/* Same maintenance contract as schema_declared_node_property_keys above:
+ * sorted, duplicate-free, one row per key an edge-properties writer can
+ * emit, each row commented with its writer. */
+static const char *const schema_declared_edge_property_keys[] = {
+    "args",             /* pipeline_internal: CALLS edge call-arg serializer (array) */
+    "base_sha",          /* git_context: HAS_BRANCH edge / Branch node */
+    "branch",            /* git_context: HAS_BRANCH edge / Branch node */
+    "broker",            /* pass_calls/pipeline: ASYNC_CALLS/INFRA_MAPS edge; also Route node */
+    "callee",           /* pass_calls: CALLS/HTTP_CALLS/ASYNC_CALLS/CONFIGURES/USAGE edges */
+    "caller_args",      /* pass_route_nodes: DATA_FLOWS edge */
+    "candidates",       /* pass_calls: CALLS edge candidate_count */
+    "canonical_root",    /* git_context: HAS_BRANCH edge / Branch node */
+    "channel_name",     /* pass_cross_repo: CROSS_CHANNEL edge */
+    "co_changes",       /* pass_githistory: FILE_CHANGES_WITH edge */
+    "confidence",       /* pass_calls/pass_configlink/pass_route_nodes: many edge types */
+    "confidence_band",  /* pass_httplinks: HTTP_CALLS/ASYNC_CALLS confidence bucket */
+    "config_key",       /* pass_configlink: CONFIGURES edge, key_symbol strategy */
+    "coupling_score",   /* pass_githistory: FILE_CHANGES_WITH edge */
+    "decorator",        /* pass_semantic: DECORATES edge */
+    "dep_name",         /* pass_configlink: CONFIGURES edge, dependency_import strategy */
+    "edge_type",        /* pass_route_nodes: DATA_FLOWS edge (nested original type) */
+    "endpoint",         /* pipeline: INFRA_MAPS edge */
+    "framework",        /* pass_route_nodes: HANDLES edge (SvelteKit routes) */
+    "git_common_dir",    /* git_context: HAS_BRANCH edge / Branch node */
+    "handler",          /* pass_calls: HANDLES edge target QN; also Route node */
+    "handler_params",   /* pass_route_nodes: DATA_FLOWS edge (array) */
+    "head_sha",          /* git_context: HAS_BRANCH edge / Branch node */
+    "is_detached",       /* git_context: HAS_BRANCH edge / Branch node */
+    "is_git",            /* git_context: HAS_BRANCH edge / Branch node */
+    "is_worktree",       /* git_context: HAS_BRANCH edge / Branch node */
+    "jaccard",          /* pass_similarity: SIMILAR_TO edge */
+    "key",              /* pass_calls: CONFIGURES edge (config-call key) */
+    "kind",             /* pass_k8s: INFRA_MAPS edge (selector match) */
+    "last_co_change",   /* pass_githistory: FILE_CHANGES_WITH edge */
+    "line",             /* pipeline_internal: CALLS edge call-site line */
+    "local_name",       /* pass_pkgmap: IMPORTS edge (generated column local_name_gen) */
+    "method",           /* pass_calls/pass_parallel: HTTP/GRPC edges; also Route node */
+    "operation",        /* pass_parallel: GRAPHQL_CALLS edge */
+    "procedure",        /* pass_parallel: TRPC_CALLS edge */
+    "root_exists",       /* git_context: HAS_BRANCH edge / Branch node */
+    "route",            /* pass_route_nodes: DATA_FLOWS edge (route QN) */
+    "same_file",        /* pass_similarity/pass_semantic_edges: SIMILAR_TO/SEMANTICALLY_RELATED */
+    "score",            /* pass_semantic_edges: SEMANTICALLY_RELATED edge */
+    "service",          /* pass_parallel/pass_k8s: GRPC_CALLS/INFRA_MAPS edge; also Route node */
+    "strategy",         /* pass_calls/pass_configlink: resolution strategy */
+    "target_file",      /* pass_cross_repo: CROSS_* edge family */
+    "target_function",  /* pass_cross_repo: CROSS_* edge family */
+    "target_project",   /* pass_cross_repo: CROSS_* edge family */
+    "topic",            /* pipeline: INFRA_MAPS edge */
+    "transport",        /* pass_definitions: EMITS/LISTENS_ON edge; also Channel node */
+    "url_path",         /* pass_httplinks/pass_pkgmap: generated column url_path_gen */
+    "via",              /* pass_calls/pass_route_nodes/pass_k8s: traversal-origin tag */
+    "via_infra",        /* pass_route_nodes: DATA_FLOWS edge (bool) */
+    "workload",         /* pass_k8s: INFRA_MAPS edge (selector match) */
+    "worktree_root",     /* git_context: HAS_BRANCH edge / Branch node */
+};
+
+const char *const *cbm_store_schema_declared_node_property_keys(int *out_count) {
+    if (out_count) {
+        *out_count =
+            (int)(sizeof(schema_declared_node_property_keys) /
+                 sizeof(schema_declared_node_property_keys[0]));
+    }
+    return schema_declared_node_property_keys;
+}
+
+const char *const *cbm_store_schema_declared_edge_property_keys(int *out_count) {
+    if (out_count) {
+        *out_count =
+            (int)(sizeof(schema_declared_edge_property_keys) /
+                 sizeof(schema_declared_edge_property_keys[0]));
+    }
+    return schema_declared_edge_property_keys;
+}
+
+/* Observational existence probes for zero-row hint/recovery paths (see
+ * store.h). Cold-path use only, so a per-call prepare is acceptable; hoist
+ * into the store's cached-statement mechanism only if profiling shows this
+ * path hot. The overlay branch reuses the exact active-view CTE built by
+ * cbm_store_build_active_overlay_cte — the same one get_schema_overlay_view
+ * and cbm_store_find_node_by_qn_overlay_view use — so a hint can never
+ * contradict a row the caller's query could see. */
+/* Shared fail-open existence probe for cbm_store_schema_label_observed and
+ * cbm_store_schema_type_observed: prepares sql, binds texts[0..nbind-1] to
+ * columns 1..nbind, steps once. Three outcomes: ROW=observed(true),
+ * DONE=definitively absent(false), anything else=fail open(true). */
+static bool schema_probe_one_row(cbm_store_t *s, const char *sql, const char *const *texts,
+                                 int nbind) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
+        if (stmt) sqlite3_finalize(stmt);
+        return true; /* fail open */
+    }
+    for (int i = 0; i < nbind; i++) {
+        bind_text(stmt, i + 1, texts[i]);
+    }
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc == SQLITE_ROW) return true;   /* observed */
+    if (rc == SQLITE_DONE) return false; /* definitively absent */
+    return true;                         /* step error -> fail open, never accuse */
+}
+
+bool cbm_store_schema_label_observed(cbm_store_t *s, const char *project,
+                                     bool include_overlay, const char *label) {
+    if (!s || !s->db || !project || !label) {
+        return true; /* cannot verify -> never accuse */
+    }
+    if (include_overlay) {
+        char active_cte[ST_SQL_BUF];
+        if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), false, false) !=
+            CBM_STORE_OK) {
+            return true; /* fail open */
+        }
+        char sql[ST_SQL_BUF];
+        int nsql = snprintf(sql, sizeof(sql),
+                            "%s"
+                            "SELECT 1 FROM active_nodes WHERE project = ?3 AND label = ?4 LIMIT 1;",
+                            active_cte);
+        if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+            return true; /* fail open */
+        }
+        const char *texts[] = {CBM_STORE_OVERLAY_STATUS_READY, CBM_STORE_OVERLAY_TOMBSTONE_FILE,
+                               project, label};
+        return schema_probe_one_row(s, sql, texts, 4);
+    }
+    /* O(log N) via idx_nodes_label(project, label); no property scan. */
+    const char *sql = "SELECT 1 FROM nodes WHERE project = ?1 AND label = ?2 LIMIT 1;";
+    const char *texts[] = {project, label};
+    return schema_probe_one_row(s, sql, texts, 2);
+}
+
+bool cbm_store_schema_type_observed(cbm_store_t *s, const char *project,
+                                    bool include_overlay, const char *type) {
+    if (!s || !s->db || !project || !type) {
+        return true; /* cannot verify -> never accuse */
+    }
+    if (include_overlay) {
+        char active_cte[ST_SQL_BUF];
+        if (cbm_store_build_active_overlay_cte(active_cte, sizeof(active_cte), true, false) !=
+            CBM_STORE_OK) {
+            return true; /* fail open */
+        }
+        char sql[ST_SQL_BUF];
+        int nsql = snprintf(sql, sizeof(sql),
+                            "%s"
+                            "SELECT 1 FROM active_edges e "
+                            "JOIN active_nodes src ON src.qualified_name = e.source_qn "
+                            "JOIN active_nodes dst ON dst.qualified_name = e.target_qn "
+                            "WHERE src.project = ?3 AND dst.project = ?3 AND e.type = ?4 LIMIT 1;",
+                            active_cte);
+        if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
+            return true; /* fail open */
+        }
+        const char *texts[] = {CBM_STORE_OVERLAY_STATUS_READY, CBM_STORE_OVERLAY_TOMBSTONE_FILE,
+                               project, type};
+        return schema_probe_one_row(s, sql, texts, 4);
+    }
+    /* O(log N) via idx_edges_type(project, type); no property scan. */
+    const char *sql = "SELECT 1 FROM edges WHERE project = ?1 AND type = ?2 LIMIT 1;";
+    const char *texts[] = {project, type};
+    return schema_probe_one_row(s, sql, texts, 2);
+}
 
 /* Discover distinct JSON property keys for a table/column via json_each().
- * Prepends base_cols, then appends up to SCHEMA_MAX_JSON_KEYS from the query.
+ * Prepends base_cols, then appends up to CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT from the query.
  * Caller must free the returned array and each string in it. */
 static int schema_discover_props(cbm_store_t *s, const char *sql, const schema_text_bind_t *binds,
-                                 int bind_count, const char **base_cols, int base_col_count,
+                                 int bind_count, const char *const *base_cols, int base_col_count,
                                  char ***out_props, int *out_count, const char *error_context) {
     if (!s || !s->db || !sql || !base_cols || base_col_count < 0 || !out_props || !out_count) {
         return CBM_NOT_FOUND;
     }
     *out_props = NULL;
     *out_count = 0;
-    int pcap = base_col_count + SCHEMA_MAX_JSON_KEYS;
+    int pcap = base_col_count + CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT;
     char **props = malloc(pcap * sizeof(char *));
     if (!props) {
         store_set_error(s, "schema property keys out of memory");
@@ -11303,34 +11559,12 @@ static int schema_collect_type_counts_from_stmt(cbm_store_t *s, sqlite3_stmt *st
     return CBM_STORE_OK;
 }
 
-static char *schema_format_rel_pattern(const char *src_label, const char *type,
-                                       const char *dst_label, int count) {
-    const char *src = safe_str(src_label);
-    const char *edge = safe_str(type);
-    const char *dst = safe_str(dst_label);
-    int needed = snprintf(NULL, 0, "(%s)-[%s]->(%s) [%dx]", src, edge, dst, count);
-    if (needed < 0) {
-        return NULL;
-    }
-    char *out = malloc((size_t)needed + 1);
-    if (!out) {
-        return NULL;
-    }
-    int written = snprintf(out, (size_t)needed + 1, "(%s)-[%s]->(%s) [%dx]", src, edge,
-                           dst, count);
-    if (written < 0 || written > needed) {
-        free(out);
-        return NULL;
-    }
-    return out;
-}
-
 static int schema_collect_rel_patterns_from_stmt(cbm_store_t *s, sqlite3_stmt *stmt,
                                                  cbm_schema_info_t *out,
                                                  const char *error_context) {
     int cap = ST_INIT_CAP_8;
     int n = 0;
-    const char **arr = calloc((size_t)cap, sizeof(*arr));
+    cbm_schema_relationship_t *arr = calloc((size_t)cap, sizeof(*arr));
     if (!arr) {
         store_set_error(s, "schema relationship patterns out of memory");
         return CBM_NOT_FOUND;
@@ -11342,18 +11576,28 @@ static int schema_collect_rel_patterns_from_stmt(cbm_store_t *s, sqlite3_stmt *s
                              "schema relationship patterns out of memory", true) !=
                 CBM_STORE_OK) {
             for (int i = 0; i < n; i++) {
-                safe_str_free(&arr[i]);
+                safe_str_free(&arr[i].source_label);
+                safe_str_free(&arr[i].edge_type);
+                safe_str_free(&arr[i].target_label);
             }
             free(arr);
             return CBM_NOT_FOUND;
         }
-        arr[n] = schema_format_rel_pattern((const char *)sqlite3_column_text(stmt, 0),
-                                           (const char *)sqlite3_column_text(stmt, SKIP_ONE),
-                                           (const char *)sqlite3_column_text(stmt, PAIR_LEN),
-                                           sqlite3_column_int(stmt, CBM_SZ_3));
-        if (!arr[n]) {
+        arr[n].source_label =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, 0)));
+        arr[n].edge_type =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, SKIP_ONE)));
+        arr[n].target_label =
+            heap_strdup(safe_str((const char *)sqlite3_column_text(stmt, PAIR_LEN)));
+        arr[n].observed_count = sqlite3_column_int(stmt, CBM_SZ_3);
+        if (!arr[n].source_label || !arr[n].edge_type || !arr[n].target_label) {
+            safe_str_free(&arr[n].source_label);
+            safe_str_free(&arr[n].edge_type);
+            safe_str_free(&arr[n].target_label);
             for (int i = 0; i < n; i++) {
-                safe_str_free(&arr[i]);
+                safe_str_free(&arr[i].source_label);
+                safe_str_free(&arr[i].edge_type);
+                safe_str_free(&arr[i].target_label);
             }
             free(arr);
             store_set_error(s, "schema relationship patterns out of memory");
@@ -11363,7 +11607,9 @@ static int schema_collect_rel_patterns_from_stmt(cbm_store_t *s, sqlite3_stmt *s
     }
     if (step_rc != SQLITE_DONE) {
         for (int i = 0; i < n; i++) {
-            safe_str_free(&arr[i]);
+            safe_str_free(&arr[i].source_label);
+            safe_str_free(&arr[i].edge_type);
+            safe_str_free(&arr[i].target_label);
         }
         free(arr);
         store_set_error_sqlite(s, error_context ? error_context : "schema relationship patterns");
@@ -11387,7 +11633,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
     /* Node labels */
     {
         const char *sql = "SELECT label, COUNT(*) FROM nodes WHERE project = ?1 GROUP BY label "
-                          "ORDER BY COUNT(*) DESC;";
+                          "ORDER BY COUNT(*) DESC, label ASC;";
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
@@ -11413,7 +11659,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                                "WHERE nodes.project = ?1 AND nodes.label = ?2 "
                                "  AND nodes.properties != '{}' "
                                "ORDER BY je.key "
-                               "LIMIT 50;";
+                               "LIMIT " CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";";
 
         for (int i = 0; i < out->node_label_count; i++) {
             const schema_text_bind_t binds[] = {{ST_COL_1, project},
@@ -11433,7 +11679,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
     /* Edge types */
     {
         const char *sql = "SELECT type, COUNT(*) FROM edges WHERE project = ?1 GROUP BY type ORDER "
-                          "BY COUNT(*) DESC;";
+                          "BY COUNT(*) DESC, type ASC;";
         sqlite3_stmt *stmt = NULL;
         if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK || !stmt) {
             if (stmt) {
@@ -11471,7 +11717,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
             return CBM_NOT_FOUND;
         }
         bind_text(stmt, ST_COL_1, project);
-        sqlite3_bind_int(stmt, ST_COL_2, SCHEMA_REL_PATTERN_LIMIT);
+        sqlite3_bind_int(stmt, ST_COL_2, CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT);
 
         int rc = schema_collect_rel_patterns_from_stmt(s, stmt, out,
                                                        "schema relationship patterns");
@@ -11491,7 +11737,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                                "WHERE edges.project = ?1 AND edges.type = ?2 "
                                "  AND edges.properties != '{}' "
                                "ORDER BY je.key "
-                               "LIMIT 50;";
+                               "LIMIT " CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";";
 
         for (int i = 0; i < out->edge_type_count; i++) {
             const schema_text_bind_t binds[] = {{ST_COL_1, project},
@@ -11569,7 +11815,8 @@ static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_sche
                         "THEN n.properties ELSE '{}' END) AS je "
                         "WHERE n.project = ?3 AND n.label = ?4 "
                         "  AND n.properties != '{}' "
-                        "ORDER BY je.key LIMIT 50;",
+                        "ORDER BY je.key LIMIT "
+                        CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";",
                         active_cte);
         if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
             cbm_store_schema_free(out);
@@ -11656,7 +11903,7 @@ static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_sche
     bind_text(stmt, ST_COL_1, CBM_STORE_OVERLAY_STATUS_READY);
     bind_text(stmt, ST_COL_2, CBM_STORE_OVERLAY_TOMBSTONE_FILE);
     bind_text(stmt, ST_COL_3, project);
-    sqlite3_bind_int(stmt, ST_COL_4, SCHEMA_REL_PATTERN_LIMIT);
+    sqlite3_bind_int(stmt, ST_COL_4, CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT);
     rc = schema_collect_rel_patterns_from_stmt(s, stmt, out,
                                                "schema_overlay relationship patterns");
     sqlite3_finalize(stmt);
@@ -11676,7 +11923,8 @@ static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_sche
                         "THEN e.properties ELSE '{}' END) AS je "
                         "WHERE src.project = ?3 AND dst.project = ?3 AND e.type = ?4 "
                         "  AND e.properties != '{}' "
-                        "ORDER BY je.key LIMIT 50;",
+                        "ORDER BY je.key LIMIT "
+                        CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";",
                         active_cte);
         if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
             cbm_store_schema_free(out);
@@ -11801,7 +12049,7 @@ int cbm_store_get_schema_counts_scoped(cbm_store_t *s, const char *project, cons
         }
         bind_text(stmt, ST_COL_1, project);
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
-        sqlite3_bind_int(stmt, ST_COL_4, SCHEMA_REL_PATTERN_LIMIT);
+        sqlite3_bind_int(stmt, ST_COL_4, CBM_STORE_SCHEMA_RELATIONSHIP_PATTERN_LIMIT);
 
         int rc = schema_collect_rel_patterns_from_stmt(s, stmt, out,
                                                        "schema scoped relationship patterns");
@@ -11838,7 +12086,9 @@ void cbm_store_schema_free(cbm_schema_info_t *out) {
     free(out->edge_types);
 
     for (int i = 0; i < out->rel_pattern_count; i++) {
-        safe_str_free(&out->rel_patterns[i]);
+        safe_str_free(&out->rel_patterns[i].source_label);
+        safe_str_free(&out->rel_patterns[i].edge_type);
+        safe_str_free(&out->rel_patterns[i].target_label);
     }
     free(out->rel_patterns);
 
