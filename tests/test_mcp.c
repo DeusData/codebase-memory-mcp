@@ -16,6 +16,7 @@
 #include <cli/cli.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
+#include <pagerank/pagerank.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <watcher/watcher.h>
@@ -6278,6 +6279,100 @@ TEST(tool_index_repository_auto_index_deps_arg_disables_deps) {
     PASS();
 }
 
+TEST(tool_index_repository_exact_moderate_preserves_semantic_stale_state) {
+    char *repo_tmp = th_mktempdir("cbm_mcp_semantic_stale_repo");
+    ASSERT_NOT_NULL(repo_tmp);
+    char repo[CBM_PATH_MAX];
+    int n = snprintf(repo, sizeof(repo), "%s", repo_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(repo));
+    char *cache_tmp = th_mktempdir("cbm_mcp_semantic_stale_cache");
+    ASSERT_NOT_NULL(cache_tmp);
+    char cache[CBM_PATH_MAX];
+    n = snprintf(cache, sizeof(cache), "%s", cache_tmp);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cache));
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? cbm_strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    cbm_config_t *cfg = cbm_config_open(cache);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX,
+                             CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_OFF),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_ENABLED, "false"), 0);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "records.py"),
+                            "def normalize_user(value):\n"
+                            "    return value.strip().lower()\n\n"
+                            "def normalize_account(value):\n"
+                            "    return value.strip().lower()\n"),
+              0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+
+    char args[CBM_SZ_4K];
+    n = snprintf(args, sizeof(args),
+                 "{\"repo_path\":\"%s\",\"mode\":\"moderate\","
+                 "\"auto_index_deps\":false,\"format\":\"json\"}",
+                 repo);
+    ASSERT(n >= 0 && (size_t)n < sizeof(args));
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "records.py"),
+                            "def normalize_user(value):\n"
+                            "    return value.strip().lower()\n\n"
+                            "def normalize_account(value):\n"
+                            "    return value.strip().lower()\n\n"
+                            "def normalize_team(value):\n"
+                            "    return value.strip().lower()\n"),
+              0);
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"publish_kind\":\"incremental_exact\""));
+    free(resp);
+
+    char *project = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(project);
+    char db_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(db_path, sizeof(db_path), cache, project), CBM_STORE_OK);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(cbm_store_derived_view_is_stale(store, project,
+                                                CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES));
+    cbm_store_close(store);
+
+    n = snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"query\":\"MATCH (a)-[:SEMANTICALLY_RELATED]->(b) "
+                 "RETURN a.name, b.name LIMIT 5\",\"format\":\"json\"}",
+                 project);
+    ASSERT(n >= 0 && (size_t)n < sizeof(args));
+    resp = cbm_mcp_handle_tool(srv, "query_graph", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "semantic_edges derived view is stale"));
+    free(resp);
+
+    free(project);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    mcp_restore_cache_dir(saved_copy);
+    th_cleanup(repo);
+    th_cleanup(cache);
+    PASS();
+}
+
 TEST(tool_index_repository_auto_dep_limit_arg_caps_deps) {
     char *repo_tmp = th_mktempdir("cbm_mcp_dep_limit_repo");
     ASSERT_NOT_NULL(repo_tmp);
@@ -12338,6 +12433,7 @@ SUITE(mcp) {
     /* Pipeline-dependent tool handlers */
     RUN_TEST(tool_index_repository_missing_path);
     RUN_TEST(tool_index_repository_auto_index_deps_arg_disables_deps);
+    RUN_TEST(tool_index_repository_exact_moderate_preserves_semantic_stale_state);
     RUN_TEST(tool_index_repository_auto_dep_limit_arg_caps_deps);
     RUN_TEST(tool_index_repository_after_publish_starts_overlay_compaction_worker);
     RUN_TEST(tool_index_repository_reports_incremental_containment_reason);

@@ -44,6 +44,32 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             ["architecture", "pagerank", "semantic_edges"],
         )
 
+    def test_persisted_stale_views_are_read_from_canonical_freshness_ledger(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            database = Path(tmpdir) / "graph.db"
+            with closing(sqlite3.connect(database)) as con, con:
+                con.execute(
+                    "CREATE TABLE derived_view_state("
+                    "project TEXT, view_name TEXT, source_generation INTEGER, "
+                    "computed_at INTEGER, status TEXT, detail TEXT, "
+                    "PRIMARY KEY(project, view_name))"
+                )
+                con.executemany(
+                    "INSERT INTO derived_view_state VALUES (?,?,?,?,?,?)",
+                    [
+                        ("repo", "semantic_edges", 2, 1, "stale", ""),
+                        ("repo", "pagerank", 2, 2, "complete", ""),
+                        ("other", "routes", 2, 1, "stale", ""),
+                    ],
+                )
+
+            self.assertEqual(
+                BENCHMARK.persisted_stale_views(database, "repo"),
+                ["semantic_edges"],
+            )
+
     def test_declared_stale_semantic_edges_preserve_core_graph_gate(self) -> None:
         gate = BENCHMARK.graph_gate_for_publish_kind(
             {"equal": False},
