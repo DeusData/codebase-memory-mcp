@@ -261,6 +261,7 @@ typedef struct {
     const char *qn_pattern;       /* regex on qualified_name, NULL = any */
     const char *pattern;          /* OR-search: matches name OR qualified_name, NULL = any */
     const char *file_pattern;     /* glob on file_path, NULL = any */
+    const char *file_contains;    /* literal case-sensitive file_path substring, NULL = any */
     const char *relationship;     /* edge type filter, NULL = any */
     const char *direction;        /* "inbound" / "outbound" / "any", NULL = any */
     int min_degree;               /* -1 = no filter (default), 0+ = minimum */

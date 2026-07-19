@@ -3458,6 +3458,26 @@ TEST(tool_query_graph_uses_query_max_rows_config_when_omitted) {
 
     free(inner);
     free(resp);
+
+    /* The configured server cap is authoritative; query text may request a
+     * smaller LIMIT but cannot expand the response beyond query_max_rows. */
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"query_graph\","
+                                      "\"arguments\":{\"project\":\"query-max-rows-config\","
+                                      "\"query\":\"MATCH (f:Function) RETURN f.name LIMIT 4\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    hits = 0;
+    p = inner;
+    while ((p = strstr(p, "ConfigLimitedFn")) != NULL) {
+        hits++;
+        p += strlen("ConfigLimitedFn");
+    }
+    ASSERT_EQ(hits, 2);
+
+    free(inner);
+    free(resp);
     cbm_mcp_server_free(srv);
     cbm_config_close(cfg);
     th_cleanup(cache);

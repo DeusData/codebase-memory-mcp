@@ -3316,10 +3316,64 @@ static void scan_alternation_labels(cbm_store_t *store, const char *project, con
     free(copy);
 }
 
-static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_rows,
-                               cbm_node_pattern_t *first, cypher_node_scan_mode_t scan_mode,
+static const char *condition_file_contains_value(const cbm_condition_t *cond,
+                                                 const char *variable) {
+    if (!cond || !variable || cond->negated || cond->func || cond->coalesce_default ||
+        cond->arg_count != 0 || !cond->variable || strcmp(cond->variable, variable) != 0 ||
+        !cond->property || strcmp(cond->property, "file_path") != 0 || !cond->op ||
+        strcmp(cond->op, "CONTAINS") != 0) {
+        return NULL;
+    }
+    return cond->value;
+}
+
+/* Find a literal file-path CONTAINS predicate that is a mandatory conjunct of
+ * the initial node match. Predicates below OR/XOR/NOT are not mandatory and
+ * must remain C-only filters. The executor still evaluates the complete WHERE
+ * tree after the store scan, so this is a candidate reduction, not a second
+ * semantic authority. */
+static void find_file_contains_conjunct(const cbm_expr_t *expr, const char *variable,
+                                        const char **out_value) {
+    if (!expr || !variable || !out_value || *out_value) {
+        return;
+    }
+    if (expr->type == EXPR_AND) {
+        find_file_contains_conjunct(expr->left, variable, out_value);
+        find_file_contains_conjunct(expr->right, variable, out_value);
+        return;
+    }
+    if (expr->type != EXPR_CONDITION) {
+        return;
+    }
+    const char *value = condition_file_contains_value(&expr->cond, variable);
+    if (value) {
+        *out_value = value;
+    }
+}
+
+static const char *where_file_contains_conjunct(const cbm_where_clause_t *where,
+                                                const char *variable) {
+    if (!where || !variable) {
+        return NULL;
+    }
+    const char *value = NULL;
+    if (where->root) {
+        find_file_contains_conjunct(where->root, variable, &value);
+        return value;
+    }
+    if (where->op && strcmp(where->op, "OR") == 0) {
+        return NULL;
+    }
+    for (int i = 0; i < where->count && !value; i++) {
+        value = condition_file_contains_value(&where->conditions[i], variable);
+    }
+    return value;
+}
+
+static void scan_pattern_nodes(cbm_store_t *store, const char *project, int candidate_limit,
+                               cbm_node_pattern_t *first, const cbm_where_clause_t *where,
+                               const char *variable, cypher_node_scan_mode_t scan_mode,
                                cbm_node_t **out_nodes, int *out_count) {
-    int seed_limit = max_rows > INT_MAX / CYP_GROWTH_10 ? INT_MAX : max_rows * CYP_GROWTH_10;
     if (first->label && strchr(first->label, '|')) {
         scan_alternation_labels(store, project, first->label, scan_mode, out_nodes, out_count);
     } else if (first->label) {
@@ -3330,13 +3384,15 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_
             cbm_store_find_nodes_by_label(store, project, first->label, out_nodes, out_count);
         }
     } else if (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY) {
-        cbm_store_find_nodes_by_label_overlay_view_limited(store, project, NULL, seed_limit,
+        cbm_store_find_nodes_by_label_overlay_view_limited(store, project, NULL, candidate_limit,
                                                            out_nodes, out_count);
     } else {
+        const char *file_contains = where_file_contains_conjunct(where, variable);
         cbm_search_params_t params = {.project = project,
+                                      .file_contains = file_contains,
                                       .min_degree = CYP_FOUND_NONE,
                                       .max_degree = CYP_FOUND_NONE,
-                                      .limit = seed_limit};
+                                      .limit = candidate_limit};
         cbm_search_output_t sout = {0};
         cbm_store_search(store, &params, &sout);
         *out_count = sout.count;
@@ -4931,9 +4987,15 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 /* Execute simple (non-aggregate) RETURN projection */
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
-    int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && ret->order_count == 0 && ret->skip <= 0) {
-        proj_cap = ret->limit;
+    /* ORDER BY, DISTINCT, and SKIP select from the complete eligible set before
+     * the output cap is applied. Prefix projection is safe only when no later
+     * result-selection operator can change which rows belong in the response. */
+    int proj_cap = bind_count;
+    if (!ret->distinct && ret->order_count == 0 && ret->skip <= 0) {
+        proj_cap = max_rows;
+        if (ret->limit >= 0 && ret->limit < proj_cap) {
+            proj_cap = ret->limit;
+        }
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
         const char *vals[CBM_SZ_32];
@@ -5265,8 +5327,8 @@ static void expand_patterns_from(cbm_store_t *store, cbm_query_t *q, int first_p
 
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
-        scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], scan_mode, &extra_nodes,
-                           &extra_count);
+        scan_pattern_nodes(store, project, INT_MAX, &patn->nodes[0], pattern_where, nvar, scan_mode,
+                           &extra_nodes, &extra_count);
         if (patn->rel_count == 0) {
             cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt,
                              pattern_where);
@@ -5350,25 +5412,74 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
-    rb_apply_skip_limit(rb, ret->skip, ret->limit >= 0 ? ret->limit : max_rows);
+    int output_limit = max_rows;
+    if (ret->limit >= 0 && ret->limit < output_limit) {
+        output_limit = ret->limit;
+    }
+    rb_apply_skip_limit(rb, ret->skip, output_limit);
+}
+
+static bool where_is_exact_file_contains(const cbm_where_clause_t *where, const char *variable) {
+    if (!where || !variable) {
+        return false;
+    }
+    if (where->root) {
+        return where->root->type == EXPR_CONDITION &&
+               condition_file_contains_value(&where->root->cond, variable) != NULL;
+    }
+    return where->count == SKIP_ONE && (!where->op || strcmp(where->op, "AND") == 0) &&
+           condition_file_contains_value(&where->conditions[0], variable) != NULL;
+}
+
+/* An output cap may bound the initial SQL scan only when every later operation
+ * preserves that scan prefix. Predicates, relationship expansion, aggregation,
+ * DISTINCT, ordering, skipping, and later stages can all make a row outside an
+ * arbitrary prefix the correct result. For those shapes, scan every candidate
+ * (after exact SQL pushdowns) and let the Cypher evaluator enforce max_rows on
+ * output. This keeps resource limits from silently changing query semantics. */
+static bool query_initial_scan_can_stop_at_output_cap(const cbm_query_t *q, const char *variable,
+                                                      cypher_node_scan_mode_t scan_mode) {
+    if (!q || q->pattern_count != SKIP_ONE || q->patterns[0].rel_count != 0 ||
+        q->patterns[0].nodes[0].prop_count != 0 || q->with_clause || q->post_with_where ||
+        q->next_stage) {
+        return false;
+    }
+    if (q->where && (scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY ||
+                     !where_is_exact_file_contains(q->where, variable))) {
+        return false;
+    }
+    const cbm_return_clause_t *ret = q->ret;
+    if (!ret) {
+        return true;
+    }
+    if (ret->distinct || ret->order_count > 0 || ret->skip > 0) {
+        return false;
+    }
+    for (int i = 0; i < ret->count; i++) {
+        if (is_aggregate_func(ret->items[i].func)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
                           cypher_node_scan_mode_t scan_mode, result_builder_t *rb) {
     cbm_pattern_t *pat0 = &q->patterns[0];
+    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
 
     /* Step 1: Scan initial nodes */
     cbm_node_t *scanned = NULL;
     int scan_count = 0;
-    scan_pattern_nodes(store, project, max_rows, &pat0->nodes[0], scan_mode, &scanned,
-                       &scan_count);
+    int candidate_limit =
+        query_initial_scan_can_stop_at_output_cap(q, var_name, scan_mode) ? max_rows : INT_MAX;
+    scan_pattern_nodes(store, project, candidate_limit, &pat0->nodes[0], q->where, var_name,
+                       scan_mode, &scanned, &scan_count);
 
     /* Build initial bindings with early WHERE */
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
     binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
     int bind_count = 0;
-    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
-
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
             break;
