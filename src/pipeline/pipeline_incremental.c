@@ -942,6 +942,7 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
     for (int i = 0; i < file_count; i++) {
         struct stat st;
         if (stat(files[i].path, &st) != 0) {
+            current_failed++;
             continue;
         }
         int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
@@ -1170,6 +1171,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
          * usages, and semantic passes. Release them only after the final
          * borrower, including every injected-failure path. */
         incr_release_seq_cross_arena(ctx);
+        cbm_pipeline_release_objectscript_tables(ctx);
         if (rc != 0) {
             return rc;
         }

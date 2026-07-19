@@ -17425,7 +17425,9 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     ASSERT_TRUE(cbm_mem_over_budget());
 
     cbm_pp_bp_nap_cycles_reset();
-    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, NULL, CBM_MODE_FULL);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/backpressure.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     int rc = cbm_pipeline_run(p);
     long cycles = cbm_pp_bp_nap_cycles();

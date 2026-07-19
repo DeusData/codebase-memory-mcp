@@ -8,6 +8,7 @@
  *   --help          Print usage and exit
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
+ *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
  *
  * Signal handling: SIGTERM/SIGINT trigger graceful shutdown.
  * Watcher runs in a background thread, polling for git changes.
@@ -671,7 +672,7 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
-            return cbm_cmd_hook_augment();
+            return cbm_cmd_hook_augment(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
@@ -806,6 +807,13 @@ int main(int argc, char **argv) {
     if (subcmd >= 0) {
         return subcmd;
     }
+    cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
+    if (cbm_mcp_parse_tool_profile_args(argc, (const char *const *)argv, &tool_profile) != 0) {
+        (void)fprintf(stderr, "codebase-memory-mcp: --tool-profile requires the supported value "
+                              "'analysis' or 'scout'\n");
+        return 2;
+    }
+    bool restricted_tool_profile = tool_profile != CBM_MCP_TOOL_PROFILE_ALL;
 
     /* parent-death watchdog — distilled from #407 (fixes #406). Start it early so
      * an orphaned server exits even if it dies before reaching the MCP loop. A
@@ -841,7 +849,7 @@ int main(int argc, char **argv) {
     cbm_ui_config_t ui_cfg;
     cbm_ui_config_load(&ui_cfg);
     bool explicit_ui_enable = false;
-    if (parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
+    if (!restricted_tool_profile && parse_ui_flags(argc, argv, &ui_cfg, &explicit_ui_enable)) {
         cbm_ui_config_save(&ui_cfg);
     }
     /* If the user explicitly asked for the UI but this binary has no embedded
@@ -863,7 +871,7 @@ int main(int argc, char **argv) {
     char config_dir[CBM_SZ_1K];
     const char *cfg_home = cbm_get_home_dir();
     cbm_config_t *runtime_config = NULL;
-    if (cfg_home) {
+    if (cfg_home && !restricted_tool_profile) {
         snprintf(config_dir, sizeof(config_dir), "%s", cbm_resolve_cache_dir());
         runtime_config = cbm_config_open(config_dir);
     }
@@ -881,6 +889,7 @@ int main(int argc, char **argv) {
 #endif
         return SKIP_ONE;
     }
+    cbm_mcp_server_set_tool_profile(g_server, tool_profile);
 
     /* Create and start watcher in background thread */
     /* Initialize log mutex before any threads are created */
@@ -912,7 +921,8 @@ int main(int argc, char **argv) {
     cbm_thread_t http_tid;
     bool http_started = false;
 
-    if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
+    if (cbm_mcp_tool_profile_allows_http(tool_profile) && ui_cfg.ui_enabled &&
+        CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
             cbm_http_server_set_watcher(g_http_server, g_watcher);
@@ -920,7 +930,8 @@ int main(int argc, char **argv) {
                 http_started = true;
             }
         }
-    } else if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT == 0) {
+    } else if (cbm_mcp_tool_profile_allows_http(tool_profile) && ui_cfg.ui_enabled &&
+               CBM_EMBEDDED_FILE_COUNT == 0) {
         cbm_log_warn("ui.no_assets", "hint", "rebuild with: make -f Makefile.cbm cbm-with-ui");
     }
 

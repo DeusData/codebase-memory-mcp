@@ -53,12 +53,12 @@ bool cbm_mkdir_p(const char *path, int mode);
 
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);
-/* Remove <db_path>-wal/-shm. MUST be called by any path installing a fresh
- * DB file where a previous generation lived — a leftover WAL is otherwise
- * replayed on top of the new file at the next open (#897). */
+/* Remove <db_path>-wal/-shm. Any path installing a fresh DB generation must
+ * do this before the new generation can be opened; a leftover WAL is
+ * otherwise replayed on top of the new file (#897). */
 void cbm_remove_db_sidecars(const char *db_path);
 /* rename() that replaces an existing destination on every platform
- * (Windows rename fails with EEXIST; this uses MoveFileExW there). */
+ * (Windows rename fails with EEXIST; this uses write-through MoveFileExW). */
 int cbm_rename_replace(const char *src, const char *dst);
 /* Canonicalize an EXISTING path (realpath / wide GetFullPathNameW). Locale-
  * independent on Windows — never routes UTF-8 through the ANSI CRT (#973).

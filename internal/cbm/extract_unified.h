@@ -14,6 +14,20 @@
 
 #define MAX_SCOPES 64
 
+// ObjectScript type map: variable name → class name (for instance_method_call
+// resolution). Stack-allocated, per-method scope. Overflow is silent (no crash).
+#define OS_TYPE_MAP_CAP 64
+typedef struct {
+    const char *var_name;
+    const char *class_name;
+} os_type_entry_t;
+
+typedef struct {
+    os_type_entry_t entries[OS_TYPE_MAP_CAP];
+    int count;
+    int class_base_count; // entries [0,class_base_count) survive method-scope resets
+} os_type_map_t;
+
 // WalkState tracks scope context during the unified cursor walk.
 // Replaces parent-chain walks for enclosing_func_qn, inside_call, etc.
 typedef struct {
@@ -30,6 +44,8 @@ typedef struct {
         uint8_t kind;
     } scopes[MAX_SCOPES];
     int scope_top;
+
+    os_type_map_t os_type_map; // ObjectScript variable → type mapping
 } WalkState;
 
 // Per-node handler prototypes. Each is called once per node during the

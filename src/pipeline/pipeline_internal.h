@@ -39,6 +39,11 @@
 #define CBM_PYTHON_SUPER_INIT_CALLEE "super().__init__"
 #define CBM_REGISTRY_STRATEGY_SUFFIX_MATCH "suffix_match"
 
+/* Incremental integrity failure: abort the run and preserve the existing DB.
+ * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
+ * "no incremental route; continue with a full index" sentinel. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
+
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
  * handlers rendezvous on the same Route QN regardless of framework syntax.
@@ -476,6 +481,14 @@ typedef struct {
      * from it until all sequential passes finish. */
     CBMArena seq_cross_arena;
     bool seq_cross_arena_live;
+
+    /* ObjectScript $$$macro table built from .inc files in the repo (NULL if
+     * no ObjectScript include files were found). Owned by pipeline.c. */
+    const CBMMacroTable *macro_table;
+
+    /* ObjectScript method-return-type table built from extracted definitions
+     * (NULL until pass_calls builds it). Owned by pipeline.c. */
+    const CBMReturnTypeTable *return_type_table;
 } cbm_pipeline_ctx_t;
 
 static inline int64_t cbm_pipeline_ctx_extract_timeout(const cbm_pipeline_ctx_t *ctx) {
@@ -484,6 +497,11 @@ static inline int64_t cbm_pipeline_ctx_extract_timeout(const cbm_pipeline_ctx_t 
 }
 
 int64_t cbm_pipeline_extract_timeout_micros(const cbm_pipeline_t *p);
+
+/* Release ObjectScript extraction tables owned by a pipeline context. This is
+ * shared by full and incremental routes so every exit path uses one ownership
+ * authority. NULL fields are accepted and cleared. */
+void cbm_pipeline_release_objectscript_tables(cbm_pipeline_ctx_t *ctx);
 
 static inline bool cbm_pipeline_mode_builds_global_semantic_edges(int mode) {
     return mode == CBM_MODE_FULL || mode == CBM_MODE_MODERATE;

@@ -268,8 +268,16 @@ static const ext_entry_t EXT_TABLE[] = {
     {"WORKSPACE", CBM_LANG_STARLARK},
     {"WORKSPACE.bazel", CBM_LANG_STARLARK},
 
-    /* BitBake include fragments — `require/include foo.inc` target files. */
+    /* BitBake include fragments — `require/include foo.inc` target files.
+     * NOTE: .inc is also used by ObjectScript include (macro) files; the
+     * ambiguity is resolved by content in cbm_disambiguate_inc(). */
     {".inc", CBM_LANG_BITBAKE},
+
+    /* InterSystems ObjectScript routines (.mac/.int/.rtn unambiguous; .cls is
+     * shared with Apex and resolved by content in cbm_disambiguate_cls()). */
+    {".mac", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+    {".int", CBM_LANG_OBJECTSCRIPT_ROUTINE},
+    {".rtn", CBM_LANG_OBJECTSCRIPT_ROUTINE},
 
     /* Vue */
     {".vue", CBM_LANG_VUE},
@@ -839,6 +847,9 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_SOQL] = "SOQL",
     [CBM_LANG_SOSL] = "SOSL",
     [CBM_LANG_MOJO] = "Mojo",
+    [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
+    [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
+    [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
 
 };
 
@@ -1029,4 +1040,85 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     }
 
     return CBM_LANG_MATLAB;
+}
+
+/* Disambiguate .cls files: shared by InterSystems ObjectScript UDL and
+ * Salesforce Apex. ObjectScript class files begin with a line of the form
+ * "Class <UppercasePackage>...". Defaults to Apex on any doubt. */
+CBMLanguage cbm_disambiguate_cls(const char *path) {
+    if (!path) {
+        return CBM_LANG_APEX;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_APEX;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    const char *line = buf;
+    while (*line) {
+        if (strncmp(line, "Class ", SLEN("Class ")) == 0 &&
+            isupper((unsigned char)line[SLEN("Class ")])) {
+            return CBM_LANG_OBJECTSCRIPT_UDL;
+        }
+        const char *nl = strchr(line, '\n');
+        if (!nl) {
+            break;
+        }
+        line = nl + SKIP_ONE;
+    }
+    return CBM_LANG_APEX;
+}
+
+/* Disambiguate .inc files: shared by BitBake include fragments and
+ * InterSystems ObjectScript include (macro) files. ObjectScript .inc files are
+ * predominantly macro definitions ("#define NAME ..." / "#def1arg NAME ...");
+ * some also carry a "ROUTINE <Name>" header. The macro-preprocessor directives
+ * are the strongest signal because that is the primary content of an .inc file,
+ * whereas BitBake uses '#' only for "# comment" lines (always '#' + space).
+ * We therefore match ObjectScript preprocessor directives ('#' immediately
+ * followed by 'def'/';'), which BitBake never produces. Defaults to BitBake on
+ * any doubt (preserves existing behaviour). */
+CBMLanguage cbm_disambiguate_inc(const char *path) {
+    if (!path) {
+        return CBM_LANG_BITBAKE;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_BITBAKE;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    const char *line = buf;
+    while (*line) {
+        /* ObjectScript include header: a line beginning "ROUTINE <Uppercase>". */
+        if (strncmp(line, "ROUTINE ", SLEN("ROUTINE ")) == 0 &&
+            isupper((unsigned char)line[SLEN("ROUTINE ")])) {
+            return CBM_LANG_OBJECTSCRIPT_ROUTINE;
+        }
+        /* ObjectScript macro directives — the primary content of .inc files.
+         * "#define"/"#def1arg" (macro defs) and "#;" (line comment). BitBake's
+         * only '#' use is "# comment" (hash + space), so these never collide. */
+        if (strncmp(line, "#define", SLEN("#define")) == 0 ||
+            strncmp(line, "#def1arg", SLEN("#def1arg")) == 0 ||
+            strncmp(line, "#;", SLEN("#;")) == 0) {
+            return CBM_LANG_OBJECTSCRIPT_ROUTINE;
+        }
+        const char *nl = strchr(line, '\n');
+        if (!nl) {
+            break;
+        }
+        line = nl + SKIP_ONE;
+    }
+    return CBM_LANG_BITBAKE;
 }

@@ -10,6 +10,8 @@
 #define CBM_CLI_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stddef.h>
 
 /* ── Version ──────────────────────────────────────────────────── */
 
@@ -109,17 +111,18 @@ int cbm_install_editor_mcp(const char *binary_path, const char *config_path);
 /* Remove MCP server entry from Cursor/Windsurf/Gemini JSON config.
  * Returns 0 on success. */
 int cbm_remove_editor_mcp(const char *config_path);
+int cbm_remove_editor_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Install MCP server entry in OpenClaw JSON config.
- * Format: { "mcp": { "servers": { "codebase-memory-mcp": {
- *   "enabled": true, "command": binary_path, "args": []
- * } } } }
+ * Format: { "mcp": { "servers": { "codebase-memory-mcp":
+ * { "enabled": true, "command": binary_path, "args": [] } } } }
  * Preserves existing entries. Returns 0 on success. */
 int cbm_install_openclaw_mcp(const char *binary_path, const char *config_path);
 
 /* Remove MCP server entry from OpenClaw JSON config.
  * Returns 0 on success. */
 int cbm_remove_openclaw_mcp(const char *config_path);
+int cbm_remove_openclaw_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Install MCP server entry in VS Code JSON config.
  * Format: { "servers": { "codebase-memory-mcp": { "type": "stdio", "command": binary_path } } }
@@ -129,47 +132,89 @@ int cbm_install_vscode_mcp(const char *binary_path, const char *config_path);
 /* Remove MCP server entry from VS Code JSON config.
  * Returns 0 on success. */
 int cbm_remove_vscode_mcp(const char *config_path);
+int cbm_remove_vscode_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Install MCP server entry in Zed settings.json.
- * Format: { "context_servers": { "codebase-memory-mcp": { "command": path, "args": [""] } } }
+ * Format: { "context_servers": { "codebase-memory-mcp": { "command": path, "args": [] } } }
  * Returns 0 on success. */
 int cbm_install_zed_mcp(const char *binary_path, const char *config_path);
 
 /* Remove MCP server entry from Zed settings.json.
  * Returns 0 on success. */
 int cbm_remove_zed_mcp(const char *config_path);
+int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path);
 
 /* ── Agent detection ──────────────────────────────────────────── */
 
 /* Detected coding agents on the system. */
 typedef struct {
-    bool claude_code;    /* ~/.claude/ exists */
+    bool claude_code;   /* ~/.claude/ exists */
     bool claude_desktop; /* platform Claude Desktop config dir exists */
-    bool codex;          /* ~/.codex/ exists */
-    bool gemini;         /* ~/.gemini/ exists */
-    bool zed;            /* platform-specific Zed config dir exists */
-    bool opencode;       /* opencode on PATH or config exists */
-    bool antigravity;    /* ~/.gemini/antigravity/ exists */
-    bool aider;          /* aider on PATH */
-    bool kilo_cli;       /* standalone Kilo ~/.config/kilo/ exists */
-    bool kilocode;       /* legacy Kilo VS Code globalStorage dir exists */
-    bool vscode;         /* VS Code User config dir exists */
-    bool cursor;         /* ~/.cursor/ exists */
-    bool windsurf;       /* ~/.codeium/windsurf/ exists */
-    bool openclaw;       /* ~/.openclaw/ exists */
-    bool kiro;           /* ~/.kiro/ exists */
-    bool junie;          /* ~/.junie/ exists */
-    bool qwen;           /* ~/.qwen/ exists */
-    bool forgecode;      /* ~/forge/ exists */
+    bool codex;         /* $CODEX_HOME or ~/.codex exists */
+    bool gemini;        /* Gemini settings or executable exists */
+    bool zed;           /* platform-specific Zed config dir exists */
+    bool opencode;      /* opencode on PATH or config exists */
+    bool antigravity;   /* Antigravity CLI config or executable exists */
+    bool aider;         /* aider on PATH */
+    bool kilo_cli;      /* standalone Kilo ~/.config/kilo exists */
+    bool kilocode;      /* KiloCode globalStorage dir exists */
+    bool vscode;        /* VS Code User config dir exists */
+    bool cursor;        /* ~/.cursor/ exists */
+    bool windsurf;      /* ~/.codeium/windsurf/ exists */
+    bool augment;       /* ~/.augment/ or Auggie CLI exists */
+    bool openclaw;      /* ~/.openclaw/ exists */
+    bool kiro;          /* ~/.kiro/ exists */
+    bool junie;         /* ~/.junie/ exists */
+    bool hermes;        /* ~/.hermes/ or hermes CLI exists */
+    bool openhands;     /* ~/.openhands/ or openhands CLI exists */
+    bool cline;         /* ~/.cline/ or cline CLI exists */
+    bool warp;          /* Warp footprint or oz/oz-preview/warp-cli exists */
+    bool qwen;          /* ~/.qwen/ or qwen CLI exists */
+    bool copilot_cli;   /* $COPILOT_HOME, ~/.copilot/, or copilot CLI exists */
+    bool factory_droid; /* ~/.factory/ or droid CLI exists */
+    bool crush;         /* Crush config or CLI exists */
+    bool goose;         /* Goose config or CLI exists */
+    bool mistral_vibe;  /* $VIBE_HOME, ~/.vibe/, or vibe CLI exists */
 } cbm_detected_agents_t;
 
 /* Detect which coding agents are installed.
  * Checks config dirs and PATH. home_dir is used for config dir checks. */
 cbm_detected_agents_t cbm_detect_agents(const char *home_dir);
 
+/* Install or refresh every detected agent integration below home. */
+int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run);
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_build_qwen_hook_command_for_testing(const char *binary_path, bool windows, char *command,
+                                            size_t command_size, char *shell, size_t shell_size);
+int cbm_build_qoder_hook_command_for_testing(const char *binary_path, bool windows, char *command,
+                                             size_t command_size, char *shell, size_t shell_size);
+int cbm_resolve_claude_hook_command_for_testing(const char *script_name, bool windows,
+                                                char *command, size_t command_size);
+bool cbm_optional_hook_supported_for_testing(const char *agent_name, bool windows);
+void cbm_hook_sanitize_metadata_for_testing(const char *input, char *output, size_t output_size);
+char *cbm_hook_augment_format_context_for_testing(const char *envelope, const char *token,
+                                                  bool *is_error);
+int cbm_upsert_qwen_lifecycle_hooks_for_testing(const char *settings_path, const char *binary_path,
+                                                bool windows);
+int cbm_upsert_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
+int cbm_remove_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
+/* Explicit lifecycle adapter seam for hook protocols whose output envelope is
+ * not Claude/Gemini-compatible. Returns allocated JSON or NULL to fail open. */
+char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char *forced_event,
+                                                  const char *dialect);
+char *cbm_hook_augment_tool_json_for_testing(const char *input, const char *dialect,
+                                             const char *context, char *path, size_t path_size);
+bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
+                                                       const char *forced_event);
+bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
+                                        bool case_insensitive);
+const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+#endif
+
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
 
-/* Codex CLI: upsert MCP entry in ~/.codex/config.toml. Returns 0 on success. */
+/* Codex CLI: upsert MCP entry in $CODEX_HOME/config.toml. Returns 0 on success. */
 int cbm_upsert_codex_mcp(const char *binary_path, const char *config_path);
 
 /* Remove CMM MCP entry from Codex config.toml. Returns 0 on success. */
@@ -180,13 +225,15 @@ int cbm_upsert_opencode_mcp(const char *binary_path, const char *config_path);
 
 /* Remove CMM MCP entry from opencode.json. Returns 0 on success. */
 int cbm_remove_opencode_mcp(const char *config_path);
+int cbm_remove_opencode_mcp_owned(const char *binary_path, const char *config_path);
 
-/* Antigravity: upsert MCP entry in ~/.gemini/antigravity/mcp_config.json.
+/* Antigravity: upsert MCP entry in ~/.gemini/config/mcp_config.json.
  * Returns 0 on success. */
 int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path);
 
 /* Remove CMM MCP entry from antigravity mcp_config.json. Returns 0 on success. */
 int cbm_remove_antigravity_mcp(const char *config_path);
+int cbm_remove_antigravity_mcp_owned(const char *binary_path, const char *config_path);
 
 /* Junie (JetBrains): upsert MCP entry in ~/.junie/mcp/mcp.json (mcpServers format).
  * Returns 0 on success. */
@@ -194,6 +241,7 @@ int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path);
 
 /* Remove CMM MCP entry from Junie mcp.json. Returns 0 on success. */
 int cbm_remove_junie_mcp(const char *config_path);
+int cbm_remove_junie_mcp_owned(const char *binary_path, const char *config_path);
 
 /* ── Instructions file upsert ─────────────────────────────────── */
 
@@ -223,9 +271,6 @@ int cbm_upsert_claude_hooks(const char *settings_path);
 /* Remove our PreToolUse hook from Claude Code settings.json.
  * Returns 0 on success. */
 int cbm_remove_claude_hooks(const char *settings_path);
-
-/* Install/remove Claude Code SessionStart reminder hooks for startup, resume,
- * clear, and compact. Returns 0 when all matcher upserts/removals succeed. */
 int cbm_upsert_claude_session_hooks(const char *settings_path);
 int cbm_remove_claude_session_hooks(const char *settings_path);
 
@@ -233,9 +278,9 @@ int cbm_remove_claude_session_hooks(const char *settings_path);
  * wrapper that invokes the compiled `hook-augment` and writes to stdout only —
  * it must never create a predictable temp/state file (issue #384). Exposed for
  * testing that security property. */
-void cbm_install_hook_gate_script(const char *home, const char *binary_path);
+bool cbm_install_hook_gate_script(const char *home, const char *binary_path);
 
-/* Upsert a BeforeTool hook in ~/.gemini/settings.json for Gemini CLI / Antigravity.
+/* Upsert a BeforeTool hook in ~/.gemini/settings.json for Gemini CLI.
  * Returns 0 on success. */
 int cbm_upsert_gemini_hooks(const char *settings_path);
 
@@ -243,12 +288,19 @@ int cbm_upsert_gemini_hooks(const char *settings_path);
  * Returns 0 on success. */
 int cbm_remove_gemini_hooks(const char *settings_path);
 
-/* Install/remove non-blocking SessionStart reminder hooks. Hook stdout is
- * intended session context for these harnesses, not MCP protocol output. */
+/* Install/remove a SessionStart reminder hook in Codex config.toml (#330) and
+ * Gemini settings.json — same methodology as the Claude Code
+ * SessionStart hook (non-blocking; stdout injected as session context). */
 int cbm_upsert_codex_hooks(const char *config_path);
 int cbm_remove_codex_hooks(const char *config_path);
 int cbm_upsert_gemini_session_hooks(const char *settings_path);
 int cbm_remove_gemini_session_hooks(const char *settings_path);
+
+#ifdef CBM_JSON_LIKE_ENABLE_TEST_API
+typedef void (*cbm_hook_json_prewrite_test_hook_t)(const char *settings_path, void *context);
+void cbm_set_hook_json_prewrite_hook_for_testing(cbm_hook_json_prewrite_test_hook_t hook,
+                                                 void *context);
+#endif
 
 /* Install/remove a Claude Code SubagentStart reminder hook in settings.json.
  * Subagents spawned via the Agent tool do not fire SessionStart, so this is the
@@ -262,9 +314,6 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path);
 /* Append an export PATH line to the given rc file.
  * Checks if already present. Returns 0 on success, 1 if already present. */
 int cbm_ensure_path(const char *bin_dir, const char *rc_file, bool dry_run);
-
-/* Remove only the exact PATH block written by cbm_ensure_path(). User-owned
- * PATH entries and all other shell content are preserved. */
 int cbm_remove_owned_path(const char *bin_dir, const char *rc_file, bool dry_run);
 
 /* ── Codex instructions (legacy, wraps cbm_get_agent_instructions) ── */
@@ -286,13 +335,11 @@ unsigned char *cbm_extract_binary_from_zip(const unsigned char *data, int data_l
 
 /* ── Index management ─────────────────────────────────────────── */
 
-/* List project index .db files in the cache directory.
- * Excludes internal stores such as _config.db. Prints each file path to stdout.
- * Returns count of index .db files found. */
+/* List .db files in the cache directory (~/.cache/codebase-memory-mcp/).
+ * Prints each file path to stdout. Returns count of .db files found. */
 int cbm_list_indexes(const char *home_dir);
 
-/* Remove project index .db files in the cache directory. Excludes _config.db.
- * Returns count removed. */
+/* Remove all .db files in the cache directory. Returns count removed. */
 int cbm_remove_indexes(const char *home_dir);
 
 /* ── Config store (persistent key-value, backed by _config.db) ── */
@@ -324,8 +371,7 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
-/* Atomically apply a named, exact capability preset. Returns 0 on success and
- * nonzero for an unknown preset or any transaction failure. */
+/* Atomically apply a named, exact capability preset. */
 int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 
 /* Well-known config keys */
@@ -338,27 +384,21 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_DEFAULT_QUERY_MAX_ROWS 100000
 #define CBM_DEFAULT_QUERY_MAX_ROWS_STR "100000"
 
-/* ── Config registry (all known keys, defaults, env overrides) ── */
-
 typedef struct {
-    const char *key;          /* config key name */
-    const char *default_val;  /* default value as string */
-    const char *env_var;      /* env var override name, NULL if none */
-    const char *category;     /* display category for config list */
-    const char *description;  /* one-line description */
-    const char *range;        /* broadest feasible range/valid values */
-    const char *guidance;     /* actionable: why change it, effect on output */
+    const char *key;
+    const char *default_val;
+    const char *env_var;
+    const char *category;
+    const char *description;
+    const char *range;
+    const char *guidance;
 } cbm_config_entry_t;
 
-/* All known config keys. Defined in cli.c. NULL-terminated. */
 extern const cbm_config_entry_t CBM_CONFIG_REGISTRY[];
 
-/* Get config value with env var override: env > db > default.
- * Returns pointer valid until next call (static buffer). */
 const char *cbm_config_get_effective(cbm_config_t *cfg, const char *key, const char *default_val);
 bool cbm_config_get_effective_bool(cbm_config_t *cfg, const char *key, bool default_val);
 int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default_val);
-
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 
@@ -382,7 +422,17 @@ int cbm_cmd_config(int argc, char **argv);
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext
  * with search_graph hits for Grep/Glob calls. NEVER blocks: every failure
  * path returns 0 with no stdout output. */
-int cbm_cmd_hook_augment(void);
+int cbm_cmd_hook_augment(int argc, char **argv);
+
+/* Build the documented hookSpecificOutput payload for a SessionStart or
+ * SubagentStart input. Returns allocated JSON, or NULL for another/invalid
+ * event. Exposed so lifecycle adapters have contract-level regression tests. */
+char *cbm_hook_augment_lifecycle_json(const char *input);
+
+/* Variant used by lifecycle adapters whose stdin omits the event. When
+ * copilot_dialect is true, emits Copilot CLI's top-level additionalContext. */
+char *cbm_hook_augment_lifecycle_json_for(const char *input, const char *forced_event,
+                                          bool copilot_dialect);
 
 /* True for an absolute path the augmenter can walk up: POSIX "/..." or a
  * Windows drive root — "X:/..." or a bare "X:" (callers normalize '\\' to '/'
@@ -391,7 +441,7 @@ int cbm_cmd_hook_augment(void);
 bool cbm_hook_path_is_abs(const char *path);
 
 /* Build the agent.install.plan.v1 install receipt for <home> (issue #388):
- * a machine-readable JSON list of the config/instruction/hook files `install`
+ * a machine-readable JSON list of config/instruction/skill/agent/hook files `install`
  * would write, produced WITHOUT mutating anything. Returns a heap JSON string
  * (caller frees) or NULL on error. Exposed for `install --plan` and testing. */
 char *cbm_build_install_plan_json(const char *home, const char *binary_path);

@@ -1439,6 +1439,36 @@ static int resp_lacks_key(const char *resp, const char *key) {
 
 /* ── list_projects ─────────────────────────────────────────────── */
 
+TEST(incr_file_node_name_stays_basename) {
+    /* #994: File nodes must keep their basename NAME through an incremental
+     * re-index (the bug renamed touched files' nodes to rel_path, diverging
+     * from a full build). Modify a file, re-index, assert no File node name
+     * contains a path separator. */
+    char path[512];
+    snprintf(path, sizeof(path), "%s/fastapi/applications.py", g_repodir);
+    FILE *f = fopen(path, "a");
+    ASSERT(f != NULL);
+    fprintf(f, "\n# incr_file_node_name_stays_basename touch\n");
+    fclose(f);
+
+    char *resp = index_repo();
+    ASSERT(resp != NULL);
+    free(resp);
+
+    double ms;
+    char *r = call_tool_timed("query_graph", &ms,
+                              "{\"project\":\"%s\",\"format\":\"json\","
+                              "\"query\":\"MATCH (n:File) WHERE n.name CONTAINS '/'"
+                              " RETURN n.name LIMIT 5\"}",
+                              g_project);
+    TOOL_OK(r, ms);
+    /* No File node may carry a path separator in its name; the query engine
+     * returns an empty rows array when nothing matches. */
+    ASSERT(strstr(r, "\"rows\":[]") != NULL || strstr(r, "\\\"rows\\\":[]") != NULL);
+    free(r);
+    PASS();
+}
+
 TEST(tool_list_projects_basic) {
     double ms;
     char *r = call_tool_timed("list_projects", &ms, "{}");
@@ -2305,11 +2335,35 @@ TEST(tool_detect_changes_default) {
     double ms;
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
     TOOL_OK(r, ms);
-    /* Must have changed_files array and changed_count */
-    ASSERT(resp_has_key(r, "changed_files"));
-    ASSERT(resp_has_key(r, "changed_count"));
-    ASSERT(resp_has_key(r, "impacted_symbols"));
-    ASSERT(resp_has_key(r, "depth"));
+    /* New tree contract: base + direction scalars, a changed_files section,
+     * and the seed/impact accounting. (The old changed_count/impacted_symbols/
+     * depth keys are gone — impact is now a real traversal, not bare names.) */
+    ASSERT(strstr(r, "changed_files:") != NULL);
+    ASSERT(strstr(r, "direction:") != NULL);
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    free(r);
+    PASS();
+}
+
+/* The blast radius is a REAL traversal now: default inbound gives transitive
+ * callers of the changed symbols with an exact impacted_total and a module
+ * rollup. Fixture diff may be empty (shallow clone at HEAD) — the sections and
+ * their accounting must still be present and internally consistent. */
+TEST(tool_detect_changes_impact_shape) {
+    double ms;
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
+    TOOL_OK(r, ms);
+    ASSERT(strstr(r, "direction: inbound") != NULL); /* default = blast radius */
+    ASSERT(strstr(r, "seed_symbols:") != NULL);
+    /* format:"json" returns the same model as structured JSON. */
+    free(r);
+    r = call_tool_timed("detect_changes", &ms,
+                        "{\"project\":\"%s\",\"base_branch\":\"HEAD\",\"format\":\"json\"}",
+                        g_project);
+    TOOL_OK(r, ms);
+    ASSERT(resp_has_key(r, "impacted_total"));
+    ASSERT(resp_has_key(r, "direction"));
     free(r);
     PASS();
 }
@@ -3460,6 +3514,7 @@ SUITE(incremental) {
 
     /* Phase 3: Incremental deltas */
     RUN_TEST(incr_modify_file);
+    RUN_TEST(incr_file_node_name_stays_basename);
     RUN_TEST(incr_formatter_run);
     RUN_TEST(incr_add_file);
     RUN_TEST(incr_delete_file);
@@ -3559,6 +3614,7 @@ SUITE(incremental) {
 
     /* Phase 15: detect_changes */
     RUN_TEST(tool_detect_changes_default);
+    RUN_TEST(tool_detect_changes_impact_shape);
     RUN_TEST(tool_detect_changes_custom_branch);
     RUN_TEST(tool_detect_changes_since);
     RUN_TEST(tool_detect_changes_since_precedence);

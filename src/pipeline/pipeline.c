@@ -28,6 +28,8 @@ enum {
 #include "graph_buffer/graph_buffer.h"
 #include "git/git_context.h"
 #include "store/store.h"
+#include "macro_table.h"
+#include "arena.h"
 #include "discover/discover.h"
 #include "discover/userconfig.h"
 #include "depindex/depindex.h"
@@ -1269,6 +1271,47 @@ static bool is_infra_file(const char *fp) {
             strstr(fp, ".tf") != NULL || strstr(fp, ".hcl") != NULL || strstr(fp, ".toml") != NULL);
 }
 
+/* CI/tooling configs describe the development TOOLCHAIN — their URLs are
+ * repository/action/registry references, never endpoints this service
+ * exposes. Minting infra Route nodes from them lets the route matcher's
+ * root-service heuristic attach every handler of an ambiguous "/" route to
+ * each tooling URL (junk HANDLES churn on plain pallets/flask, #999).
+ * Deny by file identity, not URL shape: deployment configs (Cloud
+ * Scheduler, compose) keep minting their genuine endpoints. */
+static bool is_ci_tooling_config(const char *fp) {
+    if (!fp) {
+        return false;
+    }
+    if (strstr(fp, ".github/") != NULL || strstr(fp, ".gitlab/") != NULL ||
+        strstr(fp, ".circleci/") != NULL) {
+        return true;
+    }
+    const char *slash = strrchr(fp, '/');
+    const char *base = slash ? slash + 1 : fp;
+    static const char *const tooling[] = {".pre-commit-config.yaml",
+                                          ".pre-commit-hooks.yaml",
+                                          ".gitlab-ci.yml",
+                                          ".travis.yml",
+                                          "azure-pipelines.yml",
+                                          "appveyor.yml",
+                                          "bitbucket-pipelines.yml",
+                                          ".readthedocs.yaml",
+                                          ".readthedocs.yml",
+                                          "codecov.yml",
+                                          ".codecov.yml",
+                                          ".goreleaser.yaml",
+                                          ".goreleaser.yml",
+                                          ".golangci.yml",
+                                          ".golangci.yaml",
+                                          NULL};
+    for (int i = 0; tooling[i]; i++) {
+        if (strcmp(base, tooling[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* True when a YAML key path denotes an UPSTREAM dependency, CONFIG value, or
  * HEALTHCHECK target rather than an endpoint this service exposes. Such URLs
  * (auth JWKS, downstream service base URLs, package-registry URLs, healthcheck
@@ -1338,7 +1381,8 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
     }
     for (int pass = 0; pass < CBM_INFRA_ROUTE_DENY_PASS_COUNT; pass++) {
         for (int i = 0; i < file_count; i++) {
-            if (!result_cache[i] || !is_infra_file(files[i].rel_path)) {
+            if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
+                is_ci_tooling_config(files[i].rel_path)) {
                 continue;
             }
             for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
@@ -1451,6 +1495,62 @@ static int seq_pass_lsp_cross_dispatch(cbm_pipeline_ctx_t *ctx, const cbm_file_i
 }
 
 /* Run the sequential pipeline path: definitions, k8s, lsp_cross, calls, usages, semantic. */
+/* Build the ObjectScript $$$macro table from .inc include files in the repo.
+ * Returns NULL (and does no work) when no ObjectScript include files exist.
+ * Caller owns the returned heap table (free via cbm_macro_table_free). */
+CBMMacroTable *cbm_build_macro_table_from_files(const cbm_file_info_t *files, int count,
+                                                const char *repo_path) {
+    (void)repo_path;
+    bool has_inc = false;
+    for (int i = 0; i < count; i++) {
+        if (files[i].language == CBM_LANG_OBJECTSCRIPT_ROUTINE && files[i].path &&
+            (strrchr(files[i].path, '.') != NULL &&
+             strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
+            has_inc = true;
+            break;
+        }
+    }
+    if (!has_inc) {
+        return NULL;
+    }
+
+    CBMMacroTable *mt = (CBMMacroTable *)calloc(1, sizeof(CBMMacroTable));
+    if (!mt) {
+        return NULL;
+    }
+
+    cbm_arena_init(&mt->arena);
+    cbm_macro_table_init_system(mt);
+
+    for (int i = 0; i < count; i++) {
+        if (files[i].language != CBM_LANG_OBJECTSCRIPT_ROUTINE) {
+            continue;
+        }
+        if (!files[i].path || !(strrchr(files[i].path, '.') != NULL &&
+                                strcmp(strrchr(files[i].path, '.'), ".inc") == 0)) {
+            continue;
+        }
+        FILE *f = cbm_fopen(files[i].path, "rb");
+        if (!f) {
+            continue;
+        }
+        fseek(f, 0, SEEK_END);
+        long fsize = ftell(f);
+        rewind(f);
+        if (fsize > 0) {
+            char *src = (char *)malloc((size_t)fsize + 1);
+            if (src) {
+                size_t nread = fread(src, 1, (size_t)fsize, f);
+                src[nread] = '\0';
+                cbm_parse_inc_file(mt, &mt->arena, src);
+                free(src);
+            }
+        }
+        (void)fclose(f);
+    }
+    return mt;
+}
+
 static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                    const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
@@ -1467,6 +1567,13 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBMFileResult **seq_cache = (CBMFileResult **)calloc(file_count, sizeof(CBMFileResult *));
     if (seq_cache) {
         ctx->result_cache = seq_cache;
+    }
+
+    /* ObjectScript: build the $$$macro table from .inc include files so that
+     * pass_calls can resolve macro-mediated dispatch. NULL when not present. */
+    CBMMacroTable *mt = cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+    if (mt) {
+        ctx->macro_table = mt;
     }
     typedef int (*seq_pass_fn)(cbm_pipeline_ctx_t *, const cbm_file_info_t *, int);
     static const struct {
@@ -1525,7 +1632,25 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * mimalloc-epoch memory through slab_free -> plain free() and libmalloc
      * aborts — the #773 second-index SIGABRT. */
     cbm_destroy_thread_parser();
+    cbm_pipeline_release_objectscript_tables(ctx);
     return rc;
+}
+
+void cbm_pipeline_release_objectscript_tables(cbm_pipeline_ctx_t *ctx) {
+    if (!ctx) {
+        return;
+    }
+    if (ctx->macro_table) {
+        cbm_macro_table_free((CBMMacroTable *)ctx->macro_table);
+        ctx->macro_table = NULL;
+    }
+    if (ctx->return_type_table) {
+        for (int i = 0; i < ctx->return_type_table->count; i++) {
+            free((void *)ctx->return_type_table->entries[i].return_type);
+        }
+        free((void *)ctx->return_type_table);
+        ctx->return_type_table = NULL;
+    }
 }
 
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */

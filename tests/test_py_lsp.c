@@ -192,16 +192,12 @@ TEST(pylsp_import_from_aliased) {
     const char *qns[] = {"pathlib.Path"};
     bind_imports_into_ctx(&ctx, &a, &reg, locals, qns, 1);
     const CBMType *t = py_lsp_lookup_in_scope(&ctx, "P");
-    /* Aliased name doesn't end module_qn with .P, so this binds as MODULE.
-     * Phase 6 registry lookup will downgrade to NAMED if registry has no
-     * matching module entry. Both behaviors are acceptable for v1; the
-     * test asserts the entry exists with the correct QN. */
-    ASSERT(t->kind == CBM_TYPE_NAMED || t->kind == CBM_TYPE_MODULE);
-    if (t->kind == CBM_TYPE_NAMED) {
-        ASSERT_STR_EQ(t->data.named.qualified_name, "pathlib.Path");
-    } else {
-        ASSERT_STR_EQ(t->data.module.module_qn, "pathlib.Path");
-    }
+    /* #988: an aliased from-import MUST bind NAMED (phase 6 upgrades it to
+     * the registered function/class/module). The earlier MODULE binding made
+     * `g()` calls on `from m import f as g` resolve as calls on a module —
+     * lsp=MISS and the CALLS edge was lost. */
+    ASSERT_EQ(t->kind, CBM_TYPE_NAMED);
+    ASSERT_STR_EQ(t->data.named.qualified_name, "pathlib.Path");
     cbm_arena_destroy(&a);
     PASS();
 }

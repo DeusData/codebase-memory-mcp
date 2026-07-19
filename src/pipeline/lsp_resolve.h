@@ -76,6 +76,7 @@ static inline bool cbm_lsp_reason_join_strategy(const char *strategy) {
             strcmp(strategy, "lsp_method_ref_ctor") == 0 ||
             strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
             strcmp(strategy, "lsp_dict_dispatch") == 0 ||
+            strcmp(strategy, "lsp_import_alias") == 0 ||
             strcmp(strategy, "lsp_destructor") == 0 ||
             strcmp(strategy, "php_method_dynamic") == 0);
 }

@@ -54,7 +54,7 @@ static inline int th_write_file(const char *path, const char *content) {
         cbm_mkdir_p(dir, 0755);
     }
 
-    FILE *f = fopen(path, "w");
+    FILE *f = cbm_fopen(path, "wb");
     if (!f) {
         return -1;
     }
@@ -67,7 +67,7 @@ static inline int th_write_file(const char *path, const char *content) {
 
 /* Append content to a file. */
 static inline int th_append_file(const char *path, const char *content) {
-    FILE *f = fopen(path, "a");
+    FILE *f = cbm_fopen(path, "ab");
     if (!f) {
         return -1;
     }
