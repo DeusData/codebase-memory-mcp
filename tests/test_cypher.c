@@ -489,6 +489,131 @@ TEST(cypher_exec_match_all_functions) {
     PASS();
 }
 
+/* Regression: expand_pattern_rels sized its OPTIONAL-expansion output buffer as
+ * bind_cap*10 + 1 — room for the bounded expansion (max_new = bind_cap*10) plus
+ * a SINGLE OPTIONAL fallback row. When one source saturated the expansion to
+ * max_new and two or more later sources took the OPTIONAL (no-match) path, the
+ * second fallback write ran past the allocation (ASan: heap-buffer-overflow).
+ *
+ * The fix holds the OPTIONAL fallback to the SAME global ceiling (max_new) the
+ * expansion helpers already respect, so the hop truncates at the ceiling instead
+ * of growing the buffer. Defined behavior at the ceiling: the query still
+ * succeeds (rc == 0) with a bounded result — it does not overflow or error.
+ * Query text is agent-controlled via the MCP query tool. */
+TEST(cypher_exec_optional_rel_ceiling_truncates_no_overflow) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* 1 hub + 20 leaf Function nodes → bind_cap = 21, max_new = 210. The hub is
+     * inserted first so it is expanded before the leaves; it saturates the
+     * expansion to the ceiling, then each leaf reaches the OPTIONAL fallback —
+     * under the old alloc (211 slots) the 2nd such write overflowed. */
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    for (int i = 0; i < 20; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "leaf%02d", i);
+        snprintf(qn, sizeof(qn), "test.leaf%02d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = nm, .qualified_name = qn};
+        cbm_store_upsert_node(s, &leaf);
+    }
+
+    /* Give the hub 300 CALLS edges (> max_new = 210) so its expansion saturates
+     * the ceiling; targets are non-Function so they don't inflate bind_cap. */
+    for (int i = 0; i < 300; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "callee%d", i);
+        snprintf(qn, sizeof(qn), "test.callee%d", i);
+        cbm_node_t callee = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &callee);
+        cbm_edge_t e = {.project = "test", .source_id = hub_id, .target_id = cid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    /* max_rows below the Function count (21) so bind_cap tracks scan_count (21)
+     * rather than the 100000 result ceiling — the same regime a large repo
+     * (> ceiling functions) or an agent-supplied small limit hits. */
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.name", "test", 5, &r);
+    /* Defined ceiling behavior: bounded success, no overflow (ASan proves the
+     * latter), result truncated to the LIMIT rather than crashing. */
+    ASSERT_EQ(rc, 0);
+    ASSERT_GT(r.row_count, 0);
+    ASSERT_TRUE(r.row_count <= 5);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Companion to the truncation regression: when the expansion does NOT saturate
+ * the ceiling, every leaf's OPTIONAL fallback row must survive with its target
+ * unbound. A `row_count > 0` check is too weak — it can pass on hub rows alone —
+ * so this asserts a specific leaf appears with an empty b.name, and that a real
+ * expanded hub row is present too. */
+TEST(cypher_exec_optional_rel_leaf_fallback_survives) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    /* 1 hub (2 CALLS edges) + 3 leaves (no edges). Ceiling is huge (default
+     * max_rows → bind_cap = 100000), so nothing truncates. */
+    cbm_node_t hub = {
+        .project = "test", .label = "Function", .name = "hub", .qualified_name = "test.hub"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    for (int i = 0; i < 3; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "leaf%d", i);
+        snprintf(qn, sizeof(qn), "test.leaf%d", i);
+        cbm_node_t leaf = {
+            .project = "test", .label = "Function", .name = nm, .qualified_name = qn};
+        cbm_store_upsert_node(s, &leaf);
+    }
+    for (int i = 0; i < 2; i++) {
+        char nm[32];
+        char qn[48];
+        snprintf(nm, sizeof(nm), "callee%d", i);
+        snprintf(qn, sizeof(qn), "test.callee%d", i);
+        cbm_node_t callee = {.project = "test", .label = "Var", .name = nm, .qualified_name = qn};
+        int64_t cid = cbm_store_upsert_node(s, &callee);
+        cbm_edge_t e = {.project = "test", .source_id = hub_id, .target_id = cid, .type = "CALLS"};
+        cbm_store_insert_edge(s, &e);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (a)-[:CALLS]->(b) RETURN a.name, b.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+
+    /* Scan for a leaf fallback row (a.name = "leaf0", b.name unbound = "") and a
+     * real expanded hub row (a.name = "hub", b.name non-empty). */
+    bool leaf_fallback = false;
+    bool hub_expanded = false;
+    for (int i = 0; i < r.row_count; i++) {
+        const char *a = r.rows[i][0];
+        const char *b = r.rows[i][1];
+        if (strcmp(a, "leaf0") == 0 && b[0] == '\0') {
+            leaf_fallback = true;
+        }
+        if (strcmp(a, "hub") == 0 && b[0] != '\0') {
+            hub_expanded = true;
+        }
+    }
+    ASSERT_TRUE(leaf_fallback); /* the OPTIONAL no-match row survived */
+    ASSERT_TRUE(hub_expanded);  /* the expansion still produced bound rows */
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3080,6 +3205,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
     RUN_TEST(cypher_exec_match_all_functions);
+    RUN_TEST(cypher_exec_optional_rel_ceiling_truncates_no_overflow);
+    RUN_TEST(cypher_exec_optional_rel_leaf_fallback_survives);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
     RUN_TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit);

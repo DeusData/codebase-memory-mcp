@@ -3221,6 +3221,14 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
 
         bool is_variable_length = (rel->min_hops != SKIP_ONE || rel->max_hops != SKIP_ONE);
 
+        /* One global output ceiling for this hop: at most max_new = bind_cap*10
+         * rows, whether produced by the expansion helpers or by the OPTIONAL
+         * fallback further down. The helpers already stop at max_new; the fallback
+         * is held to the SAME ceiling (its `new_count < max_new` guard), so a
+         * saturating hub followed by OPTIONAL (no-match) sources truncates at the
+         * ceiling instead of writing past this buffer. Leaving that fallback
+         * unguarded let a second fallback row after a saturated expansion run off
+         * the end (heap OOB write, CWE-787). */
         size_t alloc_n = (size_t)*bind_cap * (size_t)CYP_GROWTH_10 + SKIP_ONE;
         binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
         if (!new_bindings) {
@@ -3249,8 +3257,9 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
                                     &new_count, max_new, &match_count);
             }
 
-            /* OPTIONAL MATCH: keep binding with empty target if no matches */
-            if (is_optional && match_count == 0) {
+            /* OPTIONAL MATCH: keep the binding with the target unbound when there
+             * were no matches, held to the same global ceiling as the expansion. */
+            if (is_optional && match_count == 0 && new_count < max_new) {
                 binding_t nb = {0};
                 binding_copy(&nb, b);
                 /* Don't set to_var — it remains unbound; projection returns "" */
