@@ -274,6 +274,54 @@ TEST(query_graph_description_repeats_current_executable_schema) {
     PASS();
 }
 
+/* The schema embedded in query_graph must describe the same active overlay
+ * view that query_graph executes. A ready overlay replaces canonical rows for
+ * its file; advertising both labels would direct clients to stale vocabulary. */
+TEST(query_graph_description_uses_ready_overlay_view) {
+    enum { BASE_GENERATION = 1 };
+    const char *project = "schema_overlay_view";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/schema-overlay-view"), CBM_STORE_OK);
+
+    cbm_node_t canonical = {.project = project,
+                            .label = "CanonicalOnlyLabel",
+                            .name = "old",
+                            .qualified_name = "schema_overlay_view.old",
+                            .file_path = "changed.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &canonical), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(
+        cbm_store_reserve_overlay_generation(store, project, BASE_GENERATION, &overlay_generation),
+        CBM_STORE_OK);
+    cbm_node_t replacement = {.project = project,
+                              .label = "OverlayOnlyLabel",
+                              .name = "new",
+                              .qualified_name = "schema_overlay_view.new",
+                              .file_path = "changed.c"};
+    cbm_store_file_delta_t delta = {.project = project,
+                                    .rel_path = "changed.c",
+                                    .generation = BASE_GENERATION,
+                                    .nodes = &replacement,
+                                    .node_count = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(store, &delta, overlay_generation),
+              CBM_STORE_OK);
+
+    char *tools = cbm_mcp_tools_list(srv);
+    ASSERT_NOT_NULL(tools);
+    ASSERT_NOT_NULL(strstr(tools, "OverlayOnlyLabel"));
+    ASSERT_NULL(strstr(tools, "CanonicalOnlyLabel"));
+    free(tools);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Regression (dogfood 2026-07-18): the very first tools/list of a fresh
  * session for an already-indexed project must show the real schema, not
  * an empty one. build_query_graph_tool_description previously trusted
@@ -3355,6 +3403,7 @@ SUITE(tool_consolidation) {
     /* Tool visibility */
     RUN_TEST(streamlined_mode_shows_default_user_tools);
     RUN_TEST(query_graph_description_repeats_current_executable_schema);
+    RUN_TEST(query_graph_description_uses_ready_overlay_view);
     RUN_TEST(query_graph_description_populated_on_cold_start_tools_list);
     RUN_TEST(query_graph_zero_row_hint_names_no_hidden_tool);
     RUN_TEST(query_graph_zero_row_hint_walks_post_with_stage);
