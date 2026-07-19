@@ -31,6 +31,7 @@ from typing import Any
 
 
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
+REPEATED_JSON_TRIALS = 3
 
 
 DEFAULT_FILE_COUNT = 240
@@ -2625,16 +2626,24 @@ def run_cli_tool_call(
         tool_name,
         json.dumps(quality_arguments, separators=(",", ":")),
     ]
-    quality_proc, quality_elapsed_ms = command_result(quality_cmd, env, timeout)
-    if quality_proc.returncode != 0:
-        raise command_failure(
-            f"{tool_name}_quality_call",
-            quality_cmd,
-            env,
-            quality_proc,
-            quality_elapsed_ms,
+    quality_elapsed: list[float] = []
+    quality_hashes: list[str] = []
+    data: dict[str, Any] = {}
+    for _ in range(REPEATED_JSON_TRIALS):
+        quality_proc, quality_elapsed_ms = command_result(quality_cmd, env, timeout)
+        if quality_proc.returncode != 0:
+            raise command_failure(
+                f"{tool_name}_quality_call",
+                quality_cmd,
+                env,
+                quality_proc,
+                quality_elapsed_ms,
+            )
+        data = unwrap_cli_json(quality_proc.stdout)
+        quality_elapsed.append(round(quality_elapsed_ms, 3))
+        quality_hashes.append(
+            hashlib.sha256(canonical_response_bytes(data)).hexdigest()
         )
-    data = unwrap_cli_json(quality_proc.stdout)
     result = build_tool_call_result(
         data,
         proc.stderr,
@@ -2643,7 +2652,7 @@ def run_cli_tool_call(
         include_logs,
         raw_payload,
     )
-    result["quality_probe_elapsed_ms"] = round(quality_elapsed_ms, 3)
+    add_repeated_json_measurements(result, quality_elapsed, quality_hashes)
     return result
 
 
@@ -2658,12 +2667,36 @@ def run_mcp_tool_call(
     )
     quality_arguments = dict(arguments)
     quality_arguments["format"] = "json"
-    data, _, _, quality_elapsed_ms = client.call_tool(tool_name, quality_arguments)
+    quality_elapsed: list[float] = []
+    quality_hashes: list[str] = []
+    data: dict[str, Any] = {}
+    for _ in range(REPEATED_JSON_TRIALS):
+        data, _, _, quality_elapsed_ms = client.call_tool(tool_name, quality_arguments)
+        quality_elapsed.append(round(quality_elapsed_ms, 3))
+        quality_hashes.append(
+            hashlib.sha256(canonical_response_bytes(data)).hexdigest()
+        )
     result = build_tool_call_result(
         data, stderr, stdout_bytes, elapsed_ms, include_logs, raw_text.encode("utf-8")
     )
-    result["quality_probe_elapsed_ms"] = round(quality_elapsed_ms, 3)
+    add_repeated_json_measurements(result, quality_elapsed, quality_hashes)
     return result
+
+
+def add_repeated_json_measurements(
+    result: dict[str, Any], elapsed_ms: list[float], response_hashes: list[str]
+) -> None:
+    ordered = sorted(elapsed_ms)
+    result["quality_probe_elapsed_ms"] = elapsed_ms[0] if elapsed_ms else None
+    result["repeated_json_trials_ms"] = elapsed_ms
+    result["repeated_json_latency_ms"] = {
+        "count": len(ordered),
+        "min": ordered[0] if ordered else None,
+        "median": ordered[len(ordered) // 2] if ordered else None,
+        "max": ordered[-1] if ordered else None,
+    }
+    result["repeated_json_response_sha256"] = response_hashes
+    result["repeated_json_payloads_byte_equal"] = len(set(response_hashes)) <= 1
 
 
 def run_tool_call_for_transport(
