@@ -50,6 +50,9 @@ static const ext_entry_t EXT_TABLE[] = {
     /* C# */
     {".cs", CBM_LANG_CSHARP},
 
+    /* VB.NET */
+    {".vb", CBM_LANG_VISUALBASIC},
+
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},
     {".cljc", CBM_LANG_CLOJURE},
@@ -850,6 +853,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
+    [CBM_LANG_VISUALBASIC] = "VB.NET",
 
 };
 
