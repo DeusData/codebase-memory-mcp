@@ -10108,6 +10108,11 @@ static int search_where_basic(const cbm_search_params_t *params, char *where, in
             where_bind_text(binds, bind_idx, lp);
         }
     }
+    if (params->file_contains) {
+        snprintf(bind_buf, sizeof(bind_buf), "instr(n.file_path, ?%d) > 0", *bind_idx + SKIP_ONE);
+        *wlen = where_append(where, where_sz, *wlen, nparams, bind_buf);
+        where_bind_text(binds, bind_idx, params->file_contains);
+    }
     /* MERGE: fork delta — pattern OR-search (name OR qualified_name) for quick
      * symbol lookup, and exclude_paths (NOT LIKE per glob). */
     if (params->pattern) {

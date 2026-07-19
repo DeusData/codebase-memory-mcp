@@ -6,6 +6,7 @@
  */
 #include "test_framework.h"
 #include <cypher/cypher.h>
+#include <sqlite3.h>
 #include <store/store.h>
 #include <stdio.h>
 #include <string.h>
@@ -474,6 +475,137 @@ static cbm_store_t *setup_cypher_store(void) {
     cbm_store_insert_edge(s, &e4);
 
     return s;
+}
+
+typedef struct {
+    bool saw_file_contains_pushdown;
+} cypher_sql_trace_t;
+
+static int cypher_sql_trace(unsigned trace_type, void *context, void *statement, void *sql_text) {
+    (void)statement;
+    if (trace_type == SQLITE_TRACE_STMT && context && sql_text &&
+        strstr((const char *)sql_text, "instr(n.file_path")) {
+        ((cypher_sql_trace_t *)context)->saw_file_contains_pushdown = true;
+    }
+    return 0;
+}
+
+TEST(cypher_exec_file_contains_pushes_down_beyond_seed_window) {
+    enum { NAME_SIZE = 32, QN_SIZE = 64 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    /* max_rows=1 historically seeded only 10 unfiltered nodes, then evaluated
+     * WHERE in C. Put the sole match after that window to prove both exactness
+     * and SQL pushdown; '%' and '_' must remain literal CONTAINS characters. */
+    for (int i = 0; i < 12; i++) {
+        char name[NAME_SIZE];
+        char qn[QN_SIZE];
+        snprintf(name, sizeof(name), "unrelated_%02d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "src/unrelated.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+    cbm_node_t target = {.project = "test",
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "test.target",
+                         .file_path = "src/100%_done/target.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &target), 0);
+
+    cypher_sql_trace_t trace = {0};
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, cypher_sql_trace, &trace), SQLITE_OK);
+
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s,
+                           "MATCH (n) WHERE n.file_path CONTAINS '100%_done' AND n.name = 'target' "
+                           "RETURN n.name, n.file_path LIMIT 1",
+                           "test", 1, &r);
+    ASSERT_EQ(sqlite3_trace_v2(db, 0, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(trace.saw_file_contains_pushdown);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "target");
+    ASSERT_STR_EQ(r.rows[0][1], "src/100%_done/target.c");
+    cbm_cypher_result_free(&r);
+
+    /* A file predicate below OR is not mandatory. Pushing it would remove the
+     * valid name branch and change Cypher semantics. */
+    trace.saw_file_contains_pushdown = false;
+    ASSERT_EQ(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, cypher_sql_trace, &trace), SQLITE_OK);
+    rc = cbm_cypher_execute(
+        s,
+        "MATCH (n) WHERE n.file_path CONTAINS 'never-present' OR n.name = 'unrelated_00' "
+        "RETURN n.name LIMIT 1",
+        "test", 1, &r);
+    ASSERT_EQ(sqlite3_trace_v2(db, 0, NULL, NULL), SQLITE_OK);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(trace.saw_file_contains_pushdown);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "unrelated_00");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_output_cap_does_not_limit_predicate_scan) {
+    enum { NAME_SIZE = 32, QN_SIZE = 64, UNRELATED_COUNT = 64 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    /* max_rows is an output bound, not a search-effort bound. The historical
+     * max_rows * 10 seed window silently missed ordinary matches in projects
+     * larger than that window. Keep this fixture large enough to reproduce the
+     * practical failure while remaining cheap under sanitizers. */
+    for (int i = 0; i < UNRELATED_COUNT; i++) {
+        char name[NAME_SIZE];
+        char qn[QN_SIZE];
+        snprintf(name, sizeof(name), "unrelated_%02d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "src/unrelated.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+    cbm_node_t target = {.project = "test",
+                         .label = "Function",
+                         .name = "zz_target_after_output_window",
+                         .qualified_name = "test.zz_target_after_output_window",
+                         .file_path = "src/target.c"};
+    ASSERT_GT(cbm_store_upsert_node(s, &target), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (n) WHERE n.name = 'zz_target_after_output_window' RETURN n.name LIMIT 1", "test",
+        5, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "zz_target_after_output_window");
+    cbm_cypher_result_free(&r);
+
+    /* ORDER BY selects from the eligible set before LIMIT. Ranking only the
+     * old prefix would return unrelated_49 instead of the global top row. */
+    rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.name ORDER BY n.name DESC LIMIT 1", "test", 5,
+                            &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "zz_target_after_output_window");
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
 }
 
 TEST(cypher_exec_match_all_functions) {
@@ -1934,11 +2066,11 @@ TEST(cypher_apply_limit) {
     ASSERT_EQ(r.row_count, 10);
     cbm_cypher_result_free(&r);
 
-    /* LIMIT above max_rows → explicit limit wins */
+    /* LIMIT can reduce but cannot bypass the caller/server output cap. */
     memset(&r, 0, sizeof(r));
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 30", "lim", 10, &r);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(r.row_count, 30);
+    ASSERT_EQ(r.row_count, 10);
     cbm_cypher_result_free(&r);
 
     /* LIMIT 0 is an explicit empty result, not the no-limit sentinel. */
@@ -3540,6 +3672,8 @@ SUITE(cypher) {
     /* Execution */
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
+    RUN_TEST(cypher_exec_file_contains_pushes_down_beyond_seed_window);
+    RUN_TEST(cypher_exec_output_cap_does_not_limit_predicate_scan);
     RUN_TEST(cypher_exec_match_all_functions);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_rejects_list_index_after_function_result);

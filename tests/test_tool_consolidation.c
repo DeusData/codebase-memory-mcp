@@ -1011,6 +1011,10 @@ TEST(query_graph_description_explains_compositional_value) {
     ASSERT_NOT_NULL(strstr(streamlined, "multi-hop paths"));
     ASSERT_NOT_NULL(strstr(streamlined, "aggregates/hotspots"));
     ASSERT_NOT_NULL(strstr(streamlined, "LIMIT are optional efficiency aids"));
+    ASSERT_NOT_NULL(strstr(streamlined, "Maximum result rows"));
+    ASSERT_NOT_NULL(strstr(streamlined, "remain exact before this output cap"));
+    ASSERT_NOT_NULL(strstr(streamlined, "can lower but not bypass the cap"));
+    ASSERT_NULL(strstr(streamlined, "limits nodes scanned"));
     free(streamlined);
 
     /* query_graph is serialized from the same canonical definition in both
@@ -1029,6 +1033,10 @@ TEST(query_graph_description_explains_compositional_value) {
     ASSERT_NOT_NULL(strstr(classic, "WHERE n.project =~"));
     ASSERT_NULL(strstr(classic, "ORDER BY CASE"));
     ASSERT_NOT_NULL(strstr(classic, "WITH can feed later MATCH/OPTIONAL MATCH stages"));
+    ASSERT_NOT_NULL(strstr(classic, "Maximum result rows"));
+    ASSERT_NOT_NULL(strstr(classic, "remain exact before this output cap"));
+    ASSERT_NOT_NULL(strstr(classic, "can lower but not bypass the cap"));
+    ASSERT_NULL(strstr(classic, "limits nodes scanned"));
     free(classic);
 
     PASS();
