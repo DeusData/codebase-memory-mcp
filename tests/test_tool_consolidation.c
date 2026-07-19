@@ -2536,10 +2536,9 @@ TEST(all_tools_have_object_inputSchema) {
 /* ── 15. Cross-project search prefix collision tests ──────── */
 
 TEST(cross_project_search_not_confused_by_prefix) {
-    /* BUG found by dogfooding: session "Users-athundt-.claude" and searching
-     * project "Users-athundt-.claude-codebase-memory-mcp-..." matched on the
-     * first 22 chars (shared path prefix), causing search to open the empty
-     * session DB instead of the target's 22K-node DB.
+    /* A session project and a longer target project can share a path-derived
+     * name prefix. Prefix-only matching opened the session DB instead of the
+     * requested target DB.
      * Fix: after strncmp, check next char is '.' or '\0'.
      *
      * Test: create server with session "myapp", search with project "myapp-other".
