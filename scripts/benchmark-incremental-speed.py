@@ -112,7 +112,7 @@ LOG_TAIL_LINES = 24
 FAILURE_TAIL_LINES = 80
 FAILURE_ARTIFACT_DIRNAME = "failures"
 FAILURE_FALLBACK_DIRNAME = "cbm-benchmark-failures"
-FAILURE_TIMESTAMP_FORMAT = "%Y%m%dT%H%M%SZ"
+FAILURE_TIMESTAMP_FORMAT = "%Y-%m-%d-%H%M%SZ"
 MCP_INIT_PROTOCOL_VERSION = "2024-11-05"
 MCP_CAPABILITY_SURFACES = (
     (
@@ -1718,7 +1718,7 @@ def run_list_projects_scaling(
     generated_at = datetime.now(timezone.utc)
     metadata = binary_metadata(binary)
     run_id = (
-        f"list-projects-{generated_at.strftime('%Y%m%dT%H%M%SZ')}-"
+        f"list-projects-{generated_at.strftime(FAILURE_TIMESTAMP_FORMAT)}-"
         f"{metadata['sha256'][:12]}-{os.getpid()}"
     )
     report: dict[str, Any] = {
@@ -1891,7 +1891,7 @@ def run_search_projection(
     report: dict[str, Any] = {
         "schema_version": 1,
         "run_id": (
-            f"search-projection-{generated_at.strftime('%Y%m%dT%H%M%SZ')}-"
+            f"search-projection-{generated_at.strftime(FAILURE_TIMESTAMP_FORMAT)}-"
             f"{metadata['sha256'][:12]}-{os.getpid()}"
         ),
         "generated_at_utc": generated_at.isoformat(),

@@ -22,9 +22,18 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+CAMPAIGN_DEFINITION_VERSION = 1
 DEFAULT_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_STALE_LOCK_SECONDS = 6 * 60 * 60
+FILENAME_DATETIME_FORMAT = "%Y-%m-%d-%H%M%S.%fZ"
+DEFAULT_CANDIDATE_REFS = (
+    ("upstream-main", "upstream/main"),
+    ("pre-today-major", "api-consolidation-stable-2026-07-16-semantic-v2"),
+    ("pre-upstream-merge", "pre-upstream-main-merge-2026-07-19"),
+    ("latest", "HEAD"),
+)
 IDENTITY_FIELDS = (
+    "identity_version",
     "revision",
     "binary_sha256",
     "build",
@@ -45,6 +54,362 @@ IDENTITY_FIELDS = (
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def filename_datetime(moment: datetime | None = None) -> str:
+    """Return a sortable, filename-safe UTC datetime with collision-level precision."""
+    current = moment or datetime.now(timezone.utc)
+    return current.astimezone(timezone.utc).strftime(FILENAME_DATETIME_FORMAT)
+
+
+def campaign_version() -> str:
+    """Return the sortable version of the campaign definition, not a run number."""
+    return f"v{CAMPAIGN_DEFINITION_VERSION:04d}"
+
+
+def runset_identity(spec_payload: bytes) -> str:
+    """Identify an immutable runset so preparing the same spec resumes in place."""
+    return hashlib.sha256(spec_payload).hexdigest()[:12]
+
+
+def automatic_runset_identity(spec: dict[str, Any]) -> str:
+    """Hash semantic inputs while allowing an identical runset to be path-remapped."""
+    normalized = json.loads(json.dumps(spec))
+    normalized.pop("runset_id", None)
+    normalized.pop("benchmark_script", None)
+    normalized.pop("cwd", None)
+    for background_key in ("repository_background", "quality_background"):
+        background = normalized.get(background_key)
+        if isinstance(background, dict):
+            background.pop("repo", None)
+    candidates = normalized.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                candidate.pop("binary", None)
+    return runset_identity(canonical_json(normalized))
+
+
+def _validate_runset_identity(runset: str) -> str:
+    if len(runset) != 12 or any(char not in "0123456789abcdef" for char in runset):
+        raise ValueError(f"runset identity must be 12 lowercase hexadecimal characters: {runset!r}")
+    return runset
+
+
+def automatic_campaign_name(preset: str, source: dict[str, str], runset: str) -> str:
+    """Name a resumable campaign without confusing source and execution datetimes."""
+    if preset not in {"quick", "full"}:
+        raise ValueError(f"automatic preset must be quick or full: {preset!r}")
+    revision = source.get("revision", "")
+    commit_datetime = source.get("commit_datetime_slug", "")
+    if len(revision) != 40 or not commit_datetime:
+        raise ValueError("source must contain a full revision and commit_datetime_slug")
+    return (
+        f"{campaign_version()}-{preset}-commit-{commit_datetime}-{revision[:12]}-"
+        f"runset-{_validate_runset_identity(runset)}"
+    )
+
+
+def automatic_spec_name(preset: str, runset: str) -> str:
+    if preset not in {"quick", "full"}:
+        raise ValueError(f"automatic preset must be quick or full: {preset!r}")
+    return f"spec-{campaign_version()}-{preset}-runset-{_validate_runset_identity(runset)}.json"
+
+
+def generated_artifact_name(
+    kind: str,
+    runset: str,
+    suffix: str,
+    *,
+    preset: str | None = None,
+    moment: datetime | None = None,
+    nonce: str | None = None,
+) -> str:
+    """Name generated evidence while keeping its stable runset identity visible."""
+    if not kind or any(not (char.isalnum() or char == "-") for char in kind):
+        raise ValueError(f"artifact kind is not path-safe: {kind!r}")
+    if preset is not None and preset not in {"quick", "full", "custom"}:
+        raise ValueError(f"artifact preset is invalid: {preset!r}")
+    if not suffix.startswith(".") or "/" in suffix:
+        raise ValueError(f"artifact suffix is invalid: {suffix!r}")
+    if nonce is not None and (
+        not nonce or any(not (char.isalnum() or char in "-_") for char in nonce)
+    ):
+        raise ValueError(f"artifact nonce is not path-safe: {nonce!r}")
+    parts = [kind, campaign_version()]
+    if preset is not None:
+        parts.append(preset)
+    parts.extend(("runset", _validate_runset_identity(runset), "generated", filename_datetime(moment)))
+    if nonce is not None:
+        parts.append(nonce)
+    return "-".join(parts) + suffix
+
+
+def _run_text(command: list[str], *, cwd: Path) -> str:
+    process = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+    if process.returncode != 0:
+        detail = process.stderr.strip() or process.stdout.strip() or "no diagnostic"
+        raise RuntimeError(f"command failed ({process.returncode}): {' '.join(command)}: {detail}")
+    return process.stdout.strip()
+
+
+def resolve_commit(repository: Path, ref: str) -> str:
+    """Peel a branch, tag, or commit ref to the full commit object ID."""
+    revision = _run_text(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=repository,
+    )
+    if len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision.lower()):
+        raise RuntimeError(f"git resolved {ref!r} to an invalid commit ID: {revision!r}")
+    return revision.lower()
+
+
+def commit_identity(repository: Path, ref: str) -> dict[str, str]:
+    """Return a peeled commit, its repository datetime, and its exact tree."""
+    revision = resolve_commit(repository, ref)
+    committed_at = _run_text(["git", "show", "-s", "--format=%cI", revision], cwd=repository)
+    try:
+        parsed = datetime.fromisoformat(committed_at.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise RuntimeError(
+            f"git returned an invalid commit datetime for {revision}: {committed_at!r}"
+        ) from error
+    tree = _run_text(["git", "rev-parse", "--verify", f"{revision}^{{tree}}"], cwd=repository)
+    return {
+        "revision": revision,
+        "committed_at": parsed.isoformat(),
+        "commit_datetime_slug": parsed.strftime("%Y-%m-%d-%H%M"),
+        "tree": tree,
+    }
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _candidate_slug(label: str) -> str:
+    if not label or any(not (char.isalnum() or char in "-_") for char in label):
+        raise ValueError(f"candidate label is not path-safe: {label!r}")
+    return label
+
+
+def ensure_clean_tracked_worktree(repository: Path, role: str) -> None:
+    """Reject tracked edits while allowing ignored retained evidence and build output."""
+    tracked_status = _run_text(
+        ["git", "status", "--porcelain", "--untracked-files=no"], cwd=repository
+    )
+    if tracked_status:
+        raise RuntimeError(
+            f"{role} has tracked modifications; commit or restore them before measurement: "
+            f"{repository}"
+        )
+
+
+def _registered_candidate_worktrees(repository: Path, candidate_root: Path, revision: str) -> list[Path]:
+    listing = _run_text(["git", "worktree", "list", "--porcelain"], cwd=repository)
+    matches: list[Path] = []
+    for block in listing.split("\n\n"):
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            key, separator, value = line.partition(" ")
+            if separator:
+                fields[key] = value
+        path_value = fields.get("worktree")
+        if fields.get("HEAD") == revision and path_value:
+            candidate = Path(path_value).resolve()
+            if _path_within(candidate, candidate_root):
+                matches.append(candidate)
+    return sorted(matches)
+
+
+def _compiler_identity(worktree: Path) -> str:
+    try:
+        return _run_text(["cc", "--version"], cwd=worktree).splitlines()[0]
+    except (OSError, RuntimeError, IndexError):
+        return "unknown (see datetime-named build log)"
+
+
+def _production_cflags(worktree: Path) -> str:
+    """Read the candidate Makefile's canonical production flags without duplicating them."""
+    target = "cbm-print-production-flags"
+    definition = f"{target}:\n\t@printf '%s\\n' '$(CFLAGS_PROD)'\n"
+    try:
+        process = subprocess.run(
+            [
+                "make",
+                "-s",
+                "-f",
+                "Makefile.cbm",
+                "-f",
+                "-",
+                target,
+            ],
+            cwd=worktree,
+            input=definition,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return "unknown (see candidate Makefile.cbm and build log)"
+    if process.returncode != 0:
+        return "unknown (see candidate Makefile.cbm and build log)"
+    value = process.stdout.strip()
+    return value or "not declared by candidate Makefile.cbm"
+
+
+def _candidate_capability_support(label: str) -> dict[str, bool]:
+    if label == "upstream-main":
+        return {
+            "rank": False,
+            "dependencies": False,
+            "similarity": True,
+            "semantic_edges": True,
+            "git_history": True,
+            "http_links": False,
+        }
+    return {
+        "rank": True,
+        "dependencies": True,
+        "similarity": True,
+        "semantic_edges": True,
+        "git_history": True,
+        "http_links": True,
+    }
+
+
+def materialize_candidate(
+    repository: Path,
+    candidate_root: Path,
+    label: str,
+    ref: str,
+    *,
+    jobs: int = 2,
+) -> dict[str, Any]:
+    """Resolve, isolate, production-build, and hash one benchmark candidate."""
+    repository = repository.expanduser().resolve()
+    candidate_root = candidate_root.expanduser().resolve()
+    safe_label = _candidate_slug(label)
+    if jobs <= 0:
+        raise ValueError("build jobs must be positive")
+    source_identity = commit_identity(repository, ref)
+    revision = source_identity["revision"]
+    candidate_root.mkdir(parents=True, exist_ok=True)
+    intended = candidate_root / f"{safe_label}-{revision[:12]}"
+    matches = _registered_candidate_worktrees(repository, candidate_root, revision)
+    if intended in matches:
+        worktree = intended
+    elif matches:
+        worktree = matches[0]
+    else:
+        if intended.exists():
+            raise RuntimeError(f"candidate path exists but is not the registered {revision} worktree: {intended}")
+        process = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(intended), revision],
+            cwd=repository,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if process.returncode != 0:
+            detail = process.stderr.strip() or process.stdout.strip() or "no diagnostic"
+            raise RuntimeError(f"could not create candidate worktree {intended}: {detail}")
+        worktree = intended
+    actual_revision = resolve_commit(worktree, "HEAD")
+    if actual_revision != revision:
+        raise RuntimeError(
+            f"candidate worktree HEAD mismatch: expected={revision} actual={actual_revision} path={worktree}"
+        )
+    ensure_clean_tracked_worktree(worktree, "candidate worktree")
+
+    binary = worktree / "build" / "c" / "codebase-memory-mcp"
+    stable_build = {
+        "target": f"make -j{jobs} -f Makefile.cbm cbm",
+        "compiler": _compiler_identity(worktree),
+        "cflags": _production_cflags(worktree),
+        "source_commit_datetime": source_identity["committed_at"],
+        "source_tree": source_identity["tree"],
+    }
+    cache_path = (
+        candidate_root
+        / "cache"
+        / f"candidate-{campaign_version()}-{safe_label}-commit-{revision[:12]}.json"
+    )
+    if cache_path.is_file() and binary.is_file():
+        try:
+            cached = read_json_object(cache_path).get("candidate")
+            if (
+                isinstance(cached, dict)
+                and cached.get("label") == safe_label
+                and cached.get("revision") == revision
+                and cached.get("binary") == str(binary)
+                and cached.get("build") == stable_build
+                and cached.get("tree") == source_identity["tree"]
+                and cached.get("binary_sha256") == file_sha256(binary)
+            ):
+                return cached
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    stamp = filename_datetime()
+    log_root = candidate_root / "build-logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    build_log = log_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.log"
+    command = ["make", f"-j{jobs}", "-f", "Makefile.cbm", "cbm"]
+    with build_log.open("w", encoding="utf-8") as stream:
+        stream.write(f"started_at_utc={utc_now()}\n")
+        stream.write(f"revision={revision}\n")
+        stream.write(f"command={' '.join(command)}\n")
+        stream.flush()
+        process = subprocess.run(
+            command,
+            cwd=worktree,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        stream.write(f"finished_at_utc={utc_now()}\n")
+        stream.write(f"exit_code={process.returncode}\n")
+    if process.returncode != 0:
+        raise RuntimeError(f"candidate production build failed ({process.returncode}); see {build_log}")
+    if not binary.is_file():
+        raise RuntimeError(f"candidate build did not produce {binary}; see {build_log}")
+    candidate = {
+        "label": safe_label,
+        "revision": revision,
+        "binary": str(binary),
+        "binary_sha256": file_sha256(binary),
+        "build": stable_build,
+        "capability_support": _candidate_capability_support(safe_label),
+        "commit_datetime": source_identity["committed_at"],
+        "tree": source_identity["tree"],
+    }
+    metadata_root = candidate_root / "metadata"
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        metadata_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.json",
+        {
+            **candidate,
+            "ref": ref,
+            "worktree": str(worktree),
+            "build_log": str(build_log),
+            "recorded_at_utc": utc_now(),
+        },
+    )
+    atomic_write_json(
+        cache_path,
+        {
+            "schema_version": SCHEMA_VERSION,
+            "campaign_version": campaign_version(),
+            "candidate": candidate,
+        },
+    )
+    return candidate
 
 
 def file_sha256(path: Path) -> str:
@@ -123,8 +488,171 @@ def read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def build_automatic_spec(
+    repository: Path,
+    benchmark_script: Path,
+    candidates: list[dict[str, Any]],
+    *,
+    preset: str,
+) -> dict[str, Any]:
+    """Build the canonical safe quick or repeated full capability matrix."""
+    if preset not in {"quick", "full"}:
+        raise ValueError("preset must be quick or full")
+    repository = repository.expanduser().resolve()
+    benchmark_script = benchmark_script.expanduser().resolve()
+    if not benchmark_script.is_file():
+        raise ValueError(f"benchmark script does not exist: {benchmark_script}")
+    expected_labels = [label for label, _ in DEFAULT_CANDIDATE_REFS]
+    actual_labels = [candidate.get("label") for candidate in candidates]
+    if actual_labels != expected_labels:
+        raise ValueError(f"automatic candidates must be ordered {expected_labels}, got {actual_labels}")
+    repository_identity = commit_identity(repository, "HEAD")
+    repository_revision = repository_identity["revision"]
+    repository_tree = repository_identity["tree"]
+    runner_sha = file_sha256(Path(__file__).resolve())
+    benchmark_sha = file_sha256(benchmark_script)
+    latest_labels = ["latest"]
+    profiles: list[dict[str, Any]] = [{"label": "default", "config_profile": "default", "capabilities": {}}]
+    if preset == "full":
+        profiles.extend(
+            (
+                {
+                    "label": "upstream-equivalent",
+                    "config_profile": "default",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {
+                        "auto_index_deps": "false",
+                        "rank_enabled": "false",
+                        "httplinks_enabled": "false",
+                    },
+                    "config_overrides": {
+                        "auto_index_deps": "false",
+                        "rank_enabled": "false",
+                        "httplinks_enabled": "false",
+                    },
+                },
+                {
+                    "label": "eager-derived-freshness",
+                    "config_profile": "incremental_semantic_freshness_eager",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"incremental_derived_refresh": "eager"},
+                },
+                {
+                    "label": "rank-disabled",
+                    "config_profile": "rank_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"rank_enabled": "false"},
+                },
+                {
+                    "label": "dependency-disabled",
+                    "config_profile": "dependency_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"auto_index_deps": "false"},
+                },
+                {
+                    "label": "similarity-disabled",
+                    "config_profile": "similarity_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"similarity_enabled": "false"},
+                },
+                {
+                    "label": "semantic-edges-disabled",
+                    "config_profile": "semantic_edges_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"semantic_edges_enabled": "false"},
+                },
+                {
+                    "label": "git-history-disabled",
+                    "config_profile": "git_history_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"githistory_enabled": "false"},
+                },
+                {
+                    "label": "http-links-disabled",
+                    "config_profile": "http_links_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {"httplinks_enabled": "false"},
+                },
+                {
+                    "label": "optional-graph-disabled",
+                    "config_profile": "optional_graph_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {
+                        "rank_enabled": "false",
+                        "similarity_enabled": "false",
+                        "semantic_edges_enabled": "false",
+                        "githistory_enabled": "false",
+                        "httplinks_enabled": "false",
+                    },
+                },
+                {
+                    "label": "minimal-indexing",
+                    "config_profile": "minimal_indexing",
+                    "candidate_labels": latest_labels,
+                    "capabilities": {
+                        "auto_index_deps": "false",
+                        "rank_enabled": "false",
+                        "similarity_enabled": "false",
+                        "semantic_edges_enabled": "false",
+                        "githistory_enabled": "false",
+                        "httplinks_enabled": "false",
+                    },
+                },
+            )
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "campaign_version": campaign_version(),
+        "identity_version": 2,
+        "harness_version": (f"automatic-{preset}:benchmark-{benchmark_sha}:runner-{runner_sha}"),
+        "benchmark_script": str(benchmark_script),
+        "workload": "self_dogfood",
+        "repository_background": {
+            "repo": str(repository),
+            "revision": repository_revision,
+            "tree": repository_tree,
+            "commit_datetime": repository_identity["committed_at"],
+        },
+        "index_mode": "fast" if preset == "quick" else "moderate",
+        "execution_order": "paired_interleaved",
+        "cwd": str(repository),
+        "timeout_seconds": 900,
+        "cell_timeout_seconds": 1800,
+        "accepted_exit_codes": [0, 1],
+        "repetitions": 1 if preset == "quick" else 3,
+        "transports": ["mcp"],
+        "candidates": candidates,
+        "profiles": profiles,
+        "scenarios": [{"name": "c_new_leaf"}],
+    }
+
+
 def identity_document(cell: dict[str, Any]) -> dict[str, Any]:
-    return {key: cell.get(key) for key in IDENTITY_FIELDS}
+    if cell.get("identity_version") != 2:
+        return {key: cell.get(key) for key in IDENTITY_FIELDS if key != "identity_version"}
+    document = {key: cell.get(key) for key in IDENTITY_FIELDS}
+
+    command = list(document.get("command") or [])
+    if command:
+        command[0] = "{benchmark_script}"
+    for flag, replacement in (
+        ("--binary", "{candidate_binary}"),
+        ("--repo-root", "{repository_root}"),
+        ("--quality-background-repo", "{quality_background_root}"),
+    ):
+        for index, token in enumerate(command[:-1]):
+            if token == flag:
+                command[index + 1] = replacement
+    document["command"] = command
+    if document.get("cwd") is not None:
+        document["cwd"] = "{working_directory}"
+    parameters = json.loads(json.dumps(document.get("parameters") or {}))
+    for background_key in ("repository_background", "quality_background"):
+        background = parameters.get(background_key)
+        if isinstance(background, dict) and "repo" in background:
+            background["repo"] = f"{{{background_key}_root}}"
+    document["parameters"] = parameters
+    return document
 
 
 def cell_identity(cell: dict[str, Any]) -> str:
@@ -156,9 +684,7 @@ def validate_cell(cell: dict[str, Any], index: int) -> None:
     if not cell["command"] or not all(isinstance(item, str) for item in cell["command"]):
         raise ValueError(f"cells[{index}].command must be a non-empty string array")
     accepted = cell.get("accepted_exit_codes", [0])
-    if not isinstance(accepted, list) or not accepted or not all(
-        isinstance(code, int) for code in accepted
-    ):
+    if not isinstance(accepted, list) or not accepted or not all(isinstance(code, int) for code in accepted):
         raise ValueError(f"cells[{index}].accepted_exit_codes must be a non-empty integer array")
     support = cell.get("capability_support")
     if support is not None and (
@@ -204,6 +730,18 @@ def _nonempty_list(value: Any, field: str) -> list[Any]:
     return value
 
 
+def _optional_iso_datetime(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field} must be an ISO 8601 datetime string")
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError(f"{field} must be an ISO 8601 datetime string") from error
+    return value
+
+
 def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Expand a compact benchmark grid into immutable campaign cells."""
     if spec.get("schema_version") != SCHEMA_VERSION:
@@ -217,6 +755,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     accepted_exit_codes = spec.get("accepted_exit_codes", [0])
     capability_quality = spec.get("capability_quality")
     workload = spec.get("workload", "matrix")
+    identity_version = spec.get("identity_version", 1)
     execution_order = spec.get("execution_order")
     quality_background = spec.get("quality_background")
     repository_background = spec.get("repository_background")
@@ -235,25 +774,26 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if execution_order not in {None, "grouped", "paired_interleaved"}:
         raise ValueError("execution_order must be grouped or paired_interleaved")
     if capability_quality is not None and (
-        not isinstance(capability_quality, str)
-        or not capability_quality
-        or "=" in capability_quality
+        not isinstance(capability_quality, str) or not capability_quality or "=" in capability_quality
     ):
         raise ValueError("capability_quality must be a non-empty argument value")
     if workload not in {"matrix", "self_dogfood"}:
         raise ValueError("workload must be matrix or self_dogfood")
+    if identity_version not in {1, 2}:
+        raise ValueError("identity_version must be 1 or 2")
     if capability_quality is not None and workload != "matrix":
         raise ValueError("capability_quality cannot be combined with a self_dogfood workload")
     if quality_background is not None:
         if capability_quality not in {"similarity", "semantic_edges"}:
-            raise ValueError(
-                "quality_background requires capability_quality similarity or semantic_edges"
-            )
+            raise ValueError("quality_background requires capability_quality similarity or semantic_edges")
         if not isinstance(quality_background, dict):
             raise ValueError("quality_background must be an object")
         background_repo = quality_background.get("repo")
         background_revision = quality_background.get("revision")
         background_tree = quality_background.get("tree")
+        background_datetime = _optional_iso_datetime(
+            quality_background.get("commit_datetime"), "quality_background.commit_datetime"
+        )
         if not isinstance(background_repo, str) or not Path(background_repo).is_dir():
             raise ValueError("quality_background.repo must be an existing directory")
         if not isinstance(background_revision, str) or len(background_revision) != 40:
@@ -265,6 +805,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             "revision": background_revision,
             "tree": background_tree,
         }
+        if background_datetime is not None:
+            quality_background["commit_datetime"] = background_datetime
     if repository_background is not None:
         if workload != "self_dogfood":
             raise ValueError("repository_background requires workload self_dogfood")
@@ -273,6 +815,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         background_repo = repository_background.get("repo")
         background_revision = repository_background.get("revision")
         background_tree = repository_background.get("tree")
+        background_datetime = _optional_iso_datetime(
+            repository_background.get("commit_datetime"),
+            "repository_background.commit_datetime",
+        )
         if not isinstance(background_repo, str) or not Path(background_repo).is_dir():
             raise ValueError("repository_background.repo must be an existing directory")
         if not isinstance(background_revision, str) or len(background_revision) != 40:
@@ -284,15 +830,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             "revision": background_revision,
             "tree": background_tree,
         }
+        if background_datetime is not None:
+            repository_background["commit_datetime"] = background_datetime
     elif workload == "self_dogfood":
         raise ValueError("workload self_dogfood requires repository_background")
     if (
         not isinstance(accepted_exit_codes, list)
         or not accepted_exit_codes
-        or not all(
-            isinstance(code, int) and not isinstance(code, bool)
-            for code in accepted_exit_codes
-        )
+        or not all(isinstance(code, int) and not isinstance(code, bool) for code in accepted_exit_codes)
     ):
         raise ValueError("accepted_exit_codes must be a non-empty integer array")
     cell_timeout = spec.get("cell_timeout_seconds", benchmark_timeout * 4)
@@ -304,9 +849,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     benchmark_sha256 = file_sha256(benchmark_path)
 
     candidates = _nonempty_list(spec.get("candidates"), "candidates")
-    candidate_labels = {
-        item.get("label") for item in candidates if isinstance(item, dict)
-    }
+    candidate_labels = {item.get("label") for item in candidates if isinstance(item, dict)}
     profiles = _nonempty_list(spec.get("profiles"), "profiles")
     scenarios = (
         [{"name": f"{capability_quality}_quality"}]
@@ -340,24 +883,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         binary_sha = file_sha256(binary)
         declared_sha = candidate.get("binary_sha256")
         if declared_sha is not None and declared_sha != binary_sha:
-            raise ValueError(
-                f"candidates[{candidate_index}].binary_sha256 does not match {binary}"
-            )
-        candidate_environment = _string_map(
-            candidate.get("environment"), f"candidates[{candidate_index}].environment"
-        )
+            raise ValueError(f"candidates[{candidate_index}].binary_sha256 does not match {binary}")
+        candidate_environment = _string_map(candidate.get("environment"), f"candidates[{candidate_index}].environment")
         candidate_support = candidate.get("capability_support")
         if candidate_support is not None and (
             not isinstance(candidate_support, dict)
-            or not all(
-                isinstance(key, str) and isinstance(value, bool)
-                for key, value in candidate_support.items()
-            )
+            or not all(isinstance(key, str) and isinstance(value, bool) for key, value in candidate_support.items())
         ):
-            raise ValueError(
-                f"candidates[{candidate_index}].capability_support must be a "
-                "string-to-boolean object"
-            )
+            raise ValueError(f"candidates[{candidate_index}].capability_support must be a string-to-boolean object")
 
         for profile_index, profile in enumerate(profiles):
             if not isinstance(profile, dict):
@@ -378,9 +911,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     or not scoped_candidates
                     or not all(isinstance(item, str) and item for item in scoped_candidates)
                 ):
-                    raise ValueError(
-                        f"profiles[{profile_index}].candidate_labels must be a non-empty string array"
-                    )
+                    raise ValueError(f"profiles[{profile_index}].candidate_labels must be a non-empty string array")
                 unknown_candidates = set(scoped_candidates) - candidate_labels
                 if unknown_candidates:
                     raise ValueError(
@@ -396,8 +927,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             if config_profile == "default":
                 for key, claimed_value in capabilities.items():
                     disabled = claimed_value is False or (
-                        isinstance(claimed_value, str)
-                        and claimed_value.strip().lower() == "false"
+                        isinstance(claimed_value, str) and claimed_value.strip().lower() == "false"
                     )
                     if disabled and overrides.get(key, "").strip().lower() != "false":
                         raise ValueError(
@@ -407,9 +937,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                         )
             if "incremental_exact_max_affected_paths" in overrides:
                 raise ValueError("exact cap belongs in scenarios[].exact_caps, not profile overrides")
-            profile_environment = _string_map(
-                profile.get("environment"), f"profiles[{profile_index}].environment"
-            )
+            profile_environment = _string_map(profile.get("environment"), f"profiles[{profile_index}].environment")
 
             for scenario_index, scenario in enumerate(scenarios):
                 if not isinstance(scenario, dict):
@@ -432,8 +960,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                     if not all(isinstance(item, int) and item > 0 for item in frontier_values):
                         raise ValueError("frontier_files must contain positive integers")
                     if not all(
-                        item is None
-                        or (isinstance(item, int) and not isinstance(item, bool) and item > 0)
+                        item is None or (isinstance(item, int) and not isinstance(item, bool) and item > 0)
                         for item in cap_values
                     ):
                         raise ValueError("exact_caps must contain positive integers or null")
@@ -505,9 +1032,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 ]
                             cap_label = "default"
                             if isinstance(exact_cap, int):
-                                effective_capabilities[
-                                    "incremental_exact_max_affected_paths"
-                                ] = str(exact_cap)
+                                effective_capabilities["incremental_exact_max_affected_paths"] = str(exact_cap)
                                 command.extend(
                                     (
                                         "--config",
@@ -519,7 +1044,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 command.extend(("--config", f"{key}={value}"))
                             if capability_quality is not None or workload == "self_dogfood":
                                 command.append("--include-logs")
-                            command.extend(("--timeout", str(benchmark_timeout), "--out", "{result_path}"))
+                            command.extend(
+                                (
+                                    "--timeout",
+                                    str(benchmark_timeout),
+                                    "--out",
+                                    "{result_path}",
+                                )
+                            )
                             parameters = {
                                 "config_profile": config_profile,
                                 "config_overrides": dict(sorted(overrides.items())),
@@ -530,17 +1062,11 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 parameters["capability_quality"] = capability_quality
                                 if quality_background is not None:
                                     parameters["quality_background"] = quality_background
-                                label = (
-                                    f"{candidate_label}.{profile_label}.{transport}."
-                                    f"{scenario_name}"
-                                )
+                                label = f"{candidate_label}.{profile_label}.{transport}.{scenario_name}"
                             elif workload == "self_dogfood":
                                 assert repository_background is not None
                                 parameters["repository_background"] = repository_background
-                                label = (
-                                    f"{candidate_label}.{profile_label}.{transport}."
-                                    f"{scenario_name}"
-                                )
+                                label = f"{candidate_label}.{profile_label}.{transport}.{scenario_name}"
                             else:
                                 parameters["frontier_files"] = frontier_files
                                 parameters["exact_cap"] = exact_cap
@@ -570,12 +1096,12 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                     "timeout_seconds": cell_timeout,
                                     "accepted_exit_codes": list(accepted_exit_codes),
                                 }
+                                if identity_version == 2:
+                                    cell["identity_version"] = 2
                                 if environment:
                                     cell["environment"] = environment
                                 if isinstance(candidate_support, dict):
-                                    cell["capability_support"] = dict(
-                                        sorted(candidate_support.items())
-                                    )
+                                    cell["capability_support"] = dict(sorted(candidate_support.items()))
                                 cell["_design"] = {
                                     "candidate_index": candidate_index,
                                     "profile_index": profile_index,
@@ -605,6 +1131,14 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     for cell in cells:
         cell.pop("_design", None)
     plan = {"schema_version": SCHEMA_VERSION, "cells": cells}
+    campaign_definition = spec.get("campaign_version")
+    if campaign_definition is not None:
+        if campaign_definition != campaign_version():
+            raise ValueError(f"campaign_version must be {campaign_version()}")
+        plan["campaign_version"] = campaign_definition
+    runset = spec.get("runset_id")
+    if runset is not None:
+        plan["runset_id"] = _validate_runset_identity(runset)
     if execution_order is not None:
         plan["execution_order"] = execution_order
     validate_plan(plan)
@@ -615,9 +1149,7 @@ def ensure_disk_space(root: Path, minimum_free_bytes: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(root).free
     if free < minimum_free_bytes:
-        raise RuntimeError(
-            f"insufficient campaign disk space: free={free} required={minimum_free_bytes} root={root}"
-        )
+        raise RuntimeError(f"insufficient campaign disk space: free={free} required={minimum_free_bytes} root={root}")
 
 
 def resource_snapshot(path: Path) -> dict[str, Any]:
@@ -649,9 +1181,7 @@ def resource_snapshot(path: Path) -> dict[str, Any]:
     }
 
 
-def validate_campaign_root(
-    root: Path, *, allow_temporary: bool = False, temporary_root: Path | None = None
-) -> Path:
+def validate_campaign_root(root: Path, *, allow_temporary: bool = False, temporary_root: Path | None = None) -> Path:
     """Require retained campaign state to live outside the OS temporary tree."""
     resolved = root.expanduser().resolve()
     temp = (temporary_root or Path(tempfile.gettempdir())).expanduser().resolve()
@@ -697,7 +1227,7 @@ def acquire_lock(cell_root: Path, stale_after_seconds: int) -> tuple[Path, dict[
         if live or age < stale_after_seconds:
             raise RuntimeError(f"benchmark cell is already locked: {lock_path}")
         stale_record = {"recovered_at_utc": utc_now(), "previous_lock": existing}
-        stale_path = cell_root / f"stale-lock-{int(time.time())}-{uuid.uuid4().hex[:8]}.json"
+        stale_path = cell_root / f"stale-lock-{filename_datetime()}-{uuid.uuid4().hex[:8]}.json"
         atomic_write_json(stale_path, stale_record)
         lock_path.unlink()
     document = {
@@ -730,9 +1260,7 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
     metadata = result.get("binary_metadata")
     actual_sha = metadata.get("sha256") if isinstance(metadata, dict) else None
     if actual_sha != cell["binary_sha256"]:
-        raise ValueError(
-            f"result binary SHA-256 mismatch: expected={cell['binary_sha256']} actual={actual_sha}"
-        )
+        raise ValueError(f"result binary SHA-256 mismatch: expected={cell['binary_sha256']} actual={actual_sha}")
     if result.get("error"):
         raise ValueError(f"benchmark result contains an error: {result['error']}")
     derived = result.get("derived")
@@ -745,11 +1273,7 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
     expected_background = cell.get("parameters", {}).get("quality_background")
     if expected_background is not None:
         first_case = cases[0] if isinstance(cases, list) and cases else None
-        actual_background = (
-            first_case.get("background_repository")
-            if isinstance(first_case, dict)
-            else None
-        )
+        actual_background = first_case.get("background_repository") if isinstance(first_case, dict) else None
         if not isinstance(actual_background, dict):
             raise ValueError("benchmark result is missing background_repository identity")
         for key in ("revision", "tree"):
@@ -798,9 +1322,7 @@ def validate_attempt_artifacts(cell_root: Path, completion: dict[str, Any]) -> N
         raise ValueError("completed attempt artifact manifest is missing")
     actual = artifact_manifest(attempt_root / "artifacts")
     if actual != expected:
-        raise ValueError(
-            "completed attempt artifact manifest does not match retained files"
-        )
+        raise ValueError("completed attempt artifact manifest does not match retained files")
 
 
 def valid_completion(cell_root: Path, cell: dict[str, Any]) -> dict[str, Any] | None:
@@ -881,13 +1403,18 @@ def run_cell(
     try:
         completion = valid_completion(cell_root, cell)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
-        return {"cell_identity": identity, "label": cell["label"], "status": "corrupt", "error": str(exc)}
+        return {
+            "cell_identity": identity,
+            "label": cell["label"],
+            "status": "corrupt",
+            "error": str(exc),
+        }
     if completion is not None:
         return {"cell_identity": identity, "label": cell["label"], "status": "resumed"}
 
     lock_path, stale_record = acquire_lock(cell_root, stale_lock_seconds)
     try:
-        attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{uuid.uuid4().hex[:8]}"
+        attempt_id = filename_datetime() + f"-{uuid.uuid4().hex[:8]}"
         attempt_root = cell_root / "attempts" / attempt_id
         attempt_root.mkdir(parents=True)
         artifact_root = attempt_root / "artifacts"
@@ -924,9 +1451,10 @@ def run_cell(
             lock_path.unlink()
         raise
     try:
-        with (attempt_root / "stdout.log").open("wb") as stdout, (
-            attempt_root / "stderr.log"
-        ).open("wb") as stderr:
+        with (
+            (attempt_root / "stdout.log").open("wb") as stdout,
+            (attempt_root / "stderr.log").open("wb") as stderr,
+        ):
             try:
                 process = subprocess.Popen(
                     command,
@@ -988,7 +1516,11 @@ def run_cell(
             "benchmark_passed": benchmark_passed,
         }
         atomic_write_json(cell_root / "complete.json", completion)
-        return {"cell_identity": identity, "label": cell["label"], "status": "completed"}
+        return {
+            "cell_identity": identity,
+            "label": cell["label"],
+            "status": "completed",
+        }
     finally:
         if lock_path.exists():
             lock_path.unlink()
@@ -997,7 +1529,13 @@ def run_cell(
 def scan_campaign(campaign_root: Path, cells: list[dict[str, Any]]) -> dict[str, Any]:
     expected = {cell_identity(cell): cell for cell in cells}
     entries: list[dict[str, Any]] = []
-    counts = {"complete": 0, "missing": 0, "corrupt": 0, "duplicate_attempts": 0, "unplanned": 0}
+    counts = {
+        "complete": 0,
+        "missing": 0,
+        "corrupt": 0,
+        "duplicate_attempts": 0,
+        "unplanned": 0,
+    }
     for identity, cell in expected.items():
         cell_root = campaign_root / "runs" / identity
         attempts_root = cell_root / "attempts"
@@ -1014,7 +1552,13 @@ def scan_campaign(campaign_root: Path, cells: list[dict[str, Any]]) -> dict[str,
             error = str(exc)
         counts[status] += 1
         entries.append(
-            {"cell_identity": identity, "label": cell["label"], "status": status, "attempts": attempt_count, "error": error}
+            {
+                "cell_identity": identity,
+                "label": cell["label"],
+                "status": status,
+                "attempts": attempt_count,
+                "error": error,
+            }
         )
     runs_root = campaign_root / "runs"
     actual = {path.name for path in runs_root.iterdir() if path.is_dir()} if runs_root.is_dir() else set()
@@ -1036,9 +1580,7 @@ def environment_snapshot(plan_path: Path) -> dict[str, Any]:
     }
 
 
-def completed_report_inputs(
-    campaign_root: Path, cells: list[dict[str, Any]]
-) -> list[tuple[str, Path]]:
+def completed_report_inputs(campaign_root: Path, cells: list[dict[str, Any]]) -> list[tuple[str, Path]]:
     inputs: list[tuple[str, Path]] = []
     for cell in cells:
         cell_root = campaign_root / "runs" / cell_identity(cell)
@@ -1046,14 +1588,15 @@ def completed_report_inputs(
         if completion is not None:
             result_path = resolve_result_path(cell_root, completion)
             inputs.append(
-                (cell["label"], materialize_report_input(campaign_root, cell, result_path))
+                (
+                    cell["label"],
+                    materialize_report_input(campaign_root, cell, result_path),
+                )
             )
     return inputs
 
 
-def materialize_report_input(
-    campaign_root: Path, cell: dict[str, Any], result_path: Path
-) -> Path:
+def materialize_report_input(campaign_root: Path, cell: dict[str, Any], result_path: Path) -> Path:
     """Create a deterministic derived input with candidate metadata beside immutable raw results."""
     document = read_json_object(result_path)
     parameters = document.get("parameters")
@@ -1091,9 +1634,7 @@ def generate_report(campaign_root: Path, cells: list[dict[str, Any]], output: Pa
     command.extend(("--out", str(output)))
     process = subprocess.run(command, capture_output=True, text=True, check=False)
     if process.returncode != 0:
-        raise RuntimeError(
-            f"report generator exited with {process.returncode}: {process.stderr.strip()}"
-        )
+        raise RuntimeError(f"report generator exited with {process.returncode}: {process.stderr.strip()}")
     return {
         "path": str(output),
         "sha256": file_sha256(output),
@@ -1107,6 +1648,8 @@ def write_manifest(
     plan_path: Path,
     cells: list[dict[str, Any]],
     report: dict[str, Any] | None = None,
+    *,
+    runset: str | None = None,
 ) -> Path:
     manifest = {
         "schema_version": SCHEMA_VERSION,
@@ -1115,22 +1658,56 @@ def write_manifest(
         "audit": scan_campaign(campaign_root, cells),
         "generated_report": report,
     }
-    name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + f"-{uuid.uuid4().hex[:8]}.json"
+    effective_runset = runset or file_sha256(plan_path)[:12]
+    name = generated_artifact_name(
+        "manifest",
+        effective_runset,
+        ".json",
+        nonce=uuid.uuid4().hex[:8],
+    )
     path = campaign_root / "manifests" / name
     atomic_write_json(path, manifest)
     return path
 
 
-def main() -> int:
+def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group()
     source.add_argument("--plan", type=Path, help="Fully expanded immutable campaign plan.")
     source.add_argument(
         "--matrix-spec",
         type=Path,
         help="Compact deterministic grid expanded and archived before execution.",
     )
-    parser.add_argument("--campaign-root", required=True, type=Path)
+    source.add_argument(
+        "--quick",
+        dest="preset",
+        action="store_const",
+        const="quick",
+        help="Automatically prepare and run the safe one-repetition smoke (default).",
+    )
+    source.add_argument(
+        "--full",
+        dest="preset",
+        action="store_const",
+        const="full",
+        help="Automatically prepare and run the repeated capability matrix.",
+    )
+    parser.add_argument(
+        "--campaign-root",
+        type=Path,
+        help=(
+            "Durable result root. Automatic modes default to a versioned, commit-qualified, "
+            "content-addressed runset directory under "
+            ".worktrees/benchmark-campaign."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-root",
+        type=Path,
+        help=("Automatic candidate worktree/build root (default: .worktrees/benchmark-candidates)."),
+    )
+    parser.add_argument("--build-jobs", type=int, default=2)
     parser.add_argument(
         "--allow-temporary-campaign-root",
         action="store_true",
@@ -1142,14 +1719,95 @@ def main() -> int:
     parser.add_argument(
         "--report-out",
         type=Path,
-        help="Generated Markdown path (default: CAMPAIGN_ROOT/reports/summary.md).",
+        help="Generated Markdown path (default: versioned runset report under CAMPAIGN_ROOT/reports).",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.plan is None and args.matrix_spec is None and args.preset is None:
+        args.preset = "quick"
+    if args.preset is None and args.campaign_root is None:
+        parser.error("--campaign-root is required with --plan or --matrix-spec")
+    if args.build_jobs <= 0:
+        parser.error("--build-jobs must be positive")
+    return args
 
+
+def _commit_datetime_slug(repository: Path, revision: str) -> str:
+    return commit_identity(repository, revision)["commit_datetime_slug"]
+
+
+def prepare_automatic_campaign(
+    args: argparse.Namespace,
+) -> tuple[Path, Path]:
+    repository = Path(__file__).resolve().parents[1]
+    ensure_clean_tracked_worktree(repository, "benchmark source worktree")
+    candidate_root = (
+        args.candidate_root.expanduser().resolve()
+        if args.candidate_root
+        else repository / ".worktrees" / "benchmark-candidates"
+    )
+    ensure_disk_space(candidate_root, max(0, int(args.minimum_free_gb * 1024**3)))
+    candidates = [
+        materialize_candidate(
+            repository,
+            candidate_root,
+            label,
+            ref,
+            jobs=args.build_jobs,
+        )
+        for label, ref in DEFAULT_CANDIDATE_REFS
+    ]
+    benchmark_script = repository / "scripts" / "benchmark-incremental-speed.py"
+    spec = build_automatic_spec(
+        repository,
+        benchmark_script,
+        candidates,
+        preset=args.preset,
+    )
+    revision = spec["repository_background"]["revision"]
+    tree = spec["repository_background"]["tree"]
+    commit_datetime = _commit_datetime_slug(repository, revision)
+    runset = automatic_runset_identity(spec)
+    spec["runset_id"] = runset
+    spec_payload = (json.dumps(spec, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    source_identity = {
+        "revision": revision,
+        "commit_datetime_slug": commit_datetime,
+        "tree": tree,
+    }
+    campaign_root = (
+        args.campaign_root.expanduser().resolve()
+        if args.campaign_root
+        else repository
+        / ".worktrees"
+        / "benchmark-campaign"
+        / automatic_campaign_name(args.preset, source_identity, runset)
+    )
     campaign_root = validate_campaign_root(
-        args.campaign_root,
+        campaign_root,
         allow_temporary=args.allow_temporary_campaign_root,
     )
+    spec_path = campaign_root / "inputs" / automatic_spec_name(args.preset, runset)
+    if spec_path.exists():
+        if spec_path.read_bytes() != spec_payload:
+            raise RuntimeError(f"automatic spec path contains different bytes: {spec_path}")
+    else:
+        atomic_write_bytes(spec_path, spec_payload)
+    return campaign_root, spec_path
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_arguments(argv)
+
+    if args.preset is not None:
+        campaign_root, matrix_spec = prepare_automatic_campaign(args)
+        args.matrix_spec = matrix_spec
+    else:
+        assert args.campaign_root is not None
+        campaign_root = validate_campaign_root(
+            args.campaign_root,
+            allow_temporary=args.allow_temporary_campaign_root,
+        )
+
     minimum_free_bytes = max(0, int(args.minimum_free_gb * 1024**3))
     stale_lock_seconds = max(1, int(args.stale_lock_hours * 3600))
     ensure_disk_space(campaign_root, minimum_free_bytes)
@@ -1174,7 +1832,9 @@ def main() -> int:
             atomic_write_bytes(archived_plan, plan_path.read_bytes())
         plan_path = archived_plan
     cells = validate_plan(plan)
-    snapshot_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + ".json"
+    runset = plan.get("runset_id", file_sha256(plan_path)[:12])
+    runset = _validate_runset_identity(runset)
+    snapshot_name = generated_artifact_name("environment", runset, ".json")
     atomic_write_json(
         campaign_root / "environments" / snapshot_name,
         environment_snapshot(plan_path),
@@ -1197,10 +1857,23 @@ def main() -> int:
         report_path = (
             args.report_out.expanduser().resolve()
             if args.report_out
-            else campaign_root / "reports" / "summary.md"
+            else campaign_root
+            / "reports"
+            / generated_artifact_name(
+                "report",
+                runset,
+                ".md",
+                preset=args.preset or "custom",
+            )
         )
         report_metadata = generate_report(campaign_root, cells, report_path)
-    manifest_path = write_manifest(campaign_root, plan_path, cells, report_metadata)
+    manifest_path = write_manifest(
+        campaign_root,
+        plan_path,
+        cells,
+        report_metadata,
+        runset=runset,
+    )
     print(json.dumps({"manifest": str(manifest_path), "audit": audit}, indent=2, sort_keys=True))
     return 1 if failures or audit["counts"]["missing"] or audit["counts"]["corrupt"] else 0
 
