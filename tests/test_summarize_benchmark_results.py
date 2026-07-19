@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "summarize-benchmark-results.py"
+SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "summarize-benchmark-results.py"
+)
 SPEC = importlib.util.spec_from_file_location("summarize_benchmark_results", SCRIPT)
 assert SPEC and SPEC.loader
 SUMMARY = importlib.util.module_from_spec(SPEC)
@@ -25,7 +27,9 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
-    def test_semantic_pair_lifecycle_reports_expected_deferred_freshness_without_failure(self) -> None:
+    def test_semantic_pair_lifecycle_reports_expected_deferred_freshness_without_failure(
+        self,
+    ) -> None:
         case = {
             "scenario": "similarity_quality",
             "passed": True,
@@ -46,7 +50,10 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                     },
                     "response_quality": {"elapsed_ms": 600, "response_bytes": 181},
                 },
-                "mutation": {"description": "swap clone", "changed_paths": ["fixture.go"]},
+                "mutation": {
+                    "description": "swap clone",
+                    "changed_paths": ["fixture.go"],
+                },
                 "incremental_index": {
                     "elapsed_ms": 588,
                     "indexed_work_elapsed_ms": 382,
@@ -98,7 +105,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["full_p50_ms"], 29600.0)
         self.assertEqual(row["pair_quality_details"][0]["initial_f1"], 1.0)
         self.assertEqual(row["pair_quality_details"][0]["fresh_f1"], 1.0)
-        self.assertEqual(row["pair_quality_details"][0]["freshness"], "deferred with warning")
+        self.assertEqual(
+            row["pair_quality_details"][0]["freshness"], "deferred with warning"
+        )
         self.assertEqual(row["pair_f1_score"], 1.0)
         self.assertIsNone(row["quality_score"])
         self.assertEqual(row["query_observations"], 3)
@@ -107,7 +116,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("## Semantic pair quality and freshness", markdown)
         self.assertIn("deferred with warning", markdown)
 
-    def test_disabled_semantic_pair_control_is_not_described_as_freshness_deferral(self) -> None:
+    def test_disabled_semantic_pair_control_is_not_described_as_freshness_deferral(
+        self,
+    ) -> None:
         case = {
             "scenario": "similarity_quality",
             "passed": True,
@@ -121,15 +132,24 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "pair_lifecycle": {
                 "initial_oracles": {
                     "passed": False,
-                    "pair_classification": {"confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1}, "f1": None},
+                    "pair_classification": {
+                        "confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1},
+                        "f1": None,
+                    },
                 },
                 "incremental_oracles": {
                     "passed": False,
-                    "pair_classification": {"confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1}, "f1": None},
+                    "pair_classification": {
+                        "confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1},
+                        "f1": None,
+                    },
                 },
                 "fresh_oracles": {
                     "passed": False,
-                    "pair_classification": {"confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1}, "f1": None},
+                    "pair_classification": {
+                        "confusion": {"tp": 0, "tn": 2, "fp": 0, "fn": 1},
+                        "f1": None,
+                    },
                 },
                 "incremental_policy": {
                     "policy": "stale_on_incremental",
@@ -151,12 +171,16 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         row = SUMMARY.summarize_group("similarity-disabled", [item])
 
         self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
-        self.assertEqual(row["pair_quality_details"][0]["freshness"], "capability disabled")
+        self.assertEqual(
+            row["pair_quality_details"][0]["freshness"], "capability disabled"
+        )
         self.assertEqual(row["mutation_details"][0]["canonical"], "capability disabled")
         self.assertIn("capability-off control", row["findings"][0])
         self.assertNotIn("initial/fresh pair tasks passed", " ".join(row["findings"]))
 
-    def test_semantic_pair_policy_mismatch_rejects_capability_quality_cell(self) -> None:
+    def test_semantic_pair_policy_mismatch_rejects_capability_quality_cell(
+        self,
+    ) -> None:
         case = {
             "scenario": "similarity_quality",
             "passed": True,
@@ -264,7 +288,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("1 expected positive absent", finding)
         self.assertNotIn("All applicable", markdown)
 
-    def test_eager_pair_quality_contributes_graph_fidelity_and_overall_score(self) -> None:
+    def test_eager_pair_quality_contributes_graph_fidelity_and_overall_score(
+        self,
+    ) -> None:
         perfect = {
             "passed": True,
             "pair_classification": {
@@ -306,7 +332,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["task_success_score"], 1.0)
         self.assertEqual(row["overall_quality_score"], 1.0)
 
-    def test_pair_lifecycle_canonical_rejection_reports_exact_graph_witness(self) -> None:
+    def test_pair_lifecycle_canonical_rejection_reports_exact_graph_witness(
+        self,
+    ) -> None:
         perfect = {
             "passed": True,
             "pair_classification": {
@@ -350,7 +378,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertEqual(row["decision"], "REJECT: graph correctness")
         finding = " ".join(row["findings"])
-        self.assertIn("canonical nodes mismatch (incremental=15641, fresh=15641)", finding)
+        self.assertIn(
+            "canonical nodes mismatch (incremental=15641, fresh=15641)", finding
+        )
         self.assertIn("cbmq_records.py", finding)
         self.assertNotIn("no stage-level witness was recorded", markdown)
 
@@ -404,7 +434,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             class FakeCampaign:
                 @staticmethod
                 def expand_matrix_spec(spec: dict) -> dict:
-                    raise AssertionError("report composition must not re-expand a matrix")
+                    raise AssertionError(
+                        "report composition must not re-expand a matrix"
+                    )
 
                 @staticmethod
                 def validate_plan(document: dict) -> list[dict]:
@@ -477,7 +509,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertIn("Outcome: complete", markdown)
         self.assertIn("compact true | 30 | Equal | none | 6,824 | 1,706", markdown)
-        self.assertIn("non-compact | 30 | Equal | complexity, signature | 18,374", markdown)
+        self.assertIn(
+            "non-compact | 30 | Equal | complexity, signature | 18,374", markdown
+        )
         self.assertIn("62.9% fewer payload bytes", markdown)
         self.assertIn("No fp, sp, or bt", markdown)
         self.assertIn("not a latency comparison", markdown)
@@ -487,7 +521,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected a search_projection"):
             SUMMARY.render_search_projection({"mode": "incremental"})
 
-    def test_list_projects_scaling_report_separates_size_latency_and_lifecycle(self) -> None:
+    def test_list_projects_scaling_report_separates_size_latency_and_lifecycle(
+        self,
+    ) -> None:
         document = {
             "mode": "list_projects_scaling",
             "run_id": "list-projects-example",
@@ -545,7 +581,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "expected a list_projects_scaling"):
             SUMMARY.render_list_projects_scaling({"mode": "incremental"})
 
-    def test_mcp_surface_report_keeps_discovery_dispatch_and_behavior_distinct(self) -> None:
+    def test_mcp_surface_report_keeps_discovery_dispatch_and_behavior_distinct(
+        self,
+    ) -> None:
         def surface(count: int, size: int, tokens: int, elapsed: float) -> dict:
             return {
                 "tool_count": count,
@@ -557,37 +595,56 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         document = {
             "mode": "mcp_surface_parity",
             "surfaces": {
-                "classic": surface(15, 21000, 5250, 0.4),
+                "classic": surface(16, 21000, 5250, 0.4),
                 "streamlined_pre_reveal": surface(6, 13000, 3250, 0.3),
-                "streamlined_post_reveal": surface(17, 24000, 6000, 0.2),
+                "streamlined_post_reveal": surface(18, 24000, 6000, 0.2),
             },
             "comparison": {
                 "pre_reveal": {
-                    "advertised_classic_tools": "4/15",
-                    "dispatch_recognized_classic_tools": "15/15",
+                    "advertised_classic_tools": "4/16",
+                    "dispatch_recognized_classic_tools": "16/16",
                     "intentionally_hidden_classic_tools": ["index_repository"],
                     "get_code_alias": {
                         "property_names_equal": True,
                         "required_names_equal": True,
+                        "validation_shape_equal": True,
                         "schema_equal": False,
                     },
                 },
                 "post_reveal": {
                     "classic_name_parity": True,
                     "classic_schema_parity": True,
+                    "classic_contract_parity": True,
                     "tools_list_changed_observed": True,
                 },
+                "capability_parity": [
+                    {
+                        "capability": "programmable_graph_analysis",
+                        "outcome": "problem-specific read-only Cypher",
+                        "classic_advertised": True,
+                        "streamlined_pre_reveal_advertised": True,
+                        "streamlined_pre_reveal_callable": True,
+                        "streamlined_post_reveal_advertised": True,
+                    }
+                ],
+                "lifecycle_passed": True,
             },
         }
 
         markdown = SUMMARY.render_mcp_surface_parity(document)
 
-        self.assertIn("Pure classic | 15 | 15/15", markdown)
-        self.assertIn("Streamlined before reveal | 6 | 4/15 | 15/15", markdown)
-        self.assertIn("Same streamlined process after reveal | 17 | 15/15", markdown)
+        self.assertLess(
+            markdown.index("Capability outcome"), markdown.index("Advertised tools")
+        )
+        self.assertIn("problem-specific read-only Cypher", markdown)
+        self.assertIn("Pure classic | 16 | 16/16", markdown)
+        self.assertIn("Streamlined before reveal | 6 | 4/16 | 16/16", markdown)
+        self.assertIn("Same streamlined process after reveal | 18 | 16/16", markdown)
+        self.assertIn("MCP processes and reader threads reaped: true", markdown)
         self.assertIn("does not prove successful execution", markdown)
         self.assertIn("Behavioral parity requires capability fixtures", markdown)
-        self.assertIn("full schema equal=false", markdown)
+        self.assertIn("validation shape equal=true", markdown)
+        self.assertIn("complete advertised schema identical=false", markdown)
 
     def test_mcp_surface_report_rejects_regular_benchmark_document(self) -> None:
         with self.assertRaisesRegex(ValueError, "expected an mcp_surface_parity"):
@@ -620,7 +677,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertEqual(details[0]["result"], "BELOW CUTOFF (rank 9 of 9)")
 
-    def test_capability_quality_shortfall_is_not_called_correctness_failure(self) -> None:
+    def test_capability_quality_shortfall_is_not_called_correctness_failure(
+        self,
+    ) -> None:
         item = report(
             {
                 "scenario": "rank_quality",
@@ -703,7 +762,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("3 judgments", markdown)
         self.assertIn("doi.org/10.1145/582415.582418", markdown)
 
-    def test_fast_mode_report_marks_similarity_and_semantic_quality_not_applicable(self) -> None:
+    def test_fast_mode_report_marks_similarity_and_semantic_quality_not_applicable(
+        self,
+    ) -> None:
         case = {
             "passed": True,
             "canonical_graph": {"equal": True},
@@ -737,7 +798,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "N/A: SIMILAR_TO generation requires full or moderate mode",
         )
         self.assertIn("## Algorithm-quality applicability", markdown)
-        self.assertIn("N/A: SIMILAR_TO generation requires full or moderate mode", markdown)
+        self.assertIn(
+            "N/A: SIMILAR_TO generation requires full or moderate mode", markdown
+        )
 
     def test_candidate_support_overrides_mode_based_applicability(self) -> None:
         item = report({"passed": True})
@@ -757,7 +820,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         row = SUMMARY.summarize_group("upstream", [item])
 
-        self.assertEqual(row["capability_applicability"]["rank"], "unsupported by candidate")
+        self.assertEqual(
+            row["capability_applicability"]["rank"], "unsupported by candidate"
+        )
         self.assertEqual(
             row["capability_applicability"]["dependencies"], "unsupported by candidate"
         )
@@ -818,7 +883,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["full_observations"], 1)
         self.assertEqual(row["peak_rss_mb"], 42)
 
-    def test_dependency_mode_distinguishes_disabled_unsupported_and_unknown(self) -> None:
+    def test_dependency_mode_distinguishes_disabled_unsupported_and_unknown(
+        self,
+    ) -> None:
         case = {
             "passed": True,
             "canonical_graph": {"equal": True},
@@ -910,7 +977,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             ],
         )
 
-    def test_declared_stale_derived_views_are_not_core_correctness_failure(self) -> None:
+    def test_declared_stale_derived_views_are_not_core_correctness_failure(
+        self,
+    ) -> None:
         case = {
             "passed": True,
             "canonical_graph": {
@@ -973,7 +1042,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(row["lifecycle"], "disposed 3/3")
         self.assertEqual(row["decision"], "PASS")
 
-    def test_lifecycle_distinguishes_retained_evidence_from_cleanup_failure(self) -> None:
+    def test_lifecycle_distinguishes_retained_evidence_from_cleanup_failure(
+        self,
+    ) -> None:
         case = {"passed": True}
         retained = report(case)
         retained["cleanup"] = {"requested": False, "removed": False}
@@ -997,7 +1068,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
             "speedup_full_rebuild_over_incremental": 10.0,
         }
-        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
+        markdown = SUMMARY.render_markdown(
+            [SUMMARY.summarize_group("latest", [report(case)])]
+        )
         self.assertLess(markdown.index("Decision"), markdown.index("Speedup p50"))
         self.assertIn("Binary SHA-256", markdown)
         self.assertIn("Correctness and quality findings", markdown)
@@ -1156,7 +1229,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
             "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
         }
-        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("rank-off", [report(case)])])
+        markdown = SUMMARY.render_markdown(
+            [SUMMARY.summarize_group("rank-off", [report(case)])]
+        )
         self.assertIn("Overall quality", markdown)
         self.assertIn("Retrieval MRR", markdown)
         self.assertIn("Graph fidelity", markdown)
@@ -1190,7 +1265,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         row = SUMMARY.summarize_group("partial", [report(case)])
         self.assertEqual(row["decision"], "REJECT: task correctness")
         self.assertEqual(row["task_success_score"], 0.8)
-        self.assertAlmostEqual(row["overall_quality_score"], (0.7 * 1.0 * 0.8) ** (1 / 3))
+        self.assertAlmostEqual(
+            row["overall_quality_score"], (0.7 * 1.0 * 0.8) ** (1 / 3)
+        )
         markdown = SUMMARY.render_markdown([row])
         self.assertIn("0.800", markdown)
         self.assertIn("4/5 / 1/1 / 1/1 / 0/1", markdown)
@@ -1231,9 +1308,15 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
 
         self.assertEqual(row["decision"], "BELOW QUALITY TARGET")
 
-    def test_observation_ranges_report_dispersion_without_claiming_confidence(self) -> None:
+    def test_observation_ranges_report_dispersion_without_claiming_confidence(
+        self,
+    ) -> None:
         reports = []
-        for incremental_ms, query_ms, full_ms in ((8, 2, 80), (10, 3, 100), (20, 7, 140)):
+        for incremental_ms, query_ms, full_ms in (
+            (8, 2, 80),
+            (10, 3, 100),
+            (20, 7, 140),
+        ):
             reports.append(
                 report(
                     {
@@ -1247,7 +1330,10 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                                 "response_token_estimate": 10,
                             },
                         },
-                        "incremental": {"elapsed_ms": incremental_ms, "peak_rss_mb": 80},
+                        "incremental": {
+                            "elapsed_ms": incremental_ms,
+                            "peak_rss_mb": 80,
+                        },
                         "fresh_fast_full_after_change": {"elapsed_ms": full_ms},
                     }
                 )
@@ -1310,7 +1396,10 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertEqual(crossovers[0]["conclusion"], "fallback faster")
         markdown = SUMMARY.render_markdown(rows)
         self.assertIn("## Exact-frontier cap crossover", markdown)
-        self.assertIn("| go_inbound_frontier | 17 | 16 | 100.0 | 20.0 | 80.0 | 32 | 200.0", markdown)
+        self.assertIn(
+            "| go_inbound_frontier | 17 | 16 | 100.0 | 20.0 | 80.0 | 32 | 200.0",
+            markdown,
+        )
         self.assertIn("2.00×", markdown)
         self.assertIn("fallback faster", markdown)
 
@@ -1332,7 +1421,9 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "fresh_fast_full_after_change": {"elapsed_ms": 600},
             "speedup_full_rebuild_over_incremental": 5.0,
         }
-        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
+        markdown = SUMMARY.render_markdown(
+            [SUMMARY.summarize_group("latest", [report(case)])]
+        )
 
         self.assertIn("## Incremental mutation and reindex breakdown", markdown)
         self.assertIn("HTTP handler source edit with route literal oracle", markdown)
@@ -1362,11 +1453,15 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             "speedup_full_rebuild_over_incremental": 63 / 59,
         }
 
-        markdown = SUMMARY.render_markdown([SUMMARY.summarize_group("latest", [report(case)])])
+        markdown = SUMMARY.render_markdown(
+            [SUMMARY.summarize_group("latest", [report(case)])]
+        )
 
         self.assertIn("synthetic go inbound-frontier definition edit", markdown)
         self.assertIn("leaf.go", markdown)
-        self.assertNotIn("| not reported | not reported | incremental_exact |", markdown)
+        self.assertNotIn(
+            "| not reported | not reported | incremental_exact |", markdown
+        )
 
     def test_markdown_computes_latest_speedups_for_matching_capabilities(self) -> None:
         def measured_case(incremental_ms: int, full_ms: int, query_ms: int) -> dict:
@@ -1374,7 +1469,11 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                 "passed": True,
                 "canonical_graph": {"equal": True},
                 "oracles": {
-                    "quality": {"passed": True, "passed_count": 1, "applicable_count": 1},
+                    "quality": {
+                        "passed": True,
+                        "passed_count": 1,
+                        "applicable_count": 1,
+                    },
                     "probe": {
                         "elapsed_ms": query_ms,
                         "response_token_estimate": 10,
@@ -1385,16 +1484,24 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
             }
 
         rows = [
-            SUMMARY.summarize_group("baseline-rank-off", [report(measured_case(20, 100, 8))]),
-            SUMMARY.summarize_group("latest-rank-off", [report(measured_case(10, 50, 4))]),
+            SUMMARY.summarize_group(
+                "baseline-rank-off", [report(measured_case(20, 100, 8))]
+            ),
+            SUMMARY.summarize_group(
+                "latest-rank-off", [report(measured_case(10, 50, 4))]
+            ),
         ]
         markdown = SUMMARY.render_markdown(rows)
 
         self.assertIn("## Quality-constrained cross-version timing", markdown)
-        self.assertIn("| latest-rank-off | baseline-rank-off | 2.00× | 2.00× | 2.00× |", markdown)
+        self.assertIn(
+            "| latest-rank-off | baseline-rank-off | 2.00× | 2.00× | 2.00× |", markdown
+        )
         self.assertIn("descriptive only", markdown)
 
-    def test_cross_version_ratios_are_suppressed_when_quality_decisions_differ(self) -> None:
+    def test_cross_version_ratios_are_suppressed_when_quality_decisions_differ(
+        self,
+    ) -> None:
         case = {
             "passed": True,
             "canonical_graph": {"equal": True},

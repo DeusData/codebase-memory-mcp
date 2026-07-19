@@ -174,6 +174,21 @@ uses no overrides. The PageRank/LinkRank ablation is:
 --config-profile rank_disabled
 ```
 
+`scripts/autotune.py` is a safe frontend for the corresponding PageRank parameter
+sweep. It requires exact build metadata, generates a content-addressed rank-quality
+campaign, interleaves candidate-default and ablation repetitions, and stores the
+plan, results, logs, and report under a durable ignored campaign root. It does not
+change the normal user configuration or cache. Use `--plan-only` to validate and
+inspect the expanded cells before spending CPU time.
+
+The independent `--mcp-surface-parity` mode records classic, streamlined before
+reveal, and the same streamlined process after reveal. It compares names plus the
+full `tools/list` client contract (description, input/output schemas, and MCP
+annotations), reports user outcomes before tool counts, checks bounded pre-reveal
+handler recognition, and requires server processes and reader threads to be reaped.
+These probes establish discovery and dispatch parity; functional quality claims
+must still come from the capability fixtures and repository workloads below.
+
 The optional graph-pass ablation keeps dependency indexing enabled and is:
 
 ```text
