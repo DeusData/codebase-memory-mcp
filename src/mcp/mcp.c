@@ -1121,11 +1121,13 @@ static const tool_def_t TOOLS[] = {
      "effective, computationally efficient custom Cypher for multi-hop paths, aggregates/hotspots, "
      "arbitrary predicates, cross-service links, or graph=\"missed\". Non-exhaustive examples: "
      "MATCH (f:Function)-[:CALLS]->(g) RETURN f.name,g.name LIMIT 20; "
-     "MATCH (f:File) RETURN f.file_path,count(*). Any valid query shape is allowed; explicit "
-     "labels/properties and LIMIT are optional efficiency aids. Server caps query_max_rows and "
+     "MATCH (f:File) RETURN f.file_path,count(*). Any supported query shape is allowed; "
+     "WITH can feed later MATCH/OPTIONAL MATCH stages; ORDER BY accepts multiple projected "
+     "fields or aliases. Explicit labels/properties and LIMIT are optional efficiency aids. "
+     "Server caps query_max_rows and "
      "query_max_output_bytes; raise only when needed. Dependency symbols use proj.dep.* and "
-     "source:dependency; rank primary symbols first with "
-     "ORDER BY CASE WHEN n.project LIKE '%.dep.%' THEN 1 ELSE 0 END. "
+     "source:dependency; filter them with a supported predicate such as "
+     "WHERE n.project =~ '.*\\.dep\\..*'. "
      "Supported read-only Cypher subset: MATCH/OPTIONAL MATCH, WHERE, WITH, UNWIND, RETURN, "
      "DISTINCT, ORDER BY, SKIP, LIMIT, UNION/UNION ALL; node and relationship patterns; bounded "
      "variable-length paths; property access, comparisons, regex, IN, IS NULL, EXISTS, boolean "
@@ -6832,6 +6834,42 @@ static const char QUERY_GRAPH_NO_ROWS_FALLBACK_HINT[] =
     "properties match the current project; the query_graph tool description "
     "lists the current schema.";
 
+static void hint_walk_query_vocabulary(const cbm_query_t *ast, cbm_store_t *store,
+                                       const char *view_project, bool overlay_ready,
+                                       hint_seen_t *seen, cbm_sb_t *unknown, int *unknown_count) {
+    for (const cbm_query_t *root = ast; root; root = root->union_next) {
+        for (const cbm_query_t *q = root; q; q = q->next_stage) {
+            for (int p = 0; p < q->pattern_count; p++) {
+                const cbm_pattern_t *pat = &q->patterns[p];
+                for (int n = 0; n < pat->node_count; n++) {
+                    const char *label = pat->nodes[n].label;
+                    if (label && hint_seen_add(seen, label) &&
+                        !cbm_store_schema_label_observed(store, view_project, overlay_ready,
+                                                         label)) {
+                        cbm_sb_append(unknown, (*unknown_count)++ ? ", " : "");
+                        cbm_sb_append(unknown, label);
+                    }
+                }
+                for (int r = 0; r < pat->rel_count; r++) {
+                    for (int t = 0; t < pat->rels[r].type_count; t++) {
+                        const char *type = pat->rels[r].types[t];
+                        if (type && hint_seen_add(seen, type) &&
+                            !cbm_store_schema_type_observed(store, view_project, overlay_ready,
+                                                            type)) {
+                            cbm_sb_append(unknown, (*unknown_count)++ ? ", " : "");
+                            cbm_sb_append(unknown, type);
+                        }
+                    }
+                }
+            }
+            hint_walk_where_exists_types(q->where, store, view_project, overlay_ready, seen,
+                                         unknown, unknown_count);
+            hint_walk_where_exists_types(q->post_with_where, store, view_project, overlay_ready,
+                                         seen, unknown, unknown_count);
+        }
+    }
+}
+
 /* Self-healing zero-row hint: reparses the already-executed query
  * (O(|query|); zero-row path only) and probes each referenced label/edge
  * type with an indexed existence check against the SAME view the query ran
@@ -6862,36 +6900,8 @@ static char *query_graph_no_rows_hint(cbm_store_t *store, const char *view_proje
      * "MATCH (a:Klass) MATCH (b:Klass) RETURN a" reads "Klass, Klass." to
      * the calling model. */
     hint_seen_t seen = {0};
-    for (const cbm_query_t *q = ast; q; q = q->union_next) {
-        for (int p = 0; p < q->pattern_count; p++) {
-            const cbm_pattern_t *pat = &q->patterns[p];
-            for (int n = 0; n < pat->node_count; n++) {
-                const char *label = pat->nodes[n].label;
-                if (label && hint_seen_add(&seen, label) &&
-                    !cbm_store_schema_label_observed(store, view_project, overlay_ready, label)) {
-                    cbm_sb_append(&unknown, unknown_count++ ? ", " : "");
-                    cbm_sb_append(&unknown, label);
-                }
-            }
-            for (int r = 0; r < pat->rel_count; r++) {
-                for (int t = 0; t < pat->rels[r].type_count; t++) {
-                    const char *type = pat->rels[r].types[t];
-                    if (type && hint_seen_add(&seen, type) &&
-                        !cbm_store_schema_type_observed(store, view_project, overlay_ready,
-                                                        type)) {
-                        cbm_sb_append(&unknown, unknown_count++ ? ", " : "");
-                        cbm_sb_append(&unknown, type);
-                    }
-                }
-            }
-        }
-        /* Edge types are also referenced OUTSIDE patterns: EXISTS predicates
-         * carry the type in cond.value. Walk both WHERE trees. */
-        hint_walk_where_exists_types(q->where, store, view_project, overlay_ready, &seen, &unknown,
-                                     &unknown_count);
-        hint_walk_where_exists_types(q->post_with_where, store, view_project, overlay_ready, &seen,
-                                     &unknown, &unknown_count);
-    }
+    hint_walk_query_vocabulary(ast, store, view_project, overlay_ready, &seen, &unknown,
+                               &unknown_count);
     cbm_query_free(ast);
 
     cbm_sb_t msg;

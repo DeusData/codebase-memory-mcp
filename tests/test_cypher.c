@@ -375,8 +375,9 @@ TEST(cypher_parse_return_order_limit) {
     int rc =
         cbm_cypher_parse("MATCH (f:Function) RETURN f.name ORDER BY f.name DESC LIMIT 5", &q, &err);
     ASSERT_EQ(rc, 0);
-    ASSERT_NOT_NULL(q->ret->order_by);
-    ASSERT_STR_EQ(q->ret->order_dir, "DESC");
+    ASSERT_EQ(q->ret->order_count, 1);
+    ASSERT_STR_EQ(q->ret->order_items[0].expression, "f.name");
+    ASSERT_STR_EQ(q->ret->order_items[0].direction, "DESC");
     ASSERT_EQ(q->ret->limit, 5);
 
     cbm_query_free(q);
@@ -2691,8 +2692,75 @@ TEST(cypher_exec_optional_match_bound_terminal_no_callers) {
                                 "RETURN f.name",
                                 "test", 0, &r);
     ASSERT_EQ(rc, 0);
-    ASSERT_EQ(r.row_count, 1);
-    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    /* WHERE belongs to OPTIONAL MATCH. A non-null caller fails `c IS NULL`,
+     * so that optional pattern has no match and the outer function row is
+     * preserved with c=null; every function therefore remains. */
+    ASSERT_EQ(r.row_count, 4);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_optional_where_after_with_null_extends_failed_candidates) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WITH f OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+        "WHERE g.name = 'NoSuchFunction' RETURN f.name, g.name ORDER BY f.name ASC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_STR_EQ(r.rows[i][1], "");
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_node_only_optional_where_null_extends_failed_candidates) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_query_t *q = NULL;
+    char *error = NULL;
+    ASSERT_EQ(cbm_cypher_parse("MATCH (f:Function) WITH f OPTIONAL MATCH (g:Function) "
+                               "WHERE g.name = 'NoSuchFunction' RETURN f.name, g.name",
+                               &q, &error),
+              0);
+    ASSERT_NOT_NULL(q->next_stage);
+    ASSERT(q->next_stage->pattern_optional[0]);
+    ASSERT_NOT_NULL(q->next_stage->where);
+    cbm_query_free(q);
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WITH f OPTIONAL MATCH (g:Function) "
+        "WHERE g.name = 'NoSuchFunction' RETURN f.name, g.name ORDER BY f.name ASC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_STR_EQ(r.rows[i][1], "");
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_union_after_with_stage_executes_both_branches) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'HandleOrder' WITH f "
+        "MATCH (f)-[:CALLS]->(g:Function) RETURN g.name AS name "
+        "UNION ALL MATCH (h:Function) WHERE h.name = 'LogError' RETURN h.name AS name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[1][0], "LogError");
+    ASSERT_STR_EQ(r.rows[2][0], "LogError");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -2715,6 +2783,55 @@ TEST(cypher_exec_multi_match) {
     PASS();
 }
 
+TEST(cypher_exec_relationship_cross_join_grows_past_fanout_heuristic) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "fanout", "/tmp/fanout");
+
+    cbm_node_t root = {.project = "fanout",
+                       .label = "Module",
+                       .name = "root",
+                       .qualified_name = "fanout.root"};
+    ASSERT_GT(cbm_store_upsert_node(s, &root), 0);
+
+    int64_t ids[12] = {0};
+    char names[12][16] = {{0}};
+    char qualified_names[12][32] = {{0}};
+    for (int i = 0; i < 12; i++) {
+        snprintf(names[i], sizeof(names[i]), "fan_%02d", i);
+        snprintf(qualified_names[i], sizeof(qualified_names[i]), "fanout.%s", names[i]);
+        cbm_node_t node = {.project = "fanout",
+                           .label = "Fan",
+                           .name = names[i],
+                           .qualified_name = qualified_names[i]};
+        ids[i] = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    for (int source = 0; source < 12; source++) {
+        for (int target = 0; target < 12; target++) {
+            if (source == target) {
+                continue;
+            }
+            cbm_edge_t edge = {.project = "fanout",
+                               .source_id = ids[source],
+                               .target_id = ids[target],
+                               .type = "CALLS"};
+            ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+        }
+    }
+
+    cbm_cypher_result_t r = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (m:Module) MATCH (a:Fan)-[:CALLS]->(b:Fan) "
+                                 "RETURN a.name, b.name",
+                                 "fanout", 1000, &r),
+              0);
+    ASSERT_EQ(r.row_count, 132);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_optional_match) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -2725,6 +2842,149 @@ TEST(cypher_parse_optional_match) {
     ASSERT(!q->pattern_optional[0]);
     ASSERT(q->pattern_optional[1]);
     cbm_query_free(q);
+    PASS();
+}
+
+TEST(cypher_exec_optional_match_after_with_uses_projected_rows) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (caller:Function)-[:CALLS]->(target:Function) "
+        "WITH target, count(DISTINCT caller) AS caller_count "
+        "OPTIONAL MATCH (target)-[:CALLS]->(next:Function) "
+        "RETURN target.name AS target_name, caller_count, next.name AS next_name "
+        "ORDER BY target_name ASC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "LogError");
+    ASSERT_STR_EQ(r.rows[0][1], "1");
+    ASSERT_STR_EQ(r.rows[0][2], "");
+    ASSERT_STR_EQ(r.rows[1][0], "SubmitOrder");
+    ASSERT_STR_EQ(r.rows[1][2], "");
+    ASSERT_STR_EQ(r.rows[2][0], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[2][2], "SubmitOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_simple_with_carries_node_identity) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WITH f MATCH (f)-[:CALLS]->(g:Function) "
+                                "RETURN f.name, g.name ORDER BY f.name ASC, g.name ASC",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "LogError");
+    ASSERT_STR_EQ(r.rows[1][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[1][1], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[2][0], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[2][1], "SubmitOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_multiple_with_match_stages) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s,
+                           "MATCH (f:Function) WITH f MATCH (f)-[:CALLS]->(g:Function) WITH f, g "
+                           "MATCH (g)-[:CALLS]->(h:Function) RETURN f.name, g.name, h.name",
+                           "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "HandleOrder");
+    ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[0][2], "SubmitOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_multi_key_order_by_mixed_directions) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (n) RETURN n.label, n.name ORDER BY n.label ASC, n.name DESC",
+                              &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(err);
+    ASSERT_EQ(q->ret->order_count, 2);
+    ASSERT_STR_EQ(q->ret->order_items[0].expression, "n.label");
+    ASSERT_STR_EQ(q->ret->order_items[0].direction, "ASC");
+    ASSERT_STR_EQ(q->ret->order_items[1].expression, "n.name");
+    ASSERT_STR_EQ(q->ret->order_items[1].direction, "DESC");
+    cbm_query_free(q);
+
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    rc = cbm_cypher_execute(s,
+                            "MATCH (n) RETURN n.label, n.name "
+                            "ORDER BY n.label ASC, n.name DESC",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GTE(r.row_count, 4);
+    ASSERT_STR_EQ(r.rows[0][0], "Function");
+    ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
+    ASSERT_STR_EQ(r.rows[1][1], "SubmitOrder");
+    ASSERT_STR_EQ(r.rows[2][1], "LogError");
+    ASSERT_STR_EQ(r.rows[3][1], "HandleOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_order_by_rejects_unprojected_key_with_rewrite) {
+    cbm_query_t *q = NULL;
+    char *error = NULL;
+    int rc = cbm_cypher_parse("MATCH (n) RETURN n.name ORDER BY n.label", &q, &error);
+    ASSERT_EQ(rc, -1);
+    ASSERT_NULL(q);
+    ASSERT_NOT_NULL(error);
+    ASSERT_NOT_NULL(strstr(error, "not projected"));
+    ASSERT_NOT_NULL(strstr(error, "add it to RETURN"));
+    free(error);
+    PASS();
+}
+
+TEST(cypher_with_order_by_allows_carried_node_property) {
+    cbm_query_t *q = NULL;
+    char *error = NULL;
+    int rc = cbm_cypher_parse(
+        "MATCH (n) WITH n ORDER BY n.name MATCH (n)-[:CALLS]->(m) RETURN m.name", &q, &error);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(q);
+    ASSERT_NULL(error);
+    cbm_query_free(q);
+    PASS();
+}
+
+TEST(cypher_exec_multi_key_order_by_nulls_and_limit) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+                                "RETURN f.name, g.name ORDER BY g.name ASC, f.name ASC LIMIT 5",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 5);
+    ASSERT_STR_EQ(r.rows[0][1], "LogError");
+    ASSERT_STR_EQ(r.rows[1][1], "SubmitOrder");
+    ASSERT_STR_EQ(r.rows[2][1], "ValidateOrder");
+    /* Cypher places nulls last for ascending order; this engine's wire
+     * representation for a missing optional value is the empty string. */
+    ASSERT_STR_EQ(r.rows[3][0], "LogError");
+    ASSERT_STR_EQ(r.rows[3][1], "");
+    ASSERT_STR_EQ(r.rows[4][0], "SubmitOrder");
+    ASSERT_STR_EQ(r.rows[4][1], "");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
     PASS();
 }
 
@@ -3192,8 +3452,19 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_optional_match_no_result);
     RUN_TEST(cypher_exec_optional_match_has_result);
     RUN_TEST(cypher_exec_optional_match_bound_terminal_no_callers);
+    RUN_TEST(cypher_exec_optional_where_after_with_null_extends_failed_candidates);
+    RUN_TEST(cypher_exec_node_only_optional_where_null_extends_failed_candidates);
+    RUN_TEST(cypher_exec_union_after_with_stage_executes_both_branches);
     RUN_TEST(cypher_exec_multi_match);
+    RUN_TEST(cypher_exec_relationship_cross_join_grows_past_fanout_heuristic);
     RUN_TEST(cypher_parse_optional_match);
+    RUN_TEST(cypher_exec_optional_match_after_with_uses_projected_rows);
+    RUN_TEST(cypher_exec_simple_with_carries_node_identity);
+    RUN_TEST(cypher_exec_multiple_with_match_stages);
+    RUN_TEST(cypher_exec_multi_key_order_by_mixed_directions);
+    RUN_TEST(cypher_order_by_rejects_unprojected_key_with_rewrite);
+    RUN_TEST(cypher_with_order_by_allows_carried_node_property);
+    RUN_TEST(cypher_exec_multi_key_order_by_nulls_and_limit);
     RUN_TEST(cypher_parse_multi_match);
     /* Phase 8: UNION */
     RUN_TEST(cypher_exec_union);

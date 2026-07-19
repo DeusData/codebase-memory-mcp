@@ -371,6 +371,34 @@ TEST(query_graph_zero_row_hint_names_no_hidden_tool) {
     PASS();
 }
 
+TEST(query_graph_zero_row_hint_walks_post_with_stage) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "hint_post_with_stage";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_mcp_server_set_session_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/hint-post-with-stage"), CBM_STORE_OK);
+    cbm_node_t known = {.project = project,
+                        .label = "Function",
+                        .name = "known",
+                        .qualified_name = "hint_post_with_stage.known",
+                        .file_path = "hint.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &known), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "query_graph",
+                            "{\"query\":\"MATCH (n:Function) WITH n "
+                            "MATCH (n)-[:NO_SUCH_EDGE]->(m:NoSuchLabel) RETURN m.name\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "NO_SUCH_EDGE"));
+    ASSERT_NOT_NULL(strstr(response, "NoSuchLabel"));
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* T3 (fragility audit 2026-07-18): hints on graph="missed" must probe the
  * shadow project's rows (cbm_store_coverage_shadow_project: "<project>::
  * missed"), never the canonical project — a regression here would
@@ -923,7 +951,11 @@ TEST(query_graph_description_explains_compositional_value) {
     ASSERT_NOT_NULL(
         strstr(streamlined, "Create new, effective, computationally efficient custom Cypher"));
     ASSERT_NOT_NULL(strstr(streamlined, "Non-exhaustive examples"));
-    ASSERT_NOT_NULL(strstr(streamlined, "Any valid query shape is allowed"));
+    ASSERT_NOT_NULL(strstr(streamlined, "Any supported query shape is allowed"));
+    ASSERT_NOT_NULL(strstr(streamlined, "multiple projected fields or aliases"));
+    ASSERT_NOT_NULL(strstr(streamlined, "WHERE n.project =~"));
+    ASSERT_NULL(strstr(streamlined, "ORDER BY CASE"));
+    ASSERT_NOT_NULL(strstr(streamlined, "WITH can feed later MATCH/OPTIONAL MATCH stages"));
     ASSERT_NOT_NULL(strstr(streamlined, "multi-hop paths"));
     ASSERT_NOT_NULL(strstr(streamlined, "aggregates/hotspots"));
     ASSERT_NOT_NULL(strstr(streamlined, "LIMIT are optional efficiency aids"));
@@ -940,7 +972,11 @@ TEST(query_graph_description_explains_compositional_value) {
     ASSERT_NOT_NULL(
         strstr(classic, "Create new, effective, computationally efficient custom Cypher"));
     ASSERT_NOT_NULL(strstr(classic, "Non-exhaustive examples"));
-    ASSERT_NOT_NULL(strstr(classic, "Any valid query shape is allowed"));
+    ASSERT_NOT_NULL(strstr(classic, "Any supported query shape is allowed"));
+    ASSERT_NOT_NULL(strstr(classic, "multiple projected fields or aliases"));
+    ASSERT_NOT_NULL(strstr(classic, "WHERE n.project =~"));
+    ASSERT_NULL(strstr(classic, "ORDER BY CASE"));
+    ASSERT_NOT_NULL(strstr(classic, "WITH can feed later MATCH/OPTIONAL MATCH stages"));
     free(classic);
 
     PASS();
@@ -3321,6 +3357,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(query_graph_description_repeats_current_executable_schema);
     RUN_TEST(query_graph_description_populated_on_cold_start_tools_list);
     RUN_TEST(query_graph_zero_row_hint_names_no_hidden_tool);
+    RUN_TEST(query_graph_zero_row_hint_walks_post_with_stage);
     RUN_TEST(query_graph_missed_graph_hint_probes_shadow_project);
     RUN_TEST(query_graph_hint_on_empty_project_no_crash_no_false_vocab);
     RUN_TEST(query_graph_zero_row_hint_parity_across_formats);

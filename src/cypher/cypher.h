@@ -258,12 +258,17 @@ typedef struct {
 } cbm_return_item_t;
 
 typedef struct {
+    const char *expression; /* projected name, variable.property, or aggregate */
+    const char *direction;  /* "ASC" or "DESC"; NULL means ascending */
+} cbm_order_item_t;
+
+typedef struct {
     cbm_return_item_t *items;
     int count;
     bool distinct;
     bool star;             /* RETURN * */
-    const char *order_by;  /* "variable.property" or "COUNT(var)" or alias */
-    const char *order_dir; /* "ASC" or "DESC", NULL = default */
+    cbm_order_item_t *order_items;
+    int order_count;
     int skip;              /* SKIP N, 0 = none */
     int limit;             /* -1 = no LIMIT clause; 0 = explicit LIMIT 0 */
 } cbm_return_clause_t;
@@ -277,6 +282,7 @@ struct cbm_query {
     cbm_where_clause_t *where;           /* NULL if no WHERE */
     cbm_return_clause_t *with_clause;    /* WITH clause (NULL if none) */
     cbm_where_clause_t *post_with_where; /* WHERE after WITH */
+    cbm_query_t *next_stage;             /* MATCH stage consuming WITH output */
     cbm_return_clause_t *ret;            /* NULL if no RETURN */
     cbm_query_t *union_next;             /* next query in UNION chain (NULL if none) */
     bool union_all;                      /* true = UNION ALL, false = UNION */

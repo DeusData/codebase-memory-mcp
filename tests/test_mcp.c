@@ -2625,6 +2625,66 @@ TEST(tool_query_graph_basic) {
     PASS();
 }
 
+TEST(tool_query_graph_chained_with_optional_multi_order_formats) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *proj = "query-stage-formats";
+    ASSERT_EQ(cbm_store_upsert_project(st, proj, "/tmp/query-stage-formats"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, proj);
+
+    const char *names[] = {"CallerA", "Target", "CallerC", "Leaf"};
+    int64_t ids[4] = {0};
+    for (int i = 0; i < 4; i++) {
+        char qn[CBM_SZ_128];
+        snprintf(qn, sizeof(qn), "query.stage.%s", names[i]);
+        cbm_node_t node = {.project = proj,
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "src/stage.c"};
+        ids[i] = cbm_store_upsert_node(st, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    const int endpoints[][2] = {{0, 1}, {2, 1}, {1, 3}};
+    for (int i = 0; i < 3; i++) {
+        cbm_edge_t edge = {.project = proj,
+                           .source_id = ids[endpoints[i][0]],
+                           .target_id = ids[endpoints[i][1]],
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(st, &edge), 0);
+    }
+
+    const char *formats[] = {"toon", "json"};
+    for (int i = 0; i < 2; i++) {
+        char request[CBM_SZ_2K];
+        snprintf(request, sizeof(request),
+                 "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"query_graph\",\"arguments\":{"
+                 "\"project\":\"query-stage-formats\",\"format\":\"%s\","
+                 "\"query\":\"MATCH (caller:Function)-[:CALLS]->(target:Function) "
+                 "WITH target, count(DISTINCT caller) AS callers "
+                 "OPTIONAL MATCH (target)-[:CALLS]->(next:Function) "
+                 "RETURN target.name AS target, callers, next.name AS next "
+                 "ORDER BY callers DESC, target ASC\"}}}",
+                 160 + i, formats[i]);
+        char *resp = cbm_mcp_server_handle(srv, request);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NULL(strstr(resp, "\"isError\":true"));
+        char *inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "Target"));
+        ASSERT_NOT_NULL(strstr(inner, "Leaf"));
+        ASSERT_NOT_NULL(strstr(inner, "2"));
+        free(inner);
+        free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_uses_query_max_rows_config_when_omitted) {
     char *cache = th_mktempdir("cbm_mcp_query_max_rows_cache");
     ASSERT_NOT_NULL(cache);
@@ -10885,6 +10945,7 @@ SUITE(mcp) {
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(mcp_discovery_methods_return_supported_lists);
     RUN_TEST(tool_query_graph_basic);
+    RUN_TEST(tool_query_graph_chained_with_optional_multi_order_formats);
     RUN_TEST(tool_query_graph_uses_query_max_rows_config_when_omitted);
     RUN_TEST(tool_query_graph_warns_on_stale_route_view);
     RUN_TEST(tool_query_graph_reports_dirty_metadata_as_canonical_only);

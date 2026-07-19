@@ -6,7 +6,7 @@
  *
  * Cypher recursive descent parser (bounded by query nesting depth ~5):
  *   - parse_or_expr, parse_xor_expr, parse_and_expr, parse_not_expr
- *   - parse_atom_expr, parse_post_where, cbm_parse
+ *   - parse_atom_expr, parse_query_remainder, parse_post_where, cbm_parse
  *
  * Cypher expression traversal (bounded by WHERE clause depth ~5):
  *   - eval_expr, eval_expr_partial
@@ -27,7 +27,8 @@
  */
 #define CBM_RECURSION_WHITELIST                                                               \
     "parse_or_expr", "parse_xor_expr", "parse_and_expr", "parse_not_expr", "parse_atom_expr", \
-        "parse_post_where", "cbm_parse", "eval_expr", "eval_expr_partial", "glob_match",       \
-        "glob_match_star", "glob_match_doublestar", "glob_match_doublestar_slash",             \
-        "glob_match_doublestar_any", "parse_bool_expr", "parse_bool_atom", "r_collect_imports", \
-        "find_first_descendant_by_kind", "find_first_descendant_of"
+        "parse_query_remainder", "parse_post_where", "cbm_parse", "eval_expr",                \
+        "eval_expr_partial", "glob_match", "glob_match_star", "glob_match_doublestar",        \
+        "glob_match_doublestar_slash", "glob_match_doublestar_any", "parse_bool_expr",        \
+        "parse_bool_atom", "r_collect_imports", "find_first_descendant_by_kind",              \
+        "find_first_descendant_of"
