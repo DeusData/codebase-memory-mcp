@@ -5308,6 +5308,26 @@ static int emit_skills(const char *out_dir) {
     return CLI_OK;
 }
 
+static int emit_agents(const char *out_dir) {
+    for (cbm_graph_tier_t tier = CBM_GRAPH_TIER_SCOUT; tier < CBM_GRAPH_TIER_COUNT; tier++) {
+        char *profile = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, tier,
+                                                  CBM_GRAPH_ACCESS_DIRECT, NULL);
+        const char *slug = cbm_graph_tier_slug(tier);
+        if (!profile || !slug) {
+            free(profile);
+            return CLI_ERR;
+        }
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/agents/%s.md", out_dir, slug);
+        int rc = emit_write_file(path, profile);
+        free(profile);
+        if (rc != CLI_OK) {
+            return CLI_ERR;
+        }
+    }
+    return CLI_OK;
+}
+
 int cbm_emit_plugin(const char *out_dir, const char *version) {
     if (!out_dir || out_dir[0] == '\0') {
         return CLI_ERR;
@@ -5317,6 +5337,9 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         return CLI_ERR;
     }
     if (emit_skills(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_agents(out_dir) != CLI_OK) {
         return CLI_ERR;
     }
     return CLI_OK;

@@ -1,6 +1,7 @@
 /* test_plugin_emit.c — emit-plugin generator contract (Claude Code plugin). */
 #include "test_framework.h"
 
+#include <cli/agent_profiles.h>
 #include <cli/cli.h>
 
 #include <stdio.h>
@@ -57,7 +58,33 @@ TEST(plugin_emit_skill_matches_source_bytes) {
     PASS();
 }
 
+TEST(plugin_emit_agents_match_rendered_profiles) {
+    ASSERT_EQ(cbm_emit_plugin(emit_tmp_dir(), "9.9.9"), 0);
+
+    const cbm_graph_tier_t tiers[] = {
+        CBM_GRAPH_TIER_SCOUT, CBM_GRAPH_TIER_VERIFY, CBM_GRAPH_TIER_AUDIT};
+
+    for (int i = 0; i < 3; i++) {
+        char *expected = cbm_render_graph_profile(
+            CBM_GRAPH_DIALECT_CLAUDE, tiers[i], CBM_GRAPH_ACCESS_DIRECT, NULL);
+        ASSERT_NOT_NULL(expected);
+
+        char path[512];
+        snprintf(path, sizeof(path), "build/test-plugin-emit/agents/%s.md",
+                 cbm_graph_tier_slug(tiers[i]));
+        char *written = read_all(path);
+        ASSERT_NOT_NULL(written);
+        ASSERT_STR_EQ(written, expected);
+
+        free(written);
+        free(expected);
+    }
+
+    PASS();
+}
+
 SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_writes_plugin_json_with_version);
     RUN_TEST(plugin_emit_skill_matches_source_bytes);
+    RUN_TEST(plugin_emit_agents_match_rendered_profiles);
 }
