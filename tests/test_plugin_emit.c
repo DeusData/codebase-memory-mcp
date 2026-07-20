@@ -7,8 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 
+#include <foundation/compat_fs.h>
 #include <yyjson/yyjson.h>
 
 /* A unique temp dir under the build tree; deterministic name (no mkstemp
@@ -68,12 +68,12 @@ TEST(plugin_emit_skill_matches_source_bytes) {
 TEST(plugin_emit_agents_match_rendered_profiles) {
     ASSERT_EQ(cbm_emit_plugin(emit_tmp_dir(), "9.9.9"), 0);
 
-    const cbm_graph_tier_t tiers[] = {
-        CBM_GRAPH_TIER_SCOUT, CBM_GRAPH_TIER_VERIFY, CBM_GRAPH_TIER_AUDIT};
+    const cbm_graph_tier_t tiers[] = {CBM_GRAPH_TIER_SCOUT, CBM_GRAPH_TIER_VERIFY,
+                                      CBM_GRAPH_TIER_AUDIT};
 
     for (int i = 0; i < 3; i++) {
-        char *expected = cbm_render_graph_profile(
-            CBM_GRAPH_DIALECT_CLAUDE, tiers[i], CBM_GRAPH_ACCESS_DIRECT, NULL);
+        char *expected = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, tiers[i],
+                                                  CBM_GRAPH_ACCESS_DIRECT, NULL);
         ASSERT_NOT_NULL(expected);
 
         char path[512];
@@ -233,7 +233,8 @@ static char *emit_snapshot(const char *dir) {
 TEST(plugin_emit_is_idempotent) {
     ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-a", "9.9.9"), 0);
     ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-a", "9.9.9"), 0); /* twice, same dir */
-    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-b", "9.9.9"), 0);  /* all emits before any alloc */
+    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-b", "9.9.9"),
+              0); /* all emits before any alloc */
 
     char *first = emit_snapshot("build/test-plugin-emit-a");
     char *second = emit_snapshot("build/test-plugin-emit-b");
@@ -249,7 +250,7 @@ TEST(plugin_emit_refuses_non_plugin_dir) {
     /* A dir with a stray file and NO .claude-plugin/plugin.json must NOT be
      * wiped — emit-plugin recursively clears out_dir, so the guard protects
      * against `emit-plugin .` / a typo destroying real files. */
-    mkdir("build/test-plugin-guard", 0755);
+    cbm_mkdir_p("build/test-plugin-guard", 0755);
     FILE *f = fopen("build/test-plugin-guard/keepme.txt", "wb");
     ASSERT_NOT_NULL(f);
     fputs("x", f);
