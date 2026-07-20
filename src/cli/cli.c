@@ -5397,6 +5397,24 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         return CLI_ERR;
     }
     const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
+    /* Refuse to wipe a directory that isn't already an emitted plugin tree —
+     * emit-plugin recursively clears out_dir, so guard against `emit-plugin .`
+     * or a typo destroying real files. Safe when the dir is absent or already
+     * contains our marker. */
+    struct stat st;
+    if (stat(out_dir, &st) == 0) {
+        char marker[CLI_BUF_1K];
+        snprintf(marker, sizeof(marker), "%s/.claude-plugin/plugin.json", out_dir);
+        struct stat mst;
+        if (stat(marker, &mst) != 0) {
+            (void)fprintf(stderr,
+                          "error: refusing to clear %s: not an emitted plugin directory "
+                          "(missing .claude-plugin/plugin.json). Emit into a fresh or "
+                          "previously-emitted directory.\n",
+                          out_dir);
+            return CLI_ERR;
+        }
+    }
     if (emit_rm_rf(out_dir) != CLI_OK) {
         return CLI_ERR;
     }

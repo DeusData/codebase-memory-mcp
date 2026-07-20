@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <yyjson/yyjson.h>
 
@@ -244,6 +245,32 @@ TEST(plugin_emit_is_idempotent) {
     PASS();
 }
 
+TEST(plugin_emit_refuses_non_plugin_dir) {
+    /* A dir with a stray file and NO .claude-plugin/plugin.json must NOT be
+     * wiped — emit-plugin recursively clears out_dir, so the guard protects
+     * against `emit-plugin .` / a typo destroying real files. */
+    mkdir("build/test-plugin-guard", 0755);
+    FILE *f = fopen("build/test-plugin-guard/keepme.txt", "wb");
+    ASSERT_NOT_NULL(f);
+    fputs("x", f);
+    fclose(f);
+
+    int refused = cbm_emit_plugin("build/test-plugin-guard", "9.9.9") != 0;
+    char *kept = read_all("build/test-plugin-guard/keepme.txt");
+    int survived = kept != NULL;
+    free(kept);
+
+    /* Normal path still works: build/test-plugin-emit either already carries
+     * the marker from earlier tests, or is absent (a first-ever emit) — both
+     * are allowed by the guard. */
+    int normal_ok = cbm_emit_plugin("build/test-plugin-emit", "9.9.9") == 0;
+
+    ASSERT_TRUE(refused);
+    ASSERT_TRUE(survived);
+    ASSERT_TRUE(normal_ok);
+    PASS();
+}
+
 SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_writes_plugin_json_with_version);
     RUN_TEST(plugin_emit_skill_matches_source_bytes);
@@ -251,4 +278,5 @@ SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_mcp_json_has_single_npx_server);
     RUN_TEST(plugin_emit_hooks_json_has_four_events);
     RUN_TEST(plugin_emit_is_idempotent);
+    RUN_TEST(plugin_emit_refuses_non_plugin_dir);
 }
