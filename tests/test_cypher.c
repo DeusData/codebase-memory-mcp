@@ -3785,12 +3785,10 @@ TEST(cypher_wide_return_projection_bounded) {
 #endif
 }
 
-/* #601: an unbounded whole-graph OPTIONAL MATCH / GROUP BY does
- * O(bindings x groups) work and can run for minutes with no wall-clock guard —
- * the 100k row ceiling never fires because no rows are produced, so query_graph
- * just hangs. With the execution deadline armed to trip immediately (budget 0),
- * the runaway query must abort with a clear error instead of returning a
- * (misleading, possibly partial) result.
+/* #601: an unbounded whole-graph OPTIONAL MATCH can run for minutes before the
+ * 100k result ceiling sees a row. Group lookup had the same failure mode before
+ * it became hash-indexed. With the execution deadline armed to trip immediately
+ * (budget 0), expansive work must abort instead of returning a partial result.
  *
  * RED on unfixed code: no deadline exists, so the query completes and returns
  * rc==0 with rows and no error — the assertions below fail. */
@@ -3833,6 +3831,50 @@ TEST(cypher_exec_deadline_allows_normal_query_issue601) {
     PASS();
 }
 
+TEST(cypher_aggregate_group_lookup_is_linear_across_growth) {
+    enum { GROUP_COUNT = 600, NAME_SIZE = 32, QN_SIZE = 64 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    /* More than the 256-entry initial aggregate capacity exercises array
+     * relocation. Every row has a distinct key, the quadratic worst case. */
+    for (int i = 0; i < GROUP_COUNT; i++) {
+        char name[NAME_SIZE];
+        char qn[QN_SIZE];
+        snprintf(name, sizeof(name), "group_%04d", i);
+        snprintf(qn, sizeof(qn), "test.%s", name);
+        cbm_node_t node = {.project = "test",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "groups.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    const char *queries[] = {
+        "MATCH (n:Function) RETURN n.qualified_name AS q, count(*) AS c ORDER BY q",
+        "MATCH (n:Function) WITH n.qualified_name AS q, count(*) AS c RETURN q, c ORDER BY q",
+    };
+    for (size_t qi = 0; qi < sizeof(queries) / sizeof(queries[0]); qi++) {
+        cbm_cypher_result_t r = {0};
+        cbm_cypher_test_reset_group_lookup_probes();
+        int rc = cbm_cypher_execute(s, queries[qi], "test", GROUP_COUNT + 1, &r);
+        uint64_t probes = cbm_cypher_test_group_lookup_probes();
+
+        ASSERT_EQ(rc, 0);
+        ASSERT_EQ(r.row_count, GROUP_COUNT);
+        ASSERT_STR_EQ(r.rows[0][0], "test.group_0000");
+        ASSERT_STR_EQ(r.rows[GROUP_COUNT - 1][0], "test.group_0599");
+        ASSERT_STR_EQ(r.rows[0][1], "1");
+        ASSERT_LTE(probes, (uint64_t)GROUP_COUNT * 2u);
+        cbm_cypher_result_free(&r);
+    }
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════ */
 
 SUITE(cypher) {
@@ -3867,6 +3909,7 @@ SUITE(cypher) {
     /* Execution */
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
+    RUN_TEST(cypher_aggregate_group_lookup_is_linear_across_growth);
     RUN_TEST(cypher_exec_file_contains_pushes_down_beyond_seed_window);
     RUN_TEST(cypher_exec_output_cap_does_not_limit_predicate_scan);
     RUN_TEST(cypher_exec_match_all_functions);
