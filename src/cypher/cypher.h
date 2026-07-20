@@ -356,5 +356,9 @@ void cbm_query_free(cbm_query_t *q);
  * subsequent queries on the calling thread. 0 = trip on the first hot-loop
  * check; a negative value restores the default budget. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms);
+/* Test-only logical work counter for aggregate group lookup. Tracking is
+ * dormant until reset, so production queries do not retain per-query data. */
+void cbm_cypher_test_reset_group_lookup_probes(void);
+uint64_t cbm_cypher_test_group_lookup_probes(void);
 
 #endif /* CBM_CYPHER_H */

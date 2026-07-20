@@ -7,6 +7,7 @@
  */
 #include "cypher/cypher.h"
 #include "store/store.h"
+#include "foundation/hash_table.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
 #include "foundation/log.h"
@@ -3104,17 +3105,19 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 
 /* Wall-clock execution deadline (#601). The row ceiling above only fires once
  * rows exist, but an unbounded `OPTIONAL MATCH` over the full node set (or a
- * GROUP BY with ~one group per node) does O(bindings x groups) work and can run
- * for minutes — exhausting RAM/CPU — before a single row is produced, so the
- * ceiling never trips and the caller just hangs. A monotonic deadline aborts
- * such runaway queries with a clear, actionable error. Checked (throttled) in
- * the scan, expansion and aggregation hot loops. */
+ * high-fanout OPTIONAL MATCH can run for minutes before a single row is
+ * produced, so the ceiling never trips. Aggregate grouping formerly had the
+ * same failure mode before its hash index removed the O(bindings x groups)
+ * scan. The monotonic deadline remains a defense for genuinely expansive
+ * queries and is checked (throttled) in scan, expansion, and aggregation. */
 #define CYPHER_DEADLINE_BUDGET_MS 30000  /* 30s: generous for legit heavy queries */
 #define CYPHER_DEADLINE_CHECK_MASK 0x3FF /* sample the clock every 1024 iterations */
 
 static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
 static _Thread_local bool g_cypher_timed_out = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
+static _Thread_local bool g_cypher_track_group_lookup_probes = false;
+static _Thread_local uint64_t g_cypher_group_lookup_probes = 0;
 
 static void cypher_deadline_arm(void) {
     g_cypher_timed_out = false;
@@ -3143,6 +3146,61 @@ static bool cypher_deadline_exceeded(void) {
  * thread. 0 = trip on the first hot-loop check; <0 restores the default. */
 void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
     g_cypher_deadline_override_ms = budget_ms;
+}
+
+void cbm_cypher_test_reset_group_lookup_probes(void) {
+    g_cypher_group_lookup_probes = 0;
+    g_cypher_track_group_lookup_probes = true;
+}
+
+uint64_t cbm_cypher_test_group_lookup_probes(void) {
+    g_cypher_track_group_lookup_probes = false;
+    return g_cypher_group_lookup_probes;
+}
+
+/* Aggregate rows stay in first-seen order for deterministic output, while this
+ * side index removes the quadratic scan needed to locate an existing group.
+ * Keys are owned by the aggregate entries, not the borrowed-key hash table, so
+ * growing the entry array cannot invalidate them. If allocation inside the
+ * index fails, callers retain correctness by switching to the linear lookup. */
+typedef struct {
+    CBMHashTable *table;
+    bool valid;
+} aggregate_group_index_t;
+
+static aggregate_group_index_t aggregate_group_index_create(void) {
+    aggregate_group_index_t index = {.table = cbm_ht_create(CBM_SZ_256)};
+    index.valid = index.table != NULL;
+    return index;
+}
+
+static int aggregate_group_index_lookup(const aggregate_group_index_t *index, const char *key) {
+    if (!index->valid) {
+        return CYP_FOUND_NONE;
+    }
+    if (g_cypher_track_group_lookup_probes) {
+        g_cypher_group_lookup_probes++;
+    }
+    void *encoded = cbm_ht_get(index->table, key);
+    return encoded ? (int)((uintptr_t)encoded - 1u) : CYP_FOUND_NONE;
+}
+
+static void aggregate_group_index_insert(aggregate_group_index_t *index, const char *owned_key,
+                                         int group_index) {
+    if (!index->valid) {
+        return;
+    }
+    void *encoded = (void *)(uintptr_t)(group_index + 1);
+    (void)cbm_ht_set(index->table, owned_key, encoded);
+    if (!cbm_ht_has(index->table, owned_key)) {
+        index->valid = false;
+    }
+}
+
+static void aggregate_group_index_free(aggregate_group_index_t *index) {
+    cbm_ht_free(index->table);
+    index->table = NULL;
+    index->valid = false;
 }
 
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
@@ -4442,7 +4500,7 @@ static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_
 
 /* WITH aggregation group entry */
 typedef struct {
-    char group_key[CBM_SZ_1K];
+    const char *group_key; /* owned; also borrowed by aggregate_group_index_t */
     const char **group_vals;
     bool *group_nulls;
     double *sums;
@@ -4471,10 +4529,20 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
 
 /* Find or create an aggregation group. Returns index. */
 static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap,
-                                   cbm_return_clause_t *wc, binding_t *b, const char *key) {
-    for (int a = 0; a < *agg_cnt; a++) {
-        if (strcmp((*aggs)[a].group_key, key) == 0) {
-            return a;
+                                   aggregate_group_index_t *index, cbm_return_clause_t *wc,
+                                   binding_t *b, const char *key) {
+    int indexed = aggregate_group_index_lookup(index, key);
+    if (indexed >= 0) {
+        return indexed;
+    }
+    if (!index->valid) {
+        for (int a = 0; a < *agg_cnt; a++) {
+            if (g_cypher_track_group_lookup_probes) {
+                g_cypher_group_lookup_probes++;
+            }
+            if (strcmp((*aggs)[a].group_key, key) == 0) {
+                return a;
+            }
         }
     }
     if (*agg_cnt >= *agg_cap) {
@@ -4482,7 +4550,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         *aggs = safe_realloc(*aggs, *agg_cap * sizeof(with_agg_t));
     }
     int found = (*agg_cnt)++;
-    snprintf((*aggs)[found].group_key, sizeof((*aggs)[found].group_key), "%s", key);
+    (*aggs)[found].group_key = heap_strdup(key);
     (*aggs)[found].group_vals = calloc(wc->count, sizeof(const char *));
     (*aggs)[found].group_nulls = calloc(wc->count, sizeof(bool));
     (*aggs)[found].sums = calloc(wc->count, sizeof(double));
@@ -4516,6 +4584,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
             }
         }
     }
+    aggregate_group_index_insert(index, (*aggs)[found].group_key, found);
     return found;
 }
 
@@ -4588,6 +4657,7 @@ static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *
 /* Free with_agg_t array */
 static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
     for (int a = 0; a < agg_cnt; a++) {
+        safe_str_free(&aggs[a].group_key);
         for (int ci = 0; ci < item_count; ci++) {
             safe_str_free(&aggs[a].group_vals[ci]);
             if (aggs[a].distinct_lists && aggs[a].distinct_lists[ci]) {
@@ -4616,16 +4686,19 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
     int agg_cap = CBM_SZ_256;
     with_agg_t *aggs = calloc(agg_cap, sizeof(with_agg_t));
     int agg_cnt = 0;
+    aggregate_group_index_t group_index = aggregate_group_index_create();
 
     for (int bi = 0; bi < bind_count; bi++) {
         char key[CBM_SZ_1K] = "";
         with_agg_build_key(wc, &bindings[bi], key, sizeof(key));
-        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, wc, &bindings[bi], key);
+        int found = with_agg_find_or_create(&aggs, &agg_cnt, &agg_cap, &group_index, wc,
+                                            &bindings[bi], key);
         with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
     }
 
     *vbindings = safe_realloc(*vbindings, (agg_cnt + SKIP_ONE) * sizeof(binding_t));
     if (!*vbindings) {
+        aggregate_group_index_free(&group_index);
         with_agg_free(aggs, agg_cnt, wc->count);
         return;
     }
@@ -4664,6 +4737,7 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         }
         (*vbindings)[(*vcount)++] = vb;
     }
+    aggregate_group_index_free(&group_index);
     with_agg_free(aggs, agg_cnt, wc->count);
 }
 
@@ -4942,7 +5016,7 @@ static void format_agg_value(const char *func, int count, double sum, double min
 
 /* RETURN aggregation entry */
 typedef struct {
-    char group_key[CBM_SZ_1K];
+    const char *group_key; /* owned; also borrowed by aggregate_group_index_t */
     const char **group_vals;
     double *sums;
     int *counts;
@@ -4954,7 +5028,7 @@ typedef struct {
 /* Initialize a new RETURN aggregation group */
 static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item_count,
                                const char **vals) {
-    snprintf(entry->group_key, sizeof(entry->group_key), "%s", key);
+    entry->group_key = heap_strdup(key);
     entry->group_vals = calloc(item_count, sizeof(const char *));
     entry->sums = calloc(item_count, sizeof(double));
     entry->counts = calloc(item_count, sizeof(int));
@@ -5005,6 +5079,7 @@ static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret,
 /* Free RETURN aggregation entries */
 static void ret_agg_free(ret_agg_entry_t *aggs, int agg_count, int item_count) {
     for (int a = 0; a < agg_count; a++) {
+        safe_str_free(&aggs[a].group_key);
         for (int ci = 0; ci < item_count; ci++) {
             safe_str_free(&aggs[a].group_vals[ci]);
             for (int j = 0; j < aggs[a].collect_counts[ci]; j++) {
@@ -5079,10 +5154,11 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
     int agg_cap = CBM_SZ_256;
     ret_agg_entry_t *aggs = calloc(agg_cap, sizeof(ret_agg_entry_t));
     int agg_count = 0;
+    aggregate_group_index_t group_index = aggregate_group_index_create();
 
     for (int bi = 0; bi < bind_count; bi++) {
-        /* #601: grouping is O(bindings x groups) — the dominant cost on a
-         * whole-graph GROUP BY. Abort if we blow the wall-clock budget. */
+        /* Keep the general execution deadline: group lookup is expected O(1),
+         * but projection and aggregate functions still process every binding. */
         if ((bi & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
             break;
         }
@@ -5091,11 +5167,16 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
         char valbufs[CBM_SZ_32][CBM_SZ_512];
         ret_agg_build_key(ret, &bindings[bi], key, sizeof(key), vals, valbufs);
 
-        int found = CYP_FOUND_NONE;
-        for (int a = 0; a < agg_count; a++) {
-            if (strcmp(aggs[a].group_key, key) == 0) {
-                found = a;
-                break;
+        int found = aggregate_group_index_lookup(&group_index, key);
+        if (!group_index.valid) {
+            for (int a = 0; a < agg_count; a++) {
+                if (g_cypher_track_group_lookup_probes) {
+                    g_cypher_group_lookup_probes++;
+                }
+                if (strcmp(aggs[a].group_key, key) == 0) {
+                    found = a;
+                    break;
+                }
             }
         }
         if (found < 0) {
@@ -5105,6 +5186,7 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
             }
             found = agg_count++;
             ret_agg_init_group(&aggs[found], key, ret->count, vals);
+            aggregate_group_index_insert(&group_index, aggs[found].group_key, found);
         }
         ret_agg_accumulate(&aggs[found], ret, &bindings[bi]);
     }
@@ -5112,6 +5194,7 @@ static void execute_return_agg(cbm_return_clause_t *ret, binding_t *bindings, in
     for (int a = 0; a < agg_count; a++) {
         ret_agg_emit_row(ret, &aggs[a], rb);
     }
+    aggregate_group_index_free(&group_index);
     ret_agg_free(aggs, agg_count, ret->count);
 }
 
