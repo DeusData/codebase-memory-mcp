@@ -859,6 +859,11 @@ TEST(cli_skill_files_content) {
     ASSERT(strstr(sk[0].content, "direction") != NULL);
     ASSERT(strstr(sk[0].content, "detect_changes") != NULL);
 
+    /* Hermes isolates delegated context. Keep its actionable handoff contract in
+     * the shared installed skill instead of relying on parent conversation state. */
+    ASSERT(strstr(sk[0].content, "delegate_task") != NULL);
+    ASSERT(strstr(sk[0].content, "`context`") != NULL);
+
     /* Quality capabilities */
     ASSERT(strstr(sk[0].content, "max_degree=0") != NULL);
     ASSERT(strstr(sk[0].content, "exclude_entry_points") != NULL);
