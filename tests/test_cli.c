@@ -6734,6 +6734,55 @@ TEST(cli_config_presets_apply_exact_capability_sets) {
     PASS();
 }
 
+/* Named presets are a user-facing config capability, not only an internal
+ * benchmark helper. Exercise the real dispatcher so it cannot drift away from
+ * the existing atomic preset implementation again. */
+TEST(cli_config_command_dispatches_presets) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-command-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t tool_mode = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&tool_mode, "CBM_TOOL_MODE"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_TOOL_MODE");
+
+    char *preset_list_args[] = {"preset", "list"};
+    char *preset_apply_args[] = {"preset", "apply", "minimal-indexing"};
+    ASSERT_EQ(cbm_cmd_config(2, preset_list_args), 0);
+    ASSERT_EQ(cbm_cmd_config(3, preset_apply_args), 0);
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
+    cbm_config_close(cfg);
+
+    /* Stored preset values remain deterministic, but an active environment
+     * override must be reported through a nonzero command status. */
+    cbm_setenv("CBM_TOOL_MODE", CBM_CONFIG_TOOL_MODE_CLASSIC, 1);
+    char *overridden_args[] = {"preset", "apply", "streamlined-quality"};
+    ASSERT_NEQ(cbm_cmd_config(3, overridden_args), 0);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_TOOL_MODE, ""),
+                  CBM_CONFIG_TOOL_MODE_STREAMLINED);
+    ASSERT_STR_EQ(cbm_config_get_effective(cfg, CBM_CONFIG_TOOL_MODE, ""),
+                  CBM_CONFIG_TOOL_MODE_CLASSIC);
+    cbm_config_close(cfg);
+
+    char *unknown_args[] = {"preset", "apply", "not-a-preset"};
+    ASSERT_NEQ(cbm_cmd_config(3, unknown_args), 0);
+
+    cli_env_restore(&tool_mode);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -7339,6 +7388,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_presets_apply_exact_capability_sets);
+    RUN_TEST(cli_config_command_dispatches_presets);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32
