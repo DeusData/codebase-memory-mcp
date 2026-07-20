@@ -1066,6 +1066,38 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("Core graph", markdown)
         self.assertIn("Full graph freshness", markdown)
 
+    def test_exact_canonical_graph_is_not_labeled_declared_stale(self) -> None:
+        case = {
+            "passed": True,
+            "canonical_graph": {"equal": True},
+            # Retained results produced before canonical-equality precedence may
+            # still contain the older scoped gate. Reporting must use the
+            # stronger exact comparison without rewriting immutable evidence.
+            "graph_gate": {
+                "passed": True,
+                "policy": "declared_stale_derived_views",
+                "canonical_equal": True,
+                "freshness_scoped_equal": True,
+                "declared_stale_views": ["semantic_edges"],
+            },
+            "oracles": {
+                "passed": True,
+                "quality": {
+                    "applicable_count": 1,
+                    "passed_count": 1,
+                    "score": 1.0,
+                },
+            },
+            "incremental": {"elapsed_ms": 10, "peak_rss_mb": 80},
+            "fresh_fast_full_after_change": {"elapsed_ms": 100, "peak_rss_mb": 90},
+        }
+
+        row = SUMMARY.summarize_group("latest-disabled", [report(case)])
+
+        self.assertEqual(row["decision"], "PASS")
+        self.assertEqual(row["canonical"], "1/1")
+        self.assertNotIn("declared stale derived views", " ".join(row["findings"]))
+
     def test_aggregate_reports_p50_p95_peak_rss_and_cleanup(self) -> None:
         reports = []
         for elapsed, speedup, peak in ((10, 10.0, 90), (20, 5.0, 110), (30, 3.0, 100)):
