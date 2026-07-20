@@ -5317,14 +5317,11 @@ static int emit_plugin_json(const char *out_dir, const char *version) {
 }
 
 static int emit_skills(const char *out_dir) {
-    const cbm_skill_t *skills = cbm_get_skills();
-    if (!skills) {
-        return CLI_ERR;
-    }
+    const cbm_skill_t *skill_list = cbm_get_skills();
     for (int i = 0; i < CBM_SKILL_COUNT; i++) {
         char path[CLI_BUF_1K];
-        snprintf(path, sizeof(path), "%s/skills/%s/SKILL.md", out_dir, skills[i].name);
-        if (emit_write_file(path, skills[i].content) != CLI_OK) {
+        snprintf(path, sizeof(path), "%s/skills/%s/SKILL.md", out_dir, skill_list[i].name);
+        if (emit_write_file(path, skill_list[i].content) != CLI_OK) {
             return CLI_ERR;
         }
     }
@@ -5333,8 +5330,8 @@ static int emit_skills(const char *out_dir) {
 
 static int emit_agents(const char *out_dir) {
     for (cbm_graph_tier_t tier = CBM_GRAPH_TIER_SCOUT; tier < CBM_GRAPH_TIER_COUNT; tier++) {
-        char *profile = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, tier,
-                                                  CBM_GRAPH_ACCESS_DIRECT, NULL);
+        char *profile =
+            cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, tier, CBM_GRAPH_ACCESS_DIRECT, NULL);
         const char *slug = cbm_graph_tier_slug(tier);
         if (!profile || !slug) {
             free(profile);
@@ -5354,16 +5351,15 @@ static int emit_agents(const char *out_dir) {
 static int emit_mcp_json(const char *out_dir) {
     char path[CLI_BUF_1K];
     snprintf(path, sizeof(path), "%s/.mcp.json", out_dir);
-    static const char body[] =
-        "{\n"
-        "  \"mcpServers\": {\n"
-        "    \"codebase-memory-mcp\": {\n"
-        "      \"type\": \"stdio\",\n"
-        "      \"command\": \"npx\",\n"
-        "      \"args\": [\"-y\", \"codebase-memory-mcp\"]\n"
-        "    }\n"
-        "  }\n"
-        "}\n";
+    static const char body[] = "{\n"
+                               "  \"mcpServers\": {\n"
+                               "    \"codebase-memory-mcp\": {\n"
+                               "      \"type\": \"stdio\",\n"
+                               "      \"command\": \"npx\",\n"
+                               "      \"args\": [\"-y\", \"codebase-memory-mcp\"]\n"
+                               "    }\n"
+                               "  }\n"
+                               "}\n";
     return emit_write_file(path, body);
 }
 
