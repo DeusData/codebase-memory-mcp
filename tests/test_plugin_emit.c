@@ -232,9 +232,9 @@ static char *emit_snapshot(const char *dir) {
 TEST(plugin_emit_is_idempotent) {
     ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-a", "9.9.9"), 0);
     ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-a", "9.9.9"), 0); /* twice, same dir */
-    char *first = emit_snapshot("build/test-plugin-emit-a");
+    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-b", "9.9.9"), 0);  /* all emits before any alloc */
 
-    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-b", "9.9.9"), 0);
+    char *first = emit_snapshot("build/test-plugin-emit-a");
     char *second = emit_snapshot("build/test-plugin-emit-b");
 
     int eq = strcmp(first, second) == 0;
