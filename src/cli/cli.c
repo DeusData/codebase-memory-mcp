@@ -5322,16 +5322,21 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key) {
 
 /* ── Config CLI subcommand ────────────────────────────────────── */
 
+static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name);
+static void cbm_config_print_presets(void);
+
 int cbm_cmd_config(int argc, char **argv) {
     if (argc == 0) {
         printf("Usage: codebase-memory-mcp config <command> [args]\n\n");
         printf("Commands:\n");
-        printf("  list             Show all config values\n");
+        printf("  list             Show common effective config values\n");
         printf("  get <key>        Get a config value\n");
         printf("  set <key> <val>  Set a config value\n");
-        printf("  reset <key>      Reset a key to default\n\n");
-        printf("Config keys:\n");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "false",
+        printf("  reset <key>      Reset a key to default\n");
+        printf("  preset list      List exact named capability/API configurations\n");
+        printf("  preset apply <name>  Atomically apply a named preset\n\n");
+        printf("Common config keys:\n");
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "true",
                "Enable auto-indexing on MCP session start");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
                "Max files for auto-indexing new projects");
@@ -5361,13 +5366,23 @@ int cbm_cmd_config(int argc, char **argv) {
     if (strcmp(argv[0], "list") == 0 || strcmp(argv[0], "ls") == 0) {
         printf("Configuration:\n");
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX, "false"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
-               cbm_config_get(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
-               cbm_config_get(cfg, CBM_CONFIG_UI_LANG, "auto"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_UI_LANG, "auto"));
+    } else if (strcmp(argv[0], "preset") == 0) {
+        if (argc == MIN_ARGC_GET && strcmp(argv[CLI_SKIP_ONE], "list") == 0) {
+            cbm_config_print_presets();
+        } else if (argc == MIN_ARGC_CMD && strcmp(argv[CLI_SKIP_ONE], "apply") == 0) {
+            rc = cbm_config_apply_preset_cli(cfg, argv[CLI_PAIR_LEN]);
+        } else {
+            (void)fprintf(stderr,
+                          "Usage: config preset list | config preset apply <name>\n");
+            rc = CLI_TRUE;
+        }
     } else if (strcmp(argv[0], "get") == 0) {
         if (argc < MIN_ARGC_GET) {
             (void)fprintf(stderr, "Usage: config get <key>\n");
@@ -9882,12 +9897,51 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name) {
     return CLI_OK;
 }
 
-void cbm_config_print_presets(void) {
+static void cbm_config_print_presets(void) {
     printf("Named presets (applied atomically):\n");
     for (size_t i = 0; CBM_CONFIG_PRESETS[i].name; i++) {
         printf("  %-24s %s%s\n", CBM_CONFIG_PRESETS[i].name, CBM_CONFIG_PRESETS[i].description,
                CBM_CONFIG_PRESETS[i].quality_tradeoff ? " [quality tradeoff]" : "");
     }
+}
+
+/* A preset always records its exact values in one transaction.  Environment
+ * variables intentionally retain higher runtime priority, so the CLI verifies
+ * the effective result and reports any mismatch instead of claiming that the
+ * requested configuration is active. */
+static int cbm_config_apply_preset_cli(cbm_config_t *cfg, const char *name) {
+    const cbm_config_preset_t *preset = cbm_config_find_preset(name);
+    if (!preset) {
+        (void)fprintf(stderr, "error: unknown config preset: %s\n", name ? name : "");
+        cbm_config_print_presets();
+        return CLI_TRUE;
+    }
+    if (cbm_config_apply_preset(cfg, name) != CLI_OK) {
+        (void)fprintf(stderr, "error: failed to apply config preset: %s\n", name);
+        return CLI_TRUE;
+    }
+
+    bool overridden = false;
+    for (size_t i = 0; i < preset->value_count; i++) {
+        const cbm_config_preset_value_t *value = &preset->values[i];
+        const char *effective = cbm_config_get_effective(cfg, value->key, value->value);
+        if (strcmp(effective, value->value) != 0) {
+            (void)fprintf(stderr,
+                          "warning: %s is effectively %s because a higher-priority environment "
+                          "override is active; preset requested %s\n",
+                          value->key, effective, value->value);
+            overridden = true;
+        }
+    }
+
+    if (overridden) {
+        (void)fprintf(stderr,
+                      "preset %s was stored but is not fully effective; remove the listed override and retry\n",
+                      name);
+        return CLI_TRUE;
+    }
+    printf("Applied preset: %s\n", name);
+    return CLI_OK;
 }
 
 /* ── Config registry ──────────────────────────────────────────── */

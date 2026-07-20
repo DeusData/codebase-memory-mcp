@@ -35,6 +35,9 @@ trap 'rm -rf "$TMPDIR" "$SMOKE_STATE" "${DRYRUN_HOME:-}"' EXIT
 
 CLI_STDERR="$SMOKE_STATE/cli-stderr.log"
 cli() { "$BINARY" cli "$@" 2>"$CLI_STDERR"; }
+skill_has_delegation_contract() {
+  grep -qF 'When handing work to another agent' "$1" 2>/dev/null
+}
 
 echo "=== Phase 1: version ==="
 OUTPUT=$("$BINARY" --version 2>&1)
@@ -1854,7 +1857,7 @@ KIMI_HOOK_COUNT=$(grep -cF '[[hooks]]' "$KIMI_CONFIG" 2>/dev/null || true)
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Kimi guidance$' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
    ! grep -q 'search_graph' "$CUSTOM_KIMI_HOME/AGENTS.md" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$KIMI_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$KIMI_SKILL" ||
    ! grep -q '^theme = "dark"$' "$KIMI_CONFIG" 2>/dev/null ||
    [ "$KIMI_HOOK_COUNT" != "1" ] ||
    ! grep -q '^event = "UserPromptSubmit"$' "$KIMI_CONFIG" 2>/dev/null ||
@@ -1871,7 +1874,7 @@ echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hoo
 PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
 PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
 if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$PI_SKILL" ||
    [ -e "$FAKE_HOME/.pi/agent/mcp.json" ]; then
   echo "FAIL 8al: Pi durable context missing or unsupported MCP config created"
   exit 1
@@ -1880,7 +1883,7 @@ echo "OK 8al: Pi durable context only (no MCP config)"
 
 # 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
 WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
-if ! grep -q 'Sessions and Subagents' "$WARP_SKILL" 2>/dev/null ||
+if ! skill_has_delegation_contract "$WARP_SKILL" ||
    [ -e "$FAKE_HOME/.warp/mcp.json" ] ||
    [ -e "$FAKE_HOME/.config/warp-terminal/mcp.json" ]; then
   echo "FAIL 8am: Warp shared skill missing or unsupported MCP config created"
@@ -1905,7 +1908,7 @@ if ! path_match "$CMD" "$SELF_PATH" ||
    ! path_match "$JUNIE_ANALYSIS_CMD" "$SELF_PATH" ||
    [ "$JUNIE_SCOUT_ARGS" != "['--tool-profile=scout']" ] ||
    [ "$JUNIE_ANALYSIS_ARGS" != "['--tool-profile=analysis']" ] ||
-   ! grep -q 'Sessions and Subagents' "$JUNIE_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$JUNIE_SKILL" ||
    ! grep -q 'description: "Default task-directed graph verification' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'tools: \["Read", "Grep", "Glob"\]' "$JUNIE_AGENT" 2>/dev/null ||
    ! grep -q 'mcpServers: \["codebase-memory-analysis"\]' "$JUNIE_AGENT" 2>/dev/null ||
@@ -1976,7 +1979,7 @@ CMD=$(json_get "$DEVIN_CONFIG" "d['mcpServers']['codebase-memory-mcp']['command'
 if ! path_match "$CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Devin guidance$' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$DEVIN_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$DEVIN_SKILL" 2>/dev/null; then
+   ! skill_has_delegation_contract "$DEVIN_SKILL"; then
   echo "FAIL 8aq: Devin MCP, AGENTS.md, or skill missing"
   exit 1
 fi
@@ -2017,7 +2020,7 @@ CODEBUDDY_KEEP=$(json_get "$CODEBUDDY_MCP" "d.get('keep', '')")
 if ! path_match "$CMD" "$SELF_PATH" || [ "$CODEBUDDY_KEEP" != "codebuddy" ] ||
    ! grep -q '^# Personal CodeBuddy guidance$' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$CODEBUDDY_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$CODEBUDDY_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$CODEBUDDY_SKILL" ||
    ! grep -q '^permissionMode: plan$' "$CODEBUDDY_AGENT" 2>/dev/null ||
    ! grep -q '^tools: Read,Grep,Glob,mcp__codebase-memory-mcp__search_graph,' "$CODEBUDDY_AGENT" 2>/dev/null ||
    ! grep -q 'mcp__codebase-memory-mcp__check_index_coverage' "$CODEBUDDY_AGENT" 2>/dev/null ||
@@ -2042,7 +2045,7 @@ if ! path_match "$BOB_IDE_CMD" "$SELF_PATH" ||
    [ "$BOB_IDE_KEEP" != "bob-ide" ] || [ "$BOB_SHELL_KEEP" != "bob-shell" ] ||
    ! grep -q '^# Personal Bob guidance$' "$BOB_RULE" 2>/dev/null ||
    ! grep -q 'search_graph' "$BOB_RULE" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$BOB_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$BOB_SKILL" ||
    [ -e "$BOB_AGENT" ]; then
   echo "FAIL 8as: Bob IDE/Shell MCP, shared rules, or IDE skill is wrong"
   exit 1
@@ -2059,7 +2062,7 @@ if ! path_match "$POCHI_CMD" "$SELF_PATH" ||
    ! grep -q '"keep": "pochi"' "$POCHI_MCP" 2>/dev/null ||
    ! grep -q '^# Personal Pochi guidance$' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$POCHI_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$POCHI_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$POCHI_SKILL" ||
    ! grep -q '^  - readFile$' "$POCHI_AGENT" 2>/dev/null ||
    [ "$POCHI_TOOL_COUNT" != "1" ] ||
    ! grep -q 'parent agent' "$POCHI_AGENT" 2>/dev/null ||
@@ -2076,7 +2079,7 @@ ROVO_CMD=$(json_get "$ROVO_MCP" "d['mcpServers']['codebase-memory-mcp']['command
 if ! path_match "$ROVO_CMD" "$SELF_PATH" ||
    ! grep -q '^# Personal Rovo guidance$' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'search_graph' "$ROVO_INSTRUCTIONS" 2>/dev/null ||
-   ! grep -q 'Sessions and Subagents' "$ROVO_SKILL" 2>/dev/null ||
+   ! skill_has_delegation_contract "$ROVO_SKILL" ||
    ! grep -q 'parent agent' "$ROVO_AGENT" 2>/dev/null ||
    [ -e "$FAKE_HOME/.rovodev/hooks.json" ]; then
   echo "FAIL 8au: Rovo MCP, global memory, skill, or handoff agent is incomplete"
