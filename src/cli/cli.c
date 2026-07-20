@@ -5344,6 +5344,31 @@ static int emit_mcp_json(const char *out_dir) {
     return emit_write_file(path, body);
 }
 
+static int emit_hooks_json(const char *out_dir) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/hooks/hooks.json", out_dir);
+    static const char body[] =
+        "{\n"
+        "  \"SessionStart\": [\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment --event SessionStart\" } ] }\n"
+        "  ],\n"
+        "  \"SubagentStart\": [\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment --event SubagentStart\" } ] }\n"
+        "  ],\n"
+        "  \"PreToolUse\": [\n"
+        "    { \"matcher\": \"Grep|Glob\", \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment\" } ] }\n"
+        "  ],\n"
+        "  \"PostToolUse\": [\n"
+        "    { \"matcher\": \"Read\", \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment\" } ] }\n"
+        "  ]\n"
+        "}\n";
+    return emit_write_file(path, body);
+}
+
 int cbm_emit_plugin(const char *out_dir, const char *version) {
     if (!out_dir || out_dir[0] == '\0') {
         return CLI_ERR;
@@ -5359,6 +5384,9 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         return CLI_ERR;
     }
     if (emit_mcp_json(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_hooks_json(out_dir) != CLI_OK) {
         return CLI_ERR;
     }
     return CLI_OK;

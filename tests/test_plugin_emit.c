@@ -149,9 +149,58 @@ TEST(plugin_emit_mcp_json_has_single_npx_server) {
     PASS();
 }
 
+TEST(plugin_emit_hooks_json_has_four_events) {
+    ASSERT_EQ(cbm_emit_plugin(emit_tmp_dir(), "9.9.9"), 0);
+
+    char *json = read_all("build/test-plugin-emit/hooks/hooks.json");
+    ASSERT_NOT_NULL(json);
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    int has_doc = doc != NULL;
+
+    int has_session_start = 0;
+    int has_subagent_start = 0;
+    int has_pre_tool_use = 0;
+    int has_post_tool_use = 0;
+    if (has_doc) {
+        yyjson_val *root = yyjson_doc_get_root(doc);
+        has_session_start = yyjson_obj_get(root, "SessionStart") != NULL;
+        has_subagent_start = yyjson_obj_get(root, "SubagentStart") != NULL;
+        has_pre_tool_use = yyjson_obj_get(root, "PreToolUse") != NULL;
+        has_post_tool_use = yyjson_obj_get(root, "PostToolUse") != NULL;
+    }
+
+    /* commands route through npx hook-augment */
+    int has_session_cmd =
+        strstr(json, "npx -y codebase-memory-mcp hook-augment --event SessionStart") != NULL;
+    int has_subagent_cmd =
+        strstr(json, "npx -y codebase-memory-mcp hook-augment --event SubagentStart") != NULL;
+    /* matchers */
+    int has_grep_glob_matcher = strstr(json, "\"Grep|Glob\"") != NULL;
+    int has_read_matcher = strstr(json, "\"Read\"") != NULL;
+
+    if (has_doc) {
+        yyjson_doc_free(doc);
+    }
+    free(json);
+
+    ASSERT_TRUE(has_doc);
+    ASSERT_TRUE(has_session_start);
+    ASSERT_TRUE(has_subagent_start);
+    ASSERT_TRUE(has_pre_tool_use);
+    ASSERT_TRUE(has_post_tool_use);
+    ASSERT_TRUE(has_session_cmd);
+    ASSERT_TRUE(has_subagent_cmd);
+    ASSERT_TRUE(has_grep_glob_matcher);
+    ASSERT_TRUE(has_read_matcher);
+
+    PASS();
+}
+
 SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_writes_plugin_json_with_version);
     RUN_TEST(plugin_emit_skill_matches_source_bytes);
     RUN_TEST(plugin_emit_agents_match_rendered_profiles);
     RUN_TEST(plugin_emit_mcp_json_has_single_npx_server);
+    RUN_TEST(plugin_emit_hooks_json_has_four_events);
 }
