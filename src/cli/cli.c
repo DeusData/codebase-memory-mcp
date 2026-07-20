@@ -580,6 +580,8 @@ static const char skill_content[] =
     "- When handing work to another agent, pass the evidence tier, project, generation/freshness, "
     "bounded scope, queries and pagination state, qualified symbols, paths, coverage findings, "
     "source fallback, and unresolved questions. Do not assume it inherits tool access or context.\n"
+    "- Hermes isolates delegated context: pass those graph findings in the `context` argument to "
+    "`delegate_task`; do not assume the child inherits MCP access or the parent conversation.\n"
     "\n"
     "## Quality Analysis\n"
     "- Dead code: `search_graph(max_degree=0, exclude_entry_points=true)`\n"
