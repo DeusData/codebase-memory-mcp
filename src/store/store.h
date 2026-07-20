@@ -401,6 +401,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path);
  * store. The returned pointer is owned by the store. */
 const char *cbm_store_db_path(const cbm_store_t *s);
 
+/* True when atomic publication replaced (or removed) the path opened by this
+ * store. Constant-time metadata only; it never queries or mutates SQLite. */
+bool cbm_store_backing_file_replaced(const cbm_store_t *s);
+
 /* Check database integrity. Returns true if the DB passes basic sanity checks
  * (projects table has correct types, no corruption indicators).
  * Returns false if corruption is detected. Callers must not assume ownership of

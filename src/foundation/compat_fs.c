@@ -32,6 +32,11 @@ bool cbm_dirent_name_fits(const char *name) {
     return cbm_dirent_name_len(name, NULL);
 }
 
+bool cbm_file_identity_equal(const cbm_file_identity_t *left, const cbm_file_identity_t *right) {
+    return left && right && left->valid && right->valid && left->volume == right->volume &&
+           left->file == right->file;
+}
+
 static bool cbm_dirent_set_name(cbm_dirent_t *entry, const char *name) {
     size_t nlen = 0;
     if (!entry || !cbm_dirent_name_len(name, &nlen)) {
@@ -65,6 +70,36 @@ struct cbm_dir {
     bool first;
     bool done;
 };
+
+bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
+    if (out) {
+        *out = (cbm_file_identity_t){0};
+    }
+    if (!path || !out) {
+        return false;
+    }
+    wchar_t *wpath = cbm_utf8_to_wide(path);
+    if (!wpath) {
+        return false;
+    }
+    HANDLE handle = CreateFileW(wpath, FILE_READ_ATTRIBUTES,
+                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wpath);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    BY_HANDLE_FILE_INFORMATION info;
+    bool ok = GetFileInformationByHandle(handle, &info) != 0;
+    CloseHandle(handle);
+    if (!ok) {
+        return false;
+    }
+    out->volume = (uint64_t)info.dwVolumeSerialNumber;
+    out->file = ((uint64_t)info.nFileIndexHigh << 32U) | (uint64_t)info.nFileIndexLow;
+    out->valid = true;
+    return true;
+}
 
 cbm_dir_t *cbm_opendir(const char *path) {
     if (!path) {
@@ -693,9 +728,26 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <sys/stat.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
+
+bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out) {
+    if (out) {
+        *out = (cbm_file_identity_t){0};
+    }
+    if (!path || !out) {
+        return false;
+    }
+    struct stat state;
+    if (stat(path, &state) != 0) {
+        return false;
+    }
+    out->volume = (uint64_t)state.st_dev;
+    out->file = (uint64_t)state.st_ino;
+    out->valid = true;
+    return true;
+}
 #include <unistd.h>
 
 struct cbm_dir {
