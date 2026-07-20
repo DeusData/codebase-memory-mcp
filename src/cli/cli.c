@@ -5328,6 +5328,22 @@ static int emit_agents(const char *out_dir) {
     return CLI_OK;
 }
 
+static int emit_mcp_json(const char *out_dir) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.mcp.json", out_dir);
+    static const char body[] =
+        "{\n"
+        "  \"mcpServers\": {\n"
+        "    \"codebase-memory-mcp\": {\n"
+        "      \"type\": \"stdio\",\n"
+        "      \"command\": \"npx\",\n"
+        "      \"args\": [\"-y\", \"codebase-memory-mcp\"]\n"
+        "    }\n"
+        "  }\n"
+        "}\n";
+    return emit_write_file(path, body);
+}
+
 int cbm_emit_plugin(const char *out_dir, const char *version) {
     if (!out_dir || out_dir[0] == '\0') {
         return CLI_ERR;
@@ -5340,6 +5356,9 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         return CLI_ERR;
     }
     if (emit_agents(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_mcp_json(out_dir) != CLI_OK) {
         return CLI_ERR;
     }
     return CLI_OK;

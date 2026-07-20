@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <yyjson/yyjson.h>
+
 /* A unique temp dir under the build tree; deterministic name (no mkstemp
  * randomness needed — the suite runs single-threaded and cleans up). */
 static const char *emit_tmp_dir(void) {
@@ -91,8 +93,65 @@ TEST(plugin_emit_agents_match_rendered_profiles) {
     PASS();
 }
 
+TEST(plugin_emit_mcp_json_has_single_npx_server) {
+    ASSERT_EQ(cbm_emit_plugin(emit_tmp_dir(), "9.9.9"), 0);
+
+    char *json = read_all("build/test-plugin-emit/.mcp.json");
+    ASSERT_NOT_NULL(json);
+
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    int has_doc = doc != NULL;
+
+    int server_count = -1;
+    int has_srv = 0;
+    int command_is_npx = 0;
+    int args_len = -1;
+    int arg0_is_y = 0;
+    int arg1_is_pkg = 0;
+
+    if (has_doc) {
+        yyjson_val *servers = yyjson_obj_get(yyjson_doc_get_root(doc), "mcpServers");
+        if (servers) {
+            server_count = (int)yyjson_obj_size(servers);
+            yyjson_val *srv = yyjson_obj_get(servers, "codebase-memory-mcp");
+            has_srv = srv != NULL;
+            if (srv) {
+                const char *cmd = yyjson_get_str(yyjson_obj_get(srv, "command"));
+                command_is_npx = cmd && strcmp(cmd, "npx") == 0;
+                yyjson_val *args = yyjson_obj_get(srv, "args");
+                if (args) {
+                    args_len = (int)yyjson_arr_size(args);
+                    const char *a0 = yyjson_get_str(yyjson_arr_get(args, 0));
+                    const char *a1 = yyjson_get_str(yyjson_arr_get(args, 1));
+                    arg0_is_y = a0 && strcmp(a0, "-y") == 0;
+                    arg1_is_pkg = a1 && strcmp(a1, "codebase-memory-mcp") == 0;
+                }
+            }
+        }
+    }
+
+    int no_tool_profile = strstr(json, "--tool-profile") == NULL;
+
+    if (has_doc) {
+        yyjson_doc_free(doc);
+    }
+    free(json);
+
+    ASSERT_TRUE(has_doc);
+    ASSERT_EQ(server_count, 1);
+    ASSERT_TRUE(has_srv);
+    ASSERT_TRUE(command_is_npx);
+    ASSERT_EQ(args_len, 2);
+    ASSERT_TRUE(arg0_is_y);
+    ASSERT_TRUE(arg1_is_pkg);
+    ASSERT_TRUE(no_tool_profile);
+
+    PASS();
+}
+
 SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_writes_plugin_json_with_version);
     RUN_TEST(plugin_emit_skill_matches_source_bytes);
     RUN_TEST(plugin_emit_agents_match_rendered_profiles);
+    RUN_TEST(plugin_emit_mcp_json_has_single_npx_server);
 }
