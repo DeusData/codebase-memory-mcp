@@ -106,6 +106,22 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertTrue(gate["freshness_scoped_equal"])
         self.assertEqual(gate["declared_stale_views"], ["semantic_edges"])
 
+    def test_canonical_equality_takes_precedence_over_stale_ledger(self) -> None:
+        gate = BENCHMARK.graph_gate_for_publish_kind(
+            {"equal": True},
+            BENCHMARK.PUBLISH_INCREMENTAL_EXACT,
+            freshness_scoped={
+                "equal": True,
+                "declared_stale_views": ["semantic_edges"],
+                "excluded_edge_types": ["SEMANTICALLY_RELATED"],
+            },
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["policy"], "canonical_graph")
+        self.assertTrue(gate["canonical_equal"])
+        self.assertNotIn("declared_stale_views", gate)
+
     def test_declared_stale_semantic_edges_do_not_hide_core_graph_mismatch(
         self,
     ) -> None:

@@ -931,6 +931,10 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         isinstance((gate := case.get("graph_gate")), dict)
         and gate.get("policy") == "declared_stale_derived_views"
         and gate.get("passed") is True
+        and not (
+            isinstance((canonical_graph := case.get("canonical_graph")), dict)
+            and canonical_graph.get("equal") is True
+        )
         for case in cases
     )
     freshness_policy_failed = any(

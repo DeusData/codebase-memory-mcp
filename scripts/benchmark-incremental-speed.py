@@ -3313,6 +3313,15 @@ def graph_gate_for_publish_kind(
                 "on active read oracles and freshness metadata"
             ),
         }
+    # A stale ledger entry can describe a disabled or currently unused derived
+    # view. Exact canonical equality is stronger evidence and must not be
+    # downgraded to a scoped-freshness pass or excluded from Pareto analysis.
+    if canonical_equal:
+        return {
+            "passed": True,
+            "policy": "canonical_graph",
+            "canonical_equal": True,
+        }
     if freshness_scoped is not None and freshness_scoped.get("equal") is True:
         return {
             "passed": True,
