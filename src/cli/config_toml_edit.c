@@ -143,7 +143,7 @@ typedef struct {
 
 static int toml_managed_block_conflicts(const char *existing, size_t existing_len,
                                         size_t exclude_start, size_t exclude_end, const char *block,
-                                        size_t block_len);
+                                        size_t block_len, int preserve_descendants);
 
 static void toml_buffer_dispose(toml_buffer_t *buffer) {
     if (!buffer) {
@@ -984,8 +984,9 @@ int cbm_toml_escape_basic_string(const char *input, char *out, size_t out_size) 
     return TOML_EDIT_OK;
 }
 
-int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marker,
-                                  const char *end_marker, const char *block) {
+static int toml_upsert_managed_block(const char *file_path, const char *begin_marker,
+                                     const char *end_marker, const char *block,
+                                     int preserve_descendants) {
     size_t block_len = 0U;
     if (!toml_valid_path(file_path) || !toml_valid_marker(begin_marker) ||
         !toml_valid_marker(end_marker) || strcmp(begin_marker, end_marker) == 0 || !block ||
@@ -1016,7 +1017,7 @@ int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marke
     size_t exclude_start = has_pair ? begin_line.start : SIZE_MAX;
     size_t exclude_end = has_pair ? end_line.full_end : SIZE_MAX;
     if (toml_managed_block_conflicts(existing, existing_len, exclude_start, exclude_end, block,
-                                     block_len) != TOML_EDIT_OK) {
+                                     block_len, preserve_descendants) != TOML_EDIT_OK) {
         free(existing);
         return TOML_EDIT_ERR;
     }
@@ -1049,6 +1050,17 @@ int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marke
     toml_buffer_dispose(&output);
     free(existing);
     return result;
+}
+
+int cbm_toml_upsert_managed_block(const char *file_path, const char *begin_marker,
+                                  const char *end_marker, const char *block) {
+    return toml_upsert_managed_block(file_path, begin_marker, end_marker, block, 0);
+}
+
+int cbm_toml_upsert_managed_block_preserve_descendants(const char *file_path,
+                                                       const char *begin_marker,
+                                                       const char *end_marker, const char *block) {
+    return toml_upsert_managed_block(file_path, begin_marker, end_marker, block, 1);
 }
 
 int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marker,
@@ -1651,7 +1663,8 @@ static int toml_block_has_prior_table(const char *block, size_t block_len, size_
 
 static int toml_existing_conflicts_with_table(const char *existing, size_t existing_len,
                                               size_t exclude_start, size_t exclude_end,
-                                              const toml_key_path_t *desired) {
+                                              const toml_key_path_t *desired,
+                                              int preserve_descendants) {
     size_t cursor = 0U;
     toml_line_t line;
     int multiline_state = TOML_STRING_NONE;
@@ -1667,7 +1680,10 @@ static int toml_existing_conflicts_with_table(const char *existing, size_t exist
                 return TOML_EDIT_ERR;
             }
             if (header.present) {
-                int conflict = !excluded && toml_key_path_has_prefix(&header.path, desired);
+                int descendant = header.path.count > desired->count &&
+                                 toml_key_path_has_prefix(&header.path, desired);
+                int conflict = !excluded && toml_key_path_has_prefix(&header.path, desired) &&
+                               !(preserve_descendants && descendant);
                 toml_key_path_dispose(&scope);
                 scope = header.path;
                 memset(&header.path, 0, sizeof(header.path));
@@ -1691,8 +1707,11 @@ static int toml_existing_conflicts_with_table(const char *existing, size_t exist
                         toml_key_path_dispose(&scope);
                         return TOML_EDIT_ERR;
                     }
-                    int conflict = toml_key_path_has_prefix(&full_key, desired) ||
-                                   toml_key_path_has_prefix(desired, &full_key);
+                    int descendant_scope =
+                        scope.count > desired->count && toml_key_path_has_prefix(&scope, desired);
+                    int conflict = !(preserve_descendants && descendant_scope) &&
+                                   (toml_key_path_has_prefix(&full_key, desired) ||
+                                    toml_key_path_has_prefix(desired, &full_key));
                     toml_key_path_dispose(&full_key);
                     toml_assignment_dispose(&assignment);
                     if (conflict) {
@@ -1715,7 +1734,7 @@ static int toml_existing_conflicts_with_table(const char *existing, size_t exist
 
 static int toml_managed_block_conflicts(const char *existing, size_t existing_len,
                                         size_t exclude_start, size_t exclude_end, const char *block,
-                                        size_t block_len) {
+                                        size_t block_len, int preserve_descendants) {
     size_t cursor = 0U;
     toml_line_t line;
     int multiline_state = TOML_STRING_NONE;
@@ -1730,7 +1749,8 @@ static int toml_managed_block_conflicts(const char *existing, size_t existing_le
                 (toml_block_has_prior_table(block, block_len, line.start, &header.path) !=
                      TOML_EDIT_OK ||
                  toml_existing_conflicts_with_table(existing, existing_len, exclude_start,
-                                                    exclude_end, &header.path) != TOML_EDIT_OK)) {
+                                                    exclude_end, &header.path,
+                                                    preserve_descendants) != TOML_EDIT_OK)) {
                 toml_header_dispose(&header);
                 return TOML_EDIT_ERR;
             }
@@ -2483,8 +2503,6 @@ int cbm_toml_remove_legacy_table(const char *file_path, const char *table_name,
             if (header.present) {
                 handled_header = 1;
                 int exact = toml_key_path_equal(&header.path, &desired);
-                int descendant = header.path.count > desired.count &&
-                                 toml_key_path_has_prefix(&header.path, &desired);
                 if (exact) {
                     if (header.array) {
                         if (target_regular_seen) {
@@ -2512,8 +2530,11 @@ int cbm_toml_remove_legacy_table(const char *file_path, const char *table_name,
                     args_empty = 0;
                     edit_start = header.edit_start;
                 } else if (target_active) {
-                    if (descendant || !toml_legacy_schema_is_owned(command_count, command_owned,
-                                                                   args_count, args_empty)) {
+                    /* A descendant table (for example a Codex per-tool approval)
+                     * is not part of the legacy root table's owned body. Preserve
+                     * it while migrating the byte-exact owned command/args root. */
+                    if (!toml_legacy_schema_is_owned(command_count, command_owned, args_count,
+                                                     args_empty)) {
                         target_foreign = 1;
                     }
                     edit_end = header.edit_start;

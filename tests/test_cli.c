@@ -4389,6 +4389,28 @@ static const char test_released_session_hook_script[] =
     "3. If a project is not indexed yet, run index_repository FIRST.\n"
     "REMINDER\n";
 
+/* Exact installer output from the streamlined auto-index guidance release.
+ * Upgrades must recognize their own prior bytes while preserving near-matches. */
+static const char test_intermediate_session_hook_script[] =
+    "#!/usr/bin/env bash\n"
+    "# SessionStart hook: remind agent to use codebase-memory-mcp tools.\n"
+    "# Installed by codebase-memory-mcp. Fires on startup/resume/clear/compact.\n"
+    "cat << 'REMINDER'\n"
+    "Code Discovery Protocol:\n"
+    "1. Prefer codebase-memory-mcp tools first for structural code exploration:\n"
+    "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
+    "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
+    "   - get_code(qualified_name) for exact symbol source in streamlined mode\n"
+    "   - query_graph(query) for complex Cypher patterns\n"
+    "   - search_code(pattern) for text/regex source search in an indexed project\n"
+    "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
+    "   always Read a file before editing it.\n"
+    "3. Graph-backed tools auto-index the server CWD or explicit repo paths when\n"
+    "   auto_index=true and under auto_index_limit. search_code needs an\n"
+    "   indexed project. Use _hidden_tools\n"
+    "   to reveal index_repository or get_architecture when explicit control is needed.\n"
+    "REMINDER\n";
+
 static const char test_released_subagent_hook_script[] =
     "#!/usr/bin/env bash\n"
     "# SubagentStart hook: tell subagents to use codebase-memory-mcp tools.\n"
@@ -4466,6 +4488,17 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
                     strstr(settings, "cbm-code-discovery-gate") &&
                     strstr(settings, "cbm-session-reminder") &&
                     strstr(settings, "cbm-subagent-reminder");
+
+    /* A later installer emitted a second byte-exact session reminder before
+     * hooks delegated to the binary. It must migrate on an idempotent reinstall. */
+    ASSERT_EQ(write_test_file(session_path, test_intermediate_session_hook_script), 0);
+    int intermediate_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *intermediate_session = read_test_file_alloc(session_path);
+    bool intermediate_migrated =
+        intermediate_rc == 0 && intermediate_session &&
+        strcmp(intermediate_session, test_intermediate_session_hook_script) != 0;
+    free(intermediate_session);
     free(gate);
     free(session);
     free(subagent);
@@ -4475,8 +4508,8 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     restore_test_env("CLAUDE_CONFIG_DIR", saved_claude);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!migrated)
-        FAIL("released Claude hook scripts must migrate byte-exactly and stay registered");
+    if (!migrated || !intermediate_migrated)
+        FAIL("every released Claude hook script must migrate byte-exactly and stay registered");
     PASS();
 }
 
@@ -5090,6 +5123,37 @@ TEST(cli_upsert_codex_mcp_replace) {
     ASSERT(strstr(data, "/new/path/codebase-memory-mcp") != NULL);
     /* Other settings preserved */
     ASSERT(strstr(data, "[other_setting]") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_codex_mcp_preserves_owned_descendant_tool_policy) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-descendant-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+    const char *initial = "[mcp_servers.codebase-memory-mcp]\n"
+                          "command = \"/old/path/codebase-memory-mcp\"\n"
+                          "args = []\n\n"
+                          "[mcp_servers.codebase-memory-mcp.tools.query_graph]\n"
+                          "approval_mode = \"approve\"\n\n"
+                          "[other]\nkeep = true\n";
+    ASSERT_EQ(write_test_file(configpath, initial), 0);
+
+    ASSERT_EQ(cbm_upsert_codex_mcp("/new/path/codebase-memory-mcp", configpath), 0);
+    ASSERT_EQ(cbm_upsert_codex_mcp("/new/path/codebase-memory-mcp", configpath), 0);
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT_NOT_NULL(strstr(data, "/new/path/codebase-memory-mcp"));
+    ASSERT_NULL(strstr(data, "/old/path/codebase-memory-mcp"));
+    ASSERT_NOT_NULL(strstr(data, "[mcp_servers.codebase-memory-mcp.tools.query_graph]\n"
+                                 "approval_mode = \"approve\""));
+    ASSERT_NOT_NULL(strstr(data, "[other]\nkeep = true"));
+    ASSERT_EQ(count_substr(data, "# >>> codebase-memory-mcp MCP >>>"), 1);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -7198,6 +7262,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_codex_mcp_escapes_windows_path);
     RUN_TEST(cli_upsert_codex_mcp_existing);
     RUN_TEST(cli_upsert_codex_mcp_replace);
+    RUN_TEST(cli_upsert_codex_mcp_preserves_owned_descendant_tool_policy);
     RUN_TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string);
 
     /* Zed MCP format fix (1 test — group B) */
