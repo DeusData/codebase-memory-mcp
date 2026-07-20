@@ -558,6 +558,58 @@ TEST(mcp_tools_list_latest_metadata) {
     PASS();
 }
 
+TEST(mcp_tool_input_schemas_are_closed_in_classic_and_streamlined_modes) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *revealed = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+    ASSERT_NOT_NULL(revealed);
+    ASSERT_NULL(strstr(revealed, "\"isError\":true"));
+    free(revealed);
+
+    char *snapshots[] = {mcp_tools_list_classic_snapshot(), cbm_mcp_tools_list(NULL),
+                         cbm_mcp_tools_list(srv)};
+    for (size_t si = 0; si < sizeof(snapshots) / sizeof(snapshots[0]); si++) {
+        ASSERT_NOT_NULL(snapshots[si]);
+        yyjson_doc *doc = yyjson_read(snapshots[si], strlen(snapshots[si]), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+        ASSERT_TRUE(yyjson_is_arr(tools));
+        yyjson_arr_iter iter;
+        yyjson_arr_iter_init(tools, &iter);
+        yyjson_val *tool;
+        while ((tool = yyjson_arr_iter_next(&iter)) != NULL) {
+            yyjson_val *schema = yyjson_obj_get(tool, "inputSchema");
+            ASSERT_TRUE(yyjson_is_obj(schema));
+            yyjson_val *closed = yyjson_obj_get(schema, "additionalProperties");
+            ASSERT_TRUE(yyjson_is_bool(closed));
+            ASSERT_FALSE(yyjson_get_bool(closed));
+        }
+        yyjson_doc_free(doc);
+        free(snapshots[si]);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(mcp_canonical_input_schemas_cover_implemented_format_and_verbose_options) {
+    struct {
+        const char *tool;
+        const char *property;
+    } cases[] = {{"index_repository", "format"}, {"index_status", "verbose"}};
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const char *schema_json = cbm_mcp_tool_input_schema(cases[i].tool);
+        ASSERT_NOT_NULL(schema_json);
+        yyjson_doc *doc = yyjson_read(schema_json, strlen(schema_json), 0);
+        ASSERT_NOT_NULL(doc);
+        yyjson_val *properties = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+        ASSERT_TRUE(yyjson_is_obj(properties));
+        ASSERT_NOT_NULL(yyjson_obj_get(properties, cases[i].property));
+        yyjson_doc_free(doc);
+    }
+    PASS();
+}
+
 TEST(mcp_tools_have_behavior_annotations) {
     struct {
         const char *name;
@@ -1786,6 +1838,73 @@ TEST(tool_unknown_tool) {
     ASSERT_NULL(strstr(resp, "\"result\""));
     ASSERT_NULL(strstr(resp, "\"isError\""));
     free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_unknown_argument_is_actionable_execution_error) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+
+    char *direct = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"pattern\":\"HandleOrder\",\"repo_path\":\"/tmp/not-a-project-argument\"}");
+    ASSERT_NOT_NULL(direct);
+    ASSERT_NOT_NULL(strstr(direct, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(direct, "repo_path"));
+    ASSERT_NOT_NULL(strstr(direct, "project"));
+    ASSERT_NOT_NULL(strstr(direct, "supported"));
+    free(direct);
+
+    char *framed = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1201,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"pattern\":\"HandleOrder\",\"repo_path\":\"/tmp/not-a-project-argument\"}}}");
+    ASSERT_NOT_NULL(framed);
+    /* MCP input validation is a Tool Execution Error so a model receives the
+     * actionable correction; malformed tools/call envelopes remain protocol errors. */
+    ASSERT_NOT_NULL(strstr(framed, "\"result\""));
+    ASSERT_NOT_NULL(strstr(framed, "\"isError\":true"));
+    ASSERT_NULL(strstr(framed, "\"code\":-32602"));
+    ASSERT_NOT_NULL(strstr(framed, "repo_path"));
+    ASSERT_NOT_NULL(strstr(framed, "project"));
+    free(framed);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_search_code_legacy_search_in_is_bounded_and_actionable) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "search_code", "{\"pattern\":\"needle\",\"search_in\":\"graph\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "search_graph"));
+    ASSERT_NOT_NULL(strstr(response, "omit search_in"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_query_graph_legacy_cypher_alias_remains_bounded) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "query_graph", "{\"cypher\":\"MATCH (n) RETURN n LIMIT 1\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "unknown argument 'cypher'"));
+    free(response);
+
+    response = cbm_mcp_handle_tool(srv, "query_graph", "{\"label\":\"Function\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "unknown argument 'label'"));
+    ASSERT_NOT_NULL(strstr(response, "query"));
+    free(response);
 
     cbm_mcp_server_free(srv);
     PASS();
@@ -12299,6 +12418,8 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list);
     RUN_TEST(mcp_tools_list_classic_mode);
     RUN_TEST(mcp_tools_list_latest_metadata);
+    RUN_TEST(mcp_tool_input_schemas_are_closed_in_classic_and_streamlined_modes);
+    RUN_TEST(mcp_canonical_input_schemas_cover_implemented_format_and_verbose_options);
     RUN_TEST(mcp_tools_have_behavior_annotations);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
@@ -12367,6 +12488,9 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_uses_ready_overlay_schema);
     RUN_TEST(first_response_context_uses_ready_overlay_schema);
     RUN_TEST(tool_unknown_tool);
+    RUN_TEST(tool_unknown_argument_is_actionable_execution_error);
+    RUN_TEST(tool_search_code_legacy_search_in_is_bounded_and_actionable);
+    RUN_TEST(tool_query_graph_legacy_cypher_alias_remains_bounded);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
