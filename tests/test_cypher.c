@@ -457,7 +457,8 @@ static cbm_store_t *setup_cypher_store(void) {
                      .label = "Function",
                      .name = "LogError",
                      .qualified_name = "test.LogError",
-                     .file_path = "log.go"};
+                     .file_path = "log.go",
+                     .properties_json = "{\"empty_value\":\"\",\"null_value\":null}"};
 
     int64_t id1 = cbm_store_upsert_node(s, &n1);
     int64_t id2 = cbm_store_upsert_node(s, &n2);
@@ -2318,6 +2319,54 @@ TEST(cypher_exec_where_is_not_null) {
     PASS();
 }
 
+/* Empty strings are values, not Cypher null. Keep this distinction across
+ * property predicates and coalesce() so an empty indexed property is neither
+ * reported as absent nor replaced by a fallback value. */
+TEST(cypher_exec_null_predicates_and_coalesce_preserve_empty_strings) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_node_t n = {.project = "test",
+                    .label = "Function",
+                    .name = "EmptyValue",
+                    .qualified_name = "test.EmptyValue",
+                    .file_path = "empty.py",
+                    .properties_json = "{\"empty\":\"\",\"explicit_null\":null}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &n), 0);
+
+    cbm_cypher_result_t empty_is_null = {0};
+    ASSERT_EQ(cbm_cypher_execute(
+                  s, "MATCH (f:Function) WHERE f.empty IS NULL RETURN f.name", "test", 0,
+                  &empty_is_null),
+              0);
+    ASSERT_EQ(empty_is_null.row_count, 0);
+    cbm_cypher_result_free(&empty_is_null);
+
+    cbm_cypher_result_t nulls_are_null = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (f:Function) WHERE f.explicit_null IS NULL "
+                                 "AND f.missing IS NULL RETURN f.name",
+                                 "test", 0, &nulls_are_null),
+              0);
+    ASSERT_EQ(nulls_are_null.row_count, 1);
+    cbm_cypher_result_free(&nulls_are_null);
+
+    cbm_cypher_result_t coalesced = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (f:Function) RETURN coalesce(f.empty, \"fallback\"), "
+                                 "coalesce(f.explicit_null, \"fallback\"), "
+                                 "coalesce(f.missing, \"fallback\")",
+                                 "test", 0, &coalesced),
+              0);
+    ASSERT_EQ(coalesced.row_count, 1);
+    ASSERT_STR_EQ(coalesced.rows[0][0], "");
+    ASSERT_STR_EQ(coalesced.rows[0][1], "fallback");
+    ASSERT_STR_EQ(coalesced.rows[0][2], "fallback");
+    cbm_cypher_result_free(&coalesced);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_return_star) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -2912,6 +2961,152 @@ TEST(cypher_exec_optional_match_no_result) {
     ASSERT_STR_EQ(r.rows[0][0], "LogError");
     /* g.name should be empty since OPTIONAL MATCH found nothing */
     ASSERT_STR_EQ(r.rows[0][1], "");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_optional_match_null_aggregates) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'LogError' "
+        "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+        "RETURN count(g), count(DISTINCT g), count(*), collect(g)",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    /* Cypher count(expression), count(DISTINCT expression), and collect()
+     * ignore the null introduced by OPTIONAL MATCH; count(*) counts its row. */
+    ASSERT_STR_EQ(r.rows[0][0], "0");
+    ASSERT_STR_EQ(r.rows[0][1], "0");
+    ASSERT_STR_EQ(r.rows[0][2], "1");
+    ASSERT_STR_EQ(r.rows[0][3], "[]");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_optional_match_null_count_survives_with) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'LogError' "
+        "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+        "WITH f, count(g) AS targets, count(DISTINCT g) AS distinct_targets, count(*) AS rows "
+        "RETURN f.name, targets, distinct_targets, rows",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "LogError");
+    ASSERT_STR_EQ(r.rows[0][1], "0");
+    ASSERT_STR_EQ(r.rows[0][2], "0");
+    ASSERT_STR_EQ(r.rows[0][3], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_aggregates_distinguish_null_from_empty_string) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'LogError' "
+        "RETURN count(f.empty_value), count(f.null_value), count(f.absent_value), "
+        "collect(f.empty_value), collect(f.null_value), collect(f.absent_value)",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "1");
+    ASSERT_STR_EQ(r.rows[0][1], "0");
+    ASSERT_STR_EQ(r.rows[0][2], "0");
+    ASSERT_STR_EQ(r.rows[0][3], "[\"\"]");
+    ASSERT_STR_EQ(r.rows[0][4], "[]");
+    ASSERT_STR_EQ(r.rows[0][5], "[]");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'LogError' "
+        "WITH f.empty_value AS empty, f.null_value AS explicit_null, "
+        "f.absent_value AS missing "
+        "RETURN count(empty), count(explicit_null), count(missing)",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "1");
+    ASSERT_STR_EQ(r.rows[0][1], "0");
+    ASSERT_STR_EQ(r.rows[0][2], "0");
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s,
+                            "MATCH (f:Function) "
+                            "RETURN f.empty_value, count(*) AS rows ORDER BY rows",
+                            "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "");
+    ASSERT_STR_EQ(r.rows[0][1], "1");
+    ASSERT_STR_EQ(r.rows[1][0], "");
+    ASSERT_STR_EQ(r.rows[1][1], "3");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_optional_match_null_numeric_aggregates) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'LogError' "
+        "OPTIONAL MATCH (f)-[:CALLS]->(g:Function) "
+        "RETURN sum(g.start_line), avg(g.start_line), min(g.start_line), max(g.start_line)",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "0");
+    ASSERT_STR_EQ(r.rows[0][1], "");
+    ASSERT_STR_EQ(r.rows[0][2], "");
+    ASSERT_STR_EQ(r.rows[0][3], "");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_grouping_uses_node_identity_not_display_name) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_node_t first = {.project = "test",
+                        .label = "Function",
+                        .name = "SharedName",
+                        .qualified_name = "test.alpha.SharedName",
+                        .file_path = "alpha.go"};
+    cbm_node_t second = {.project = "test",
+                         .label = "Function",
+                         .name = "SharedName",
+                         .qualified_name = "test.beta.SharedName",
+                         .file_path = "beta.go"};
+    ASSERT_GT(cbm_store_upsert_node(s, &first), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &second), 0);
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (f:Function) WHERE f.name = 'SharedName' "
+        "WITH f, count(*) AS rows "
+        "RETURN id(f), f.qualified_name, rows ORDER BY f.qualified_name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][1], "test.alpha.SharedName");
+    ASSERT_STR_EQ(r.rows[0][2], "1");
+    ASSERT_STR_EQ(r.rows[1][1], "test.beta.SharedName");
+    ASSERT_STR_EQ(r.rows[1][2], "1");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -3764,6 +3959,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_not_in);
     RUN_TEST(cypher_exec_where_is_null);
     RUN_TEST(cypher_exec_where_is_not_null);
+    RUN_TEST(cypher_exec_null_predicates_and_coalesce_preserve_empty_strings);
     RUN_TEST(cypher_exec_return_star);
     RUN_TEST(cypher_parse_neq);
     RUN_TEST(cypher_parse_in);
@@ -3810,6 +4006,11 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_with_where);
     /* Phase 7: OPTIONAL MATCH + multiple MATCH */
     RUN_TEST(cypher_exec_optional_match_no_result);
+    RUN_TEST(cypher_exec_optional_match_null_aggregates);
+    RUN_TEST(cypher_exec_optional_match_null_count_survives_with);
+    RUN_TEST(cypher_exec_aggregates_distinguish_null_from_empty_string);
+    RUN_TEST(cypher_exec_optional_match_null_numeric_aggregates);
+    RUN_TEST(cypher_exec_grouping_uses_node_identity_not_display_name);
     RUN_TEST(cypher_exec_optional_match_has_result);
     RUN_TEST(cypher_exec_optional_match_bound_terminal_no_callers);
     RUN_TEST(cypher_exec_optional_where_after_with_null_extends_failed_candidates);

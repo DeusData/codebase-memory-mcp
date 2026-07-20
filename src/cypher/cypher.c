@@ -2282,6 +2282,7 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
 typedef struct {
     const char *var_names[CYP_MAX_VARS]; /* variable names (nodes) */
     bool var_name_owned[CYP_MAX_VARS];   /* WITH aliases are heap-owned */
+    bool var_is_null[CYP_MAX_VARS];      /* projected null is distinct from an empty string */
     cbm_node_t var_nodes[CYP_MAX_VARS];  /* node data */
     int var_count;
     const char *edge_var_names[CYP_MAX_EDGE_VARS]; /* variable names (edges) */
@@ -2339,7 +2340,7 @@ static bool binding_array_append(binding_t **rows, int *count, int *capacity, in
 }
 
 /* Return a string field from a node by property name.  NULL-safe. */
-static const char *node_string_field(const cbm_node_t *n, const char *prop) {
+static const char *node_string_field(const cbm_node_t *n, const char *prop, bool *is_null) {
     static const struct {
         const char *key;
         size_t offset;
@@ -2357,6 +2358,11 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
     for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
         if (strcmp(prop, fields[i].key) == 0) {
             const char *val = *(const char **)((const char *)n + fields[i].offset);
+            /* SQLite-backed optional core columns are normalized to an empty
+             * string on read, which is their established null representation.
+             * Dynamic JSON properties retain an exact empty-vs-null distinction
+             * and are handled separately by json_extract_prop_ex(). */
+            *is_null = val == NULL || val[0] == '\0';
             return val ? val : "";
         }
     }
@@ -2365,20 +2371,21 @@ static const char *node_string_field(const cbm_node_t *n, const char *prop) {
 
 /* Get node property by name.
  * store may be NULL; only needed for virtual degree properties. */
-static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz);
+static const char *json_extract_prop_ex(const char *json, const char *key, char *buf, size_t buf_sz,
+                                        bool *is_null);
 static void node_fields_free(cbm_node_t *n); /* defined below; used by the stub re-fetch */
 
-static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store,
-                             const char *project, bool use_active_overlay_edges) {
+static const char *node_prop_ex(const cbm_node_t *n, const char *prop, cbm_store_t *store,
+                                const char *project, bool use_active_overlay_edges, bool *is_null) {
+    *is_null = true;
     if (!n || !prop) {
         return "";
     }
-    const char *str = node_string_field(n, prop);
-    if (str && str[0]) {
+    const char *str = node_string_field(n, prop, is_null);
+    bool may_be_projected_stub = store && n->id > 0 && !n->file_path && !n->label;
+    if (str && (!*is_null || !may_be_projected_stub)) {
         return str;
     }
-    /* Note: a string field that exists but is empty ("") falls through here so a
-     * WITH-aggregation node stub (below) can re-fetch it. */
     /* Computed and JSON-derived values live in rotating thread-local buffers:
      * a single row (or an ORDER-BY comparison) reads several of these before any
      * of them is copied out, so returning one shared static buffer would alias
@@ -2390,10 +2397,12 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
 
     if (strcmp(prop, "start_line") == 0) {
         snprintf(out, CBM_SZ_512, "%d", n->start_line);
+        *is_null = false;
         return out;
     }
     if (strcmp(prop, "end_line") == 0) {
         snprintf(out, CBM_SZ_512, "%d", n->end_line);
+        *is_null = false;
         return out;
     }
     /* Virtual computed properties: in_degree/out_degree via the same
@@ -2409,6 +2418,7 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
         }
         int val = (strcmp(prop, "in_degree") == 0) ? in_deg : out_deg;
         snprintf(out, CBM_SZ_512, "%d", val);
+        *is_null = false;
         return out;
     }
     /* Fall back to any value stored in the node's properties JSON — exposes the
@@ -2416,8 +2426,8 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
      * transitive_loop_depth, recursive) and any other persisted property to
      * WHERE/RETURN, e.g. WHERE n.loop_depth >= 2. */
     if (n->properties_json && n->properties_json[0] == '{') {
-        const char *v = json_extract_prop(n->properties_json, prop, out, CBM_SZ_512);
-        if (v && v[0]) {
+        const char *v = json_extract_prop_ex(n->properties_json, prop, out, CBM_SZ_512, is_null);
+        if (!*is_null) {
             return v;
         }
     }
@@ -2429,39 +2439,37 @@ static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t 
      * stub discriminator: a real bound node with NULL label AND file_path would
      * also match, but in that case the worst case is one redundant indexed fetch
      * that returns the same value — never a wrong result. */
-    if (store && n->id > 0 && !n->file_path && !n->label) {
+    if (may_be_projected_stub) {
         cbm_node_t full = {0};
         if (cbm_store_find_node_by_id(store, n->id, &full) == CBM_STORE_OK) {
-            const char *res = NULL;
-            const char *rv = node_string_field(&full, prop);
-            if (rv && rv[0]) {
+            bool full_is_null = true;
+            const char *rv = node_prop_ex(&full, prop, NULL, project, use_active_overlay_edges,
+                                          &full_is_null);
+            if (!full_is_null) {
                 snprintf(out, CBM_SZ_512, "%s", rv);
-                res = out;
-            } else if (strcmp(prop, "start_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.start_line);
-                res = out;
-            } else if (strcmp(prop, "end_line") == 0) {
-                snprintf(out, CBM_SZ_512, "%d", full.end_line);
-                res = out;
-            } else if (full.properties_json && full.properties_json[0] == '{') {
-                const char *jv = json_extract_prop(full.properties_json, prop, out, CBM_SZ_512);
-                if (jv && jv[0]) {
-                    res = out;
-                }
             }
             node_fields_free(&full);
-            if (res) {
-                return res;
+            if (!full_is_null) {
+                *is_null = false;
+                return out;
             }
         }
     }
     return "";
 }
 
+static const char *node_prop(const cbm_node_t *n, const char *prop, cbm_store_t *store,
+                             const char *project, bool use_active_overlay_edges) {
+    bool is_null = true;
+    return node_prop_ex(n, prop, store, project, use_active_overlay_edges, &is_null);
+}
+
 /* Extract a string value from JSON properties_json by key.
  * Writes result to buf (up to buf_sz). Returns buf if found, "" otherwise.
  * Handles both string values ("key":"value") and numeric values ("key":1.5). */
-static const char *json_extract_prop(const char *json, const char *key, char *buf, size_t buf_sz) {
+static const char *json_extract_prop_ex(const char *json, const char *key, char *buf, size_t buf_sz,
+                                        bool *is_null) {
+    *is_null = true;
     if (!json || !key) {
         buf[0] = '\0';
         return buf;
@@ -2479,6 +2487,12 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
     while (*p == ' ' || *p == '\t') {
         p++;
     }
+    if (strncmp(p, "null", 4) == 0 &&
+        (p[4] == ',' || p[4] == '}' || isspace((unsigned char)p[4]))) {
+        buf[0] = '\0';
+        return buf;
+    }
+    *is_null = false;
     if (*p == '"') {
         /* String value — honor backslash escapes: without this, an embedded \"
          * cuts the value short at the first escaped quote. */
@@ -2535,19 +2549,27 @@ static const char *json_extract_prop(const char *json, const char *key, char *bu
 /* Get edge property by name. Uses rotating static buffers to allow
  * multiple concurrent calls (e.g. projecting r.url_path, r.confidence
  * in the same row). */
-static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
+static const char *edge_prop_ex(const cbm_edge_t *e, const char *prop, bool *is_null) {
+    *is_null = true;
     if (!e || !prop) {
         return "";
     }
     if (strcmp(prop, "type") == 0) {
+        *is_null = e->type == NULL;
         return e->type ? e->type : "";
     }
-    /* Rotate through 8 static buffers so multiple props can be accessed per row */
-    static char ebufs[CYP_BUF_8][CBM_SZ_512];
-    static int ebuf_idx = 0;
+    /* Rotate through per-thread buffers so columns cannot alias and concurrent
+     * MCP requests cannot race over projection scratch storage. */
+    static _Thread_local char ebufs[CYP_BUF_8][CBM_SZ_512];
+    static _Thread_local int ebuf_idx = 0;
     char *buf = ebufs[ebuf_idx++ & CYP_EBUF_MASK];
-    json_extract_prop(e->properties_json, prop, buf, CBM_SZ_512);
+    json_extract_prop_ex(e->properties_json, prop, buf, CBM_SZ_512, is_null);
     return buf;
+}
+
+static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
+    bool is_null = true;
+    return edge_prop_ex(e, prop, &is_null);
 }
 
 /* Find an edge variable in a binding */
@@ -2646,6 +2668,7 @@ static void binding_copy(binding_t *dst, const binding_t *src) {
     for (int i = 0; i < src->var_count; i++) {
         node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
         dst->var_name_owned[i] = src->var_name_owned[i];
+        dst->var_is_null[i] = src->var_is_null[i];
         dst->var_names[i] = src->var_name_owned[i] ? heap_strdup(src->var_names[i])
                                                    : src->var_names[i];
     }
@@ -2666,6 +2689,7 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
         if (strcmp(b->var_names[i], var) == 0) {
             node_fields_free(&b->var_nodes[i]);
             node_deep_copy(&b->var_nodes[i], node);
+            b->var_is_null[i] = false;
             return;
         }
     }
@@ -2674,15 +2698,22 @@ static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
     }
     b->var_names[b->var_count] = var; /* not owned — points to AST string */
     b->var_name_owned[b->var_count] = false;
+    b->var_is_null[b->var_count] = false;
     node_deep_copy(&b->var_nodes[b->var_count], node);
     b->var_count++;
 }
 
+static const char *binding_get_virtual_ex(binding_t *b, const char *var, const char *prop,
+                                          bool *is_null);
 static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *item, char *buf,
-                                      size_t bufsz);
+                                      size_t bufsz, bool *is_null);
 
-/* Resolve the actual property value for a condition from a binding */
-static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b) {
+/* Resolve the actual property value and preserve the Cypher distinction between
+ * null and a valid empty string. This is the shared lookup used by projection,
+ * aggregation, WHERE, and scalar functions. */
+static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *b,
+                                           bool *is_null) {
+    *is_null = true;
     /* Multi-arg scalar function LHS: coalesce(f.depth, 0) >= 2 (#874).
      * Evaluated through the same code path as RETURN projections. The value is
      * consumed by eval_condition before any other condition is resolved, so a
@@ -2695,21 +2726,27 @@ static const char *resolve_condition_value(const cbm_condition_t *c, binding_t *
         item.func = c->func;
         item.args = c->args;
         item.arg_count = c->arg_count;
-        return eval_multiarg_func(b, &item, func_buf, sizeof(func_buf));
+        return eval_multiarg_func(b, &item, func_buf, sizeof(func_buf), is_null);
     }
 
     cbm_edge_t *e = binding_get_edge(b, c->variable);
     if (e) {
-        return edge_prop(e, c->property);
+        if (c->property) {
+            return edge_prop_ex(e, c->property, is_null);
+        }
+        *is_null = false;
+        return e->properties_json ? e->properties_json : "{}";
     }
     cbm_node_t *n = binding_get(b, c->variable);
     if (!n) {
-        return NULL; /* unbound variable */
+        return ""; /* unbound variable */
     }
     if (c->property) {
-        return node_prop(n, c->property, b->store, b->project, b->use_active_overlay_edges);
+        return node_prop_ex(n, c->property, b->store, b->project, b->use_active_overlay_edges,
+                            is_null);
     }
     /* Bare alias (e.g. post-WITH virtual var) — use node name directly */
+    *is_null = false;
     return n->name ? n->name : "";
 }
 
@@ -2815,26 +2852,29 @@ static bool eval_condition(const cbm_condition_t *c, binding_t *b) {
         return c->negated ? !result : result;
     }
 
-    const char *actual = resolve_condition_value(c, b);
-    /* coalesce(var.prop, literal) (#874): a missing/empty property value
-     * falls back to the literal default before the operator runs. */
-    if (c->coalesce_default && (!actual || actual[0] == '\0')) {
+    bool actual_is_null = true;
+    const char *actual = resolve_condition_value(c, b, &actual_is_null);
+    /* Legacy two-argument coalesce representation: fall back only for null,
+     * never for a present empty string. */
+    if (c->coalesce_default && actual_is_null) {
         actual = c->coalesce_default;
-    }
-    if (!actual) {
-        return true;
+        actual_is_null = false;
     }
 
     bool result;
 
     /* IS NULL / IS NOT NULL */
     if (strcmp(c->op, "IS NULL") == 0) {
-        result = (actual[0] == '\0');
+        result = actual_is_null;
         return c->negated ? !result : result;
     }
     if (strcmp(c->op, "IS NOT NULL") == 0) {
-        result = (actual[0] != '\0');
+        result = !actual_is_null;
         return c->negated ? !result : result;
+    }
+    /* A null comparison is unknown and therefore does not pass WHERE. */
+    if (actual_is_null) {
+        return false;
     }
 
     /* IN [...] */
@@ -3107,8 +3147,15 @@ void cbm_cypher_test_set_deadline_ms(int64_t budget_ms) {
 
 /* ── Binding virtual variables (for WITH clause) ──────────────── */
 
-static const char *binding_get_virtual(binding_t *b, const char *var, const char *prop) {
+static const char *binding_get_virtual_ex(binding_t *b, const char *var, const char *prop,
+                                          bool *is_null) {
+    *is_null = true;
     if (!var) {
+        return "";
+    }
+    /* COUNT(*) counts rows, so its synthetic argument is always non-null. */
+    if (strcmp(var, "*") == 0 && !prop) {
+        *is_null = false;
         return "";
     }
     /* Check virtual vars first (from WITH projection) */
@@ -3120,6 +3167,7 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
     }
     for (int i = 0; i < b->var_count; i++) {
         if (strcmp(b->var_names[i], full) == 0) {
+            *is_null = b->var_is_null[i];
             return b->var_nodes[i].name ? b->var_nodes[i].name : "";
         }
     }
@@ -3129,16 +3177,61 @@ static const char *binding_get_virtual(binding_t *b, const char *var, const char
         /* Bare `RETURN r` on an edge: surface the full properties JSON
          * (or "{}" if none) so callers can inspect timestamps, weights,
          * etc. without naming each property. */
-        return prop ? edge_prop(e, prop) : (e->properties_json ? e->properties_json : "{}");
+        if (prop) {
+            return edge_prop_ex(e, prop, is_null);
+        }
+        *is_null = false;
+        return e->properties_json ? e->properties_json : "{}";
     }
     cbm_node_t *n = binding_get(b, var);
     if (n) {
         if (prop) {
-            return node_prop(n, prop, b->store, b->project, b->use_active_overlay_edges);
+            return node_prop_ex(n, prop, b->store, b->project, b->use_active_overlay_edges,
+                                is_null);
         }
+        *is_null = false;
         return n->name ? n->name : "";
     }
     return "";
+}
+
+static const char *binding_get_virtual(binding_t *b, const char *var, const char *prop) {
+    bool is_null = true;
+    return binding_get_virtual_ex(b, var, prop, &is_null);
+}
+
+/* Append one aggregation grouping component. Entity values group by canonical
+ * store identity, not display name; scalar values use a length prefix so a
+ * delimiter inside user data cannot merge otherwise distinct tuples. */
+static int group_key_append(char *key, size_t key_sz, int pos, binding_t *binding,
+                            const char *var, const char *prop, const char *value, bool is_null) {
+    if ((size_t)pos >= key_sz - SKIP_ONE) {
+        return (int)key_sz - SKIP_ONE;
+    }
+    size_t remaining = key_sz - (size_t)pos;
+    int written = 0;
+    if (!prop) {
+        cbm_node_t *node = binding_get(binding, var);
+        if (node && node->id > 0) {
+            written = snprintf(key + pos, remaining, "N:%lld|", (long long)node->id);
+        } else {
+            cbm_edge_t *edge = binding_get_edge(binding, var);
+            if (edge && edge->id > 0) {
+                written = snprintf(key + pos, remaining, "E:%lld|", (long long)edge->id);
+            }
+        }
+    }
+    if (written == 0) {
+        written = is_null ? snprintf(key + pos, remaining, "Z|")
+                          : snprintf(key + pos, remaining, "V:%zu:%s|", strlen(value), value);
+    }
+    if (written < 0) {
+        return pos;
+    }
+    if ((size_t)written >= remaining) {
+        return (int)key_sz - SKIP_ONE;
+    }
+    return pos + written;
 }
 
 /* ── String function application ──────────────────────────────── */
@@ -4004,24 +4097,37 @@ static const char *node_keys_list(const cbm_node_t *n, char *buf, size_t buf_sz)
 }
 
 /* Resolve a function argument to its string value (literal or var.prop). */
-static const char *eval_func_arg(binding_t *b, const cbm_func_arg_t *a) {
+static const char *eval_func_arg_ex(binding_t *b, const cbm_func_arg_t *a, bool *is_null) {
     if (a->literal) {
+        *is_null = false;
         return a->literal;
     }
-    return binding_get_virtual(b, a->variable, a->property);
+    return binding_get_virtual_ex(b, a->variable, a->property, is_null);
+}
+
+static const char *eval_func_arg(binding_t *b, const cbm_func_arg_t *a) {
+    bool is_null = true;
+    return eval_func_arg_ex(b, a, &is_null);
 }
 
 /* Evaluate a multi-argument scalar function into func_buf (or a direct value). */
 static const char *eval_multiarg_func(binding_t *b, const cbm_return_item_t *item, char *buf,
-                                      size_t bufsz) {
+                                      size_t bufsz, bool *is_null) {
+    if (is_null) {
+        *is_null = false;
+    }
     const char *f = item->func;
     int n = item->arg_count;
     if (strcmp(f, "coalesce") == 0) {
         for (int i = 0; i < n; i++) {
-            const char *v = eval_func_arg(b, &item->args[i]);
-            if (v && v[0]) {
+            bool arg_is_null = true;
+            const char *v = eval_func_arg_ex(b, &item->args[i], &arg_is_null);
+            if (!arg_is_null) {
                 return v;
             }
+        }
+        if (is_null) {
+            *is_null = true;
         }
         return "";
     }
@@ -4101,7 +4207,8 @@ static const char *project_item(binding_t *b, cbm_return_item_t *item, char *fun
         return eval_case_expr(item->kase, b);
     }
     if (item->args) {
-        return eval_multiarg_func(b, item, func_buf, buf_sz);
+        bool is_null = true;
+        return eval_multiarg_func(b, item, func_buf, buf_sz, &is_null);
     }
     /* Entity-introspection functions operate on the bound node/edge itself,
      * not on a scalar property value. */
@@ -4337,6 +4444,7 @@ static const char *resolve_item_alias(const cbm_return_item_t *item, char *name_
 typedef struct {
     char group_key[CBM_SZ_1K];
     const char **group_vals;
+    bool *group_nulls;
     double *sums;
     int *counts;
     double *mins, *maxs;
@@ -4352,11 +4460,11 @@ static int with_agg_build_key(cbm_return_clause_t *wc, binding_t *b, char *key, 
         if (wc->items[ci].func) {
             continue;
         }
-        const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
-        kl += snprintf(key + kl, key_sz - (size_t)kl, "%s|", v);
-        if (kl >= (int)key_sz) {
-            kl = (int)key_sz - SKIP_ONE;
-        }
+        bool is_null = true;
+        const char *v = binding_get_virtual_ex(b, wc->items[ci].variable,
+                                               wc->items[ci].property, &is_null);
+        kl = group_key_append(key, key_sz, kl, b, wc->items[ci].variable,
+                              wc->items[ci].property, v, is_null);
     }
     return kl;
 }
@@ -4376,6 +4484,7 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
     int found = (*agg_cnt)++;
     snprintf((*aggs)[found].group_key, sizeof((*aggs)[found].group_key), "%s", key);
     (*aggs)[found].group_vals = calloc(wc->count, sizeof(const char *));
+    (*aggs)[found].group_nulls = calloc(wc->count, sizeof(bool));
     (*aggs)[found].sums = calloc(wc->count, sizeof(double));
     (*aggs)[found].counts = calloc(wc->count, sizeof(int));
     (*aggs)[found].mins = calloc(wc->count, sizeof(double));
@@ -4392,8 +4501,11 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
             (*aggs)[found].group_vals[ci] = heap_strdup("0");
             continue;
         }
-        const char *v = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
+        bool is_null = true;
+        const char *v = binding_get_virtual_ex(b, wc->items[ci].variable,
+                                               wc->items[ci].property, &is_null);
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
+        (*aggs)[found].group_nulls[ci] = is_null;
         /* If this group item is a bare node variable, remember its id so the
          * carried virtual var can re-fetch any property (group_vals holds only
          * the name). */
@@ -4413,8 +4525,13 @@ static void with_agg_accumulate(with_agg_t *agg, cbm_return_clause_t *wc, bindin
         if (!wc->items[ci].func) {
             continue;
         }
+        bool is_null = true;
+        const char *raw = binding_get_virtual_ex(b, wc->items[ci].variable,
+                                                 wc->items[ci].property, &is_null);
+        if (is_null) {
+            continue;
+        }
         agg->counts[ci]++;
-        const char *raw = binding_get_virtual(b, wc->items[ci].variable, wc->items[ci].property);
         if (wc->items[ci].distinct && strcmp(wc->items[ci].func, "COUNT") == 0) {
             distinct_list_add(&agg->distinct_lists[ci], &agg->distinct_n[ci], raw);
         }
@@ -4434,24 +4551,37 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
     if (strcmp(func, "SUM") == 0) {
         snprintf(buf, buf_sz, "%.10g", agg->sums[ci]);
     } else if (strcmp(func, "AVG") == 0) {
-        snprintf(buf, buf_sz, "%.10g", agg->counts[ci] > 0 ? agg->sums[ci] / agg->counts[ci] : 0.0);
+        if (agg->counts[ci] == 0) {
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, buf_sz, "%.10g", agg->sums[ci] / agg->counts[ci]);
+        }
     } else if (strcmp(func, "MIN") == 0) {
-        snprintf(buf, buf_sz, "%.10g", agg->mins[ci]);
+        if (agg->counts[ci] == 0) {
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, buf_sz, "%.10g", agg->mins[ci]);
+        }
     } else if (strcmp(func, "MAX") == 0) {
-        snprintf(buf, buf_sz, "%.10g", agg->maxs[ci]);
+        if (agg->counts[ci] == 0) {
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, buf_sz, "%.10g", agg->maxs[ci]);
+        }
     } else {
         snprintf(buf, buf_sz, "%d", agg->counts[ci]);
     }
 }
 
 /* Add a virtual variable binding for one WITH item */
-static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val) {
+static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val, bool is_null) {
     if (vb->var_count >= CYP_MAX_VARS) {
         return;
     }
     int index = vb->var_count++;
     vb->var_names[index] = heap_strdup(alias);
     vb->var_name_owned[index] = true;
+    vb->var_is_null[index] = is_null;
     vb->var_nodes[index].name = heap_strdup(val);
 }
 
@@ -4468,6 +4598,7 @@ static void with_agg_free(with_agg_t *aggs, int agg_cnt, int item_count) {
             }
         }
         free(aggs[a].group_vals);
+        free(aggs[a].group_nulls);
         free(aggs[a].sums);
         free(aggs[a].counts);
         free(aggs[a].mins);
@@ -4516,9 +4647,14 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 } else {
                     with_agg_format(wc->items[ci].func, &aggs[a], ci, vbuf, sizeof(vbuf));
                 }
-                with_add_vbinding_var(&vb, alias, vbuf);
+                bool is_null = aggs[a].counts[ci] == 0 &&
+                               (strcmp(wc->items[ci].func, "AVG") == 0 ||
+                                strcmp(wc->items[ci].func, "MIN") == 0 ||
+                                strcmp(wc->items[ci].func, "MAX") == 0);
+                with_add_vbinding_var(&vb, alias, vbuf, is_null);
             } else {
-                with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci]);
+                with_add_vbinding_var(&vb, alias, aggs[a].group_vals[ci],
+                                      aggs[a].group_nulls[ci]);
                 /* Tag the carried virtual var with the node id (when the group
                  * var is a node) so node_prop can re-fetch its full properties. */
                 if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
@@ -4545,7 +4681,12 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
             char func_buf[CBM_SZ_512];
             const char *val =
                 project_item(&bindings[bi], &wc->items[ci], func_buf, sizeof(func_buf));
-            with_add_vbinding_var(&vb, alias, val);
+            bool is_null = false;
+            if (!wc->items[ci].func && !wc->items[ci].kase && !wc->items[ci].args) {
+                (void)binding_get_virtual_ex(&bindings[bi], wc->items[ci].variable,
+                                             wc->items[ci].property, &is_null);
+            }
+            with_add_vbinding_var(&vb, alias, val, is_null);
             /* A whole-node projection must remain a node binding across the
              * WITH boundary. Retain its canonical id so the next MATCH stage
              * can traverse from it and node_prop can re-fetch complete fields. */
@@ -4775,11 +4916,23 @@ static void format_agg_value(const char *func, int count, double sum, double min
     if (strcmp(func, "SUM") == 0) {
         snprintf(buf, buf_sz, "%.10g", sum);
     } else if (strcmp(func, "AVG") == 0) {
-        snprintf(buf, buf_sz, "%.10g", count > 0 ? sum / count : 0.0);
+        if (count == 0) {
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, buf_sz, "%.10g", sum / count);
+        }
     } else if (strcmp(func, "MIN") == 0) {
-        snprintf(buf, buf_sz, "%.10g", min_val);
+        if (count == 0) {
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, buf_sz, "%.10g", min_val);
+        }
     } else if (strcmp(func, "MAX") == 0) {
-        snprintf(buf, buf_sz, "%.10g", max_val);
+        if (count == 0) {
+            buf[0] = '\0';
+        } else {
+            snprintf(buf, buf_sz, "%.10g", max_val);
+        }
     } else if (strcmp(func, "COLLECT") == 0) {
         format_collect_list(collect_lists[ci], collect_counts[ci], buf, buf_sz);
     } else {
@@ -4822,8 +4975,13 @@ static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret,
         if (!ret->items[ci].func) {
             continue;
         }
+        bool is_null = true;
+        const char *raw = binding_get_virtual_ex(b, ret->items[ci].variable,
+                                                 ret->items[ci].property, &is_null);
+        if (is_null) {
+            continue;
+        }
         entry->counts[ci]++;
-        const char *raw = binding_get_virtual(b, ret->items[ci].variable, ret->items[ci].property);
         double dv = strtod(raw, NULL);
         entry->sums[ci] += dv;
         if (dv < entry->mins[ci]) {
@@ -4878,15 +5036,18 @@ static void ret_agg_build_key(cbm_return_clause_t *ret, binding_t *b, char *key,
         /* project_item may return its own scratch (stable static or a per-column
          * buffer it copied into); persist the value in the caller-owned valbufs
          * so vals[] survives until ret_agg_init_group strdup's it. */
+        bool is_null = false;
+        if (!ret->items[ci].func && !ret->items[ci].kase && !ret->items[ci].args) {
+            (void)binding_get_virtual_ex(b, ret->items[ci].variable, ret->items[ci].property,
+                                         &is_null);
+        }
         const char *v = project_item(b, &ret->items[ci], valbufs[ci], CBM_SZ_512);
         if (v != valbufs[ci]) {
             snprintf(valbufs[ci], CBM_SZ_512, "%s", v ? v : "");
         }
         vals[ci] = valbufs[ci];
-        klen += snprintf(key + klen, key_sz - (size_t)klen, "%s|", vals[ci]);
-        if (klen >= (int)key_sz) {
-            klen = (int)key_sz - SKIP_ONE;
-        }
+        klen = group_key_append(key, key_sz, klen, b, ret->items[ci].variable,
+                                ret->items[ci].property, vals[ci], is_null);
     }
 }
 
