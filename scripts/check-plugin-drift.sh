@@ -11,8 +11,12 @@ VERSION=$(grep -m1 '"version"' server.json | sed -E 's/.*"version"[^"]*"([^"]+)"
 scripts/build.sh --version "$VERSION"
 build/c/codebase-memory-mcp emit-plugin ./plugin --version "$VERSION"
 
-if ! git diff --exit-code -- plugin/; then
+# git status --porcelain catches untracked (??), modified (M), and deleted (D)
+# in one shot — plain `git diff` misses brand-new emitted files.
+if [ -n "$(git status --porcelain -- plugin/)" ]; then
   echo "error: plugin/ is stale. Run scripts/check-plugin-drift.sh locally and commit the result." >&2
+  git status --porcelain -- plugin/ >&2
+  git diff -- plugin/ >&2
   exit 1
 fi
 echo "plugin/ is in sync with src/cli/cli.c"
