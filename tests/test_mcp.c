@@ -6888,6 +6888,45 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+TEST(search_code_reports_resolved_project_for_empty_json_and_toon_results) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    /* The session project may differ from an explicitly queried project.  Empty
+     * results must identify the project actually searched so a valid-but-wrong
+     * project selection is distinguishable from "no matching code". */
+    cbm_mcp_server_set_session_project(srv, "different-session-project");
+
+    const char *formats[] = {"json", "toon"};
+    for (size_t i = 0; i < sizeof(formats) / sizeof(formats[0]); i++) {
+        char args[512];
+        int n = snprintf(args, sizeof(args),
+                         "{\"pattern\":\"definitely_absent_symbol\","
+                         "\"project\":\"test-project\",\"format\":\"%s\"}",
+                         formats[i]);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(args));
+
+        char *resp = cbm_mcp_handle_tool(srv, "search_code", args);
+        ASSERT_NOT_NULL(resp);
+        char *inner = extract_text_content(resp);
+        ASSERT_NOT_NULL(inner);
+        if (strcmp(formats[i], "json") == 0) {
+            ASSERT_NOT_NULL(strstr(inner, "\"project\":\"test-project\""));
+        } else {
+            ASSERT_NOT_NULL(strstr(inner, "project: test-project"));
+        }
+        ASSERT_NULL(strstr(inner, "different-session-project"));
+        free(inner);
+        free(resp);
+    }
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches) {
     char tmp[512];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -9475,6 +9514,62 @@ TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context) {
     PASS();
 }
 
+TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_indexed) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-first-source-call-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-first-source-call-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char source_path[CBM_SZ_512];
+    snprintf(source_path, sizeof(source_path), "%s/first_source_call.py", repo);
+    FILE *source = fopen(source_path, "w");
+    ASSERT_NOT_NULL(source);
+    fputs("def first_source_response_target():\n    return 42\n", source);
+    fclose(source);
+
+    char old_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(cbm_getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(cbm_chdir(repo), 0);
+
+    cbm_config_t *config = cbm_config_open(cache);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+
+    char *initialize = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"initialize\",\"params\":{}}");
+    ASSERT_NOT_NULL(initialize);
+    free(initialize);
+
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":63,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"pattern\":\"first_source_response_target\",\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "project not found or not indexed"));
+    ASSERT_NOT_NULL(strstr(response, "first_source_response_target"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_unlink(source_path);
+    th_rmtree(cache);
+    cbm_rmdir(repo);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL/GETLINE FILE* BUFFERING FIX
  * ══════════════════════════════════════════════════════════════════ */
@@ -11432,6 +11527,51 @@ TEST(watcher_publication_reopens_cached_store_generation) {
     PASS();
 }
 
+/* A separate CLI or MCP process cannot call notify_index_published() on this
+ * server. The next request must therefore notice that atomic publication
+ * replaced the cache path and reopen its read-only handle instead of serving
+ * the old, unlinked SQLite generation indefinitely. */
+TEST(external_process_publication_reopens_cached_store_generation) {
+    const char *cache = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache);
+    const char *project = "external-generation-project";
+    char live_path[CBM_PATH_MAX];
+    char next_path[CBM_PATH_MAX];
+    ASSERT_EQ(mcp_project_db_path(live_path, sizeof(live_path), cache, project), CBM_STORE_OK);
+    snprintf(next_path, sizeof(next_path), "%s/external-next-generation.db", cache);
+    ASSERT_TRUE(mcp_create_generation_db(live_path, project, "BeforeExternalPublication"));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *before =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"external-generation-project\","
+                            "\"name_pattern\":\"BeforeExternalPublication\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(before);
+    ASSERT_NOT_NULL(strstr(before, "BeforeExternalPublication"));
+    free(before);
+
+    ASSERT_TRUE(mcp_create_generation_db(next_path, project, "AfterExternalPublication"));
+    cbm_remove_db_sidecars(live_path);
+    ASSERT_EQ(cbm_replace_file(next_path, live_path), 0);
+
+    /* Deliberately no cbm_mcp_server_notify_index_published(): a sibling
+     * process has no access to this server's in-memory notification flag. */
+    char *after =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"external-generation-project\","
+                            "\"name_pattern\":\"AfterExternalPublication\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(after);
+    ASSERT_NOT_NULL(strstr(after, "AfterExternalPublication"));
+    ASSERT_NULL(strstr(after, "BeforeExternalPublication"));
+    free(after);
+
+    cbm_mcp_server_free(srv);
+    mcp_unlink_db_sidecars(live_path);
+    mcp_unlink_db_sidecars(next_path);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #832 — background auto-index + watcher re-index must run in the
  *         supervised worker SUBPROCESS (RSS isolation)
@@ -12477,6 +12617,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_tools_call_rejects_non_object_arguments);
     RUN_TEST(server_handle_unknown_tool_preserves_string_id);
     RUN_TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context);
+    RUN_TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_indexed);
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
@@ -12586,6 +12727,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_reports_resolved_project_for_empty_json_and_toon_results);
     RUN_TEST(search_code_reports_dirty_graph_metadata_without_hiding_live_matches);
     RUN_TEST(search_code_uses_overlay_active_nodes_for_graph_annotations);
     RUN_TEST(search_code_limit_zero_uses_config_default);
@@ -12629,6 +12771,7 @@ SUITE(mcp) {
     RUN_TEST(readonly_query_does_not_mutate_db);
     RUN_TEST(readonly_query_succeeds_on_readonly_fs);
     RUN_TEST(watcher_publication_reopens_cached_store_generation);
+    RUN_TEST(external_process_publication_reopens_cached_store_generation);
 
     /* Idle store eviction */
     RUN_TEST(store_idle_eviction);

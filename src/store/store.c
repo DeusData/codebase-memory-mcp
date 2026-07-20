@@ -159,6 +159,7 @@ static void store_bind_edge_types(sqlite3_stmt *stmt, int first_bind, const char
 struct cbm_store {
     sqlite3 *db;
     const char *db_path; /* heap-allocated, or NULL for :memory: */
+    cbm_file_identity_t opened_file_identity;
     char errbuf[CBM_SZ_512];
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
@@ -1278,6 +1279,15 @@ const char *cbm_store_db_path(const cbm_store_t *s) {
     return s ? s->db_path : NULL;
 }
 
+bool cbm_store_backing_file_replaced(const cbm_store_t *s) {
+    if (!s || !s->db_path || !s->opened_file_identity.valid) {
+        return false;
+    }
+    cbm_file_identity_t current = {0};
+    return !cbm_file_identity_read(s->db_path, &current) ||
+           !cbm_file_identity_equal(&s->opened_file_identity, &current);
+}
+
 /* Build a SQLite "file:" URI with immutable=1 from a filesystem path.
  * immutable=1 bypasses WAL and locking and reads the main DB file directly —
  * used only as a fallback for read-only filesystems where the wal-index
@@ -1347,6 +1357,13 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         return NULL;
     }
 
+    /* Snapshot the path identity before SQLite opens it. If publication races
+     * the open, retaining the earlier identity causes one conservative reopen
+     * on the next request; recording it afterward could instead pair a new
+     * path identity with an old open handle and miss the replacement forever. */
+    cbm_file_identity_t opening_identity = {0};
+    (void)cbm_file_identity_read(db_path, &opening_identity);
+
     /* Query tools open the project DB READ-ONLY: a read query must never
      * mutate the DB (the previous READWRITE open + WAL write-pragmas did),
      * and must work on a read-only DB file / filesystem.
@@ -1396,6 +1413,10 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+    s->opened_file_identity = opening_identity;
+    if (!s->opened_file_identity.valid) {
+        (void)cbm_file_identity_read(db_path, &s->opened_file_identity);
+    }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);

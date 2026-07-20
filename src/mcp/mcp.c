@@ -71,6 +71,7 @@ enum {
 #include "foundation/compat_regex.h"
 #include <sqlite3.h>
 #include "pipeline/artifact.h"
+#include "helpers.h" /* cbm_kind_in_set_free_cache: auto-index thread teardown */
 
 #ifdef _WIN32
 #include <direct.h>
@@ -3655,9 +3656,21 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
     char parent_buf[1024];
     const char *db_project = parent_project_for_db(project, parent_buf, sizeof(parent_buf));
 
-    /* Already open for this project's DB? */
+    /* Already open for this project's DB? A sibling CLI/MCP process cannot
+     * raise this server's in-memory publication flag, so compare the stable
+     * filesystem identity before trusting a cached handle. Atomic replacement
+     * changes identity without exposing a partial DB; a missing/replaced path
+     * is closed here on the request thread, preserving store ownership. */
     if (srv->current_project && strcmp(srv->current_project, db_project) == 0 && srv->store) {
-        return srv->store;
+        if (!cbm_store_backing_file_replaced(srv->store)) {
+            return srv->store;
+        }
+        if (srv->owns_store) {
+            cbm_store_close(srv->store);
+        }
+        srv->store = NULL;
+        free(srv->current_project);
+        srv->current_project = NULL;
     }
 
     /* Close old store */
@@ -10721,6 +10734,21 @@ static char *read_file_lines(const char *path, int start, int end) {
 
 /* ── Helper: get project root_path from store ─────────────────── */
 
+static char *get_project_root_from_store(cbm_store_t *store, const char *project) {
+    if (!store || !project || !project[0]) {
+        return NULL;
+    }
+    cbm_project_t proj = {0};
+    if (cbm_store_get_project(store, project, &proj) != CBM_STORE_OK) {
+        return NULL;
+    }
+    char *root = heap_strdup(proj.root_path);
+    free((void *)proj.name);
+    free((void *)proj.indexed_at);
+    free((void *)proj.root_path);
+    return root;
+}
+
 static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
     /* Resolve the project slug: accept either a slug or a filesystem path.
      * Also fall back to session_project when project is NULL. */
@@ -10747,15 +10775,7 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
         free(slug_owned);
         return NULL;
     }
-    cbm_project_t proj = {0};
-    if (cbm_store_get_project(store, slug, &proj) != CBM_STORE_OK) {
-        free(slug_owned);
-        return NULL;
-    }
-    char *root = heap_strdup(proj.root_path);
-    free((void *)proj.name);
-    free((void *)proj.indexed_at);
-    free((void *)proj.root_path);
+    char *root = get_project_root_from_store(store, slug);
     free(slug_owned);
     return root;
 }
@@ -11351,7 +11371,6 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
 
     if (rc != 0 || wr.outcome == CBM_PROC_SPAWN_FAILED) {
         cbm_index_worker_result_free(&wr);
-        cbm_mcp_server_notify_index_published(srv);
         return NULL; /* degrade to in-process */
     }
     if (wr.outcome == CBM_PROC_CLEAN) {
@@ -11363,13 +11382,14 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         char *resp = wr.response; /* transfer ownership to caller (may be NULL) */
         wr.response = NULL;
         cbm_index_worker_result_free(&wr);
-        cbm_mcp_server_notify_index_published(srv);
+        if (cbm_mcp_index_response_published(resp)) {
+            cbm_mcp_server_notify_index_published(srv);
+        }
         return resp;
     }
     if (cancel_requested && atomic_load(cancel_requested)) {
         cbm_proc_outcome_t cancelled_outcome = wr.outcome;
         cbm_index_worker_result_free(&wr);
-        cbm_mcp_server_notify_index_published(srv);
         return build_worker_failure_response(args, cancelled_outcome);
     }
 
@@ -11512,12 +11532,17 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     }
 
     (void)remove(quarantine_path);
-    cbm_mcp_server_notify_index_published(srv);
 
-    if (resp) {
-        return resp;
+    if (!resp) {
+        resp = build_worker_failure_response(args, last_outcome);
     }
-    return build_worker_failure_response(args, last_outcome);
+    /* A contained worker failure is a valid tool response, but it did not
+     * publish a graph generation. Reuse the response-status authority so only
+     * indexed/degraded outcomes invalidate query stores and tool descriptions. */
+    if (cbm_mcp_index_response_published(resp)) {
+        cbm_mcp_server_notify_index_published(srv);
+    }
+    return resp;
 }
 
 /* Build a minimal {"repo_path": "<root>"} args object (path safely escaped) and
@@ -12911,10 +12936,15 @@ static yyjson_mut_val *build_dir_distribution(yyjson_mut_doc *doc, search_result
  * distribution table, and the summary scalars. */
 static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep_match_t *raw,
                                          int raw_count, int gm_count, int limit,
-                                         bool warn_literal_pipe, uint64_t elapsed_ms) {
+                                         const char *project, bool warn_literal_pipe,
+                                         uint64_t elapsed_ms) {
     enum { MAX_RAW = 20, SEARCH_SLOW_MS = 5000 };
     cbm_sb_t sb;
     cbm_sb_init(&sb);
+
+    /* Identify the resolved target even when the result set is empty.  This is
+     * intentionally the queried project, which may differ from session context. */
+    cbm_toon_scalar_str(&sb, "project", project);
 
     int output_count = sr_count < limit ? sr_count : limit;
     static const char *const cols[] = {"qn", "label", "file", "lines", "matches", "in", "out"};
@@ -12999,7 +13029,7 @@ static char *assemble_search_output_toon(search_result_t *sr, int sr_count, grep
 /* Phase 4: assemble JSON output from search results */
 static char *assemble_search_output(search_result_t *sr, int sr_count, grep_match_t *raw,
                                     int raw_count, int gm_count, int limit, int mode,
-                                    int context_lines, const char *root_path,
+                                    int context_lines, const char *root_path, const char *project,
                                     bool warn_literal_pipe, uint64_t elapsed_ms,
                                     const char *search_scope, int dirty_pending,
                                     int dirty_overlay_ready, const char *dirty_warning,
@@ -13014,6 +13044,10 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root_obj);
+
+    /* Report the resolved target rather than session context: explicit project
+     * selection remains observable for successful and zero-result searches. */
+    yyjson_mut_obj_add_str(doc, root_obj, "project", project);
 
     int output_count = sr_count < limit ? sr_count : limit;
 
@@ -13616,23 +13650,22 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
             "\"hint\":\"Pass a text pattern or regex (with regex:true) to search source code.\"}", true);
     }
 
-    /* Project: explicit param > session_project fallback > error */
-    if (!project && srv->session_project[0]) {
-        project = heap_strdup(srv->session_project);
-    }
-    if (!project) {
+    /* Use the same project and automatic-indexing authority as graph tools.
+     * It joins an in-flight startup index (or performs configured first-use
+     * indexing) before a missing store can be reported.  The returned store is
+     * retained below for graph annotations, avoiding a second cache lookup. */
+    project_expand_t pe = {0};
+    cbm_store_t *store = resolve_project_store(srv, project, &pe);
+    project = pe.value; /* resolve_project_store consumes the raw argument. */
+    REQUIRE_STORE_EX(store, project, {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
         }
         free(pattern);
         free(file_pattern);
-        char *_err = build_project_list_error("project is required");
-        char *_res = cbm_mcp_text_result(_err, true);
-        free(_err);
-        return _res;
-    }
+    });
 
-    char *root_path = get_project_root(srv, project);
+    char *root_path = get_project_root_from_store(store, project);
     if (!root_path) {
         if (has_path_filter) {
             cbm_regfree(&path_regex);
@@ -13837,8 +13870,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     /* Sort grep matches by file for contiguous processing.
      * Then: one SQL query per unique file for nodes, one batch query for all degrees. */
 
-    cbm_store_t *store = resolve_store(srv, project);
-
     int sr_cap = CBM_SZ_32;
     int sr_count = 0;
     search_result_t *sr = calloc(sr_cap, sizeof(search_result_t));
@@ -13912,15 +13943,15 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                 dirty_overlay_ready > 0;
     char *result = NULL;
     if (mode == MODE_COMPACT && !sc_legacy_json && !needs_freshness_json) {
-        char *toon_text = assemble_search_output_toon(
-            sr, sr_count, raw, raw_count, gm_count, limit, pat_has_pipe && !use_regex,
-            cbm_now_ms() - search_t0);
+        char *toon_text =
+            assemble_search_output_toon(sr, sr_count, raw, raw_count, gm_count, limit, project,
+                                        pat_has_pipe && !use_regex, cbm_now_ms() - search_t0);
         result = cbm_mcp_text_result(toon_text ? toon_text : "out of memory",
                                      toon_text == NULL);
         free(toon_text);
     } else {
         result = assemble_search_output(
-            sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines, root_path,
+            sr, sr_count, raw, raw_count, gm_count, limit, mode, context_lines, root_path, project,
             pat_has_pipe && !use_regex, cbm_now_ms() - search_t0, search_scope, dirty_pending,
             dirty_overlay_ready,
             overlay_ready_for_code
@@ -15284,6 +15315,14 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
 }
 
 /* Background auto-index thread function */
+static void autoindex_thread_release_caches(void) {
+    /* Sequential extraction builds a thread-local syntax-kind bitset cache on
+     * the calling thread. Worker-pool threads release the same cache at their
+     * exit boundary; the auto-index owner must do likewise on every return. */
+    cbm_kind_in_set_free_cache();
+    cbm_mem_collect();
+}
+
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
@@ -15297,9 +15336,18 @@ static void *autoindex_thread(void *arg) {
     if (cbm_index_supervisor_should_wrap()) {
         char *resp = index_run_supervised_path(srv, srv->session_root);
         if (resp) {
+            bool published = cbm_mcp_index_response_published(resp);
             free(resp);
             if (atomic_load(&srv->stop_requested)) {
                 cbm_log_info("autoindex.cancelled", "project", srv->session_project);
+                autoindex_thread_release_caches();
+                return NULL;
+            }
+            srv->autoindex_failed = !published;
+            srv->just_autoindexed = published;
+            if (!published) {
+                cbm_log_warn("autoindex.err", "msg", "supervised_index_failed");
+                autoindex_thread_release_caches();
                 return NULL;
             }
             cbm_log_info("autoindex.done", "project", srv->session_project, "mode", "supervised");
@@ -15308,6 +15356,7 @@ static void *autoindex_thread(void *arg) {
              * `if (srv->watcher)` would register even when the user set
              * `config set auto_watch false`, since srv->watcher is always set. */
             register_watcher_if_enabled(srv);
+            autoindex_thread_release_caches();
             return NULL;
         }
         /* resp == NULL → spawn-failure degrade → fall through to in-process. */
@@ -15315,12 +15364,16 @@ static void *autoindex_thread(void *arg) {
 
     if (atomic_load(&srv->stop_requested)) {
         cbm_log_info("autoindex.cancelled", "project", srv->session_project);
+        autoindex_thread_release_caches();
         return NULL;
     }
 
     cbm_pipeline_t *p = cbm_pipeline_new(srv->session_root, NULL, CBM_MODE_FULL);
     if (!p) {
+        srv->autoindex_failed = true;
+        srv->just_autoindexed = false;
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
+        autoindex_thread_release_caches();
         return NULL;
     }
     cbm_pipeline_apply_config(p, srv->config);
@@ -15335,6 +15388,8 @@ static void *autoindex_thread(void *arg) {
 
     cbm_pipeline_free(p);
 
+    srv->autoindex_failed = (rc != 0);
+    srv->just_autoindexed = (rc == 0);
 
     if (rc == 0) {
         /* Re-index dependencies after fresh dump.
@@ -15375,7 +15430,7 @@ static void *autoindex_thread(void *arg) {
     } else {
         cbm_log_warn("autoindex.err", "msg", "pipeline_run_failed");
     }
-    cbm_mem_collect();
+    autoindex_thread_release_caches();
     return NULL;
 }
 

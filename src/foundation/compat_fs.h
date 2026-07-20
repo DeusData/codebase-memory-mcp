@@ -9,6 +9,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
 #include "foundation/constants.h"
@@ -47,6 +48,19 @@ int cbm_pclose(FILE *f);
 int cbm_pclose_exit_code(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
+
+/* Stable identity of one filesystem object. This distinguishes atomic path
+ * replacement from in-place metadata changes and is valid across processes. */
+typedef struct {
+    uint64_t volume;
+    uint64_t file;
+    bool valid;
+} cbm_file_identity_t;
+
+/* Read the object identity currently named by path. Returns false when the
+ * path is missing or its identity cannot be read. */
+bool cbm_file_identity_read(const char *path, cbm_file_identity_t *out);
+bool cbm_file_identity_equal(const cbm_file_identity_t *left, const cbm_file_identity_t *right);
 
 /* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
 bool cbm_mkdir_p(const char *path, int mode);
