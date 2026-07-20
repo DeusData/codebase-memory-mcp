@@ -38,10 +38,13 @@ TEST(plugin_emit_writes_plugin_json_with_version) {
 
     char *json = read_all("build/test-plugin-emit/.claude-plugin/plugin.json");
     ASSERT_NOT_NULL(json);
-    ASSERT_TRUE(strstr(json, "\"name\": \"codebase-memory\"") != NULL);
-    ASSERT_TRUE(strstr(json, "\"version\": \"9.9.9\"") != NULL);
-    ASSERT_TRUE(strstr(json, "\"description\"") != NULL);
+    int has_name = strstr(json, "\"name\": \"codebase-memory\"") != NULL;
+    int has_version = strstr(json, "\"version\": \"9.9.9\"") != NULL;
+    int has_description = strstr(json, "\"description\"") != NULL;
     free(json);
+    ASSERT_TRUE(has_name);
+    ASSERT_TRUE(has_version);
+    ASSERT_TRUE(has_description);
     PASS();
 }
 
@@ -53,8 +56,9 @@ TEST(plugin_emit_skill_matches_source_bytes) {
 
     char *written = read_all("build/test-plugin-emit/skills/codebase-memory/SKILL.md");
     ASSERT_NOT_NULL(written);
-    ASSERT_STR_EQ(written, skills[0].content);
+    int eq = strcmp(written, skills[0].content) == 0;
     free(written);
+    ASSERT_TRUE(eq);
     PASS();
 }
 
@@ -73,11 +77,15 @@ TEST(plugin_emit_agents_match_rendered_profiles) {
         snprintf(path, sizeof(path), "build/test-plugin-emit/agents/%s.md",
                  cbm_graph_tier_slug(tiers[i]));
         char *written = read_all(path);
+        if (!written) {
+            free(expected);
+        }
         ASSERT_NOT_NULL(written);
-        ASSERT_STR_EQ(written, expected);
 
+        int eq = strcmp(written, expected) == 0;
         free(written);
         free(expected);
+        ASSERT_TRUE(eq);
     }
 
     PASS();
