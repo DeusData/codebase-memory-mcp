@@ -5293,12 +5293,30 @@ static int emit_plugin_json(const char *out_dir, const char *version) {
     return emit_write_file(path, json);
 }
 
+static int emit_skills(const char *out_dir) {
+    const cbm_skill_t *skills = cbm_get_skills();
+    if (!skills) {
+        return CLI_ERR;
+    }
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/skills/%s/SKILL.md", out_dir, skills[i].name);
+        if (emit_write_file(path, skills[i].content) != CLI_OK) {
+            return CLI_ERR;
+        }
+    }
+    return CLI_OK;
+}
+
 int cbm_emit_plugin(const char *out_dir, const char *version) {
     if (!out_dir || out_dir[0] == '\0') {
         return CLI_ERR;
     }
     const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
     if (emit_plugin_json(out_dir, ver) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_skills(out_dir) != CLI_OK) {
         return CLI_ERR;
     }
     return CLI_OK;

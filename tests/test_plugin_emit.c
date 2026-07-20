@@ -44,6 +44,20 @@ TEST(plugin_emit_writes_plugin_json_with_version) {
     PASS();
 }
 
+TEST(plugin_emit_skill_matches_source_bytes) {
+    ASSERT_EQ(cbm_emit_plugin(emit_tmp_dir(), "9.9.9"), 0);
+
+    const cbm_skill_t *skills = cbm_get_skills();
+    ASSERT_NOT_NULL(skills);
+
+    char *written = read_all("build/test-plugin-emit/skills/codebase-memory/SKILL.md");
+    ASSERT_NOT_NULL(written);
+    ASSERT_STR_EQ(written, skills[0].content);
+    free(written);
+    PASS();
+}
+
 SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_writes_plugin_json_with_version);
+    RUN_TEST(plugin_emit_skill_matches_source_bytes);
 }
