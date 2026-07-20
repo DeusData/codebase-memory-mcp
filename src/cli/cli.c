@@ -9751,7 +9751,7 @@ typedef struct {
 #define PRESET_COUNT(values_) (sizeof(values_) / sizeof((values_)[0]))
 
 static const cbm_config_preset_value_t PRESET_STREAMLINED_QUALITY[] = {
-    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, "streamlined"),
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED),
     PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
     PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
     PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
@@ -9761,7 +9761,7 @@ static const cbm_config_preset_value_t PRESET_STREAMLINED_QUALITY[] = {
 };
 
 static const cbm_config_preset_value_t PRESET_CLASSIC_QUALITY[] = {
-    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, "classic"),
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC),
     PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
     PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
     PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
@@ -9988,7 +9988,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "auto-pushed summary that closes the codebase://architecture pull-only gap. Kept small (10) "
      "to keep first-response token cost modest; raise to 20-25 if you want richer upfront context."},
     /* ── Tools ── */
-    {CBM_CONFIG_TOOL_MODE, "streamlined", "CBM_TOOL_MODE", "Tools",
+    {CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED, "CBM_TOOL_MODE", "Tools",
      "Which tool surface the MCP server lists by default",
      "streamlined|classic",
      "'streamlined' (default): lists core tools plus _hidden_tools discovery: "

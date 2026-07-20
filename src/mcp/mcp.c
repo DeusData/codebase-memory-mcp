@@ -1435,9 +1435,6 @@ static const tool_def_t STREAMLINED_TOOLS[] = {
 };
 static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STREAMLINED_TOOLS[0]);
 
-/* Config key for tool visibility mode. */
-#define CBM_CONFIG_TOOL_MODE "tool_mode"
-
 static const char MCP_TOOL_OUTPUT_SCHEMA[] =
     "{\"type\":\"object\",\"additionalProperties\":true}";
 static const char MCP_HIDDEN_TOOL_INPUT_SCHEMA[] = "{\"type\":\"object\",\"properties\":{}}";
@@ -2344,6 +2341,13 @@ static char *build_key_functions_sql(const char *exclude_csv, const char **exclu
 static bool validate_cbm_db_with_timeout(const char *path, int busy_timeout_ms);
 static void *overlay_compaction_thread(void *arg);
 
+typedef enum {
+    MCP_AUTOINDEX_BLOCK_NONE = 0,
+    MCP_AUTOINDEX_BLOCK_DISABLED,
+    MCP_AUTOINDEX_BLOCK_FILE_COUNT,
+    MCP_AUTOINDEX_BLOCK_FILE_LIMIT,
+} mcp_autoindex_block_t;
+
 struct cbm_mcp_server {
     cbm_mcp_tool_profile_t tool_profile;
     cbm_store_t *store;             /* currently open project store (or NULL) */
@@ -2366,6 +2370,12 @@ struct cbm_mcp_server {
     bool autoindex_active; /* true if auto-index thread was started */
     bool autoindex_failed; /* IX-1: true if last auto-index attempt failed */
     bool just_autoindexed; /* IX-3: true after auto-index completes, reset on next search */
+    /* Request-thread-owned reason startup indexing did not start. This reports
+     * only this server's decision; it never guesses sibling-process liveness
+     * from temp files or other crash-stale filesystem artifacts. */
+    mcp_autoindex_block_t autoindex_block;
+    int autoindex_observed_files;
+    int autoindex_file_limit;
     bool context_injected; /* true after first _context header sent (Phase 9) */
     /* Request-thread-owned tools/list docstring. Graph workers may only mark
      * it stale atomically; they must never read, replace, or free the pointer. */
@@ -2425,12 +2435,12 @@ static bool cbm_mcp_tool_mode_is_classic(cbm_mcp_server_t *srv) {
     const char *tool_mode = cbm_safe_getenv("CBM_TOOL_MODE", tool_mode_buf,
                                             sizeof(tool_mode_buf), NULL);
     if (tool_mode && tool_mode[0] != '\0') {
-        return strcmp(tool_mode, "classic") == 0;
+        return strcmp(tool_mode, CBM_CONFIG_TOOL_MODE_CLASSIC) == 0;
     }
-    tool_mode = (srv && srv->config)
-        ? cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE, "streamlined")
-        : "streamlined";
-    return strcmp(tool_mode, "classic") == 0;
+    tool_mode = (srv && srv->config) ? cbm_config_get(srv->config, CBM_CONFIG_TOOL_MODE,
+                                                      CBM_CONFIG_TOOL_MODE_STREAMLINED)
+                                     : CBM_CONFIG_TOOL_MODE_STREAMLINED;
+    return strcmp(tool_mode, CBM_CONFIG_TOOL_MODE_CLASSIC) == 0;
 }
 
 static cbm_mcp_output_format_t cbm_mcp_response_format(cbm_mcp_server_t *srv,
@@ -2620,17 +2630,29 @@ static int cbm_mcp_auto_index_limit(cbm_mcp_server_t *srv) {
 
 static bool cbm_mcp_auto_index_within_limit(cbm_mcp_server_t *srv, const char *root_path) {
     int file_limit = cbm_mcp_auto_index_limit(srv);
+    if (srv) {
+        srv->autoindex_block = MCP_AUTOINDEX_BLOCK_NONE;
+        srv->autoindex_observed_files = 0;
+        srv->autoindex_file_limit = file_limit;
+    }
     if (file_limit <= 0) {
         return true;
     }
     cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
     int count = 0;
     if (cbm_discover_count_bounded(root_path, &opts, file_limit, &count) != 0) {
+        if (srv) {
+            srv->autoindex_block = MCP_AUTOINDEX_BLOCK_FILE_COUNT;
+        }
         cbm_log_warn("autoindex.skip", "reason", "file_count_failed", "path",
                      root_path ? root_path : "");
         return false;
     }
     if (count > file_limit) {
+        if (srv) {
+            srv->autoindex_block = MCP_AUTOINDEX_BLOCK_FILE_LIMIT;
+            srv->autoindex_observed_files = count;
+        }
         char count_buf[CBM_SZ_32];
         snprintf(count_buf, sizeof(count_buf), "%d", count);
         cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
@@ -3905,6 +3927,33 @@ static void add_git_context_json(yyjson_mut_doc *doc, yyjson_mut_val *obj, const
     cbm_git_context_free(&ctx);
 }
 
+/* Describe the exact indexing call sequence exposed by this server. This is
+ * reached only after resolve_project_store exhausted permissible automatic
+ * recovery: it joins local startup work, retries a failed thread launch with a
+ * synchronous index, and attempts configured first-use indexing. Explicit
+ * auto_index=false and the resource-protection limit must not be overridden.
+ * The MCP profile and reveal state are the authorities; never tell a caller to
+ * invoke a tool that its current tools/list hides. */
+static void mcp_index_recovery_action(cbm_mcp_server_t *srv, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    bool allowed = !srv || mcp_tool_allowed(srv->tool_profile, "index_repository");
+    bool visible = allowed && (!srv || cbm_mcp_advanced_tool_visible(srv, "index_repository"));
+    if (visible) {
+        snprintf(out, out_size, "call index_repository with repo_path='/absolute/path/to/repo'.");
+    } else if (allowed) {
+        snprintf(out, out_size,
+                 "call _hidden_tools, refresh tools/list, then call index_repository with "
+                 "repo_path='/absolute/path/to/repo'.");
+    } else {
+        snprintf(out, out_size,
+                 "this MCP tool profile does not expose index_repository; run "
+                 "codebase-memory-mcp cli index_repository --repo-path "
+                 "'/absolute/path/to/repo'.");
+    }
+}
+
 /* Build a helpful error listing available projects. Caller must free() result. */
 static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *reason) {
     char dir_path[1024];
@@ -3916,9 +3965,46 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
     int total_count = collect_db_project_names(dir_path, projects, sizeof(projects),
                                                &listed_count, &projects_truncated);
 
+    char index_action[CBM_SZ_512];
+    mcp_index_recovery_action(srv, index_action, sizeof(index_action));
+    char recovery_hint[CBM_SZ_1K];
+    switch (srv ? srv->autoindex_block : MCP_AUTOINDEX_BLOCK_NONE) {
+    case MCP_AUTOINDEX_BLOCK_DISABLED:
+        snprintf(recovery_hint, sizeof(recovery_hint),
+                 "Automatic indexing is disabled (auto_index=false). Set auto_index=true and "
+                 "retry, or %s",
+                 index_action);
+        break;
+    case MCP_AUTOINDEX_BLOCK_FILE_COUNT:
+        snprintf(recovery_hint, sizeof(recovery_hint),
+                 "Automatic indexing could not count project files safely. Check project read "
+                 "permissions, then retry; %s",
+                 index_action);
+        break;
+    case MCP_AUTOINDEX_BLOCK_FILE_LIMIT:
+        snprintf(recovery_hint, sizeof(recovery_hint),
+                 "Automatic indexing stopped after more than %d files exceeded "
+                 "auto_index_limit=%d. Check available memory before raising the limit and "
+                 "retrying; if the larger run is intentional, %s",
+                 srv->autoindex_observed_files, srv->autoindex_file_limit, index_action);
+        break;
+    case MCP_AUTOINDEX_BLOCK_NONE:
+    default:
+        snprintf(recovery_hint, sizeof(recovery_hint),
+                 "No published index is readable. Pass the repository path as project to use "
+                 "configured automatic indexing, or %s",
+                 index_action);
+        break;
+    }
+
     /* Optional: session_project and _context fields for richer error context */
     char session_frag[256] = "";
-    char context_frag[512] = "";
+    char context_frag[CBM_SZ_2K] = "";
+    const char *context_hint =
+        total_count == 0
+            ? recovery_hint
+            : "The requested project has no readable published index. Use list_projects and "
+              "pass the intended project explicitly.";
     if (srv && srv->session_project[0]) {
         snprintf(session_frag, sizeof(session_frag),
                  ",\"session_project\":\"%s\"", srv->session_project);
@@ -3927,7 +4013,8 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
         if (ctx_enabled && !srv->context_injected) {
             snprintf(context_frag, sizeof(context_frag),
                      ",\"_context\":{\"status\":\"not_indexed\","
-                     "\"hint\":\"No project indexed yet. Pass project='/path/to/repo' to index.\"}");
+                     "\"hint\":\"%s\"}",
+                     context_hint);
             srv->context_injected = true;  /* one-shot: suppress from future successful responses */
         }
     }
@@ -3950,10 +4037,8 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
             }
         }
     } else {
-        snprintf(buf, sizeof(buf),
-                 "{\"error\":\"%s\",\"hint\":\"No projects indexed yet. "
-                 "Call index_repository first.\"%s%s}",
-                 reason, session_frag, context_frag);
+        snprintf(buf, sizeof(buf), "{\"error\":\"%s\",\"hint\":\"%s\"%s%s}", reason, recovery_hint,
+                 session_frag, context_frag);
     }
     return heap_strdup(buf);
 }
@@ -15513,6 +15598,9 @@ static int cbm_mcp_reindex_stale_seconds(cbm_mcp_server_t *srv) {
 
 /* Start auto-indexing if configured and project not yet indexed. */
 static void maybe_auto_index(cbm_mcp_server_t *srv) {
+    srv->autoindex_block = MCP_AUTOINDEX_BLOCK_NONE;
+    srv->autoindex_observed_files = 0;
+    srv->autoindex_file_limit = cbm_mcp_auto_index_limit(srv);
     if (srv->session_root[0] == '\0') {
         return; /* no session root detected */
     }
@@ -15563,6 +15651,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     bool auto_index = cbm_mcp_auto_index_enabled(srv);
 
     if (!auto_index) {
+        srv->autoindex_block = MCP_AUTOINDEX_BLOCK_DISABLED;
         cbm_log_info("autoindex.skip", "reason", "disabled", "hint",
                      "export CBM_AUTO_INDEX=true  OR  codebase-memory-mcp config set auto_index true");
         return;
@@ -15577,6 +15666,11 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
     /* Launch auto-index in background */
     if (cbm_thread_create(&srv->autoindex_tid, 0, autoindex_thread, srv) == 0) {
         srv->autoindex_active = true;
+    } else {
+        /* Do not turn a transient thread-launch failure into a user task. The
+         * first store-backed request runs the existing synchronous first-use
+         * path before REQUIRE_STORE_EX can build an error. */
+        cbm_log_warn("autoindex.skip", "reason", "thread_start_failed");
     }
 }
 
