@@ -5259,9 +5259,28 @@ static int emit_write_file(const char *path, const char *content) {
     return (wrote == len && close_rc == 0) ? CLI_OK : CLI_ERR;
 }
 
+/* Copy src into dst (size cap) as a JSON-safe string body: escape " and \,
+ * drop control chars < 0x20. Only version needs this — later artifacts write
+ * static literals or verbatim source, not interpolated untrusted data. */
+static void json_escape_into(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 2 < dst_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+        } else if (c < 0x20) {
+            continue;
+        }
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
 static int emit_plugin_json(const char *out_dir, const char *version) {
     char path[CLI_BUF_1K];
     snprintf(path, sizeof(path), "%s/.claude-plugin/plugin.json", out_dir);
+    char ver_esc[CLI_BUF_1K];
+    json_escape_into(ver_esc, sizeof(ver_esc), version);
     char json[CLI_BUF_1K];
     snprintf(json, sizeof(json),
              "{\n"
@@ -5270,7 +5289,7 @@ static int emit_plugin_json(const char *out_dir, const char *version) {
              "  \"description\": \"Codebase knowledge graph for AI agents — "
              "159 languages, sub-ms queries, 99%% fewer tokens.\"\n"
              "}\n",
-             version);
+             ver_esc);
     return emit_write_file(path, json);
 }
 

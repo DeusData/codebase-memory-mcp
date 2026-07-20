@@ -6,8 +6,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 /* A unique temp dir under the build tree; deterministic name (no mkstemp
  * randomness needed — the suite runs single-threaded and cleans up). */
@@ -41,6 +39,7 @@ TEST(plugin_emit_writes_plugin_json_with_version) {
     ASSERT_NOT_NULL(json);
     ASSERT_TRUE(strstr(json, "\"name\": \"codebase-memory\"") != NULL);
     ASSERT_TRUE(strstr(json, "\"version\": \"9.9.9\"") != NULL);
+    ASSERT_TRUE(strstr(json, "\"description\"") != NULL);
     free(json);
     PASS();
 }
