@@ -9570,6 +9570,136 @@ TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_ind
     PASS();
 }
 
+static char *request_missing_index_with_mode(cbm_config_t *config, int request_id,
+                                             bool reveal_hidden_tools) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return NULL;
+    }
+    cbm_mcp_server_set_config(srv, config);
+    char *initialize = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+    if (!initialize) {
+        cbm_mcp_server_free(srv);
+        return NULL;
+    }
+    free(initialize);
+    if (reveal_hidden_tools) {
+        char *reveal = cbm_mcp_handle_tool(srv, "_hidden_tools", "{}");
+        if (!reveal) {
+            cbm_mcp_server_free(srv);
+            return NULL;
+        }
+        free(reveal);
+    }
+    char request[CBM_SZ_1K];
+    int written = snprintf(request, sizeof(request),
+                           "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
+                           "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+                           "\"name_pattern\":\"blocked_index_target\"}}}",
+                           request_id);
+    char *response = written > 0 && (size_t)written < sizeof(request)
+                         ? cbm_mcp_server_handle(srv, request)
+                         : NULL;
+    cbm_mcp_server_free(srv);
+    return response;
+}
+
+static bool response_has_structured_content(const char *response) {
+    yyjson_doc *doc = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *result = root ? yyjson_obj_get(root, "result") : NULL;
+    bool found = result && yyjson_is_obj(yyjson_obj_get(result, "structuredContent"));
+    yyjson_doc_free(doc);
+    return found;
+}
+
+TEST(first_search_reports_automatic_index_block_reason) {
+    char repo[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-index-block-repo-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-index-block-cache-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char source_path[CBM_SZ_512];
+    snprintf(source_path, sizeof(source_path), "%s/blocked.py", repo);
+    FILE *source = fopen(source_path, "w");
+    ASSERT_NOT_NULL(source);
+    fputs("def blocked_index_target():\n    return 42\n", source);
+    fclose(source);
+    char second_source_path[CBM_SZ_512];
+    snprintf(second_source_path, sizeof(second_source_path), "%s/also_blocked.py", repo);
+    source = fopen(second_source_path, "w");
+    ASSERT_NOT_NULL(source);
+    fputs("def second_blocked_target():\n    return 43\n", source);
+    fclose(source);
+
+    char old_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(cbm_getcwd(old_cwd, sizeof(old_cwd)));
+    ASSERT_EQ(cbm_chdir(repo), 0);
+
+    cbm_config_t *config = cbm_config_open(cache);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+
+    char *response = request_missing_index_with_mode(config, 65, false);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_NOT_NULL(strstr(response, "auto_index=false"));
+    ASSERT_NOT_NULL(strstr(response, "_hidden_tools"));
+    ASSERT_NOT_NULL(strstr(response, "tools/list"));
+    ASSERT_NOT_NULL(strstr(response, "index_repository"));
+    ASSERT_NOT_NULL(strstr(response, "repo_path"));
+    ASSERT_NULL(strstr(response, "\"status\":\"auto_indexing\""));
+    free(response);
+
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_AUTO_INDEX_LIMIT, "1"), 0);
+    response = request_missing_index_with_mode(config, 67, false);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_NOT_NULL(strstr(response, "auto_index_limit"));
+    ASSERT_NOT_NULL(strstr(response, "_hidden_tools"));
+    ASSERT_NOT_NULL(strstr(response, "tools/list"));
+    ASSERT_NOT_NULL(strstr(response, "index_repository"));
+    ASSERT_NOT_NULL(strstr(response, "repo_path"));
+    ASSERT_NULL(strstr(response, "\"status\":\"auto_indexing\""));
+    free(response);
+
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC), 0);
+    response = request_missing_index_with_mode(config, 69, false);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_NOT_NULL(strstr(response, "call index_repository"));
+    ASSERT_NOT_NULL(strstr(response, "repo_path"));
+    ASSERT_NULL(strstr(response, "_hidden_tools"));
+    free(response);
+
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED), 0);
+    response = request_missing_index_with_mode(config, 71, true);
+    ASSERT_NOT_NULL(response);
+    ASSERT_TRUE(response_has_structured_content(response));
+    ASSERT_NOT_NULL(strstr(response, "call index_repository"));
+    ASSERT_NOT_NULL(strstr(response, "repo_path"));
+    ASSERT_NULL(strstr(response, "_hidden_tools"));
+    ASSERT_NULL(strstr(response, "refresh tools/list"));
+    free(response);
+
+    cbm_config_close(config);
+    ASSERT_EQ(cbm_chdir(old_cwd), 0);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(repo);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL/GETLINE FILE* BUFFERING FIX
  * ══════════════════════════════════════════════════════════════════ */
@@ -12618,6 +12748,7 @@ SUITE(mcp) {
     RUN_TEST(server_handle_unknown_tool_preserves_string_id);
     RUN_TEST(first_graph_call_waits_for_startup_index_and_returns_ready_context);
     RUN_TEST(first_search_code_call_waits_for_startup_index_instead_of_reporting_not_indexed);
+    RUN_TEST(first_search_reports_automatic_index_block_reason);
 
     /* Tool handlers */
     RUN_TEST(tool_list_projects_empty);
