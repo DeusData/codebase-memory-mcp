@@ -324,6 +324,20 @@ The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org
 You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ```
 
+### Install via Claude Code plugin
+
+The fastest path for Claude Code users — one command wires up the MCP server,
+the `codebase-memory` skill, the three graph agents, and the context hooks:
+
+```bash
+claude plugin marketplace add DeusData/codebase-memory-mcp
+claude plugin install codebase-memory
+```
+
+The plugin launches the server via `npx -y codebase-memory-mcp`, which downloads
+the prebuilt binary on first run — no separate install step. Other clients
+(Codex, Gemini, Copilot, …) continue to use `codebase-memory-mcp install`.
+
 ### Build from Source
 
 <details>

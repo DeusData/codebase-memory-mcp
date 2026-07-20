@@ -27,6 +27,21 @@ jobs:
   lint:
     uses: ./.github/workflows/_lint.yml
 
+  # ── Lock plugin/ to its C source of truth (emit-plugin in src/cli/cli.c).
+  #    Standalone job, not bolted onto _lint.yml, because it needs a real
+  #    build of the standard binary and lint intentionally stays build-free/fast. ──
+  plugin-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Install deps (Ubuntu)
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+
+      - name: Check Claude Code plugin is in sync
+        run: scripts/check-plugin-drift.sh
+
   test:
     needs: [lint]
     if: ${{ !cancelled() && needs.lint.result == 'success' }}
@@ -122,7 +137,7 @@ jobs:
     # The one required context (besides dco) — fails unless every PR stage
     # succeeded, so matrix renames can never silently deadlock merges. `skipped`
     # is OK: pr-smoke skips on docs/CI/test-only PRs (changes.product == false).
-    needs: [security, lint, test, changes, pr-smoke]
+    needs: [security, lint, plugin-drift, test, changes, pr-smoke]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
