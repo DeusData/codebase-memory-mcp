@@ -1,0 +1,14 @@
+{
+  "name": "codebase-memory",
+  "owner": {
+    "name": "DeusData",
+    "url": "https://github.com/DeusData"
+  },
+  "plugins": [
+    {
+      "name": "codebase-memory",
+      "source": "./plugin",
+      "description": "Codebase knowledge graph for AI agents — 159 languages, sub-ms queries, 99% fewer tokens."
+    }
+  ]
+}

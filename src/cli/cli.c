@@ -5245,6 +5245,29 @@ int cbm_cmd_config(int argc, char **argv) {
 
 /* ── emit-plugin: Claude Code plugin generator ──────────────────── */
 
+/* Recursively delete path (file or directory tree). Missing path is not an
+ * error — emit re-runs are idempotent against a from-scratch out_dir.
+ * Built entirely on the cross-platform cbm_opendir/readdir/unlink/rmdir
+ * primitives in compat_fs.c, so no platform-specific code is needed here. */
+static int emit_rm_rf(const char *path) {
+    cbm_dir_t *d = cbm_opendir(path);
+    if (!d) {
+        return CLI_OK; /* not a directory (missing, or a plain file) */
+    }
+    int rc = CLI_OK;
+    cbm_dirent_t *e;
+    while (rc == CLI_OK && (e = cbm_readdir(d)) != NULL) {
+        char child[CLI_BUF_1K];
+        snprintf(child, sizeof(child), "%s/%s", path, e->name);
+        rc = e->is_dir ? emit_rm_rf(child) : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+    }
+    cbm_closedir(d);
+    if (rc != CLI_OK) {
+        return rc;
+    }
+    return cbm_rmdir(path) == 0 ? CLI_OK : CLI_ERR;
+}
+
 static int emit_write_file(const char *path, const char *content) {
     if (!path || !content || ensure_parent_dir(path) != CLI_OK) {
         return CLI_ERR;
@@ -5374,6 +5397,9 @@ int cbm_emit_plugin(const char *out_dir, const char *version) {
         return CLI_ERR;
     }
     const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
+    if (emit_rm_rf(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
     if (emit_plugin_json(out_dir, ver) != CLI_OK) {
         return CLI_ERR;
     }

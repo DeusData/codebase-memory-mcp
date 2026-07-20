@@ -197,10 +197,58 @@ TEST(plugin_emit_hooks_json_has_four_events) {
     PASS();
 }
 
+/* Concatenate every emitted file's bytes into one buffer, in a fixed order,
+ * so two runs can be compared for byte-identity. */
+static char *emit_snapshot(const char *dir) {
+    static const char *const rel[] = {
+        ".claude-plugin/plugin.json",
+        ".mcp.json",
+        "hooks/hooks.json",
+        "skills/codebase-memory/SKILL.md",
+        "agents/codebase-memory-scout.md",
+        "agents/codebase-memory.md",
+        "agents/codebase-memory-auditor.md",
+    };
+    size_t cap = 1 << 20, len = 0;
+    char *out = malloc(cap);
+    out[0] = '\0';
+    for (size_t i = 0; i < sizeof(rel) / sizeof(rel[0]); i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/%s", dir, rel[i]);
+        char *c = read_all(path);
+        if (c) {
+            size_t n = strlen(c);
+            if (len + n + 1 < cap) {
+                memcpy(out + len, c, n);
+                len += n;
+                out[len] = '\0';
+            }
+            free(c);
+        }
+    }
+    return out;
+}
+
+TEST(plugin_emit_is_idempotent) {
+    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-a", "9.9.9"), 0);
+    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-a", "9.9.9"), 0); /* twice, same dir */
+    char *first = emit_snapshot("build/test-plugin-emit-a");
+
+    ASSERT_EQ(cbm_emit_plugin("build/test-plugin-emit-b", "9.9.9"), 0);
+    char *second = emit_snapshot("build/test-plugin-emit-b");
+
+    int eq = strcmp(first, second) == 0;
+    free(first);
+    free(second);
+    ASSERT_TRUE(eq);
+    PASS();
+}
+
 SUITE(plugin_emit) {
     RUN_TEST(plugin_emit_writes_plugin_json_with_version);
     RUN_TEST(plugin_emit_skill_matches_source_bytes);
     RUN_TEST(plugin_emit_agents_match_rendered_profiles);
     RUN_TEST(plugin_emit_mcp_json_has_single_npx_server);
     RUN_TEST(plugin_emit_hooks_json_has_four_events);
+    RUN_TEST(plugin_emit_is_idempotent);
 }
