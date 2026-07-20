@@ -210,7 +210,7 @@ static int mcp_project_db_path(char *out, size_t out_sz, const char *cache,
 }
 
 static bool mcp_create_generation_db(const char *db_path, const char *project,
-                                     const char *node_name) {
+                                     const char *node_label, const char *node_name) {
     cbm_store_t *store = cbm_store_open_path(db_path);
     if (!store) {
         return false;
@@ -218,7 +218,7 @@ static bool mcp_create_generation_db(const char *db_path, const char *project,
     char qualified_name[CBM_PATH_MAX];
     int n = snprintf(qualified_name, sizeof(qualified_name), "%s.%s", project, node_name);
     cbm_node_t node = {.project = project,
-                       .label = "Function",
+                       .label = node_label,
                        .name = node_name,
                        .qualified_name = qualified_name,
                        .file_path = "src/generation.c",
@@ -11626,7 +11626,7 @@ TEST(watcher_publication_reopens_cached_store_generation) {
     char next_path[CBM_PATH_MAX];
     ASSERT_EQ(mcp_project_db_path(live_path, sizeof(live_path), cache, project), CBM_STORE_OK);
     snprintf(next_path, sizeof(next_path), "%s/next-generation.db", cache);
-    ASSERT_TRUE(mcp_create_generation_db(live_path, project, "BeforePublication"));
+    ASSERT_TRUE(mcp_create_generation_db(live_path, project, "Function", "BeforePublication"));
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -11638,7 +11638,7 @@ TEST(watcher_publication_reopens_cached_store_generation) {
     ASSERT_NOT_NULL(strstr(before, "BeforePublication"));
     free(before);
 
-    ASSERT_TRUE(mcp_create_generation_db(next_path, project, "AfterPublication"));
+    ASSERT_TRUE(mcp_create_generation_db(next_path, project, "Function", "AfterPublication"));
     cbm_remove_db_sidecars(live_path);
     ASSERT_EQ(cbm_replace_file(next_path, live_path), 0);
 
@@ -11669,7 +11669,8 @@ TEST(external_process_publication_reopens_cached_store_generation) {
     char next_path[CBM_PATH_MAX];
     ASSERT_EQ(mcp_project_db_path(live_path, sizeof(live_path), cache, project), CBM_STORE_OK);
     snprintf(next_path, sizeof(next_path), "%s/external-next-generation.db", cache);
-    ASSERT_TRUE(mcp_create_generation_db(live_path, project, "BeforeExternalPublication"));
+    ASSERT_TRUE(mcp_create_generation_db(live_path, project, "BeforeExternalLabel",
+                                         "BeforeExternalPublication"));
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -11681,12 +11682,26 @@ TEST(external_process_publication_reopens_cached_store_generation) {
     ASSERT_NOT_NULL(strstr(before, "BeforeExternalPublication"));
     free(before);
 
-    ASSERT_TRUE(mcp_create_generation_db(next_path, project, "AfterExternalPublication"));
+    char *before_list = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":201,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(before_list);
+    ASSERT_NOT_NULL(strstr(before_list, "BeforeExternalLabel"));
+    free(before_list);
+
+    ASSERT_TRUE(mcp_create_generation_db(next_path, project, "AfterExternalLabel",
+                                         "AfterExternalPublication"));
     cbm_remove_db_sidecars(live_path);
     ASSERT_EQ(cbm_replace_file(next_path, live_path), 0);
 
     /* Deliberately no cbm_mcp_server_notify_index_published(): a sibling
      * process has no access to this server's in-memory notification flag. */
+    char *after_list = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":202,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(after_list);
+    ASSERT_NOT_NULL(strstr(after_list, "AfterExternalLabel"));
+    ASSERT_NULL(strstr(after_list, "BeforeExternalLabel"));
+    free(after_list);
+
     char *after =
         cbm_mcp_handle_tool(srv, "search_graph",
                             "{\"project\":\"external-generation-project\","

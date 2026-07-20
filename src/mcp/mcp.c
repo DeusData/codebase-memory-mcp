@@ -2824,6 +2824,23 @@ static int mcp_get_current_schema(cbm_store_t *store, const char *project,
                       : cbm_store_get_schema_counts(store, project, out);
 }
 
+/* Copy only the selected project name into caller-owned stack storage. This is
+ * not a database/graph snapshot: the bounded copy keeps the name valid if
+ * resolve_store closes a replaced database and frees current_project. */
+static const char *mcp_copy_schema_project_name(cbm_mcp_server_t *srv, char *out, size_t out_size) {
+    if (!srv || !out || out_size == 0) {
+        return NULL;
+    }
+    const char *source = srv->current_project && srv->current_project[0]
+                             ? srv->current_project
+                             : (srv->session_project[0] ? srv->session_project : NULL);
+    if (!source) {
+        return NULL;
+    }
+    int written = snprintf(out, out_size, "%s", source);
+    return written >= 0 && (size_t)written < out_size ? out : NULL;
+}
+
 /* Build the query_graph docstring once per published graph state. It belongs in
  * MCP tools/list so reconnects and relists can restore actionable schema after
  * context compaction; it must never be appended to tools/call results. Full
@@ -2867,16 +2884,7 @@ static char *build_query_graph_tool_description(cbm_mcp_server_t *srv,
      * next use). Passing the live pointer through would free the very
      * string resolve_store is still reading (use-after-free). */
     char project_buf[CBM_SZ_256];
-    const char *project = NULL;
-    if (srv) {
-        const char *src = srv->current_project && srv->current_project[0]
-                              ? srv->current_project
-                              : (srv->session_project[0] ? srv->session_project : NULL);
-        if (src) {
-            snprintf(project_buf, sizeof(project_buf), "%s", src);
-            project = project_buf;
-        }
-    }
+    const char *project = mcp_copy_schema_project_name(srv, project_buf, sizeof(project_buf));
     /* Lazily resolve the project's real store rather than trusting
      * srv->store as-is: on the very first tools/list of a fresh session
      * (before any tool call has resolved a project), srv->store is still
@@ -2952,6 +2960,18 @@ static const char *query_graph_tool_description(cbm_mcp_server_t *srv,
                                                 const tool_def_t *tool_def) {
     if (!srv) {
         return tool_def->description;
+    }
+    if (srv->query_graph_tool_description) {
+        /* A sibling CLI/MCP/HTTP worker cannot flip this process's stale bit.
+         * Probe the cached query-only store's stable file identity on each
+         * relist so an atomic database replacement invalidates the inline
+         * schema before it is served. resolve_store is O(1) on the unchanged
+         * fast path and closes/reopens only on this request-owning thread. */
+        char project_buf[CBM_SZ_256];
+        const char *project = mcp_copy_schema_project_name(srv, project_buf, sizeof(project_buf));
+        if (project) {
+            (void)resolve_store(srv, project);
+        }
     }
     if (atomic_exchange(&srv->query_graph_tool_description_stale, false)) {
         free(srv->query_graph_tool_description);
@@ -3687,6 +3707,10 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         if (!cbm_store_backing_file_replaced(srv->store)) {
             return srv->store;
         }
+        /* The same identity mismatch that invalidates query rows also
+         * invalidates cached tools/list schema. This is request-thread-owned;
+         * sibling liveness is never inferred and no cross-thread free occurs. */
+        atomic_store(&srv->query_graph_tool_description_stale, true);
         if (srv->owns_store) {
             cbm_store_close(srv->store);
         }
