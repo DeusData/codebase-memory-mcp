@@ -373,7 +373,7 @@ TEST(integ_mcp_trace_path) {
     char args[256];
     snprintf(args, sizeof(args),
              "{\"function_name\":\"Compute\",\"project\":\"%s\","
-             "\"direction\":\"outbound\",\"max_depth\":3}",
+             "\"direction\":\"outbound\",\"depth\":3}",
              g_project);
 
     char *resp = call_tool("trace_path", args);

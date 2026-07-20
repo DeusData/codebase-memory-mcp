@@ -539,16 +539,16 @@ TEST(g1_summary_mode_has_results_key) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  CQ-3: Cypher + filter params produces warning
+ *  CQ-3: Cypher + search-only filter is rejected actionably
  * ══════════════════════════════════════════════════════════════════ */
 
-TEST(cq3_cypher_with_label_warns) {
+TEST(cq3_cypher_with_label_rejected) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_validation_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* format:"json" — the ignored-filters warning is part of the legacy JSON
-     * response shape (the TOON default only carries Cypher-engine warnings). */
+    /* query_graph has never advertised label. Strict validation prevents an
+     * apparently successful call from silently ignoring the search filter. */
     char *raw = cbm_mcp_handle_tool(srv, "query_graph",
         "{\"cypher\":\"MATCH (n:Function) RETURN n.name LIMIT 5\","
         "\"label\":\"Class\",\"format\":\"json\"}");
@@ -556,8 +556,8 @@ TEST(cq3_cypher_with_label_warns) {
     free(raw);
     ASSERT_NOT_NULL(resp);
 
-    /* CQ-3: Should warn that label is ignored in Cypher mode */
-    ASSERT_NOT_NULL(strstr(resp, "warning"));
+    ASSERT_NOT_NULL(strstr(resp, "unknown argument 'label'"));
+    ASSERT_NOT_NULL(strstr(resp, "supported arguments"));
 
     free(resp);
     cbm_mcp_server_free(srv);
@@ -1565,7 +1565,7 @@ void suite_input_validation(void) {
     RUN_TEST(f15_valid_direction_succeeds);
     RUN_TEST(trace_invalid_mode_errors);
     RUN_TEST(g1_summary_mode_has_results_key);
-    RUN_TEST(cq3_cypher_with_label_warns);
+    RUN_TEST(cq3_cypher_with_label_rejected);
     RUN_TEST(ix2_status_resource_format);
     RUN_TEST(pattern_or_search_graph);
     RUN_TEST(pattern_or_search_graph_normalizes_valid_regex_shaped_glob);

@@ -341,16 +341,17 @@ TEST(search_graph_include_deps_marks_source) {
     PASS();
 }
 
-TEST(trace_path_marks_boundary) {
+TEST(trace_path_dependency_graph_uses_supported_schema) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_dep_query_server(tmp, sizeof(tmp));
     ASSERT_NOT_NULL(srv);
 
-    /* trace_path with include_dependencies should mark boundary */
+    /* Dependency nodes share the project graph and trace_path follows its
+     * selected edge set directly; it has never advertised a separate
+     * include_dependencies switch. Verify the supported call remains safe. */
     char *raw = cbm_mcp_handle_tool(srv, "trace_path",
                                     "{\"function_name\":\"process_data\","
-                                    "\"project\":\"dep-query-test\","
-                                    "\"include_dependencies\":true}");
+                                    "\"project\":\"dep-query-test\"}");
     char *resp = extract_text_content_di(raw);
     free(raw);
     ASSERT_NOT_NULL(resp);
@@ -1108,7 +1109,7 @@ SUITE(depindex) {
     /* AI grounding: core vs dependency disambiguation */
     RUN_TEST(search_graph_default_excludes_deps);
     RUN_TEST(search_graph_include_deps_marks_source);
-    RUN_TEST(trace_path_marks_boundary);
+    RUN_TEST(trace_path_dependency_graph_uses_supported_schema);
     RUN_TEST(get_code_snippet_dep_shows_provenance);
 
     /* External node marking */

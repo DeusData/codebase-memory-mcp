@@ -638,6 +638,9 @@ TEST(index_not_indexed_by_design_reported) {
     char *resp2 = cbm_mcp_handle_tool(lp.srv, "index_repository", iargs);
     ASSERT_NOT_NULL(resp2);
     free(resp2);
+    /* qargs was repurposed for query_graph above. Rebuild the index_status
+     * request instead of accidentally testing strict rejection of graph/query. */
+    snprintf(qargs, sizeof(qargs), "{\"project\":\"%s\"}", lp.project);
     char *sresp2 = cbm_mcp_handle_tool(lp.srv, "index_status", qargs);
     ASSERT_NOT_NULL(sresp2);
     ASSERT_NOT_NULL(strstr(sresp2, "secret.py"));
