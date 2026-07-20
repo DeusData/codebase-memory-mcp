@@ -1063,6 +1063,9 @@ static const tool_def_t TOOLS[] = {
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
      "\"Write compressed artifact to .codebase-memory/graph.db.zst for team sharing. "
      "Teammates can bootstrap from the artifact instead of full re-indexing.\"}"
+     ",\"format\":{\"type\":\"string\",\"enum\":[\"toon\",\"json\"],\"default\":\"toon\","
+     "\"description\":\"Compact TOON by default; json returns legacy objects. Omit to use "
+     "default_response_format.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph", "Search graph",
@@ -1315,7 +1318,9 @@ static const tool_def_t TOOLS[] = {
      "overlay compaction state. Git metadata labels HEAD as committed-only and reports whether "
      "the current working tree is dirty.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\",\"description\":"
-     "\"Indexed project name to inspect.\"}},\"required\":["
+     "\"Indexed project name to inspect.\"},\"verbose\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"Include repository path and Git identity/freshness "
+     "metadata.\"}},\"required\":["
      "\"project\"]}"},
 
     {"check_index_coverage", "Check index coverage",
@@ -1434,6 +1439,7 @@ static const int STREAMLINED_TOOL_COUNT = sizeof(STREAMLINED_TOOLS) / sizeof(STR
 
 static const char MCP_TOOL_OUTPUT_SCHEMA[] =
     "{\"type\":\"object\",\"additionalProperties\":true}";
+static const char MCP_HIDDEN_TOOL_INPUT_SCHEMA[] = "{\"type\":\"object\",\"properties\":{}}";
 
 typedef struct {
     const char *name;
@@ -1492,6 +1498,30 @@ static void mcp_add_json_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj, const 
     yyjson_doc_free(schema_doc);
 }
 
+/* MCP inputs are closed globally: an undeclared key is almost always a typo
+ * that would otherwise leave a real option at its default and return a
+ * plausible but wrong result. Keep the property/required definitions in the
+ * canonical registry and apply this policy during serialization rather than
+ * duplicating it in every schema literal. Runtime dispatch enforces the same
+ * policy for raw-JSON CLI and clients that do not validate tools/list. */
+static void mcp_add_tool_input_schema(yyjson_mut_doc *doc, yyjson_mut_val *obj,
+                                      const char *schema_json) {
+    if (!schema_json) {
+        return;
+    }
+    yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
+    if (!schema_doc) {
+        return;
+    }
+    yyjson_mut_val *schema = yyjson_val_mut_copy(doc, yyjson_doc_get_root(schema_doc));
+    if (schema && yyjson_mut_is_obj(schema)) {
+        (void)yyjson_mut_obj_remove_key(schema, "additionalProperties");
+        yyjson_mut_obj_add_bool(doc, schema, "additionalProperties", false);
+        yyjson_mut_obj_add_val(doc, obj, "inputSchema", schema);
+    }
+    yyjson_doc_free(schema_doc);
+}
+
 /* Canonical tool serialization for classic, streamlined, and paged lists. */
 static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def_t *tool_def,
                       const char *description_override) {
@@ -1501,7 +1531,7 @@ static void emit_tool(yyjson_mut_doc *doc, yyjson_mut_val *tools, const tool_def
                            tool_def->title ? tool_def->title : tool_def->name);
     yyjson_mut_obj_add_str(doc, tool, "description",
                            description_override ? description_override : tool_def->description);
-    mcp_add_json_schema(doc, tool, "inputSchema", tool_def->input_schema);
+    mcp_add_tool_input_schema(doc, tool, tool_def->input_schema);
     mcp_add_json_schema(doc, tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
     const tool_annotation_def_t *def = mcp_tool_annotations(tool_def->name);
     yyjson_mut_val *annotations = yyjson_mut_obj(doc);
@@ -1526,7 +1556,9 @@ static bool is_streamlined_default_tool(const char *name) {
                     strcmp(name, "trace_path") == 0);
 }
 
-/* Return the same schema advertised by tools/list. Static lifetime; do not free. */
+/* Return the canonical property and required definitions used by tools/list,
+ * CLI flag typing, and runtime key validation. tools/list additionally applies
+ * the global closed-input policy. Static lifetime; do not free. */
 const char *cbm_mcp_tool_input_schema(const char *tool_name) {
     if (!tool_name) {
         return NULL;
@@ -1535,6 +1567,9 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
      * has the same request schema even though only the canonical name is listed. */
     if (strcmp(tool_name, "trace_call_path") == 0) {
         tool_name = "trace_path";
+    }
+    if (strcmp(tool_name, "_hidden_tools") == 0) {
+        return MCP_HIDDEN_TOOL_INPUT_SCHEMA;
     }
     for (int i = 0; i < TOOL_COUNT; i++) {
         if (strcmp(TOOLS[i].name, tool_name) == 0) {
@@ -1550,8 +1585,7 @@ const char *cbm_mcp_tool_input_schema(const char *tool_name) {
 }
 
 static bool mcp_tool_name_is_known(const char *tool_name) {
-    return cbm_mcp_tool_input_schema(tool_name) != NULL ||
-           (tool_name && strcmp(tool_name, "_hidden_tools") == 0);
+    return cbm_mcp_tool_input_schema(tool_name) != NULL;
 }
 
 static bool mcp_tool_allowed(cbm_mcp_tool_profile_t profile, const char *name) {
@@ -3001,6 +3035,7 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
             yyjson_mut_obj_add_str(doc, hint_schema, "type", "object");
             yyjson_mut_val *hint_props = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_val(doc, hint_schema, "properties", hint_props);
+            yyjson_mut_obj_add_bool(doc, hint_schema, "additionalProperties", false);
             yyjson_mut_obj_add_val(doc, hint_tool, "inputSchema", hint_schema);
             mcp_add_json_schema(doc, hint_tool, "outputSchema", MCP_TOOL_OUTPUT_SCHEMA);
             yyjson_mut_arr_add_val(tools, hint_tool);
@@ -14951,6 +14986,129 @@ static char *build_hidden_tools_payload(cbm_mcp_server_t *srv) {
     return out ? out : heap_strdup("{\"error\":\"failed to serialize hidden tools payload\"}");
 }
 
+/* Compatibility spellings accepted by older raw-JSON callers but deliberately
+ * omitted from tools/list and CLI help. Keep this list narrow and semantic:
+ * each entry must map unambiguously to a current canonical input.
+ *
+ * History: 3d133a3c added search_in to the former combined search tool;
+ * 39539eff split graph and source search into search_graph and search_code.
+ * Existing callers/tests still pass search_in="source", which is an exact
+ * no-op spelling of search_code's contract. 32a3820c accepted `cypher` before
+ * the query_graph schema standardized on `query`; those strings are exact
+ * aliases. Other values/keys are ambiguous and must fail with the canonical
+ * spelling or tool. Remove an exception only in an announced compatibility
+ * break after usage evidence shows it is unused. */
+static bool mcp_legacy_argument_is_valid(const char *tool_name, yyjson_val *properties,
+                                         yyjson_val *args, const char *key,
+                                         bool *out_invalid_search_in) {
+    if (out_invalid_search_in) {
+        *out_invalid_search_in = false;
+    }
+    if (!tool_name || !properties || !args || !key) {
+        return false;
+    }
+    yyjson_val *value = yyjson_obj_get(args, key);
+    if (yyjson_obj_get(properties, "project") && yyjson_is_str(value) &&
+        (strcmp(key, "project_name") == 0 || strcmp(key, "project_id") == 0 ||
+         strcmp(key, "projectName") == 0)) {
+        return true;
+    }
+    if (strcmp(tool_name, "search_code") == 0 && strcmp(key, "search_in") == 0) {
+        bool is_source = yyjson_is_str(value) && strcmp(yyjson_get_str(value), "source") == 0;
+        if (!is_source && out_invalid_search_in) {
+            *out_invalid_search_in = true;
+        }
+        return is_source;
+    }
+    if (strcmp(tool_name, "query_graph") == 0 && strcmp(key, "cypher") == 0) {
+        return yyjson_is_str(value);
+    }
+    return false;
+}
+
+static char *mcp_validate_tool_argument_keys(const char *tool_name, const char *args_json) {
+    const char *schema_json = cbm_mcp_tool_input_schema(tool_name);
+    if (!schema_json) {
+        return NULL; /* unknown-tool handling remains a protocol-level authority */
+    }
+
+    const char *effective_args = args_json ? args_json : "{}";
+    yyjson_doc *args_doc = yyjson_read(effective_args, strlen(effective_args), 0);
+    yyjson_val *args = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    if (!args || !yyjson_is_obj(args)) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result(
+            "tool arguments must be a JSON object; use tools/list or 'cli <tool> --help' "
+            "for the supported arguments",
+            true);
+    }
+
+    yyjson_doc *schema_doc = yyjson_read(schema_json, strlen(schema_json), 0);
+    yyjson_val *schema = schema_doc ? yyjson_doc_get_root(schema_doc) : NULL;
+    yyjson_val *properties = schema ? yyjson_obj_get(schema, "properties") : NULL;
+    if (!properties || !yyjson_is_obj(properties)) {
+        yyjson_doc_free(schema_doc);
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("tool input schema is unavailable; retry after reinstalling",
+                                   true);
+    }
+
+    const char *unknown = NULL;
+    bool invalid_search_in = false;
+    yyjson_obj_iter arg_iter;
+    yyjson_obj_iter_init(args, &arg_iter);
+    yyjson_val *arg_key;
+    while ((arg_key = yyjson_obj_iter_next(&arg_iter)) != NULL) {
+        const char *key = yyjson_get_str(arg_key);
+        bool accepted = key && yyjson_obj_get(properties, key);
+        if (!accepted) {
+            accepted =
+                mcp_legacy_argument_is_valid(tool_name, properties, args, key, &invalid_search_in);
+        }
+        if (!accepted) {
+            unknown = key ? key : "<invalid>";
+            break;
+        }
+    }
+
+    char *error_result = NULL;
+    if (invalid_search_in) {
+        error_result = cbm_mcp_text_result(
+            "search_code supports source text search directly: omit search_in or use "
+            "search_in='source' for legacy callers; use search_graph for graph search",
+            true);
+    } else if (unknown) {
+        char supported[CBM_SZ_1K] = "";
+        size_t used = 0;
+        yyjson_obj_iter prop_iter;
+        yyjson_obj_iter_init(properties, &prop_iter);
+        yyjson_val *prop_key;
+        while ((prop_key = yyjson_obj_iter_next(&prop_iter)) != NULL) {
+            const char *name = yyjson_get_str(prop_key);
+            if (!name) {
+                continue;
+            }
+            int written = snprintf(supported + used, sizeof(supported) - used, "%s%s",
+                                   used ? ", " : "", name);
+            if (written < 0 || (size_t)written >= sizeof(supported) - used) {
+                break;
+            }
+            used += (size_t)written;
+        }
+        char message[CBM_SZ_2K];
+        snprintf(message, sizeof(message),
+                 "unknown argument '%.*s' for tool '%.*s'; supported arguments: %s. "
+                 "Use tools/list or 'cli %.*s --help' for types and descriptions.",
+                 CBM_SZ_256, unknown, CBM_SZ_256, tool_name, supported[0] ? supported : "(none)",
+                 CBM_SZ_256, tool_name);
+        error_result = cbm_mcp_text_result(message, true);
+    }
+
+    yyjson_doc_free(schema_doc);
+    yyjson_doc_free(args_doc);
+    return error_result;
+}
+
 char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const char *args_json) {
     if (!tool_name) {
         return cbm_mcp_text_result(
@@ -14964,6 +15122,10 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
         snprintf(message, sizeof(message), "tool '%s' is not available in the %s tool profile",
                  tool_name, mcp_tool_profile_name(srv->tool_profile));
         return cbm_mcp_text_result(message, true);
+    }
+    char *argument_error = mcp_validate_tool_argument_keys(tool_name, args_json);
+    if (argument_error) {
+        return argument_error;
     }
 
     /* Streamlined alias: get_code → get_code_snippet handler.
