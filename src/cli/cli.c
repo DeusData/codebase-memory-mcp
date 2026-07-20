@@ -5243,6 +5243,70 @@ int cbm_cmd_config(int argc, char **argv) {
     return rc;
 }
 
+/* ── emit-plugin: Claude Code plugin generator ──────────────────── */
+
+static int emit_write_file(const char *path, const char *content) {
+    if (!path || !content || ensure_parent_dir(path) != CLI_OK) {
+        return CLI_ERR;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return CLI_ERR;
+    }
+    size_t len = strlen(content);
+    size_t wrote = fwrite(content, 1, len, f);
+    int close_rc = fclose(f);
+    return (wrote == len && close_rc == 0) ? CLI_OK : CLI_ERR;
+}
+
+static int emit_plugin_json(const char *out_dir, const char *version) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.claude-plugin/plugin.json", out_dir);
+    char json[CLI_BUF_1K];
+    snprintf(json, sizeof(json),
+             "{\n"
+             "  \"name\": \"codebase-memory\",\n"
+             "  \"version\": \"%s\",\n"
+             "  \"description\": \"Codebase knowledge graph for AI agents — "
+             "159 languages, sub-ms queries, 99%% fewer tokens.\"\n"
+             "}\n",
+             version);
+    return emit_write_file(path, json);
+}
+
+int cbm_emit_plugin(const char *out_dir, const char *version) {
+    if (!out_dir || out_dir[0] == '\0') {
+        return CLI_ERR;
+    }
+    const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
+    if (emit_plugin_json(out_dir, ver) != CLI_OK) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+int cbm_cmd_emit_plugin(int argc, char **argv) {
+    const char *out_dir = NULL;
+    const char *version = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 && i + 1 < argc) {
+            version = argv[++i];
+        } else if (argv[i][0] != '-' && !out_dir) {
+            out_dir = argv[i];
+        }
+    }
+    if (!out_dir) {
+        (void)fprintf(stderr, "usage: codebase-memory-mcp emit-plugin <dir> [--version X]\n");
+        return CLI_ERR;
+    }
+    if (cbm_emit_plugin(out_dir, version) != CLI_OK) {
+        (void)fprintf(stderr, "error: emit-plugin failed for %s\n", out_dir);
+        return CLI_ERR;
+    }
+    printf("Emitted Claude Code plugin to %s\n", out_dir);
+    return CLI_OK;
+}
+
 /* ── Interactive prompt ───────────────────────────────────────── */
 
 /* Global auto-answer mode: 0=interactive, 1=always yes, -1=always no */

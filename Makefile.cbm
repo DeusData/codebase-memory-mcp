@@ -402,6 +402,7 @@ TEST_TRACES_SRCS = tests/test_traces.c
 
 
 TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
+	tests/test_plugin_emit.c \
 	tests/test_config_json_like.c \
 	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c
 
