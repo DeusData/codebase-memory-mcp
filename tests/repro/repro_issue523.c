@@ -57,6 +57,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* ── Fixture files ───────────────────────────────────────────────────────── */
 
@@ -475,6 +476,75 @@ TEST(repro_issue523_idempotent_cross_edges) {
     PASS();
 }
 
+/*
+ * TEST: the matcher must not CREATE databases for unknown project names.
+ * WHY RED on unfixed code: cbm_store_open_path creates a fresh empty store,
+ * so a never-indexed source or target name silently materializes an empty
+ * <name>.db and the run reports success with zero matches. A CLI quoting
+ * mistake (passing the literal text ["*"] as a target name) previously
+ * created an empty database named ["*"].db this way. The header contract
+ * already says the project .db must exist.
+ */
+TEST(repro_issue523_missing_projects_not_created) {
+    RProj client, server;
+    bool ok = cr536_setup(&client,
+                          "import requests\n"
+                          "\n"
+                          "\n"
+                          "def fetch_ping():\n"
+                          "    \"\"\"Poll the ping endpoint.\"\"\"\n"
+                          "    return requests.get(\"/v2/ping\")\n",
+                          &server,
+                          "from flask import Flask, jsonify\n"
+                          "\n"
+                          "app = Flask(__name__)\n"
+                          "\n"
+                          "\n"
+                          "@app.get(\"/v2/ping\")\n"
+                          "def get_ping():\n"
+                          "    \"\"\"Return pong.\"\"\"\n"
+                          "    return jsonify({\"ping\": \"pong\"})\n");
+    if (!ok) {
+        rh_cleanup(&client, NULL);
+        rh_cleanup(&server, NULL);
+        FAIL("fixture precondition failed (client HTTP_CALLS / server Route missing)");
+    }
+
+    const char *cache_dir = cbm_resolve_cache_dir();
+    ASSERT_NOT_NULL(cache_dir);
+    char ghost_tgt_db[512];
+    char ghost_src_db[512];
+    snprintf(ghost_tgt_db, sizeof(ghost_tgt_db), "%s/repro523-ghost-target.db", cache_dir);
+    snprintf(ghost_src_db, sizeof(ghost_src_db), "%s/repro523-ghost-source.db", cache_dir);
+
+    /* Unknown TARGET: skipped and reported, no database created, and the run
+     * still matches the real indexed target listed alongside it. */
+    const char *targets[] = {"repro523-ghost-target", server.project};
+    cbm_cross_repo_result_t r = cbm_cross_repo_match(client.project, targets, 2);
+    struct stat st;
+    fprintf(stderr,
+            "  [523] ghost target: http=%d scanned=%d missing=%d ghost_db_exists=%d\n",
+            r.http_edges, r.projects_scanned, r.targets_missing,
+            stat(ghost_tgt_db, &st) == 0);
+    ASSERT_NEQ(stat(ghost_tgt_db, &st), 0);
+    ASSERT_EQ(r.targets_missing, 1);
+    ASSERT_EQ(r.projects_scanned, 1);
+    ASSERT_GTE(r.http_edges, 1);
+
+    /* Unknown SOURCE: refused and reported, no database created. */
+    const char *tgt = server.project;
+    cbm_cross_repo_result_t r2 = cbm_cross_repo_match("repro523-ghost-source", &tgt, 1);
+    fprintf(stderr, "  [523] ghost source: http=%d source_missing=%d ghost_db_exists=%d\n",
+            r2.http_edges, r2.source_missing, stat(ghost_src_db, &st) == 0);
+    ASSERT_NEQ(stat(ghost_src_db, &st), 0);
+    ASSERT_TRUE(r2.source_missing);
+    ASSERT_EQ(r2.http_edges, 0);
+
+    rh_cleanup(&client, NULL);
+    rh_cleanup(&server, NULL);
+    PASS();
+}
+
 /* ── Suite ───────────────────────────────────────────────────────────────── */
 SUITE(repro_issue523) {
     RUN_TEST(repro_issue523_crossrepo_http_calls_edge);
@@ -482,4 +552,5 @@ SUITE(repro_issue523) {
     RUN_TEST(repro_issue523_template_fuzzy_match);
     RUN_TEST(repro_issue523_reverse_direction_match);
     RUN_TEST(repro_issue523_idempotent_cross_edges);
+    RUN_TEST(repro_issue523_missing_projects_not_created);
 }

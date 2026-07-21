@@ -9572,7 +9572,11 @@ static const char *cli_schema_type(yyjson_val *props, const char *key) {
 }
 
 /* Append a typed value to the output object under `key`. For array-typed
- * properties, repeated flags accumulate into a single JSON array. */
+ * properties, repeated flags accumulate into a single JSON array, and a value
+ * that is itself JSON array text ('["*"]', '["a","b"]') contributes its
+ * string elements instead of one literal element — otherwise the raw text
+ * would flow downstream as a bogus single value (e.g. a project literally
+ * named ["*"]). */
 static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *key,
                           const char *type, const char *value, bool have_value) {
     if (type && strcmp(type, "array") == 0) {
@@ -9580,6 +9584,30 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
         if (!arr || !yyjson_mut_is_arr(arr)) {
             arr = yyjson_mut_arr(out);
             yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
+        }
+        if (have_value && value[0] == '[') {
+            yyjson_doc *vdoc = yyjson_read(value, strlen(value), 0);
+            yyjson_val *vroot = vdoc ? yyjson_doc_get_root(vdoc) : NULL;
+            bool all_strings = vroot && yyjson_is_arr(vroot);
+            size_t idx;
+            size_t max;
+            yyjson_val *el;
+            if (all_strings) {
+                yyjson_arr_foreach(vroot, idx, max, el) {
+                    if (!yyjson_is_str(el)) {
+                        all_strings = false;
+                        break;
+                    }
+                }
+            }
+            if (all_strings) {
+                yyjson_arr_foreach(vroot, idx, max, el) {
+                    yyjson_mut_arr_add_strcpy(out, arr, yyjson_get_str(el));
+                }
+                yyjson_doc_free(vdoc);
+                return;
+            }
+            yyjson_doc_free(vdoc);
         }
         yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
         return;

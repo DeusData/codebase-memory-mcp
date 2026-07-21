@@ -1822,6 +1822,27 @@ TEST(first_response_context_uses_ready_overlay_schema) {
     PASS();
 }
 
+/* cross-repo-intelligence must honor the `name` override exactly like an
+ * indexing call. Previously the mode derived the project from repo_path and
+ * silently matched a different (possibly never-indexed) project than the one
+ * indexed under `name`. The missing-source error must cite the overridden
+ * name, proving the override was used, and must not create a database. */
+TEST(tool_cross_repo_mode_honors_name_override) {
+    cbm_mcp_server_t *srv = setup_mcp_with_data();
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "index_repository",
+        "{\"repo_path\":\"/tmp/cbm-nonexistent-cross-src\",\"mode\":\"cross-repo-intelligence\","
+        "\"name\":\"cross-name-override\",\"target_projects\":[\"*\"]}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "cross-name-override"));
+    ASSERT_NOT_NULL(strstr(resp, "not indexed"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_unknown_tool) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
 
@@ -12774,6 +12795,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_graph_schema_empty);
     RUN_TEST(tool_get_graph_schema_uses_ready_overlay_schema);
     RUN_TEST(first_response_context_uses_ready_overlay_schema);
+    RUN_TEST(tool_cross_repo_mode_honors_name_override);
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_unknown_argument_is_actionable_execution_error);
     RUN_TEST(tool_search_code_legacy_search_in_is_bounded_and_actionable);

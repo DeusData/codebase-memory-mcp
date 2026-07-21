@@ -42,8 +42,16 @@ enum {
 
 static const char *const RN_PROPS_INFRA_MATCH = "{\"source\":\"infra_match\"}";
 static const char *const RN_PROPS_PREFIX_BRIDGE = "{\"source\":\"prefix_decorator_bridge\"}";
+static const char *const RN_PROPS_METHOD_VARIANT = "{\"source\":\"method_variant\"}";
 static const char *const RN_SOURCE_INFRA_MATCH = "\"source\":\"infra_match\"";
 static const char *const RN_SOURCE_PREFIX_BRIDGE = "\"source\":\"prefix_decorator_bridge\"";
+static const char *const RN_SOURCE_METHOD_VARIANT = "\"source\":\"method_variant\"";
+
+/* Concrete HTTP verbs, shared by method-variant rendezvous and the SvelteKit
+ * verb-export mapping ("ANY" is the wildcard method, not a verb). */
+static const char *const RN_HTTP_VERBS[] = {"GET",    "POST",    "PUT", "PATCH",
+                                            "DELETE", "OPTIONS", "HEAD"};
+enum { RN_HTTP_VERB_COUNT = sizeof(RN_HTTP_VERBS) / sizeof(RN_HTTP_VERBS[0]) };
 
 /* True for characters that may appear in a ":name" route parameter. */
 static inline bool is_route_ident_char(char c) {
@@ -148,7 +156,12 @@ bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t 
     const char *qpath = path;
     if (svc == CBM_SVC_HTTP) {
         prefix = method ? method : CBM_ROUTE_DEFAULT_METHOD;
-        qpath = cbm_route_canon_path(path, cpath, sizeof(cpath));
+        /* Strip any "scheme://host[:port]" first so a client-side full URL
+         * ("http://users-svc/api/x") builds the same canonical identity a
+         * server-side registration builds ("/api/x") — otherwise the caller's
+         * Route and the handler's Route never merge. Bare paths pass through
+         * unchanged. Async topics keep scheme-like text ("kafka://orders"). */
+        qpath = cbm_route_canon_path(cbm_pipeline_route_url_path(path), cpath, sizeof(cpath));
     } else if (svc == CBM_SVC_ASYNC) {
         prefix = broker ? broker : CBM_ROUTE_DEFAULT_ASYNC_BROKER;
     } else {
@@ -188,6 +201,11 @@ bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t 
 int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_svc_kind_t svc,
                                           const char *method, const char *broker,
                                           const char *source, const char *file_path) {
+    /* Display name follows the identity: HTTP routes are named by their bare
+     * path, never by a caller's full URL. */
+    if (svc == CBM_SVC_HTTP) {
+        path = cbm_pipeline_route_url_path(path);
+    }
     char route_qn[CBM_ROUTE_QN_SIZE];
     char route_props[CBM_SZ_256];
     if (!cbm_pipeline_build_service_route_identity(path, svc, method, broker, source, route_qn,
@@ -396,7 +414,7 @@ static void route_edge_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
 }
 
 /* Extract URL path from full URL: "https://host/path/" → "/path/" */
-static const char *url_path(const char *url) {
+const char *cbm_pipeline_route_url_path(const char *url) {
     if (!url) {
         return NULL;
     }
@@ -619,7 +637,7 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
             continue;
         }
 
-        const char *infra_path = url_path(infra->name);
+        const char *infra_path = cbm_pipeline_route_url_path(infra->name);
         char svc_buf[CBM_SZ_128];
         const char *svc_name = extract_service_name(infra->name, svc_buf, sizeof(svc_buf));
         if (!infra_path || !svc_name) {
@@ -647,6 +665,43 @@ static void match_infra_routes(cbm_gbuf_t *gb) {
 /* Phase 2a: Ensure all functions with route_path properties have Route+HANDLES edges.
  * During incremental indexing, only changed files get Route nodes from extraction.
  * This pass scans ALL Function/Method nodes and creates missing Route+HANDLES. */
+
+/* Rendezvous with call-minted method variants of the same path. A call site
+ * indexed before this registration mints "__route__GET__/p" (or the ANY
+ * variant when its method is unknown) with no handler, so caller→Route and
+ * handler→Route would split on method. Attach this handler to those variants,
+ * bridging only across ANY: an ANY registration covers every verb variant and
+ * a verb registration covers the ANY variant, but distinct concrete verbs
+ * stay separate (a POST call must not appear handled by a GET-only handler).
+ * Bounded exact-QN lookups; cbm_gbuf_insert_edge deduplicates HANDLES. */
+static void attach_one_method_variant(cbm_gbuf_t *gb, const cbm_gbuf_node_t *func,
+                                      const char *path, const char *variant_method) {
+    char variant_qn[CBM_ROUTE_QN_SIZE];
+    char variant_props[CBM_SZ_256];
+    if (!cbm_pipeline_build_service_route_identity(path, CBM_SVC_HTTP, variant_method, NULL, NULL,
+                                                   variant_qn, sizeof(variant_qn), variant_props,
+                                                   sizeof(variant_props))) {
+        return;
+    }
+    const cbm_gbuf_node_t *variant = cbm_gbuf_find_by_qn(gb, variant_qn);
+    if (variant) {
+        cbm_gbuf_insert_edge(gb, func->id, variant->id, "HANDLES", RN_PROPS_METHOD_VARIANT);
+    }
+}
+
+static void attach_handler_to_method_variants(cbm_gbuf_t *gb, const cbm_gbuf_node_t *func,
+                                              const char *path, const char *method) {
+    if (strcmp(method, CBM_ROUTE_DEFAULT_METHOD) == 0) {
+        /* ANY registration covers every concrete verb variant. */
+        for (int vi = 0; vi < RN_HTTP_VERB_COUNT; vi++) {
+            attach_one_method_variant(gb, func, path, RN_HTTP_VERBS[vi]);
+        }
+    } else {
+        /* A verb registration covers the ANY variant only; distinct concrete
+         * verbs stay separate. */
+        attach_one_method_variant(gb, func, path, CBM_ROUTE_DEFAULT_METHOD);
+    }
+}
 
 /* Process a single Function/Method node: create Route+HANDLES if it has route_path.
  * Returns 1 if a new HANDLES edge was created, 0 otherwise. */
@@ -699,6 +754,7 @@ static int ensure_one_decorator_route(cbm_gbuf_t *gb, const cbm_gbuf_node_t *fun
     snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\"}",
              func->qualified_name ? func->qualified_name : "");
     cbm_gbuf_insert_edge(gb, func->id, route_id, "HANDLES", hprops);
+    attach_handler_to_method_variants(gb, func, path, method);
     return SKIP_ONE;
 }
 
@@ -1372,12 +1428,9 @@ static const char *sveltekit_server_method(const char *name) {
     if (!name) {
         return NULL;
     }
-    static const char *const verbs[] = {
-        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD",
-    };
-    for (size_t i = 0; i < sizeof(verbs) / sizeof(verbs[0]); i++) {
-        if (strcmp(name, verbs[i]) == 0) {
-            return verbs[i];
+    for (int i = 0; i < RN_HTTP_VERB_COUNT; i++) {
+        if (strcmp(name, RN_HTTP_VERBS[i]) == 0) {
+            return RN_HTTP_VERBS[i];
         }
     }
     /* `fallback` catches any verb not explicitly exported. */
@@ -1498,6 +1551,7 @@ void cbm_pipeline_clear_route_derived_edges(cbm_gbuf_t *gb) {
     cbm_gbuf_delete_edges_by_type(gb, "DATA_FLOWS");
     cbm_gbuf_delete_edges_by_type_matching_props(gb, "HANDLES", RN_SOURCE_PREFIX_BRIDGE);
     cbm_gbuf_delete_edges_by_type_matching_props(gb, "HANDLES", RN_SOURCE_INFRA_MATCH);
+    cbm_gbuf_delete_edges_by_type_matching_props(gb, "HANDLES", RN_SOURCE_METHOD_VARIANT);
 }
 
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {

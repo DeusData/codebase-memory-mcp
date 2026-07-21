@@ -61,6 +61,12 @@ bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t 
                                                size_t route_qn_sz, char *route_props,
                                                size_t route_props_sz);
 
+/* Strip "scheme://host[:port]" from a URL, returning the path ("/" when the
+ * URL has no path after the host); bare paths pass through unchanged. Shared
+ * by route minting and cross-repo matching so client-side full URLs and
+ * server-side registrations converge on the same route path. (#523) */
+const char *cbm_pipeline_route_url_path(const char *url);
+
 int64_t cbm_pipeline_upsert_service_route(cbm_gbuf_t *gb, const char *path, cbm_svc_kind_t svc,
                                           const char *method, const char *broker,
                                           const char *source, const char *file_path);

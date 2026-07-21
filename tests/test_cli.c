@@ -7022,6 +7022,29 @@ TEST(cli_build_args_json_repeated_array_issue680) {
     PASS();
 }
 
+/* An array-typed flag whose value is itself JSON array text must be parsed
+ * into its string elements, not wrapped as one literal element. Previously
+ * `--target-projects '["*"]'` produced ["[\"*\"]"]; the cross-repo matcher
+ * then treated that as a literal project name, silently created an empty
+ * database named ["*"].db, and reported success with zero matches. */
+TEST(cli_build_args_json_json_array_value) {
+    char *err = NULL;
+    char *argv[] = {"--target-projects", "[\"*\"]"};
+    char *json = cbm_cli_build_args_json("index_repository", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"target_projects\":[\"*\"]") != NULL);
+    ASSERT(strstr(json, "[\\\"*\\\"]") == NULL);
+    free(json);
+
+    /* JSON-array values and plain values accumulate into one array. */
+    char *argv2[] = {"--target-projects", "[\"a\",\"b\"]", "--target-projects", "c"};
+    json = cbm_cli_build_args_json("index_repository", 4, argv2, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"target_projects\":[\"a\",\"b\",\"c\"]") != NULL);
+    free(json);
+    PASS();
+}
+
 /* kebab-case flag names map to snake_case JSON keys. */
 TEST(cli_build_args_json_kebab_to_snake_issue680) {
     char *err = NULL;
@@ -7455,6 +7478,7 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_json_array_value);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
