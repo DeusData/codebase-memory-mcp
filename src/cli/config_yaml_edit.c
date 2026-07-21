@@ -500,6 +500,30 @@ static int yaml_lock_acquire(const char *path, yaml_config_lock_t *lock) {
     return 0;
 }
 
+int cbm_yaml_remove_lock_sidecar(const char *file_path) {
+    char *lock_path = NULL;
+    if (yaml_build_lock_path(file_path, &lock_path) != 0) {
+        return YAML_ERROR;
+    }
+#ifdef _WIN32
+    /* Windows locks are delete-on-close directories; nothing persists. */
+    free(lock_path);
+    return 0;
+#else
+    struct stat state;
+    int result = 0;
+    if (lstat(lock_path, &state) != 0) {
+        result = 0; /* already absent */
+    } else if (!yaml_lock_file_state_is_safe(&state)) {
+        result = YAML_ERROR; /* symlink or foreign file: preserve it */
+    } else if (unlink(lock_path) != 0) {
+        result = YAML_ERROR;
+    }
+    free(lock_path);
+    return result;
+#endif
+}
+
 static int yaml_lock_release(yaml_config_lock_t *lock) {
     int result = YAML_ERROR;
 #ifdef _WIN32

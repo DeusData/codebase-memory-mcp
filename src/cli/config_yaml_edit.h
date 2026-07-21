@@ -47,6 +47,13 @@ extern "C" {
  * comments remain user-owned and are preserved. Callers must not use a key
  * whose child fields should remain independently user-owned.
  */
+/* Remove the persistent ".cbm-yaml.lock" sidecar beside file_path. The
+ * sidecar is deliberately reused across edits; call this only when management
+ * of the file ends (uninstall). An absent sidecar is a successful no-op; an
+ * unsafe sidecar (symlink, foreign owner or mode) is preserved and reported
+ * as an error. */
+int cbm_yaml_remove_lock_sidecar(const char *file_path);
+
 int cbm_yaml_upsert_mapping_entry(const char *file_path, const char *section_key,
                                   const char *entry_key, const char *entry_block);
 int cbm_yaml_remove_mapping_entry(const char *file_path, const char *section_key,
