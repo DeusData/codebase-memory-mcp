@@ -1241,6 +1241,239 @@ TEST(discover_nested_gitignore_stacks_with_root) {
     PASS();
 }
 
+/* ── Shebang fallback for extensionless scripts (issue #1199) ────── */
+
+/* Language detected for a discovered file by relative path, or CBM_LANG_COUNT
+ * if the file was not indexed. */
+static CBMLanguage discover_lang_of(const cbm_file_info_t *files, int count, const char *rel) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel) == 0) {
+            return files[i].language;
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
+/* Write raw bytes (may contain embedded NUL) to base/rel. Parent must exist. */
+static int write_bytes_file(const char *path, const void *data, size_t n) {
+    FILE *f = cbm_fopen(path, "wb");
+    if (!f) {
+        return -1;
+    }
+    size_t w = fwrite(data, 1, n, f);
+    fclose(f);
+    return w == n ? 0 : -1;
+}
+
+/* Discover a single file with the given first-line content and report the
+ * language it was classified as via *out_lang (CBM_LANG_COUNT if unindexed).
+ * Returns true only when temp-dir creation, the file write, and discovery all
+ * succeeded, so callers can assert setup success before asserting the language
+ * -- otherwise a negative expectation (CBM_LANG_COUNT) could pass vacuously
+ * when setup silently failed. */
+static bool shebang_probe(const char *prefix, const char *rel, const char *content,
+                          CBMLanguage *out_lang) {
+    *out_lang = CBM_LANG_COUNT;
+    char *base = th_mktempdir(prefix);
+    if (!base) {
+        return false;
+    }
+    bool ok = false;
+    if (th_write_file(TH_PATH(base, rel), content) == 0) {
+        cbm_discover_opts_t opts = {0};
+        cbm_file_info_t *files = NULL;
+        int count = 0;
+        if (cbm_discover(base, &opts, &files, &count) == 0) {
+            *out_lang = discover_lang_of(files, count, rel);
+            ok = true;
+        }
+        cbm_discover_free(files, count);
+    }
+    th_cleanup(base);
+    return ok;
+}
+
+TEST(shebang_direct_python_path) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_dpy", "bin/run", "#!/usr/bin/python3\nprint(1)\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_PYTHON);
+    PASS();
+}
+
+TEST(shebang_env_python) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_epy", "bin/run", "#!/usr/bin/env python3\nprint(1)\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_PYTHON);
+    PASS();
+}
+
+TEST(shebang_env_split_string_python_args) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_spy", "bin/run", "#!/usr/bin/env -S python3 -u\nprint(1)\n",
+                         &lang));
+    ASSERT_EQ(lang, CBM_LANG_PYTHON);
+    PASS();
+}
+
+TEST(shebang_versioned_python) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_vpy", "bin/run", "#!/usr/bin/python3.12\nprint(1)\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_PYTHON);
+    PASS();
+}
+
+TEST(shebang_bash_direct) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_bash", "bin/run", "#!/bin/bash\necho hi\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_BASH);
+    PASS();
+}
+
+TEST(shebang_env_node_javascript) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_node", "bin/run", "#!/usr/bin/env node\nconsole.log(1)\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_JAVASCRIPT);
+    PASS();
+}
+
+TEST(shebang_crlf_first_line) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_crlf", "bin/run", "#!/usr/bin/env python3\r\nprint(1)\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_PYTHON);
+    PASS();
+}
+
+/* Recognized extension stays authoritative even with a conflicting shebang. */
+TEST(shebang_extension_authoritative) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_ext", "weird.py", "#!/bin/bash\nprint(1)\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_PYTHON);
+    PASS();
+}
+
+/* Special filename stays authoritative even with a conflicting shebang. */
+TEST(shebang_special_filename_authoritative) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_mk", "Makefile", "#!/usr/bin/env python3\nall:\n\techo\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_MAKEFILE);
+    PASS();
+}
+
+TEST(shebang_plain_text_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_txt", "notes", "just some plain text\nno shebang here\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(shebang_malformed_unindexed) {
+    /* Missing '!' — not a shebang. */
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_mal", "notes", "#/usr/bin/python3\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(shebang_unknown_interpreter_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_unk", "notes", "#!/usr/bin/frobnicate\ndata\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+/* Guard against arbitrary prefix matches (python-wrapper must NOT map). */
+TEST(shebang_prefix_not_matched_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_pw", "notes", "#!/usr/bin/python-wrapper\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+/* Numeric version components must be non-empty (reject trailing/doubled dots). */
+TEST(shebang_malformed_python_version_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_pdot", "notes", "#!/usr/bin/python3.\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    ASSERT(shebang_probe("cbm_sb_pddot", "notes", "#!/usr/bin/python3..12\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+/* env NAME=value assignment (with a slash in the value) must NOT be mistaken
+ * for an interpreter: env would set the var, not run "python" (issue #1199,
+ * Finding 2). */
+TEST(shebang_env_assignment_not_matched_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_asn", "notes",
+                         "#!/usr/bin/env PYTHON=/usr/bin/python python-wrapper\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    /* Same shape behind -S must also stay unindexed. */
+    ASSERT(shebang_probe("cbm_sb_asn2", "notes",
+                         "#!/usr/bin/env -S PYTHON=/usr/bin/python python\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+/* Unsupported env option forms (a leading '-' token that is not -S/
+ * --split-string) must stay unindexed rather than be treated as the
+ * interpreter (issue #1199, Finding 2). */
+TEST(shebang_env_unsupported_option_unindexed) {
+    CBMLanguage lang;
+    ASSERT(shebang_probe("cbm_sb_eopt", "notes", "#!/usr/bin/env -i python3\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    ASSERT(shebang_probe("cbm_sb_eopt2", "notes", "#!/usr/bin/env -S -i python3\nx\n", &lang));
+    ASSERT_EQ(lang, CBM_LANG_COUNT);
+    PASS();
+}
+
+TEST(shebang_embedded_nul_unindexed) {
+    char *base = th_mktempdir("cbm_sb_nul");
+    ASSERT(base != NULL);
+    /* NUL embedded within the first line -> fail closed. */
+    static const char bytes[] = "#!/usr/bin/py\0thon3\nprint(1)\n";
+    ASSERT_EQ(write_bytes_file(TH_PATH(base, "run"), bytes, sizeof(bytes) - 1), 0);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "run"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* A first line longer than the bounded read window (255 bytes) with no
+ * newline inside that window must fail closed even when it begins with an
+ * otherwise-valid Python shebang: the interpreter token is truncated, so the
+ * file must remain unindexed (issue #1199, Finding 1). */
+TEST(shebang_oversized_first_line_unindexed) {
+    char *base = th_mktempdir("cbm_sb_long");
+    ASSERT(base != NULL);
+
+    /* "#!/usr/bin/python3 " + padding to push the newline past byte 255. */
+    char content[512];
+    int off = snprintf(content, sizeof(content), "#!/usr/bin/python3 ");
+    ASSERT(off > 0 && off < (int)sizeof(content));
+    for (int i = off; i < 400; i++) {
+        content[i] = 'a';
+    }
+    content[400] = '\n';
+    content[401] = '\0';
+    ASSERT_EQ(write_bytes_file(TH_PATH(base, "run"), content, 401), 0);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "run"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -1311,6 +1544,26 @@ SUITE(discover) {
     RUN_TEST(pattern_spec);
     RUN_TEST(pattern_stories);
     RUN_TEST(pattern_dts_full);
+
+    /* Shebang fallback for extensionless scripts (issue #1199) */
+    RUN_TEST(shebang_direct_python_path);
+    RUN_TEST(shebang_env_python);
+    RUN_TEST(shebang_env_split_string_python_args);
+    RUN_TEST(shebang_versioned_python);
+    RUN_TEST(shebang_bash_direct);
+    RUN_TEST(shebang_env_node_javascript);
+    RUN_TEST(shebang_crlf_first_line);
+    RUN_TEST(shebang_extension_authoritative);
+    RUN_TEST(shebang_special_filename_authoritative);
+    RUN_TEST(shebang_plain_text_unindexed);
+    RUN_TEST(shebang_malformed_unindexed);
+    RUN_TEST(shebang_unknown_interpreter_unindexed);
+    RUN_TEST(shebang_prefix_not_matched_unindexed);
+    RUN_TEST(shebang_malformed_python_version_unindexed);
+    RUN_TEST(shebang_env_assignment_not_matched_unindexed);
+    RUN_TEST(shebang_env_unsupported_option_unindexed);
+    RUN_TEST(shebang_embedded_nul_unindexed);
+    RUN_TEST(shebang_oversized_first_line_unindexed);
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
