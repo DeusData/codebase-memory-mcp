@@ -2709,6 +2709,10 @@ static int jl_decode_field_string(const char *text, size_t start, size_t end,
 static bool jl_field_shape_matches(const char *text, const jl_member_t *member,
                                    cbm_json_like_value_shape_t shape, char **decoded_out) {
     *decoded_out = NULL;
+    if (shape == CBM_JSON_LIKE_VALUE_TRUE) {
+        return member->value_end - member->value_start == 4U &&
+               memcmp(text + member->value_start, "true", 4U) == 0;
+    }
     if (shape == CBM_JSON_LIKE_VALUE_EMPTY_ARRAY) {
         if (member->value_start >= member->value_end || text[member->value_start] != '[') {
             return false;
@@ -2747,11 +2751,12 @@ int cbm_json_like_match_object_entry(const char *document, size_t document_lengt
     size_t capture_count = 0U;
     for (size_t i = 0U; i < field_count; ++i) {
         if (!fields[i].key || fields[i].key[0] == '\0' ||
-            fields[i].shape > CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY ||
+            fields[i].shape > CBM_JSON_LIKE_VALUE_TRUE ||
             (fields[i].flags &
              ~(CBM_JSON_LIKE_FIELD_REQUIRED | CBM_JSON_LIKE_FIELD_CAPTURE_STRING)) != 0U ||
             ((fields[i].flags & CBM_JSON_LIKE_FIELD_CAPTURE_STRING) != 0U &&
-             fields[i].shape == CBM_JSON_LIKE_VALUE_EMPTY_ARRAY)) {
+             (fields[i].shape == CBM_JSON_LIKE_VALUE_EMPTY_ARRAY ||
+              fields[i].shape == CBM_JSON_LIKE_VALUE_TRUE))) {
             return -1;
         }
         capture_count += (fields[i].flags & CBM_JSON_LIKE_FIELD_CAPTURE_STRING) != 0U ? 1U : 0U;

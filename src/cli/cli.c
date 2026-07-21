@@ -883,7 +883,7 @@ static char *cbm_build_json_mcp_entry(const char *binary_path, cbm_json_mcp_sche
 }
 
 static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const char *argument,
-                                            cbm_json_like_object_field_t fields[3]) {
+                                            cbm_json_like_object_field_t fields[4]) {
     fields[0] = (cbm_json_like_object_field_t){
         .key = "command",
         .shape = cbm_json_mcp_command_is_array(schema) ? CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY
@@ -898,17 +898,26 @@ static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const 
         .expected_string = argument,
         .flags = argument ? CBM_JSON_LIKE_FIELD_REQUIRED : 0U,
     };
+    /* Pre-consolidation installer releases wrote an extra "enabled": true
+     * member; accept that exact released shape so upgrades and uninstalls
+     * recognize their own prior entries (command ownership still required). */
+    size_t count = 2U;
     const char *type = cbm_json_mcp_required_type(schema);
-    if (!type) {
-        return 2U;
+    if (type) {
+        fields[count++] = (cbm_json_like_object_field_t){
+            .key = "type",
+            .shape = CBM_JSON_LIKE_VALUE_STRING,
+            .expected_string = type,
+            .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+        };
     }
-    fields[2] = (cbm_json_like_object_field_t){
-        .key = "type",
-        .shape = CBM_JSON_LIKE_VALUE_STRING,
-        .expected_string = type,
-        .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+    fields[count++] = (cbm_json_like_object_field_t){
+        .key = "enabled",
+        .shape = CBM_JSON_LIKE_VALUE_TRUE,
+        .expected_string = NULL,
+        .flags = 0U,
     };
-    return 3U;
+    return count;
 }
 
 static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary) {
@@ -926,7 +935,7 @@ static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document
                                            const char *const *object_path, size_t path_len,
                                            cbm_json_mcp_schema_t schema, const char *entry_name,
                                            const char *argument, const char *expected_binary) {
-    cbm_json_like_object_field_t fields[3];
+    cbm_json_like_object_field_t fields[4];
     size_t field_count = cbm_json_mcp_ownership_fields(schema, argument, fields);
     char *command = NULL;
     int result = cbm_json_like_match_object_entry(document, document_length, object_path, path_len,

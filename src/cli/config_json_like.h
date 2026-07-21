@@ -47,6 +47,9 @@ typedef enum {
     CBM_JSON_LIKE_VALUE_STRING,
     CBM_JSON_LIKE_VALUE_EMPTY_ARRAY,
     CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY,
+    /* Matches exactly the literal `true`; used to recognize the released
+     * legacy "enabled": true member in installer-owned MCP entries. */
+    CBM_JSON_LIKE_VALUE_TRUE,
 } cbm_json_like_value_shape_t;
 
 enum {
