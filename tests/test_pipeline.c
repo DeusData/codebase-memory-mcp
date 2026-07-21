@@ -1596,6 +1596,117 @@ cleanup:
     return ok;
 }
 
+/* A caller whose HTTP call uses a FULL URL literal must join the same
+ * canonical Route node the handler HANDLES. Previously route minting used the
+ * raw url_path, so "http://users-svc:5000/api/users" minted a second Route
+ * distinct from the registration's "/api/users": caller→Route and
+ * handler→Route never met and the cross-service join query returned nothing. */
+static int pipeline_full_url_call_joins_canonical_route_case(void) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_url_route_join_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+
+    write_temp_file(tmp, "service/app.py",
+                    "from flask import Flask, jsonify\n\n"
+                    "app = Flask(__name__)\n\n\n"
+                    "@app.route(\"/api/users\", methods=[\"GET\"])\n"
+                    "def get_users():\n"
+                    "    return jsonify([])\n");
+    write_temp_file(tmp, "client/consumer.py",
+                    "import requests\n\n\n"
+                    "def fetch_users():\n"
+                    "    return requests.get(\"http://users-svc:5000/api/users\").json()\n");
+
+    char db_path[CBM_PATH_MAX];
+    int n = snprintf(db_path, sizeof(db_path), "%s/urljoin.db", tmp);
+    int ok = n > 0 && (size_t)n < sizeof(db_path);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    cbm_store_t *store = NULL;
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_edge_t *http_edges = NULL;
+    int http_count = 0;
+    cbm_edge_t *handles_edges = NULL;
+    int handles_count = 0;
+    const char *project = NULL;
+    if (!pipeline || cbm_pipeline_run(pipeline) != 0) {
+        ok = 0;
+        goto cleanup;
+    }
+
+    store = cbm_store_open_path(db_path);
+    project = cbm_pipeline_project_name(pipeline);
+    if (!store) {
+        ok = 0;
+        goto cleanup;
+    }
+
+    /* No Route node may embed a scheme/authority. */
+    if (cbm_store_find_nodes_by_label(store, project, "Route", &routes, &route_count) !=
+            CBM_STORE_OK ||
+        route_count < 1) {
+        ok = 0;
+        goto cleanup;
+    }
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].name && strstr(routes[i].name, "://")) {
+            ok = 0;
+        }
+    }
+
+    /* The join: at least one HTTP_CALLS edge must target the same Route node
+     * that a HANDLES edge targets, and that Route must be "/api/users". */
+    if (cbm_store_find_edges_by_type(store, project, "HTTP_CALLS", &http_edges, &http_count) !=
+            CBM_STORE_OK ||
+        cbm_store_find_edges_by_type(store, project, "HANDLES", &handles_edges, &handles_count) !=
+            CBM_STORE_OK) {
+        ok = 0;
+        goto cleanup;
+    }
+    bool joined = false;
+    for (int i = 0; i < http_count && !joined; i++) {
+        for (int j = 0; j < handles_count && !joined; j++) {
+            if (http_edges[i].target_id != handles_edges[j].target_id) {
+                continue;
+            }
+            cbm_node_t route = {0};
+            if (cbm_store_find_node_by_id(store, http_edges[i].target_id, &route) ==
+                    CBM_STORE_OK &&
+                route.name && strcmp(route.name, "/api/users") == 0) {
+                joined = true;
+            }
+            cbm_node_free_fields(&route);
+        }
+    }
+    if (!joined) {
+        ok = 0;
+    }
+
+cleanup:
+    if (!ok && store) {
+        fprintf(stderr, "  [URL-JOIN] routes=%d http=%d handles=%d\n", route_count, http_count,
+                handles_count);
+        for (int i = 0; i < route_count; i++) {
+            fprintf(stderr, "    route name=%s qn=%s\n", routes[i].name ? routes[i].name : "<null>",
+                    routes[i].qualified_name ? routes[i].qualified_name : "<null>");
+        }
+    }
+    cbm_store_free_edges(http_edges, http_count);
+    cbm_store_free_edges(handles_edges, handles_count);
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    return ok;
+}
+
+TEST(pipeline_full_url_call_joins_canonical_route) {
+    ASSERT_TRUE(pipeline_full_url_call_joins_canonical_route_case());
+    PASS();
+}
+
 TEST(pipeline_route_discovery_uses_canonical_identities_sequential) {
     ASSERT_TRUE(pipeline_route_discovery_uses_canonical_identities_case(false));
     PASS();
@@ -17911,6 +18022,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_full_and_incremental_persist_file_state);
     RUN_TEST(pipeline_incremental_full_index_rebuilds_owner_metadata);
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_full_url_call_joins_canonical_route);
     RUN_TEST(pipeline_route_discovery_uses_canonical_identities_sequential);
     RUN_TEST(pipeline_route_discovery_uses_canonical_identities_parallel);
     RUN_TEST(pipeline_httplink_collection_has_no_fixed_item_ceiling);

@@ -7,6 +7,8 @@
 
 #include "store/store.h"
 
+#include <stdbool.h>
+
 /* Result of a cross-repo matching run. */
 typedef struct {
     int http_edges;    /* CROSS_HTTP_CALLS edges created */
@@ -16,6 +18,8 @@ typedef struct {
     int graphql_edges; /* CROSS_GRAPHQL_CALLS edges created */
     int trpc_edges;    /* CROSS_TRPC_CALLS edges created */
     int projects_scanned;
+    int targets_missing; /* named targets with no indexed .db (skipped) */
+    bool source_missing; /* source project has no indexed .db (nothing ran) */
     double elapsed_ms;
 } cbm_cross_repo_result_t;
 
@@ -24,8 +28,9 @@ typedef struct {
  * indexed projects. Writes CROSS_* edges bidirectionally into both the
  * source and target project DBs.
  *
- * `project` must already be indexed (its .db must exist).
- * Returns result with edge counts. */
+ * `project` must already be indexed (its .db must exist): a missing source
+ * sets source_missing and runs nothing; a missing named target is skipped and
+ * counted in targets_missing. Neither creates a database. */
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count);
 

@@ -134,24 +134,6 @@ static void insert_cross_edge(cbm_store_t *store, const char *project, int64_t f
     cbm_store_insert_edge(store, &edge);
 }
 
-/* Strip "scheme://host[:port]" from a stored HTTP_CALLS url, returning the
- * path. url_path property values are stored raw from the call's first string
- * argument, so they can be full URLs ("scheme://host:port/v2/x") — and
- * cbm_route_canon_path only canonicalizes placeholder syntax, never strips
- * authorities. Returns "/" for a URL with no path after the host (a request
- * against the bare base URL targets the root route). (#523) */
-static const char *cr_url_path(const char *url) {
-    if (!url) {
-        return url;
-    }
-    const char *scheme_end = strstr(url, "://");
-    if (!scheme_end) {
-        return url; /* already a bare path */
-    }
-    const char *path_start = strchr(scheme_end + CR_SCHEME_SKIP, '/');
-    return path_start ? path_start : "/";
-}
-
 /* Look up a node's name and file_path by id. */
 static void lookup_node_info(struct sqlite3 *db, int64_t node_id, char *name_out, size_t name_sz,
                              char *file_out, size_t file_sz) {
@@ -419,7 +401,7 @@ static int match_http_routes(cbm_store_t *src_store, const char *src_project,
             continue;
         }
 
-        const char *route_path = cr_url_path(url_path);
+        const char *route_path = cbm_pipeline_route_url_path(url_path);
         char canonical_path[CBM_SZ_256];
         cbm_route_canon_path(route_path, canonical_path, sizeof(canonical_path));
         char route_qn[CBM_ROUTE_QN_SIZE];
@@ -772,9 +754,16 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
     struct timespec t0;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    /* Open source project store (read-write) */
+    /* Open source project store (read-write). Opening creates a missing
+     * database, so check existence first: a never-indexed name (for example a
+     * typo or a mis-quoted target list) must be reported, not satisfied by a
+     * silently created empty store. */
     char src_path[CR_PATH_BUF];
     cr_db_path(project, src_path, sizeof(src_path));
+    if (!cbm_file_exists(src_path)) {
+        result.source_missing = true;
+        return result;
+    }
     cbm_store_t *src_store = cbm_store_open_path(src_path);
     if (!src_store) {
         return result;
@@ -805,6 +794,13 @@ cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **t
 
         char tgt_path[CR_PATH_BUF];
         cr_db_path(tgt, tgt_path, sizeof(tgt_path));
+
+        /* Skip never-indexed targets instead of creating an empty database
+         * for them; report the miss so callers can surface it. */
+        if (!cbm_file_exists(tgt_path)) {
+            result.targets_missing++;
+            continue;
+        }
 
         /* Open target store read-write (for bidirectional edge writes) */
         cbm_store_t *tgt_store = cbm_store_open_path(tgt_path);

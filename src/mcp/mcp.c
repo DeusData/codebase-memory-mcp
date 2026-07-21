@@ -10891,9 +10891,28 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
 
 /* ── index_repository ─────────────────────────────────────────── */
 
-/* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
-static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
-    char *project = heap_strdup(cbm_project_name_from_path(repo_path));
+/* Handle mode="cross-repo-intelligence" — extract to reduce complexity.
+ * name_override (may be NULL) selects the same project a prior
+ * index_repository call with that name wrote; otherwise the project name is
+ * derived from repo_path exactly like a name-less indexing call. */
+static char *handle_cross_repo_mode(const char *repo_path, const char *name_override,
+                                    const char *args) {
+    char *project = NULL;
+    if (name_override && name_override[0]) {
+        project = cbm_project_name_from_path(name_override);
+        if (!project || !cbm_validate_project_name(project)) {
+            free(project);
+            return cbm_mcp_text_result(
+                "{\"error\":\"invalid name for cross-repo-intelligence mode\","
+                "\"hint\":\"Pass the same name used when indexing, or omit name to use "
+                "the project derived from repo_path.\"}",
+                true);
+        }
+    } else {
+        /* cbm_project_name_from_path returns owned memory; the previous
+         * heap_strdup wrapper leaked the inner allocation. */
+        project = cbm_project_name_from_path(repo_path);
+    }
     if (!project) {
         return cbm_mcp_text_result("cannot derive project name", true);
     }
@@ -10925,6 +10944,18 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     free(targets);
     yyjson_doc_free(jdoc);
 
+    if (result.source_missing) {
+        char msg[CBM_SZ_512];
+        snprintf(msg, sizeof(msg),
+                 "{\"error\":\"project '%s' is not indexed; cross-repo-intelligence matches "
+                 "existing indexes only\",\"hint\":\"Run index_repository on this repo_path "
+                 "(with the same name, if any) first, then rerun cross-repo-intelligence. "
+                 "Run list_projects to see indexed projects.\"}",
+                 project);
+        free(project);
+        return cbm_mcp_text_result(msg, true);
+    }
+
     int total = result.http_edges + result.async_edges + result.channel_edges + result.grpc_edges +
                 result.graphql_edges + result.trpc_edges;
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
@@ -10934,6 +10965,9 @@ static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
     yyjson_mut_obj_add_str(doc, root, "mode", "cross-repo-intelligence");
     yyjson_mut_obj_add_strcpy(doc, root, "project", project);
     yyjson_mut_obj_add_int(doc, root, "projects_scanned", result.projects_scanned);
+    if (result.targets_missing > 0) {
+        yyjson_mut_obj_add_int(doc, root, "targets_missing", result.targets_missing);
+    }
     yyjson_mut_obj_add_int(doc, root, "cross_http_calls", result.http_edges);
     yyjson_mut_obj_add_int(doc, root, "cross_async_calls", result.async_edges);
     yyjson_mut_obj_add_int(doc, root, "cross_channel", result.channel_edges);
@@ -11729,8 +11763,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         free(mode_str);
+        char *result = handle_cross_repo_mode(repo_path, name_override, args);
         free(name_override);
-        char *result = handle_cross_repo_mode(repo_path, args);
         free(repo_path);
         CBM_PROF_END("index_repository", "cross_repo_mode", prof_index_args);
         CBM_PROF_END("index_repository", "TOTAL", prof_index_total);
