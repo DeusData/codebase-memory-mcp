@@ -614,7 +614,11 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
 static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
     CBMLanguage lang = cbm_language_for_filename(entry_name);
     if (lang == CBM_LANG_COUNT) {
-        return CBM_LANG_COUNT;
+        /* Filename/extension detection failed: fall back to a conservative
+         * shebang probe so extensionless scripts get indexed (#1199). Filename
+         * detection stays authoritative — this runs only when it returns
+         * unknown. */
+        return cbm_language_from_shebang(abs_path);
     }
     /* Special: .m files need content-based disambiguation */
     const char *dot = strrchr(entry_name, '.');
