@@ -378,6 +378,38 @@ TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar) {
     PASS();
 }
 
+/* The persistent lock sidecar is reused across edits by design, but an
+ * uninstall must not leave it behind. cbm_yaml_remove_lock_sidecar removes a
+ * safe sidecar, treats an absent one as success, and refuses a symlink. */
+TEST(config_yaml_edit_remove_lock_sidecar) {
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, "model: fast\n"), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), 0);
+    char lock_path[1024];
+    ASSERT(snprintf(lock_path, sizeof(lock_path), "%s.cbm-yaml.lock", fixture.path) > 0);
+    struct stat state;
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+
+    ASSERT_EQ(cbm_yaml_remove_lock_sidecar(fixture.path), 0);
+    ASSERT(lstat(lock_path, &state) != 0);
+
+    /* Absent sidecar: success (idempotent). */
+    ASSERT_EQ(cbm_yaml_remove_lock_sidecar(fixture.path), 0);
+
+    /* Symlinked sidecar: refuse and preserve. */
+    char decoy[1024];
+    ASSERT(snprintf(decoy, sizeof(decoy), "%s.decoy", fixture.path) > 0);
+    ASSERT_EQ(th_write_file(decoy, "keep\n"), 0);
+    ASSERT_EQ(symlink(decoy, lock_path), 0);
+    ASSERT(cbm_yaml_remove_lock_sidecar(fixture.path) != 0);
+    ASSERT_EQ(lstat(lock_path, &state), 0);
+    ASSERT_EQ(lstat(decoy, &state), 0);
+
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_rejects_symlink_lock_sidecar) {
     const char *original = "model: fast\n";
     yaml_fixture_t fixture;
@@ -1561,6 +1593,7 @@ SUITE(config_yaml_edit) {
 #ifndef _WIN32
     RUN_TEST(config_yaml_edit_lock_postcreate_verification_failure_preserves_unsafe_sidecar);
     RUN_TEST(config_yaml_edit_reuses_persistent_safe_lock_sidecar);
+    RUN_TEST(config_yaml_edit_remove_lock_sidecar);
     RUN_TEST(config_yaml_edit_rejects_symlink_lock_sidecar);
     RUN_TEST(config_yaml_edit_rejects_hard_linked_lock_sidecar);
     RUN_TEST(config_yaml_edit_rejects_unsafe_mode_lock_sidecar);

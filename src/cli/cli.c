@@ -8564,6 +8564,9 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
             if (cbm_remove_instructions(ip) != CLI_OK) {
                 record_agent_config_error(true, "Aider", "instructions_uninstall", ip);
             }
+            /* Management of this config ends here; drop the persistent lock
+             * sidecar the YAML editor reuses across edits. */
+            (void)cbm_yaml_remove_lock_sidecar(cp);
         }
         printf("Aider: removed instructions + loader reference\n");
     }
@@ -8802,6 +8805,11 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Hermes", cp, NULL}, dry_run,
                                   cbm_remove_hermes_mcp_owned);
         uninstall_agent_skill("Hermes", skills_dir, dry_run);
+        if (!dry_run) {
+            /* Management of this config ends here; drop the persistent lock
+             * sidecar the YAML editor reuses across edits. */
+            (void)cbm_yaml_remove_lock_sidecar(cp);
+        }
     }
     if (agents->openhands) {
         char cp[CLI_BUF_1K];
