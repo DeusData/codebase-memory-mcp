@@ -2671,6 +2671,58 @@ TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries) {
     PASS();
 }
 
+/* A pre-consolidation installer release wrote local-array MCP entries with an
+ * extra "enabled": true member: {"enabled":true,"type":"local","command":[bin]}.
+ * Upsert must recognize that exact released shape as installer-owned and
+ * rewrite it canonically, and owned removal must delete it; an entry with
+ * "enabled": false is user-modified and must still be refused. */
+TEST(cli_json_mcp_migrates_legacy_enabled_true_entry) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-legacy-enabled-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_path[768];
+    snprintf(config_path, sizeof(config_path), "%s/kilo.jsonc", tmpdir);
+    char binary[768];
+    snprintf(binary, sizeof(binary), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+
+    char legacy[1600];
+    snprintf(legacy, sizeof(legacy),
+             "{\n  \"mcp\": {\n    \"codebase-memory-mcp\": {\n      \"enabled\": true,\n"
+             "      \"type\": \"local\",\n      \"command\": [\"%s\"]\n    }\n  }\n}\n",
+             binary);
+    ASSERT_EQ(write_test_file(config_path, legacy), 0);
+    ASSERT_EQ(cbm_upsert_opencode_mcp(binary, config_path), 0);
+
+    const char *contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "\"enabled\"") == NULL);
+    ASSERT(strstr(contents, binary) != NULL);
+
+    /* Owned removal must also recognize the legacy released shape. */
+    ASSERT_EQ(write_test_file(config_path, legacy), 0);
+    ASSERT_EQ(cbm_remove_opencode_mcp_owned(binary, config_path), 0);
+    contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "codebase-memory-mcp\"") == NULL || strstr(contents, binary) == NULL);
+
+    /* "enabled": false was never a released shape: refuse to overwrite it. */
+    char modified[1600];
+    snprintf(modified, sizeof(modified),
+             "{\n  \"mcp\": {\n    \"codebase-memory-mcp\": {\n      \"enabled\": false,\n"
+             "      \"type\": \"local\",\n      \"command\": [\"%s\"]\n    }\n  }\n}\n",
+             binary);
+    ASSERT_EQ(write_test_file(config_path, modified), 0);
+    ASSERT(cbm_upsert_opencode_mcp(binary, config_path) != 0);
+    contents = read_test_file(config_path);
+    ASSERT_NOT_NULL(contents);
+    ASSERT(strstr(contents, "\"enabled\": false") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* issue #222: Cursor (~/.cursor/) must be detected so install/update registers
  * the MCP server in ~/.cursor/mcp.json — previously it was never discovered. */
 TEST(cli_detect_agents_finds_cursor_issue222) {
@@ -7245,6 +7297,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_standalone_kilo_install_plan_and_uninstall_preserve_foreign_entries);
+    RUN_TEST(cli_json_mcp_migrates_legacy_enabled_true_entry);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_reference_harnesses_are_planned_without_mutation);
