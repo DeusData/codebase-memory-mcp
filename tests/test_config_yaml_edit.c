@@ -1366,6 +1366,32 @@ TEST(config_yaml_edit_nested_sequence_creates_missing_file_section_and_list) {
     PASS();
 }
 
+TEST(config_yaml_edit_nested_sequence_preserves_unrelated_flow_sequence) {
+    const char *initial = "plugins:\n"
+                          "  enabled: []\n"
+                          "mcp_servers:\n"
+                          "  codebase-memory-mcp:\n"
+                          "    command: \"/opt/codebase-memory-mcp\"\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+
+    ASSERT_EQ(cbm_yaml_upsert_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    char *installed = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(installed);
+    ASSERT_NOT_NULL(strstr(installed, "plugins:\n  enabled: []\n"));
+    ASSERT_NOT_NULL(strstr(installed, "mcp_servers:\n"
+                                      "  codebase-memory-mcp:\n"
+                                      "    command: \"/opt/codebase-memory-mcp\"\n"));
+    ASSERT_NOT_NULL(strstr(installed, "hooks:\n"
+                                      "  pre_llm_call:\n"
+                                      "    - id: \"codebase-memory-mcp\"\n"));
+    free(installed);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_preserves_crlf) {
     const char *initial = "hooks:\r\n"
                           "  pre_llm_call:\r\n"
@@ -1568,6 +1594,7 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_list_ambiguity_fails_unchanged);
     RUN_TEST(config_yaml_edit_nested_sequence_preserves_siblings_comments_and_is_idempotent);
     RUN_TEST(config_yaml_edit_nested_sequence_creates_missing_file_section_and_list);
+    RUN_TEST(config_yaml_edit_nested_sequence_preserves_unrelated_flow_sequence);
     RUN_TEST(config_yaml_edit_nested_sequence_preserves_crlf);
     RUN_TEST(config_yaml_edit_nested_sequence_foreign_identity_is_preserved);
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);

@@ -2371,7 +2371,11 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
         if (value == '#' && (i == start || doc->data[i - YAML_UNIT] == ' ')) {
             break;
         }
-        if (value == '[' || value == ']' || value == '|' || value == '>') {
+        /* Flow sequences do not alter indentation or mapping boundaries, so
+         * unrelated settings such as Hermes' `plugins.enabled: []` are safe
+         * to preserve while editing hooks.pre_llm_call. Block scalars can
+         * absorb later lines, so they remain unsupported and fail closed. */
+        if (value == '|' || value == '>') {
             return YAML_MATCH;
         }
     }
