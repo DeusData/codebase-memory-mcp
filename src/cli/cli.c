@@ -6102,10 +6102,16 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
             access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
         char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
                                                    profiles.binary_path);
-        const char *released[2];
+        char *legacy_codex = profiles.dialect == CBM_GRAPH_DIALECT_CODEX
+                                 ? cbm_render_legacy_codex_graph_profile(tier)
+                                 : NULL;
+        const char *released[3];
         size_t released_count = 0U;
         if (alternate) {
             released[released_count++] = alternate;
+        }
+        if (legacy_codex) {
+            released[released_count++] = legacy_codex;
         }
         if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
             released[released_count++] = profiles.legacy_verify_content;
@@ -6113,6 +6119,7 @@ static void install_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, boo
         int result = prepare_config_parent(path)
                          ? cbm_text_migrate_owned_document(path, current, released, released_count)
                          : CLI_ERR;
+        free(legacy_codex);
         free(alternate);
         free(current);
         if (result != CLI_OK) {
@@ -6149,15 +6156,22 @@ static void uninstall_tiered_agent_profiles(cbm_tiered_profile_set_t profiles, b
             access == CBM_GRAPH_ACCESS_DIRECT ? CBM_GRAPH_ACCESS_HANDOFF : CBM_GRAPH_ACCESS_DIRECT;
         char *alternate = cbm_render_graph_profile(profiles.dialect, tier, alternate_access,
                                                    profiles.binary_path);
-        const char *released[2];
+        char *legacy_codex = profiles.dialect == CBM_GRAPH_DIALECT_CODEX
+                                 ? cbm_render_legacy_codex_graph_profile(tier)
+                                 : NULL;
+        const char *released[3];
         size_t released_count = 0U;
         if (alternate) {
             released[released_count++] = alternate;
+        }
+        if (legacy_codex) {
+            released[released_count++] = legacy_codex;
         }
         if (tier == CBM_GRAPH_TIER_VERIFY && profiles.legacy_verify_content) {
             released[released_count++] = profiles.legacy_verify_content;
         }
         int result = cbm_text_remove_owned_document_any(path, current, released, released_count);
+        free(legacy_codex);
         free(alternate);
         free(current);
         if (result < CLI_OK) {
