@@ -10539,7 +10539,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "true|false",
      "Enable to trace calls into dependencies (e.g. find all callers of a library function). "
      "Disable for faster indexing when cross-package search is not needed."},
-    {"auto_dep_limit", "20", NULL, "Dependencies",
+    {CBM_CONFIG_AUTO_DEP_LIMIT, CBM_STRINGIFY(CBM_DEFAULT_AUTO_DEP_LIMIT), NULL, "Dependencies",
      "Max number of packages to auto-index",
      "0-10000",
      "When more packages are installed than this limit, the most-imported packages are selected "

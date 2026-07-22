@@ -7,6 +7,10 @@
 #ifndef CBM_CONSTANTS_H
 #define CBM_CONSTANTS_H
 
+/* Expand a macro value before converting it to a string literal. */
+#define CBM_STRINGIFY_INNER(value) #value
+#define CBM_STRINGIFY(value) CBM_STRINGIFY_INNER(value)
+
 /* ── Allocation counts ───────────────────────────────────────── */
 enum { CBM_ALLOC_ONE = 1 }; /* calloc(CBM_ALLOC_ONE, sizeof(T)) */
 

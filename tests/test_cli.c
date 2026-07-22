@@ -6918,6 +6918,20 @@ TEST(cli_config_registry_includes_query_max_rows) {
     PASS();
 }
 
+TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_EQ(atoi(found->default_val), CBM_DEFAULT_AUTO_DEP_LIMIT);
+    PASS();
+}
+
 TEST(cli_config_registry_reindex_startup_guidance_is_precise) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -7740,6 +7754,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_effective_env_overrides_db);
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_registry_includes_query_max_rows);
+    RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
     RUN_TEST(cli_configuration_doc_auto_index_default_matches_registry);
     RUN_TEST(cli_config_delete);
