@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. Zero dependencies. Plug and play across 43 supported automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 158 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 16 MCP tools. Zero dependencies. Plug and play across 43 supported automatic/conditional client surfaces.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -37,7 +37,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **43 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **16 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR and personal memory management, and more.
 
 ## Quick Start
 
@@ -151,7 +151,7 @@ Removes owned agent config entries, skills, hooks, instructions, and the install
 
 ### Graph & analysis
 - **Architecture overview**: `get_architecture` returns languages, packages, entry points, routes, hotspots, boundaries, layers, and clusters in a single call
-- **Architecture Decision Records**: `manage_adr` persists architectural decisions across sessions
+- **Architecture Decision Records**: `manage_adr` persists project ADRs; `manage_memory` stores personal repo memory locally outside source repos
 - **Louvain community detection**: Discovers functional modules by clustering call edges
 - **Git diff impact mapping**: `detect_changes` maps uncommitted changes to affected symbols with risk classification
 - **Call graph**: Resolves function calls across files and packages (import-aware, type-inferred)
@@ -191,6 +191,7 @@ Removes owned agent config entries, skills, hooks, instructions, and the install
 
 ### Distribution & operation
 - **Single static binary, zero infrastructure**: SQLite-backed, persists to `~/.cache/codebase-memory-mcp/`
+- **Personal memory**: Local repo knowledge lives in `manage_memory` under the user data dir; it is never written to the repo unless you explicitly export artifacts
 - **Auto-sync**: Background watcher detects file changes and re-indexes automatically
 - **Route nodes**: REST endpoints are first-class graph entities
 - **CLI mode**: `codebase-memory-mcp cli search_graph '{"project": "my-project", "name_pattern": ".*Handler.*"}'`
@@ -211,6 +212,20 @@ Commit a single compressed file to your repo and your teammates skip the reindex
 - **Optional**: never committed unless you want it. Add `.codebase-memory/` to `.gitignore` if you prefer everyone to reindex from scratch.
 
 The result is similar in spirit to graphify's `graphify-out/` directory, but as a single compressed file with explicit two-tier export, integrity-checked import, and zero merge friction.
+
+## Personal Repo Memory
+
+Use `manage_memory` when you want ADR-style knowledge to stay local and private.
+
+- **Storage**: local SQLite `memory.db` under the user data dir, separate from repo files
+- **Override**: set `CBM_MEMORY_DIR=/path/to/private/memory`
+- **No upload**: `manage_memory` never writes `.codebase-memory/` or changes tracked files
+- **Branch aware**: memory is keyed by repo identity, branch, and document type; feature branches can keep overlays while `main` keeps base memory
+- **LLM workflow**: call `manage_memory(mode="get")` at session start, investigate with graph tools if empty/stale, then update with `manage_memory(mode="update", content="...")`
+- **Branch promotion**: after branch work, copy branch memory into base with `manage_memory(mode="promote", branch="feature")`
+- **Maintenance**: list entries with `manage_memory(mode="list")`, remove one branch/doc with `manage_memory(mode="delete", branch="...")`, inspect paths with `manage_memory(mode="settings")`
+
+`manage_adr(scope="personal", ...)` is also accepted as a compatibility path to the same personal store.
 
 ## How It Works
 
@@ -364,7 +379,7 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 16 tools.
 
 </details>
 
@@ -558,6 +573,7 @@ codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records. |
+| `manage_memory` | Local personal repo memory outside source repos. |
 | `ingest_traces` | Ingest runtime traces to validate HTTP_CALLS edges. |
 
 ## Graph Data Model
@@ -599,8 +615,32 @@ codebase-memory-mcp config list                          # show all settings
 codebase-memory-mcp config set auto_index true           # auto-index on session start
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
+codebase-memory-mcp config set auto_update false         # disable startup update checks
+codebase-memory-mcp config get memory_dir                # local personal memory directory
+codebase-memory-mcp config set memory_enabled true       # opt in to local per-repo memory
+codebase-memory-mcp config set memory_dir ~/private/cbm  # override personal memory dir
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+Default memory config:
+- `memory_enabled=false`: `manage_memory` storage is opt-in. When not configured, existing project ADR/index behavior is unchanged.
+- `memory_default_scope=project`: LLM workflows keep project-scoped behavior unless local personal memory is explicitly enabled.
+- `memory_dir=<user data dir>`: global user-home memory DB location, override with config or `CBM_MEMORY_DIR`. The path must be absolute and outside the source repo.
+
+### Personal memory privacy and storage boundaries
+
+`manage_memory` is opt-in, local-only personal storage. It is intentionally separate from project indexes and source repos. Enable it with `codebase-memory-mcp config set memory_enabled true` or by passing an external config with `memory_enabled=true`:
+
+- **Where data lives:** one SQLite DB named `memory.db` under `memory_dir`. Defaults are macOS `~/Library/Application Support/codebase-memory-mcp`, Linux `~/.local/share/codebase-memory-mcp`, Windows `%LOCALAPPDATA%/codebase-memory-mcp`. `CBM_MEMORY_DIR` or `config set memory_dir ...` can override this with an absolute path outside the repo.
+- **Repo boundary:** write/read/delete operations are rejected when `memory_dir` is relative or inside the current project root. The tool reports `storage_boundary_error` and does not create `memory.db`.
+- **No external transmission:** `manage_memory` does not upload memory, does not write to git, does not call network APIs, and does not sync to the repo. Responses redact repo identity and storage keys. Paths are redacted unless `reveal_paths=true` is passed to `mode="settings"`.
+- **No sensitive-data logging:** memory content, storage keys, repo IDs, and memory paths are not logged by the memory tool. Content is returned only to the caller for explicit `get`/`sections` requests.
+- **Delete semantics:** `mode="delete"` removes only the selected repo/branch/doc row from `memory.db`. It does not delete other branches, other repos, the DB file, SQLite free pages, filesystem backups, or user copies.
+- **Promote/sync semantics:** `mode="promote"` is a local-only copy from the current branch doc to the base branch doc in the same `memory.db`. `mode="sync"` is disabled and returns `sync_disabled`; there is no network sync feature.
+
+Default update config:
+- `auto_update=true`: MCP startup checks GitHub for newer releases and shows a one-shot notice.
+- Set `auto_update=false` to disable network update checks. Manual `codebase-memory-mcp update` still works.
 
 ### Environment Variables
 
@@ -608,6 +648,7 @@ codebase-memory-mcp config reset auto_index              # reset to default
 |----------|---------|-------------|
 | `CBM_ALLOWED_ROOT` | *(unset)* | Restrict `index_repository` to paths within this directory. When set, a `repo_path` that resolves (after symlink / `..` resolution) outside this root is refused; unset imposes no restriction. Useful when the server may be driven by an untrusted caller, e.g. agentic or multi-tenant deployments. |
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. |
+| `CBM_MEMORY_DIR` | macOS: `~/Library/Application Support/codebase-memory-mcp`; Linux: `~/.local/share/codebase-memory-mcp`; Windows: `%LOCALAPPDATA%/codebase-memory-mcp` | Override local personal memory storage with an absolute path outside the repo. `manage_memory` writes `memory.db` here and does not touch the repo. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable periodic diagnostics output to `/tmp/cbm-diagnostics-<pid>.json`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
 | `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Logs go to stderr; stdout is reserved for MCP JSON-RPC. |
@@ -618,6 +659,9 @@ codebase-memory-mcp config reset auto_index              # reset to default
 ```bash
 # Store indexes in a custom directory
 export CBM_CACHE_DIR=~/my-projects/cbm-data
+
+# Store personal memory in a private directory
+export CBM_MEMORY_DIR=~/private/cbm-memory
 ```
 
 ## Custom File Extensions
@@ -646,7 +690,7 @@ Project config overrides global for conflicting extensions. An entry whose langu
 
 ## Persistence
 
-SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across restarts (WAL mode, ACID-safe). To reset: `rm -rf ~/.cache/codebase-memory-mcp/`.
+Project index SQLite databases are stored at `~/.cache/codebase-memory-mcp/`. Personal memory is stored separately in the user data dir or an absolute, repo-external `CBM_MEMORY_DIR`. Both persist across restarts (WAL mode, ACID-safe). To reset indexes: `rm -rf ~/.cache/codebase-memory-mcp/`. To reset personal memory, remove `memory.db` from `manage_memory(mode="settings", reveal_paths=true)` output.
 
 ## Troubleshooting
 
@@ -706,7 +750,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (16 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (43 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)

@@ -8,6 +8,7 @@
 #include "../src/foundation/compat_fs.h" /* cbm_unlink / cbm_rmdir */
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
+#include "../src/foundation/platform.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -280,7 +281,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all tools, including the targeted coverage gate. */
+/* Should contain all 16 tools */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -295,6 +296,7 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "check_index_coverage"));
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
     ASSERT_NOT_NULL(strstr(json, "manage_adr"));
+    ASSERT_NOT_NULL(strstr(json, "manage_memory"));
     ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
     free(json);
     PASS();
@@ -337,6 +339,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", false, true, true, false},
         {"detect_changes", false, true, true, false},
         {"manage_adr", false, true, false, false},
+        {"manage_memory", false, true, false, false},
         {"ingest_traces", false, false, false, false},
     };
 
@@ -4004,6 +4007,273 @@ TEST(tool_detect_changes_not_found_rich_error) {
     PASS();
 }
 
+TEST(tool_manage_memory_personal_store) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-memory-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char repo_dir[512];
+    snprintf(repo_dir, sizeof(repo_dir), "%s/repo", tmp_dir);
+    ASSERT_TRUE(cbm_mkdir_p(repo_dir, 0700));
+    char memory_dir[512];
+    snprintf(memory_dir, sizeof(memory_dir), "%s/memory", tmp_dir);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", memory_dir, 1), 0);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmp_dir);
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MEMORY_ENABLED, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "personal"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "memory-proj", repo_dir);
+    cbm_mcp_server_set_project(srv, "memory-proj");
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":130,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"settings\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "CBM_MEMORY_DIR"));
+    ASSERT_NOT_NULL(strstr(resp, "repo_upload"));
+    ASSERT_NOT_NULL(strstr(resp, "local_only"));
+    ASSERT_NOT_NULL(strstr(resp, "network_sync"));
+    ASSERT_NOT_NULL(strstr(resp, "paths_redacted"));
+    ASSERT_NOT_NULL(strstr(resp, "external_transmission"));
+    ASSERT_NOT_NULL(strstr(resp, "sensitive_data_logging"));
+    ASSERT_NOT_NULL(strstr(resp, "storage_boundary"));
+    ASSERT_NOT_NULL(strstr(resp, "<redacted>"));
+    ASSERT_NULL(strstr(resp, memory_dir));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1300,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"settings\",\"reveal_paths\":true}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, memory_dir));
+    ASSERT_NOT_NULL(strstr(resp, "\"paths_redacted\":false"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1301,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"update\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "missing_content"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv,
+        "{\"jsonrpc\":\"2.0\",\"id\":131,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+        "\"mode\":\"update\",\"branch\":\"main\",\"content\":\"## PURPOSE\\nLocal only.\\n\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    ASSERT_NOT_NULL(strstr(resp, "storage_key_redacted"));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":132,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"get\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Local only."));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":135,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"list\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"count\":1"));
+    ASSERT_NOT_NULL(strstr(resp, "\"branch\":\"main\""));
+    ASSERT_NOT_NULL(strstr(resp, "key_redacted"));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1351,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"sync\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "sync_disabled"));
+    ASSERT_NOT_NULL(strstr(resp, "no network sync exists"));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"update\",\"branch\":\"feature\",\"content\":\"## PURPOSE\\nFeature "
+             "memory.\\n\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":137,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"promote\",\"branch\":\"feature\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "promoted"));
+    ASSERT_NOT_NULL(strstr(resp, "local_only"));
+    ASSERT_NOT_NULL(strstr(resp, "network_sync"));
+    ASSERT_NOT_NULL(strstr(resp, "from_key_redacted"));
+    ASSERT_NOT_NULL(strstr(resp, "to_key_redacted"));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":138,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"get\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "Feature memory."));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":133,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"delete\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    ASSERT_NOT_NULL(strstr(resp, "delete_semantics"));
+    ASSERT_NOT_NULL(strstr(resp, "database_removed"));
+    ASSERT_NOT_NULL(strstr(resp, "storage_key_redacted"));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1331,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"delete\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "not_found"));
+    ASSERT_NULL(strstr(resp, "delete_error"));
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":134,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
+             "\"mode\":\"get\",\"branch\":\"main\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "no_memory"));
+    free(resp);
+
+    char memory_db[512];
+    snprintf(memory_db, sizeof(memory_db), "%s/memory.db", memory_dir);
+    ASSERT_TRUE(cbm_file_exists(memory_db));
+#ifndef _WIN32
+    struct stat memory_st;
+    ASSERT_EQ(stat(memory_dir, &memory_st), 0);
+    ASSERT_EQ((int)(memory_st.st_mode & 0777), 0700);
+#endif
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cbm_unsetenv("CBM_MEMORY_DIR");
+    remove(memory_db);
+    rmdir(memory_dir);
+    char config_db[512];
+    snprintf(config_db, sizeof(config_db), "%s/_config.db", cache_dir);
+    remove(config_db);
+    rmdir(cache_dir);
+    rmdir(repo_dir);
+    rmdir(tmp_dir);
+
+    PASS();
+}
+
+TEST(tool_manage_memory_disabled_by_default) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-memory-disabled-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char memory_dir[512];
+    snprintf(memory_dir, sizeof(memory_dir), "%s/memory", tmp_dir);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", memory_dir, 1), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "memory-disabled-proj", tmp_dir);
+    cbm_mcp_server_set_project(srv, "memory-disabled-proj");
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2300,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"manage_memory\",\"arguments\":{"
+                                   "\"project\":\"memory-disabled-proj\",\"mode\":\"update\","
+                                   "\"branch\":\"main\",\"content\":\"secret\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "memory_enabled=false"));
+    ASSERT_FALSE(cbm_file_exists(memory_dir));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_unsetenv("CBM_MEMORY_DIR");
+    rmdir(tmp_dir);
+
+    PASS();
+}
+
+TEST(tool_manage_memory_rejects_repo_local_storage) {
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-memory-boundary-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char memory_dir[512];
+    snprintf(memory_dir, sizeof(memory_dir), "%s/.cbm-memory", tmp_dir);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", memory_dir, 1), 0);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmp_dir);
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MEMORY_ENABLED, "true"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "memory-boundary-proj", tmp_dir);
+    cbm_mcp_server_set_project(srv, "memory-boundary-proj");
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2301,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"manage_memory\",\"arguments\":{"
+                                   "\"project\":\"memory-boundary-proj\",\"mode\":\"update\","
+                                   "\"branch\":\"main\",\"content\":\"secret\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "storage_boundary_error"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_dir_inside_repo"));
+    ASSERT_NOT_NULL(strstr(resp, "external_transmission"));
+    ASSERT_FALSE(cbm_file_exists(memory_dir));
+    ASSERT_NULL(strstr(resp, tmp_dir));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cbm_unsetenv("CBM_MEMORY_DIR");
+    char config_db[512];
+    snprintf(config_db, sizeof(config_db), "%s/_config.db", cache_dir);
+    remove(config_db);
+    rmdir(cache_dir);
+    rmdir(tmp_dir);
+
+    PASS();
+}
+
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -7080,6 +7350,9 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_get_accepts_abs_path);
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);
     RUN_TEST(tool_detect_changes_not_found_rich_error);
+    RUN_TEST(tool_manage_memory_personal_store);
+    RUN_TEST(tool_manage_memory_disabled_by_default);
+    RUN_TEST(tool_manage_memory_rejects_repo_local_storage);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 

@@ -1,5 +1,5 @@
 /*
- * mcp.c — MCP server: JSON-RPC 2.0 over stdio with 14 graph tools.
+ * mcp.c — MCP server: JSON-RPC 2.0 over stdio with graph tools.
  *
  * Uses yyjson for fast JSON parsing/building.
  * Single-threaded event loop: read line → parse → dispatch → respond.
@@ -62,6 +62,7 @@ enum {
 #include "foundation/dump_verify.h"
 #include "foundation/compat_regex.h"
 #include "pipeline/artifact.h"
+#include "personal_memory/memory.h"
 
 #ifdef _WIN32
 #include <direct.h>
@@ -628,9 +629,23 @@ static const tool_def_t TOOLS[] = {
 
     {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
-     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"scope\":{\"type\":\"string\","
+     "\"enum\":[\"project\",\"personal\"],\"default\":\"project\"},\"branch\":{\"type\":\"string\"}"
+     ","
+     "\"content\":{\"type\":\"string\"},\"sections\":{\"type\":\"array\",\"items\":{\"type\":"
+     "\"string\"}}},"
+     "\"required\":[\"project\"]"
      "}"},
+
+    {"manage_memory", "Manage personal repo memory",
+     "Create or update local personal memory stored outside source repos",
+     "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
+     "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"settings\",\"bootstrap\",\"delete\","
+     "\"list\",\"promote\",\"sync\"]},"
+     "\"doc_type\":{\"type\":\"string\",\"default\":\"adr\"},\"branch\":{\"type\":\"string\"},"
+     "\"content\":{\"type\":\"string\"},\"reveal_paths\":{\"type\":\"boolean\",\"default\":false},"
+     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+     "\"required\":[\"project\"]}"},
 
     {"ingest_traces", "Ingest traces", "Ingest runtime traces to enhance the knowledge graph",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
@@ -668,6 +683,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", false, true, true, false},
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
+    {"manage_memory", false, true, false, false},
     {"ingest_traces", false, false, false, false},
 };
 
@@ -9125,10 +9141,267 @@ static char *adr_read_legacy_file(const char *root_path) {
     "then draft and store. Sections: PURPOSE, STACK, ARCHITECTURE, "               \
     "PATTERNS, TRADEOFFS, PHILOSOPHY."
 
+#define MEMORY_EMPTY_HINT                                                       \
+    "No personal memory yet. Explore with get_architecture/search_graph, then " \
+    "store a compact ADR with manage_memory(mode='update', content='...')."
+
+static void memory_add_privacy_json(yyjson_mut_doc *doc, yyjson_mut_val *root) {
+    yyjson_mut_obj_add_str(doc, root, "storage", "personal");
+    yyjson_mut_obj_add_bool(doc, root, "local_only", true);
+    yyjson_mut_obj_add_bool(doc, root, "external_transmission", false);
+    yyjson_mut_obj_add_str(doc, root, "network_sync", "disabled");
+    yyjson_mut_obj_add_str(doc, root, "repo_upload", "disabled");
+    yyjson_mut_obj_add_str(doc, root, "sensitive_data_logging", "disabled");
+}
+
+static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    char *mode_str = cbm_mcp_get_string_arg(args, "mode");
+    char *content = cbm_mcp_get_string_arg(args, "content");
+    char *doc_type = cbm_mcp_get_string_arg(args, "doc_type");
+    char *branch_arg = cbm_mcp_get_string_arg(args, "branch");
+    bool reveal_paths = cbm_mcp_get_bool_arg(args, "reveal_paths");
+
+    if (!mode_str) {
+        mode_str = heap_strdup("get");
+    }
+    if (!doc_type) {
+        doc_type = heap_strdup("adr");
+    }
+
+    if (!cbm_memory_enabled(srv->config) && strcmp(mode_str, "settings") != 0) {
+        free(project);
+        free(mode_str);
+        free(content);
+        free(doc_type);
+        free(branch_arg);
+        return cbm_mcp_text_result("personal memory disabled by config memory_enabled=false", true);
+    }
+
+    char *root_path = get_project_root(srv, project);
+    if (!root_path) {
+        free(project);
+        free(mode_str);
+        free(content);
+        free(doc_type);
+        free(branch_arg);
+        return cbm_mcp_text_result("project not found", true);
+    }
+
+    cbm_git_context_t ctx = {0};
+    (void)cbm_git_context_resolve(root_path, &ctx);
+    const char *current_branch =
+        branch_arg && branch_arg[0] ? branch_arg : cbm_memory_current_branch(&ctx);
+    const char *base_branch = cbm_memory_default_branch(&ctx);
+    char *repo_id = cbm_memory_repo_id(project, root_path, &ctx);
+    char *key = cbm_memory_doc_key(repo_id, current_branch, doc_type);
+    char *base_key = cbm_memory_doc_key(repo_id, base_branch, doc_type);
+    if (!repo_id || !key || !base_key) {
+        free(root_path);
+        free(repo_id);
+        free(key);
+        free(base_key);
+        free(project);
+        free(mode_str);
+        free(content);
+        free(doc_type);
+        free(branch_arg);
+        cbm_git_context_free(&ctx);
+        return cbm_mcp_text_result("personal memory store unavailable", true);
+    }
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root_obj = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root_obj);
+    yyjson_mut_obj_add_str(doc, root_obj, "repo_id", "<local-repo-redacted>");
+    yyjson_mut_obj_add_bool(doc, root_obj, "repo_id_redacted", true);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "branch", current_branch);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "base_branch", base_branch);
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "doc_type", doc_type);
+
+    char storage_boundary[CBM_SZ_256];
+    bool storage_allowed = cbm_memory_storage_allowed(srv->config, root_path, storage_boundary,
+                                                      sizeof(storage_boundary));
+    yyjson_mut_obj_add_strcpy(doc, root_obj, "storage_boundary", storage_boundary);
+    yyjson_mut_obj_add_bool(doc, root_obj, "storage_boundary_enforced", true);
+    if (strcmp(mode_str, "settings") != 0) {
+        memory_add_privacy_json(doc, root_obj);
+    }
+
+    bool is_error = false;
+    if (!storage_allowed && strcmp(mode_str, "settings") != 0 &&
+        strcmp(mode_str, "bootstrap") != 0) {
+        yyjson_mut_obj_add_str(doc, root_obj, "status", "storage_boundary_error");
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "error", storage_boundary);
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "error_hint",
+            "Set memory_dir/CBM_MEMORY_DIR to an absolute path outside the source repo.");
+        is_error = true;
+    } else if (strcmp(mode_str, "settings") == 0) {
+        char *db_path = cbm_memory_db_path(srv->config, false);
+        cbm_memory_add_settings_json(srv->config, doc, root_obj, db_path, reveal_paths);
+        free(db_path);
+    } else if (strcmp(mode_str, "list") == 0) {
+        char *db_path = NULL;
+        cbm_store_t *store = cbm_memory_open_query(srv->config, &db_path);
+        cbm_memory_add_list_json(store, repo_id, doc, root_obj);
+        if (store) {
+            cbm_store_close(store);
+        }
+        free(db_path);
+    } else if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
+        char *db_path = NULL;
+        cbm_store_t *store = cbm_memory_open(srv->config, &db_path);
+        if (!store) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+            is_error = true;
+        } else if (cbm_store_adr_store(store, key, content) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "updated");
+            yyjson_mut_obj_add_bool(doc, root_obj, "storage_key_redacted", true);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+            is_error = true;
+        }
+        if (store) {
+            cbm_store_close(store);
+        }
+        free(db_path);
+    } else if (strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) {
+        yyjson_mut_obj_add_str(doc, root_obj, "status", "missing_content");
+        yyjson_mut_obj_add_str(doc, root_obj, "error", "content is required for update/store");
+        is_error = true;
+    } else if (strcmp(mode_str, "sync") == 0) {
+        yyjson_mut_obj_add_str(doc, root_obj, "status", "sync_disabled");
+        yyjson_mut_obj_add_str(doc, root_obj, "sync_semantics", "disabled; no network sync exists");
+        yyjson_mut_obj_add_str(doc, root_obj, "promote_hint",
+                               "Use mode=promote only for local branch-to-base memory copy.");
+        is_error = true;
+    } else if (strcmp(mode_str, "promote") == 0) {
+        char *db_path = NULL;
+        cbm_store_t *store = cbm_memory_open(srv->config, &db_path);
+        if (!store || strcmp(current_branch, base_branch) == 0) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", store ? "already_base" : "write_error");
+            is_error = !store;
+        } else {
+            cbm_adr_t branch_doc;
+            memset(&branch_doc, 0, sizeof(branch_doc));
+            if (cbm_store_adr_get(store, key, &branch_doc) == CBM_STORE_OK && branch_doc.content) {
+                if (cbm_store_adr_store(store, base_key, branch_doc.content) == CBM_STORE_OK) {
+                    yyjson_mut_obj_add_str(doc, root_obj, "status", "promoted");
+                    yyjson_mut_obj_add_str(doc, root_obj, "promote_semantics",
+                                           "local branch doc copy to base branch doc");
+                    yyjson_mut_obj_add_bool(doc, root_obj, "from_key_redacted", true);
+                    yyjson_mut_obj_add_bool(doc, root_obj, "to_key_redacted", true);
+                } else {
+                    yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+                    is_error = true;
+                }
+                cbm_store_adr_free(&branch_doc);
+            } else {
+                yyjson_mut_obj_add_str(doc, root_obj, "status", "no_branch_memory");
+                is_error = true;
+            }
+        }
+        if (store) {
+            cbm_store_close(store);
+        }
+        free(db_path);
+    } else if (strcmp(mode_str, "delete") == 0) {
+        char *db_path = NULL;
+        cbm_store_t *store = cbm_memory_open_existing(srv->config, &db_path);
+        int delete_rc = store ? cbm_store_adr_delete(store, key) : CBM_STORE_NOT_FOUND;
+        if (delete_rc == CBM_STORE_OK) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "deleted");
+            yyjson_mut_obj_add_str(doc, root_obj, "delete_semantics",
+                                   "selected repo/branch/doc row only");
+            yyjson_mut_obj_add_bool(doc, root_obj, "database_removed", false);
+            yyjson_mut_obj_add_bool(doc, root_obj, "storage_key_redacted", true);
+        } else if (delete_rc == CBM_STORE_NOT_FOUND) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "not_found");
+            yyjson_mut_obj_add_str(doc, root_obj, "delete_semantics",
+                                   "selected repo/branch/doc row only");
+            yyjson_mut_obj_add_bool(doc, root_obj, "database_removed", false);
+            yyjson_mut_obj_add_bool(doc, root_obj, "storage_key_redacted", true);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "delete_error");
+            is_error = true;
+        }
+        if (store) {
+            cbm_store_close(store);
+        }
+        free(db_path);
+    } else if (strcmp(mode_str, "bootstrap") == 0) {
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "content",
+            "## PURPOSE\nCapture project purpose, main users, and operational scope.\n\n"
+            "## STACK\nList languages, frameworks, storage, APIs, infra.\n\n"
+            "## ARCHITECTURE\nDescribe major modules, entry points, data flow, boundaries.\n\n"
+            "## DECISIONS\nRecord accepted technical decisions and rationale.\n\n"
+            "## FEATURES\nTrack important capabilities and product behavior.\n\n"
+            "## CHANGELOG\nAppend branch/pull changes that affect architecture or behavior.\n");
+        yyjson_mut_obj_add_str(doc, root_obj, "status", "template");
+    } else {
+        char *db_path = NULL;
+        cbm_store_t *store = cbm_memory_open_query(srv->config, &db_path);
+        cbm_adr_t adr;
+        memset(&adr, 0, sizeof(adr));
+        bool have = store && (cbm_store_adr_get(store, key, &adr) == CBM_STORE_OK);
+        if (!have && strcmp(current_branch, base_branch) != 0) {
+            have = store && (cbm_store_adr_get(store, base_key, &adr) == CBM_STORE_OK);
+            if (have) {
+                yyjson_mut_obj_add_bool(doc, root_obj, "inherited_from_base", true);
+            }
+        }
+        if (strcmp(mode_str, "sections") == 0) {
+            adr_list_sections_from_content(doc, root_obj, have ? adr.content : NULL);
+        } else if (have && adr.content) {
+            yyjson_mut_obj_add_strcpy(doc, root_obj, "content", adr.content);
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "content", "");
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "no_memory");
+            yyjson_mut_obj_add_str(doc, root_obj, "memory_hint", MEMORY_EMPTY_HINT);
+        }
+        if (have) {
+            cbm_store_adr_free(&adr);
+        }
+        if (store) {
+            cbm_store_close(store);
+        }
+        free(db_path);
+    }
+
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    free(root_path);
+    free(repo_id);
+    free(key);
+    free(base_key);
+    free(project);
+    free(mode_str);
+    free(content);
+    free(doc_type);
+    free(branch_arg);
+    cbm_git_context_free(&ctx);
+
+    char *result = cbm_mcp_text_result(json, is_error);
+    free(json);
+    return result;
+}
+
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *content = cbm_mcp_get_string_arg(args, "content");
+    char *scope = cbm_mcp_get_string_arg(args, "scope");
+
+    if (scope && strcmp(scope, "personal") == 0) {
+        free(project);
+        free(mode_str);
+        free(content);
+        free(scope);
+        return handle_manage_memory(srv, args);
+    }
+    free(scope);
 
     if (!mode_str) {
         mode_str = heap_strdup("get");
@@ -9321,6 +9594,9 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
     }
     if (strcmp(tool_name, "manage_adr") == 0) {
         return handle_manage_adr(srv, args_json);
+    }
+    if (strcmp(tool_name, "manage_memory") == 0) {
+        return handle_manage_memory(srv, args_json);
     }
     if (strcmp(tool_name, "ingest_traces") == 0) {
         return handle_ingest_traces(srv, args_json);
@@ -9560,6 +9836,11 @@ static void *update_check_thread(void *arg) {
 
 static void start_update_check(cbm_mcp_server_t *srv) {
     if (srv->update_checked) {
+        return;
+    }
+    if (srv->config && !cbm_config_get_bool(srv->config, CBM_CONFIG_AUTO_UPDATE, true)) {
+        srv->update_checked = true;
+        cbm_log_info("update.check.skip", "reason", "auto_update_disabled");
         return;
     }
     srv->update_checked = true; /* prevent double-launch */

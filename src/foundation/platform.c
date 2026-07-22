@@ -453,3 +453,42 @@ const char *cbm_resolve_cache_dir(void) {
     snprintf(buf, sizeof(buf), "%s/.cache/codebase-memory-mcp", home);
     return buf;
 }
+
+const char *cbm_resolve_memory_dir(void) {
+    static char buf[CBM_SZ_1K];
+    char tmp[CBM_SZ_256] = "";
+    cbm_safe_getenv("CBM_MEMORY_DIR", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s", tmp);
+        cbm_normalize_path_sep(buf);
+        return buf;
+    }
+
+#ifdef _WIN32
+    const char *local = cbm_app_local_dir();
+    if (!local) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s/codebase-memory-mcp", local);
+    return buf;
+#elif defined(__APPLE__)
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s/Library/Application Support/codebase-memory-mcp", home);
+    return buf;
+#else
+    cbm_safe_getenv("XDG_DATA_HOME", tmp, sizeof(tmp), NULL);
+    if (tmp[0]) {
+        snprintf(buf, sizeof(buf), "%s/codebase-memory-mcp", tmp);
+        return buf;
+    }
+    const char *home = cbm_get_home_dir();
+    if (!home) {
+        return NULL;
+    }
+    snprintf(buf, sizeof(buf), "%s/.local/share/codebase-memory-mcp", home);
+    return buf;
+#endif
+}

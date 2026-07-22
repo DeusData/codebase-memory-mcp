@@ -367,6 +367,10 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
+#define CBM_CONFIG_MEMORY_ENABLED "memory_enabled"
+#define CBM_CONFIG_MEMORY_DIR "memory_dir"
+#define CBM_CONFIG_MEMORY_DEFAULT_SCOPE "memory_default_scope"
+#define CBM_CONFIG_AUTO_UPDATE "auto_update"
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
