@@ -253,7 +253,15 @@ static int cbm_run_win(const cbm_proc_opts_t *opts, cbm_proc_result_t *out) {
     HANDLE hlog = INVALID_HANDLE_VALUE;
     STARTUPINFOW si = {.cb = sizeof(si)};
     if (opts->log_file) {
-        hlog = CreateFileA(opts->log_file, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS,
+        /* The log handle MUST be inheritable. With STARTF_USESTDHANDLES set below, a
+         * NON-inheritable hStdOutput/hStdError leaves the child's stdio invalid, so every
+         * line the worker writes is discarded and the post-mortem log is CREATED but stays
+         * 0 bytes. That is the Windows half of the blind spot the reap-site observability
+         * note describes: a worker that exits non-zero leaves nothing to diagnose, and the
+         * caller only ever sees the generic "crashed on a file" hint — even for causes the
+         * worker reported explicitly (e.g. a bad JSON arg → "repo_path is required"). */
+        SECURITY_ATTRIBUTES sa = {.nLength = sizeof(sa), .bInheritHandle = TRUE};
+        hlog = CreateFileA(opts->log_file, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS,
                            FILE_ATTRIBUTE_NORMAL, NULL);
         if (hlog != INVALID_HANDLE_VALUE) {
             si.dwFlags = STARTF_USESTDHANDLES;
