@@ -324,6 +324,44 @@ The `codebase-memory-mcp-bin` package is available at: https://aur.archlinux.org
 You: "Install this MCP server: https://github.com/DeusData/codebase-memory-mcp"
 ```
 
+### Install modes: MCP or Skill CLI
+
+`install` can configure agents in two modes:
+
+| Mode | Command | How it works | Use when |
+|------|---------|--------------|----------|
+| MCP mode | `codebase-memory-mcp install --skill-mode=mcp` | Installs MCP server config, Claude Code skill, and supported hooks. The agent starts `codebase-memory-mcp` as a stdio MCP server and calls tools over the MCP connection. This is the default. | Your agent supports MCP and you want direct tool calls. |
+| Skill CLI mode | `codebase-memory-mcp install --skill-mode=cli` | Installs a Claude Code skill that instructs the agent to run `codebase-memory-mcp cli <tool> '<json>'` through shell commands. It skips MCP config and hooks. | You want skill-only usage without maintaining an MCP connection or installing MCP config. |
+
+Default install is MCP mode:
+
+```bash
+codebase-memory-mcp install
+# same as:
+codebase-memory-mcp install --skill-mode=mcp
+```
+
+Skill-only install:
+
+```bash
+codebase-memory-mcp install --skill-mode=cli
+```
+
+Preview planned writes without changing files:
+
+```bash
+codebase-memory-mcp install --plan --skill-mode=mcp
+codebase-memory-mcp install --plan --skill-mode=cli
+```
+
+In MCP mode the process exits when stdin closes, on SIGTERM/SIGINT, or when its parent process exits. For wrappers that launch a stdio server intermittently, set an idle timeout so it self-exits after no requests:
+
+```bash
+CBM_IDLE_TIMEOUT_S=60 codebase-memory-mcp
+# or
+codebase-memory-mcp --idle-timeout=60
+```
+
 ### Build from Source
 
 <details>
@@ -533,6 +571,8 @@ codebase-memory-mcp cli trace_path '{"project": "my-project", "function_name": "
 codebase-memory-mcp cli query_graph '{"project": "my-project", "query": "MATCH (f:Function) RETURN f.name LIMIT 5"}'
 codebase-memory-mcp cli --raw search_graph '{"project": "my-project", "label": "Function"}' | jq '.results[].name'
 ```
+
+This is also how Skill CLI mode works. The installed skill tells the LLM to create JSON arguments, run the `cli` subcommand through bash, and summarize the result. No MCP client connection is required for those requests.
 
 ## MCP Tools
 

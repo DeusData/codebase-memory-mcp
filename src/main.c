@@ -9,6 +9,7 @@
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
  *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
+ *   --idle-timeout=N Exit after N seconds without MCP requests (default: disabled)
  *
  * Signal handling: SIGTERM/SIGINT trigger graceful shutdown.
  * Watcher runs in a background thread, polling for git changes.
@@ -29,6 +30,7 @@ enum {
     MAIN_CLI_ARGC = 2,
     MAIN_FLAG_OFF = 5, /* strlen("--ui=") */
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
+    MAIN_IDLE_TIMEOUT_OFF = 15, /* strlen("--idle-timeout=") */
     MAIN_MAX_PORT = 65536,
     PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
 };
@@ -510,7 +512,7 @@ static void print_help(void) {
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--skill-mode=cli|mcp]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
@@ -521,6 +523,12 @@ static void print_help(void) {
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
+    printf("  --idle-timeout=N  Exit after N seconds without MCP requests\n");
+    printf("\nInstall modes:\n");
+    printf("  --skill-mode=mcp  Install MCP config, Claude Code skill, and supported hooks (default)\n");
+    printf("  --skill-mode=cli  Install only the Claude Code CLI skill and skip MCP configs/hooks\n");
+    printf("  Claude skill path: ~/.claude/skills/codebase-memory/SKILL.md\n");
+    printf("  Shared skill path for supported clients: ~/.agents/skills/codebase-memory/SKILL.md\n");
     printf("\nSupported automatic/conditional client surfaces (43):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
@@ -539,7 +547,7 @@ static void print_help(void) {
     printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
     printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
     printf("  list_projects, delete_project, index_status, detect_changes,\n");
-    printf("  manage_adr, ingest_traces\n");
+    printf("  check_index_coverage, manage_adr, ingest_traces\n");
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
@@ -606,6 +614,30 @@ static bool parse_ui_flags(int argc, char **argv, cbm_ui_config_t *cfg, bool *ex
         }
     }
     return changed;
+}
+
+/* Optional whole-server idle timeout. Default 0 keeps permanent MCP sessions.
+ * CBM_IDLE_TIMEOUT_S supports wrappers that launch a stdio server from skills
+ * and want it to self-exit after intermittent requests stop. */
+static int parse_idle_timeout(int argc, char **argv) {
+    int timeout_s = 0;
+    char env_buf[128];
+    const char *env = cbm_safe_getenv("CBM_IDLE_TIMEOUT_S", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        long v = strtol(env, NULL, CBM_DECIMAL_BASE);
+        if (v > 0 && v < MAIN_MAX_PORT) {
+            timeout_s = (int)v;
+        }
+    }
+    for (int i = SKIP_ONE; i < argc; i++) {
+        if (strncmp(argv[i], "--idle-timeout=", SLEN("--idle-timeout=")) == 0) {
+            long v = strtol(argv[i] + MAIN_IDLE_TIMEOUT_OFF, NULL, CBM_DECIMAL_BASE);
+            if (v > 0 && v < MAIN_MAX_PORT) {
+                timeout_s = (int)v;
+            }
+        }
+    }
+    return timeout_s;
 }
 
 /* Install platform-specific signal handlers. */
@@ -827,7 +859,11 @@ int main(int argc, char **argv) {
     }
 
     /* Run MCP event loop (blocks until EOF or signal) */
-    int rc = cbm_mcp_server_run(g_server, stdin, stdout);
+    int idle_timeout_s = parse_idle_timeout(argc, argv);
+    if (idle_timeout_s > 0) {
+        cbm_log_int(CBM_LOG_INFO, "server.idle_timeout.enabled", "seconds", idle_timeout_s);
+    }
+    int rc = cbm_mcp_server_run_with_idle_timeout(g_server, stdin, stdout, idle_timeout_s);
     atomic_store(&g_shutdown, 1); /* unblock the watchdog poll loop */
 
     /* Shutdown */

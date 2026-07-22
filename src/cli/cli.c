@@ -489,7 +489,7 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 /* Consolidated from 4 separate skills into 1 with progressive disclosure.
  * This embedded version is the single source of truth for the CLI installer.
  * Based on PR #81 by @gdilla — factual corrections applied. */
-static const char skill_content[] =
+static const char mcp_skill_content[] =
     "---\n"
     "name: codebase-memory\n"
     "description: Use the codebase knowledge graph for structural code queries. "
@@ -598,6 +598,133 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
 
+static const char cli_skill_content[] =
+    "---\n"
+    "name: codebase-memory\n"
+    "description: Codebase knowledge graph expert. ALWAYS invoke this skill before code reviews, before planning changes, when exploring unfamiliar code, when tracing impact, when checking architecture, routes, dependencies, dead code, complexity, or refactor risk. Use this before Grep, Glob, or file search for code discovery. CLI mode is the only mechanism for this skill; do not use MCP tools unless the user explicitly asks.\n"
+    "---\n"
+    "\n"
+    "# Codebase Memory — CLI Skill\n"
+    "\n"
+    "Use `codebase-memory-mcp` as a normal executable. Do not rely on a permanent MCP connection. Run each request through bash:\n"
+    "\n"
+    "```bash\n"
+    "codebase-memory-mcp cli <tool> '<json arguments>'\n"
+    "```\n"
+    "\n"
+    "## When to use this skill\n"
+    "Use this skill before grep/file search when the task is about code understanding. In particular:\n"
+    "- Before edits: map relevant functions, routes, files, dependencies, and likely blast radius.\n"
+    "- Before code review: inspect changed symbols, callers, callees, hotspots, coverage gaps, and architectural impact.\n"
+    "- Before refactors: find usages, entry points, unreferenced code, and cross-service links.\n"
+    "- For architecture questions: summarize packages, dependencies, routes, clusters, and ADRs.\n"
+    "- For quality cleanup: find dead code candidates, high-degree functions, complex areas, and duplicates.\n"
+    "\n"
+    "## First checks\n"
+    "```bash\n"
+    "command -v codebase-memory-mcp\n"
+    "codebase-memory-mcp --version\n"
+    "printf '{}' | codebase-memory-mcp cli list_projects\n"
+    "```\n"
+    "\n"
+    "If binary is missing, ask the user before installing. Do not auto-install. If the user says yes, install binary-only, not MCP config:\n"
+    "```bash\n"
+    "curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash -s -- --skip-config\n"
+    "```\n"
+    "\n"
+    "## Standard pre-analysis workflow\n"
+    "1. `list_projects` — see if current repo is already indexed and get exact project names.\n"
+    "2. `index_repository` — index or refresh the repo before analysis when missing or stale.\n"
+    "3. `index_status` — confirm indexing completed and note current generation/freshness.\n"
+    "4. `get_graph_schema` — learn available labels, edge types, and properties before custom queries.\n"
+    "5. `search_graph` — find relevant functions, classes, routes, resources, or files before grep.\n"
+    "6. `trace_path` — inspect callers/callees and impact for the symbols you may edit.\n"
+    "7. `get_code_snippet` — read exact implementation after finding `qualified_name`.\n"
+    "8. `check_index_coverage` — check candidate source paths before making negative, exhaustive, or risky claims.\n"
+    "9. `detect_changes` — for reviews, map git diff to changed symbols and risk labels.\n"
+    "\n"
+    "Safe JSON pattern:\n"
+    "```bash\n"
+    "project=PROJECT\n"
+    "json=$(jq -nc --arg project \"$project\" --arg q \"auth handler\" '{project:$project,query:$q,limit:20}')\n"
+    "codebase-memory-mcp cli search_graph \"$json\"\n"
+    "```\n"
+    "\n"
+    "## Evidence tiers\n"
+    "- **Scout (Tier 1):** fast positive lookup with few graph calls and targeted source checks. Treat results as provisional. Do not make absence, exhaustive, dead-code, or complete-impact claims.\n"
+    "- **Verify (Tier 2, default):** task-directed searches, relevant trace directions, exact snippets for material claims, all relevant result pages, and coverage checks for cited paths.\n"
+    "- **Auditor (Tier 3):** bounded-scope full verification with current graph generation, complete relevant pagination, both call directions and broader relationships when material, plus explicit unresolved limitations.\n"
+    "- **Every tier:** after candidate paths are known, call `check_index_coverage` once with every evidence path. For negative or exhaustive claims also include relevant scopes. A clean result means no recorded gap, not proof of completeness. For partial, skipped, excluded, stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying on the graph.\n"
+    "\n"
+    "## Sessions and subagents\n"
+    "- At session start or after compaction, run `list_projects`/`index_status` before structural exploration.\n"
+    "- Before delegating, query the graph and coverage in the parent. Pass tier, exact project, generation/freshness, bounded scope, queries and pagination state, qualified symbols, paths, call-chain findings, coverage ranges/reasons, source fallback already performed, and unresolved questions to the child.\n"
+    "- A child without CLI access must not claim graph access. It should work from supplied evidence and use read/grep on exact source, especially every reported missed-coverage range.\n"
+    "\n"
+    "## Commands and what they are useful for\n"
+    "- `list_projects` — discover indexed repos and exact project names. Run first.\n"
+    "- `index_repository` — build or refresh graph data for a repo. Use before serious analysis.\n"
+    "- `index_status` — check whether indexing completed and how much graph data exists.\n"
+    "- `search_graph` — primary discovery command for symbols, routes, files, resources, and quality filters.\n"
+    "- `search_code` — indexed text search. Use for literals, error strings, config keys, or comments.\n"
+    "- `get_code_snippet` — read source for a qualified symbol without opening many files.\n"
+    "- `trace_path` — answer who calls this, what it calls, and what a change can affect.\n"
+    "- `detect_changes` — review helper for current git diff, changed symbols, blast radius, and risk.\n"
+    "- `get_architecture` — summarize packages, dependencies, routes, clusters, and hotspots.\n"
+    "- `get_graph_schema` — inspect labels, relationship types, and properties before Cypher.\n"
+    "- `query_graph` — custom Cypher-like read queries for advanced architecture/quality questions.\n"
+    "- `check_index_coverage` — identify partial, skipped, excluded, stale, pending, or unknown indexed source ranges.\n"
+    "- `manage_adr` — read or update Architecture Decision Records. Ask before creating/updating ADRs.\n"
+    "- `ingest_traces` — import runtime traces to validate or enrich cross-service edges.\n"
+    "- `delete_project` — remove indexed graph data. Ask before running.\n"
+    "\n"
+    "## Common command templates\n"
+    "```bash\n"
+    "# Index current repo when absent or stale\n"
+    "codebase-memory-mcp cli index_repository '{\"repo_path\":\"/path/to/repo\",\"name\":\"my-project\",\"mode\":\"moderate\"}'\n"
+    "\n"
+    "# Find symbols or concepts before editing\n"
+    "codebase-memory-mcp cli search_graph '{\"project\":\"PROJECT\",\"query\":\"update settings\",\"limit\":20}'\n"
+    "\n"
+    "# Find HTTP routes before changing API behavior\n"
+    "codebase-memory-mcp cli search_graph '{\"project\":\"PROJECT\",\"label\":\"Route\",\"limit\":100}'\n"
+    "\n"
+    "# Read implementation after search_graph returns qualified_name\n"
+    "codebase-memory-mcp cli get_code_snippet '{\"project\":\"PROJECT\",\"qualified_name\":\"pkg/orders.ProcessOrder\",\"include_neighbors\":true}'\n"
+    "\n"
+    "# Trace impact before edits or during review\n"
+    "codebase-memory-mcp cli trace_path '{\"project\":\"PROJECT\",\"function_name\":\"ProcessOrder\",\"direction\":\"both\",\"depth\":3}'\n"
+    "\n"
+    "# Check coverage for cited source paths\n"
+    "codebase-memory-mcp cli check_index_coverage '{\"project\":\"PROJECT\",\"paths\":[\"src/orders.py\"]}'\n"
+    "\n"
+    "# Review current git diff with graph context\n"
+    "codebase-memory-mcp cli detect_changes '{\"project\":\"PROJECT\",\"repo_path\":\"/path/to/repo\"}'\n"
+    "\n"
+    "# Architecture overview\n"
+    "codebase-memory-mcp cli get_architecture '{\"project\":\"PROJECT\",\"aspects\":[\"packages\",\"dependencies\",\"clusters\",\"routes\"]}'\n"
+    "\n"
+    "# Advanced quality query\n"
+    "codebase-memory-mcp cli query_graph '{\"project\":\"PROJECT\",\"query\":\"MATCH (f:Function) RETURN f.qualified_name LIMIT 20\",\"max_rows\":20}'\n"
+    "```\n"
+    "\n"
+    "## Edge types\n"
+    "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD, HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CONFIGURES, FILE_CHANGES_WITH, SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE\n"
+    "\n"
+    "## Gotchas\n"
+    "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree. Use `query_graph` with Cypher to see actual edges.\n"
+    "2. `query_graph` has a 100k row ceiling. Add a Cypher `LIMIT` for broad queries or use `search_graph` pagination.\n"
+    "3. `trace_path` needs exact names. Use `search_graph(name_pattern=...)` first.\n"
+    "4. `direction=\"outbound\"` misses cross-service callers. Use `direction=\"both\"`.\n"
+    "5. `search_graph` results default to 50 per page. Check `has_more` and use `offset`.\n"
+    "\n"
+    "## Rules\n"
+    "- CLI first and only for this skill.\n"
+    "- Use this before grep/file search for code discovery, review pre-analysis, and change planning.\n"
+    "- Use `jq` for JSON creation and summarizing large outputs.\n"
+    "- Save large raw outputs to `/tmp/cbm-*.json`.\n"
+    "- Fall back to file search only for non-indexed files, exact literals missing from graph, coverage gaps, or generated/vendor files.\n"
+    "- Ask before `delete_project`, `uninstall`, global config mutation, or ADR writes.\n";
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
     "\n"
@@ -621,9 +748,16 @@ static const char *old_skill_names[] = {
 };
 enum { OLD_SKILL_COUNT = 4 };
 
-static const cbm_skill_t skills[CBM_SKILL_COUNT] = {
-    {"codebase-memory", skill_content},
+static bool g_cli_skill_mode = false;
+
+static cbm_skill_t skills[CBM_SKILL_COUNT] = {
+    {"codebase-memory", mcp_skill_content},
 };
+
+void cbm_set_cli_skill_mode(bool enabled) {
+    g_cli_skill_mode = enabled;
+    skills[0].content = enabled ? cli_skill_content : mcp_skill_content;
+}
 
 const cbm_skill_t *cbm_get_skills(void) {
     return skills;
@@ -5650,6 +5784,9 @@ static void install_claude_code_config(const char *home, const char *binary_path
                 .dialect = CBM_GRAPH_DIALECT_CLAUDE,
             },
             dry_run);
+        if (g_cli_skill_mode) {
+            return;
+        }
         snprintf(p, sizeof(p), "%s/.claude.json", user_root);
         plan_record("Claude Code", "mcp_config", p);
         snprintf(p, sizeof(p), "%s/settings.json", config_dir);
@@ -5679,6 +5816,11 @@ static void install_claude_code_config(const char *home, const char *binary_path
 
     if (cbm_remove_old_monolithic_skill(skills_dir, dry_run)) {
         printf("  removed old monolithic skill\n");
+    }
+
+    if (g_cli_skill_mode) {
+        printf("  skill-mode: cli (MCP configs/hooks skipped)\n");
+        return;
     }
 
     /* ~/.claude/.mcp.json is not a documented Claude Code MCP location.
@@ -7317,6 +7459,12 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
     if (agents.claude_code) {
         install_claude_code_config(home, binary_path, force, dry_run);
     }
+    if (g_cli_skill_mode) {
+        if (!agents.claude_code && !g_install_plan) {
+            printf("skill-mode: cli requested, but no Claude Code skills directory was detected.\n");
+        }
+        return CLI_OK;
+    }
     install_cli_agent_configs(&agents, home, binary_path, force, dry_run);
     install_editor_agent_configs(&agents, home, binary_path, force, dry_run);
     install_additional_agent_configs(&agents, home, binary_path, force, dry_run);
@@ -7481,6 +7629,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "type", "agent.install.plan.v1");
+    yyjson_mut_obj_add_str(doc, root, "skill_mode", g_cli_skill_mode ? "cli" : "mcp");
 
     yyjson_mut_val *agents = yyjson_mut_arr(doc);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -7534,7 +7683,9 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
-    yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
+    yyjson_mut_obj_add_str(doc, root, "next_safe_command",
+                           g_cli_skill_mode ? "codebase-memory-mcp install -y --skill-mode=cli"
+                                            : "codebase-memory-mcp install -y --skill-mode=mcp");
 
     char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL);
     yyjson_mut_doc_free(doc);
@@ -7548,6 +7699,7 @@ int cbm_cmd_install(int argc, char **argv) {
     bool force = false;
     bool plan = false;
     bool reset_indexes = false;
+    bool cli_skill_mode = false;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
@@ -7563,7 +7715,14 @@ int cbm_cmd_install(int argc, char **argv) {
         if (strcmp(argv[i], "--reset-indexes") == 0) {
             reset_indexes = true;
         }
+        if (strcmp(argv[i], "--skill-mode=cli") == 0 || strcmp(argv[i], "--cli-skill") == 0) {
+            cli_skill_mode = true;
+        }
+        if (strcmp(argv[i], "--skill-mode=mcp") == 0) {
+            cli_skill_mode = false;
+        }
     }
+    cbm_set_cli_skill_mode(cli_skill_mode);
 
     const char *home = cbm_get_home_dir();
     if (!home) {
@@ -7587,7 +7746,8 @@ int cbm_cmd_install(int argc, char **argv) {
         return 0;
     }
 
-    printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
+    printf("codebase-memory-mcp install %s\n", CBM_VERSION);
+    printf("skill-mode: %s\n\n", cli_skill_mode ? "cli" : "mcp");
 
     /* (#607) Default: preserve existing indexes. `--reset-indexes` opts into
      * the old prompt-and-delete behaviour. The helper returns 0 only when the
