@@ -37,6 +37,12 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
  * non-zero (and prints nothing) if it is not. */
 int cbm_cli_print_tool_help(const char *tool_name);
 
+/* Print the top-level `--help` text (usage lines including every config
+ * subcommand, UI options, agent list, tool lists) to stdout. Lives here
+ * instead of main.c so the test runner, which does not link main.c, can
+ * assert the help content in-process. */
+void cbm_cli_print_main_help(void);
+
 /* ── Self-update: version comparison ──────────────────────────── */
 
 /* Compare two semver strings (e.g. "0.2.1" vs "0.2.0").

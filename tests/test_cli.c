@@ -7085,6 +7085,44 @@ TEST(cli_print_tool_help_issue680) {
     PASS();
 }
 
+/* Top-level --help must advertise every working config subcommand. `config
+ * preset <list|apply>` dispatches in cbm_cmd_config and is listed by the
+ * config-specific usage, but the main help's config line omitted it, so
+ * `--help` readers never learn presets exist. Capture stdout via pipe+dup2
+ * (same technique as test_log.c's stderr capture) and assert the preset
+ * line is present next to the other config usage line. */
+TEST(cli_main_help_lists_config_preset_subcommand) {
+    fflush(stdout);
+    int saved_stdout = dup(STDOUT_FILENO);
+    ASSERT_TRUE(saved_stdout >= 0);
+    int fds[2];
+    ASSERT_EQ(cbm_pipe(fds), 0);
+    dup2(fds[1], STDOUT_FILENO);
+    close(fds[1]);
+
+    cbm_cli_print_main_help();
+
+    fflush(stdout);
+    dup2(saved_stdout, STDOUT_FILENO);
+    close(saved_stdout);
+
+    static char help_buf[8192];
+    size_t used = 0;
+    ssize_t n;
+    while (used < sizeof(help_buf) - 1 &&
+           (n = read(fds[0], help_buf + used, sizeof(help_buf) - 1 - used)) > 0) {
+        used += (size_t)n;
+    }
+    close(fds[0]);
+    help_buf[used] = '\0';
+
+    /* Existing config line still present ... */
+    ASSERT_NOT_NULL(strstr(help_buf, "config <list|get|set|reset>"));
+    /* ... and the preset subcommand is advertised beside it. */
+    ASSERT_NOT_NULL(strstr(help_buf, "config preset <list|apply>"));
+    PASS();
+}
+
 /* The self-update path verifies a downloaded archive against a published
  * checksum. That check is only meaningful if the digest is actually computed —
  * a broken hash command (it once invoked `shasum -a CBM_SZ_256`, an invalid
@@ -7483,4 +7521,5 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+    RUN_TEST(cli_main_help_lists_config_preset_subcommand);
 }

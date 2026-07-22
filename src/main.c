@@ -613,31 +613,11 @@ static int run_cli(int argc, char **argv) {
 
 /* ── Help ───────────────────────────────────────────────────────── */
 
+/* Body lives in cli.c (cbm_cli_print_main_help) so tests can assert the help
+ * content in-process; main.c is not linked into the test runner. The version
+ * is bound via cbm_cli_set_version(CBM_VERSION) before subcommand dispatch. */
 static void print_help(void) {
-    printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
-    printf("Usage:\n");
-    printf("  codebase-memory-mcp              Run MCP server on stdio\n");
-    printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
-    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
-    printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");
-    printf("  codebase-memory-mcp config <list|get|set|reset>\n");
-    printf("  codebase-memory-mcp --version    Print version\n");
-    printf("  codebase-memory-mcp --help       Print this help\n");
-    printf("\nUI options:\n");
-    printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
-    printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
-    printf("  --port=N     Set UI port (default 9749, persisted)\n");
-    printf("\nSupported agents (auto-detected):\n");
-    printf("  Claude Code, Claude Desktop, Codex CLI, Gemini CLI, Qwen Code,\n");
-    printf("  ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode,\n");
-    printf("  VS Code, Cursor, Windsurf, OpenClaw, Kiro, Junie\n");
-    printf("\nDefault MCP tools: search_graph, query_graph, trace_path,\n");
-    printf("  search_code, get_code, _hidden_tools\n");
-    printf("\nAdvanced and CLI-callable tools: index_repository, get_code_snippet,\n");
-    printf("  get_graph_schema, get_architecture, list_projects, delete_project,\n");
-    printf("  index_status, detect_changes, manage_adr, ingest_traces,\n");
-    printf("  index_dependencies\n");
+    cbm_cli_print_main_help();
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
