@@ -373,6 +373,69 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
 #endif
 }
 
+TEST(httpd_resolves_deleted_self_to_replaced_launch_path) {
+#if defined(__linux__)
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_httpd_deleted_self_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+
+    char current[1024];
+    ssize_t current_len = readlink("/proc/self/exe", current, sizeof(current) - 1);
+    ASSERT_GT(current_len, 0);
+    ASSERT_LT(current_len, (ssize_t)(sizeof(current) - 1));
+    current[current_len] = '\0';
+
+    char launch_path[512];
+    char replacement_path[512];
+    snprintf(launch_path, sizeof(launch_path), "%s/test-runner", tmpdir);
+    snprintf(replacement_path, sizeof(replacement_path), "%s/test-runner.new", tmpdir);
+    ASSERT_EQ(cbm_copy_file(current, launch_path), 0);
+    ASSERT_EQ(chmod(launch_path, 0755), 0);
+
+    int ready_pipe[2];
+    int continue_pipe[2];
+    ASSERT_EQ(pipe(ready_pipe), 0);
+    ASSERT_EQ(pipe(continue_pipe), 0);
+
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(continue_pipe[1]);
+        char ready_fd[32];
+        char continue_fd[32];
+        snprintf(ready_fd, sizeof(ready_fd), "%d", ready_pipe[1]);
+        snprintf(continue_fd, sizeof(continue_fd), "%d", continue_pipe[0]);
+        execl(launch_path, launch_path, "__cbm_deleted_self_probe", ready_fd, continue_fd,
+              launch_path, (char *)NULL);
+        _exit(127);
+    }
+    ASSERT_GT(child, 0);
+
+    close(ready_pipe[1]);
+    close(continue_pipe[0]);
+    char ready = '\0';
+    ASSERT_EQ(read(ready_pipe[0], &ready, 1), 1);
+    ASSERT_EQ(ready, 'R');
+
+    ASSERT_EQ(cbm_copy_file(current, replacement_path), 0);
+    ASSERT_EQ(chmod(replacement_path, 0755), 0);
+    ASSERT_EQ(rename(replacement_path, launch_path), 0);
+    ASSERT_EQ(write(continue_pipe[1], "G", 1), 1);
+    close(ready_pipe[0]);
+    close(continue_pipe[1]);
+
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    unlink(launch_path);
+    rmdir(tmpdir);
+    PASS();
+#else
+    PASS();
+#endif
+}
+
 /* ── Transport integration (listener only) ────────────────────── */
 
 TEST(httpd_listen_ephemeral_port) {
@@ -1189,6 +1252,7 @@ SUITE(httpd) {
     RUN_TEST(httpd_query_param_edge_cases);
     RUN_TEST(httpd_path_match_matrix);
     RUN_TEST(httpd_resolves_bare_binary_path_from_path);
+    RUN_TEST(httpd_resolves_deleted_self_to_replaced_launch_path);
     RUN_TEST(repo_info_web_base_normalizes_to_https);
     RUN_TEST(repo_info_strips_credentials_from_remote);
 
