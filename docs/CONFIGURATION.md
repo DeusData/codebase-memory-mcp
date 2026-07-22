@@ -80,9 +80,11 @@ for any registry key):
 
 | Key | Default | Meaning |
 |---|---|---|
-| `auto_index` | `true` | Automatically index new projects when an MCP session starts. |
+| `auto_index` | `true` | Automatically index new projects at MCP startup or first graph use. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `auto_watch` | `true` | Register indexed projects for automatic background Git-change refresh. |
 | `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
+| `context_injection` | `true` | Include codebase schema and stats automatically in the first `search_graph` response. |
 | `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
 | `auto_index_deps` | `true` | Index installed dependency APIs for cross-package search and tracing. |
 | `auto_dep_limit` | `20` | Import-ranked automatic dependency package cap; `0` is unlimited. |
@@ -91,6 +93,12 @@ for any registry key):
 | `githistory_enabled` | `true` | Create Git co-change coupling edges. |
 | `httplinks_enabled` | `true` | Link HTTP clients to discovered routes. |
 | `default_response_format` | `toon` | Tool-response encoding when a call omits `format`: `toon` (compact tables) or `json` (full objects). A per-call `format` argument always wins. |
+
+Normal streamlined exploration uses `search_graph`, `trace_path`, `get_code`, and
+`query_graph` as needed; automatic indexing and first-response context follow their
+settings. Classic structural discovery uses `search_graph`, then `trace_path`, then
+`get_code_snippet`; use `query_graph` or `get_architecture` for broader structure.
+Classic mode advertises advanced tools directly.
 
 ### Named presets
 

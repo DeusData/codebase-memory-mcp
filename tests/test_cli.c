@@ -876,8 +876,11 @@ TEST(cli_skill_files_content) {
     ASSERT(strstr(sk[0].content, "auto_index=true") != NULL);
     ASSERT(strstr(sk[0].content, "auto_index_deps=true") != NULL);
     ASSERT(strstr(sk[0].content, "auto_dep_limit") != NULL);
-    ASSERT(strstr(sk[0].content, "get_code_snippet` in classic mode") != NULL);
+    ASSERT(strstr(sk[0].content, "get_code_snippet") != NULL);
     ASSERT(strstr(sk[0].content, "_hidden_tools") != NULL);
+    ASSERT(strstr(sk[0].content, "**Classic:** use `search_graph") != NULL);
+    ASSERT(strstr(sk[0].content, "then `trace_path`, then `get_code_snippet") != NULL);
+    ASSERT(strstr(sk[0].content, "detect_changes()` — map git diff") != NULL);
     ASSERT(strstr(sk[0].content, "problem-specific Cypher") != NULL);
     ASSERT(strstr(sk[0].content, "query_max_output_bytes") != NULL);
     ASSERT(strstr(sk[0].content, "## 15 MCP Tools") == NULL);
@@ -899,6 +902,8 @@ TEST(cli_codex_instructions) {
     ASSERT(strstr(instr, "get_code` in streamlined mode") != NULL);
     ASSERT(strstr(instr, "auto_index_deps") != NULL);
     ASSERT(strstr(instr, "auto_dep_limit") != NULL);
+    ASSERT(strstr(instr, "Normal streamlined exploration uses the four core tools") != NULL);
+    ASSERT(strstr(instr, "get_architecture` — high-level summary") != NULL);
     ASSERT(strstr(instr, "retry that operation with escalation") != NULL);
     ASSERT(strstr(instr, "MCP approval and shell sandbox authorization are separate") != NULL);
     PASS();
@@ -4175,18 +4180,24 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     cli_env_snapshot_t cache = {0};
     cli_env_snapshot_t tool_mode = {0};
     cli_env_snapshot_t auto_index = {0};
+    cli_env_snapshot_t context_injection = {0};
+    cli_env_snapshot_t auto_watch = {0};
     cli_env_snapshot_t auto_index_limit = {0};
     cli_env_snapshot_t auto_index_deps = {0};
     cli_env_snapshot_t auto_dep_limit = {0};
     ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
     ASSERT_TRUE(cli_env_snapshot(&tool_mode, "CBM_TOOL_MODE"));
     ASSERT_TRUE(cli_env_snapshot(&auto_index, "CBM_AUTO_INDEX"));
+    ASSERT_TRUE(cli_env_snapshot(&context_injection, "CBM_CONTEXT_INJECTION"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_watch, "CBM_AUTO_WATCH"));
     ASSERT_TRUE(cli_env_snapshot(&auto_index_limit, "CBM_AUTO_INDEX_LIMIT"));
     ASSERT_TRUE(cli_env_snapshot(&auto_index_deps, "CBM_AUTO_INDEX_DEPS"));
     ASSERT_TRUE(cli_env_snapshot(&auto_dep_limit, "CBM_AUTO_DEP_LIMIT"));
     cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
     cbm_unsetenv("CBM_TOOL_MODE");
     cbm_unsetenv("CBM_AUTO_INDEX");
+    cbm_unsetenv("CBM_CONTEXT_INJECTION");
+    cbm_unsetenv("CBM_AUTO_WATCH");
     cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
     cbm_unsetenv("CBM_AUTO_INDEX_DEPS");
     cbm_unsetenv("CBM_AUTO_DEP_LIMIT");
@@ -4195,6 +4206,8 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_CONTEXT_INJECTION, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "true"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "17"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
     cbm_config_close(cfg);
@@ -4205,10 +4218,31 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     char *output = cbm_hook_augment_lifecycle_json(input);
     ASSERT_NOT_NULL(output);
     ASSERT(strstr(output, "API=streamlined") != NULL);
-    ASSERT(strstr(output, "_hidden_tools") != NULL);
+    ASSERT(strstr(output, "_hidden_tools") == NULL);
     ASSERT(strstr(output, "get_code") != NULL);
+    ASSERT(strstr(output, "get_architecture") == NULL);
+    ASSERT(strstr(output, "then trace_path") == NULL);
+    ASSERT(strstr(output, "First-use indexing") != NULL);
+    ASSERT(strstr(output, "first-response codebase context") != NULL);
+    ASSERT(strstr(output, "auto_watch=true") != NULL);
+    ASSERT(strstr(output, "Git-change refresh is automatic") != NULL);
     ASSERT(strstr(output, "auto_index_limit=17") != NULL);
     ASSERT(strstr(output, "auto_index_deps=false") != NULL);
+    free(output);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_CONTEXT_INJECTION, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_WATCH, "false"), 0);
+    cbm_config_close(cfg);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=streamlined") != NULL);
+    ASSERT(strstr(output, "First-use indexing") == NULL);
+    ASSERT(strstr(output, "first-response codebase context") == NULL);
+    ASSERT(strstr(output, "auto_watch=false") != NULL);
+    ASSERT(strstr(output, "refresh explicitly after Git changes") != NULL);
     free(output);
 
     cfg = cbm_config_open(tmpdir);
@@ -4223,6 +4257,8 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     ASSERT_NOT_NULL(output);
     ASSERT(strstr(output, "API=classic") != NULL);
     ASSERT(strstr(output, "get_code_snippet") != NULL);
+    ASSERT(strstr(output, "get_architecture") != NULL);
+    ASSERT(strstr(output, "search_graph, then trace_path, then get_code_snippet") != NULL);
     ASSERT(strstr(output, "directly visible") != NULL);
     ASSERT(strstr(output, "_hidden_tools") == NULL);
     ASSERT(strstr(output, "auto_index=false") != NULL);
@@ -4249,6 +4285,8 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     cli_env_restore(&auto_index_deps);
     cli_env_restore(&auto_index_limit);
     cli_env_restore(&auto_index);
+    cli_env_restore(&context_injection);
+    cli_env_restore(&auto_watch);
     cli_env_restore(&tool_mode);
     cli_env_restore(&cache);
     test_rmdir_r(tmpdir);
@@ -5765,6 +5803,37 @@ TEST(cli_agent_instructions_content) {
     ASSERT(strstr(instr, "search_graph") != NULL);
     ASSERT(strstr(instr, "trace_path") != NULL);
     ASSERT(strstr(instr, "get_code") != NULL);
+    ASSERT(strstr(instr, "Classic uses steps 1-3 in order") != NULL);
+    ASSERT(strstr(instr, "then choose Scout, Verify") != NULL);
+    PASS();
+}
+
+TEST(cli_mode_guidance_artifacts_preserve_both_contracts) {
+    const cbm_skill_t *installed_skills = cbm_get_skills();
+    const char *artifacts[] = {
+        installed_skills[0].content,
+        cbm_get_codex_instructions(),
+        read_test_file("README.md"),
+        read_test_file("docs/CONFIGURATION.md"),
+    };
+    for (size_t i = 0U; i < sizeof(artifacts) / sizeof(artifacts[0]); i++) {
+        ASSERT_NOT_NULL(artifacts[i]);
+        ASSERT_NOT_NULL(strstr(artifacts[i], "streamlined"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "classic"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "search_graph`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "trace_path`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "get_code_snippet`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "query_graph`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "get_architecture`"));
+        ASSERT_NOT_NULL(strstr(artifacts[i], "advertises"));
+    }
+
+    const char *agent = cbm_get_agent_instructions();
+    ASSERT_NOT_NULL(agent);
+    ASSERT_NOT_NULL(strstr(agent, "Classic uses steps 1-3 in order"));
+    ASSERT_NOT_NULL(strstr(agent, "get_code_snippet` (classic)"));
+    ASSERT_NOT_NULL(strstr(agent, "get_architecture`"));
+    ASSERT_NOT_NULL(strstr(agent, "advanced when streamlined"));
     PASS();
 }
 
@@ -6404,7 +6473,7 @@ TEST(cli_tool_hooks_preserve_foreign_same_matcher) {
                      strstr(claude, "user-claude-sibling") &&
                      strstr(claude, "cbm-code-discovery-gate") && gemini &&
                      strstr(gemini, "user-gemini-tool-hook") &&
-                     strstr(gemini, "codebase-memory-mcp search_graph");
+                     strstr(gemini, "graph tools over grep or file search");
     free(claude);
     free(gemini);
 
@@ -6416,7 +6485,7 @@ TEST(cli_tool_hooks_preserve_foreign_same_matcher) {
                               strstr(claude, "user-claude-sibling") &&
                               !strstr(claude, "cbm-code-discovery-gate") && gemini &&
                               strstr(gemini, "user-gemini-tool-hook") &&
-                              !strstr(gemini, "codebase-memory-mcp search_graph");
+                              !strstr(gemini, "graph tools over grep or file search");
     free(claude);
     free(gemini);
     test_rmdir_r(tmpdir);
@@ -6556,6 +6625,8 @@ TEST(cli_upsert_gemini_hook_fresh) {
         FAIL("Gemini BeforeTool hook must use the current google_web_search tool name");
     if (!strstr(data, "hookSpecificOutput") || !strstr(data, "additionalContext"))
         FAIL("Gemini BeforeTool hook must emit JSON additionalContext, not bare stderr text");
+    ASSERT(strstr(data, "graph tools over grep or file search") != NULL);
+    ASSERT(strstr(data, "get_code_snippet") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -6610,6 +6681,32 @@ TEST(cli_upsert_gemini_hook_replace) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "google_search|read_file|grep_search") == NULL);
     ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_gemini_hook_replaces_previous_json_guidance) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ghook-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char settingspath[512];
+    snprintf(settingspath, sizeof(settingspath), "%s/settings.json", tmpdir);
+    write_test_file(
+        settingspath,
+        "{\"hooks\":{\"BeforeTool\":[{\"matcher\":\"google_web_search|grep_search\","
+        "\"hooks\":[{\"type\":\"command\",\"command\":\"node -e \\\"process.stdout.write("
+        "JSON.stringify({hookSpecificOutput:{hookEventName:'BeforeTool',additionalContext:"
+        "'Code discovery: prefer codebase-memory-mcp search_graph, trace_path, and "
+        "get_code_snippet over grep or file search.'}}))\\\"\"}]}]}}");
+
+    ASSERT_EQ(cbm_upsert_gemini_hooks(settingspath), 0);
+    const char *data = read_test_file(settingspath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "graph tools over grep or file search") != NULL);
+    ASSERT(strstr(data, "get_code_snippet") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -7600,6 +7697,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_instructions_no_duplicate);
     RUN_TEST(cli_remove_instructions);
     RUN_TEST(cli_agent_instructions_content);
+    RUN_TEST(cli_mode_guidance_artifacts_preserve_both_contracts);
     RUN_TEST(cli_qwen_windows_hook_command_uses_powershell_schema);
     RUN_TEST(cli_windows_optional_hooks_require_a_documented_shell);
     RUN_TEST(cli_installed_skill_limits_match_server_contract);
@@ -7628,6 +7726,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_gemini_hook_fresh);
     RUN_TEST(cli_upsert_gemini_hook_existing);
     RUN_TEST(cli_upsert_gemini_hook_replace);
+    RUN_TEST(cli_upsert_gemini_hook_replaces_previous_json_guidance);
     RUN_TEST(cli_remove_gemini_hooks);
 
     /* Skill directive descriptions (1 test — group E) */
