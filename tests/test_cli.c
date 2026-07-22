@@ -874,6 +874,9 @@ TEST(cli_skill_files_content) {
     ASSERT(strstr(sk[0].content, "MCP Tools") != NULL);
     ASSERT(strstr(sk[0].content, "index_dependencies") != NULL);
     ASSERT(strstr(sk[0].content, "auto_index=true") != NULL);
+    ASSERT(strstr(sk[0].content, "auto_index_deps=true") != NULL);
+    ASSERT(strstr(sk[0].content, "auto_dep_limit") != NULL);
+    ASSERT(strstr(sk[0].content, "get_code_snippet` in classic mode") != NULL);
     ASSERT(strstr(sk[0].content, "_hidden_tools") != NULL);
     ASSERT(strstr(sk[0].content, "problem-specific Cypher") != NULL);
     ASSERT(strstr(sk[0].content, "query_max_output_bytes") != NULL);
@@ -893,6 +896,9 @@ TEST(cli_codex_instructions) {
     ASSERT(strstr(instr, "trace_path") != NULL);
     ASSERT(strstr(instr, "effective, computationally efficient") != NULL);
     ASSERT(strstr(instr, "examples and LIMIT are optional guidance") != NULL);
+    ASSERT(strstr(instr, "get_code` in streamlined mode") != NULL);
+    ASSERT(strstr(instr, "auto_index_deps") != NULL);
+    ASSERT(strstr(instr, "auto_dep_limit") != NULL);
     ASSERT(strstr(instr, "retry that operation with escalation") != NULL);
     ASSERT(strstr(instr, "MCP approval and shell sandbox authorization are separate") != NULL);
     PASS();
@@ -2192,7 +2198,8 @@ TEST(cli_uninstall_removes_codex_json_hook_only) {
                                           "\"hooks\":[{\"type\":\"command\","
                                           "\"command\":\"echo user-hook\"}]}]}}"),
               0);
-    ASSERT_EQ(cbm_upsert_gemini_session_hooks(hooks_path), 0);
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(hooks_path, "/usr/local/bin/codebase-memory-mcp"),
+              0);
 
     cli_env_snapshot_t home = {0};
     ASSERT_TRUE(cli_env_snapshot(&home, "HOME"));
@@ -3053,17 +3060,20 @@ TEST(cli_gemini_session_hook_parity) {
     char cfg[512];
     snprintf(cfg, sizeof(cfg), "%s/settings.json", tmpdir);
 
-    ASSERT_EQ(cbm_upsert_gemini_session_hooks(cfg), 0);
+    ASSERT_EQ(cbm_upsert_gemini_session_hooks(cfg, "/opt/cbm/bin/codebase-memory-mcp"), 0);
     const char *d = read_test_file(cfg);
     ASSERT_NOT_NULL(d);
     ASSERT(strstr(d, "SessionStart") != NULL);
-    ASSERT(strstr(d, "search_graph") != NULL);
+    ASSERT(strstr(d, "hook-augment") != NULL);
+    ASSERT(strstr(d, "--dialect gemini") == NULL);
+    ASSERT(strstr(d, "get_code_snippet") == NULL);
+    ASSERT(strstr(d, "run index_repository first") == NULL);
     ASSERT(strstr(d, "\"matcher\": \"startup\"") != NULL);
     ASSERT(strstr(d, "\"matcher\": \"resume\"") != NULL);
     ASSERT(strstr(d, "\"matcher\": \"clear\"") != NULL);
     ASSERT(strstr(d, "startup|resume|clear") == NULL);
 
-    ASSERT_EQ(cbm_remove_gemini_session_hooks(cfg), 0);
+    ASSERT_EQ(cbm_remove_gemini_session_hooks(cfg, "/opt/cbm/bin/codebase-memory-mcp"), 0);
     d = read_test_file(cfg);
     ASSERT_NULL(strstr(d, "SessionStart"));
 
@@ -4101,14 +4111,147 @@ TEST(cli_hook_augment_subagent_tier_router_contract) {
 }
 
 TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-guidance-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t tool_mode = {0};
+    cli_env_snapshot_t auto_index = {0};
+    cli_env_snapshot_t auto_index_limit = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&tool_mode, "CBM_TOOL_MODE"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index, "CBM_AUTO_INDEX"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_limit, "CBM_AUTO_INDEX_LIMIT"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_AUTO_INDEX");
+    cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "17"), 0);
+    cbm_config_close(cfg);
+
     const char *session = cbm_hook_no_project_index_guidance_for_testing("SessionStart");
     const char *subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart");
     ASSERT_NOT_NULL(session);
     ASSERT_NOT_NULL(subagent);
-    ASSERT(strstr(session, "Run index_repository") != NULL);
-    ASSERT(strstr(subagent, "Ask the parent agent to run index_repository") != NULL);
-    ASSERT(strstr(subagent, "do not attempt graph mutation") != NULL);
-    ASSERT(strstr(subagent, "Run index_repository") == NULL);
+    ASSERT(strstr(session, "search_graph") != NULL);
+    ASSERT(strstr(session, "auto_index_limit=17") != NULL);
+    ASSERT(strstr(subagent, "Ask the parent") != NULL);
+    ASSERT(strstr(subagent, "auto_index_limit=17") != NULL);
+    ASSERT(strstr(subagent, "Do not mutate the graph") != NULL);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+    cbm_config_close(cfg);
+    session = cbm_hook_no_project_index_guidance_for_testing("SessionStart");
+    subagent = cbm_hook_no_project_index_guidance_for_testing("SubagentStart");
+    ASSERT(strstr(session, "auto_index=false") != NULL);
+    ASSERT(strstr(session, "index_repository") != NULL);
+    ASSERT(strstr(subagent, "Ask the parent") != NULL);
+    ASSERT(strstr(subagent, "auto_index=false") != NULL);
+    ASSERT(strstr(subagent, "Do not mutate the graph") != NULL);
+
+    cli_env_restore(&auto_index_limit);
+    cli_env_restore(&auto_index);
+    cli_env_restore(&tool_mode);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-config-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t tool_mode = {0};
+    cli_env_snapshot_t auto_index = {0};
+    cli_env_snapshot_t auto_index_limit = {0};
+    cli_env_snapshot_t auto_index_deps = {0};
+    cli_env_snapshot_t auto_dep_limit = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&tool_mode, "CBM_TOOL_MODE"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index, "CBM_AUTO_INDEX"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_limit, "CBM_AUTO_INDEX_LIMIT"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_deps, "CBM_AUTO_INDEX_DEPS"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_dep_limit, "CBM_AUTO_DEP_LIMIT"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_TOOL_MODE");
+    cbm_unsetenv("CBM_AUTO_INDEX");
+    cbm_unsetenv("CBM_AUTO_INDEX_LIMIT");
+    cbm_unsetenv("CBM_AUTO_INDEX_DEPS");
+    cbm_unsetenv("CBM_AUTO_DEP_LIMIT");
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "17"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
+    cbm_config_close(cfg);
+
+    const char *input =
+        "{\"hook_event_name\":\"SessionStart\","
+        "\"cwd\":\"/definitely-not-indexed/config-guidance\"}";
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=streamlined") != NULL);
+    ASSERT(strstr(output, "_hidden_tools") != NULL);
+    ASSERT(strstr(output, "get_code") != NULL);
+    ASSERT(strstr(output, "auto_index_limit=17") != NULL);
+    ASSERT(strstr(output, "auto_index_deps=false") != NULL);
+    free(output);
+
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "3"), 0);
+    cbm_config_close(cfg);
+
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=classic") != NULL);
+    ASSERT(strstr(output, "get_code_snippet") != NULL);
+    ASSERT(strstr(output, "directly visible") != NULL);
+    ASSERT(strstr(output, "_hidden_tools") == NULL);
+    ASSERT(strstr(output, "auto_index=false") != NULL);
+    ASSERT(strstr(output, "auto_dep_limit=3") != NULL);
+    free(output);
+
+    /* Environment-only configuration must still shape guidance when no config
+     * database exists, and the hook must not create one while reading it. */
+    char missing_cache[512];
+    snprintf(missing_cache, sizeof(missing_cache), "%s/missing", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", missing_cache, 1);
+    cbm_setenv("CBM_TOOL_MODE", CBM_CONFIG_TOOL_MODE_STREAMLINED, 1);
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+    cbm_setenv("CBM_AUTO_INDEX_LIMIT", "9", 1);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "API=streamlined") != NULL);
+    ASSERT(strstr(output, "auto_index_limit=9") != NULL);
+    struct stat missing_cache_stat;
+    ASSERT_EQ(stat(missing_cache, &missing_cache_stat), -1);
+    free(output);
+
+    cli_env_restore(&auto_dep_limit);
+    cli_env_restore(&auto_index_deps);
+    cli_env_restore(&auto_index_limit);
+    cli_env_restore(&auto_index);
+    cli_env_restore(&tool_mode);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
     PASS();
 }
 
@@ -7389,6 +7532,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);
+    RUN_TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config);
     RUN_TEST(cli_hook_augment_post_read_event_and_path_contract);
     RUN_TEST(cli_hook_augment_hermes_dialect_contract);
     RUN_TEST(cli_hook_augment_qoder_lifecycle_contract);

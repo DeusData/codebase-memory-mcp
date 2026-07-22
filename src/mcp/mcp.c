@@ -733,10 +733,6 @@ enum {
 #define CBM_MCP_UPDATE_CHECK_TIMEOUT_S 5
 #define CBM_CONFIG_UPDATE_CHECK_TIMEOUT_S "update_check_timeout_s"
 
-/* Auto-index default used by production servers with a config store. Embedded
- * no-config servers stay manual unless CBM_AUTO_INDEX explicitly opts in. */
-#define CBM_DEFAULT_AUTO_INDEX_LIMIT 50000
-
 /* Config key: comma-separated glob patterns to exclude from key_functions.
  * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"

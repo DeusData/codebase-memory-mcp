@@ -75,7 +75,8 @@ codebase-memory-mcp config set auto_index_limit 50000
 codebase-memory-mcp config reset auto_index
 ```
 
-Important keys (run `config list` for the complete registry):
+Important keys (`config list` shows common effective values; use `config get <key>`
+for any registry key):
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -84,6 +85,7 @@ Important keys (run `config list` for the complete registry):
 | `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
 | `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
 | `auto_index_deps` | `true` | Index installed dependency APIs for cross-package search and tracing. |
+| `auto_dep_limit` | `20` | Import-ranked automatic dependency package cap; `0` is unlimited. |
 | `similarity_enabled` | `true` | Create MinHash similarity edges in applicable index modes. |
 | `semantic_edges_enabled` | `true` | Create semantic-related edges in applicable index modes. |
 | `githistory_enabled` | `true` | Create Git co-change coupling edges. |

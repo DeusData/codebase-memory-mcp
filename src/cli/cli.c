@@ -548,10 +548,13 @@ static const char skill_content[] =
     "## Exploration Workflow\n"
     "1. `search_graph(name_pattern=\"...\")` — finds symbols and auto-indexes the server CWD or "
     "explicit repo path when auto_index=true and under auto_index_limit\n"
-    "2. `get_code(qualified_name=\"project.path.FuncName\")` — read one symbol's source\n"
+    "2. Use advertised `get_code(qualified_name=\"project.path.FuncName\")` in streamlined "
+    "mode or `get_code_snippet` in classic mode — read one symbol's source\n"
     "3. `query_graph(query=\"MATCH ...\")` — compose multi-hop structural questions\n"
-    "4. `_hidden_tools` — reveal diagnostics and explicit maintenance tools such as "
-    "list_projects, index_status, get_graph_schema, and index_dependencies when needed\n"
+    "4. In streamlined mode, call `_hidden_tools` once to reveal diagnostics and explicit "
+    "maintenance tools such as list_projects, index_status, get_graph_schema, "
+    "check_index_coverage, index_repository, and index_dependencies; classic mode advertises "
+    "them directly\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
@@ -567,7 +570,8 @@ static const char skill_content[] =
     "- **Auditor (Tier 3):** bounded-scope full verification with a current graph generation, "
     "complete relevant pagination, both call directions and broader relationships when material, "
     "plus explicit unresolved limitations.\n"
-    "- **Every tier:** after candidate paths are known, call `check_index_coverage` once with "
+    "- **Every tier:** in streamlined mode reveal advanced tools first; after candidate paths "
+    "are known, call `check_index_coverage` once with "
     "every "
     "evidence path. For negative or exhaustive claims also include the relevant scopes. A clean "
     "result means no recorded gap, not proof of completeness. For partial, skipped, excluded, "
@@ -575,8 +579,11 @@ static const char skill_content[] =
     "the graph.\n"
     "\n"
     "## Freshness and Delegation\n"
-    "- Default graph calls resolve indexing automatically. Reveal list_projects/index_status only "
-    "for explicit inventory or freshness diagnostics.\n"
+    "- When auto_index=true, default graph calls can index the server CWD or an explicit path "
+    "under auto_index_limit. When disabled or skipped, reveal/use index_repository explicitly. "
+    "Reveal list_projects/index_status only for explicit inventory or freshness diagnostics.\n"
+    "- auto_index_deps=true indexes dependency APIs up to auto_dep_limit; when disabled or capped, "
+    "reveal/use index_dependencies for required packages instead of assuming dependency coverage.\n"
     "- When handing work to another agent, pass the evidence tier, project, generation/freshness, "
     "bounded scope, queries and pagination state, qualified symbols, paths, coverage findings, "
     "source fallback, and unresolved questions. Do not assume it inherits tool access or context.\n"
@@ -591,8 +598,10 @@ static const char skill_content[] =
     "in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
     "\n"
     "## MCP Tools\n"
-    "Streamlined defaults: `search_graph`, `query_graph`, `search_code`, `trace_path`, `get_code`. "
-    "Graph-backed defaults auto-index when configured. Revealed and classic capabilities:\n"
+    "Streamlined defaults: `search_graph`, `query_graph`, `search_code`, `trace_path`, `get_code`, "
+    "plus `_hidden_tools`. Graph-backed defaults auto-index when configured. Call `_hidden_tools` "
+    "once to reveal advanced capabilities; classic mode advertises them directly and uses "
+    "`get_code_snippet` for source retrieval:\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
     "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
@@ -636,11 +645,18 @@ static const char codex_instructions_content[] =
     "auto-index the server CWD or explicit repo path when auto_index=true and under "
     "auto_index_limit\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
-    "- `get_code` — read function source code by qualified_name\n"
+    "- Use the advertised source tool: `get_code` in streamlined mode or `get_code_snippet` in "
+    "classic mode\n"
     "- `query_graph` — write problem-specific Cypher for effective, computationally efficient "
     "structural answers; examples and LIMIT are optional guidance\n"
-    "- `get_architecture` — high-level summary after `_hidden_tools` reveal or "
-    "CBM_TOOL_MODE=classic\n"
+    "- `get_architecture` — high-level summary after `_hidden_tools` reveal or in classic mode\n"
+    "\n"
+    "In streamlined mode, call `_hidden_tools` once before required checks with "
+    "`check_index_coverage`, `index_status`, `index_repository`, or `index_dependencies`; classic "
+    "mode advertises those tools directly. With auto_index=true, graph-backed tools can index "
+    "paths under auto_index_limit; otherwise use index_repository. auto_index_deps and "
+    "auto_dep_limit control automatic dependency coverage, so use index_dependencies for "
+    "disabled, capped, or missing packages.\n"
     "\n"
     "Prefer graph tools over grep for structural code discovery.\n"
     "If a sandbox blocks an MCP or CLI operation because it crosses a shell or filesystem "
@@ -1698,8 +1714,10 @@ static const char agent_instructions_content[] =
     "### Priority Order\n"
     "1. `search_graph` — find functions, classes, routes, variables by pattern\n"
     "2. `trace_path` — trace who calls a function or what it calls\n"
-    "3. `get_code_snippet` — read specific function/class source code\n"
-    "4. `check_index_coverage` — validate candidate paths and missed ranges before claims\n"
+    "3. Use advertised `get_code` (streamlined) or `get_code_snippet` (classic) — read exact "
+    "source\n"
+    "4. `check_index_coverage` — validate candidate paths and missed ranges before claims "
+    "(reveal it first with `_hidden_tools` in streamlined mode)\n"
     "5. `query_graph` — run Cypher queries for complex patterns\n"
     "6. `get_architecture` — high-level project summary\n"
     "\n"
@@ -1713,7 +1731,8 @@ static const char agent_instructions_content[] =
     "- **Auditor (Tier 3):** bounded-scope full verification with current generation, complete "
     "relevant pagination, both call directions and broader relationships when material, and every "
     "limitation disclosed.\n"
-    "- After candidate paths are known in any tier, call `check_index_coverage` once with every "
+    "- After candidate paths are known in any tier, reveal advanced tools when streamlined, then "
+    "call `check_index_coverage` once with every "
     "evidence path. Add relevant scopes for negative or exhaustive claims. A clean result means no "
     "recorded gap, not proof of completeness. For partial, skipped, excluded, stale, pending, or "
     "unknown coverage, read/grep the reported ranges or scope before relying on graph results.\n"
@@ -1726,11 +1745,16 @@ static const char agent_instructions_content[] =
     "### Examples\n"
     "- Find a handler: `search_graph(name_pattern=\".*OrderHandler.*\")`\n"
     "- Who calls it: `trace_path(function_name=\"OrderHandler\", direction=\"inbound\")`\n"
-    "- Read source: `get_code_snippet(qualified_name=\"pkg/orders.OrderHandler\")`\n"
+    "- Read source: use advertised `get_code(qualified_name=...)` or "
+    "`get_code_snippet(qualified_name=...)`\n"
     "\n"
     "### Session resets and subagents\n"
     "- At session start or after compaction, confirm the nearest graph project and generation with "
-    "`list_projects` or `index_status`, then choose Scout, Verify, or Auditor.\n"
+    "`list_projects` or `index_status` (after `_hidden_tools` reveal when streamlined), then "
+    "choose Scout, Verify, or Auditor.\n"
+    "- With auto_index=true, graph-backed tools can index a CWD/path under auto_index_limit; "
+    "otherwise reveal/use index_repository. auto_index_deps and auto_dep_limit bound automatic "
+    "dependency coverage; reveal/use index_dependencies for missing packages.\n"
     "- Before spawning a subagent, query the graph and coverage in the parent. Pass the tier, "
     "project, generation/freshness, bounded scope, queries and pagination state, qualified "
     "symbols, "
@@ -2291,13 +2315,18 @@ static int cbm_build_augment_command(const char *binary_path, char *out, size_t 
     return written > 0 && (size_t)written < out_size ? CLI_OK : CLI_ERR;
 }
 
+static bool cbm_hook_dialect_supported(const char *dialect) {
+    return dialect &&
+           (strcmp(dialect, "hermes") == 0 || strcmp(dialect, "qoder") == 0 ||
+            strcmp(dialect, "kimi") == 0 || strcmp(dialect, "devin") == 0 ||
+            strcmp(dialect, "cline") == 0 || strcmp(dialect, "gemini") == 0 ||
+            strcmp(dialect, "qwen") == 0 || strcmp(dialect, "factory") == 0 ||
+            strcmp(dialect, "augment") == 0);
+}
+
 static int cbm_build_augment_dialect_command(const char *binary_path, const char *dialect,
                                              char *out, size_t out_size) {
-    if (!dialect || (strcmp(dialect, "hermes") != 0 && strcmp(dialect, "qoder") != 0 &&
-                     strcmp(dialect, "kimi") != 0 && strcmp(dialect, "devin") != 0 &&
-                     strcmp(dialect, "cline") != 0 && strcmp(dialect, "gemini") != 0 &&
-                     strcmp(dialect, "qwen") != 0 && strcmp(dialect, "factory") != 0 &&
-                     strcmp(dialect, "augment") != 0)) {
+    if (!cbm_hook_dialect_supported(dialect)) {
         return CLI_ERR;
     }
     char base[CLI_BUF_8K];
@@ -2317,20 +2346,30 @@ static int cbm_build_augment_command_windows(const char *binary_path, char *out,
     return written > 0 && (size_t)written < out_size ? CLI_OK : CLI_ERR;
 }
 
-static int cbm_build_dialect_hook_command(const char *binary_path, const char *dialect,
-                                          bool windows, char *command, size_t command_size,
-                                          char *shell, size_t shell_size) {
+static int cbm_build_hook_command(const char *binary_path, bool windows, char *command,
+                                  size_t command_size, char *shell, size_t shell_size) {
     if (!shell || shell_size == 0U) {
         return CLI_ERR;
     }
     if (!windows) {
         shell[0] = '\0';
-        return cbm_build_augment_dialect_command(binary_path, dialect, command, command_size);
+        return cbm_build_augment_command(binary_path, command, command_size);
     }
     int shell_written = snprintf(shell, shell_size, "%s", "powershell");
+    return shell_written > 0 && (size_t)shell_written < shell_size
+               ? cbm_build_augment_command_windows(binary_path, command, command_size)
+               : CLI_ERR;
+}
+
+static int cbm_build_dialect_hook_command(const char *binary_path, const char *dialect,
+                                          bool windows, char *command, size_t command_size,
+                                          char *shell, size_t shell_size) {
+    if (!cbm_hook_dialect_supported(dialect)) {
+        return CLI_ERR;
+    }
     char base[CLI_BUF_8K];
-    if (shell_written < 0 || (size_t)shell_written >= shell_size ||
-        cbm_build_augment_command_windows(binary_path, base, sizeof(base)) != CLI_OK) {
+    if (cbm_build_hook_command(binary_path, windows, base, sizeof(base), shell, shell_size) !=
+        CLI_OK) {
         return CLI_ERR;
     }
     int written = snprintf(command, command_size, "%s --dialect %s", base, dialect);
@@ -4458,22 +4497,29 @@ static int cbm_remove_gemini_coverage_hook(const char *settings_path, const char
 }
 #endif
 
-/* Gemini CLI SessionStart reminder. settings.json uses the same
- * hooks.<Event>[].hooks[] JSON shape as Claude, so it reuses upsert_hooks_json. */
-#define GEMINI_SESSION_COMMAND                                                          \
+/* Exact released command retained only so upgrades and uninstalls can remove
+ * entries owned by versions that embedded static SessionStart guidance. */
+#define GEMINI_RELEASED_SESSION_COMMAND                                                 \
     "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"               \
     "hookEventName:'SessionStart',additionalContext:'Code discovery: prefer "           \
     "codebase-memory-mcp search_graph, trace_path, get_code_snippet, query_graph, and " \
     "search_code; run index_repository first when needed.'}}))\""
 static const char *const cmm_gemini_released_session_commands[] = {
+    GEMINI_RELEASED_SESSION_COMMAND,
     "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, "
     "get_code_snippet, query_graph, search_code) over grep/file-read; run index_repository "
     "first if the project is not indexed.\"",
     NULL,
 };
 
-int cbm_upsert_gemini_session_hooks(const char *settings_path) {
+int cbm_upsert_gemini_session_hooks(const char *settings_path, const char *binary_path) {
     static const char *const matchers[] = {"startup", "resume", "clear"};
+    char command[CLI_BUF_8K];
+    char shell[CLI_BUF_32];
+    if (cbm_build_hook_command(binary_path, cbm_current_platform_is_windows(), command,
+                               sizeof(command), shell, sizeof(shell)) != CLI_OK) {
+        return CLI_ERR;
+    }
     int rc = CLI_OK;
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         const char *const *old_matchers = i == 0U ? cmm_gemini_session_old_matchers : NULL;
@@ -4481,11 +4527,12 @@ int cbm_upsert_gemini_session_hooks(const char *settings_path) {
                 .settings_path = settings_path,
                 .hook_event = "SessionStart",
                 .matcher_str = matchers[i],
-                .command_str = GEMINI_SESSION_COMMAND,
+                .command_str = command,
+                .shell = shell[0] ? shell : NULL,
                 .old_matchers = old_matchers,
                 .old_commands = cmm_gemini_released_session_commands,
                 .timeout_value = GEMINI_HOOK_TIMEOUT_MS,
-                .match_command_exact = GEMINI_SESSION_COMMAND,
+                .match_command_exact = command,
             }) != CLI_OK) {
             rc = CLI_ERR;
         }
@@ -4493,8 +4540,14 @@ int cbm_upsert_gemini_session_hooks(const char *settings_path) {
     return rc;
 }
 
-int cbm_remove_gemini_session_hooks(const char *settings_path) {
+int cbm_remove_gemini_session_hooks(const char *settings_path, const char *binary_path) {
     static const char *const matchers[] = {"startup", "resume", "clear"};
+    char command[CLI_BUF_8K];
+    char shell[CLI_BUF_32];
+    if (cbm_build_hook_command(binary_path, cbm_current_platform_is_windows(), command,
+                               sizeof(command), shell, sizeof(shell)) != CLI_OK) {
+        return CLI_ERR;
+    }
     int rc = CLI_OK;
     for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
         const char *const *old_matchers = i == 0U ? cmm_gemini_session_old_matchers : NULL;
@@ -4504,7 +4557,7 @@ int cbm_remove_gemini_session_hooks(const char *settings_path) {
                 .matcher_str = matchers[i],
                 .old_matchers = old_matchers,
                 .old_commands = cmm_gemini_released_session_commands,
-                .match_command_exact = GEMINI_SESSION_COMMAND,
+                .match_command_exact = command,
             }) != CLI_OK) {
             rc = CLI_ERR;
         }
@@ -5168,6 +5221,16 @@ struct cbm_config {
     char get_buf[CLI_BUF_4K]; /* static buffer for cbm_config_get return values */
 };
 
+static cbm_config_t *cbm_config_wrap_db(sqlite3 *db) {
+    cbm_config_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(*cfg));
+    if (!cfg) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    cfg->db = db;
+    return cfg;
+}
+
 cbm_config_t *cbm_config_open(const char *cache_dir) {
     if (!cache_dir) {
         return NULL;
@@ -5196,13 +5259,24 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
         return NULL;
     }
 
-    cbm_config_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(*cfg));
-    if (!cfg) {
-        sqlite3_close(db);
+    return cbm_config_wrap_db(db);
+}
+
+cbm_config_t *cbm_config_open_readonly(const char *cache_dir) {
+    if (!cache_dir) {
         return NULL;
     }
-    cfg->db = db;
-    return cfg;
+
+    char dbpath[CLI_BUF_1K];
+    snprintf(dbpath, sizeof(dbpath), "%s/_config.db", cache_dir);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(dbpath, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db) {
+            sqlite3_close(db);
+        }
+        return NULL;
+    }
+    return cbm_config_wrap_db(db);
 }
 
 void cbm_config_close(cbm_config_t *cfg) {
@@ -5347,7 +5421,8 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("Common config keys:\n");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX, "true",
                "Enable auto-indexing on MCP session start");
-        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT, "50000",
+        printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
+               CBM_DEFAULT_AUTO_INDEX_LIMIT_STR,
                "Max files for auto-indexing new projects");
         printf("  %-25s  default=%-10s  %s\n", CBM_CONFIG_AUTO_WATCH, "true",
                "Register background git watcher on session connect");
@@ -5377,7 +5452,8 @@ int cbm_cmd_config(int argc, char **argv) {
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX,
                cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_INDEX_LIMIT,
-               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "50000"));
+               cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT,
+                                        CBM_DEFAULT_AUTO_INDEX_LIMIT_STR));
         printf("  %-25s = %-10s\n", CBM_CONFIG_AUTO_WATCH,
                cbm_config_get_effective(cfg, CBM_CONFIG_AUTO_WATCH, "true"));
         printf("  %-25s = %-10s\n", CBM_CONFIG_UI_LANG,
@@ -6780,7 +6856,7 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
             record_agent_config_error(false, "Gemini CLI", "after_tool_hook_install", cp);
         }
 #endif
-        if (cbm_upsert_gemini_session_hooks(cp) != CLI_OK) {
+        if (cbm_upsert_gemini_session_hooks(cp, binary_path) != CLI_OK) {
             record_agent_config_error(false, "Gemini CLI", "session_hook_install", cp);
         }
     }
@@ -6917,7 +6993,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             snprintf(legacy_settings, sizeof(legacy_settings),
                      "%s/.gemini/antigravity-cli/settings.json", home);
             if (cbm_file_exists(legacy_settings) &&
-                cbm_remove_gemini_session_hooks(legacy_settings) != CLI_OK) {
+                cbm_remove_gemini_session_hooks(legacy_settings, binary_path) != CLI_OK) {
                 record_agent_config_error(false, "Antigravity", "legacy_hook_cleanup",
                                           legacy_settings);
             }
@@ -8452,7 +8528,7 @@ static void uninstall_gemini_config(const char *home, bool dry_run) {
             record_agent_config_error(true, "Gemini CLI", "after_tool_hook_uninstall", cp);
         }
 #endif
-        if (cbm_remove_gemini_session_hooks(cp) != CLI_OK) {
+        if (cbm_remove_gemini_session_hooks(cp, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Gemini CLI", "session_hook_uninstall", cp);
         }
         if (cbm_remove_instructions(ip) != CLI_OK) {
@@ -8547,7 +8623,9 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         if (!dry_run) {
             char sp[CLI_BUF_1K];
             snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
-            if (cbm_remove_gemini_session_hooks(sp) != CLI_OK) {
+            char installed_binary[CLI_BUF_1K];
+            cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+            if (cbm_remove_gemini_session_hooks(sp, installed_binary) != CLI_OK) {
                 record_agent_config_error(true, "Antigravity", "session_hook_uninstall", sp);
             }
         }
@@ -10047,7 +10125,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Auto-index the MCP server CWD or explicit repo paths on startup/first use",
      "true|false",
      "Enable for automatic indexing; disable for manual control, CI, or embedded read-only contexts."},
-    {"auto_index_limit", "50000", "CBM_AUTO_INDEX_LIMIT", "Indexing",
+    {"auto_index_limit", CBM_DEFAULT_AUTO_INDEX_LIMIT_STR, "CBM_AUTO_INDEX_LIMIT", "Indexing",
      "Max indexable files before auto-index is skipped (0=no limit, index everything)",
      "0-10000000",
      "Protects against accidentally indexing huge monorepos. Raise for large codebases. "
