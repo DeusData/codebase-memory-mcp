@@ -24,7 +24,27 @@
 enum {
     CBM_DEP_MANIFEST_MAX_BYTES = 1024 * 1024,
     CBM_DEP_DISCOVERY_INITIAL_CAPACITY = 16,
+    /* Usage-ranked selection (depindex.c: cbm_discover_installed_deps) needs
+     * to see more candidates than the final cap so the most-imported
+     * packages can be picked instead of merely the first discovered.
+     * CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER scales the cap; the result is
+     * clamped to CBM_DEP_DISCOVERY_OVERFETCH_MAX regardless of multiplier.
+     * Bound rationale: each retained cbm_dep_discovered_t candidate owns
+     * three heap strings (package, path, version), so unbounded over-fetch
+     * is a real memory cost, not just extra compute. */
+    CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER = 5,
+    CBM_DEP_DISCOVERY_OVERFETCH_MAX = 500,
 };
+
+/* Upper bound for fetching project Variable/import-reference nodes, shared by
+ * cbm_dep_link_cross_edges() (matches project imports to already-indexed dep
+ * Module nodes) and rank_by_import_usage() below (counts project imports per
+ * not-yet-indexed candidate package). Both consumers match project import
+ * references to package names by exact node name over the same node source,
+ * so they share one fetch bound and one query shape rather than inventing a
+ * second matching scheme (repo CLAUDE.md: prefer extending the established
+ * path). */
+#define CBM_DEP_PROJECT_IMPORT_FETCH_LIMIT 500
 
 /* ── Package Manager Parse/String ──────────────────────────────── */
 
@@ -524,10 +544,97 @@ static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t
     return 0;
 }
 
+/* Sort key for rank_by_import_usage: pairs a discovered candidate with how
+ * many distinct project import references name it. A plain array of
+ * cbm_dep_discovered_t can't carry a sort key without either mutating the
+ * public struct or threading context through qsort (not portable in C11),
+ * so this local wrapper is the established pattern in this codebase for
+ * qsort-by-derived-key (see path_alias.c comparators). */
+typedef struct {
+    cbm_dep_discovered_t entry;
+    int64_t import_count;
+} cbm_dep_rank_entry_t;
+
+/* Descending by import_count; ties broken by package name ascending so
+ * selection is deterministic and reproducible across runs. */
+static int cmp_dep_rank_entry(const void *a, const void *b) {
+    const cbm_dep_rank_entry_t *ea = a;
+    const cbm_dep_rank_entry_t *eb = b;
+    if (ea->import_count != eb->import_count)
+        return (ea->import_count < eb->import_count) ? 1 : -1;
+    const char *na = ea->entry.package ? ea->entry.package : "";
+    const char *nb = eb->entry.package ? eb->entry.package : "";
+    return strcmp(na, nb);
+}
+
+/* Rank discovered candidates by how many distinct project import references
+ * name each package, descending; tiebreak by package name ascending.
+ * Reorders candidates[] in place.
+ *
+ * Reuses the exact node source cbm_dep_link_cross_edges() matches against
+ * dep Module nodes (project-scoped Variable-label nodes, matched by exact
+ * name) instead of inventing a second import-matching scheme, per repo
+ * CLAUDE.md.
+ *
+ * Returns 0 on success. Returns -1 if the store query failed; callers MUST
+ * fail OPEN on -1 (keep discovery order) rather than fail the whole
+ * auto-index — ranking is a refinement, not a correctness requirement. */
+static int rank_by_import_usage(cbm_store_t *store, const char *project_name,
+                                cbm_dep_discovered_t *candidates, int candidate_count) {
+    if (!store || !project_name || !candidates || candidate_count <= 0) return -1;
+
+    cbm_search_params_t params = {0};
+    params.project = project_name;
+    params.project_exact = true;
+    params.label = "Variable";
+    params.limit = CBM_DEP_PROJECT_IMPORT_FETCH_LIMIT;
+
+    cbm_search_output_t out = {0};
+    if (cbm_store_search(store, &params, &out) != 0) {
+        cbm_store_search_free(&out);
+        return -1;
+    }
+
+    CBMHashTable *counts = cbm_ht_create((uint32_t)(out.count > 0 ? out.count : 1));
+    if (!counts) {
+        cbm_store_search_free(&out);
+        return -1;
+    }
+    for (int i = 0; i < out.count; i++) {
+        const char *name = out.results[i].node.name;
+        if (!name || !name[0]) continue;
+        intptr_t cur = (intptr_t)cbm_ht_get(counts, name);
+        cbm_ht_set(counts, name, (void *)(cur + 1));
+    }
+
+    cbm_dep_rank_entry_t *ranked = calloc((size_t)candidate_count, sizeof(*ranked));
+    if (!ranked) {
+        cbm_ht_free(counts);
+        cbm_store_search_free(&out);
+        return -1;
+    }
+    for (int i = 0; i < candidate_count; i++) {
+        ranked[i].entry = candidates[i];
+        ranked[i].import_count = candidates[i].package
+                                      ? (int64_t)(intptr_t)cbm_ht_get(counts, candidates[i].package)
+                                      : 0;
+    }
+    qsort(ranked, (size_t)candidate_count, sizeof(*ranked), cmp_dep_rank_entry);
+    for (int i = 0; i < candidate_count; i++) {
+        candidates[i] = ranked[i].entry;
+    }
+
+    free(ranked);
+    cbm_ht_free(counts);
+    cbm_store_search_free(&out);
+    return 0;
+}
+
 /* Discover installed deps by querying the graph for Variable nodes
  * in manifest files under dependency sections.
  * Runtime: O(search_limit) for query + O(N) for filtering + O(N) for resolution.
- * Memory: O(max_results) for the results array. */
+ * Memory: O(fetch_limit) for the results array before ranking truncates it to
+ * max_results (see CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER/_MAX). */
 int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
                                 cbm_store_t *store, const char *project_name,
                                 cbm_dep_discovered_t **out, int *count,
@@ -537,55 +644,96 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
     *count = 0;
     if (max_results <= 0) max_results = CBM_DEFAULT_AUTO_DEP_LIMIT;
 
+    /* Over-fetch so usage ranking has more candidates to choose from than the
+     * final cap. When the caller's cap already meets or exceeds the ceiling,
+     * fetch exactly what was asked (no headroom to rank within, but never
+     * less than requested). */
+    int fetch_limit = max_results;
+    if (max_results < INT_MAX / CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER) {
+        int overfetch = max_results * CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER;
+        fetch_limit = overfetch < CBM_DEP_DISCOVERY_OVERFETCH_MAX ? overfetch
+                                                                   : CBM_DEP_DISCOVERY_OVERFETCH_MAX;
+        if (fetch_limit < max_results) fetch_limit = max_results;
+    }
+
+    int rc;
     if (mgr == CBM_PKG_NPM || mgr == CBM_PKG_BUN) {
-        return discover_npm_deps(mgr, project_root, out, count, max_results);
-    }
+        rc = discover_npm_deps(mgr, project_root, out, count, fetch_limit);
+    } else if (mgr == CBM_PKG_MAKE || mgr == CBM_PKG_CMAKE || mgr == CBM_PKG_MESON ||
+               mgr == CBM_PKG_CONAN || mgr == CBM_PKG_CUSTOM) {
+        /* C/C++ build systems and generic vendored deps: scan vendor directories
+         * directly. These don't have a registry/lockfile to parse; deps live in
+         * the source tree. */
+        rc = discover_vendored_deps(project_root, out, count, fetch_limit);
+    } else {
+        cbm_search_params_t params = {0};
+        params.project = project_name;
+        params.label = "Variable";
+        params.qn_pattern = "dependencies|require";
+        /* Raw-hit window stays tied to max_results (not fetch_limit): this is
+         * the SQL fetch bound for filtering, distinct from the retention cap
+         * below. Keeping it unscaled by fetch_limit means the underlying
+         * query and its ordering never change, so results are byte-identical
+         * to today whenever the true distinct-package count is within
+         * max_results — only the retention cap grows to let ranking see more
+         * of the SAME raw window. */
+        params.limit = max_results * 5; /* over-fetch since we filter post-query */
 
-    /* C/C++ build systems and generic vendored deps: scan vendor directories directly.
-     * These don't have a registry/lockfile to parse; deps live in the source tree. */
-    if (mgr == CBM_PKG_MAKE || mgr == CBM_PKG_CMAKE ||
-        mgr == CBM_PKG_MESON || mgr == CBM_PKG_CONAN ||
-        mgr == CBM_PKG_CUSTOM) {
-        return discover_vendored_deps(project_root, out, count, max_results);
-    }
-
-    cbm_search_params_t params = {0};
-    params.project = project_name;
-    params.label = "Variable";
-    params.qn_pattern = "dependencies|require";
-    params.limit = max_results * 5; /* over-fetch since we filter post-query */
-
-    cbm_search_output_t search_out = {0};
-    int rc = cbm_store_search(store, &params, &search_out);
-    if (rc != 0) return -1;
-
-    cbm_dep_discovered_t *results = calloc(max_results, sizeof(cbm_dep_discovered_t));
-    if (!results) {
-        cbm_store_search_free(&search_out);
-        return -1;
-    }
-
-    int n = 0;
-    for (int i = 0; i < search_out.count && n < max_results; i++) {
-        const char *fp = search_out.results[i].node.file_path;
-        const char *name = search_out.results[i].node.name;
-        if (!fp || !name || !name[0]) continue;
-
-        /* Filter to manifest files only (DRY via CBM_MANIFEST_FILES) */
-        if (!cbm_is_manifest_path(fp)) continue;
-
-        cbm_dep_resolved_t resolved = {0};
-        if (cbm_resolve_pkg_source(mgr, name, project_root, &resolved) == 0) {
-            results[n].package = cbm_strdup(name);
-            results[n].path = resolved.path;
-            results[n].version = resolved.version;
-            n++;
+        cbm_search_output_t search_out = {0};
+        rc = cbm_store_search(store, &params, &search_out);
+        if (rc != 0) {
+            cbm_store_search_free(&search_out);
+            return -1;
         }
+
+        cbm_dep_discovered_t *results = calloc((size_t)fetch_limit, sizeof(cbm_dep_discovered_t));
+        if (!results) {
+            cbm_store_search_free(&search_out);
+            return -1;
+        }
+
+        int n = 0;
+        for (int i = 0; i < search_out.count && n < fetch_limit; i++) {
+            const char *fp = search_out.results[i].node.file_path;
+            const char *name = search_out.results[i].node.name;
+            if (!fp || !name || !name[0]) continue;
+
+            /* Filter to manifest files only (DRY via CBM_MANIFEST_FILES) */
+            if (!cbm_is_manifest_path(fp)) continue;
+
+            cbm_dep_resolved_t resolved = {0};
+            if (cbm_resolve_pkg_source(mgr, name, project_root, &resolved) == 0) {
+                results[n].package = cbm_strdup(name);
+                results[n].path = resolved.path;
+                results[n].version = resolved.version;
+                n++;
+            }
+        }
+
+        cbm_store_search_free(&search_out);
+        *out = results;
+        *count = n;
+        rc = 0;
+    }
+    if (rc != 0) return rc;
+
+    /* Rank-then-truncate only when discovery actually found more than the
+     * cap; otherwise the result is byte-identical to today regardless of the
+     * (larger) internal fetch_limit used above — see the callers of this
+     * function in cbm_dep_auto_index_effective(). */
+    if (*count > max_results) {
+        if (rank_by_import_usage(store, project_name, *out, *count) != 0) {
+            /* Fail open: store query failed, keep discovery order (today's
+             * semantics) rather than fail the whole auto-index. */
+        }
+        for (int i = max_results; i < *count; i++) {
+            free((void *)(*out)[i].package);
+            free((void *)(*out)[i].path);
+            free((void *)(*out)[i].version);
+        }
+        *count = max_results;
     }
 
-    cbm_store_search_free(&search_out);
-    *out = results;
-    *count = n;
     return 0;
 }
 
@@ -695,7 +843,7 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
     params.project = project_name;
     params.project_exact = true;
     params.label = "Variable";  /* import statements are typically Variable nodes */
-    params.limit = 500;
+    params.limit = CBM_DEP_PROJECT_IMPORT_FETCH_LIMIT;
 
     cbm_search_output_t out = {0};
     int rc = cbm_store_search(store, &params, &out);

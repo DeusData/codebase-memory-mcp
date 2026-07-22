@@ -1097,6 +1097,199 @@ TEST(test_auto_index_deps_config_limit_policy) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  USAGE-RANKED DEPENDENCY SELECTION (cbm_discover_installed_deps)
+ *
+ *  When discovery finds more npm packages than max_results, the retained
+ *  subset must be the most-imported ones (by distinct project import
+ *  reference count), not merely the first declared. See
+ *  notes/2026-07-21-2332-path-autoindex-dependency-asymmetry-analysis.md
+ *  section 9.
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Create a temp dir with package.json declaring npm dependencies in the
+ * given declaration order, each with a real node_modules/<name>/ directory
+ * so cbm_resolve_pkg_source succeeds and discover_npm_deps retains it. */
+static int setup_npm_rank_fixture(char *tmp_dir, size_t tmp_sz, const char *const *names,
+                                  int name_count) {
+    int n = snprintf(tmp_dir, tmp_sz, "%s/cbm_deprank_XXXXXX", cbm_tmpdir());
+    if (n <= 0 || (size_t)n >= tmp_sz) return -1;
+    if (!cbm_mkdtemp(tmp_dir)) return -1;
+
+    char json[CBM_SZ_1K];
+    size_t off = 0;
+    int w = snprintf(json + off, sizeof(json) - off, "{\"name\":\"fixture\",\"dependencies\":{");
+    if (w <= 0) return -1;
+    off += (size_t)w;
+    for (int i = 0; i < name_count; i++) {
+        w = snprintf(json + off, sizeof(json) - off, "%s\"%s\":\"1.0.0\"", i > 0 ? "," : "", names[i]);
+        if (w <= 0) return -1;
+        off += (size_t)w;
+    }
+    w = snprintf(json + off, sizeof(json) - off, "}}\n");
+    if (w <= 0) return -1;
+
+    char path[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/package.json", tmp_dir);
+    FILE *fp = fopen(path, "w");
+    if (!fp) return -1;
+    fputs(json, fp);
+    fclose(fp);
+
+    for (int i = 0; i < name_count; i++) {
+        char dep_dir[CBM_SZ_1K];
+        snprintf(dep_dir, sizeof(dep_dir), "%s/node_modules/%s", tmp_dir, names[i]);
+        if (!cbm_mkdir_p(dep_dir, 0700)) return -1;
+    }
+    return 0;
+}
+
+/* Insert a project-scoped Variable node standing in for one project import
+ * reference to `package`, mirroring the node shape
+ * cbm_dep_link_cross_edges() and rank_by_import_usage() match against
+ * (label="Variable", project_exact, node.name == package name). */
+static void insert_import_reference(cbm_store_t *store, const char *project, const char *package,
+                                    int seq) {
+    char qn[192];
+    snprintf(qn, sizeof(qn), "%s.app.import.%d", project, seq);
+    cbm_node_t n = {0};
+    n.project = project;
+    n.label = "Variable";
+    n.name = package;
+    n.qualified_name = qn;
+    n.file_path = "app.py";
+    n.start_line = 1;
+    n.end_line = 1;
+    n.properties_json = "{}";
+    (void)cbm_store_upsert_node(store, &n);
+}
+
+TEST(test_discover_deps_ranks_by_import_usage) {
+    char tmp[CBM_SZ_256];
+    const char *names[] = {"pkg-a", "pkg-b", "pkg-c", "pkg-d", "pkg-e"};
+    ASSERT_EQ(setup_npm_rank_fixture(tmp, sizeof(tmp), names, 5), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "rank-fixture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    /* pkg-c: 4 import references, pkg-a: 2, pkg-b: 1, pkg-d/pkg-e: 0. */
+    int seq = 0;
+    for (int i = 0; i < 4; i++) insert_import_reference(store, project, "pkg-c", seq++);
+    for (int i = 0; i < 2; i++) insert_import_reference(store, project, "pkg-a", seq++);
+    insert_import_reference(store, project, "pkg-b", seq++);
+
+    cbm_dep_discovered_t *out = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_NPM, tmp, store, project, &out, &count, 3), 0);
+    ASSERT_EQ(count, 3);
+    ASSERT_NOT_NULL(out);
+    ASSERT_STR_EQ(out[0].package, "pkg-c"); /* 4 imports: most used */
+    ASSERT_STR_EQ(out[1].package, "pkg-a"); /* 2 imports */
+    ASSERT_STR_EQ(out[2].package, "pkg-b"); /* 1 import */
+
+    cbm_dep_discovered_free(out, count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_discover_deps_tiebreak_by_name_is_deterministic) {
+    char tmp[CBM_SZ_256];
+    /* Declaration order deliberately not alphabetical, so a passing test
+     * proves the tiebreak sorts by name rather than preserving discovery
+     * order for the zero-import packages. */
+    const char *names[] = {"pkg-e", "pkg-b", "pkg-a", "pkg-d", "pkg-c"};
+    ASSERT_EQ(setup_npm_rank_fixture(tmp, sizeof(tmp), names, 5), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "tiebreak-fixture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    /* Only pkg-c is imported; pkg-a, pkg-b, pkg-d, pkg-e all tie at zero
+     * import references and must break the tie alphabetically. */
+    insert_import_reference(store, project, "pkg-c", 0);
+
+    cbm_dep_discovered_t *out = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_NPM, tmp, store, project, &out, &count, 3), 0);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(out[0].package, "pkg-c"); /* the only imported package wins */
+    ASSERT_STR_EQ(out[1].package, "pkg-a"); /* tie at 0 imports: alphabetical */
+    ASSERT_STR_EQ(out[2].package, "pkg-b");
+
+    cbm_dep_discovered_free(out, count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_discover_deps_at_limit_preserves_discovery_order) {
+    char tmp[CBM_SZ_256];
+    const char *names[] = {"pkg-a", "pkg-b", "pkg-c"};
+    ASSERT_EQ(setup_npm_rank_fixture(tmp, sizeof(tmp), names, 3), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "atlimit-fixture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    /* pkg-c is imported heavily, but candidate count (3) is AT the limit
+     * (3), so ranking must not run: order must stay declaration order
+     * (a, b, c) — byte-identical to pre-ranking behavior. */
+    for (int i = 0; i < 5; i++) insert_import_reference(store, project, "pkg-c", i);
+
+    cbm_dep_discovered_t *out = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_NPM, tmp, store, project, &out, &count, 3), 0);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(out[0].package, "pkg-a");
+    ASSERT_STR_EQ(out[1].package, "pkg-b");
+    ASSERT_STR_EQ(out[2].package, "pkg-c");
+
+    cbm_dep_discovered_free(out, count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_discover_deps_rank_query_failure_falls_back_to_discovery_order) {
+    char tmp[CBM_SZ_256];
+    const char *names[] = {"pkg-a", "pkg-b", "pkg-c", "pkg-d", "pkg-e"};
+    ASSERT_EQ(setup_npm_rank_fixture(tmp, sizeof(tmp), names, 5), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "rankfail-fixture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    /* Corrupt the store so the import-usage query fails deterministically:
+     * dropping `nodes` breaks cbm_store_search (used by rank_by_import_usage)
+     * while npm discovery itself reads package.json directly from disk and
+     * makes no store query, so discovery must still succeed. */
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_exec(db, "DROP TABLE nodes;", NULL, NULL, NULL), SQLITE_OK);
+
+    cbm_dep_discovered_t *out = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_NPM, tmp, store, project, &out, &count, 3), 0);
+    ASSERT_EQ(count, 3);
+    ASSERT_NOT_NULL(out);
+    /* Fail-open: the ranking query failed, so declaration/discovery order
+     * (a, b, c) is preserved rather than erroring or crashing. */
+    ASSERT_STR_EQ(out[0].package, "pkg-a");
+    ASSERT_STR_EQ(out[1].package, "pkg-b");
+    ASSERT_STR_EQ(out[2].package, "pkg-c");
+
+    cbm_dep_discovered_free(out, count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -1156,4 +1349,10 @@ SUITE(depindex) {
     RUN_TEST(test_cross_edges_null_safety);
     RUN_TEST(test_cross_edges_record_file_owner);
     RUN_TEST(test_auto_index_deps_config_limit_policy);
+
+    /* Usage-ranked dependency selection */
+    RUN_TEST(test_discover_deps_ranks_by_import_usage);
+    RUN_TEST(test_discover_deps_tiebreak_by_name_is_deterministic);
+    RUN_TEST(test_discover_deps_at_limit_preserves_discovery_order);
+    RUN_TEST(test_discover_deps_rank_query_failure_falls_back_to_discovery_order);
 }
