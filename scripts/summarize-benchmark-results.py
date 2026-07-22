@@ -2094,7 +2094,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
     lines.extend(
         (
             "",
-            "These are descriptive min–max ranges, not confidence intervals. Campaigns run "
+            "These are descriptive min–max ranges, not confidence intervals. Experiments run "
             "sequentially to avoid resource contention. Rows record grouped or paired-interleaved "
             "execution explicitly; interleaving reduces configuration-aligned drift but does not "
             "by itself create an effect-size confidence interval. Medians and ratios remain "
@@ -2339,7 +2339,7 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "remain visible so the aggregate cannot hide which capability changed.",
             "",
             "Query p50 aggregates the recorded default-response oracle calls. Indexing p50/p95 use only "
-            "the recorded indexing observations; consult Cases and the immutable campaign manifest before "
+            "the recorded indexing observations; consult Cases and the immutable experiment manifest before "
             "treating a small pilot as a population estimate.",
             "Performance ratios require matched experiment identities and enough independent repetitions "
             "for an effect-size confidence interval. This report shows observation counts and does not "

@@ -1152,7 +1152,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("Binary SHA-256", markdown)
         self.assertIn("Correctness and quality findings", markdown)
         self.assertIn("exact default tool-response payload", markdown)
-        self.assertIn("consult Cases and the immutable campaign manifest", markdown)
+        self.assertIn("consult Cases and the immutable experiment manifest", markdown)
 
     def test_query_quality_size_latency_and_pareto_frontier(self) -> None:
         compact_case = {
