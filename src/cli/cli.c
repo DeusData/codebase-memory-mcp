@@ -9826,6 +9826,38 @@ int cbm_cli_print_tool_help(const char *tool_name) {
     }
     return CLI_OK;
 }
+
+/* Top-level --help text. Moved here from main.c's static print_help so the
+ * test runner (which does not link main.c) can assert the help content.
+ * Version comes from cbm_cli_set_version, bound in main() before dispatch. */
+void cbm_cli_print_main_help(void) {
+    printf("codebase-memory-mcp %s\n\n", cbm_cli_get_version());
+    printf("Usage:\n");
+    printf("  codebase-memory-mcp              Run MCP server on stdio\n");
+    printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
+    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] [--plan]\n");
+    printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
+    printf("  codebase-memory-mcp update [-y|-n] [--force] [--dry-run] [--standard|--ui]\n");
+    printf("  codebase-memory-mcp config <list|get|set|reset>\n");
+    printf("  codebase-memory-mcp config preset <list|apply>\n");
+    printf("  codebase-memory-mcp --version    Print version\n");
+    printf("  codebase-memory-mcp --help       Print this help\n");
+    printf("\nUI options:\n");
+    printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
+    printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
+    printf("  --port=N     Set UI port (default 9749, persisted)\n");
+    printf("\nSupported agents (auto-detected):\n");
+    printf("  Claude Code, Claude Desktop, Codex CLI, Gemini CLI, Qwen Code,\n");
+    printf("  ForgeCode, Zed, OpenCode, Antigravity, Aider, KiloCode,\n");
+    printf("  VS Code, Cursor, Windsurf, OpenClaw, Kiro, Junie\n");
+    printf("\nDefault MCP tools: search_graph, query_graph, trace_path,\n");
+    printf("  search_code, get_code, _hidden_tools\n");
+    printf("\nAdvanced and CLI-callable tools: index_repository, get_code_snippet,\n");
+    printf("  get_graph_schema, get_architecture, list_projects, delete_project,\n");
+    printf("  index_status, detect_changes, manage_adr, ingest_traces,\n");
+    printf("  index_dependencies\n");
+}
+
 double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val) {
     const char *val = cbm_config_get(cfg, key, NULL);
     if (!val) {

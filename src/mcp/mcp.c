@@ -5597,6 +5597,14 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                     cbm_store_t *writable_store =
                         cbm_mcp_writable_existing_store(store, &owned_writable_store);
                     if (writable_store) {
+                        /* Mirror the session-root branch: dependency
+                         * auto-indexing honors auto_index_deps /
+                         * auto_dep_limit and runs BEFORE rank computation so
+                         * rank sees dependency nodes. */
+                        int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
+                        (void)cbm_mcp_auto_index_deps(srv, db_project, _raw_path,
+                                                      writable_store, effective_dep_limit,
+                                                      NULL);
                         cbm_pagerank_compute_with_config(writable_store, db_project, srv->config);
                     }
                     if (owned_writable_store) {
@@ -7209,7 +7217,19 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             if (srv->session_root[0])
                 eco = cbm_detect_ecosystem(srv->session_root);
             char hint[1024];
-            if (eco == CBM_PKG_COUNT) {
+            /* Self-healing: when dependency auto-indexing is switched off,
+             * the missing results are policy, not absence of deps — name the
+             * corrective tool instead of describing build systems. */
+            int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
+            if (effective_dep_limit == 0) {
+                snprintf(hint, sizeof(hint),
+                    "No dependency sub-projects indexed: auto_index_deps is disabled "
+                    "in server config, so dependency indexing never ran for this "
+                    "project. Call index_dependencies(project=..., packages=[...]) to "
+                    "index specific dependencies now, or enable automatic dependency "
+                    "indexing with `codebase-memory-mcp config set auto_index_deps "
+                    "true` and re-run index_repository.");
+            } else if (eco == CBM_PKG_COUNT) {
                 snprintf(hint, sizeof(hint),
                     "No dependency sub-projects indexed, and no recognized build system "
                     "detected in '%s'. Supported: Python/uv (pyproject.toml, requirements.txt), "
@@ -7217,14 +7237,19 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                     ".NET/NuGet (*.csproj), Ruby/Bundler (Gemfile), PHP/Composer, "
                     "Swift/SPM, Dart/pub, Elixir/Mix, C-Make (Makefile), C-CMake, "
                     "C-Meson, C-Conan, or generic vendor/ directory. "
-                    "Re-index after adding a manifest file.",
+                    "Re-index after adding a manifest file, or call "
+                    "index_dependencies(project=..., packages=[...], source_paths=[...]) "
+                    "to index dependency source directly.",
                     srv->session_root[0] ? srv->session_root : "(unknown project root)");
             } else {
                 snprintf(hint, sizeof(hint),
                     "No dependency sub-projects indexed yet for %s build system '%s'. "
                     "Dep scanning runs automatically on index_repository. "
                     "If deps are vendored in vendor/ vendored/ third_party/ etc., "
-                    "re-run index_repository(repo_path=\"%s\") to trigger dep discovery.",
+                    "re-run index_repository(repo_path=\"%s\") to trigger dep discovery. "
+                    "If the package you need was skipped by the auto_dep_limit cap, call "
+                    "index_dependencies(project=..., packages=[...]) to index it "
+                    "explicitly.",
                     cbm_pkg_manager_str(eco), cbm_pkg_manager_str(eco),
                     srv->session_root[0] ? srv->session_root : "<repo_path>");
             }
