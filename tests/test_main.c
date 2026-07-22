@@ -15,6 +15,7 @@ int tf_skip_count = 0;
 #include "foundation/mem.h"       /* cbm_mem_init — worker budget */
 #include "mcp/index_supervisor.h" /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"              /* cbm_mcp_handle_tool — act as a real worker */
+#include "ui/http_server.h"       /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -23,6 +24,8 @@ int tf_skip_count = 0;
 #include <string.h>
 #ifdef _WIN32
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
+#else
+#include <unistd.h>
 #endif
 
 /* Test handlers that exercise the production index_repository flow must never
@@ -141,6 +144,33 @@ static int tf_maybe_run_socket_probe(int argc, char **argv) {
     int rc = getsockopt(s, SOL_SOCKET, SO_TYPE, (char *)&type, &len);
     /* rc==0 ⇒ the handle is a live socket in THIS child ⇒ it was inherited. */
     return rc == 0 ? 42 : 0;
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
+static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
+#if defined(__linux__)
+    if (argc != 5 || strcmp(argv[1], "__cbm_deleted_self_probe") != 0) {
+        return -1;
+    }
+    int ready_fd = atoi(argv[2]);
+    int continue_fd = atoi(argv[3]);
+    cbm_http_server_set_binary_path(argv[4]);
+    if (write(ready_fd, "R", 1) != 1) {
+        return 41;
+    }
+    char go = '\0';
+    if (read(continue_fd, &go, 1) != 1) {
+        return 42;
+    }
+    char resolved[1024];
+    if (!cbm_http_server_resolve_binary_path(NULL, resolved, sizeof(resolved))) {
+        return 43;
+    }
+    return strcmp(resolved, argv[4]) == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
 #else
     (void)argc;
     (void)argv;
@@ -294,6 +324,11 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
+    if (deleted_self_rc >= 0) {
+        return deleted_self_rc;
+    }
+
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
      * inheritable socket handle crossed into this child and exit before any suite. */
     int probe_rc = tf_maybe_run_socket_probe(argc, argv);

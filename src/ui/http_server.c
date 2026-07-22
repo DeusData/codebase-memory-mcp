@@ -962,9 +962,18 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
     }
 #endif
 
+#ifndef _WIN32
+    if (g_binary_path[0] && is_executable_file(g_binary_path)) {
+        return copy_path(out, outsz, g_binary_path);
+    }
+    if (resolve_self_executable(out, outsz) && is_executable_file(out)) {
+        return true;
+    }
+#else
     if (resolve_self_executable(out, outsz)) {
         return true;
     }
+#endif
     return copy_path(out, outsz, argv0);
 }
 
