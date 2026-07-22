@@ -283,17 +283,52 @@ class BenchmarkExperimentTest(unittest.TestCase):
             self.assertEqual(quick["repetitions"], 1)
             self.assertEqual(quick["index_mode"], "fast")
             self.assertIn("commit_datetime", quick["repository_background"])
-            self.assertEqual([item["label"] for item in quick["profiles"]], ["default"])
+            self.assertEqual(
+                [item["label"] for item in quick["profiles"]],
+                [
+                    "candidate-native-configuration",
+                    "automatic-dependency-source-indexing-disabled",
+                ],
+            )
+            self.assertEqual(
+                quick["profiles"][0],
+                {
+                    "label": "candidate-native-configuration",
+                    "config_profile": "candidate_native_configuration",
+                    "candidate_labels": [
+                        "upstream-main",
+                        "pre-today-major",
+                        "pre-upstream-merge",
+                    ],
+                    "capabilities": {},
+                },
+            )
+            self.assertEqual(
+                quick["profiles"][1]["config_profile"],
+                "automatic_dependency_source_indexing_disabled",
+            )
+            self.assertEqual(
+                quick["profiles"][1]["capabilities"],
+                {
+                    "auto_index_deps": "false",
+                    "rank_enabled": "true",
+                    "similarity_enabled": "true",
+                    "semantic_edges_enabled": "true",
+                    "githistory_enabled": "true",
+                    "httplinks_enabled": "true",
+                },
+            )
             self.assertEqual(full["repetitions"], 3)
             self.assertEqual(full["index_mode"], "moderate")
             self.assertEqual(
                 [item["label"] for item in full["profiles"]],
                 [
-                    "default",
+                    "candidate-native-configuration",
+                    "automatic-dependency-source-indexing-disabled",
+                    "automatic-dependency-source-indexing-enabled",
                     "upstream-equivalent",
                     "eager-derived-freshness",
                     "rank-disabled",
-                    "dependency-disabled",
                     "similarity-disabled",
                     "semantic-edges-disabled",
                     "git-history-disabled",
@@ -588,7 +623,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "binary_sha256 does not match"):
                 EXPERIMENT.expand_matrix_spec(spec)
 
-    def test_default_profile_rejects_disabled_capability_without_config_override(
+    def test_candidate_native_profile_rejects_capability_without_config_override(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -621,7 +656,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 "profiles": [
                     {
                         "label": "dependency-disabled",
-                        "config_profile": "default",
+                        "config_profile": "candidate_native_configuration",
                         "capabilities": {"auto_index_deps": "false"},
                     }
                 ],
