@@ -4171,6 +4171,39 @@ TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only) {
     PASS();
 }
 
+TEST(cli_hook_augment_guidance_uses_dependency_default) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-default-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    cli_env_snapshot_t cache = {0};
+    cli_env_snapshot_t auto_index_deps = {0};
+    cli_env_snapshot_t auto_dep_limit = {0};
+    ASSERT_TRUE(cli_env_snapshot(&cache, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_index_deps, "CBM_AUTO_INDEX_DEPS"));
+    ASSERT_TRUE(cli_env_snapshot(&auto_dep_limit, "CBM_AUTO_DEP_LIMIT"));
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_unsetenv("CBM_AUTO_INDEX_DEPS");
+    cbm_unsetenv("CBM_AUTO_DEP_LIMIT");
+
+    const char *input =
+        "{\"hook_event_name\":\"SessionStart\","
+        "\"cwd\":\"/definitely-not-indexed/default-dependency-guidance\"}";
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT_NOT_NULL(strstr(output, "auto_index_deps=false"));
+    ASSERT_NOT_NULL(strstr(output, "index_dependencies"));
+    ASSERT_NULL(strstr(output, "Dependencies: automatic"));
+    free(output);
+
+    cli_env_restore(&auto_dep_limit);
+    cli_env_restore(&auto_index_deps);
+    cli_env_restore(&cache);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-config-XXXXXX");
@@ -6932,6 +6965,24 @@ TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
     PASS();
 }
 
+TEST(cli_config_registry_auto_index_deps_defaults_disabled) {
+    const cbm_config_entry_t *found = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_AUTO_INDEX_DEPS) == 0) {
+            found = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+
+    ASSERT_NOT_NULL(found);
+    ASSERT_STR_EQ(found->default_val, "false");
+    ASSERT_STR_EQ(found->range, "true|false");
+    ASSERT_NOT_NULL(strstr(found->description, "installed dependency source"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "index_dependencies"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "does not delete"));
+    PASS();
+}
+
 TEST(cli_config_registry_reindex_startup_guidance_is_precise) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -7017,14 +7068,55 @@ TEST(cli_config_presets_apply_exact_capability_sets) {
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
 
-    ASSERT_EQ(cbm_config_apply_preset(cfg, "streamlined-quality"), 0);
-    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_TOOL_MODE, ""), "streamlined");
-    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, false));
-    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, false));
+    static const struct {
+        const char *name;
+        const char *tool_mode;
+        bool auto_index_deps;
+    } cases[] = {
+        {"streamlined-automatic-dependency-source-indexing-disabled", "streamlined", false},
+        {"streamlined-automatic-dependency-source-indexing-enabled", "streamlined", true},
+        {"classic-automatic-dependency-source-indexing-disabled", "classic", false},
+        {"classic-automatic-dependency-source-indexing-enabled", "classic", true},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS,
+                                 cases[i].auto_index_deps ? "false" : "true"),
+                  0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_ENABLED, "false"), 0);
+        ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, "false"), 0);
+
+        ASSERT_EQ(cbm_config_apply_preset(cfg, cases[i].name), 0);
+        ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_TOOL_MODE, ""), cases[i].tool_mode);
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, false));
+        ASSERT_EQ(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS,
+                                      !cases[i].auto_index_deps),
+                  cases[i].auto_index_deps);
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, false));
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, false));
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, false));
+        ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, false));
+    }
+
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "streamlined-quality"), 0);
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "classic-quality"), 0);
+    ASSERT_NEQ(cbm_config_apply_preset(cfg, "dependency-disabled"), 0);
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "rank-disabled"), 0);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
     ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, false));
-    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, false));
-    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, false));
-    ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, false));
+
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "optional-graph-disabled"), 0);
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, true));
+    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, true));
 
     ASSERT_EQ(cbm_config_apply_preset(cfg, "minimal-indexing"), 0);
     ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
@@ -7070,7 +7162,8 @@ TEST(cli_config_command_dispatches_presets) {
     /* Stored preset values remain deterministic, but an active environment
      * override must be reported through a nonzero command status. */
     cbm_setenv("CBM_TOOL_MODE", CBM_CONFIG_TOOL_MODE_CLASSIC, 1);
-    char *overridden_args[] = {"preset", "apply", "streamlined-quality"};
+    char *overridden_args[] = {
+        "preset", "apply", "streamlined-automatic-dependency-source-indexing-disabled"};
     ASSERT_NEQ(cbm_cmd_config(3, overridden_args), 0);
     cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
@@ -7643,6 +7736,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);
+    RUN_TEST(cli_hook_augment_guidance_uses_dependency_default);
     RUN_TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config);
     RUN_TEST(cli_hook_augment_post_read_event_and_path_contract);
     RUN_TEST(cli_hook_augment_hermes_dialect_contract);
@@ -7755,6 +7849,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_registry_includes_query_max_rows);
     RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
+    RUN_TEST(cli_config_registry_auto_index_deps_defaults_disabled);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
     RUN_TEST(cli_configuration_doc_auto_index_default_matches_registry);
     RUN_TEST(cli_config_delete);

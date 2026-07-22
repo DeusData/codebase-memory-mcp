@@ -45,6 +45,8 @@ static const char *CBM_MANIFEST_FILES[] = {
 };
 
 /* Default limits (convention: -1=unlimited, 0=disabled, >0=limit) */
+#define CBM_DEFAULT_AUTO_INDEX_DEPS false
+#define CBM_DEFAULT_AUTO_INDEX_DEPS_STR "false"
 #define CBM_DEFAULT_AUTO_DEP_LIMIT 20
 #define CBM_DEFAULT_DEP_MAX_FILES 1000
 

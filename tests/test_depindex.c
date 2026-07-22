@@ -1081,8 +1081,8 @@ TEST(test_auto_index_deps_config_limit_policy) {
     cbm_config_t *cfg = cbm_config_open(cache_tmp);
     ASSERT_NOT_NULL(cfg);
 
-    ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT),
-              CBM_DEFAULT_AUTO_DEP_LIMIT);
+    ASSERT_EQ(cbm_dep_auto_index_effective_limit(NULL, CBM_DEFAULT_AUTO_DEP_LIMIT), 0);
+    ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
     ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);

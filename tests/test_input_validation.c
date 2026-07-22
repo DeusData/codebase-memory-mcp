@@ -14,6 +14,7 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <cli/cli.h>
+#include <depindex/depindex.h>
 #include <yyjson/yyjson.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1459,7 +1460,7 @@ TEST(path_project_autoindex_respects_file_limit) {
 
 /* ══════════════════════════════════════════════════════════════════
  *  Path-based auto-index must run dependency auto-indexing exactly like
- *  the session-root branch: auto_index_deps (default true) triggers
+ *  the session-root branch: explicit auto_index_deps=true triggers
  *  cbm_mcp_auto_index_deps after the project index; config can disable
  *  it or cap it via auto_dep_limit. Analysis:
  *  notes/2026-07-21-2332-path-autoindex-dependency-asymmetry-analysis.md
@@ -1531,55 +1532,12 @@ TEST(path_project_autoindex_indexes_dependencies) {
     ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
     ASSERT_EQ(setup_path_dep_target(target_tmp), 0);
 
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
-    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
-    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
-
-    bool project_indexed = false;
-    char *dep_resp = NULL;
-    run_path_dep_queries(srv, session_tmp, target_tmp, "path_dep_sentinel",
-                         &project_indexed, &dep_resp);
-    bool dep_indexed = dep_resp && strstr(dep_resp, "path_dep_sentinel") != NULL;
-    free(dep_resp);
-
-    cbm_mcp_server_free(srv);
-    if (old_auto_index_copy) {
-        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
-        free(old_auto_index_copy);
-    } else {
-        cbm_unsetenv("CBM_AUTO_INDEX");
-    }
-    th_cleanup(target_tmp);
-    th_cleanup(session_tmp);
-
-    ASSERT_TRUE(project_indexed);
-    /* RED before the fix: the path branch never called
-     * cbm_mcp_auto_index_deps, so the vendored dep was silently absent
-     * even though auto_index_deps defaults to true. */
-    ASSERT_TRUE(dep_indexed);
-    PASS();
-}
-
-TEST(path_project_autoindex_deps_disabled_by_config) {
-    char session_tmp[256];
-    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_depoff_sess_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
-    ASSERT_EQ(th_write_file(TH_PATH(session_tmp, "main.c"), "void session_dep_fn(void) {}\n"),
-              0);
-
-    char target_tmp[256];
-    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_depoff_tgt_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
-    ASSERT_EQ(setup_path_dep_target(target_tmp), 0);
-
     char cfg_tmp[256];
-    snprintf(cfg_tmp, sizeof(cfg_tmp), "/tmp/cbm_path_depoff_cfg_XXXXXX");
+    snprintf(cfg_tmp, sizeof(cfg_tmp), "/tmp/cbm_path_depon_cfg_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(cfg_tmp));
     cbm_config_t *cfg = cbm_config_open(cfg_tmp);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, "auto_index_deps", "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -1608,7 +1566,58 @@ TEST(path_project_autoindex_deps_disabled_by_config) {
     th_cleanup(session_tmp);
 
     ASSERT_TRUE(project_indexed);
-    /* auto_index_deps=false must keep the path branch dep-free. */
+    /* The enabled preset path must run the same dependency indexing helper as
+     * session-root indexing. */
+    ASSERT_TRUE(dep_indexed);
+    PASS();
+}
+
+TEST(path_project_autoindex_deps_disabled_by_default) {
+    char session_tmp[256];
+    snprintf(session_tmp, sizeof(session_tmp), "/tmp/cbm_path_depoff_sess_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(session_tmp));
+    ASSERT_EQ(th_write_file(TH_PATH(session_tmp, "main.c"), "void session_dep_fn(void) {}\n"),
+              0);
+
+    char target_tmp[256];
+    snprintf(target_tmp, sizeof(target_tmp), "/tmp/cbm_path_depoff_tgt_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(target_tmp));
+    ASSERT_EQ(setup_path_dep_target(target_tmp), 0);
+
+    char cfg_tmp[256];
+    snprintf(cfg_tmp, sizeof(cfg_tmp), "/tmp/cbm_path_depoff_cfg_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cfg_tmp));
+    cbm_config_t *cfg = cbm_config_open(cfg_tmp);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    const char *old_auto_index = getenv("CBM_AUTO_INDEX");
+    char *old_auto_index_copy = old_auto_index ? strdup(old_auto_index) : NULL;
+    cbm_setenv("CBM_AUTO_INDEX", "true", 1);
+
+    bool project_indexed = false;
+    char *dep_resp = NULL;
+    run_path_dep_queries(srv, session_tmp, target_tmp, "path_dep_sentinel",
+                         &project_indexed, &dep_resp);
+    bool dep_indexed = dep_resp && strstr(dep_resp, "path_dep_sentinel") != NULL;
+    free(dep_resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    if (old_auto_index_copy) {
+        cbm_setenv("CBM_AUTO_INDEX", old_auto_index_copy, 1);
+        free(old_auto_index_copy);
+    } else {
+        cbm_unsetenv("CBM_AUTO_INDEX");
+    }
+    th_cleanup(cfg_tmp);
+    th_cleanup(target_tmp);
+    th_cleanup(session_tmp);
+
+    ASSERT_TRUE(project_indexed);
+    /* The product default must keep automatic path indexing dep-free. */
     ASSERT_FALSE(dep_indexed);
     PASS();
 }
@@ -1645,7 +1654,7 @@ TEST(path_project_autoindex_honors_auto_dep_limit) {
     ASSERT_NOT_NULL(cbm_mkdtemp(cfg_tmp));
     cbm_config_t *cfg = cbm_config_open(cfg_tmp);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, "auto_index_deps", "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
     ASSERT_EQ(cbm_config_set(cfg, "auto_dep_limit", "1"), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -1697,7 +1706,7 @@ TEST(dep_search_hint_names_index_dependencies_when_deps_disabled) {
 
     cbm_config_t *cfg = cbm_config_open(tmp);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, "auto_index_deps", "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "false"), 0);
     cbm_mcp_server_set_config(srv, cfg);
 
     /* "deps" expands to "validation-test.dep" (prefix match, zero rows).
@@ -1856,7 +1865,7 @@ void suite_input_validation(void) {
     RUN_TEST(path_project_auto_indexes_separate_directory);
     RUN_TEST(path_project_autoindex_respects_file_limit);
     RUN_TEST(path_project_autoindex_indexes_dependencies);
-    RUN_TEST(path_project_autoindex_deps_disabled_by_config);
+    RUN_TEST(path_project_autoindex_deps_disabled_by_default);
     RUN_TEST(path_project_autoindex_honors_auto_dep_limit);
     RUN_TEST(dep_search_hint_names_index_dependencies_when_deps_disabled);
     RUN_TEST(regression_trace_path_tool_name_still_works);

@@ -86,7 +86,7 @@ for any registry key):
 | `tool_mode` | `streamlined` | MCP discovery surface: `streamlined` or `classic`. |
 | `context_injection` | `true` | Include codebase schema and stats automatically in the first `search_graph` response. |
 | `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
-| `auto_index_deps` | `true` | Index installed dependency APIs for cross-package search and tracing. |
+| `auto_index_deps` | `false` | Automatically index installed dependency source for cross-package search and tracing. |
 | `auto_dep_limit` | `20` | Import-ranked automatic dependency package cap; `0` is unlimited. |
 | `similarity_enabled` | `true` | Create MinHash similarity edges in applicable index modes. |
 | `semantic_edges_enabled` | `true` | Create semantic-related edges in applicable index modes. |
@@ -107,17 +107,23 @@ silently leak into a comparison:
 
 ```bash
 codebase-memory-mcp config preset list
-codebase-memory-mcp config preset apply streamlined-quality
-codebase-memory-mcp config preset apply classic-quality
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-disabled
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-enabled
+codebase-memory-mcp config preset apply classic-automatic-dependency-source-indexing-disabled
+codebase-memory-mcp config preset apply classic-automatic-dependency-source-indexing-enabled
 ```
 
-`streamlined-quality` is the recommended default surface with all measured quality
-capabilities enabled. `classic-quality` changes only the API discovery surface while
-retaining those capabilities. The `rank-disabled`, `dependency-disabled`,
-`optional-graph-disabled`, and `minimal-indexing` presets are explicit ablations;
-the CLI labels them as quality tradeoffs when applied. Environment variables remain
-higher priority than stored preset values, and the command returns nonzero with a
-warning when an active override prevents the requested effective configuration.
+The four product presets pair the `streamlined` or `classic` tool surface with an
+explicit automatic dependency-source indexing state. All four enable the same rank,
+similarity, semantic-edge, Git-history, and HTTP-link capabilities. The disabled
+variants bound default indexing latency, CPU, memory, and stored graph size; the
+enabled variants add installed dependency-source coverage up to `auto_dep_limit`.
+`index_dependencies` remains available for explicit packages. Disabling automation
+stops future automatic dependency indexing but does not delete dependency projects
+already indexed. `rank-disabled`, `optional-graph-disabled`, and `minimal-indexing`
+are benchmark ablations, and the CLI labels them accordingly. Environment variables
+remain higher priority than stored preset values, and preset application returns
+nonzero when an active override prevents the requested effective configuration.
 
 ## 3. UI Settings
 

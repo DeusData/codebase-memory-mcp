@@ -9978,80 +9978,75 @@ typedef struct {
     const char *description;
     const cbm_config_preset_value_t *values;
     size_t value_count;
-    bool quality_tradeoff;
+    bool benchmark_ablation;
 } cbm_config_preset_t;
 
 #define PRESET_VALUE(key_, value_) {key_, value_}
 #define PRESET_COUNT(values_) (sizeof(values_) / sizeof((values_)[0]))
+#define PRESET_QUALITY_VALUES(auto_index_deps_, rank_, similarity_, semantic_, git_, http_)       \
+    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, rank_),                                                \
+    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, auto_index_deps_),                                  \
+    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, similarity_),                                    \
+    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, semantic_),                                  \
+    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, git_),                                           \
+    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, http_)
 
-static const cbm_config_preset_value_t PRESET_STREAMLINED_QUALITY[] = {
+static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_DISABLED[] = {
     PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED),
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true",
+                          "true", "true"),
 };
 
-static const cbm_config_preset_value_t PRESET_CLASSIC_QUALITY[] = {
+static const cbm_config_preset_value_t PRESET_STREAMLINED_DEPS_ENABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_STREAMLINED),
+    PRESET_QUALITY_VALUES("true", "true", "true", "true", "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_DISABLED[] = {
     PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC),
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "true", "true", "true",
+                          "true", "true"),
+};
+
+static const cbm_config_preset_value_t PRESET_CLASSIC_DEPS_ENABLED[] = {
+    PRESET_VALUE(CBM_CONFIG_TOOL_MODE, CBM_CONFIG_TOOL_MODE_CLASSIC),
+    PRESET_QUALITY_VALUES("true", "true", "true", "true", "true", "true"),
 };
 
 static const cbm_config_preset_value_t PRESET_RANK_DISABLED[] = {
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
-};
-
-static const cbm_config_preset_value_t PRESET_DEPENDENCY_DISABLED[] = {
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "false"),
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "true"),
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "true"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "true", "true", "true",
+                          "true"),
 };
 
 static const cbm_config_preset_value_t PRESET_OPTIONAL_GRAPH_DISABLED[] = {
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "true"),
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "false"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "false", "false", "false",
+                          "false"),
 };
 
 static const cbm_config_preset_value_t PRESET_MINIMAL_INDEXING[] = {
-    PRESET_VALUE(CBM_CONFIG_RANK_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_AUTO_INDEX_DEPS, "false"),
-    PRESET_VALUE(CBM_CONFIG_SIMILARITY_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_GITHISTORY_ENABLED, "false"),
-    PRESET_VALUE(CBM_CONFIG_HTTPLINKS_ENABLED, "false"),
+    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "false", "false", "false",
+                          "false"),
 };
 
 static const cbm_config_preset_t CBM_CONFIG_PRESETS[] = {
-    {"streamlined-quality", "recommended streamlined API with all measured quality capabilities",
-     PRESET_STREAMLINED_QUALITY, PRESET_COUNT(PRESET_STREAMLINED_QUALITY), false},
-    {"classic-quality", "classic API with the same full-quality graph capabilities",
-     PRESET_CLASSIC_QUALITY, PRESET_COUNT(PRESET_CLASSIC_QUALITY), false},
+    {"streamlined-automatic-dependency-source-indexing-disabled",
+     "streamlined API; automatic installed dependency-source indexing disabled",
+     PRESET_STREAMLINED_DEPS_DISABLED, PRESET_COUNT(PRESET_STREAMLINED_DEPS_DISABLED), false},
+    {"streamlined-automatic-dependency-source-indexing-enabled",
+     "streamlined API; automatic installed dependency-source indexing enabled",
+     PRESET_STREAMLINED_DEPS_ENABLED, PRESET_COUNT(PRESET_STREAMLINED_DEPS_ENABLED), false},
+    {"classic-automatic-dependency-source-indexing-disabled",
+     "classic API; automatic installed dependency-source indexing disabled",
+     PRESET_CLASSIC_DEPS_DISABLED, PRESET_COUNT(PRESET_CLASSIC_DEPS_DISABLED), false},
+    {"classic-automatic-dependency-source-indexing-enabled",
+     "classic API; automatic installed dependency-source indexing enabled",
+     PRESET_CLASSIC_DEPS_ENABLED, PRESET_COUNT(PRESET_CLASSIC_DEPS_ENABLED), false},
     {"rank-disabled", "exact PageRank/LinkRank ablation; lowers measured ranking quality",
      PRESET_RANK_DISABLED, PRESET_COUNT(PRESET_RANK_DISABLED), true},
-    {"dependency-disabled", "exact dependency-indexing ablation; removes dependency API results",
-     PRESET_DEPENDENCY_DISABLED, PRESET_COUNT(PRESET_DEPENDENCY_DISABLED), true},
-    {"optional-graph-disabled", "disable optional graph passes but retain dependency indexing",
+    {"optional-graph-disabled",
+     "disable optional graph passes; dependency-source automation stays disabled",
      PRESET_OPTIONAL_GRAPH_DISABLED, PRESET_COUNT(PRESET_OPTIONAL_GRAPH_DISABLED), true},
-    {"minimal-indexing", "lowest measured indexing cost; disables rank and dependency results",
+    {"minimal-indexing", "disable optional graph passes and dependency-source automation",
      PRESET_MINIMAL_INDEXING, PRESET_COUNT(PRESET_MINIMAL_INDEXING), true},
     {NULL, NULL, NULL, 0, false},
 };
@@ -10090,7 +10085,7 @@ static void cbm_config_print_presets(void) {
     printf("Named presets (applied atomically):\n");
     for (size_t i = 0; CBM_CONFIG_PRESETS[i].name; i++) {
         printf("  %-24s %s%s\n", CBM_CONFIG_PRESETS[i].name, CBM_CONFIG_PRESETS[i].description,
-               CBM_CONFIG_PRESETS[i].quality_tradeoff ? " [quality tradeoff]" : "");
+               CBM_CONFIG_PRESETS[i].benchmark_ablation ? " [benchmark ablation]" : "");
     }
 }
 
@@ -10534,11 +10529,13 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "'unweighted' = raw connection count regardless of type. "
      "'calls_only' = only count direct function call connections — best for finding the most-called functions."},
     /* ── Dependencies ── */
-    {"auto_index_deps", "true", NULL, "Dependencies",
-     "Auto-index installed packages from package.json, Cargo.toml, go.mod, etc.",
+    {CBM_CONFIG_AUTO_INDEX_DEPS, CBM_DEFAULT_AUTO_INDEX_DEPS_STR, NULL, "Dependencies",
+     "Automatically index installed dependency source for cross-package search and tracing",
      "true|false",
-     "Enable to trace calls into dependencies (e.g. find all callers of a library function). "
-     "Disable for faster indexing when cross-package search is not needed."},
+     "Disabled by default to bound indexing latency, CPU, memory, and stored graph size. Enable when "
+     "automatic dependency-source coverage is worth that cost; auto_dep_limit bounds each discovery "
+     "pass. index_dependencies remains available for explicit packages. Disabling this setting stops "
+     "future automatic dependency indexing; it does not delete dependency projects already indexed."},
     {CBM_CONFIG_AUTO_DEP_LIMIT, CBM_STRINGIFY(CBM_DEFAULT_AUTO_DEP_LIMIT), NULL, "Dependencies",
      "Max number of packages to auto-index",
      "0-10000",
