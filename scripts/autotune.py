@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Create or run an auditable PageRank tuning campaign.
+"""Create or run an auditable PageRank tuning experiment.
 
 This compatibility frontend uses the repository's versioned rank-quality fixture
-and content-addressed campaign runner. It never changes the user's normal CBM
+and content-addressed experiment runner. It never changes the user's normal CBM
 configuration or cache, and it retains every result under an ignored durable
-campaign root rather than an operating-system temporary directory.
+experiment root rather than an operating-system temporary directory.
 """
 
 from __future__ import annotations
@@ -22,10 +22,10 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BENCHMARK = ROOT / "scripts" / "benchmark-incremental-speed.py"
-CAMPAIGN_RUNNER = ROOT / "scripts" / "run-benchmark-campaign.py"
-DEFAULT_CAMPAIGN_ROOT = ROOT / ".worktrees" / "benchmark-campaign" / "autotune"
+EXPERIMENT_RUNNER = ROOT / "scripts" / "run-benchmark-experiments.py"
+DEFAULT_EXPERIMENT_ROOT = ROOT / ".worktrees" / "benchmark-experiments" / "autotune"
 
-# Each row is an independently identified campaign profile. The first two are
+# Each row is an independently identified experiment profile. The first two are
 # the essential capability ablation; the remaining rows preserve the useful
 # parameter sweep from the former global-config autotuner.
 TUNING_PROFILES: tuple[dict[str, Any], ...] = (
@@ -76,10 +76,10 @@ TUNING_PROFILES: tuple[dict[str, Any], ...] = (
 )
 
 
-def load_campaign_runner(path: Path = CAMPAIGN_RUNNER) -> ModuleType:
-    spec = importlib.util.spec_from_file_location("cbm_benchmark_campaign", path)
+def load_experiment_runner(path: Path = EXPERIMENT_RUNNER) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("cbm_benchmark_experiment", path)
     if not spec or not spec.loader:
-        raise RuntimeError(f"cannot load campaign runner: {path}")
+        raise RuntimeError(f"cannot load experiment runner: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -122,7 +122,7 @@ def build_matrix_spec(
         if not build.get(key):
             raise ValueError(f"build metadata requires non-empty {key}")
 
-    runner = load_campaign_runner()
+    runner = load_experiment_runner()
     return {
         "schema_version": 1,
         "harness_version": f"benchmark-incremental-speed.py:{runner.file_sha256(BENCHMARK)}",
@@ -159,7 +159,14 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Full candidate commit; defaults to repository HEAD.",
     )
-    parser.add_argument("--campaign-root", type=Path, default=DEFAULT_CAMPAIGN_ROOT)
+    parser.add_argument(
+        "--experiment-root",
+        "--campaign-root",
+        dest="experiment_root",
+        type=Path,
+        default=DEFAULT_EXPERIMENT_ROOT,
+        help="Durable result root (--campaign-root is a legacy alias).",
+    )
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--transport", choices=("cli", "mcp", "both"), default="both")
@@ -201,13 +208,13 @@ def main() -> int:
         build=build,
     )
 
-    runner = load_campaign_runner()
+    runner = load_experiment_runner()
     plan = runner.expand_matrix_spec(spec)
-    campaign_root = args.campaign_root.expanduser().resolve()
-    runner.validate_campaign_root(campaign_root)
-    campaign_root.mkdir(parents=True, exist_ok=True)
-    spec_path = campaign_root / "autotune-matrix-spec.json"
-    plan_path = campaign_root / "autotune-plan.json"
+    experiment_root = args.experiment_root.expanduser().resolve()
+    runner.validate_experiment_root(experiment_root)
+    experiment_root.mkdir(parents=True, exist_ok=True)
+    spec_path = experiment_root / "autotune-matrix-spec.json"
+    plan_path = experiment_root / "autotune-plan.json"
     runner.atomic_write_json(spec_path, spec)
     runner.atomic_write_json(plan_path, plan)
     if args.plan_only:
@@ -222,11 +229,11 @@ def main() -> int:
         sys.executable,
         [
             sys.executable,
-            str(CAMPAIGN_RUNNER),
+            str(EXPERIMENT_RUNNER),
             "--plan",
             str(plan_path),
-            "--campaign-root",
-            str(campaign_root),
+            "--experiment-root",
+            str(experiment_root),
         ],
     )
     return 1

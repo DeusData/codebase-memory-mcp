@@ -15,6 +15,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 import queue
 import re
 import shutil
@@ -31,6 +32,9 @@ from typing import Any
 
 
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
+BENCHMARK_RUN_CONTEXT_ENV = "CBM_BENCHMARK_RUN_CONTEXT"
+BENCHMARK_FACT_SCHEMA_VERSION = 1
+BENCHMARK_FACT_SCHEMA = "docs/schema/benchmark-facts-v1.schema.json"
 REPEATED_JSON_TRIALS = 3
 
 
@@ -297,6 +301,597 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def canonical_json_bytes(value: Any) -> bytes:
+    return json.dumps(value, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def unknown_fact(reason: str) -> dict[str, str]:
+    return {"status": "unknown", "reason": reason}
+
+
+def benchmark_run_context() -> dict[str, Any]:
+    raw = os.environ.get(BENCHMARK_RUN_CONTEXT_ENV)
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{BENCHMARK_RUN_CONTEXT_ENV} must contain valid JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{BENCHMARK_RUN_CONTEXT_ENV} must contain a JSON object")
+    return value
+
+
+def benchmark_harness_metadata() -> dict[str, Any]:
+    script = Path(__file__).resolve()
+    return {
+        "path": str(script),
+        "sha256": file_sha256(script),
+        "fact_schema_version": BENCHMARK_FACT_SCHEMA_VERSION,
+    }
+
+
+def report_mode(report: dict[str, Any]) -> str:
+    mode = report.get("mode")
+    if isinstance(mode, str) and mode:
+        return mode
+    if isinstance(report.get("cases"), list):
+        return "legacy_cases"
+    return "incremental_speed"
+
+
+def report_implementation_identity(
+    report: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    binary = report.get("binary_metadata")
+    binary = (
+        binary if isinstance(binary, dict) else unknown_fact("binary_metadata_missing")
+    )
+    revision = context.get("revision")
+    revision_source = str(context.get("revision_source") or "experiment_cell")
+    allow_report_revision_fallback = context.get("label") != "standalone"
+    if (
+        not isinstance(revision, str) or not revision
+    ) and allow_report_revision_fallback:
+        source_git = report.get("source_git")
+        revision = source_git.get("head") if isinstance(source_git, dict) else None
+        revision_source = "source_git.head"
+    if (
+        not isinstance(revision, str) or not revision
+    ) and allow_report_revision_fallback:
+        background = report.get("repository_background")
+        revision = background.get("revision") if isinstance(background, dict) else None
+        revision_source = "repository_background.revision"
+    revision_value: Any = revision
+    if not isinstance(revision_value, str) or not revision_value:
+        revision_value = unknown_fact("legacy_report_did_not_record_candidate_revision")
+        revision_source = "unavailable"
+    build = context.get("build")
+    if not isinstance(build, dict):
+        build = unknown_fact("legacy_report_did_not_record_build_metadata")
+    return {
+        "revision": revision_value,
+        "revision_source": revision_source,
+        "binary": binary,
+        "build": build,
+    }
+
+
+def report_capability_manifest(
+    report: dict[str, Any], context: dict[str, Any]
+) -> dict[str, Any]:
+    parameters = report.get("parameters")
+    parameters = parameters if isinstance(parameters, dict) else {}
+    declared = context.get("capabilities")
+    declared = dict(declared) if isinstance(declared, dict) else {}
+    overrides = parameters.get("config_overrides")
+    if isinstance(overrides, dict):
+        declared.update(overrides)
+    for key in ("index_mode", "rank_refresh", "config_profile", "transport"):
+        value = parameters.get(key)
+        if value is not None:
+            declared[key] = value
+    return {
+        "values": dict(sorted(declared.items())),
+        "completeness": "complete_declared_cell"
+        if context.get("capabilities") is not None
+        else "partial",
+        "provenance": (
+            "experiment_cell_plus_effective_benchmark_arguments"
+            if context.get("capabilities") is not None
+            else "legacy_report_parameters_only"
+        ),
+        "missing_behavior": "unknown values prohibit parity joins",
+    }
+
+
+def report_scope_manifest(report: dict[str, Any]) -> dict[str, Any]:
+    parameters = report.get("parameters")
+    parameters = parameters if isinstance(parameters, dict) else {}
+    background = report.get("repository_background")
+    generated_source_policy: Any = unknown_fact(
+        "report_did_not_record_generated_source_policy"
+    )
+    if report_mode(report) == "incremental_speed" and isinstance(
+        parameters.get("files"), int
+    ):
+        generated_source_policy = {
+            "kind": "deterministic_generated_go_fixture",
+            "generator": "create_repo/go_file_content",
+            "mutation": "modify_existing_files revision_offset_1000",
+            "provenance": "benchmark_harness_contract",
+        }
+    scope: dict[str, Any] = {
+        "workload": report_mode(report),
+        "files": parameters.get("files", unknown_fact("file_count_not_recorded")),
+        "functions_per_file": parameters.get(
+            "functions_per_file", unknown_fact("function_count_not_recorded")
+        ),
+        "changed_files": parameters.get(
+            "changed_files", unknown_fact("changed_file_count_not_recorded")
+        ),
+        "generated_source_policy": generated_source_policy,
+    }
+    if isinstance(background, dict):
+        scope["repository_background"] = background
+    elif isinstance(report.get("source_repo"), str):
+        scope["repository"] = report["source_repo"]
+    return scope
+
+
+def report_cache_manifest(report: dict[str, Any]) -> dict[str, Any]:
+    parameters = report.get("parameters")
+    parameters = parameters if isinstance(parameters, dict) else {}
+    transport = parameters.get("transport")
+    return {
+        "process": {
+            "state": "persistent_within_lifecycle"
+            if transport == "mcp"
+            else "new_per_tool_call",
+            "source": "transport_contract"
+            if transport in {"cli", "mcp"}
+            else "unknown",
+        },
+        "repository_graph": {
+            "initial_state": "empty_harness_owned_cache",
+            "reset_procedure": "remove_project_dbs_before_clean_rebuild",
+        },
+        "dependency_artifacts": unknown_fact(
+            "legacy_harness_did_not_record_dependency_cache_identity"
+        ),
+        "os_page_cache": unknown_fact("os_page_cache_state_not_controlled"),
+        "sqlite_page_cache": unknown_fact("sqlite_page_cache_state_not_recorded"),
+        "parser_compiler_cache": unknown_fact(
+            "parser_compiler_cache_state_not_recorded"
+        ),
+        "fixture_cache": unknown_fact("fixture_cache_state_not_recorded"),
+    }
+
+
+STEP_ID_BY_FIELD = {
+    "initial_fast_full": "initial_index",
+    "incremental": "incremental_index",
+    "incremental_exact": "incremental_index",
+    "fresh_fast_full_after_change": "clean_rebuild_index",
+    "fresh_full_after_change": "clean_rebuild_index",
+}
+
+
+def fact_step_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen_objects: set[int] = set()
+
+    def visit(
+        value: Any, path: tuple[str, ...], parent_occurrence_id: str | None
+    ) -> None:
+        if isinstance(value, dict):
+            object_id = id(value)
+            if object_id in seen_objects:
+                return
+            seen_objects.add(object_id)
+            elapsed = value.get("elapsed_ms")
+            current_parent = parent_occurrence_id
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+                field = path[-1] if path else "operation"
+                step_id = STEP_ID_BY_FIELD.get(field, field)
+                occurrence_id = hashlib.sha256(
+                    canonical_json_bytes({"run_id": run_id, "path": path})
+                ).hexdigest()[:24]
+                row = {
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "occurrence_id": occurrence_id,
+                    "source_path": ".".join(path),
+                    "parent_occurrence_id": parent_occurrence_id,
+                    "dependency_occurrence_ids": [],
+                    "elapsed_ms": float(elapsed),
+                    "monotonic_start_ns": unknown_fact(
+                        "legacy_profile_marker_did_not_record_start_timestamp"
+                    ),
+                    "monotonic_end_ns": unknown_fact(
+                        "legacy_profile_marker_did_not_record_end_timestamp"
+                    ),
+                    "cpu_ms": unknown_fact("cpu_time_not_recorded"),
+                    "cpu_scope": "unknown",
+                    "queue_wait_ms": unknown_fact("queue_wait_not_recorded"),
+                    "thread_or_worker_id": unknown_fact("worker_identity_not_recorded"),
+                    "critical_path": unknown_fact("dependency_event_dag_not_recorded"),
+                    "peak_rss_mb": value.get(
+                        "peak_rss_mb", unknown_fact("peak_rss_not_recorded")
+                    ),
+                    "work_counters": {},
+                    "provenance": "normalized_existing_report_measurement",
+                }
+                rows.append(row)
+                current_parent = occurrence_id
+                components = value.get("timing_components_ms")
+                if isinstance(components, dict):
+                    for name, duration in sorted(components.items()):
+                        if not isinstance(duration, (int, float)) or isinstance(
+                            duration, bool
+                        ):
+                            continue
+                        component_occurrence = hashlib.sha256(
+                            canonical_json_bytes(
+                                {"run_id": run_id, "path": path, "component": name}
+                            )
+                        ).hexdigest()[:24]
+                        rows.append(
+                            {
+                                "run_id": run_id,
+                                "step_id": str(name),
+                                "occurrence_id": component_occurrence,
+                                "source_path": ".".join(
+                                    (*path, "timing_components_ms", name)
+                                ),
+                                "parent_occurrence_id": occurrence_id,
+                                "dependency_occurrence_ids": [],
+                                "elapsed_ms": float(duration),
+                                "monotonic_start_ns": unknown_fact(
+                                    "legacy_component_marker_did_not_record_start_timestamp"
+                                ),
+                                "monotonic_end_ns": unknown_fact(
+                                    "legacy_component_marker_did_not_record_end_timestamp"
+                                ),
+                                "cpu_ms": unknown_fact("cpu_time_not_recorded"),
+                                "cpu_scope": "unknown",
+                                "queue_wait_ms": unknown_fact(
+                                    "queue_wait_not_recorded"
+                                ),
+                                "thread_or_worker_id": unknown_fact(
+                                    "worker_identity_not_recorded"
+                                ),
+                                "critical_path": unknown_fact(
+                                    "dependency_event_dag_not_recorded"
+                                ),
+                                "peak_rss_mb": unknown_fact(
+                                    "component_peak_rss_not_recorded"
+                                ),
+                                "work_counters": {},
+                                "provenance": "parsed_existing_profile_marker",
+                            }
+                        )
+            for key, child in value.items():
+                if (
+                    key == "incremental"
+                    and "incremental_exact" in value
+                    and value["incremental_exact"] == child
+                ):
+                    continue
+                visit(child, (*path, str(key)), current_parent)
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                visit(child, (*path, str(index)), parent_occurrence_id)
+
+    measurements = report.get("measurements")
+    if isinstance(measurements, dict):
+        visit(measurements, ("measurements",), None)
+    cases = report.get("cases")
+    if isinstance(cases, list):
+        visit(cases, ("cases",), None)
+    return rows
+
+
+def fact_result_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    derived = report.get("derived")
+    passed = derived.get("passed") if isinstance(derived, dict) else None
+    rows.append(
+        {
+            "run_id": run_id,
+            "result_id": "benchmark_gate",
+            "kind": "product_contract",
+            "status": "passed"
+            if passed is True
+            else "failed"
+            if passed is False
+            else "unknown",
+            "value": passed
+            if isinstance(passed, bool)
+            else unknown_fact("derived_passed_missing"),
+            "provenance": "report.derived.passed",
+        }
+    )
+    error = report.get("error")
+    if error is not None:
+        rows.append(
+            {
+                "run_id": run_id,
+                "result_id": "harness_error",
+                "kind": "instrumentation",
+                "status": "failed",
+                "value": error,
+                "provenance": "report.error",
+            }
+        )
+    return rows
+
+
+def fact_artifact_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            artifacts = value.get("measurement_log_artifacts")
+            if isinstance(artifacts, list):
+                for artifact in artifacts:
+                    if not isinstance(artifact, dict):
+                        continue
+                    path = artifact.get("path") or artifact.get("artifact_path")
+                    digest = artifact.get("sha256") or artifact.get("artifact_sha256")
+                    if not isinstance(path, str) or not isinstance(digest, str):
+                        continue
+                    key = (path, digest)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    rows.append(
+                        {
+                            "run_id": run_id,
+                            "artifact_id": hashlib.sha256(
+                                canonical_json_bytes(key)
+                            ).hexdigest()[:24],
+                            "artifact_type": "measurement_log",
+                            "path": path,
+                            "sha256": digest,
+                            "size_bytes": artifact.get(
+                                "size_bytes", unknown_fact("artifact_size_not_recorded")
+                            ),
+                            "schema_version": unknown_fact(
+                                "unstructured_measurement_log"
+                            ),
+                            "cleanup_status": "retained",
+                        }
+                    )
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    visit(report)
+    return rows
+
+
+def normalize_benchmark_report(
+    report: dict[str, Any], context: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if not isinstance(report, dict):
+        raise ValueError("benchmark report must be a JSON object")
+    resolved_context = dict(context or {})
+    implementation = report_implementation_identity(report, resolved_context)
+    run_identity = {
+        "generated_at_utc": report.get("generated_at_utc"),
+        "mode": report_mode(report),
+        "implementation": implementation,
+        "measurement_checkout": resolved_context.get(
+            "source_git", unknown_fact("measurement_checkout_not_recorded")
+        ),
+        "cell_identity": resolved_context.get("cell_identity"),
+        "repetition": resolved_context.get("repetition"),
+        "parameters": report.get("parameters"),
+    }
+    run_id = hashlib.sha256(canonical_json_bytes(run_identity)).hexdigest()[:24]
+    recorded_host = report.get("host")
+    if not isinstance(recorded_host, dict):
+        recorded_host = report.get("host_metadata")
+    if not isinstance(recorded_host, dict):
+        recorded_host = (
+            {
+                "platform": platform.platform(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "provenance": "measurement_process",
+            }
+            if resolved_context
+            else unknown_fact("legacy_report_did_not_record_host_metadata")
+        )
+    run_row = {
+        "run_id": run_id,
+        "lifecycle_id": run_id,
+        "generated_at_utc": report.get(
+            "generated_at_utc", unknown_fact("legacy_report_timestamp_missing")
+        ),
+        "mode": report_mode(report),
+        "cell_identity": resolved_context.get(
+            "cell_identity", unknown_fact("not_executed_by_experiment_runner")
+        ),
+        "cell_label": resolved_context.get(
+            "label", unknown_fact("cell_label_not_recorded")
+        ),
+        "repetition": resolved_context.get(
+            "repetition", unknown_fact("repetition_not_recorded")
+        ),
+        "implementation": implementation,
+        "harness": benchmark_harness_metadata(),
+        "host": recorded_host,
+        "measurement_checkout": resolved_context.get(
+            "source_git", unknown_fact("measurement_checkout_not_recorded")
+        ),
+        "capabilities": report_capability_manifest(report, resolved_context),
+        "scope": report_scope_manifest(report),
+        "cache": report_cache_manifest(report),
+        "legacy_import": not bool(resolved_context),
+    }
+    return {
+        "$schema": BENCHMARK_FACT_SCHEMA,
+        "schema_version": BENCHMARK_FACT_SCHEMA_VERSION,
+        "runs": [run_row],
+        "steps": fact_step_rows(report, run_id),
+        "results": fact_result_rows(report, run_id),
+        "artifacts": fact_artifact_rows(report, run_id),
+    }
+
+
+def validate_benchmark_facts(facts: dict[str, Any]) -> None:
+    if facts.get("schema_version") != BENCHMARK_FACT_SCHEMA_VERSION:
+        raise ValueError("benchmark facts schema_version is unsupported")
+    for table in ("runs", "steps", "results", "artifacts"):
+        rows = facts.get(table)
+        if not isinstance(rows, list):
+            raise ValueError(f"benchmark facts {table} must be an array")
+    if len(facts["runs"]) != 1 or not isinstance(facts["runs"][0], dict):
+        raise ValueError("benchmark facts must contain exactly one run row")
+    run = facts["runs"][0]
+    required_run_fields = {
+        "run_id",
+        "lifecycle_id",
+        "generated_at_utc",
+        "mode",
+        "implementation",
+        "harness",
+        "host",
+        "measurement_checkout",
+        "capabilities",
+        "scope",
+        "cache",
+        "legacy_import",
+    }
+    missing_run_fields = sorted(required_run_fields - run.keys())
+    if missing_run_fields:
+        raise ValueError(
+            "benchmark facts run row is missing required fields: "
+            + ", ".join(missing_run_fields)
+        )
+    run_id = run.get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{24}", run_id):
+        raise ValueError("benchmark fact run_id must be 24 lowercase hex characters")
+    for table in ("steps", "results", "artifacts"):
+        for row in facts[table]:
+            if not isinstance(row, dict) or row.get("run_id") != run_id:
+                raise ValueError(f"benchmark facts {table} row has a foreign run_id")
+    occurrence_ids = [row.get("occurrence_id") for row in facts["steps"]]
+    if len(occurrence_ids) != len(set(occurrence_ids)):
+        raise ValueError("benchmark fact step occurrence IDs must be unique")
+
+
+def write_benchmark_fact_tables(facts: dict[str, Any], root: Path) -> dict[str, Any]:
+    validate_benchmark_facts(facts)
+    root.mkdir(parents=True, exist_ok=True)
+    files: dict[str, dict[str, Any]] = {}
+    bundle_path = root / "facts.json"
+    atomic_write_text(bundle_path, json.dumps(facts, indent=2, sort_keys=True) + "\n")
+    files["bundle"] = {
+        "path": str(bundle_path),
+        "sha256": file_sha256(bundle_path),
+        "rows": sum(
+            len(facts[table]) for table in ("runs", "steps", "results", "artifacts")
+        ),
+    }
+    for table in ("runs", "steps", "results", "artifacts"):
+        path = root / ("steps.jsonl" if table == "steps" else f"{table}.json")
+        if table == "steps":
+            payload = "".join(
+                json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n"
+                for row in facts[table]
+            )
+        else:
+            payload = json.dumps(facts[table], indent=2, sort_keys=True) + "\n"
+        atomic_write_text(path, payload)
+        files[table] = {
+            "path": str(path),
+            "sha256": file_sha256(path),
+            "rows": len(facts[table]),
+        }
+    manifest = {
+        "schema_version": BENCHMARK_FACT_SCHEMA_VERSION,
+        "run_id": facts["runs"][0]["run_id"],
+        "files": files,
+    }
+    manifest_path = root / "manifest.json"
+    atomic_write_text(
+        manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    manifest["manifest_path"] = str(manifest_path)
+    manifest["manifest_sha256"] = file_sha256(manifest_path)
+    return manifest
+
+
+def resolve_facts_dir(args: argparse.Namespace) -> Path | None:
+    if getattr(args, "facts_dir", ""):
+        return Path(args.facts_dir).expanduser()
+    artifact_dir = os.environ.get(BENCHMARK_ARTIFACT_DIR_ENV)
+    if artifact_dir:
+        return Path(artifact_dir).expanduser() / "facts"
+    if getattr(args, "out", ""):
+        output = Path(args.out).expanduser()
+        return output.parent / f"{output.stem}.facts"
+    return None
+
+
+def standalone_run_context(args: argparse.Namespace) -> dict[str, Any]:
+    context: dict[str, Any] = {
+        "label": "standalone",
+        "repetition": 1,
+        "harness_version": benchmark_harness_metadata()["sha256"],
+    }
+    build = getattr(args, "build_metadata", None)
+    if isinstance(build, dict) and build:
+        context["build"] = build
+    candidates = [Path(args.binary).expanduser().resolve().parent]
+    repo_root = getattr(args, "repo_root", "")
+    if repo_root:
+        candidates.append(Path(repo_root).expanduser().resolve())
+    for candidate in candidates:
+        try:
+            root = resolve_git_repo_root(candidate, args.timeout)
+            revision_arg = getattr(args, "candidate_revision", "") or "HEAD"
+            revision = command_stdout(
+                ["git", "rev-parse", f"{revision_arg}^{{commit}}"], args.timeout, root
+            )
+            context["source_git"] = git_metadata(root, args.timeout)
+            if getattr(args, "candidate_revision", ""):
+                context["revision"] = revision
+                context["revision_source"] = "standalone_declared_revision"
+            else:
+                context["checkout_revision"] = revision
+            break
+        except (OSError, RuntimeError, subprocess.SubprocessError):
+            continue
+    return context
+
+
+def emit_report(report: dict[str, Any], args: argparse.Namespace) -> None:
+    context = benchmark_run_context()
+    if not context:
+        context = standalone_run_context(args)
+    if context:
+        report["benchmark_run_context"] = context
+    facts = normalize_benchmark_report(report, context)
+    facts_dir = resolve_facts_dir(args)
+    if facts_dir is not None:
+        report["fact_manifest"] = write_benchmark_fact_tables(facts, facts_dir)
+    if args.out:
+        atomic_write_text(
+            Path(args.out).expanduser(),
+            json.dumps(report, indent=2, sort_keys=True) + "\n",
+        )
+    print(json.dumps(report, indent=2, sort_keys=True))
 
 
 def archive_measurement_log(source: Path, artifact_dir: Path) -> dict[str, Any]:
@@ -1694,10 +2289,7 @@ def run_mcp_surface_parity(
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
-        if args.out:
-            atomic_write_text(Path(args.out).expanduser(), rendered)
-        print(rendered, end="")
+        emit_report(report, args)
     return report, exit_code
 
 
@@ -1862,12 +2454,7 @@ def run_list_projects_scaling(
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
-        if args.out:
-            out_path = Path(args.out).expanduser()
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(out_path, rendered)
-        print(rendered, end="")
+        emit_report(report, args)
     return report, exit_code
 
 
@@ -2036,10 +2623,7 @@ def run_search_projection(
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
-        if args.out:
-            atomic_write_text(Path(args.out).expanduser(), rendered)
-        print(rendered, end="")
+        emit_report(report, args)
     return report, exit_code
 
 
@@ -5158,10 +5742,7 @@ def run_capability_quality(
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
-        if args.out:
-            atomic_write_text(Path(args.out).expanduser(), rendered)
-        print(rendered, end="")
+        emit_report(report, args)
     return report, exit_code
 
 
@@ -5375,12 +5956,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        if args.out:
-            atomic_write_text(
-                Path(args.out).expanduser(),
-                json.dumps(report, indent=2, sort_keys=True) + "\n",
-            )
-        print(json.dumps(report, indent=2, sort_keys=True))
+        emit_report(report, args)
     return report, exit_code
 
 
@@ -5641,12 +6217,7 @@ def run_self_dogfood(
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        if args.out:
-            atomic_write_text(
-                Path(args.out).expanduser(),
-                json.dumps(report, indent=2, sort_keys=True) + "\n",
-            )
-        print(json.dumps(report, indent=2, sort_keys=True))
+        emit_report(report, args)
     return report, exit_code
 
 
@@ -5655,9 +6226,47 @@ def parse_args() -> argparse.Namespace:
         description="Gate exact fast-mode incremental indexing against a fresh full rebuild."
     )
     parser.add_argument("--binary", default="build/c/codebase-memory-mcp")
+    parser.add_argument(
+        "--candidate-revision",
+        default="",
+        help=(
+            "Commit-ish identifying the candidate binary for a standalone run. It is "
+            "resolved to a full commit in the binary checkout; experiment runs supply the "
+            "immutable cell revision automatically."
+        ),
+    )
+    parser.add_argument(
+        "--build-metadata-json",
+        default="",
+        metavar="JSON",
+        help=(
+            "Standalone build metadata object, for example compiler, target, CFLAGS, "
+            "optimization, sanitizer, and feature flags. Experiment runs supply this from "
+            "the immutable cell automatically."
+        ),
+    )
     parser.add_argument("--work-root", default="")
     parser.add_argument("--repo-root", default=".")
     parser.add_argument("--out", default="")
+    parser.add_argument(
+        "--facts-dir",
+        default="",
+        help=(
+            "Write versioned runs.json, steps.jsonl, results.json, artifacts.json, "
+            f"and manifest.json facts using {BENCHMARK_FACT_SCHEMA}. Defaults to the "
+            "experiment artifact directory or <out-stem>.facts."
+        ),
+    )
+    parser.add_argument(
+        "--import-report",
+        default="",
+        metavar="LEGACY-REPORT.json",
+        help=(
+            "Normalize a retained older benchmark report into canonical fact tables. "
+            "Missing historical metadata is marked unknown; no benchmark binary runs. "
+            "Requires --facts-dir."
+        ),
+    )
     parser.add_argument("--files", type=int, default=DEFAULT_FILE_COUNT)
     parser.add_argument(
         "--functions-per-file", type=int, default=DEFAULT_FUNCTIONS_PER_FILE
@@ -5854,6 +6463,15 @@ def parse_args() -> argparse.Namespace:
         help="Existing MCP tool used by --overhead-probes.",
     )
     args = parser.parse_args()
+    if args.build_metadata_json:
+        try:
+            args.build_metadata = json.loads(args.build_metadata_json)
+        except json.JSONDecodeError as exc:
+            parser.error(f"--build-metadata-json must contain valid JSON: {exc}")
+        if not isinstance(args.build_metadata, dict):
+            parser.error("--build-metadata-json must contain a JSON object")
+    else:
+        args.build_metadata = {}
     args.config_overrides = resolve_config_overrides(args.config_profile, args.config)
     return args
 
@@ -5871,6 +6489,48 @@ def resolve_binary_path(binary_arg: str) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.import_report:
+        if not args.facts_dir:
+            print("error: --import-report requires --facts-dir", file=sys.stderr)
+            return 2
+        source = Path(args.import_report).expanduser()
+        try:
+            report = json.loads(source.read_text(encoding="utf-8"))
+            if not isinstance(report, dict):
+                raise ValueError("legacy benchmark report must be a JSON object")
+            embedded_context = report.get("benchmark_run_context")
+            context = embedded_context if isinstance(embedded_context, dict) else {}
+            facts = normalize_benchmark_report(report, context)
+            facts["artifacts"].append(
+                {
+                    "run_id": facts["runs"][0]["run_id"],
+                    "artifact_id": hashlib.sha256(
+                        canonical_json_bytes(
+                            {
+                                "path": str(source.resolve()),
+                                "sha256": file_sha256(source),
+                            }
+                        )
+                    ).hexdigest()[:24],
+                    "artifact_type": "legacy_source_report",
+                    "path": str(source.resolve()),
+                    "sha256": file_sha256(source),
+                    "size_bytes": source.stat().st_size,
+                    "schema_version": report.get(
+                        "schema_version",
+                        unknown_fact("legacy_report_schema_not_recorded"),
+                    ),
+                    "cleanup_status": "retained",
+                }
+            )
+            manifest = write_benchmark_fact_tables(
+                facts, Path(args.facts_dir).expanduser()
+            )
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"error: cannot import benchmark report: {exc}", file=sys.stderr)
+            return 2
+        print(json.dumps(manifest, indent=2, sort_keys=True))
+        return 0
     binary = resolve_binary_path(args.binary)
     if not binary.is_file():
         print(f"error: binary not found: {binary}", file=sys.stderr)
@@ -6025,12 +6685,7 @@ def main() -> int:
         if auto_root and not args.keep_work_root:
             shutil.rmtree(work_root, ignore_errors=True)
             report["cleanup"]["removed"] = not work_root.exists()
-        if args.out:
-            atomic_write_text(
-                Path(args.out).expanduser(),
-                json.dumps(report, indent=2, sort_keys=True) + "\n",
-            )
-        print(json.dumps(report, indent=2, sort_keys=True))
+        emit_report(report, args)
 
     return exit_code
 

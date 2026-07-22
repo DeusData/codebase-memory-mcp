@@ -1765,6 +1765,194 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         )
         self.assertTrue(metadata["path"].endswith("/cbm"))
 
+    def test_normalize_benchmark_report_records_experiment_identity_and_steps(
+        self,
+    ) -> None:
+        incremental = {
+            "elapsed_ms": 40,
+            "peak_rss_mb": 128,
+            "timing_components_ms": {
+                "main_index": 20,
+                "dependency_index": 10,
+                "rank_refresh": 5,
+                "worker_total": 35,
+                "cold_process_and_supervisor": 5,
+            },
+        }
+        report = {
+            "generated_at_utc": "2026-07-22T08:00:00+00:00",
+            "binary_metadata": {"path": "/tmp/cbm", "sha256": "b" * 64},
+            "parameters": {
+                "config_profile": "default",
+                "config_overrides": {"auto_index_deps": "true"},
+                "index_mode": "full",
+                "rank_refresh": "eager",
+                "transport": "mcp",
+            },
+            "measurements": {
+                "initial_fast_full": {"elapsed_ms": 100},
+                "incremental_exact": incremental,
+                "incremental": incremental,
+                "fresh_fast_full_after_change": {"elapsed_ms": 90},
+            },
+            "derived": {"passed": True},
+        }
+        context = {
+            "cell_identity": "cell-1",
+            "label": "candidate.default.mcp",
+            "revision": "a" * 40,
+            "repetition": 3,
+            "build": {"compiler": "clang", "cflags": "-O2"},
+            "capabilities": {"rank_enabled": "true"},
+            "source_git": {"head": "b" * 40, "branch": "fixture"},
+        }
+
+        facts = BENCHMARK.normalize_benchmark_report(report, context)
+        BENCHMARK.validate_benchmark_facts(facts)
+
+        run = facts["runs"][0]
+        self.assertEqual(run["implementation"]["revision"], "a" * 40)
+        self.assertEqual(run["implementation"]["build"]["cflags"], "-O2")
+        self.assertEqual(run["repetition"], 3)
+        self.assertEqual(run["measurement_checkout"]["head"], "b" * 40)
+        self.assertEqual(run["capabilities"]["values"]["rank_enabled"], "true")
+        self.assertEqual(run["capabilities"]["values"]["index_mode"], "full")
+        self.assertFalse(run["legacy_import"])
+        parent_steps = [
+            row for row in facts["steps"] if row["step_id"] == "incremental_index"
+        ]
+        self.assertEqual(len(parent_steps), 1)
+        component = next(
+            row for row in facts["steps"] if row["step_id"] == "dependency_index"
+        )
+        self.assertEqual(
+            component["parent_occurrence_id"], parent_steps[0]["occurrence_id"]
+        )
+        self.assertEqual(component["elapsed_ms"], 10.0)
+
+    def test_normalize_legacy_report_marks_unavailable_metadata_unknown(self) -> None:
+        report = {
+            "generated_at_utc": "2026-07-20T00:00:00+00:00",
+            "binary_metadata": {"path": "/old/cbm", "sha256": "c" * 64},
+            "parameters": {"transport": "cli"},
+            "measurements": {"incremental": {"elapsed_ms": 25}},
+            "derived": {"passed": False},
+        }
+
+        facts = BENCHMARK.normalize_benchmark_report(report)
+
+        run = facts["runs"][0]
+        self.assertTrue(run["legacy_import"])
+        self.assertEqual(run["implementation"]["revision"]["status"], "unknown")
+        self.assertEqual(run["implementation"]["build"]["status"], "unknown")
+        self.assertEqual(run["repetition"]["status"], "unknown")
+        self.assertEqual(run["capabilities"]["completeness"], "partial")
+        self.assertEqual(facts["steps"][0]["cpu_ms"]["status"], "unknown")
+        self.assertEqual(facts["results"][0]["status"], "failed")
+
+    def test_standalone_context_does_not_attribute_checkout_head_to_binary(
+        self,
+    ) -> None:
+        args = mock.Mock(
+            binary=str(SCRIPT),
+            repo_root=str(SCRIPT.parents[1]),
+            timeout=30,
+            candidate_revision="",
+            build_metadata={},
+        )
+
+        context = BENCHMARK.standalone_run_context(args)
+
+        self.assertNotIn("revision", context)
+        self.assertRegex(context["checkout_revision"], r"^[0-9a-f]{40}$")
+        self.assertEqual(context["source_git"]["head"], context["checkout_revision"])
+
+        facts = BENCHMARK.normalize_benchmark_report(
+            {"source_git": {"head": context["checkout_revision"]}}, context
+        )
+        self.assertEqual(
+            facts["runs"][0]["implementation"]["revision"]["status"], "unknown"
+        )
+
+    def test_write_benchmark_fact_tables_writes_hashed_manifest(self) -> None:
+        facts = BENCHMARK.normalize_benchmark_report(
+            {
+                "generated_at_utc": "2026-07-22T08:00:00+00:00",
+                "binary_metadata": {"path": "/tmp/cbm", "sha256": "d" * 64},
+                "parameters": {"transport": "cli"},
+                "measurements": {"incremental": {"elapsed_ms": 5}},
+                "derived": {"passed": True},
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "facts"
+            manifest = BENCHMARK.write_benchmark_fact_tables(facts, root)
+            manifest_document = json.loads((root / "manifest.json").read_text())
+            bundle = json.loads((root / "facts.json").read_text())
+            step_rows = [
+                json.loads(line)
+                for line in (root / "steps.jsonl").read_text().splitlines()
+            ]
+
+        self.assertEqual(manifest_document["run_id"], facts["runs"][0]["run_id"])
+        self.assertEqual(bundle["$schema"], BENCHMARK.BENCHMARK_FACT_SCHEMA)
+        self.assertNotIn("$schema", manifest_document)
+        self.assertEqual(manifest["files"]["bundle"]["rows"], 3)
+        self.assertEqual(manifest["files"]["steps"]["rows"], 1)
+        self.assertEqual(step_rows[0]["step_id"], "incremental_index")
+        self.assertRegex(manifest["manifest_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_validate_benchmark_facts_rejects_schema_required_run_field_gap(
+        self,
+    ) -> None:
+        facts = BENCHMARK.normalize_benchmark_report(
+            {"derived": {"passed": True}}, {"label": "fixture"}
+        )
+        del facts["runs"][0]["measurement_checkout"]
+
+        with self.assertRaisesRegex(ValueError, "measurement_checkout"):
+            BENCHMARK.validate_benchmark_facts(facts)
+
+    def test_import_report_cli_does_not_require_benchmark_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            source = root / "legacy.json"
+            facts_dir = root / "facts"
+            source.write_text(
+                json.dumps(
+                    {
+                        "generated_at_utc": "2026-07-20T00:00:00+00:00",
+                        "binary_metadata": {"path": "/gone/cbm", "sha256": "e" * 64},
+                        "parameters": {"transport": "cli"},
+                        "measurements": {"incremental": {"elapsed_ms": 7}},
+                        "derived": {"passed": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_sha256 = BENCHMARK.file_sha256(source)
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--import-report",
+                    str(source),
+                    "--facts-dir",
+                    str(facts_dir),
+                    "--binary",
+                    str(root / "missing-binary"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(process.returncode, 0, process.stderr)
+            artifacts = json.loads((facts_dir / "artifacts.json").read_text())
+            self.assertTrue((facts_dir / "runs.json").is_file())
+        self.assertEqual(artifacts[-1]["artifact_type"], "legacy_source_report")
+        self.assertEqual(artifacts[-1]["sha256"], source_sha256)
+
     def test_build_index_result_reports_maximum_logged_peak_rss(self) -> None:
         stderr = "\n".join(
             (
@@ -1977,7 +2165,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
     def test_self_dogfood_worktree_uses_the_declared_revision(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source_repo = Path(tmpdir) / "source" / "repo"
-            case_root = Path(tmpdir) / "campaign" / "cell"
+            case_root = Path(tmpdir) / "experiment" / "cell"
             completed = subprocess.CompletedProcess([], 0, "", "")
 
             with mock.patch.object(
