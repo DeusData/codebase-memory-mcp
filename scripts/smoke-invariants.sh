@@ -521,9 +521,9 @@ inv_mcp_initialize() {
 }
 
 # ── Invariant 4: tools/list returns all expected tools ─────────────────────
-# Cross-check against the canonical 15-tool list (TOOLS[] in src/mcp/mcp.c).
-EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_graph_schema get_architecture search_code list_projects delete_project index_status detect_changes manage_adr manage_memory ingest_traces"
-EXPECTED_TOOL_COUNT=15
+# Cross-check against the canonical 17-tool list (TOOLS[] in src/mcp/mcp.c).
+EXPECTED_TOOLS="index_repository search_graph query_graph trace_path get_code_snippet get_file_outline get_graph_schema compare_graphs get_architecture search_code list_projects delete_project index_status check_index_coverage detect_changes manage_adr manage_memory ingest_traces"
+EXPECTED_TOOL_COUNT=17
 inv_tools_list() {
     if ! mcp_alive; then
         fail "tools-list" "server not alive"
