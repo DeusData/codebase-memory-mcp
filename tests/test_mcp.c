@@ -845,7 +845,7 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-/* Should contain all 15 tools */
+/* Should contain all 17 tools */
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
     ASSERT_NOT_NULL(strstr(json, "query_graph"));
@@ -953,6 +953,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"check_index_coverage", false, true, true, false},
         {"detect_changes", false, true, true, false},
         {"manage_adr", false, true, false, false},
+        {"manage_memory", false, true, false, false},
         {"ingest_traces", false, false, false, false},
     };
 

@@ -792,6 +792,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"check_index_coverage", false, true, true, false},
     {"detect_changes", false, true, true, false},
     {"manage_adr", false, true, false, false},
+    {"manage_memory", false, true, false, false},
     {"ingest_traces", false, false, false, false},
 };
 
