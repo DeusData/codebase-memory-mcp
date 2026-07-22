@@ -31,7 +31,7 @@ DEFAULT_EXPERIMENT_ROOT = ROOT / ".worktrees" / "benchmark-experiments" / "autot
 TUNING_PROFILES: tuple[dict[str, Any], ...] = (
     {
         "label": "candidate-default",
-        "config_profile": "default",
+        "config_profile": "automatic_dependency_source_indexing_disabled",
         "capabilities": {"rank_enabled": "candidate_default"},
     },
     {
@@ -41,25 +41,25 @@ TUNING_PROFILES: tuple[dict[str, Any], ...] = (
     },
     {
         "label": "calls-boost",
-        "config_profile": "default",
+        "config_profile": "automatic_dependency_source_indexing_disabled",
         "capabilities": {"rank_enabled": "true"},
         "config_overrides": {"edge_weight_calls": "2.0", "edge_weight_usage": "0.3"},
     },
     {
         "label": "usage-dampen",
-        "config_profile": "default",
+        "config_profile": "automatic_dependency_source_indexing_disabled",
         "capabilities": {"rank_enabled": "true"},
         "config_overrides": {"edge_weight_usage": "0.3", "edge_weight_defines": "0.05"},
     },
     {
         "label": "tests-dampen",
-        "config_profile": "default",
+        "config_profile": "automatic_dependency_source_indexing_disabled",
         "capabilities": {"rank_enabled": "true"},
         "config_overrides": {"edge_weight_tests": "0.01", "edge_weight_usage": "0.3"},
     },
     {
         "label": "calls-boost-tests-dampen",
-        "config_profile": "default",
+        "config_profile": "automatic_dependency_source_indexing_disabled",
         "capabilities": {"rank_enabled": "true"},
         "config_overrides": {
             "edge_weight_calls": "2.0",
@@ -69,7 +69,7 @@ TUNING_PROFILES: tuple[dict[str, Any], ...] = (
     },
     {
         "label": "more-iterations",
-        "config_profile": "default",
+        "config_profile": "automatic_dependency_source_indexing_disabled",
         "capabilities": {"rank_enabled": "true"},
         "config_overrides": {"pagerank_max_iter": "100"},
     },

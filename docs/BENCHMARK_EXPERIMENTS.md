@@ -236,8 +236,14 @@ Neither the source checkout nor its worktree registry is modified.
 
 Capability ablations should use the named `--config-profile` values so an important
 cost center cannot be silently omitted. Repeated `--config KEY=VALUE` arguments
-remain available and take priority over the selected profile. The default profile
-uses no overrides. The PageRank/LinkRank ablation is:
+remain available and take priority over the selected profile. The benchmark default,
+`automatic_dependency_source_indexing_disabled`, explicitly pins the current product
+capability values and sets `auto_index_deps=false`. Use
+`automatic_dependency_source_indexing_enabled` for the same capability set with
+`auto_index_deps=true`. `candidate_native_configuration` applies no overrides and is
+reserved for older candidates that do not implement the current configuration keys;
+its unspecified effective values cannot participate in capability-parity joins. The
+PageRank/LinkRank ablation is:
 
 ```text
 --config-profile rank_disabled
@@ -258,7 +264,8 @@ handler recognition, and requires server processes and reader threads to be reap
 These probes establish discovery and dispatch parity; functional quality claims
 must still come from the capability fixtures and repository workloads below.
 
-The optional graph-pass ablation keeps dependency indexing enabled and is:
+The optional graph-pass ablation retains the benchmark default
+`auto_index_deps=false` and is:
 
 ```text
 --config-profile optional_graph_disabled
@@ -306,7 +313,12 @@ The lowest-cost indexing baseline also disables installed-package indexing and i
 `minimal_indexing` expands to `auto_index_deps=false`, `rank_enabled=false`,
 `similarity_enabled=false`, `semantic_edges_enabled=false`,
 `githistory_enabled=false`, and `httplinks_enabled=false`. Reports retain both the
-profile name and the fully expanded `config_overrides` map for auditability.
+profile name and the fully expanded requested/effective override maps for
+auditability. Each benchmark case removes inherited `CBM_*` product variables,
+uses an isolated cache, and records that worker selection follows the candidate's
+native default with `CBM_WORKERS` unset. Candidate-native profiles record effective
+configuration as unknown instead of inferring defaults that an older binary did not
+report.
 
 Only apply gates a candidate revision actually supports. Record unsupported
 combinations as compatibility findings rather than silently treating them as the

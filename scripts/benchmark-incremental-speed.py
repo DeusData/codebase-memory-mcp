@@ -69,45 +69,80 @@ SEARCH_PROJECTION_CORE_FIELDS = frozenset(
     }
 )
 DEFAULT_FASTAPI_URL = "https://github.com/fastapi/fastapi.git"
-CONFIG_PROFILE_DEFAULT = "default"
+CONFIG_PROFILE_CANDIDATE_NATIVE = "candidate_native_configuration"
+CONFIG_PROFILE_AUTOMATIC_DEPENDENCY_SOURCE_INDEXING_DISABLED = (
+    "automatic_dependency_source_indexing_disabled"
+)
+CONFIG_PROFILE_AUTOMATIC_DEPENDENCY_SOURCE_INDEXING_ENABLED = (
+    "automatic_dependency_source_indexing_enabled"
+)
+CONFIG_PROFILE_DEFAULT = CONFIG_PROFILE_AUTOMATIC_DEPENDENCY_SOURCE_INDEXING_DISABLED
 CONFIG_PROFILE_RANK_DISABLED = "rank_disabled"
 CONFIG_PROFILE_SIMILARITY_DISABLED = "similarity_disabled"
 CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED = "semantic_edges_disabled"
 CONFIG_PROFILE_GIT_HISTORY_DISABLED = "git_history_disabled"
 CONFIG_PROFILE_HTTP_LINKS_DISABLED = "http_links_disabled"
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
-CONFIG_PROFILE_DEPENDENCY_DISABLED = "dependency_disabled"
 CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER = (
     "incremental_semantic_freshness_eager"
 )
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
 DERIVED_REFRESH_CANDIDATE_DEFAULT = "candidate_default"
+PRODUCT_DEFAULT_GRAPH_CAPABILITIES = {
+    "auto_index_deps": "false",
+    "rank_enabled": "true",
+    "similarity_enabled": "true",
+    "semantic_edges_enabled": "true",
+    "githistory_enabled": "true",
+    "httplinks_enabled": "true",
+}
+
+
+def product_default_graph_capabilities(**changes: str) -> dict[str, str]:
+    values = dict(PRODUCT_DEFAULT_GRAPH_CAPABILITIES)
+    values.update(changes)
+    return values
+
+
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
-    CONFIG_PROFILE_DEFAULT: {},
-    CONFIG_PROFILE_RANK_DISABLED: {"rank_enabled": "false"},
-    CONFIG_PROFILE_SIMILARITY_DISABLED: {"similarity_enabled": "false"},
-    CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED: {"semantic_edges_enabled": "false"},
-    CONFIG_PROFILE_GIT_HISTORY_DISABLED: {"githistory_enabled": "false"},
-    CONFIG_PROFILE_HTTP_LINKS_DISABLED: {"httplinks_enabled": "false"},
-    CONFIG_PROFILE_DEPENDENCY_DISABLED: {"auto_index_deps": "false"},
+    CONFIG_PROFILE_CANDIDATE_NATIVE: {},
+    CONFIG_PROFILE_AUTOMATIC_DEPENDENCY_SOURCE_INDEXING_DISABLED: product_default_graph_capabilities(),
+    CONFIG_PROFILE_AUTOMATIC_DEPENDENCY_SOURCE_INDEXING_ENABLED: product_default_graph_capabilities(
+        auto_index_deps="true"
+    ),
+    CONFIG_PROFILE_RANK_DISABLED: product_default_graph_capabilities(
+        rank_enabled="false"
+    ),
+    CONFIG_PROFILE_SIMILARITY_DISABLED: product_default_graph_capabilities(
+        similarity_enabled="false"
+    ),
+    CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED: product_default_graph_capabilities(
+        semantic_edges_enabled="false"
+    ),
+    CONFIG_PROFILE_GIT_HISTORY_DISABLED: product_default_graph_capabilities(
+        githistory_enabled="false"
+    ),
+    CONFIG_PROFILE_HTTP_LINKS_DISABLED: product_default_graph_capabilities(
+        httplinks_enabled="false"
+    ),
     CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER: {
-        "incremental_derived_refresh": "eager"
+        **product_default_graph_capabilities(),
+        "incremental_derived_refresh": "eager",
     },
-    CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: {
-        "githistory_enabled": "false",
-        "httplinks_enabled": "false",
-        "rank_enabled": "false",
-        "semantic_edges_enabled": "false",
-        "similarity_enabled": "false",
-    },
-    CONFIG_PROFILE_MINIMAL_INDEXING: {
-        "auto_index_deps": "false",
-        "githistory_enabled": "false",
-        "httplinks_enabled": "false",
-        "rank_enabled": "false",
-        "semantic_edges_enabled": "false",
-        "similarity_enabled": "false",
-    },
+    CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: product_default_graph_capabilities(
+        rank_enabled="false",
+        similarity_enabled="false",
+        semantic_edges_enabled="false",
+        githistory_enabled="false",
+        httplinks_enabled="false",
+    ),
+    CONFIG_PROFILE_MINIMAL_INDEXING: product_default_graph_capabilities(
+        rank_enabled="false",
+        similarity_enabled="false",
+        semantic_edges_enabled="false",
+        githistory_enabled="false",
+        httplinks_enabled="false",
+    ),
 }
 INDEX_MODES = ("fast", "moderate", "full")
 PROJECT_DB_SUFFIX = ".db"
@@ -389,23 +424,39 @@ def report_capability_manifest(
     declared = context.get("capabilities")
     declared = dict(declared) if isinstance(declared, dict) else {}
     overrides = parameters.get("config_overrides")
+    requested_overrides = dict(overrides) if isinstance(overrides, dict) else {}
     if isinstance(overrides, dict):
         declared.update(overrides)
     for key in ("index_mode", "rank_refresh", "config_profile", "transport"):
         value = parameters.get(key)
         if value is not None:
             declared[key] = value
+    candidate_native = (
+        parameters.get("config_profile") == CONFIG_PROFILE_CANDIDATE_NATIVE
+    )
+    context_declared = context.get("capabilities") is not None
+    complete = context_declared and not candidate_native and not report.get("error")
+    if complete:
+        provenance = "experiment_cell_plus_isolated_successful_config_set_arguments"
+    elif context_declared:
+        provenance = "candidate_native_configuration"
+    else:
+        provenance = "legacy_report_parameters_only"
     return {
         "values": dict(sorted(declared.items())),
-        "completeness": "complete_declared_cell"
-        if context.get("capabilities") is not None
-        else "partial",
-        "provenance": (
-            "experiment_cell_plus_effective_benchmark_arguments"
-            if context.get("capabilities") is not None
-            else "legacy_report_parameters_only"
+        "requested_config_overrides": dict(sorted(requested_overrides.items())),
+        "effective_config_overrides": (
+            unknown_fact("candidate_native_configuration_was_not_overridden")
+            if candidate_native
+            else dict(sorted(requested_overrides.items()))
         ),
-        "missing_behavior": "unknown values prohibit parity joins",
+        "completeness": "complete_declared_cell" if complete else "partial",
+        "provenance": provenance,
+        "missing_behavior": (
+            "none for declared capability keys"
+            if complete
+            else "unknown values prohibit parity joins"
+        ),
     }
 
 
@@ -4034,7 +4085,9 @@ def validate_isolated_cache_dir(cache_dir: Path) -> Path:
 
 def build_env(cache_dir: Path) -> dict[str, str]:
     isolated_cache = validate_isolated_cache_dir(cache_dir)
-    env = dict(os.environ)
+    env = {
+        key: value for key, value in os.environ.items() if not key.startswith("CBM_")
+    }
     env["CBM_CACHE_DIR"] = str(isolated_cache)
     env["CBM_AUTO_INDEX"] = "false"
     env["CBM_CONTEXT_INJECTION"] = "false"
@@ -4042,6 +4095,19 @@ def build_env(cache_dir: Path) -> dict[str, str]:
     # harness streams their exact memory/timing markers before cleaning the cache.
     env["CBM_PROFILE"] = "1"
     return env
+
+
+def benchmark_environment_policy() -> dict[str, Any]:
+    return {
+        "inherited_product_environment": "remove_all_CBM_prefix_variables",
+        "harness_overrides": {
+            "CBM_AUTO_INDEX": "false",
+            "CBM_CONTEXT_INJECTION": "false",
+            "CBM_PROFILE": "1",
+        },
+        "worker_selection": "candidate_default_with_CBM_WORKERS_unset",
+        "cache_scope": "isolated_per_benchmark_case",
+    }
 
 
 def prepare_matrix_scenario(
@@ -5620,6 +5686,7 @@ def run_capability_quality(
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
+            "configuration_environment": benchmark_environment_policy(),
             "transport": args.transport,
             "timeout": args.timeout,
             "quality_background_repo": args.quality_background_repo or None,
@@ -5926,6 +5993,7 @@ def run_matrix(args: argparse.Namespace, binary: Path) -> tuple[dict[str, Any], 
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
+            "configuration_environment": benchmark_environment_policy(),
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
@@ -6182,6 +6250,7 @@ def run_self_dogfood(
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
+            "configuration_environment": benchmark_environment_policy(),
             "timeout": args.timeout,
             "transport": args.transport,
             "scenarios": scenarios,
@@ -6301,8 +6370,11 @@ def parse_args() -> argparse.Namespace:
         choices=tuple(CONFIG_PROFILES),
         default=CONFIG_PROFILE_DEFAULT,
         help=(
-            "Named, auditable capability profile. dependency_disabled changes only "
-            "auto_index_deps for a controlled ablation; minimal_indexing disables dependency "
+            "Named, auditable configuration profile. The default "
+            "automatic_dependency_source_indexing_disabled sets auto_index_deps=false; "
+            "automatic_dependency_source_indexing_enabled sets it true; "
+            "candidate_native_configuration applies no override for binaries that do not "
+            "support this setting. minimal_indexing disables automatic dependency-source "
             "indexing plus every optional graph/rank pass. Repeated --config KEY=VALUE "
             "arguments take priority over the selected profile."
         ),
@@ -6586,6 +6658,7 @@ def main() -> int:
             ),
             "config_profile": args.config_profile,
             "config_overrides": args.config_overrides,
+            "configuration_environment": benchmark_environment_policy(),
             "timeout": args.timeout,
             "transport": args.transport,
             "overhead_probes": args.overhead_probes,

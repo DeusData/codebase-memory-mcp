@@ -604,22 +604,54 @@ def build_automatic_spec(
     repository_tree = repository_identity["tree"]
     runner_sha = file_sha256(Path(__file__).resolve())
     benchmark_sha = file_sha256(benchmark_script)
-    latest_labels = ["latest"]
+    latest_labels = [label for label, ref in DEFAULT_CANDIDATE_REFS if ref == "HEAD"]
+    native_candidate_labels = [
+        label for label, ref in DEFAULT_CANDIDATE_REFS if ref != "HEAD"
+    ]
+    product_defaults = {
+        "auto_index_deps": "false",
+        "rank_enabled": "true",
+        "similarity_enabled": "true",
+        "semantic_edges_enabled": "true",
+        "githistory_enabled": "true",
+        "httplinks_enabled": "true",
+    }
+
+    def capabilities(**changes: str) -> dict[str, str]:
+        values = dict(product_defaults)
+        values.update(changes)
+        return values
+
     profiles: list[dict[str, Any]] = [
-        {"label": "default", "config_profile": "default", "capabilities": {}}
+        {
+            "label": "candidate-native-configuration",
+            "config_profile": "candidate_native_configuration",
+            "candidate_labels": native_candidate_labels,
+            "capabilities": {},
+        },
+        {
+            "label": "automatic-dependency-source-indexing-disabled",
+            "config_profile": "automatic_dependency_source_indexing_disabled",
+            "candidate_labels": latest_labels,
+            "capabilities": capabilities(),
+        },
     ]
     if preset == "full":
         profiles.extend(
             (
                 {
-                    "label": "upstream-equivalent",
-                    "config_profile": "default",
+                    "label": "automatic-dependency-source-indexing-enabled",
+                    "config_profile": "automatic_dependency_source_indexing_enabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {
-                        "auto_index_deps": "false",
-                        "rank_enabled": "false",
-                        "httplinks_enabled": "false",
-                    },
+                    "capabilities": capabilities(auto_index_deps="true"),
+                },
+                {
+                    "label": "upstream-equivalent",
+                    "config_profile": "automatic_dependency_source_indexing_disabled",
+                    "candidate_labels": latest_labels,
+                    "capabilities": capabilities(
+                        rank_enabled="false", httplinks_enabled="false"
+                    ),
                     "config_overrides": {
                         "auto_index_deps": "false",
                         "rank_enabled": "false",
@@ -630,68 +662,64 @@ def build_automatic_spec(
                     "label": "eager-derived-freshness",
                     "config_profile": "incremental_semantic_freshness_eager",
                     "candidate_labels": latest_labels,
-                    "capabilities": {"incremental_derived_refresh": "eager"},
+                    "capabilities": {
+                        **capabilities(),
+                        "incremental_derived_refresh": "eager",
+                    },
                 },
                 {
                     "label": "rank-disabled",
                     "config_profile": "rank_disabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {"rank_enabled": "false"},
-                },
-                {
-                    "label": "dependency-disabled",
-                    "config_profile": "dependency_disabled",
-                    "candidate_labels": latest_labels,
-                    "capabilities": {"auto_index_deps": "false"},
+                    "capabilities": capabilities(rank_enabled="false"),
                 },
                 {
                     "label": "similarity-disabled",
                     "config_profile": "similarity_disabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {"similarity_enabled": "false"},
+                    "capabilities": capabilities(similarity_enabled="false"),
                 },
                 {
                     "label": "semantic-edges-disabled",
                     "config_profile": "semantic_edges_disabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {"semantic_edges_enabled": "false"},
+                    "capabilities": capabilities(semantic_edges_enabled="false"),
                 },
                 {
                     "label": "git-history-disabled",
                     "config_profile": "git_history_disabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {"githistory_enabled": "false"},
+                    "capabilities": capabilities(githistory_enabled="false"),
                 },
                 {
                     "label": "http-links-disabled",
                     "config_profile": "http_links_disabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {"httplinks_enabled": "false"},
+                    "capabilities": capabilities(httplinks_enabled="false"),
                 },
                 {
                     "label": "optional-graph-disabled",
                     "config_profile": "optional_graph_disabled",
                     "candidate_labels": latest_labels,
-                    "capabilities": {
-                        "rank_enabled": "false",
-                        "similarity_enabled": "false",
-                        "semantic_edges_enabled": "false",
-                        "githistory_enabled": "false",
-                        "httplinks_enabled": "false",
-                    },
+                    "capabilities": capabilities(
+                        rank_enabled="false",
+                        similarity_enabled="false",
+                        semantic_edges_enabled="false",
+                        githistory_enabled="false",
+                        httplinks_enabled="false",
+                    ),
                 },
                 {
                     "label": "minimal-indexing",
                     "config_profile": "minimal_indexing",
                     "candidate_labels": latest_labels,
-                    "capabilities": {
-                        "auto_index_deps": "false",
-                        "rank_enabled": "false",
-                        "similarity_enabled": "false",
-                        "semantic_edges_enabled": "false",
-                        "githistory_enabled": "false",
-                        "httplinks_enabled": "false",
-                    },
+                    "capabilities": capabilities(
+                        rank_enabled="false",
+                        similarity_enabled="false",
+                        semantic_edges_enabled="false",
+                        githistory_enabled="false",
+                        httplinks_enabled="false",
+                    ),
                 },
             )
         )
@@ -1081,16 +1109,13 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 profile.get("config_overrides"),
                 f"profiles[{profile_index}].config_overrides",
             )
-            if config_profile == "default":
+            if config_profile == "candidate_native_configuration":
                 for key, claimed_value in capabilities.items():
-                    disabled = claimed_value is False or (
-                        isinstance(claimed_value, str)
-                        and claimed_value.strip().lower() == "false"
-                    )
-                    if disabled and overrides.get(key, "").strip().lower() != "false":
+                    expected = str(claimed_value).strip().lower()
+                    if overrides.get(key, "").strip().lower() != expected:
                         raise ValueError(
-                            f"profiles[{profile_index}].capabilities claims {key}=false "
-                            "but the default profile does not apply that setting; add the "
+                            f"profiles[{profile_index}].capabilities claims {key}={expected} "
+                            "but the candidate-native profile does not apply that setting; add the "
                             "same value to config_overrides"
                         )
             if "incremental_exact_max_affected_paths" in overrides:

@@ -1313,10 +1313,23 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             },
         )
 
-    def test_dependency_disabled_profile_changes_only_dependency_indexing(self) -> None:
+    def test_automatic_dependency_source_profiles_change_only_dependency_indexing(
+        self,
+    ) -> None:
+        disabled = BENCHMARK.resolve_config_overrides(
+            "automatic_dependency_source_indexing_disabled", []
+        )
+        enabled = BENCHMARK.resolve_config_overrides(
+            "automatic_dependency_source_indexing_enabled", []
+        )
         self.assertEqual(
-            BENCHMARK.resolve_config_overrides("dependency_disabled", []),
-            {"auto_index_deps": "false"},
+            disabled,
+            BENCHMARK.PRODUCT_DEFAULT_GRAPH_CAPABILITIES,
+        )
+        self.assertEqual(enabled, {**disabled, "auto_index_deps": "true"})
+        self.assertEqual(
+            BENCHMARK.resolve_config_overrides("candidate_native_configuration", []),
+            {},
         )
 
     def test_incremental_semantic_freshness_eager_profile_changes_only_refresh_policy(
@@ -1326,26 +1339,28 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             BENCHMARK.resolve_config_overrides(
                 "incremental_semantic_freshness_eager", []
             ),
-            {"incremental_derived_refresh": "eager"},
+            {
+                **BENCHMARK.PRODUCT_DEFAULT_GRAPH_CAPABILITIES,
+                "incremental_derived_refresh": "eager",
+            },
         )
 
     def test_single_capability_ablation_profiles_change_exactly_one_group(self) -> None:
-        expected = {
-            "rank_disabled": {"rank_enabled": "false"},
-            "similarity_disabled": {"similarity_enabled": "false"},
-            "semantic_edges_disabled": {"semantic_edges_enabled": "false"},
-            "git_history_disabled": {"githistory_enabled": "false"},
-            "http_links_disabled": {"httplinks_enabled": "false"},
-            "dependency_disabled": {"auto_index_deps": "false"},
+        changed_keys = {
+            "rank_disabled": "rank_enabled",
+            "similarity_disabled": "similarity_enabled",
+            "semantic_edges_disabled": "semantic_edges_enabled",
+            "git_history_disabled": "githistory_enabled",
+            "http_links_disabled": "httplinks_enabled",
         }
-
-        self.assertEqual(
-            {
-                profile: BENCHMARK.resolve_config_overrides(profile, [])
-                for profile in expected
-            },
-            expected,
-        )
+        baseline = BENCHMARK.PRODUCT_DEFAULT_GRAPH_CAPABILITIES
+        for profile, changed_key in changed_keys.items():
+            resolved = BENCHMARK.resolve_config_overrides(profile, [])
+            differences = {
+                key for key, value in resolved.items() if baseline.get(key) != value
+            }
+            self.assertEqual(differences, {changed_key})
+            self.assertEqual(resolved[changed_key], "false")
 
     def test_index_mode_metadata_marks_fast_only_capability_gaps(self) -> None:
         self.assertEqual(
@@ -1625,6 +1640,39 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(env["CBM_PROFILE"], "1")
         self.assertEqual(env["CBM_AUTO_INDEX"], "false")
 
+    def test_benchmark_environment_removes_inherited_product_configuration(
+        self,
+    ) -> None:
+        inherited = {
+            "CBM_TOOL_MODE": "classic",
+            "CBM_AUTO_INDEX_DEPS": "true",
+            "CBM_AUTO_DEP_LIMIT": "999",
+            "UNRELATED_BENCHMARK_ENV": "preserved",
+        }
+        with mock.patch.dict(os.environ, inherited, clear=False):
+            env = BENCHMARK.build_env(Path("/tmp/cbm-benchmark-isolated-cache"))
+
+        self.assertNotIn("CBM_TOOL_MODE", env)
+        self.assertNotIn("CBM_AUTO_INDEX_DEPS", env)
+        self.assertNotIn("CBM_AUTO_DEP_LIMIT", env)
+        self.assertEqual(env["UNRELATED_BENCHMARK_ENV"], "preserved")
+        self.assertEqual(env["CBM_AUTO_INDEX"], "false")
+        self.assertEqual(env["CBM_CONTEXT_INJECTION"], "false")
+        self.assertEqual(env["CBM_PROFILE"], "1")
+        self.assertEqual(
+            BENCHMARK.benchmark_environment_policy(),
+            {
+                "inherited_product_environment": "remove_all_CBM_prefix_variables",
+                "harness_overrides": {
+                    "CBM_AUTO_INDEX": "false",
+                    "CBM_CONTEXT_INJECTION": "false",
+                    "CBM_PROFILE": "1",
+                },
+                "worker_selection": "candidate_default_with_CBM_WORKERS_unset",
+                "cache_scope": "isolated_per_benchmark_case",
+            },
+        )
+
     def test_tool_result_separates_default_payload_quality_json_and_transport(
         self,
     ) -> None:
@@ -1817,6 +1865,15 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(run["measurement_checkout"]["head"], "b" * 40)
         self.assertEqual(run["capabilities"]["values"]["rank_enabled"], "true")
         self.assertEqual(run["capabilities"]["values"]["index_mode"], "full")
+        self.assertEqual(
+            run["capabilities"]["requested_config_overrides"],
+            {"auto_index_deps": "true"},
+        )
+        self.assertEqual(
+            run["capabilities"]["effective_config_overrides"],
+            {"auto_index_deps": "true"},
+        )
+        self.assertEqual(run["capabilities"]["completeness"], "complete_declared_cell")
         self.assertFalse(run["legacy_import"])
         parent_steps = [
             row for row in facts["steps"] if row["step_id"] == "incremental_index"
@@ -1849,6 +1906,30 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(run["capabilities"]["completeness"], "partial")
         self.assertEqual(facts["steps"][0]["cpu_ms"]["status"], "unknown")
         self.assertEqual(facts["results"][0]["status"], "failed")
+
+    def test_candidate_native_fact_manifest_does_not_invent_effective_defaults(
+        self,
+    ) -> None:
+        report = {
+            "parameters": {
+                "config_profile": "candidate_native_configuration",
+                "config_overrides": {},
+                "transport": "mcp",
+            },
+            "measurements": {"incremental": {"elapsed_ms": 25}},
+            "derived": {"passed": True},
+        }
+        context = {"capabilities": {}, "label": "upstream-main"}
+
+        run = BENCHMARK.normalize_benchmark_report(report, context)["runs"][0]
+
+        self.assertEqual(run["capabilities"]["completeness"], "partial")
+        self.assertEqual(
+            run["capabilities"]["effective_config_overrides"]["status"], "unknown"
+        )
+        self.assertEqual(
+            run["capabilities"]["provenance"], "candidate_native_configuration"
+        )
 
     def test_standalone_context_does_not_attribute_checkout_head_to_binary(
         self,
