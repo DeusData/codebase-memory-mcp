@@ -739,19 +739,27 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
 
 /* ── Auto-Index ────────────────────────────────────────────────── */
 
+int cbm_dep_normalize_configured_limit(int limit, int default_limit) {
+    if (limit == 0) {
+        return -1;
+    }
+    if (limit > 0 && limit <= CBM_MAX_AUTO_DEP_LIMIT) {
+        return limit;
+    }
+    return default_limit > 0 && default_limit <= CBM_MAX_AUTO_DEP_LIMIT
+               ? default_limit
+               : CBM_DEFAULT_AUTO_DEP_LIMIT;
+}
+
 int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit) {
-    if (!cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS,
-                             CBM_DEFAULT_AUTO_INDEX_DEPS)) {
+    if (!cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, CBM_DEFAULT_AUTO_INDEX_DEPS)) {
         return 0;
     }
 
     int limit = cbm_config_get_int(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, default_limit);
     /* The direct API keeps max_deps=0 as disabled. The config registry documents
      * auto_dep_limit=0 as unlimited, so map configured callers to -1 here. */
-    if (limit <= 0) {
-        return -1;
-    }
-    return limit;
+    return cbm_dep_normalize_configured_limit(limit, default_limit);
 }
 
 /* Auto-detect ecosystem, discover deps, index each via flush_to_store.

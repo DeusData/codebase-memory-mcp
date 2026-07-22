@@ -5346,17 +5346,28 @@ bool cbm_config_get_bool(cbm_config_t *cfg, const char *key, bool default_val) {
     return default_val;
 }
 
-int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
-    const char *val = cbm_config_get(cfg, key, NULL);
-    if (!val) {
-        return default_val;
+static bool cbm_config_parse_decimal_int(const char *value, int *out) {
+    if (!value || !out) {
+        return false;
     }
     char *endptr;
-    long v = strtol(val, &endptr, CLI_STRTOL_BASE);
-    if (endptr == val || *endptr != '\0') {
+    errno = 0;
+    long parsed = strtol(value, &endptr, CLI_STRTOL_BASE);
+    if (errno == ERANGE || endptr == value || *endptr != '\0' ||
+        parsed < INT_MIN || parsed > INT_MAX) {
+        return false;
+    }
+    *out = (int)parsed;
+    return true;
+}
+
+int cbm_config_get_int(cbm_config_t *cfg, const char *key, int default_val) {
+    const char *val = cbm_config_get(cfg, key, NULL);
+    int parsed = 0;
+    if (!cbm_config_parse_decimal_int(val, &parsed)) {
         return default_val;
     }
-    return (int)v;
+    return parsed;
 }
 
 static bool cbm_config_value_matches_enum(const char *range, const char *value) {
@@ -5378,7 +5389,19 @@ static bool cbm_config_value_matches_enum(const char *range, const char *value) 
     return false;
 }
 
+static bool cbm_config_decimal_integer_in_range(const char *value, long minimum, long maximum) {
+    int parsed = 0;
+    if (!cbm_config_parse_decimal_int(value, &parsed)) {
+        return false;
+    }
+    return parsed >= minimum && parsed <= maximum;
+}
+
 static bool cbm_config_value_is_valid(const char *key, const char *value) {
+    if (key && strcmp(key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 &&
+        !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_AUTO_DEP_LIMIT)) {
+        return false;
+    }
     for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
             return cbm_config_value_matches_enum(CBM_CONFIG_REGISTRY[i].range, value);
@@ -10538,7 +10561,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "future automatic dependency indexing; it does not delete dependency projects already indexed."},
     {CBM_CONFIG_AUTO_DEP_LIMIT, CBM_STRINGIFY(CBM_DEFAULT_AUTO_DEP_LIMIT), NULL, "Dependencies",
      "Max number of packages to auto-index",
-     "0-10000",
+     "0-" CBM_STRINGIFY(CBM_MAX_AUTO_DEP_LIMIT),
      "When more packages are installed than this limit, the most-imported packages are selected "
      "(ranked by project import references, ties broken by name). Raise to 100+ for comprehensive "
      "dependency analysis. 0 = unlimited (may be very slow for large dependency trees)."},
@@ -10590,12 +10613,11 @@ int cbm_config_get_effective_int(cbm_config_t *cfg, const char *key, int default
     if (!val || !val[0]) {
         return default_val;
     }
-    char *endptr;
-    long parsed = strtol(val, &endptr, CLI_STRTOL_BASE);
-    if (endptr == val || *endptr != '\0') {
+    int parsed = 0;
+    if (!cbm_config_parse_decimal_int(val, &parsed)) {
         return default_val;
     }
-    return (int)parsed;
+    return parsed;
 }
 
 /* ── Config CLI subcommand ────────────────────────────────────── */

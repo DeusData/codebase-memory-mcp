@@ -610,6 +610,21 @@ TEST(mcp_canonical_input_schemas_cover_implemented_format_and_verbose_options) {
     PASS();
 }
 
+TEST(mcp_index_repository_auto_dep_limit_schema_uses_shared_bounds) {
+    const char *schema_json = cbm_mcp_tool_input_schema("index_repository");
+    ASSERT_NOT_NULL(schema_json);
+    yyjson_doc *doc = yyjson_read(schema_json, strlen(schema_json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *properties = yyjson_obj_get(yyjson_doc_get_root(doc), "properties");
+    ASSERT_TRUE(yyjson_is_obj(properties));
+    yyjson_val *limit = yyjson_obj_get(properties, CBM_CONFIG_AUTO_DEP_LIMIT);
+    ASSERT_TRUE(yyjson_is_obj(limit));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(limit, "minimum")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(limit, "maximum")), CBM_MAX_AUTO_DEP_LIMIT);
+    yyjson_doc_free(doc);
+    PASS();
+}
+
 TEST(mcp_tools_have_behavior_annotations) {
     struct {
         const char *name;
@@ -12726,6 +12741,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_tools_list_latest_metadata);
     RUN_TEST(mcp_tool_input_schemas_are_closed_in_classic_and_streamlined_modes);
     RUN_TEST(mcp_canonical_input_schemas_cover_implemented_format_and_verbose_options);
+    RUN_TEST(mcp_index_repository_auto_dep_limit_schema_uses_shared_bounds);
     RUN_TEST(mcp_tools_have_behavior_annotations);
     RUN_TEST(mcp_index_repository_declares_name_override_issue571);
     RUN_TEST(mcp_tools_array_schemas_have_items);
