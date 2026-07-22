@@ -191,8 +191,11 @@ pageheap)
     esac
     ;;
 test-par)
-    # Full-suite parallel run on all VM cores via the repo's parallel harness.
-    vm clangarm64 "cd /c/cbm && bash scripts/run-tests-parallel.sh build/c/test-runner 2>&1 | tail -25"
+    # Full-suite parallel run on all VM cores via the repo's parallel harness,
+    # under the CI-shaped protected temp root with FULL output (this leg once
+    # ran under the MSYS-shared /tmp and piped through `tail -25` — the same
+    # truncated-blindness class that hid 40 Windows failures from `test`).
+    vm clangarm64 "cd /c/cbm && CBM_VM_TEST_LOG=/tmp/win-test-par.log bash test-infrastructure/vm/vm-run-tests.sh --par"
     ;;
 *)
     echo "unknown command: $cmd (see header for usage)" >&2; exit 2

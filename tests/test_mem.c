@@ -21,6 +21,11 @@
 #include <mimalloc.h>
 #ifndef _WIN32
 #include <sys/mman.h>
+#else
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #endif
 
 /* ASan detection — mimalloc MI_OVERRIDE=0 under ASan, mi_process_info
@@ -275,11 +280,32 @@ TEST(mem_rss_reflects_external_resident_memory) {
      * reporting a broken small counter instead of true resident memory — which
      * the Linux #else branch exercises directly against the undercount. */
     const size_t threshold = (size_t)32 * 1024 * 1024;
+    const size_t lock_span = (size_t)64 * 1024 * 1024;
     void *big = malloc(region);
     ASSERT_NOT_NULL(big);
     memset(big, 0x5A, region);
-    memset(big, 0x5B, region); /* re-touch right before the measurement */
-    size_t rss = cbm_mem_rss();
+    /* Trimming can evict even a just-touched region: at 18 parallel suites
+     * the VM kept 19 MB resident of a 256 MB double-touch, losing the
+     * re-touch race this test previously relied on. Locked pages are exempt
+     * from working-set trimming, so lock a span comfortably above the
+     * threshold and the measurement becomes pressure-immune. When the lock
+     * is unavailable (working-set quota policy), fall back to bounded
+     * touch-and-sample retries — those races are transient. */
+    HANDLE self_process = GetCurrentProcess();
+    bool locked = SetProcessWorkingSetSize(self_process, lock_span + (size_t)32 * 1024 * 1024,
+                                           (size_t)512 * 1024 * 1024) != 0 &&
+                  VirtualLock(big, lock_span) != 0;
+    size_t rss = 0;
+    for (int attempt = 0; attempt < 6; attempt++) {
+        memset(big, 0x5B + attempt, lock_span);
+        rss = cbm_mem_rss();
+        if (locked || rss >= threshold) {
+            break;
+        }
+    }
+    if (locked) {
+        (void)VirtualUnlock(big, lock_span);
+    }
     ASSERT_GTE(rss, threshold);
     free(big);
 #else

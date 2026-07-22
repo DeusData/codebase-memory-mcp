@@ -20,6 +20,8 @@ services:
     platform: linux/arm64
     volumes:
       - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-arm64:/root/.ccache
     environment:
       CCACHE_DIR: /root/.ccache
@@ -33,6 +35,8 @@ services:
     platform: linux/amd64
     volumes:
       - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-amd64:/root/.ccache
     environment:
       CCACHE_DIR: /root/.ccache
@@ -50,6 +54,8 @@ services:
     platform: linux/arm64
     volumes:
       - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-arm64:/root/.ccache
     environment:
       CCACHE_DIR: /root/.ccache
@@ -71,6 +77,8 @@ services:
     platform: linux/amd64
     volumes:
       - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
       - cbm-ccache-amd64:/root/.ccache
     environment:
       CCACHE_DIR: /root/.ccache
@@ -236,3 +244,9 @@ services:
 volumes:
   cbm-ccache-arm64:
   cbm-ccache-amd64:
+  # Build artifacts and the incremental-suite fixture cache stay on the VM's
+  # native filesystem: object writes over the virtiofs bind mount are the
+  # container legs' largest avoidable I/O cost, and the fixture cache makes
+  # the network clone once-per-volume instead of once-per-container.
+  cbm-build:
+  cbm-fixture-cache:

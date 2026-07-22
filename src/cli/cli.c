@@ -10627,8 +10627,10 @@ int cbm_cmd_install(int argc, char **argv) {
         cli_binary_validator_t staged_validator = {{0}};
         if (stage_status != CBM_ACTIVATION_TRANSACTION_OK || !binary_transaction ||
             !cli_activation_transaction_expected_build(binary_transaction, &staged_validator)) {
-            (void)fprintf(stderr, "error: failed to stage install candidate: %s\n",
-                          cbm_activation_transaction_status_message(stage_status));
+            const char *stage_refusal = cbm_activation_transaction_refusal_note();
+            (void)fprintf(stderr, "error: failed to stage install candidate: %s%s%s\n",
+                          cbm_activation_transaction_status_message(stage_status),
+                          stage_refusal[0] ? ": " : "", stage_refusal);
             (void)cli_activation_transaction_abort(&binary_transaction);
             if (prepared_dir[0]) {
                 (void)cbm_rmdir(prepared_dir);

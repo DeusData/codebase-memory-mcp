@@ -186,10 +186,34 @@ run_one() {
 export -f run_one
 
 xargs -P "$JOBS" -I{} bash -c 'run_one "$@"' _ {} < "$PAR_FILE"
-# Serial tail: quiet machine for the deadline-sensitive suites.
+
+# Tail scheduling in two phases. The FLEX suites are timing-shaped but do
+# not rendezvous through the shared per-account daemon runtime namespace,
+# so a small fixed overlap (CBM_TAIL_JOBS, default 2) is safe and converts
+# idle cores into wall time — the old fully-serial tail ran them one at a
+# time on an idle machine. The EXCL group (daemon-family plus the suites
+# that drive daemon one-shots or supervisor rendezvous) then runs strictly
+# sequentially on a machine exactly as quiet as the old tail gave it.
+TAIL_EXCL="cli mcp index_supervisor daemon_application daemon_runtime \
+    daemon_frontend daemon_bootstrap daemon_ipc"
+is_tail_excl() {
+    case " $TAIL_EXCL " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+FLEX_FILE="$LOGDIR/suites-tail-flex.txt"
+EXCL_FILE="$LOGDIR/suites-tail-excl.txt"
+: > "$FLEX_FILE"
+: > "$EXCL_FILE"
+while IFS= read -r sname; do
+    if is_tail_excl "$sname"; then
+        echo "$sname" >> "$EXCL_FILE"
+    else
+        echo "$sname" >> "$FLEX_FILE"
+    fi
+done < "$SER_FILE"
+xargs -P "${CBM_TAIL_JOBS:-2}" -I{} bash -c 'run_one "$@"' _ {} < "$FLEX_FILE"
 while IFS= read -r sname; do
     run_one "$sname"
-done < "$SER_FILE"
+done < "$EXCL_FILE"
 
 # Machine-checkable manifest for CI's cross-shard completeness job: it
 # proves at runtime that the shards of one leg agree on N and on the full

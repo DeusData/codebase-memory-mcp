@@ -20,7 +20,7 @@ set -uo pipefail
 RUNNER="${CBM_VM_RUNNER:-build/c/test-runner}"
 LOG="${CBM_VM_TEST_LOG:-/tmp/win-test.log}"
 
-[ $# -ge 1 ] || { echo "usage: vm-run-tests.sh <suite...>" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: vm-run-tests.sh <suite...> | --par" >&2; exit 2; }
 [ -x "$RUNNER" ] || { echo "ERROR: runner '$RUNNER' missing — build first" >&2; exit 2; }
 
 # Stale roots from earlier runs are removed up front; the current root is kept
@@ -70,8 +70,16 @@ MSYS2_ARG_CONV_EXCL='*' icacls "${runner_dir_w}\\*" /reset /T /C /Q >/dev/null 2
 
 echo "=== vm-run-tests: runner=$RUNNER temp=$TEMP suites: $* ==="
 
-"$RUNNER" "$@" 2>&1 | tee "$LOG"
-rc="${PIPESTATUS[0]}"
+# --par runs the repo's full parallel harness (wave + tail scheduling,
+# per-shard union guard, manifest) under this same protected environment;
+# explicit suite names keep the direct single-runner invocation.
+if [ "$1" = "--par" ]; then
+    bash scripts/run-tests-parallel.sh "$RUNNER" 2>&1 | tee "$LOG"
+    rc="${PIPESTATUS[0]}"
+else
+    "$RUNNER" "$@" 2>&1 | tee "$LOG"
+    rc="${PIPESTATUS[0]}"
+fi
 
 if ! grep -Eq '[0-9]+ passed' "$LOG"; then
     echo "GUARD: test runner produced no completion summary — the suites did" \
