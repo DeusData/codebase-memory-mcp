@@ -11845,9 +11845,6 @@ int cbm_deduplicate_hops(const cbm_node_hop_t *hops, int hop_count, cbm_node_hop
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
-#define CBM_SCHEMA_STRINGIFY_INNER(value) #value
-#define CBM_SCHEMA_STRINGIFY(value) CBM_SCHEMA_STRINGIFY_INNER(value)
-
 typedef struct {
     int index;
     const char *text;
@@ -12544,7 +12541,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                                "WHERE nodes.project = ?1 AND nodes.label = ?2 "
                                "  AND nodes.properties != '{}' "
                                "ORDER BY je.key "
-                               "LIMIT " CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";";
+                               "LIMIT " CBM_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";";
 
         for (int i = 0; i < out->node_label_count; i++) {
             const schema_text_bind_t binds[] = {{ST_COL_1, project},
@@ -12622,7 +12619,7 @@ static int get_schema_impl(cbm_store_t *s, const char *project, cbm_schema_info_
                                "WHERE edges.project = ?1 AND edges.type = ?2 "
                                "  AND edges.properties != '{}' "
                                "ORDER BY je.key "
-                               "LIMIT " CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";";
+                               "LIMIT " CBM_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";";
 
         for (int i = 0; i < out->edge_type_count; i++) {
             const schema_text_bind_t binds[] = {{ST_COL_1, project},
@@ -12701,7 +12698,7 @@ static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_sche
                         "WHERE n.project = ?3 AND n.label = ?4 "
                         "  AND n.properties != '{}' "
                         "ORDER BY je.key LIMIT "
-                        CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";",
+                        CBM_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";",
                         active_cte);
         if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
             cbm_store_schema_free(out);
@@ -12809,7 +12806,7 @@ static int get_schema_overlay_impl(cbm_store_t *s, const char *project, cbm_sche
                         "WHERE src.project = ?3 AND dst.project = ?3 AND e.type = ?4 "
                         "  AND e.properties != '{}' "
                         "ORDER BY je.key LIMIT "
-                        CBM_SCHEMA_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";",
+                        CBM_STRINGIFY(CBM_STORE_SCHEMA_PROPERTY_KEY_LIMIT) ";",
                         active_cte);
         if (nsql <= 0 || (size_t)nsql >= sizeof(sql)) {
             cbm_store_schema_free(out);
