@@ -546,15 +546,16 @@ static const char skill_content[] =
     "| Text search | `search_code` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `search_graph(name_pattern=\"...\")` — finds symbols and auto-indexes the server CWD or "
-    "explicit repo path when auto_index=true and under auto_index_limit\n"
-    "2. Use advertised `get_code(qualified_name=\"project.path.FuncName\")` in streamlined "
-    "mode or `get_code_snippet` in classic mode — read one symbol's source\n"
-    "3. `query_graph(query=\"MATCH ...\")` — compose multi-hop structural questions\n"
-    "4. In streamlined mode, call `_hidden_tools` once to reveal diagnostics and explicit "
-    "maintenance tools such as list_projects, index_status, get_graph_schema, "
-    "check_index_coverage, index_repository, and index_dependencies; classic mode advertises "
-    "them directly\n"
+    "- **Streamlined:** `search_graph(name_pattern=\"...\")` finds symbols and can auto-index the "
+    "server CWD or explicit repo path; use `trace_path`, `get_code(qualified_name=...)`, and "
+    "`query_graph` as needed. First-use indexing and first-response context are automatic when "
+    "configured.\n"
+    "- **Classic:** use `search_graph(name_pattern=\"...\")`, then `trace_path`, then "
+    "`get_code_snippet(qualified_name=...)`; use `query_graph` or `get_architecture` for broader "
+    "structure.\n"
+    "- `_hidden_tools` is only for explicit streamlined diagnostics or maintenance such as "
+    "list_projects, index_status, get_graph_schema, check_index_coverage, index_repository, or "
+    "index_dependencies; classic advertises those tools directly.\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
@@ -570,15 +571,16 @@ static const char skill_content[] =
     "- **Auditor (Tier 3):** bounded-scope full verification with a current graph generation, "
     "complete relevant pagination, both call directions and broader relationships when material, "
     "plus explicit unresolved limitations.\n"
-    "- **Every tier:** in streamlined mode reveal advanced tools first; after candidate paths "
-    "are known, call `check_index_coverage` once with "
-    "every "
-    "evidence path. For negative or exhaustive claims also include the relevant scopes. A clean "
+    "- **Every tier:** after candidate paths are known, call `check_index_coverage` once with "
+    "every evidence path (reveal it first when streamlined). "
+    "For negative or exhaustive claims also include the relevant scopes. A clean "
     "result means no recorded gap, not proof of completeness. For partial, skipped, excluded, "
     "stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying on "
     "the graph.\n"
     "\n"
     "## Freshness and Delegation\n"
+    "- auto_watch=true registers indexed projects for automatic background Git-change refresh; "
+    "when false, refresh explicitly after changes.\n"
     "- When auto_index=true, default graph calls can index the server CWD or an explicit path "
     "under auto_index_limit. When disabled or skipped, reveal/use index_repository explicitly. "
     "Reveal list_projects/index_status only for explicit inventory or freshness diagnostics.\n"
@@ -598,9 +600,10 @@ static const char skill_content[] =
     "in_degree ORDER BY in_degree DESC LIMIT 20\")`\n"
     "\n"
     "## MCP Tools\n"
-    "Streamlined defaults: `search_graph`, `query_graph`, `search_code`, `trace_path`, `get_code`, "
-    "plus `_hidden_tools`. Graph-backed defaults auto-index when configured. Call `_hidden_tools` "
-    "once to reveal advanced capabilities; classic mode advertises them directly and uses "
+    "Normal streamlined exploration uses `search_graph`, `query_graph`, `search_code`, "
+    "`trace_path`, and `get_code`; graph-backed calls auto-index and deliver first-response "
+    "context when configured. `_hidden_tools` discovers explicit advanced operations. Classic "
+    "mode advertises them directly and uses "
     "`get_code_snippet` for source retrieval:\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
@@ -651,12 +654,18 @@ static const char codex_instructions_content[] =
     "structural answers; examples and LIMIT are optional guidance\n"
     "- `get_architecture` — high-level summary after `_hidden_tools` reveal or in classic mode\n"
     "\n"
-    "In streamlined mode, call `_hidden_tools` once before required checks with "
-    "`check_index_coverage`, `index_status`, `index_repository`, or `index_dependencies`; classic "
-    "mode advertises those tools directly. With auto_index=true, graph-backed tools can index "
+    "Normal streamlined exploration uses the four core tools above as needed without a reveal. "
+    "Classic structural discovery uses `search_graph`, then `trace_path`, then "
+    "`get_code_snippet`; use `query_graph` or `get_architecture` for broader structure. When "
+    "configured, streamlined first-use indexing and first-response context are automatic. "
+    "Classic mode advertises explicit checks such as "
+    "`check_index_coverage`, `index_status`, `index_repository`, and `index_dependencies` "
+    "directly; streamlined discovers them through `_hidden_tools`. "
+    "With auto_index=true, graph-backed tools can index "
     "paths under auto_index_limit; otherwise use index_repository. auto_index_deps and "
     "auto_dep_limit control automatic dependency coverage, so use index_dependencies for "
-    "disabled, capped, or missing packages.\n"
+    "disabled, capped, or missing packages. auto_watch controls automatic background Git-change "
+    "refresh.\n"
     "\n"
     "Prefer graph tools over grep for structural code discovery.\n"
     "If a sandbox blocks an MCP or CLI operation because it crosses a shell or filesystem "
@@ -1712,6 +1721,8 @@ static const char agent_instructions_content[] =
     "ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.\n"
     "\n"
     "### Priority Order\n"
+    "Classic uses steps 1-3 in order; streamlined uses them as needed without a reveal. Later "
+    "tools cover verification or broader structure.\n"
     "1. `search_graph` — find functions, classes, routes, variables by pattern\n"
     "2. `trace_path` — trace who calls a function or what it calls\n"
     "3. Use advertised `get_code` (streamlined) or `get_code_snippet` (classic) — read exact "
@@ -1719,7 +1730,7 @@ static const char agent_instructions_content[] =
     "4. `check_index_coverage` — validate candidate paths and missed ranges before claims "
     "(reveal it first with `_hidden_tools` in streamlined mode)\n"
     "5. `query_graph` — run Cypher queries for complex patterns\n"
-    "6. `get_architecture` — high-level project summary\n"
+    "6. `get_architecture` — high-level project summary (advanced when streamlined)\n"
     "\n"
     "### Evidence tiers\n"
     "- **Scout (Tier 1):** quick positive lookup with few calls and targeted source checks. Mark "
@@ -1749,12 +1760,14 @@ static const char agent_instructions_content[] =
     "`get_code_snippet(qualified_name=...)`\n"
     "\n"
     "### Session resets and subagents\n"
-    "- At session start or after compaction, confirm the nearest graph project and generation with "
-    "`list_projects` or `index_status` (after `_hidden_tools` reveal when streamlined), then "
-    "choose Scout, Verify, or Auditor.\n"
+    "- At session start or after compaction, use automatic session/first-response context when "
+    "available. For explicit inventory or freshness diagnostics, use `list_projects` or "
+    "`index_status` (after `_hidden_tools` reveal when streamlined), then choose Scout, Verify, "
+    "or Auditor.\n"
     "- With auto_index=true, graph-backed tools can index a CWD/path under auto_index_limit; "
     "otherwise reveal/use index_repository. auto_index_deps and auto_dep_limit bound automatic "
-    "dependency coverage; reveal/use index_dependencies for missing packages.\n"
+    "dependency coverage; reveal/use index_dependencies for missing packages. auto_watch controls "
+    "automatic background Git-change refresh.\n"
     "- Before spawning a subagent, query the graph and coverage in the parent. Pass the tier, "
     "project, generation/freshness, bounded scope, queries and pagination state, qualified "
     "symbols, "
@@ -4429,16 +4442,22 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path) {
 #define GEMINI_HOOK_MATCHER "google_web_search|grep_search"
 #define GEMINI_HOOK_COMMAND                                                            \
     "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"              \
-    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer "            \
-    "codebase-memory-mcp search_graph, trace_path, and get_code_snippet over grep or " \
+    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer the "          \
+    "codebase-memory-mcp graph tools over grep or file search.'}}))\""
+#define GEMINI_PREVIOUS_HOOK_COMMAND                                                   \
+    "node -e \"process.stdout.write(JSON.stringify({hookSpecificOutput:{"              \
+    "hookEventName:'BeforeTool',additionalContext:'Code discovery: prefer "             \
+    "codebase-memory-mcp search_graph, trace_path, and get_code_snippet over grep or "  \
     "file search.'}}))\""
 static const char *const cmm_gemini_released_hook_commands[] = {
+    GEMINI_PREVIOUS_HOOK_COMMAND,
     "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_path/get_code_snippet over "
     "grep/file search for code discovery.' >&2",
     "echo 'Reminder: prefer codebase-memory-mcp search_graph/trace_call_path/get_code_snippet "
     "over grep/file search for code discovery.' >&2",
     NULL,
 };
+#undef GEMINI_PREVIOUS_HOOK_COMMAND
 
 int cbm_upsert_gemini_hooks(const char *settings_path) {
     return upsert_hooks_json((hooks_upsert_args_t){
@@ -10258,7 +10277,7 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "toon (default) returns compact tables across supported read tools. json preserves complete "
      "object/array responses for programmatic and compatibility workflows. An explicit per-call "
      "format always overrides this default."},
-    {"context_injection", "true", "CBM_CONTEXT_INJECTION", "Tools",
+    {CBM_CONFIG_CONTEXT_INJECTION, "true", "CBM_CONTEXT_INJECTION", "Tools",
      "Inject codebase schema and stats into the first tool response so the AI starts informed",
      "true|false",
      "When true (default), the first search_graph response includes a "

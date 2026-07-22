@@ -4050,7 +4050,8 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
         snprintf(session_frag, sizeof(session_frag),
                  ",\"session_project\":\"%s\"", srv->session_project);
         /* Include a minimal _context so clients can identify session state */
-        bool ctx_enabled = cbm_config_get_bool(srv->config, "context_injection", true);
+        bool ctx_enabled =
+            cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
         if (ctx_enabled && !srv->context_injected) {
             snprintf(context_frag, sizeof(context_frag),
                      ",\"_context\":{\"status\":\"not_indexed\","
@@ -4181,7 +4182,8 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
      *   - model given explicit system-prompt codebase instructions instead
      *   - benchmarking (removes schema-query overhead from latency measurements)
      * Checked before setting context_injected so toggling mid-session works. */
-    bool inject_enabled = cbm_config_get_bool(srv->config, "context_injection", true);
+    bool inject_enabled =
+        cbm_config_get_bool(srv->config, CBM_CONFIG_CONTEXT_INJECTION, true);
     if (!inject_enabled) return;
 
     srv->context_injected = true;

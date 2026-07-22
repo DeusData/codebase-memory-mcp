@@ -121,13 +121,13 @@ Open `http://localhost:9749` in your browser. The UI runs as a background thread
 
 ### Auto-Index
 
-Enable automatic indexing on MCP session start:
+Enable automatic indexing at MCP session startup or first graph-backed use:
 
 ```bash
 codebase-memory-mcp config set auto_index true
 ```
 
-When enabled, new projects are indexed automatically on first connection. Previously-indexed projects are registered with the background watcher for git-based change detection; refreshes use the configured reindex policy. Configurable file limit: `config set auto_index_limit 50000`.
+When enabled, new projects are indexed automatically at startup or first graph-backed use. With `auto_watch=true`, indexed projects are registered with the background watcher for Git-based change detection; refreshes use the configured reindex policy. Configurable file limit: `config set auto_index_limit 50000`.
 
 Watcher registration is controlled separately by `auto_watch` (default `true`). Set `config set auto_watch false` to keep a session from registering its project with the background watcher — useful when working across many projects and you want each session contained to explicit indexing.
 
@@ -513,9 +513,12 @@ codebase-memory-mcp config set default_response_format json  # full JSON objects
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 
-In streamlined mode, call `_hidden_tools` once before advanced tools such as
-`check_index_coverage`, `index_repository`, or `index_dependencies`. Classic mode
-advertises those tools directly. Automatic repository indexing obeys
+Normal streamlined exploration uses the core tools without a reveal; first-use
+indexing and first-response codebase context are automatic when configured. Use
+`_hidden_tools` only for explicit advanced operations such as `check_index_coverage`,
+`index_repository`, or `index_dependencies`. Classic mode advertises those tools
+directly and uses `search_graph`, then `trace_path`, then `get_code_snippet` for
+structural discovery. Automatic repository indexing obeys
 `auto_index`/`auto_index_limit`; automatic dependency indexing obeys
 `auto_index_deps`/`auto_dep_limit`.
 
