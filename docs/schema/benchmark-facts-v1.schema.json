@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "benchmark-facts-v1.schema.json",
+  "title": "Codebase Memory benchmark fact bundle",
+  "type": "object",
+  "required": ["$schema", "schema_version", "runs", "steps", "results", "artifacts"],
+  "properties": {
+    "$schema": {"const": "docs/schema/benchmark-facts-v1.schema.json"},
+    "schema_version": {"const": 1},
+    "runs": {
+      "description": "Run-level identity and measurement conditions; exactly one row per fact bundle.",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {"$ref": "#/$defs/run"}
+    },
+    "steps": {
+      "description": "Measured operation occurrences. Rows may overlap in wall time and are not additive unless a report proves serial execution.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/step"}
+    },
+    "results": {
+      "description": "Correctness, quality, and instrumentation outcomes for the run.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/result"}
+    },
+    "artifacts": {
+      "description": "Content-identified files retained as measurement evidence.",
+      "type": "array",
+      "items": {"$ref": "#/$defs/artifact"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "unknown": {
+      "description": "A value the measurement source did not record; reason states the missing evidence.",
+      "type": "object",
+      "required": ["status", "reason"],
+      "properties": {
+        "status": {"const": "unknown"},
+        "reason": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "runId": {"type": "string", "pattern": "^[0-9a-f]{24}$"},
+    "run": {
+      "type": "object",
+      "required": [
+        "run_id", "lifecycle_id", "generated_at_utc", "mode", "implementation",
+        "harness", "host", "measurement_checkout", "capabilities", "scope", "cache", "legacy_import"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId", "description": "Content-derived identity for this measured lifecycle."},
+        "lifecycle_id": {"$ref": "#/$defs/runId", "description": "Identity of the user-observable process-to-gate lifecycle; equal to run_id in schema version 1."},
+        "generated_at_utc": {"description": "Recorded report completion time, or an explicit unknown fact."},
+        "mode": {"type": "string", "minLength": 1, "description": "Benchmark workload/report family."},
+        "cell_identity": {"description": "Immutable experiment-cell identity, or an explicit unknown fact for standalone and legacy runs."},
+        "cell_label": {"description": "Human-readable experiment-cell label, or an explicit unknown fact."},
+        "repetition": {"description": "One-based repetition declared by the experiment, or an explicit unknown fact."},
+        "implementation": {"type": "object", "description": "Candidate revision, revision provenance, binary identity, and build metadata."},
+        "harness": {"type": "object", "description": "Benchmark script path, SHA-256, and fact-schema version."},
+        "host": {"type": "object", "description": "Host facts recorded by the measurement process, or an explicit unknown fact."},
+        "measurement_checkout": {"type": "object", "description": "Git checkout that executed the harness; it is not evidence of the candidate binary revision."},
+        "capabilities": {"type": "object", "description": "Resolved capability/configuration values plus completeness and provenance."},
+        "scope": {"type": "object", "description": "Workload identity, corpus or fixture bounds, and mutation size."},
+        "cache": {"type": "object", "description": "Known process, graph, dependency, OS, parser, and fixture cache states."},
+        "legacy_import": {"type": "boolean", "description": "True when a retained report was normalized without recorded measurement-process context."}
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "required": [
+        "run_id", "step_id", "occurrence_id", "source_path", "parent_occurrence_id",
+        "dependency_occurrence_ids", "elapsed_ms", "monotonic_start_ns",
+        "monotonic_end_ns", "cpu_ms", "cpu_scope", "queue_wait_ms",
+        "thread_or_worker_id", "critical_path", "peak_rss_mb", "work_counters",
+        "provenance"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "step_id": {"type": "string", "minLength": 1, "description": "Stable operation-class label; multiple occurrences may share it."},
+        "occurrence_id": {"type": "string", "pattern": "^[0-9a-f]{24}$", "description": "Identity of this operation occurrence within the run."},
+        "source_path": {"type": "string", "description": "JSON path from which the measurement was normalized."},
+        "parent_occurrence_id": {"type": ["string", "null"], "description": "Containing occurrence; containment does not imply serial execution."},
+        "dependency_occurrence_ids": {"type": "array", "items": {"type": "string"}, "description": "Recorded prerequisite occurrences; an empty array means no dependency evidence was recorded."},
+        "elapsed_ms": {"type": "number", "minimum": 0, "description": "Wall-clock duration. Overlapping occurrence durations must not be summed."},
+        "monotonic_start_ns": {"description": "Monotonic start timestamp or an explicit unknown fact."},
+        "monotonic_end_ns": {"description": "Monotonic end timestamp or an explicit unknown fact."},
+        "cpu_ms": {"description": "CPU time consumed by cpu_scope, or an explicit unknown fact."},
+        "cpu_scope": {"type": "string", "description": "Entity covered by cpu_ms, such as thread, process, or process tree."},
+        "queue_wait_ms": {"description": "Runnable-to-execution delay or an explicit unknown fact."},
+        "thread_or_worker_id": {"description": "Recorded execution resource identity or an explicit unknown fact."},
+        "critical_path": {"description": "Whether and how this occurrence lies on the measured dependency critical path, or an explicit unknown fact."},
+        "peak_rss_mb": {"description": "Peak resident memory attributable to the occurrence, or an explicit unknown fact."},
+        "work_counters": {"type": "object", "description": "Operation-specific item counts with named units."},
+        "provenance": {"type": "string", "description": "Measurement source or normalization rule that produced the row."}
+      },
+      "additionalProperties": false
+    },
+    "result": {
+      "type": "object",
+      "required": ["run_id", "result_id", "kind", "status", "value", "provenance"],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "result_id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "status": {"enum": ["passed", "failed", "unknown", "skipped"]},
+        "value": {},
+        "provenance": {"type": "string"}
+      },
+      "additionalProperties": false
+    },
+    "artifact": {
+      "type": "object",
+      "required": [
+        "run_id", "artifact_id", "artifact_type", "path", "sha256", "size_bytes",
+        "schema_version", "cleanup_status"
+      ],
+      "properties": {
+        "run_id": {"$ref": "#/$defs/runId"},
+        "artifact_id": {"type": "string", "pattern": "^[0-9a-f]{24}$"},
+        "artifact_type": {"type": "string", "minLength": 1},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "size_bytes": {},
+        "schema_version": {},
+        "cleanup_status": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

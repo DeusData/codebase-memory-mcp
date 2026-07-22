@@ -2375,13 +2375,13 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_campaign_runner() -> Any:
-    path = Path(__file__).resolve().with_name("run-benchmark-campaign.py")
+def load_experiment_runner() -> Any:
+    path = Path(__file__).resolve().with_name("run-benchmark-experiments.py")
     spec = importlib.util.spec_from_file_location(
-        "run_benchmark_campaign_for_summary", path
+        "run_benchmark_experiment_for_summary", path
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load campaign runner: {path}")
+        raise RuntimeError(f"cannot load experiment runner: {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -2395,9 +2395,9 @@ def _composition_path(base: Path, value: Any, field: str) -> Path:
 
 
 def load_composition_groups(
-    composition_path: Path, campaign_runner: Any | None = None
+    composition_path: Path, experiment_runner: Any | None = None
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
-    """Resolve completed campaign cells into exact cross-scenario report groups."""
+    """Resolve completed experiment cells into exact cross-scenario report groups."""
     composition_path = composition_path.expanduser().resolve()
     with composition_path.open(encoding="utf-8") as stream:
         composition = json.load(stream)
@@ -2406,31 +2406,40 @@ def load_composition_groups(
     groups = composition.get("groups")
     if not isinstance(groups, list) or not groups:
         raise ValueError("composition groups must be a non-empty array")
-    campaigns = composition.get("campaigns")
-    if not isinstance(campaigns, dict) or not campaigns:
-        raise ValueError("composition campaigns must be a non-empty object")
-    runner = campaign_runner or load_campaign_runner()
+    experiments = composition.get("experiments")
+    legacy_experiments = composition.get("campaigns")
+    if experiments is not None and legacy_experiments is not None:
+        raise ValueError("composition must not mix experiments with legacy campaigns")
+    legacy_layout = experiments is None and legacy_experiments is not None
+    if legacy_layout:
+        experiments = legacy_experiments
+    if not isinstance(experiments, dict) or not experiments:
+        raise ValueError("composition experiments must be a non-empty object")
+    runner = experiment_runner or load_experiment_runner()
     base = composition_path.parent
-    resolved_campaigns: dict[str, tuple[list[dict[str, Any]], Path]] = {}
-    campaign_records: list[dict[str, Any]] = []
-    for campaign_name, campaign in campaigns.items():
+    resolved_experiments: dict[str, tuple[list[dict[str, Any]], Path]] = {}
+    experiment_records: list[dict[str, Any]] = []
+    for experiment_name, experiment in experiments.items():
         if (
-            not isinstance(campaign_name, str)
-            or not campaign_name
-            or not isinstance(campaign, dict)
+            not isinstance(experiment_name, str)
+            or not experiment_name
+            or not isinstance(experiment, dict)
         ):
             raise ValueError(
-                "composition campaign entries must have non-empty names and objects"
+                "composition experiment entries must have non-empty names and objects"
             )
-        prefix = f"campaigns.{campaign_name}"
-        matrix_value = campaign.get("matrix_spec")
-        plan_value = campaign.get("plan")
+        prefix = f"experiments.{experiment_name}"
+        matrix_value = experiment.get("matrix_spec")
+        plan_value = experiment.get("plan")
         if (matrix_value is None) == (plan_value is None):
             raise ValueError(
                 f"{prefix} must declare exactly one of matrix_spec or plan"
             )
-        campaign_root = _composition_path(
-            base, campaign.get("campaign_root"), f"{prefix}.campaign_root"
+        root_value = experiment.get("experiment_root")
+        if root_value is None and legacy_layout:
+            root_value = experiment.get("campaign_root")
+        experiment_root = _composition_path(
+            base, root_value, f"{prefix}.experiment_root"
         )
         if plan_value is not None:
             source_path = _composition_path(base, plan_value, f"{prefix}.plan")
@@ -2447,10 +2456,10 @@ def load_composition_groups(
             if not isinstance(cells, list):
                 raise ValueError(f"{prefix}.matrix_spec did not expand to cells")
             source_kind = "live_matrix_expansion"
-        resolved_campaigns[campaign_name] = (cells, campaign_root)
-        campaign_records.append(
+        resolved_experiments[experiment_name] = (cells, experiment_root)
+        experiment_records.append(
             {
-                "campaign": campaign_name,
+                "experiment": experiment_name,
                 "source_kind": source_kind,
                 "source_path": str(source_path),
                 "source_sha256": file_sha256(source_path),
@@ -2477,13 +2486,15 @@ def load_composition_groups(
                     f"groups[{group_index}].inputs[{source_index}] must be an object"
                 )
             prefix = f"groups[{group_index}].inputs[{source_index}]"
-            campaign_name = source.get("campaign")
+            experiment_name = source.get("experiment")
+            if experiment_name is None and legacy_layout:
+                experiment_name = source.get("campaign")
             if (
-                not isinstance(campaign_name, str)
-                or campaign_name not in resolved_campaigns
+                not isinstance(experiment_name, str)
+                or experiment_name not in resolved_experiments
             ):
-                raise ValueError(f"{prefix}.campaign must name a declared campaign")
-            cells, campaign_root = resolved_campaigns[campaign_name]
+                raise ValueError(f"{prefix}.experiment must name a declared experiment")
+            cells, experiment_root = resolved_experiments[experiment_name]
             cell_labels = source.get("cell_labels")
             if (
                 not isinstance(cell_labels, list)
@@ -2501,7 +2512,7 @@ def load_composition_groups(
                 raise ValueError(
                     f"{prefix} cell labels not found: {', '.join(missing_labels)}"
                 )
-            inputs = runner.completed_report_inputs(campaign_root, selected)
+            inputs = runner.completed_report_inputs(experiment_root, selected)
             if len(inputs) != len(selected):
                 raise ValueError(
                     f"{prefix} has {len(inputs)} validated completions for {len(selected)} cells"
@@ -2524,7 +2535,7 @@ def load_composition_groups(
         "schema_version": 1,
         "spec_path": str(composition_path),
         "spec_sha256": file_sha256(composition_path),
-        "campaigns": campaign_records,
+        "experiments": experiment_records,
         "input_count": len(input_records),
         "inputs": input_records,
     }
@@ -2537,7 +2548,7 @@ def main() -> int:
     parser.add_argument(
         "--composition-spec",
         type=Path,
-        help="Compose exact labels from validated cells in multiple durable campaigns.",
+        help="Compose exact labels from validated cells in multiple durable experiments.",
     )
     parser.add_argument(
         "--mcp-surface-parity",
@@ -2626,7 +2637,7 @@ def main() -> int:
                     "",
                     f"- Spec: `{composition_provenance['spec_path']}`",
                     f"- Spec SHA-256: `{composition_provenance['spec_sha256']}`",
-                    f"- Validated campaign inputs: {composition_provenance['input_count']}",
+                    f"- Validated experiment inputs: {composition_provenance['input_count']}",
                     "- Per-input paths and SHA-256 values are retained in the sidecar manifest.",
                 )
             )

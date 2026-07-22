@@ -3,14 +3,12 @@
 `scripts/run-benchmark-experiments.py` runs a JSON plan sequentially and keeps every
 attempt under a content-addressed cell directory. It is intended for release-build
 comparisons where correctness and query-result quality are gates, not optional
-context around a speed claim. `scripts/run-benchmark-campaign.py` is a
-backwards-compatible shim with identical behavior, kept so existing invocations,
-automation, and retained runsets under `.worktrees/benchmark-campaign/` keep
-working unchanged; `--experiment-root` and `--campaign-root` are interchangeable
-aliases on both entry points.
+context around a speed claim. New automation uses this entry point and
+`--experiment-root`. The legacy script name, flag aliases, persisted JSON keys, and
+`.worktrees/benchmark-campaign/` location remain readable for retained runs.
 
-Use a durable ignored experiment root such as `.worktrees/benchmark-campaign`
-(directory name kept for backwards compatibility with existing retained runsets).
+Use a durable ignored experiment root. Automatic runs continue to use
+`.worktrees/benchmark-campaign/` so existing retained runsets resume in place.
 The runner rejects the operating-system temporary tree by default because a crash
 or reboot can otherwise erase manifests, results, and logs. Do not track generated
 results or the generated Markdown report in Git.
@@ -29,6 +27,72 @@ JSON fields:
 Changing any of those inputs creates a different cell. A completed cell is resumed
 only when its completion marker, retained result, result SHA-256, binary SHA-256,
 current plan identity, and every archived artifact path, size, and SHA-256 agree.
+
+## Canonical fact tables
+
+Every new benchmark result also writes a schema-valid `facts.json` bundle, normalized
+`runs.json`, `steps.jsonl`, `results.json`, and `artifacts.json` tables, and a hashed
+`manifest.json` under the experiment attempt's artifact directory. Standalone runs use
+`--facts-dir DIR`; when only `--out result.json` is given, facts default to
+`result.facts/`. The schema is `docs/schema/benchmark-facts-v1.schema.json`.
+
+The run row records the experiment cell ID and label, exact candidate commit,
+repetition, binary path/hash/size, build metadata, harness hash, host metadata,
+capability arguments, workload scope, and per-layer cache knowledge. Step rows keep
+each occurrence separate and distinguish elapsed work from CPU, queue, worker,
+dependency, and monotonic-boundary fields. A field absent from the historical
+measurement is an explicit `{"status":"unknown","reason":"..."}` value; it is
+never reconstructed from a preset name or treated as suitable for a parity join.
+Experiment cells supply the candidate commit and build metadata automatically.
+Standalone runs must pass `--candidate-revision FULL_COMMIT` and
+`--build-metadata-json '{...}'` to make those fields authoritative; otherwise the
+current checkout HEAD is retained separately as measurement context and the binary's
+source revision/build flags remain `unknown`.
+
+Retained reports from earlier harness versions remain usable:
+
+```bash
+uv run python scripts/benchmark-incremental-speed.py \
+  --import-report path/to/result.json \
+  --facts-dir path/to/recovered-facts
+```
+
+The importer recovers binary identity, recorded configuration, elapsed phases,
+peak RSS, outcomes, and retained-log hashes when present. It preserves missing
+revision, build, cache, CPU, timestamp, worker, and concurrency evidence as
+`unknown`, so generated comparisons can state the historical limitation rather
+than silently inventing parity.
+
+### Fact vocabulary and timing rules
+
+These terms are normative in the runner, schema, JSON tables, and generated reports:
+
+| Term | Meaning |
+|---|---|
+| Experiment | One declared comparison design: its candidates, capabilities, workloads, transports, repetitions, and execution order. |
+| Runset | The immutable experiment specification identified by the first 12 hexadecimal characters of its canonical JSON SHA-256. Reusing identical semantic inputs resumes the same runset. |
+| Cell | One fully resolved point in the experiment matrix, including one candidate revision, binary, build, capability map, workload, transport, and repetition. |
+| Attempt | One process execution of a cell. Failed or interrupted attempts remain evidence; only a validated attempt creates `complete.json`. |
+| Lifecycle | The user-observable sequence represented by one `run_id`, from process invocation through the benchmark gate. Component steps may overlap within it. |
+| Run row | Identity and conditions shared by every observation in one lifecycle: implementation, harness, host, capability, scope, and cache facts. |
+| Step row | One measured operation occurrence. `step_id` names the operation class; `occurrence_id` identifies this occurrence, so repeated operations are never merged. |
+| Parent occurrence | A containment relation in the recorded operation hierarchy. It does not prove that parent and child executed serially. |
+| Dependency occurrence | A measured predecessor that must finish before the step can proceed. An empty list means no dependency edge was recorded, not that the step was independent. |
+| `elapsed_ms` | Wall-clock duration of that occurrence. Overlapping parent, child, or sibling durations must not be summed. |
+| `cpu_ms` | CPU time consumed by the named `cpu_scope`. It remains `unknown` when the profiler recorded only wall time. |
+| `queue_wait_ms` | Time after the operation became runnable but before its worker began executing. It remains `unknown` without scheduler instrumentation. |
+| Critical path | The dependency-chain duration that determines lifecycle wall time. It remains `unknown` unless timestamped dependency events make the chain recoverable. |
+| Result row | A correctness, quality, or instrumentation outcome. Product-contract failures and harness failures use different `kind` values. |
+| Artifact row | A retained file identified by path, byte count when known, and SHA-256. |
+| Unknown fact | `{"status":"unknown","reason":"..."}`: the source did not record the value. Unknown values prohibit capability-parity joins and arithmetic. |
+
+`timing_components_ms` values parsed from existing worker profile markers become
+separate step occurrences. The current markers provide elapsed wall time and
+containment but not start/end timestamps, worker IDs, CPU time, queue wait, or a
+dependency event graph; those fields therefore remain explicitly `unknown`.
+This preserves parallel implementations without pretending their overlapping work
+was serial. Future low-overhead instrumentation can populate the same fields without
+changing the fact-table contract.
 
 ## Plan format
 
@@ -256,9 +320,8 @@ uv run python scripts/run-benchmark-experiments.py \
   --experiment-root .worktrees/benchmark-campaign/results
 ```
 
-The legacy form (`run-benchmark-campaign.py` with `--campaign-root`) is
-byte-identical and continues to work; both scripts and both flag spellings are
-interchangeable.
+The legacy `run-benchmark-campaign.py` entry point and `--campaign-root` flag remain
+accepted so retained automation can open and resume existing experiment roots.
 
 Rerunning the same command resumes validated cells. The runner executes cells
 sequentially by default so concurrent indexing does not distort latency or peak RSS.

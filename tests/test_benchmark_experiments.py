@@ -9,11 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run-benchmark-campaign.py"
-SPEC = importlib.util.spec_from_file_location("run_benchmark_campaign", SCRIPT)
+SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "run-benchmark-experiments.py"
+)
+SPEC = importlib.util.spec_from_file_location("run_benchmark_experiments", SCRIPT)
 assert SPEC and SPEC.loader
-CAMPAIGN = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(CAMPAIGN)
+EXPERIMENT = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(EXPERIMENT)
 
 
 def cell(command: list[str], **overrides: object) -> dict:
@@ -34,13 +36,15 @@ def cell(command: list[str], **overrides: object) -> dict:
     return value
 
 
-class BenchmarkCampaignTest(unittest.TestCase):
+class BenchmarkExperimentTest(unittest.TestCase):
     def test_filename_datetime_is_sortable_explicit_utc_and_filename_safe(self) -> None:
-        stamp = CAMPAIGN.filename_datetime(datetime(2026, 7, 19, 21, 13, 58, 123456, tzinfo=timezone.utc))
+        stamp = EXPERIMENT.filename_datetime(
+            datetime(2026, 7, 19, 21, 13, 58, 123456, tzinfo=timezone.utc)
+        )
 
         self.assertEqual(stamp, "2026-07-19-211358.123456Z")
 
-    def test_campaign_names_separate_definition_runset_source_and_generation_identity(
+    def test_experiment_names_separate_definition_runset_source_and_generation_identity(
         self,
     ) -> None:
         source = {
@@ -48,15 +52,15 @@ class BenchmarkCampaignTest(unittest.TestCase):
             "commit_datetime_slug": "2026-07-19-1642",
             "tree": "b" * 40,
         }
-        runset = CAMPAIGN.runset_identity(b'{"stable":"spec"}\n')
+        runset = EXPERIMENT.runset_identity(b'{"stable":"spec"}\n')
         generated = datetime(2026, 7, 19, 21, 13, 58, 123456, tzinfo=timezone.utc)
 
-        root = CAMPAIGN.automatic_campaign_name("quick", source, runset)
-        spec = CAMPAIGN.automatic_spec_name("quick", runset)
-        report = CAMPAIGN.generated_artifact_name(
+        root = EXPERIMENT.automatic_experiment_name("quick", source, runset)
+        spec = EXPERIMENT.automatic_spec_name("quick", runset)
+        report = EXPERIMENT.generated_artifact_name(
             "report", runset, ".md", preset="quick", moment=generated
         )
-        manifest = CAMPAIGN.generated_artifact_name(
+        manifest = EXPERIMENT.generated_artifact_name(
             "manifest", runset, ".json", moment=generated, nonce="c0ffee12"
         )
 
@@ -75,10 +79,12 @@ class BenchmarkCampaignTest(unittest.TestCase):
         )
         self.assertLessEqual(max(map(len, (root, spec, report, manifest))), 96)
 
-    def test_runset_identity_is_stable_for_resume_and_changes_with_spec_bytes(self) -> None:
-        first = CAMPAIGN.runset_identity(b'{"preset":"quick"}\n')
-        resumed = CAMPAIGN.runset_identity(b'{"preset":"quick"}\n')
-        changed = CAMPAIGN.runset_identity(b'{"preset":"full"}\n')
+    def test_runset_identity_is_stable_for_resume_and_changes_with_spec_bytes(
+        self,
+    ) -> None:
+        first = EXPERIMENT.runset_identity(b'{"preset":"quick"}\n')
+        resumed = EXPERIMENT.runset_identity(b'{"preset":"quick"}\n')
+        changed = EXPERIMENT.runset_identity(b'{"preset":"full"}\n')
 
         self.assertEqual(resumed, first)
         self.assertNotEqual(changed, first)
@@ -89,7 +95,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
     ) -> None:
         spec = {
             "schema_version": 1,
-            "campaign_version": "v0001",
+            "experiment_version": "v0001",
             "harness_version": "runner-deadbeef",
             "benchmark_script": "/checkout-a/scripts/benchmark.py",
             "cwd": "/checkout-a",
@@ -118,13 +124,25 @@ class BenchmarkCampaignTest(unittest.TestCase):
         changed["candidates"][0]["binary_sha256"] = "e" * 64
 
         self.assertEqual(
-            CAMPAIGN.automatic_runset_identity(remapped),
-            CAMPAIGN.automatic_runset_identity(spec),
+            EXPERIMENT.automatic_runset_identity(remapped),
+            EXPERIMENT.automatic_runset_identity(spec),
         )
         self.assertNotEqual(
-            CAMPAIGN.automatic_runset_identity(changed),
-            CAMPAIGN.automatic_runset_identity(spec),
+            EXPERIMENT.automatic_runset_identity(changed),
+            EXPERIMENT.automatic_runset_identity(spec),
         )
+
+    def test_legacy_campaign_version_is_read_but_new_plans_write_experiment_version(
+        self,
+    ) -> None:
+        self.assertEqual(
+            EXPERIMENT.read_experiment_version({"campaign_version": "v0001"}),
+            "v0001",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts"):
+            EXPERIMENT.read_experiment_version(
+                {"campaign_version": "v0000", "experiment_version": "v0001"}
+            )
 
     def test_identity_v2_resumes_after_canonical_path_remap_without_changing_legacy_ids(
         self,
@@ -156,29 +174,37 @@ class BenchmarkCampaignTest(unittest.TestCase):
         remapped["command"][4] = "/corpus-b"
         remapped["cwd"] = "/checkout-b"
         remapped["parameters"]["repository_background"]["repo"] = "/corpus-b"
-        legacy_original = {key: value for key, value in original.items() if key != "identity_version"}
-        legacy_remapped = {key: value for key, value in remapped.items() if key != "identity_version"}
+        legacy_original = {
+            key: value for key, value in original.items() if key != "identity_version"
+        }
+        legacy_remapped = {
+            key: value for key, value in remapped.items() if key != "identity_version"
+        }
         legacy_document = {
             key: legacy_original.get(key)
-            for key in CAMPAIGN.IDENTITY_FIELDS
+            for key in EXPERIMENT.IDENTITY_FIELDS
             if key != "identity_version"
         }
-        legacy_expected = hashlib.sha256(CAMPAIGN.canonical_json(legacy_document)).hexdigest()[:24]
+        legacy_expected = hashlib.sha256(
+            EXPERIMENT.canonical_json(legacy_document)
+        ).hexdigest()[:24]
 
-        self.assertEqual(CAMPAIGN.cell_identity(remapped), CAMPAIGN.cell_identity(original))
-        self.assertEqual(CAMPAIGN.cell_identity(legacy_original), legacy_expected)
+        self.assertEqual(
+            EXPERIMENT.cell_identity(remapped), EXPERIMENT.cell_identity(original)
+        )
+        self.assertEqual(EXPERIMENT.cell_identity(legacy_original), legacy_expected)
         self.assertNotEqual(
-            CAMPAIGN.cell_identity(legacy_remapped),
-            CAMPAIGN.cell_identity(legacy_original),
+            EXPERIMENT.cell_identity(legacy_remapped),
+            EXPERIMENT.cell_identity(legacy_original),
         )
 
     def test_no_arguments_selects_quick_preset_and_full_flag_selects_full_matrix(
         self,
     ) -> None:
-        quick = CAMPAIGN.parse_arguments([])
-        full = CAMPAIGN.parse_arguments(["--full"])
-        explicit = CAMPAIGN.parse_arguments(
-            ["--matrix-spec", "legacy-spec.json", "--campaign-root", "legacy-results"]
+        quick = EXPERIMENT.parse_arguments([])
+        full = EXPERIMENT.parse_arguments(["--full"])
+        explicit = EXPERIMENT.parse_arguments(
+            ["--matrix-spec", "legacy-spec.json", "--experiment-root", "legacy-results"]
         )
 
         self.assertEqual(quick.preset, "quick")
@@ -186,13 +212,13 @@ class BenchmarkCampaignTest(unittest.TestCase):
         self.assertIsNone(explicit.preset)
         self.assertEqual(explicit.matrix_spec, Path("legacy-spec.json"))
         with self.assertRaises(SystemExit):
-            CAMPAIGN.parse_arguments(["--full", "--matrix-spec", "spec.json"])
+            EXPERIMENT.parse_arguments(["--full", "--matrix-spec", "spec.json"])
 
     def test_default_candidates_use_current_upstream_stable_run_premerge_and_head(
         self,
     ) -> None:
         self.assertEqual(
-            CAMPAIGN.DEFAULT_CANDIDATE_REFS,
+            EXPERIMENT.DEFAULT_CANDIDATE_REFS,
             (
                 ("upstream-main", "upstream/main"),
                 (
@@ -228,9 +254,13 @@ class BenchmarkCampaignTest(unittest.TestCase):
             benchmark = root / "benchmark.py"
             benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(root), "add", "benchmark.py"], check=True)
-            subprocess.run(["git", "-C", str(root), "commit", "-qm", "fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "fixture"], check=True
+            )
             candidates = []
-            for index, label in enumerate(("upstream-main", "pre-today-major", "pre-upstream-merge", "latest")):
+            for index, label in enumerate(
+                ("upstream-main", "pre-today-major", "pre-upstream-merge", "latest")
+            ):
                 binary = root / f"cbm-{label}"
                 binary.write_bytes(label.encode())
                 candidates.append(
@@ -238,13 +268,17 @@ class BenchmarkCampaignTest(unittest.TestCase):
                         "label": label,
                         "revision": str(index) * 40,
                         "binary": str(binary),
-                        "binary_sha256": CAMPAIGN.file_sha256(binary),
+                        "binary_sha256": EXPERIMENT.file_sha256(binary),
                         "build": {"target": "make cbm", "cflags": "-O2"},
                     }
                 )
 
-            quick = CAMPAIGN.build_automatic_spec(root, benchmark, candidates, preset="quick")
-            full = CAMPAIGN.build_automatic_spec(root, benchmark, candidates, preset="full")
+            quick = EXPERIMENT.build_automatic_spec(
+                root, benchmark, candidates, preset="quick"
+            )
+            full = EXPERIMENT.build_automatic_spec(
+                root, benchmark, candidates, preset="full"
+            )
 
             self.assertEqual(quick["repetitions"], 1)
             self.assertEqual(quick["index_mode"], "fast")
@@ -268,8 +302,13 @@ class BenchmarkCampaignTest(unittest.TestCase):
                     "minimal-indexing",
                 ],
             )
-            self.assertTrue(all(item.get("candidate_labels") == ["latest"] for item in full["profiles"][1:]))
-            expanded = CAMPAIGN.expand_matrix_spec(quick)
+            self.assertTrue(
+                all(
+                    item.get("candidate_labels") == ["latest"]
+                    for item in full["profiles"][1:]
+                )
+            )
+            expanded = EXPERIMENT.expand_matrix_spec(quick)
             self.assertEqual(
                 expanded["cells"][0]["parameters"]["repository_background"][
                     "commit_datetime"
@@ -308,13 +347,21 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 encoding="utf-8",
             )
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True
+            )
             subprocess.run(["git", "-C", str(repo), "tag", "stable"], check=True)
             candidate_root = base / "candidates"
 
-            first = CAMPAIGN.materialize_candidate(repo, candidate_root, "stable-candidate", "stable", jobs=1)
-            build_logs_after_first = sorted((candidate_root / "build-logs").glob("*.log"))
-            second = CAMPAIGN.materialize_candidate(repo, candidate_root, "stable-candidate", "stable", jobs=1)
+            first = EXPERIMENT.materialize_candidate(
+                repo, candidate_root, "stable-candidate", "stable", jobs=1
+            )
+            build_logs_after_first = sorted(
+                (candidate_root / "build-logs").glob("*.log")
+            )
+            second = EXPERIMENT.materialize_candidate(
+                repo, candidate_root, "stable-candidate", "stable", jobs=1
+            )
 
             expected_revision = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "stable^{commit}"],
@@ -333,7 +380,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 build_logs_after_first,
             )
             Path(second["binary"]).write_bytes(b"tampered")
-            rebuilt = CAMPAIGN.materialize_candidate(
+            rebuilt = EXPERIMENT.materialize_candidate(
                 repo, candidate_root, "stable-candidate", "stable", jobs=1
             )
             self.assertEqual(rebuilt, first)
@@ -349,12 +396,21 @@ class BenchmarkCampaignTest(unittest.TestCase):
             ).stdout
             self.assertEqual(worktrees.count(expected_revision), 2)
 
-    def test_clean_tree_check_rejects_tracked_edits_but_allows_untracked_artifacts(self) -> None:
+    def test_clean_tree_check_rejects_tracked_edits_but_allows_untracked_artifacts(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir)
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             subprocess.run(
-                ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "config",
+                    "user.email",
+                    "test@example.invalid",
+                ],
                 check=True,
             )
             subprocess.run(
@@ -364,48 +420,54 @@ class BenchmarkCampaignTest(unittest.TestCase):
             tracked = repo / "tracked.txt"
             tracked.write_text("committed\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(repo), "add", "tracked.txt"], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True
+            )
             (repo / "retained.log").write_text("untracked evidence\n", encoding="utf-8")
 
-            CAMPAIGN.ensure_clean_tracked_worktree(repo, "fixture")
+            EXPERIMENT.ensure_clean_tracked_worktree(repo, "fixture")
             tracked.write_text("modified\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "fixture has tracked modifications"):
-                CAMPAIGN.ensure_clean_tracked_worktree(repo, "fixture")
+            with self.assertRaisesRegex(
+                RuntimeError, "fixture has tracked modifications"
+            ):
+                EXPERIMENT.ensure_clean_tracked_worktree(repo, "fixture")
 
-    def test_campaign_root_rejects_os_temporary_tree_by_default(self) -> None:
+    def test_experiment_root_rejects_os_temporary_tree_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             temporary_root = Path(tmpdir) / "system-temp"
-            campaign_root = temporary_root / "lost-after-reboot"
+            experiment_root = temporary_root / "lost-after-reboot"
             with self.assertRaisesRegex(ValueError, "experiment root is temporary"):
-                CAMPAIGN.validate_campaign_root(
-                    campaign_root,
+                EXPERIMENT.validate_experiment_root(
+                    experiment_root,
                     temporary_root=temporary_root,
                 )
             self.assertEqual(
-                CAMPAIGN.validate_campaign_root(
-                    campaign_root,
+                EXPERIMENT.validate_experiment_root(
+                    experiment_root,
                     allow_temporary=True,
                     temporary_root=temporary_root,
                 ),
-                campaign_root.resolve(),
+                experiment_root.resolve(),
             )
 
-    def test_campaign_root_accepts_durable_path_outside_temporary_tree(self) -> None:
+    def test_experiment_root_accepts_durable_path_outside_temporary_tree(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base = Path(tmpdir)
             temporary_root = base / "system-temp"
-            campaign_root = base / "repository" / ".worktrees" / "benchmark-campaign"
+            experiment_root = (
+                base / "repository" / ".worktrees" / "benchmark-experiments"
+            )
             self.assertEqual(
-                CAMPAIGN.validate_campaign_root(
-                    campaign_root,
+                EXPERIMENT.validate_experiment_root(
+                    experiment_root,
                     temporary_root=temporary_root,
                 ),
-                campaign_root.resolve(),
+                experiment_root.resolve(),
             )
 
     def test_cell_identity_covers_binary_config_scenario_and_repetition(self) -> None:
         base = cell(["benchmark", "{result_path}"])
-        base_id = CAMPAIGN.cell_identity(base)
+        base_id = EXPERIMENT.cell_identity(base)
         for key, changed in (
             ("binary_sha256", "c" * 64),
             ("capabilities", {"rank_enabled": "true"}),
@@ -417,7 +479,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
         ):
             variant = dict(base)
             variant[key] = changed
-            self.assertNotEqual(base_id, CAMPAIGN.cell_identity(variant), key)
+            self.assertNotEqual(base_id, EXPERIMENT.cell_identity(variant), key)
 
     def test_matrix_spec_expands_structured_frontier_cap_and_repetition_cells(
         self,
@@ -463,20 +525,24 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 ],
             }
 
-            plan = CAMPAIGN.expand_matrix_spec(spec)
+            plan = EXPERIMENT.expand_matrix_spec(spec)
 
             self.assertEqual(plan["schema_version"], 1)
             self.assertEqual(len(plan["cells"]), 8)
-            self.assertEqual(len({CAMPAIGN.cell_identity(item) for item in plan["cells"]}), 8)
+            self.assertEqual(
+                len({EXPERIMENT.cell_identity(item) for item in plan["cells"]}), 8
+            )
             first = plan["cells"][0]
-            self.assertEqual(first["binary_sha256"], CAMPAIGN.file_sha256(binary))
+            self.assertEqual(first["binary_sha256"], EXPERIMENT.file_sha256(binary))
             self.assertEqual(first["parameters"]["frontier_files"], 4)
             self.assertEqual(first["parameters"]["exact_cap"], 4)
             self.assertEqual(first["accepted_exit_codes"], [0, 1])
-            self.assertEqual(first["capability_support"], {"dependencies": True, "rank": True})
+            self.assertEqual(
+                first["capability_support"], {"dependencies": True, "rank": True}
+            )
             self.assertEqual(
                 first["parameters"]["benchmark_script_sha256"],
-                CAMPAIGN.file_sha256(benchmark),
+                EXPERIMENT.file_sha256(benchmark),
             )
             self.assertIn("--frontier-files", first["command"])
             self.assertIn("incremental_exact_max_affected_paths=4", first["command"])
@@ -520,7 +586,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
             }
 
             with self.assertRaisesRegex(ValueError, "binary_sha256 does not match"):
-                CAMPAIGN.expand_matrix_spec(spec)
+                EXPERIMENT.expand_matrix_spec(spec)
 
     def test_default_profile_rejects_disabled_capability_without_config_override(
         self,
@@ -562,8 +628,10 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "scenarios": [{"name": "c_new_leaf"}],
             }
 
-            with self.assertRaisesRegex(ValueError, "capabilities claims auto_index_deps=false"):
-                CAMPAIGN.expand_matrix_spec(spec)
+            with self.assertRaisesRegex(
+                ValueError, "capabilities claims auto_index_deps=false"
+            ):
+                EXPERIMENT.expand_matrix_spec(spec)
 
     def test_matrix_spec_expands_capability_quality_without_frontier_axes(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -601,7 +669,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 ],
             }
 
-            plan = CAMPAIGN.expand_matrix_spec(spec)
+            plan = EXPERIMENT.expand_matrix_spec(spec)
 
             self.assertEqual(len(plan["cells"]), 4)
             first = plan["cells"][0]
@@ -654,10 +722,12 @@ class BenchmarkCampaignTest(unittest.TestCase):
                         "candidate_labels": ["latest"],
                     },
                 ],
-                "scenarios": [{"name": "go_modify_1", "frontier_files": [4], "exact_caps": [None]}],
+                "scenarios": [
+                    {"name": "go_modify_1", "frontier_files": [4], "exact_caps": [None]}
+                ],
             }
 
-            plan = CAMPAIGN.expand_matrix_spec(spec)
+            plan = EXPERIMENT.expand_matrix_spec(spec)
 
             self.assertEqual(
                 [item["label"] for item in plan["cells"]],
@@ -707,7 +777,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "scenarios": [{"name": "route_handler"}],
             }
 
-            plan = CAMPAIGN.expand_matrix_spec(spec)
+            plan = EXPERIMENT.expand_matrix_spec(spec)
 
             self.assertEqual(len(plan["cells"]), 2)
             first = plan["cells"][0]
@@ -770,10 +840,12 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 ],
             }
 
-            plan = CAMPAIGN.expand_matrix_spec(spec)
+            plan = EXPERIMENT.expand_matrix_spec(spec)
 
             self.assertEqual(plan["execution_order"], "paired_interleaved")
-            self.assertEqual([cell["repetition"] for cell in plan["cells"]], [1, 1, 1, 1, 2, 2, 2, 2])
+            self.assertEqual(
+                [cell["repetition"] for cell in plan["cells"]], [1, 1, 1, 1, 2, 2, 2, 2]
+            )
             self.assertEqual(
                 [cell["parameters"]["execution_position"] for cell in plan["cells"]],
                 list(range(1, 9)),
@@ -791,7 +863,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
 
     def test_resource_snapshot_records_load_disk_and_host_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            snapshot = CAMPAIGN.resource_snapshot(Path(tmpdir))
+            snapshot = EXPERIMENT.resource_snapshot(Path(tmpdir))
 
         self.assertIn("load_average", snapshot)
         self.assertGreater(snapshot["disk"]["total_bytes"], 0)
@@ -836,12 +908,21 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 ],
             }
 
-            cell = CAMPAIGN.expand_matrix_spec(spec)["cells"][0]
+            cell = EXPERIMENT.expand_matrix_spec(spec)["cells"][0]
 
-            self.assertEqual(cell["label"], "candidate.default.mcp.go_modify_1.f16.capdefault")
+            self.assertEqual(
+                cell["label"], "candidate.default.mcp.go_modify_1.f16.capdefault"
+            )
             self.assertIsNone(cell["parameters"]["exact_cap"])
-            self.assertNotIn("incremental_exact_max_affected_paths", cell["capabilities"])
-            self.assertFalse(any("incremental_exact_max_affected_paths=" in item for item in cell["command"]))
+            self.assertNotIn(
+                "incremental_exact_max_affected_paths", cell["capabilities"]
+            )
+            self.assertFalse(
+                any(
+                    "incremental_exact_max_affected_paths=" in item
+                    for item in cell["command"]
+                )
+            )
 
     def test_successful_cell_resumes_without_second_attempt(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -858,9 +939,9 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "{result_path}",
             ]
             planned = cell(command)
-            first = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            second = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            first = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            second = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
             self.assertEqual(first["status"], "completed")
             self.assertEqual(second["status"], "resumed")
             self.assertTrue((cell_root / "complete.json").is_file())
@@ -870,6 +951,41 @@ class BenchmarkCampaignTest(unittest.TestCase):
             attempt_record = json.loads((attempt / "attempt.json").read_text())
             self.assertIn("resource_before", command_record)
             self.assertIn("resource_after", attempt_record)
+
+    def test_run_cell_passes_revision_build_capabilities_and_repetition_context(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            command = [
+                sys.executable,
+                "-c",
+                (
+                    "import json,os,sys; "
+                    "json.dump({'binary_metadata':{'sha256':'"
+                    + "b"
+                    * 64
+                    + "'},'benchmark_run_context':json.loads(os.environ['CBM_BENCHMARK_RUN_CONTEXT']),"
+                    "'derived':{'passed':True},'cases':[{'passed':True}]},open(sys.argv[1],'w'))"
+                ),
+                "{result_path}",
+            ]
+            planned = cell(command, repetition=4)
+
+            outcome = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            attempt = next(
+                (
+                    root / "runs" / EXPERIMENT.cell_identity(planned) / "attempts"
+                ).iterdir()
+            )
+            command_record = json.loads((attempt / "command.json").read_text())
+
+        self.assertEqual(outcome["status"], "completed")
+        context = command_record["benchmark_run_context"]
+        self.assertEqual(context["revision"], "a" * 40)
+        self.assertEqual(context["repetition"], 4)
+        self.assertEqual(context["build"], {"target": "cbm", "cflags": "-O2"})
+        self.assertEqual(context["capabilities"], {"rank_enabled": "false"})
 
     def test_successful_cell_hashes_durable_artifacts_created_by_child(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -889,8 +1005,8 @@ class BenchmarkCampaignTest(unittest.TestCase):
             ]
 
             planned = cell(command)
-            result = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            result = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
             attempt = next((cell_root / "attempts").iterdir())
             record = json.loads((attempt / "attempt.json").read_text())
 
@@ -925,8 +1041,8 @@ class BenchmarkCampaignTest(unittest.TestCase):
                     "{result_path}",
                 ]
                 planned = cell(command)
-                outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-                cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+                outcome = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+                cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
                 attempt_root = next((cell_root / "attempts").iterdir())
                 artifact_root = attempt_root / "artifacts"
                 artifact = artifact_root / "worker.log.gz"
@@ -939,7 +1055,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 else:
                     (artifact_root / "unlisted.log.gz").write_bytes(b"extra")
 
-                audit = CAMPAIGN.scan_campaign(root, [planned])
+                audit = EXPERIMENT.scan_experiment(root, [planned])
                 self.assertEqual(audit["counts"]["corrupt"], 1)
                 self.assertIn("artifact manifest", audit["cells"][0]["error"])
 
@@ -965,7 +1081,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 "execution_position": 7,
             }
 
-            derived = CAMPAIGN.materialize_report_input(root, planned, raw)
+            derived = EXPERIMENT.materialize_report_input(root, planned, raw)
 
             self.assertEqual(json.loads(raw.read_text()), raw_document)
             document = json.loads(derived.read_text())
@@ -973,16 +1089,18 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 document["parameters"]["capability_support"],
                 {"dependencies": False, "rank": False},
             )
-            self.assertEqual(document["parameters"]["execution_order"], "paired_interleaved")
+            self.assertEqual(
+                document["parameters"]["execution_order"], "paired_interleaved"
+            )
             self.assertEqual(document["parameters"]["execution_block"], 2)
             self.assertEqual(document["parameters"]["execution_position"], 7)
             self.assertEqual(
-                document["campaign_provenance"]["source_result_sha256"],
-                CAMPAIGN.file_sha256(raw),
+                document["experiment_provenance"]["source_result_sha256"],
+                EXPERIMENT.file_sha256(raw),
             )
             self.assertEqual(
-                document["campaign_provenance"]["cell_identity"],
-                CAMPAIGN.cell_identity(planned),
+                document["experiment_provenance"]["cell_identity"],
+                EXPERIMENT.cell_identity(planned),
             )
 
     def test_result_rejects_background_revision_or_tree_mismatch(self) -> None:
@@ -1016,8 +1134,10 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "background repository revision mismatch"):
-                CAMPAIGN.validate_result(result, planned)
+            with self.assertRaisesRegex(
+                ValueError, "background repository revision mismatch"
+            ):
+                EXPERIMENT.validate_result(result, planned)
 
     def test_result_rejects_self_dogfood_repository_tree_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1046,15 +1166,19 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self.assertRaisesRegex(ValueError, "repository background tree mismatch"):
-                CAMPAIGN.validate_result(result, planned)
+            with self.assertRaisesRegex(
+                ValueError, "repository background tree mismatch"
+            ):
+                EXPERIMENT.validate_result(result, planned)
 
     def test_failed_attempt_retains_logs_without_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            planned = cell([sys.executable, "-c", "import sys; print('bad'); sys.exit(3)"])
-            result = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            planned = cell(
+                [sys.executable, "-c", "import sys; print('bad'); sys.exit(3)"]
+            )
+            result = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
             attempts = list((cell_root / "attempts").iterdir())
             self.assertEqual(result["status"], "failed")
             self.assertFalse((cell_root / "complete.json").exists())
@@ -1078,10 +1202,12 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 f"subprocess.Popen([sys.executable,'-c',{child!r},sys.argv[1]]); "
                 "time.sleep(60)"
             )
-            planned = cell([sys.executable, "-c", parent, str(marker)], timeout_seconds=0.5)
+            planned = cell(
+                [sys.executable, "-c", parent, str(marker)], timeout_seconds=0.5
+            )
 
-            outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            outcome = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
             attempt = next((cell_root / "attempts").iterdir())
             record = json.loads((attempt / "attempt.json").read_text())
 
@@ -1097,20 +1223,20 @@ class BenchmarkCampaignTest(unittest.TestCase):
             root = Path(tmpdir)
             planned = cell(["benchmark"], environment={"BAD": 3})
             with self.assertRaisesRegex(ValueError, "cell environment"):
-                CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+                EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
             self.assertFalse((cell_root / "running.lock").exists())
 
     def test_scan_reports_corrupt_and_unplanned_run_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             planned = cell(["benchmark"])
-            expected_id = CAMPAIGN.cell_identity(planned)
+            expected_id = EXPERIMENT.cell_identity(planned)
             expected = root / "runs" / expected_id
             expected.mkdir(parents=True)
             (expected / "complete.json").write_text("not-json")
             (root / "runs" / "unplanned-cell").mkdir()
-            audit = CAMPAIGN.scan_campaign(root, [planned])
+            audit = EXPERIMENT.scan_experiment(root, [planned])
             self.assertEqual(audit["counts"]["corrupt"], 1)
             self.assertEqual(audit["counts"]["unplanned"], 1)
             self.assertEqual(audit["unplanned"], ["unplanned-cell"])
@@ -1118,7 +1244,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
     def test_atomic_json_roundtrip_leaves_no_temporary_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "manifest.json"
-            CAMPAIGN.atomic_write_json(path, {"ok": True})
+            EXPERIMENT.atomic_write_json(path, {"ok": True})
             self.assertEqual(json.loads(path.read_text()), {"ok": True})
             self.assertEqual(list(path.parent.glob(".manifest.json.*.tmp")), [])
 
@@ -1126,14 +1252,14 @@ class BenchmarkCampaignTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "plan.json"
             payload = b'{ "schema_version": 1 }\n'
-            CAMPAIGN.atomic_write_bytes(path, payload)
+            EXPERIMENT.atomic_write_bytes(path, payload)
             self.assertEqual(path.read_bytes(), payload)
 
     def test_completed_inputs_group_repetitions_under_candidate_label(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             planned = cell(["benchmark"])
-            identity = CAMPAIGN.cell_identity(planned)
+            identity = EXPERIMENT.cell_identity(planned)
             result = root / "runs" / identity / "attempts" / "one" / "result.json"
             result.parent.mkdir(parents=True)
             result.write_text(
@@ -1146,25 +1272,31 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            CAMPAIGN.atomic_write_json(
+            EXPERIMENT.atomic_write_json(
                 root / "runs" / identity / "complete.json",
                 {
                     "cell_identity": identity,
                     "result_path": str(result.relative_to(root / "runs" / identity)),
-                    "result_sha256": CAMPAIGN.file_sha256(result),
+                    "result_sha256": EXPERIMENT.file_sha256(result),
                 },
             )
-            inputs = CAMPAIGN.completed_report_inputs(root, [planned])
+            inputs = EXPERIMENT.completed_report_inputs(root, [planned])
             self.assertEqual(inputs[0][0], "latest-rank-off-r1")
             self.assertNotEqual(inputs[0][1], result.resolve())
             self.assertEqual(
-                json.loads(inputs[0][1].read_text())["campaign_provenance"]["source_result_sha256"],
-                CAMPAIGN.file_sha256(result),
+                json.loads(inputs[0][1].read_text())["experiment_provenance"][
+                    "source_result_sha256"
+                ],
+                EXPERIMENT.file_sha256(result),
             )
-            report = CAMPAIGN.generate_report(root, [planned], root / "reports" / "summary.md")
+            report = EXPERIMENT.generate_report(
+                root, [planned], root / "reports" / "summary.md"
+            )
             self.assertEqual(report["input_count"], 1)
             self.assertTrue((root / "reports" / "summary.md").is_file())
-            self.assertIn("latest-rank-off-r1", (root / "reports" / "summary.md").read_text())
+            self.assertIn(
+                "latest-rank-off-r1", (root / "reports" / "summary.md").read_text()
+            )
 
     def test_harness_error_report_is_not_marked_complete(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1183,8 +1315,8 @@ class BenchmarkCampaignTest(unittest.TestCase):
                 json.dumps(payload),
             ]
             planned = cell(command, accepted_exit_codes=[0, 1])
-            outcome = CAMPAIGN.run_cell(root, planned, minimum_free_bytes=0)
-            cell_root = root / "runs" / CAMPAIGN.cell_identity(planned)
+            outcome = EXPERIMENT.run_cell(root, planned, minimum_free_bytes=0)
+            cell_root = root / "runs" / EXPERIMENT.cell_identity(planned)
             self.assertEqual(outcome["status"], "failed")
             self.assertIn("contains an error", outcome["error"])
             self.assertFalse((cell_root / "complete.json").exists())

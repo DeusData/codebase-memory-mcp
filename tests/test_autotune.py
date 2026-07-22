@@ -37,7 +37,7 @@ class AutotuneTest(unittest.TestCase):
             any(profile.get("config_overrides") for profile in spec["profiles"])
         )
 
-    def test_generated_plan_is_accepted_by_shared_campaign_runner(self) -> None:
+    def test_generated_plan_is_accepted_by_shared_experiment_runner(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             binary = Path(tmpdir) / "cbm"
             binary.write_bytes(b"optimized binary")
@@ -49,7 +49,7 @@ class AutotuneTest(unittest.TestCase):
                 transports=["mcp"],
                 build={"target": "make cbm", "compiler": "clang 18", "cflags": "-O3"},
             )
-            plan = AUTOTUNE.load_campaign_runner().expand_matrix_spec(spec)
+            plan = AUTOTUNE.load_experiment_runner().expand_matrix_spec(spec)
 
         self.assertEqual(len(plan["cells"]), len(AUTOTUNE.TUNING_PROFILES))
         self.assertTrue(

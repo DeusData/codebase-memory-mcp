@@ -421,12 +421,12 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
         self.assertIn("cbmq_records.py", finding)
         self.assertNotIn("no stage-level witness was recorded", markdown)
 
-    def test_composition_spec_groups_validated_campaign_cells(self) -> None:
+    def test_composition_spec_groups_validated_experiment_cells(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            campaign_root = root / "campaign"
-            campaign_root.mkdir()
-            plan = campaign_root / "immutable-plan.json"
+            experiment_root = root / "experiment"
+            experiment_root.mkdir()
+            plan = experiment_root / "immutable-plan.json"
             plan.write_text(
                 json.dumps(
                     {
@@ -437,7 +437,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                 encoding="utf-8",
             )
             for label in ("rank", "incremental"):
-                (campaign_root / f"{label}.json").write_text(
+                (experiment_root / f"{label}.json").write_text(
                     json.dumps({"binary_metadata": {"sha256": "a" * 64}, "cases": []}),
                     encoding="utf-8",
                 )
@@ -446,10 +446,10 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                 json.dumps(
                     {
                         "schema_version": 1,
-                        "campaigns": {
+                        "experiments": {
                             "fixture": {
-                                "plan": "campaign/immutable-plan.json",
-                                "campaign_root": "campaign",
+                                "plan": "experiment/immutable-plan.json",
+                                "experiment_root": "experiment",
                             }
                         },
                         "groups": [
@@ -457,7 +457,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                                 "label": "latest-default-mcp",
                                 "inputs": [
                                     {
-                                        "campaign": "fixture",
+                                        "experiment": "fixture",
                                         "cell_labels": ["rank", "incremental"],
                                     }
                                 ],
@@ -468,7 +468,7 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            class FakeCampaign:
+            class FakeExperiment:
                 @staticmethod
                 def expand_matrix_spec(spec: dict) -> dict:
                     raise AssertionError(
@@ -489,12 +489,27 @@ class SummarizeBenchmarkResultsTest(unittest.TestCase):
                     ]
 
             grouped, provenance = SUMMARY.load_composition_groups(
-                composition, FakeCampaign
+                composition, FakeExperiment
             )
 
             self.assertEqual(len(grouped["latest-default-mcp"]), 2)
             self.assertEqual(provenance["input_count"], 2)
             self.assertEqual(provenance["spec_path"], str(composition.resolve()))
+
+            legacy_document = json.loads(composition.read_text(encoding="utf-8"))
+            legacy_document["campaigns"] = legacy_document.pop("experiments")
+            legacy_entry = legacy_document["campaigns"]["fixture"]
+            legacy_entry["campaign_root"] = legacy_entry.pop("experiment_root")
+            legacy_source = legacy_document["groups"][0]["inputs"][0]
+            legacy_source["campaign"] = legacy_source.pop("experiment")
+            composition.write_text(json.dumps(legacy_document), encoding="utf-8")
+
+            legacy_grouped, legacy_provenance = SUMMARY.load_composition_groups(
+                composition, FakeExperiment
+            )
+            self.assertEqual(len(legacy_grouped["latest-default-mcp"]), 2)
+            self.assertIn("experiments", legacy_provenance)
+            self.assertNotIn("campaigns", legacy_provenance)
 
     def test_search_projection_report_keeps_identity_quality_beside_size(self) -> None:
         document = {

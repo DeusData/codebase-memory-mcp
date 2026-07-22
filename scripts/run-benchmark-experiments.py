@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Run an immutable, resumable benchmark experiment plan and retain an auditable disk trail.
 
-This is the canonical entry point for benchmark experiments. `run-benchmark-campaign.py`
-is a backwards-compatible shim with byte-identical behavior, kept so existing
-invocations, automation, and retained runsets under `.worktrees/benchmark-campaign/`
-keep working unchanged.
+This is the canonical entry point. The legacy `run-benchmark-campaign.py` filename,
+flags, persisted keys, and `.worktrees/benchmark-campaign/` directory remain readable
+for compatibility; new interfaces and records use "experiment" consistently.
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
-CAMPAIGN_DEFINITION_VERSION = 1
+EXPERIMENT_DEFINITION_VERSION = 1
 DEFAULT_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
 DEFAULT_STALE_LOCK_SECONDS = 6 * 60 * 60
 FILENAME_DATETIME_FORMAT = "%Y-%m-%d-%H%M%S.%fZ"
@@ -75,9 +74,21 @@ def filename_datetime(moment: datetime | None = None) -> str:
     return current.astimezone(timezone.utc).strftime(FILENAME_DATETIME_FORMAT)
 
 
-def campaign_version() -> str:
-    """Return the sortable version of the campaign definition, not a run number."""
-    return f"v{CAMPAIGN_DEFINITION_VERSION:04d}"
+def experiment_version() -> str:
+    """Return the sortable version of the experiment definition, not a run number."""
+    return f"v{EXPERIMENT_DEFINITION_VERSION:04d}"
+
+
+def read_experiment_version(document: dict[str, Any]) -> str | None:
+    """Read the current key or its legacy on-disk spelling without writing the legacy key."""
+    current = document.get("experiment_version")
+    legacy = document.get("campaign_version")
+    if current is not None and legacy is not None and current != legacy:
+        raise ValueError("experiment_version conflicts with legacy campaign_version")
+    value = current if current is not None else legacy
+    if value is not None and value != experiment_version():
+        raise ValueError(f"experiment_version must be {experiment_version()}")
+    return value
 
 
 def runset_identity(spec_payload: bytes) -> str:
@@ -105,12 +116,14 @@ def automatic_runset_identity(spec: dict[str, Any]) -> str:
 
 def _validate_runset_identity(runset: str) -> str:
     if len(runset) != 12 or any(char not in "0123456789abcdef" for char in runset):
-        raise ValueError(f"runset identity must be 12 lowercase hexadecimal characters: {runset!r}")
+        raise ValueError(
+            f"runset identity must be 12 lowercase hexadecimal characters: {runset!r}"
+        )
     return runset
 
 
-def automatic_campaign_name(preset: str, source: dict[str, str], runset: str) -> str:
-    """Name a resumable campaign without confusing source and execution datetimes."""
+def automatic_experiment_name(preset: str, source: dict[str, str], runset: str) -> str:
+    """Name a resumable experiment without confusing source and execution datetimes."""
     if preset not in {"quick", "full"}:
         raise ValueError(f"automatic preset must be quick or full: {preset!r}")
     revision = source.get("revision", "")
@@ -118,7 +131,7 @@ def automatic_campaign_name(preset: str, source: dict[str, str], runset: str) ->
     if len(revision) != 40 or not commit_datetime:
         raise ValueError("source must contain a full revision and commit_datetime_slug")
     return (
-        f"{campaign_version()}-{preset}-commit-{commit_datetime}-{revision[:12]}-"
+        f"{experiment_version()}-{preset}-commit-{commit_datetime}-{revision[:12]}-"
         f"runset-{_validate_runset_identity(runset)}"
     )
 
@@ -126,7 +139,7 @@ def automatic_campaign_name(preset: str, source: dict[str, str], runset: str) ->
 def automatic_spec_name(preset: str, runset: str) -> str:
     if preset not in {"quick", "full"}:
         raise ValueError(f"automatic preset must be quick or full: {preset!r}")
-    return f"spec-{campaign_version()}-{preset}-runset-{_validate_runset_identity(runset)}.json"
+    return f"spec-{experiment_version()}-{preset}-runset-{_validate_runset_identity(runset)}.json"
 
 
 def generated_artifact_name(
@@ -149,20 +162,31 @@ def generated_artifact_name(
         not nonce or any(not (char.isalnum() or char in "-_") for char in nonce)
     ):
         raise ValueError(f"artifact nonce is not path-safe: {nonce!r}")
-    parts = [kind, campaign_version()]
+    parts = [kind, experiment_version()]
     if preset is not None:
         parts.append(preset)
-    parts.extend(("runset", _validate_runset_identity(runset), "generated", filename_datetime(moment)))
+    parts.extend(
+        (
+            "runset",
+            _validate_runset_identity(runset),
+            "generated",
+            filename_datetime(moment),
+        )
+    )
     if nonce is not None:
         parts.append(nonce)
     return "-".join(parts) + suffix
 
 
 def _run_text(command: list[str], *, cwd: Path) -> str:
-    process = subprocess.run(command, cwd=cwd, capture_output=True, text=True, check=False)
+    process = subprocess.run(
+        command, cwd=cwd, capture_output=True, text=True, check=False
+    )
     if process.returncode != 0:
         detail = process.stderr.strip() or process.stdout.strip() or "no diagnostic"
-        raise RuntimeError(f"command failed ({process.returncode}): {' '.join(command)}: {detail}")
+        raise RuntimeError(
+            f"command failed ({process.returncode}): {' '.join(command)}: {detail}"
+        )
     return process.stdout.strip()
 
 
@@ -172,22 +196,30 @@ def resolve_commit(repository: Path, ref: str) -> str:
         ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
         cwd=repository,
     )
-    if len(revision) != 40 or any(char not in "0123456789abcdef" for char in revision.lower()):
-        raise RuntimeError(f"git resolved {ref!r} to an invalid commit ID: {revision!r}")
+    if len(revision) != 40 or any(
+        char not in "0123456789abcdef" for char in revision.lower()
+    ):
+        raise RuntimeError(
+            f"git resolved {ref!r} to an invalid commit ID: {revision!r}"
+        )
     return revision.lower()
 
 
 def commit_identity(repository: Path, ref: str) -> dict[str, str]:
     """Return a peeled commit, its repository datetime, and its exact tree."""
     revision = resolve_commit(repository, ref)
-    committed_at = _run_text(["git", "show", "-s", "--format=%cI", revision], cwd=repository)
+    committed_at = _run_text(
+        ["git", "show", "-s", "--format=%cI", revision], cwd=repository
+    )
     try:
         parsed = datetime.fromisoformat(committed_at.replace("Z", "+00:00"))
     except ValueError as error:
         raise RuntimeError(
             f"git returned an invalid commit datetime for {revision}: {committed_at!r}"
         ) from error
-    tree = _run_text(["git", "rev-parse", "--verify", f"{revision}^{{tree}}"], cwd=repository)
+    tree = _run_text(
+        ["git", "rev-parse", "--verify", f"{revision}^{{tree}}"], cwd=repository
+    )
     return {
         "revision": revision,
         "committed_at": parsed.isoformat(),
@@ -225,7 +257,9 @@ def parse_candidate_ref_override(value: str) -> tuple[str, str]:
         raise ValueError(f"--candidate-ref must be LABEL=REF: {value!r}")
     known_labels = {default_label for default_label, _ in DEFAULT_CANDIDATE_REFS}
     if label not in known_labels:
-        raise ValueError(f"--candidate-ref label must be one of {sorted(known_labels)}: {label!r}")
+        raise ValueError(
+            f"--candidate-ref label must be one of {sorted(known_labels)}: {label!r}"
+        )
     return label, ref
 
 
@@ -255,7 +289,9 @@ def ensure_clean_tracked_worktree(repository: Path, role: str) -> None:
         )
 
 
-def _registered_candidate_worktrees(repository: Path, candidate_root: Path, revision: str) -> list[Path]:
+def _registered_candidate_worktrees(
+    repository: Path, candidate_root: Path, revision: str
+) -> list[Path]:
     listing = _run_text(["git", "worktree", "list", "--porcelain"], cwd=repository)
     matches: list[Path] = []
     for block in listing.split("\n\n"):
@@ -353,7 +389,9 @@ def materialize_candidate(
         worktree = matches[0]
     else:
         if intended.exists():
-            raise RuntimeError(f"candidate path exists but is not the registered {revision} worktree: {intended}")
+            raise RuntimeError(
+                f"candidate path exists but is not the registered {revision} worktree: {intended}"
+            )
         process = subprocess.run(
             ["git", "worktree", "add", "--detach", str(intended), revision],
             cwd=repository,
@@ -363,7 +401,9 @@ def materialize_candidate(
         )
         if process.returncode != 0:
             detail = process.stderr.strip() or process.stdout.strip() or "no diagnostic"
-            raise RuntimeError(f"could not create candidate worktree {intended}: {detail}")
+            raise RuntimeError(
+                f"could not create candidate worktree {intended}: {detail}"
+            )
         worktree = intended
     actual_revision = resolve_commit(worktree, "HEAD")
     if actual_revision != revision:
@@ -383,7 +423,7 @@ def materialize_candidate(
     cache_path = (
         candidate_root
         / "cache"
-        / f"candidate-{campaign_version()}-{safe_label}-commit-{revision[:12]}.json"
+        / f"candidate-{experiment_version()}-{safe_label}-commit-{revision[:12]}.json"
     )
     if cache_path.is_file() and binary.is_file():
         try:
@@ -404,7 +444,9 @@ def materialize_candidate(
     stamp = filename_datetime()
     log_root = candidate_root / "build-logs"
     log_root.mkdir(parents=True, exist_ok=True)
-    build_log = log_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.log"
+    build_log = (
+        log_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.log"
+    )
     command = ["make", f"-j{jobs}", "-f", "Makefile.cbm", "cbm"]
     with build_log.open("w", encoding="utf-8") as stream:
         stream.write(f"started_at_utc={utc_now()}\n")
@@ -422,7 +464,9 @@ def materialize_candidate(
         stream.write(f"finished_at_utc={utc_now()}\n")
         stream.write(f"exit_code={process.returncode}\n")
     if process.returncode != 0:
-        raise RuntimeError(f"candidate production build failed ({process.returncode}); see {build_log}")
+        raise RuntimeError(
+            f"candidate production build failed ({process.returncode}); see {build_log}"
+        )
     if not binary.is_file():
         raise RuntimeError(f"candidate build did not produce {binary}; see {build_log}")
     candidate = {
@@ -438,7 +482,8 @@ def materialize_candidate(
     metadata_root = candidate_root / "metadata"
     metadata_root.mkdir(parents=True, exist_ok=True)
     atomic_write_json(
-        metadata_root / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.json",
+        metadata_root
+        / f"generated-{stamp}-for-{safe_label}-commit-{revision[:12]}.json",
         {
             **candidate,
             "ref": ref,
@@ -451,7 +496,7 @@ def materialize_candidate(
         cache_path,
         {
             "schema_version": SCHEMA_VERSION,
-            "campaign_version": campaign_version(),
+            "experiment_version": experiment_version(),
             "candidate": candidate,
         },
     )
@@ -551,14 +596,18 @@ def build_automatic_spec(
     expected_labels = [label for label, _ in DEFAULT_CANDIDATE_REFS]
     actual_labels = [candidate.get("label") for candidate in candidates]
     if actual_labels != expected_labels:
-        raise ValueError(f"automatic candidates must be ordered {expected_labels}, got {actual_labels}")
+        raise ValueError(
+            f"automatic candidates must be ordered {expected_labels}, got {actual_labels}"
+        )
     repository_identity = commit_identity(repository, "HEAD")
     repository_revision = repository_identity["revision"]
     repository_tree = repository_identity["tree"]
     runner_sha = file_sha256(Path(__file__).resolve())
     benchmark_sha = file_sha256(benchmark_script)
     latest_labels = ["latest"]
-    profiles: list[dict[str, Any]] = [{"label": "default", "config_profile": "default", "capabilities": {}}]
+    profiles: list[dict[str, Any]] = [
+        {"label": "default", "config_profile": "default", "capabilities": {}}
+    ]
     if preset == "full":
         profiles.extend(
             (
@@ -648,9 +697,11 @@ def build_automatic_spec(
         )
     return {
         "schema_version": SCHEMA_VERSION,
-        "campaign_version": campaign_version(),
+        "experiment_version": experiment_version(),
         "identity_version": 2,
-        "harness_version": (f"automatic-{preset}:benchmark-{benchmark_sha}:runner-{runner_sha}"),
+        "harness_version": (
+            f"automatic-{preset}:benchmark-{benchmark_sha}:runner-{runner_sha}"
+        ),
         "benchmark_script": str(benchmark_script),
         "workload": "self_dogfood",
         "repository_background": {
@@ -675,7 +726,9 @@ def build_automatic_spec(
 
 def identity_document(cell: dict[str, Any]) -> dict[str, Any]:
     if cell.get("identity_version") != 2:
-        return {key: cell.get(key) for key in IDENTITY_FIELDS if key != "identity_version"}
+        return {
+            key: cell.get(key) for key in IDENTITY_FIELDS if key != "identity_version"
+        }
     document = {key: cell.get(key) for key in IDENTITY_FIELDS}
 
     command = list(document.get("command") or [])
@@ -722,22 +775,39 @@ def validate_cell(cell: dict[str, Any], index: int) -> None:
         if not isinstance(cell.get(key), expected_type):
             raise ValueError(f"cells[{index}].{key} must be {expected_type.__name__}")
     if not cell["label"] or "=" in cell["label"]:
-        raise ValueError(f"cells[{index}].label must be non-empty and cannot contain '='")
+        raise ValueError(
+            f"cells[{index}].label must be non-empty and cannot contain '='"
+        )
     if len(cell["revision"]) != 40:
-        raise ValueError(f"cells[{index}].revision must be a full 40-character commit hash")
+        raise ValueError(
+            f"cells[{index}].revision must be a full 40-character commit hash"
+        )
     if len(cell["binary_sha256"]) != 64:
         raise ValueError(f"cells[{index}].binary_sha256 must be a full SHA-256")
-    if not cell["command"] or not all(isinstance(item, str) for item in cell["command"]):
+    if not cell["command"] or not all(
+        isinstance(item, str) for item in cell["command"]
+    ):
         raise ValueError(f"cells[{index}].command must be a non-empty string array")
     accepted = cell.get("accepted_exit_codes", [0])
-    if not isinstance(accepted, list) or not accepted or not all(isinstance(code, int) for code in accepted):
-        raise ValueError(f"cells[{index}].accepted_exit_codes must be a non-empty integer array")
+    if (
+        not isinstance(accepted, list)
+        or not accepted
+        or not all(isinstance(code, int) for code in accepted)
+    ):
+        raise ValueError(
+            f"cells[{index}].accepted_exit_codes must be a non-empty integer array"
+        )
     support = cell.get("capability_support")
     if support is not None and (
         not isinstance(support, dict)
-        or not all(isinstance(key, str) and isinstance(value, bool) for key, value in support.items())
+        or not all(
+            isinstance(key, str) and isinstance(value, bool)
+            for key, value in support.items()
+        )
     ):
-        raise ValueError(f"cells[{index}].capability_support must be a string-to-boolean object")
+        raise ValueError(
+            f"cells[{index}].capability_support must be a string-to-boolean object"
+        )
 
 
 def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
@@ -789,7 +859,7 @@ def _optional_iso_datetime(value: Any, field: str) -> str | None:
 
 
 def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
-    """Expand a compact benchmark grid into immutable campaign cells."""
+    """Expand a compact benchmark grid into immutable experiment cells."""
     if spec.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
     harness_version = spec.get("harness_version")
@@ -820,7 +890,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if execution_order not in {None, "grouped", "paired_interleaved"}:
         raise ValueError("execution_order must be grouped or paired_interleaved")
     if capability_quality is not None and (
-        not isinstance(capability_quality, str) or not capability_quality or "=" in capability_quality
+        not isinstance(capability_quality, str)
+        or not capability_quality
+        or "=" in capability_quality
     ):
         raise ValueError("capability_quality must be a non-empty argument value")
     if workload not in {"matrix", "self_dogfood"}:
@@ -828,17 +900,22 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if identity_version not in {1, 2}:
         raise ValueError("identity_version must be 1 or 2")
     if capability_quality is not None and workload != "matrix":
-        raise ValueError("capability_quality cannot be combined with a self_dogfood workload")
+        raise ValueError(
+            "capability_quality cannot be combined with a self_dogfood workload"
+        )
     if quality_background is not None:
         if capability_quality not in {"similarity", "semantic_edges"}:
-            raise ValueError("quality_background requires capability_quality similarity or semantic_edges")
+            raise ValueError(
+                "quality_background requires capability_quality similarity or semantic_edges"
+            )
         if not isinstance(quality_background, dict):
             raise ValueError("quality_background must be an object")
         background_repo = quality_background.get("repo")
         background_revision = quality_background.get("revision")
         background_tree = quality_background.get("tree")
         background_datetime = _optional_iso_datetime(
-            quality_background.get("commit_datetime"), "quality_background.commit_datetime"
+            quality_background.get("commit_datetime"),
+            "quality_background.commit_datetime",
         )
         if not isinstance(background_repo, str) or not Path(background_repo).is_dir():
             raise ValueError("quality_background.repo must be an existing directory")
@@ -868,7 +945,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(background_repo, str) or not Path(background_repo).is_dir():
             raise ValueError("repository_background.repo must be an existing directory")
         if not isinstance(background_revision, str) or len(background_revision) != 40:
-            raise ValueError("repository_background.revision must be a full commit hash")
+            raise ValueError(
+                "repository_background.revision must be a full commit hash"
+            )
         if not isinstance(background_tree, str) or len(background_tree) != 40:
             raise ValueError("repository_background.tree must be a full tree hash")
         repository_background = {
@@ -883,7 +962,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if (
         not isinstance(accepted_exit_codes, list)
         or not accepted_exit_codes
-        or not all(isinstance(code, int) and not isinstance(code, bool) for code in accepted_exit_codes)
+        or not all(
+            isinstance(code, int) and not isinstance(code, bool)
+            for code in accepted_exit_codes
+        )
     ):
         raise ValueError("accepted_exit_codes must be a non-empty integer array")
     cell_timeout = spec.get("cell_timeout_seconds", benchmark_timeout * 4)
@@ -895,7 +977,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     benchmark_sha256 = file_sha256(benchmark_path)
 
     candidates = _nonempty_list(spec.get("candidates"), "candidates")
-    candidate_labels = {item.get("label") for item in candidates if isinstance(item, dict)}
+    candidate_labels = {
+        item.get("label") for item in candidates if isinstance(item, dict)
+    }
     profiles = _nonempty_list(spec.get("profiles"), "profiles")
     scenarios = (
         [{"name": f"{capability_quality}_quality"}]
@@ -915,12 +999,20 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         revision = candidate.get("revision")
         binary_value = candidate.get("binary")
         build = candidate.get("build")
-        if not isinstance(candidate_label, str) or not candidate_label or "=" in candidate_label:
+        if (
+            not isinstance(candidate_label, str)
+            or not candidate_label
+            or "=" in candidate_label
+        ):
             raise ValueError(f"candidates[{candidate_index}].label is invalid")
         if not isinstance(revision, str) or len(revision) != 40:
-            raise ValueError(f"candidates[{candidate_index}].revision must be a full commit hash")
+            raise ValueError(
+                f"candidates[{candidate_index}].revision must be a full commit hash"
+            )
         if not isinstance(binary_value, str) or not binary_value:
-            raise ValueError(f"candidates[{candidate_index}].binary must be a path string")
+            raise ValueError(
+                f"candidates[{candidate_index}].binary must be a path string"
+            )
         if not isinstance(build, dict):
             raise ValueError(f"candidates[{candidate_index}].build must be an object")
         binary = Path(binary_value).expanduser().resolve()
@@ -929,14 +1021,23 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         binary_sha = file_sha256(binary)
         declared_sha = candidate.get("binary_sha256")
         if declared_sha is not None and declared_sha != binary_sha:
-            raise ValueError(f"candidates[{candidate_index}].binary_sha256 does not match {binary}")
-        candidate_environment = _string_map(candidate.get("environment"), f"candidates[{candidate_index}].environment")
+            raise ValueError(
+                f"candidates[{candidate_index}].binary_sha256 does not match {binary}"
+            )
+        candidate_environment = _string_map(
+            candidate.get("environment"), f"candidates[{candidate_index}].environment"
+        )
         candidate_support = candidate.get("capability_support")
         if candidate_support is not None and (
             not isinstance(candidate_support, dict)
-            or not all(isinstance(key, str) and isinstance(value, bool) for key, value in candidate_support.items())
+            or not all(
+                isinstance(key, str) and isinstance(value, bool)
+                for key, value in candidate_support.items()
+            )
         ):
-            raise ValueError(f"candidates[{candidate_index}].capability_support must be a string-to-boolean object")
+            raise ValueError(
+                f"candidates[{candidate_index}].capability_support must be a string-to-boolean object"
+            )
 
         for profile_index, profile in enumerate(profiles):
             if not isinstance(profile, dict):
@@ -944,20 +1045,30 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             profile_label = profile.get("label")
             config_profile = profile.get("config_profile")
             capabilities = profile.get("capabilities")
-            if not isinstance(profile_label, str) or not profile_label or "=" in profile_label:
+            if (
+                not isinstance(profile_label, str)
+                or not profile_label
+                or "=" in profile_label
+            ):
                 raise ValueError(f"profiles[{profile_index}].label is invalid")
             if not isinstance(config_profile, str) or not config_profile:
                 raise ValueError(f"profiles[{profile_index}].config_profile is invalid")
             if not isinstance(capabilities, dict):
-                raise ValueError(f"profiles[{profile_index}].capabilities must be an object")
+                raise ValueError(
+                    f"profiles[{profile_index}].capabilities must be an object"
+                )
             scoped_candidates = profile.get("candidate_labels")
             if scoped_candidates is not None:
                 if (
                     not isinstance(scoped_candidates, list)
                     or not scoped_candidates
-                    or not all(isinstance(item, str) and item for item in scoped_candidates)
+                    or not all(
+                        isinstance(item, str) and item for item in scoped_candidates
+                    )
                 ):
-                    raise ValueError(f"profiles[{profile_index}].candidate_labels must be a non-empty string array")
+                    raise ValueError(
+                        f"profiles[{profile_index}].candidate_labels must be a non-empty string array"
+                    )
                 unknown_candidates = set(scoped_candidates) - candidate_labels
                 if unknown_candidates:
                     raise ValueError(
@@ -973,7 +1084,8 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
             if config_profile == "default":
                 for key, claimed_value in capabilities.items():
                     disabled = claimed_value is False or (
-                        isinstance(claimed_value, str) and claimed_value.strip().lower() == "false"
+                        isinstance(claimed_value, str)
+                        and claimed_value.strip().lower() == "false"
                     )
                     if disabled and overrides.get(key, "").strip().lower() != "false":
                         raise ValueError(
@@ -982,8 +1094,12 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                             "same value to config_overrides"
                         )
             if "incremental_exact_max_affected_paths" in overrides:
-                raise ValueError("exact cap belongs in scenarios[].exact_caps, not profile overrides")
-            profile_environment = _string_map(profile.get("environment"), f"profiles[{profile_index}].environment")
+                raise ValueError(
+                    "exact cap belongs in scenarios[].exact_caps, not profile overrides"
+                )
+            profile_environment = _string_map(
+                profile.get("environment"), f"profiles[{profile_index}].environment"
+            )
 
             for scenario_index, scenario in enumerate(scenarios):
                 if not isinstance(scenario, dict):
@@ -1003,13 +1119,24 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                         scenario.get("exact_caps"),
                         f"scenarios[{scenario_index}].exact_caps",
                     )
-                    if not all(isinstance(item, int) and item > 0 for item in frontier_values):
-                        raise ValueError("frontier_files must contain positive integers")
                     if not all(
-                        item is None or (isinstance(item, int) and not isinstance(item, bool) and item > 0)
+                        isinstance(item, int) and item > 0 for item in frontier_values
+                    ):
+                        raise ValueError(
+                            "frontier_files must contain positive integers"
+                        )
+                    if not all(
+                        item is None
+                        or (
+                            isinstance(item, int)
+                            and not isinstance(item, bool)
+                            and item > 0
+                        )
                         for item in cap_values
                     ):
-                        raise ValueError("exact_caps must contain positive integers or null")
+                        raise ValueError(
+                            "exact_caps must contain positive integers or null"
+                        )
 
                 for transport_index, transport in enumerate(transports):
                     for frontier_files in frontier_values:
@@ -1078,7 +1205,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 ]
                             cap_label = "default"
                             if isinstance(exact_cap, int):
-                                effective_capabilities["incremental_exact_max_affected_paths"] = str(exact_cap)
+                                effective_capabilities[
+                                    "incremental_exact_max_affected_paths"
+                                ] = str(exact_cap)
                                 command.extend(
                                     (
                                         "--config",
@@ -1088,7 +1217,10 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 cap_label = str(exact_cap)
                             for key, value in sorted(overrides.items()):
                                 command.extend(("--config", f"{key}={value}"))
-                            if capability_quality is not None or workload == "self_dogfood":
+                            if (
+                                capability_quality is not None
+                                or workload == "self_dogfood"
+                            ):
                                 command.append("--include-logs")
                             command.extend(
                                 (
@@ -1107,11 +1239,15 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                             if capability_quality is not None:
                                 parameters["capability_quality"] = capability_quality
                                 if quality_background is not None:
-                                    parameters["quality_background"] = quality_background
+                                    parameters["quality_background"] = (
+                                        quality_background
+                                    )
                                 label = f"{candidate_label}.{profile_label}.{transport}.{scenario_name}"
                             elif workload == "self_dogfood":
                                 assert repository_background is not None
-                                parameters["repository_background"] = repository_background
+                                parameters["repository_background"] = (
+                                    repository_background
+                                )
                                 label = f"{candidate_label}.{profile_label}.{transport}.{scenario_name}"
                             else:
                                 parameters["frontier_files"] = frontier_files
@@ -1147,7 +1283,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                                 if environment:
                                     cell["environment"] = environment
                                 if isinstance(candidate_support, dict):
-                                    cell["capability_support"] = dict(sorted(candidate_support.items()))
+                                    cell["capability_support"] = dict(
+                                        sorted(candidate_support.items())
+                                    )
                                 cell["_design"] = {
                                     "candidate_index": candidate_index,
                                     "profile_index": profile_index,
@@ -1177,11 +1315,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     for cell in cells:
         cell.pop("_design", None)
     plan = {"schema_version": SCHEMA_VERSION, "cells": cells}
-    campaign_definition = spec.get("campaign_version")
-    if campaign_definition is not None:
-        if campaign_definition != campaign_version():
-            raise ValueError(f"campaign_version must be {campaign_version()}")
-        plan["campaign_version"] = campaign_definition
+    experiment_definition = read_experiment_version(spec)
+    if experiment_definition is not None:
+        plan["experiment_version"] = experiment_definition
     runset = spec.get("runset_id")
     if runset is not None:
         plan["runset_id"] = _validate_runset_identity(runset)
@@ -1195,13 +1331,17 @@ def ensure_disk_space(root: Path, minimum_free_bytes: int) -> None:
     root.mkdir(parents=True, exist_ok=True)
     free = shutil.disk_usage(root).free
     if free < minimum_free_bytes:
-        raise RuntimeError(f"insufficient experiment disk space: free={free} required={minimum_free_bytes} root={root}")
+        raise RuntimeError(
+            f"insufficient experiment disk space: free={free} required={minimum_free_bytes} root={root}"
+        )
 
 
 def resource_snapshot(path: Path) -> dict[str, Any]:
     disk = shutil.disk_usage(path)
     try:
-        load_average: list[float] | None = [round(value, 6) for value in os.getloadavg()]
+        load_average: list[float] | None = [
+            round(value, 6) for value in os.getloadavg()
+        ]
     except (AttributeError, OSError):
         load_average = None
     physical_memory_bytes: int | None = None
@@ -1227,8 +1367,10 @@ def resource_snapshot(path: Path) -> dict[str, Any]:
     }
 
 
-def validate_campaign_root(root: Path, *, allow_temporary: bool = False, temporary_root: Path | None = None) -> Path:
-    """Require retained campaign state to live outside the OS temporary tree."""
+def validate_experiment_root(
+    root: Path, *, allow_temporary: bool = False, temporary_root: Path | None = None
+) -> Path:
+    """Require retained experiment state to live outside the OS temporary tree."""
     resolved = root.expanduser().resolve()
     temp = (temporary_root or Path(tempfile.gettempdir())).expanduser().resolve()
     if not allow_temporary and (resolved == temp or temp in resolved.parents):
@@ -1252,7 +1394,9 @@ def process_is_live(pid: int) -> bool:
     return True
 
 
-def acquire_lock(cell_root: Path, stale_after_seconds: int) -> tuple[Path, dict[str, Any] | None]:
+def acquire_lock(
+    cell_root: Path, stale_after_seconds: int
+) -> tuple[Path, dict[str, Any] | None]:
     cell_root.mkdir(parents=True, exist_ok=True)
     lock_path = cell_root / "running.lock"
     stale_record: dict[str, Any] | None = None
@@ -1273,7 +1417,9 @@ def acquire_lock(cell_root: Path, stale_after_seconds: int) -> tuple[Path, dict[
         if live or age < stale_after_seconds:
             raise RuntimeError(f"benchmark cell is already locked: {lock_path}")
         stale_record = {"recovered_at_utc": utc_now(), "previous_lock": existing}
-        stale_path = cell_root / f"stale-lock-{filename_datetime()}-{uuid.uuid4().hex[:8]}.json"
+        stale_path = (
+            cell_root / f"stale-lock-{filename_datetime()}-{uuid.uuid4().hex[:8]}.json"
+        )
         atomic_write_json(stale_path, stale_record)
         lock_path.unlink()
     document = {
@@ -1306,22 +1452,48 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
     metadata = result.get("binary_metadata")
     actual_sha = metadata.get("sha256") if isinstance(metadata, dict) else None
     if actual_sha != cell["binary_sha256"]:
-        raise ValueError(f"result binary SHA-256 mismatch: expected={cell['binary_sha256']} actual={actual_sha}")
+        raise ValueError(
+            f"result binary SHA-256 mismatch: expected={cell['binary_sha256']} actual={actual_sha}"
+        )
     if result.get("error"):
         raise ValueError(f"benchmark result contains an error: {result['error']}")
+    run_context = result.get("benchmark_run_context")
+    if run_context is not None:
+        if not isinstance(run_context, dict):
+            raise ValueError("benchmark_run_context must be an object")
+        expected_context = {
+            "cell_identity": cell_identity(cell),
+            "label": cell["label"],
+            "revision": cell["revision"],
+            "repetition": cell["repetition"],
+            "build": cell["build"],
+            "capabilities": cell["capabilities"],
+            "capability_support": cell.get("capability_support", {}),
+            "harness_version": cell["harness_version"],
+        }
+        if run_context != expected_context:
+            raise ValueError("benchmark_run_context does not match the experiment cell")
     derived = result.get("derived")
     if not isinstance(derived, dict) or not isinstance(derived.get("passed"), bool):
         raise ValueError("benchmark result must contain derived.passed as a boolean")
     cases = result.get("cases")
     measurements = result.get("measurements")
     if not (isinstance(cases, list) and cases) and not isinstance(measurements, dict):
-        raise ValueError("benchmark result must contain non-empty cases or measurements")
+        raise ValueError(
+            "benchmark result must contain non-empty cases or measurements"
+        )
     expected_background = cell.get("parameters", {}).get("quality_background")
     if expected_background is not None:
         first_case = cases[0] if isinstance(cases, list) and cases else None
-        actual_background = first_case.get("background_repository") if isinstance(first_case, dict) else None
+        actual_background = (
+            first_case.get("background_repository")
+            if isinstance(first_case, dict)
+            else None
+        )
         if not isinstance(actual_background, dict):
-            raise ValueError("benchmark result is missing background_repository identity")
+            raise ValueError(
+                "benchmark result is missing background_repository identity"
+            )
         for key in ("revision", "tree"):
             if actual_background.get(key) != expected_background.get(key):
                 raise ValueError(
@@ -1332,7 +1504,9 @@ def validate_result(path: Path, cell: dict[str, Any]) -> dict[str, Any]:
     if expected_repository is not None:
         actual_repository = result.get("repository_background")
         if not isinstance(actual_repository, dict):
-            raise ValueError("benchmark result is missing repository_background identity")
+            raise ValueError(
+                "benchmark result is missing repository_background identity"
+            )
         for key in ("revision", "tree"):
             if actual_repository.get(key) != expected_repository.get(key):
                 raise ValueError(
@@ -1368,7 +1542,9 @@ def validate_attempt_artifacts(cell_root: Path, completion: dict[str, Any]) -> N
         raise ValueError("completed attempt artifact manifest is missing")
     actual = artifact_manifest(attempt_root / "artifacts")
     if actual != expected:
-        raise ValueError("completed attempt artifact manifest does not match retained files")
+        raise ValueError(
+            "completed attempt artifact manifest does not match retained files"
+        )
 
 
 def valid_completion(cell_root: Path, cell: dict[str, Any]) -> dict[str, Any] | None:
@@ -1386,7 +1562,9 @@ def valid_completion(cell_root: Path, cell: dict[str, Any]) -> dict[str, Any] | 
     return completion
 
 
-def expanded_command(command: list[str], attempt_root: Path, result_path: Path) -> list[str]:
+def expanded_command(
+    command: list[str], attempt_root: Path, result_path: Path
+) -> list[str]:
     replacements = {
         "{attempt_dir}": str(attempt_root),
         "{result_path}": str(result_path),
@@ -1436,16 +1614,16 @@ def stop_cell_process_tree(
 
 
 def run_cell(
-    campaign_root: Path,
+    experiment_root: Path,
     cell: dict[str, Any],
     *,
     minimum_free_bytes: int = DEFAULT_MINIMUM_FREE_BYTES,
     stale_lock_seconds: int = DEFAULT_STALE_LOCK_SECONDS,
 ) -> dict[str, Any]:
     validate_cell(cell, 0)
-    ensure_disk_space(campaign_root, minimum_free_bytes)
+    ensure_disk_space(experiment_root, minimum_free_bytes)
     identity = cell_identity(cell)
-    cell_root = campaign_root / "runs" / identity
+    cell_root = experiment_root / "runs" / identity
     try:
         completion = valid_completion(cell_root, cell)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -1470,11 +1648,25 @@ def run_cell(
         environment = dict(os.environ)
         overrides = cell.get("environment", {})
         if not isinstance(overrides, dict) or not all(
-            isinstance(key, str) and isinstance(value, str) for key, value in overrides.items()
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in overrides.items()
         ):
             raise ValueError("cell environment must be a string-to-string object")
         environment.update(overrides)
         environment["CBM_BENCHMARK_ARTIFACT_DIR"] = str(artifact_root)
+        benchmark_run_context = {
+            "cell_identity": identity,
+            "label": cell["label"],
+            "revision": cell["revision"],
+            "repetition": cell["repetition"],
+            "build": cell["build"],
+            "capabilities": cell["capabilities"],
+            "capability_support": cell.get("capability_support", {}),
+            "harness_version": cell["harness_version"],
+        }
+        environment["CBM_BENCHMARK_RUN_CONTEXT"] = canonical_json(
+            benchmark_run_context
+        ).decode("utf-8")
         command_record = {
             "cell_identity": identity,
             "identity": identity_document(cell),
@@ -1482,10 +1674,11 @@ def run_cell(
             "command": command,
             "cwd": str(cwd),
             "environment_overrides": overrides,
+            "benchmark_run_context": benchmark_run_context,
             "artifact_directory": "artifacts",
             "started_at_utc": utc_now(),
             "stale_lock_recovered": stale_record is not None,
-            "resource_before": resource_snapshot(campaign_root),
+            "resource_before": resource_snapshot(experiment_root),
         }
         atomic_write_json(attempt_root / "command.json", command_record)
         started = time.monotonic()
@@ -1534,7 +1727,7 @@ def run_cell(
             "returncode": returncode,
             "status": "completed" if error is None else "failed",
             "error": error,
-            "resource_after": resource_snapshot(campaign_root),
+            "resource_after": resource_snapshot(experiment_root),
             "artifacts": artifact_manifest(artifact_root),
         }
         atomic_write_json(attempt_root / "attempt.json", attempt_record)
@@ -1572,7 +1765,9 @@ def run_cell(
             lock_path.unlink()
 
 
-def scan_campaign(campaign_root: Path, cells: list[dict[str, Any]]) -> dict[str, Any]:
+def scan_experiment(
+    experiment_root: Path, cells: list[dict[str, Any]]
+) -> dict[str, Any]:
     expected = {cell_identity(cell): cell for cell in cells}
     entries: list[dict[str, Any]] = []
     counts = {
@@ -1583,9 +1778,13 @@ def scan_campaign(campaign_root: Path, cells: list[dict[str, Any]]) -> dict[str,
         "unplanned": 0,
     }
     for identity, cell in expected.items():
-        cell_root = campaign_root / "runs" / identity
+        cell_root = experiment_root / "runs" / identity
         attempts_root = cell_root / "attempts"
-        attempt_count = sum(1 for path in attempts_root.iterdir() if path.is_dir()) if attempts_root.is_dir() else 0
+        attempt_count = (
+            sum(1 for path in attempts_root.iterdir() if path.is_dir())
+            if attempts_root.is_dir()
+            else 0
+        )
         if attempt_count > 1:
             counts["duplicate_attempts"] += attempt_count - 1
         status = "missing"
@@ -1606,8 +1805,12 @@ def scan_campaign(campaign_root: Path, cells: list[dict[str, Any]]) -> dict[str,
                 "error": error,
             }
         )
-    runs_root = campaign_root / "runs"
-    actual = {path.name for path in runs_root.iterdir() if path.is_dir()} if runs_root.is_dir() else set()
+    runs_root = experiment_root / "runs"
+    actual = (
+        {path.name for path in runs_root.iterdir() if path.is_dir()}
+        if runs_root.is_dir()
+        else set()
+    )
     unplanned = sorted(actual - set(expected))
     counts["unplanned"] = len(unplanned)
     return {"counts": counts, "cells": entries, "unplanned": unplanned}
@@ -1626,23 +1829,27 @@ def environment_snapshot(plan_path: Path) -> dict[str, Any]:
     }
 
 
-def completed_report_inputs(campaign_root: Path, cells: list[dict[str, Any]]) -> list[tuple[str, Path]]:
+def completed_report_inputs(
+    experiment_root: Path, cells: list[dict[str, Any]]
+) -> list[tuple[str, Path]]:
     inputs: list[tuple[str, Path]] = []
     for cell in cells:
-        cell_root = campaign_root / "runs" / cell_identity(cell)
+        cell_root = experiment_root / "runs" / cell_identity(cell)
         completion = valid_completion(cell_root, cell)
         if completion is not None:
             result_path = resolve_result_path(cell_root, completion)
             inputs.append(
                 (
                     cell["label"],
-                    materialize_report_input(campaign_root, cell, result_path),
+                    materialize_report_input(experiment_root, cell, result_path),
                 )
             )
     return inputs
 
 
-def materialize_report_input(campaign_root: Path, cell: dict[str, Any], result_path: Path) -> Path:
+def materialize_report_input(
+    experiment_root: Path, cell: dict[str, Any], result_path: Path
+) -> Path:
     """Create a deterministic derived input with candidate metadata beside immutable raw results."""
     document = read_json_object(result_path)
     parameters = document.get("parameters")
@@ -1659,20 +1866,26 @@ def materialize_report_input(campaign_root: Path, cell: dict[str, Any], result_p
                 parameters[key] = cell_parameters[key]
     source_sha = file_sha256(result_path)
     identity = cell_identity(cell)
-    document["campaign_provenance"] = {
+    document["experiment_provenance"] = {
         "cell_identity": identity,
         "source_result": str(result_path),
         "source_result_sha256": source_sha,
     }
-    output = campaign_root / "reports" / "inputs" / f"{identity}-{source_sha[:12]}.json"
+    output = (
+        experiment_root / "reports" / "inputs" / f"{identity}-{source_sha[:12]}.json"
+    )
     atomic_write_json(output, document)
     return output
 
 
-def generate_report(campaign_root: Path, cells: list[dict[str, Any]], output: Path) -> dict[str, Any]:
-    inputs = completed_report_inputs(campaign_root, cells)
+def generate_report(
+    experiment_root: Path, cells: list[dict[str, Any]], output: Path
+) -> dict[str, Any]:
+    inputs = completed_report_inputs(experiment_root, cells)
     if not inputs:
-        raise RuntimeError("cannot generate a report without completed campaign cells")
+        raise RuntimeError(
+            "cannot generate a report without completed experiment cells"
+        )
     summarizer = Path(__file__).resolve().with_name("summarize-benchmark-results.py")
     command = [sys.executable, str(summarizer)]
     for label, result_path in inputs:
@@ -1680,7 +1893,9 @@ def generate_report(campaign_root: Path, cells: list[dict[str, Any]], output: Pa
     command.extend(("--out", str(output)))
     process = subprocess.run(command, capture_output=True, text=True, check=False)
     if process.returncode != 0:
-        raise RuntimeError(f"report generator exited with {process.returncode}: {process.stderr.strip()}")
+        raise RuntimeError(
+            f"report generator exited with {process.returncode}: {process.stderr.strip()}"
+        )
     return {
         "path": str(output),
         "sha256": file_sha256(output),
@@ -1690,7 +1905,7 @@ def generate_report(campaign_root: Path, cells: list[dict[str, Any]], output: Pa
 
 
 def write_manifest(
-    campaign_root: Path,
+    experiment_root: Path,
     plan_path: Path,
     cells: list[dict[str, Any]],
     report: dict[str, Any] | None = None,
@@ -1701,7 +1916,7 @@ def write_manifest(
         "schema_version": SCHEMA_VERSION,
         "generated_at_utc": utc_now(),
         "plan_sha256": file_sha256(plan_path),
-        "audit": scan_campaign(campaign_root, cells),
+        "audit": scan_experiment(experiment_root, cells),
         "generated_report": report,
     }
     effective_runset = runset or file_sha256(plan_path)[:12]
@@ -1711,7 +1926,7 @@ def write_manifest(
         ".json",
         nonce=uuid.uuid4().hex[:8],
     )
-    path = campaign_root / "manifests" / name
+    path = experiment_root / "manifests" / name
     atomic_write_json(path, manifest)
     return path
 
@@ -1719,7 +1934,9 @@ def write_manifest(
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group()
-    source.add_argument("--plan", type=Path, help="Fully expanded immutable experiment plan.")
+    source.add_argument(
+        "--plan", type=Path, help="Fully expanded immutable experiment plan."
+    )
     source.add_argument(
         "--matrix-spec",
         type=Path,
@@ -1742,26 +1959,27 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--experiment-root",
         "--campaign-root",
-        dest="campaign_root",
+        dest="experiment_root",
         type=Path,
         help=(
-            "Durable result root (--campaign-root is a backwards-compatible alias). "
+            "Durable result root (--campaign-root is a legacy alias). "
             "Automatic modes default to a versioned, commit-qualified, "
             "content-addressed runset directory under "
-            ".worktrees/benchmark-campaign (path kept for backwards compatibility "
-            "with existing retained runsets)."
+            ".worktrees/benchmark-campaign (legacy path retained for existing runsets)."
         ),
     )
     parser.add_argument(
         "--candidate-root",
         type=Path,
-        help=("Automatic candidate worktree/build root (default: .worktrees/benchmark-candidates)."),
+        help=(
+            "Automatic candidate worktree/build root (default: .worktrees/benchmark-candidates)."
+        ),
     )
     parser.add_argument("--build-jobs", type=int, default=2)
     parser.add_argument(
         "--allow-temporary-experiment-root",
         "--allow-temporary-campaign-root",
-        dest="allow_temporary_campaign_root",
+        dest="allow_temporary_experiment_root",
         action="store_true",
         help="Allow disposable experiment state under the OS temporary directory.",
     )
@@ -1792,8 +2010,10 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.plan is None and args.matrix_spec is None and args.preset is None:
         args.preset = "quick"
-    if args.preset is None and args.campaign_root is None:
-        parser.error("--experiment-root (or --campaign-root) is required with --plan or --matrix-spec")
+    if args.preset is None and args.experiment_root is None:
+        parser.error(
+            "--experiment-root (legacy alias: --campaign-root) is required with --plan or --matrix-spec"
+        )
     if args.build_jobs <= 0:
         parser.error("--build-jobs must be positive")
     candidate_ref_overrides: dict[str, str] = {}
@@ -1813,7 +2033,7 @@ def _commit_datetime_slug(repository: Path, revision: str) -> str:
     return commit_identity(repository, revision)["commit_datetime_slug"]
 
 
-def prepare_automatic_campaign(
+def prepare_automatic_experiment(
     args: argparse.Namespace,
 ) -> tuple[Path, Path]:
     repository = Path(__file__).resolve().parents[1]
@@ -1859,60 +2079,64 @@ def prepare_automatic_campaign(
         "commit_datetime_slug": commit_datetime,
         "tree": tree,
     }
-    campaign_root = (
-        args.campaign_root.expanduser().resolve()
-        if args.campaign_root
+    experiment_root = (
+        args.experiment_root.expanduser().resolve()
+        if args.experiment_root
         else repository
         / ".worktrees"
         / "benchmark-campaign"
-        / automatic_campaign_name(args.preset, source_identity, runset)
+        / automatic_experiment_name(args.preset, source_identity, runset)
     )
-    campaign_root = validate_campaign_root(
-        campaign_root,
-        allow_temporary=args.allow_temporary_campaign_root,
+    experiment_root = validate_experiment_root(
+        experiment_root,
+        allow_temporary=args.allow_temporary_experiment_root,
     )
-    spec_path = campaign_root / "inputs" / automatic_spec_name(args.preset, runset)
+    spec_path = experiment_root / "inputs" / automatic_spec_name(args.preset, runset)
     if spec_path.exists():
         if spec_path.read_bytes() != spec_payload:
-            raise RuntimeError(f"automatic spec path contains different bytes: {spec_path}")
+            raise RuntimeError(
+                f"automatic spec path contains different bytes: {spec_path}"
+            )
     else:
         atomic_write_bytes(spec_path, spec_payload)
-    return campaign_root, spec_path
+    return experiment_root, spec_path
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_arguments(argv)
 
     if args.preset is not None:
-        campaign_root, matrix_spec = prepare_automatic_campaign(args)
+        experiment_root, matrix_spec = prepare_automatic_experiment(args)
         args.matrix_spec = matrix_spec
     else:
-        assert args.campaign_root is not None
-        campaign_root = validate_campaign_root(
-            args.campaign_root,
-            allow_temporary=args.allow_temporary_campaign_root,
+        assert args.experiment_root is not None
+        experiment_root = validate_experiment_root(
+            args.experiment_root,
+            allow_temporary=args.allow_temporary_experiment_root,
         )
 
     minimum_free_bytes = max(0, int(args.minimum_free_gb * 1024**3))
     stale_lock_seconds = max(1, int(args.stale_lock_hours * 3600))
-    ensure_disk_space(campaign_root, minimum_free_bytes)
+    ensure_disk_space(experiment_root, minimum_free_bytes)
     if args.matrix_spec:
         spec_path = args.matrix_spec.expanduser().resolve()
         spec = read_json_object(spec_path)
         plan = expand_matrix_spec(spec)
         plan["matrix_spec_sha256"] = file_sha256(spec_path)
-        archived_spec = campaign_root / "specs" / f"{file_sha256(spec_path)}.json"
+        archived_spec = experiment_root / "specs" / f"{file_sha256(spec_path)}.json"
         if not archived_spec.exists():
             atomic_write_bytes(archived_spec, spec_path.read_bytes())
-        plan_payload = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        plan_payload = (json.dumps(plan, indent=2, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
         plan_digest = hashlib.sha256(plan_payload).hexdigest()
-        plan_path = campaign_root / "plans" / f"{plan_digest}.json"
+        plan_path = experiment_root / "plans" / f"{plan_digest}.json"
         if not plan_path.exists():
             atomic_write_bytes(plan_path, plan_payload)
     else:
         plan_path = args.plan.expanduser().resolve()
         plan = read_json_object(plan_path)
-        archived_plan = campaign_root / "plans" / f"{file_sha256(plan_path)}.json"
+        archived_plan = experiment_root / "plans" / f"{file_sha256(plan_path)}.json"
         if not archived_plan.exists():
             atomic_write_bytes(archived_plan, plan_path.read_bytes())
         plan_path = archived_plan
@@ -1921,7 +2145,7 @@ def main(argv: list[str] | None = None) -> int:
     runset = _validate_runset_identity(runset)
     snapshot_name = generated_artifact_name("environment", runset, ".json")
     atomic_write_json(
-        campaign_root / "environments" / snapshot_name,
+        experiment_root / "environments" / snapshot_name,
         environment_snapshot(plan_path),
     )
 
@@ -1929,20 +2153,20 @@ def main(argv: list[str] | None = None) -> int:
     if not args.audit_only:
         for cell in cells:
             outcome = run_cell(
-                campaign_root,
+                experiment_root,
                 cell,
                 minimum_free_bytes=minimum_free_bytes,
                 stale_lock_seconds=stale_lock_seconds,
             )
             print(json.dumps(outcome, sort_keys=True), flush=True)
             failures += int(outcome["status"] in {"failed", "corrupt"})
-    audit = scan_campaign(campaign_root, cells)
+    audit = scan_experiment(experiment_root, cells)
     report_metadata = None
     if audit["counts"]["complete"]:
         report_path = (
             args.report_out.expanduser().resolve()
             if args.report_out
-            else campaign_root
+            else experiment_root
             / "reports"
             / generated_artifact_name(
                 "report",
@@ -1951,16 +2175,22 @@ def main(argv: list[str] | None = None) -> int:
                 preset=args.preset or "custom",
             )
         )
-        report_metadata = generate_report(campaign_root, cells, report_path)
+        report_metadata = generate_report(experiment_root, cells, report_path)
     manifest_path = write_manifest(
-        campaign_root,
+        experiment_root,
         plan_path,
         cells,
         report_metadata,
         runset=runset,
     )
-    print(json.dumps({"manifest": str(manifest_path), "audit": audit}, indent=2, sort_keys=True))
-    return 1 if failures or audit["counts"]["missing"] or audit["counts"]["corrupt"] else 0
+    print(
+        json.dumps(
+            {"manifest": str(manifest_path), "audit": audit}, indent=2, sort_keys=True
+        )
+    )
+    return (
+        1 if failures or audit["counts"]["missing"] or audit["counts"]["corrupt"] else 0
+    )
 
 
 if __name__ == "__main__":
