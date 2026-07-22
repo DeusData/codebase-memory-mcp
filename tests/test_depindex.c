@@ -1090,6 +1090,18 @@ TEST(test_auto_index_deps_config_limit_policy) {
     ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), 7);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "0"), 0);
     ASSERT_EQ(cbm_dep_auto_index_effective_limit(cfg, CBM_DEFAULT_AUTO_DEP_LIMIT), -1);
+    ASSERT_EQ(
+        cbm_dep_normalize_configured_limit(CBM_MAX_AUTO_DEP_LIMIT, CBM_DEFAULT_AUTO_DEP_LIMIT),
+        CBM_MAX_AUTO_DEP_LIMIT);
+    ASSERT_EQ(cbm_dep_normalize_configured_limit(-1, CBM_DEFAULT_AUTO_DEP_LIMIT),
+              CBM_DEFAULT_AUTO_DEP_LIMIT);
+    ASSERT_EQ(
+        cbm_dep_normalize_configured_limit(CBM_MAX_AUTO_DEP_LIMIT + 1, CBM_MAX_AUTO_DEP_LIMIT + 1),
+        CBM_DEFAULT_AUTO_DEP_LIMIT);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "-1"), 0);
+    char over_limit[CBM_SZ_32];
+    snprintf(over_limit, sizeof(over_limit), "%d", CBM_MAX_AUTO_DEP_LIMIT + 1);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, over_limit), 0);
 
     cbm_config_close(cfg);
     cleanup_fixture_dir(cache_tmp);

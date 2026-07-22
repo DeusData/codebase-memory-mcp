@@ -1052,8 +1052,10 @@ static const tool_def_t TOOLS[] = {
      "Use [\\\"*\\\"] for all indexed projects. Run list_projects to see available projects.\"},"
      "\"auto_index_deps\":{\"type\":\"boolean\",\"description\":"
      "\"Set false to skip dependency package indexing for this call. Default follows config auto_index_deps.\"},"
-     "\"auto_dep_limit\":{\"type\":\"integer\",\"description\":"
-     "\"Dependency package cap for this call. Default follows config auto_dep_limit; 0 means unlimited.\"},"
+     "\"auto_dep_limit\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":"
+     CBM_STRINGIFY(CBM_MAX_AUTO_DEP_LIMIT) ",\"description\":"
+     "\"Dependency package cap for this call from 1 to " CBM_STRINGIFY(CBM_MAX_AUTO_DEP_LIMIT)
+     ". Default follows config auto_dep_limit; 0 means unlimited.\"},"
      "\"name\":{\"type\":\"string\",\"description\":"
      "\"Override the derived project name. Non-ASCII bytes are encoded and unsafe path characters "
      "are normalized.\"},"
@@ -2572,7 +2574,7 @@ static int cbm_mcp_effective_auto_dep_limit(cbm_mcp_server_t *srv, const char *a
     if (cbm_mcp_has_arg(args_json, CBM_CONFIG_AUTO_DEP_LIMIT)) {
         limit = cbm_mcp_get_int_arg(args_json, CBM_CONFIG_AUTO_DEP_LIMIT, limit);
     }
-    return limit <= 0 ? -1 : limit;
+    return cbm_dep_normalize_configured_limit(limit, CBM_DEFAULT_AUTO_DEP_LIMIT);
 }
 
 /* Query routes deliberately cache read-only stores. Mutation routes must never

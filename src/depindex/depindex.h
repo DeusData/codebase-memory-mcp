@@ -48,6 +48,7 @@ static const char *CBM_MANIFEST_FILES[] = {
 #define CBM_DEFAULT_AUTO_INDEX_DEPS false
 #define CBM_DEFAULT_AUTO_INDEX_DEPS_STR "false"
 #define CBM_DEFAULT_AUTO_DEP_LIMIT 20
+#define CBM_MAX_AUTO_DEP_LIMIT 10000
 #define CBM_DEFAULT_DEP_MAX_FILES 1000
 
 /* Config key strings */
@@ -162,5 +163,9 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name);
 /* Effective dependency auto-index limit from config.
  * Return 0 to disable, -1 for unlimited, or a positive package count. */
 int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit);
+
+/* Normalize an enabled auto_dep_limit value: 0 is unlimited, valid positive
+ * values are retained, and out-of-range values fall back to a bounded default. */
+int cbm_dep_normalize_configured_limit(int limit, int default_limit);
 
 #endif /* CBM_DEPINDEX_H */

@@ -6879,6 +6879,10 @@ TEST(cli_config_get_int) {
     cbm_config_set(cfg, "limit", "abc");
     ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
 
+    /* Values outside int range must not wrap into a valid limit. */
+    cbm_config_set(cfg, "limit", "999999999999999999999999");
+    ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
+
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
     PASS();
@@ -6962,6 +6966,9 @@ TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
 
     ASSERT_NOT_NULL(found);
     ASSERT_EQ(atoi(found->default_val), CBM_DEFAULT_AUTO_DEP_LIMIT);
+    char expected_range[CBM_SZ_32];
+    snprintf(expected_range, sizeof(expected_range), "0-%d", CBM_MAX_AUTO_DEP_LIMIT);
+    ASSERT_STR_EQ(found->range, expected_range);
     PASS();
 }
 
