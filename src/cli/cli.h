@@ -299,8 +299,8 @@ int cbm_remove_gemini_hooks(const char *settings_path);
  * SessionStart hook (non-blocking; stdout injected as session context). */
 int cbm_upsert_codex_hooks(const char *config_path);
 int cbm_remove_codex_hooks(const char *config_path);
-int cbm_upsert_gemini_session_hooks(const char *settings_path);
-int cbm_remove_gemini_session_hooks(const char *settings_path);
+int cbm_upsert_gemini_session_hooks(const char *settings_path, const char *binary_path);
+int cbm_remove_gemini_session_hooks(const char *settings_path, const char *binary_path);
 
 #ifdef CBM_JSON_LIKE_ENABLE_TEST_API
 typedef void (*cbm_hook_json_prewrite_test_hook_t)(const char *settings_path, void *context);
@@ -356,6 +356,9 @@ typedef struct cbm_config cbm_config_t;
  * Creates _config.db if it doesn't exist. Returns NULL on error. */
 cbm_config_t *cbm_config_open(const char *cache_dir);
 
+/* Open an existing config store without creating files or schema. */
+cbm_config_t *cbm_config_open_readonly(const char *cache_dir);
+
 /* Close the config store. */
 void cbm_config_close(cbm_config_t *cfg);
 
@@ -383,6 +386,9 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
+/* Production auto-index file cap. A zero configured value means unlimited. */
+#define CBM_DEFAULT_AUTO_INDEX_LIMIT 50000
+#define CBM_DEFAULT_AUTO_INDEX_LIMIT_STR "50000"
 #define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 #define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
 #define CBM_CONFIG_TOOL_MODE "tool_mode"

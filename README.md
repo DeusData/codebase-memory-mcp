@@ -501,13 +501,23 @@ See [docs/cbmignore.md](docs/cbmignore.md) for the full `.cbmignore` how-to: syn
 ## Configuration
 
 ```bash
-codebase-memory-mcp config list                          # show all settings
+codebase-memory-mcp config list                          # show common effective settings
 codebase-memory-mcp config set auto_index true           # auto-index on startup/first use
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
+codebase-memory-mcp config set tool_mode streamlined     # concise surface; reveal advanced tools on demand
+codebase-memory-mcp config set auto_index_deps true      # index installed dependency APIs
+codebase-memory-mcp config set auto_dep_limit 20         # import-ranked dependency package cap; 0=unlimited
+codebase-memory-mcp config preset list                   # list named capability/API configurations
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
 codebase-memory-mcp config set default_response_format json  # full JSON objects instead of compact TOON tables
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+In streamlined mode, call `_hidden_tools` once before advanced tools such as
+`check_index_coverage`, `index_repository`, or `index_dependencies`. Classic mode
+advertises those tools directly. Automatic repository indexing obeys
+`auto_index`/`auto_index_limit`; automatic dependency indexing obeys
+`auto_index_deps`/`auto_dep_limit`.
 
 ### Environment Variables
 
