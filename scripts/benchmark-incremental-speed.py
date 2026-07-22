@@ -5776,7 +5776,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--quality-background-revision",
         default="",
-        help="Commit-ish copied by git archive for --quality-background-repo; campaigns should use a full hash.",
+        help="Commit-ish copied by git archive for --quality-background-repo; experiments should use a full hash.",
     )
     parser.add_argument(
         "--matrix",
@@ -5792,7 +5792,7 @@ def parse_args() -> argparse.Namespace:
         "--repo-revision",
         default="HEAD",
         help=(
-            "Exact commit used for --self-dogfood detached worktrees. Campaigns should pass "
+            "Exact commit used for --self-dogfood detached worktrees. Experiments should pass "
             "a full hash so mutable source HEAD cannot change the measured corpus."
         ),
     )

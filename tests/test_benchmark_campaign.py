@@ -376,7 +376,7 @@ class BenchmarkCampaignTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             temporary_root = Path(tmpdir) / "system-temp"
             campaign_root = temporary_root / "lost-after-reboot"
-            with self.assertRaisesRegex(ValueError, "campaign root is temporary"):
+            with self.assertRaisesRegex(ValueError, "experiment root is temporary"):
                 CAMPAIGN.validate_campaign_root(
                     campaign_root,
                     temporary_root=temporary_root,
