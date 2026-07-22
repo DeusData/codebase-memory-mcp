@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import shutil
@@ -816,11 +817,21 @@ def validate_cell(cell: dict[str, Any], index: int) -> None:
         isinstance(item, str) for item in cell["command"]
     ):
         raise ValueError(f"cells[{index}].command must be a non-empty string array")
+    if not _is_positive_json_integer(cell["repetition"]):
+        raise ValueError(f"cells[{index}].repetition must be a positive integer")
+    timeout_seconds = cell.get("timeout_seconds")
+    if timeout_seconds is not None and not _is_positive_json_number(timeout_seconds):
+        raise ValueError(
+            f"cells[{index}].timeout_seconds must be a positive finite number"
+        )
+    identity_version = cell.get("identity_version", 1)
+    if not _is_json_integer(identity_version) or identity_version not in {1, 2}:
+        raise ValueError(f"cells[{index}].identity_version must be 1 or 2")
     accepted = cell.get("accepted_exit_codes", [0])
     if (
         not isinstance(accepted, list)
         or not accepted
-        or not all(isinstance(code, int) for code in accepted)
+        or not all(_is_json_integer(code) for code in accepted)
     ):
         raise ValueError(
             f"cells[{index}].accepted_exit_codes must be a non-empty integer array"
@@ -839,7 +850,10 @@ def validate_cell(cell: dict[str, Any], index: int) -> None:
 
 
 def validate_plan(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    if plan.get("schema_version") != SCHEMA_VERSION:
+    if (
+        not _is_json_integer(plan.get("schema_version"))
+        or plan.get("schema_version") != SCHEMA_VERSION
+    ):
         raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
     cells = plan.get("cells")
     if not isinstance(cells, list) or not cells:
@@ -868,6 +882,25 @@ def _string_map(value: Any, field: str) -> dict[str, str]:
     return dict(value)
 
 
+def _is_json_integer(value: Any) -> bool:
+    """Return whether a decoded JSON value is an integer rather than a boolean."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_positive_json_integer(value: Any) -> bool:
+    return _is_json_integer(value) and value > 0
+
+
+def _is_positive_json_number(value: Any) -> bool:
+    """Accept finite positive JSON numbers while keeping booleans distinct."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    )
+
+
 def _nonempty_list(value: Any, field: str) -> list[Any]:
     if not isinstance(value, list) or not value:
         raise ValueError(f"{field} must be a non-empty array")
@@ -888,7 +921,10 @@ def _optional_iso_datetime(value: Any, field: str) -> str | None:
 
 def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     """Expand a compact benchmark grid into immutable experiment cells."""
-    if spec.get("schema_version") != SCHEMA_VERSION:
+    if (
+        not _is_json_integer(spec.get("schema_version"))
+        or spec.get("schema_version") != SCHEMA_VERSION
+    ):
         raise ValueError(f"schema_version must be {SCHEMA_VERSION}")
     harness_version = spec.get("harness_version")
     benchmark_script = spec.get("benchmark_script")
@@ -909,9 +945,9 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("benchmark_script must be a non-empty string")
     if not isinstance(cwd, str) or not cwd:
         raise ValueError("cwd must be a non-empty string")
-    if not isinstance(repetitions, int) or repetitions <= 0:
+    if not _is_positive_json_integer(repetitions):
         raise ValueError("repetitions must be a positive integer")
-    if not isinstance(benchmark_timeout, int) or benchmark_timeout <= 0:
+    if not _is_positive_json_integer(benchmark_timeout):
         raise ValueError("timeout_seconds must be a positive integer")
     if index_mode not in {"fast", "moderate", "full"}:
         raise ValueError("index_mode must be fast, moderate, or full")
@@ -925,7 +961,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("capability_quality must be a non-empty argument value")
     if workload not in {"matrix", "self_dogfood"}:
         raise ValueError("workload must be matrix or self_dogfood")
-    if identity_version not in {1, 2}:
+    if not _is_json_integer(identity_version) or identity_version not in {1, 2}:
         raise ValueError("identity_version must be 1 or 2")
     if capability_quality is not None and workload != "matrix":
         raise ValueError(
@@ -990,14 +1026,11 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     if (
         not isinstance(accepted_exit_codes, list)
         or not accepted_exit_codes
-        or not all(
-            isinstance(code, int) and not isinstance(code, bool)
-            for code in accepted_exit_codes
-        )
+        or not all(_is_json_integer(code) for code in accepted_exit_codes)
     ):
         raise ValueError("accepted_exit_codes must be a non-empty integer array")
     cell_timeout = spec.get("cell_timeout_seconds", benchmark_timeout * 4)
-    if not isinstance(cell_timeout, int) or cell_timeout <= 0:
+    if not _is_positive_json_integer(cell_timeout):
         raise ValueError("cell_timeout_seconds must be a positive integer")
     benchmark_path = Path(benchmark_script).expanduser().resolve()
     if not benchmark_path.is_file():
@@ -1145,18 +1178,13 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
                         f"scenarios[{scenario_index}].exact_caps",
                     )
                     if not all(
-                        isinstance(item, int) and item > 0 for item in frontier_values
+                        _is_positive_json_integer(item) for item in frontier_values
                     ):
                         raise ValueError(
                             "frontier_files must contain positive integers"
                         )
                     if not all(
-                        item is None
-                        or (
-                            isinstance(item, int)
-                            and not isinstance(item, bool)
-                            and item > 0
-                        )
+                        item is None or _is_positive_json_integer(item)
                         for item in cap_values
                     ):
                         raise ValueError(

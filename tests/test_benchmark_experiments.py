@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import importlib.util
 import json
@@ -16,6 +17,16 @@ SPEC = importlib.util.spec_from_file_location("run_benchmark_experiments", SCRIP
 assert SPEC and SPEC.loader
 EXPERIMENT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPERIMENT)
+
+BENCHMARK_SCRIPT = (
+    Path(__file__).resolve().parents[1] / "scripts" / "benchmark-incremental-speed.py"
+)
+BENCHMARK_SPEC = importlib.util.spec_from_file_location(
+    "benchmark_incremental_speed_for_experiments", BENCHMARK_SCRIPT
+)
+assert BENCHMARK_SPEC and BENCHMARK_SPEC.loader
+BENCHMARK = importlib.util.module_from_spec(BENCHMARK_SPEC)
+BENCHMARK_SPEC.loader.exec_module(BENCHMARK)
 
 
 def cell(command: list[str], **overrides: object) -> dict:
@@ -343,6 +354,18 @@ class BenchmarkExperimentTest(unittest.TestCase):
                     for item in full["profiles"][1:]
                 )
             )
+            for profile in full["profiles"][1:]:
+                config_items = [
+                    f"{key}={value}"
+                    for key, value in profile.get("config_overrides", {}).items()
+                ]
+                self.assertEqual(
+                    profile["capabilities"],
+                    BENCHMARK.resolve_config_overrides(
+                        profile["config_profile"], config_items
+                    ),
+                    profile["label"],
+                )
             expanded = EXPERIMENT.expand_matrix_spec(quick)
             self.assertEqual(
                 expanded["cells"][0]["parameters"]["repository_background"][
@@ -516,6 +539,28 @@ class BenchmarkExperimentTest(unittest.TestCase):
             variant[key] = changed
             self.assertNotEqual(base_id, EXPERIMENT.cell_identity(variant), key)
 
+    def test_plan_rejects_boolean_values_for_integer_fields(self) -> None:
+        for field, value in (
+            ("repetition", True),
+            ("timeout_seconds", True),
+            ("identity_version", True),
+            ("accepted_exit_codes", [False]),
+        ):
+            invalid = cell(["benchmark", "{result_path}"])
+            invalid[field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, field):
+                EXPERIMENT.validate_plan(
+                    {"schema_version": EXPERIMENT.SCHEMA_VERSION, "cells": [invalid]}
+                )
+
+        with self.assertRaisesRegex(ValueError, "schema_version"):
+            EXPERIMENT.validate_plan(
+                {
+                    "schema_version": True,
+                    "cells": [cell(["benchmark", "{result_path}"])],
+                }
+            )
+
     def test_matrix_spec_expands_structured_frontier_cap_and_repetition_cells(
         self,
     ) -> None:
@@ -581,6 +626,27 @@ class BenchmarkExperimentTest(unittest.TestCase):
             )
             self.assertIn("--frontier-files", first["command"])
             self.assertIn("incremental_exact_max_affected_paths=4", first["command"])
+
+            invalid_values = (
+                ("schema_version", True),
+                ("identity_version", True),
+                ("repetitions", True),
+                ("timeout_seconds", True),
+                ("cell_timeout_seconds", True),
+            )
+            for field, value in invalid_values:
+                invalid = copy.deepcopy(spec)
+                invalid[field] = value
+                with (
+                    self.subTest(field=field),
+                    self.assertRaisesRegex(ValueError, field),
+                ):
+                    EXPERIMENT.expand_matrix_spec(invalid)
+
+            invalid = copy.deepcopy(spec)
+            invalid["scenarios"][0]["frontier_files"] = [True]
+            with self.assertRaisesRegex(ValueError, "frontier_files"):
+                EXPERIMENT.expand_matrix_spec(invalid)
 
     def test_matrix_spec_rejects_candidate_sha_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
