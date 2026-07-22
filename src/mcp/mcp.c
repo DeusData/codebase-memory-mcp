@@ -2623,6 +2623,27 @@ static int cbm_mcp_auto_index_deps(cbm_mcp_server_t *srv, const char *project,
     return deps_reindexed;
 }
 
+/* Complete the shared post-index work against a writable handle. Query routes
+ * cache read-only handles, so both session-root and explicit-path auto-indexing
+ * must use this path before returning the resolved query store. */
+static void cbm_mcp_refresh_auto_indexed_store(cbm_mcp_server_t *srv,
+                                               cbm_store_t *resolved_store,
+                                               const char *project,
+                                               const char *root_path) {
+    cbm_store_t *owned_writable_store = NULL;
+    cbm_store_t *writable_store =
+        cbm_mcp_writable_existing_store(resolved_store, &owned_writable_store);
+    if (writable_store) {
+        int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
+        (void)cbm_mcp_auto_index_deps(srv, project, root_path, writable_store,
+                                      effective_dep_limit, NULL);
+        cbm_pagerank_compute_with_config(writable_store, project, srv->config);
+    }
+    if (owned_writable_store) {
+        cbm_store_close(owned_writable_store);
+    }
+}
+
 static int cbm_mcp_auto_index_limit(cbm_mcp_server_t *srv) {
     return cbm_config_get_effective_int(srv ? srv->config : NULL, CBM_CONFIG_AUTO_INDEX_LIMIT,
                                         CBM_DEFAULT_AUTO_INDEX_LIMIT);
@@ -5560,20 +5581,8 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
                 srv->current_project = NULL;
                 store = resolve_store(srv, srv->session_project);
                 if (store) {
-                    cbm_store_t *owned_writable_store = NULL;
-                    cbm_store_t *writable_store =
-                        cbm_mcp_writable_existing_store(store, &owned_writable_store);
-                    int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
-                    if (writable_store) {
-                        (void)cbm_mcp_auto_index_deps(srv, srv->session_project,
-                                                      srv->session_root, writable_store,
-                                                      effective_dep_limit, NULL);
-                        cbm_pagerank_compute_with_config(writable_store, srv->session_project,
-                                                         srv->config);
-                    }
-                    if (owned_writable_store) {
-                        cbm_store_close(owned_writable_store);
-                    }
+                    cbm_mcp_refresh_auto_indexed_store(srv, store, srv->session_project,
+                                                       srv->session_root);
                 }
             }
         }
@@ -5593,23 +5602,7 @@ static cbm_store_t *resolve_project_store(cbm_mcp_server_t *srv,
             if (cbm_mcp_run_sync_auto_index(srv, _raw_path, "autoindex.path", "path", _raw_path)) {
                 store = resolve_store(srv, db_project);
                 if (store) {
-                    cbm_store_t *owned_writable_store = NULL;
-                    cbm_store_t *writable_store =
-                        cbm_mcp_writable_existing_store(store, &owned_writable_store);
-                    if (writable_store) {
-                        /* Mirror the session-root branch: dependency
-                         * auto-indexing honors auto_index_deps /
-                         * auto_dep_limit and runs BEFORE rank computation so
-                         * rank sees dependency nodes. */
-                        int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
-                        (void)cbm_mcp_auto_index_deps(srv, db_project, _raw_path,
-                                                      writable_store, effective_dep_limit,
-                                                      NULL);
-                        cbm_pagerank_compute_with_config(writable_store, db_project, srv->config);
-                    }
-                    if (owned_writable_store) {
-                        cbm_store_close(owned_writable_store);
-                    }
+                    cbm_mcp_refresh_auto_indexed_store(srv, store, db_project, _raw_path);
                 }
             }
         }
