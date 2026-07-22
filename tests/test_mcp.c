@@ -974,6 +974,10 @@ TEST(mcp_get_int_arg) {
     ASSERT_EQ(val, 5);
     val = cbm_mcp_get_int_arg(args, "missing", 42);
     ASSERT_EQ(val, 42);
+    val = cbm_mcp_get_int_arg("{\"limit\":4294967297}", "limit", 17);
+    ASSERT_EQ(val, 17);
+    val = cbm_mcp_get_int_arg("{\"limit\":-9223372036854775808}", "limit", 19);
+    ASSERT_EQ(val, 19);
     PASS();
 }
 
