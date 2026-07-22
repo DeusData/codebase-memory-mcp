@@ -84,6 +84,7 @@ enum {
 #include <fcntl.h>
 #endif
 #include <yyjson/yyjson.h>
+#include <limits.h> // INT_MIN, INT_MAX
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
@@ -2223,8 +2224,16 @@ int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val)
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *val = yyjson_obj_get(root, key);
     int result = default_val;
-    if (val && yyjson_is_int(val)) {
-        result = yyjson_get_int(val);
+    if (val && yyjson_is_sint(val)) {
+        int64_t parsed = yyjson_get_sint(val);
+        if (parsed >= INT_MIN && parsed <= INT_MAX) {
+            result = (int)parsed;
+        }
+    } else if (val && yyjson_is_uint(val)) {
+        uint64_t parsed = yyjson_get_uint(val);
+        if (parsed <= INT_MAX) {
+            result = (int)parsed;
+        }
     }
     yyjson_doc_free(doc);
     return result;
