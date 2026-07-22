@@ -10413,8 +10413,9 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {"auto_dep_limit", "20", NULL, "Dependencies",
      "Max number of packages to auto-index",
      "0-10000",
-     "20 covers the most-used imports. Raise to 100+ for comprehensive dependency analysis. "
-     "0 = unlimited (may be very slow for large dependency trees)."},
+     "When more packages are installed than this limit, the most-imported packages are selected "
+     "(ranked by project import references, ties broken by name). Raise to 100+ for comprehensive "
+     "dependency analysis. 0 = unlimited (may be very slow for large dependency trees)."},
     {"dep_max_files", "1000", NULL, "Dependencies",
      "Max source files per dependency package (0=unlimited)",
      "0-1000000",
