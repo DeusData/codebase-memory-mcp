@@ -508,6 +508,8 @@ codebase-memory-mcp config set tool_mode streamlined     # concise surface; reve
 codebase-memory-mcp config set auto_index_deps true      # index installed dependency APIs
 codebase-memory-mcp config set auto_dep_limit 20         # import-ranked dependency package cap; 0=unlimited
 codebase-memory-mcp config preset list                   # list named capability/API configurations
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-disabled
+codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-enabled
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
 codebase-memory-mcp config set default_response_format json  # full JSON objects instead of compact TOON tables
 codebase-memory-mcp config reset auto_index              # reset to default
@@ -520,7 +522,9 @@ indexing and first-response codebase context are automatic when configured. Use
 directly and uses `search_graph`, then `trace_path`, then `get_code_snippet` for
 structural discovery. Automatic repository indexing obeys
 `auto_index`/`auto_index_limit`; automatic dependency indexing obeys
-`auto_index_deps`/`auto_dep_limit`.
+`auto_index_deps`/`auto_dep_limit` and is disabled by default. Explicit
+`index_dependencies` calls remain available; disabling automation does not delete
+dependency projects that are already indexed.
 
 ### Environment Variables
 

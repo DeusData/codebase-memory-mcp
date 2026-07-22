@@ -2557,7 +2557,9 @@ static int cbm_mcp_overlay_compaction_max_generations(cbm_mcp_server_t *srv) {
 }
 
 static int cbm_mcp_effective_auto_dep_limit(cbm_mcp_server_t *srv, const char *args_json) {
-    bool enabled = cbm_config_get_bool(srv ? srv->config : NULL, CBM_CONFIG_AUTO_INDEX_DEPS, true);
+    bool enabled = cbm_config_get_bool(srv ? srv->config : NULL,
+                                       CBM_CONFIG_AUTO_INDEX_DEPS,
+                                       CBM_DEFAULT_AUTO_INDEX_DEPS);
     if (cbm_mcp_has_arg(args_json, CBM_CONFIG_AUTO_INDEX_DEPS)) {
         enabled = cbm_mcp_get_bool_arg_default(args_json, CBM_CONFIG_AUTO_INDEX_DEPS, enabled);
     }

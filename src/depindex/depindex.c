@@ -740,10 +740,8 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
 /* ── Auto-Index ────────────────────────────────────────────────── */
 
 int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit) {
-    if (!cfg) {
-        return default_limit;
-    }
-    if (!cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true)) {
+    if (!cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS,
+                             CBM_DEFAULT_AUTO_INDEX_DEPS)) {
         return 0;
     }
 

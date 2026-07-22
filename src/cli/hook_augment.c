@@ -1158,7 +1158,7 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
         .auto_index = true,
         .context_injection = true,
         .auto_watch = true,
-        .auto_index_deps = true,
+        .auto_index_deps = CBM_DEFAULT_AUTO_INDEX_DEPS,
         .auto_index_limit = CBM_DEFAULT_AUTO_INDEX_LIMIT,
         .auto_dep_limit = CBM_DEFAULT_AUTO_DEP_LIMIT,
     };
@@ -1171,8 +1171,8 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
     result.context_injection =
         cbm_config_get_effective_bool(cfg, CBM_CONFIG_CONTEXT_INJECTION, true);
     result.auto_watch = cbm_config_get_effective_bool(cfg, CBM_CONFIG_AUTO_WATCH, true);
-    result.auto_index_deps =
-        cbm_config_get_effective_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true);
+    result.auto_index_deps = cbm_config_get_effective_bool(
+        cfg, CBM_CONFIG_AUTO_INDEX_DEPS, CBM_DEFAULT_AUTO_INDEX_DEPS);
     result.auto_index_limit =
         cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT,
                                      CBM_DEFAULT_AUTO_INDEX_LIMIT);
