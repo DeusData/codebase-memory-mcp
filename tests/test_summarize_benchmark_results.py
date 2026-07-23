@@ -27,6 +27,76 @@ def report(case: dict, sha: str = "a" * 64) -> dict:
 
 
 class SummarizeBenchmarkResultsTest(unittest.TestCase):
+    def test_report_canonicalizes_pre_rename_configuration_spellings(self) -> None:
+        item = report(
+            {
+                "passed": True,
+                "initial_fast_full": {"elapsed_ms": 100},
+                "incremental": {"elapsed_ms": 10},
+                "fresh_fast_full_after_change": {"elapsed_ms": 90},
+                "canonical_graph": {"equal": True},
+                "graph_gate": {"passed": True},
+                "oracles": {"passed": True},
+            }
+        )
+        item["parameters"] = {
+            "config_profile": "incremental_semantic_freshness_eager",
+            "config_overrides": {
+                "incremental_derived_refresh": "eager",
+                "incremental_reindex": "off",
+                "rank_refresh": "stale_on_incremental",
+            },
+        }
+
+        row = SUMMARY.summarize_group("eager-derived-freshness", [item])
+        markdown = SUMMARY.render_markdown([row])
+
+        self.assertEqual(row["candidate"], "derived-results-refresh-at-publish")
+        self.assertIn(
+            "incremental_derived_results_refresh=at_publish", row["capabilities"]
+        )
+        self.assertIn(
+            "incremental_derived_results_refresh_at_publish", row["capabilities"]
+        )
+        self.assertIn("incremental_reindex=full_rebuild", row["capabilities"])
+        self.assertIn(
+            "rank_refresh=defer_all_incremental_reindexes", row["capabilities"]
+        )
+        self.assertNotIn("incremental_derived_refresh=eager", row["capabilities"])
+        self.assertNotIn("incremental_semantic_freshness_eager", row["capabilities"])
+        self.assertIn(
+            "recorded configuration spellings used before the canonical rename",
+            markdown,
+        )
+
+    def test_config_canonicalization_rejects_conflicting_old_and_new_values(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "conflicting retained config values after canonicalization"
+        ):
+            SUMMARY.canonical_config_overrides(
+                {
+                    "incremental_derived_refresh": "eager",
+                    "incremental_derived_results_refresh": (
+                        "defer_all_incremental_reindexes"
+                    ),
+                }
+            )
+
+    def test_config_canonicalization_deduplicates_equivalent_old_and_new_values(
+        self,
+    ) -> None:
+        self.assertEqual(
+            SUMMARY.canonical_config_overrides(
+                {
+                    "incremental_derived_refresh": "eager",
+                    "incremental_derived_results_refresh": "at_publish",
+                }
+            ),
+            {"incremental_derived_results_refresh": "at_publish"},
+        )
+
     def test_query_summary_separates_cold_default_from_repeated_json_latency(
         self,
     ) -> None:

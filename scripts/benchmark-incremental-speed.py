@@ -31,6 +31,17 @@ from pathlib import Path
 from typing import Any
 
 
+CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name(
+    "benchmark-config-spellings-v1.json"
+)
+with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
+    CONFIG_SPELLING_SPEC = json.load(stream)
+if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
+    raise RuntimeError(
+        f"unsupported benchmark config spelling schema: {CONFIG_SPELLING_SPEC_PATH}"
+    )
+
+
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
 BENCHMARK_RUN_CONTEXT_ENV = "CBM_BENCHMARK_RUN_CONTEXT"
 BENCHMARK_FACT_SCHEMA_VERSION = 1
@@ -83,11 +94,36 @@ CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED = "semantic_edges_disabled"
 CONFIG_PROFILE_GIT_HISTORY_DISABLED = "git_history_disabled"
 CONFIG_PROFILE_HTTP_LINKS_DISABLED = "http_links_disabled"
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
-CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER = (
-    "incremental_semantic_freshness_eager"
-)
+CONFIG_PROFILE_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH = CONFIG_SPELLING_SPEC[
+    "profiles"
+]["derived_results_refresh_at_publish"]["canonical"]
 CONFIG_PROFILE_MINIMAL_INDEXING = "minimal_indexing"
 DERIVED_REFRESH_CANDIDATE_DEFAULT = "candidate_default"
+CONFIG_SPELLING_CANONICAL = "canonical"
+CONFIG_SPELLING_PRE_RENAME = "pre_rename"
+CONFIG_SPELLING_MODES: dict[tuple[str, int, int], str] = {}
+CONFIG_SPELLING_MODES_LOCK = threading.Lock()
+CONFIG_OVERRIDE_SPELLINGS = {
+    entry["id"]: entry for entry in CONFIG_SPELLING_SPEC["config_overrides"]
+}
+PRE_RENAME_CONFIG_SPELLINGS = {
+    (entry["canonical"]["key"], entry["canonical"]["value"]): (
+        entry["historical"]["key"],
+        entry["historical"]["value"],
+    )
+    for entry in CONFIG_SPELLING_SPEC["config_overrides"]
+}
+DERIVED_RESULTS_AT_PUBLISH_OVERRIDE = CONFIG_OVERRIDE_SPELLINGS[
+    "incremental_derived_results_refresh_at_publish"
+]["canonical"]
+RANK_REFRESH_DEFAULT_SPELLINGS = CONFIG_OVERRIDE_SPELLINGS[
+    "rank_refresh_defer_all_incremental_reindexes"
+]
+RANK_REFRESH_POLICIES = tuple(
+    entry["canonical"]["value"]
+    for entry in CONFIG_SPELLING_SPEC["config_overrides"]
+    if entry["canonical"]["key"] == "rank_refresh"
+)
 PRODUCT_DEFAULT_GRAPH_CAPABILITIES = {
     "auto_index_deps": "false",
     "rank_enabled": "true",
@@ -125,9 +161,11 @@ CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_HTTP_LINKS_DISABLED: product_default_graph_capabilities(
         httplinks_enabled="false"
     ),
-    CONFIG_PROFILE_INCREMENTAL_SEMANTIC_FRESHNESS_EAGER: {
+    CONFIG_PROFILE_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH: {
         **product_default_graph_capabilities(),
-        "incremental_derived_refresh": "eager",
+        DERIVED_RESULTS_AT_PUBLISH_OVERRIDE["key"]: DERIVED_RESULTS_AT_PUBLISH_OVERRIDE[
+            "value"
+        ],
     },
     CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: product_default_graph_capabilities(
         rank_enabled="false",
@@ -494,7 +532,36 @@ def report_scope_manifest(report: dict[str, Any]) -> dict[str, Any]:
     return scope
 
 
-def report_cache_manifest(report: dict[str, Any]) -> dict[str, Any]:
+def report_cache_manifest(
+    report: dict[str, Any], imported_report: bool
+) -> dict[str, Any]:
+    if imported_report:
+        recorded = report.get("cache")
+        if isinstance(recorded, dict):
+            return recorded
+        return {
+            "process": unknown_fact(
+                "imported_report_did_not_record_process_cache_state"
+            ),
+            "repository_graph": unknown_fact(
+                "imported_report_did_not_record_repository_graph_cache_state"
+            ),
+            "dependency_artifacts": unknown_fact(
+                "imported_report_did_not_record_dependency_cache_identity"
+            ),
+            "os_page_cache": unknown_fact(
+                "imported_report_did_not_record_os_page_cache_state"
+            ),
+            "sqlite_page_cache": unknown_fact(
+                "imported_report_did_not_record_sqlite_page_cache_state"
+            ),
+            "parser_compiler_cache": unknown_fact(
+                "imported_report_did_not_record_parser_compiler_cache_state"
+            ),
+            "fixture_cache": unknown_fact(
+                "imported_report_did_not_record_fixture_cache_state"
+            ),
+        }
     parameters = report.get("parameters")
     parameters = parameters if isinstance(parameters, dict) else {}
     transport = parameters.get("transport")
@@ -561,10 +628,10 @@ def fact_step_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
                     "dependency_occurrence_ids": [],
                     "elapsed_ms": float(elapsed),
                     "monotonic_start_ns": unknown_fact(
-                        "legacy_profile_marker_did_not_record_start_timestamp"
+                        "profile_marker_did_not_record_start_timestamp"
                     ),
                     "monotonic_end_ns": unknown_fact(
-                        "legacy_profile_marker_did_not_record_end_timestamp"
+                        "profile_marker_did_not_record_end_timestamp"
                     ),
                     "cpu_ms": unknown_fact("cpu_time_not_recorded"),
                     "cpu_scope": "unknown",
@@ -575,7 +642,7 @@ def fact_step_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
                         "peak_rss_mb", unknown_fact("peak_rss_not_recorded")
                     ),
                     "work_counters": {},
-                    "provenance": "normalized_existing_report_measurement",
+                    "provenance": "normalized_report_measurement",
                 }
                 rows.append(row)
                 current_parent = occurrence_id
@@ -603,10 +670,10 @@ def fact_step_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]]:
                                 "dependency_occurrence_ids": [],
                                 "elapsed_ms": float(duration),
                                 "monotonic_start_ns": unknown_fact(
-                                    "legacy_component_marker_did_not_record_start_timestamp"
+                                    "component_marker_did_not_record_start_timestamp"
                                 ),
                                 "monotonic_end_ns": unknown_fact(
-                                    "legacy_component_marker_did_not_record_end_timestamp"
+                                    "component_marker_did_not_record_end_timestamp"
                                 ),
                                 "cpu_ms": unknown_fact("cpu_time_not_recorded"),
                                 "cpu_scope": "unknown",
@@ -730,11 +797,17 @@ def fact_artifact_rows(report: dict[str, Any], run_id: str) -> list[dict[str, An
 
 
 def normalize_benchmark_report(
-    report: dict[str, Any], context: dict[str, Any] | None = None
+    report: dict[str, Any],
+    context: dict[str, Any] | None = None,
+    *,
+    imported_report: bool | None = None,
 ) -> dict[str, Any]:
     if not isinstance(report, dict):
         raise ValueError("benchmark report must be a JSON object")
     resolved_context = dict(context or {})
+    is_imported_report = (
+        not bool(resolved_context) if imported_report is None else imported_report
+    )
     implementation = report_implementation_identity(report, resolved_context)
     run_identity = {
         "generated_at_utc": report.get("generated_at_utc"),
@@ -786,8 +859,8 @@ def normalize_benchmark_report(
         ),
         "capabilities": report_capability_manifest(report, resolved_context),
         "scope": report_scope_manifest(report),
-        "cache": report_cache_manifest(report),
-        "legacy_import": not bool(resolved_context),
+        "cache": report_cache_manifest(report, is_imported_report),
+        "legacy_import": is_imported_report,
     }
     return {
         "$schema": BENCHMARK_FACT_SCHEMA,
@@ -2892,9 +2965,75 @@ def indexed_work_elapsed_ms(logged_elapsed_ms: dict[str, int | None]) -> int | N
     return logged_elapsed_ms.get("pipeline_done")
 
 
+def candidate_binary_identity(binary: Path) -> tuple[str, int, int]:
+    resolved = binary.resolve()
+    metadata = resolved.stat()
+    return str(resolved), metadata.st_mtime_ns, metadata.st_size
+
+
+def config_spelling_mode(binary: Path, env: dict[str, str], timeout: int) -> str:
+    identity = candidate_binary_identity(binary)
+    with CONFIG_SPELLING_MODES_LOCK:
+        cached = CONFIG_SPELLING_MODES.get(identity)
+        if cached is not None:
+            return cached
+
+        with tempfile.TemporaryDirectory(
+            prefix="cbm-config-spelling-probe-"
+        ) as cache_dir:
+            probe_env = dict(env)
+            probe_env["CBM_CACHE_DIR"] = cache_dir
+            canonical_cmd = [
+                str(binary),
+                "config",
+                "set",
+                RANK_REFRESH_DEFAULT_SPELLINGS["canonical"]["key"],
+                RANK_REFRESH_DEFAULT_SPELLINGS["canonical"]["value"],
+            ]
+            canonical, canonical_elapsed_ms = command_result(
+                canonical_cmd, probe_env, timeout
+            )
+            if canonical.returncode == 0:
+                CONFIG_SPELLING_MODES[identity] = CONFIG_SPELLING_CANONICAL
+                return CONFIG_SPELLING_CANONICAL
+
+            pre_rename_cmd = [
+                str(binary),
+                "config",
+                "set",
+                RANK_REFRESH_DEFAULT_SPELLINGS["historical"]["key"],
+                RANK_REFRESH_DEFAULT_SPELLINGS["historical"]["value"],
+            ]
+            pre_rename, pre_rename_elapsed_ms = command_result(
+                pre_rename_cmd, probe_env, timeout
+            )
+            if pre_rename.returncode == 0:
+                CONFIG_SPELLING_MODES[identity] = CONFIG_SPELLING_PRE_RENAME
+                return CONFIG_SPELLING_PRE_RENAME
+    raise command_failure(
+        "config_spelling_probe",
+        pre_rename_cmd,
+        probe_env,
+        pre_rename,
+        pre_rename_elapsed_ms,
+    ) from command_failure(
+        "config_spelling_probe_canonical",
+        canonical_cmd,
+        probe_env,
+        canonical,
+        canonical_elapsed_ms,
+    )
+
+
 def run_config_set(
     binary: Path, env: dict[str, str], key: str, value: str, timeout: int
 ) -> None:
+    canonical = (key, value)
+    if (
+        canonical in PRE_RENAME_CONFIG_SPELLINGS
+        and config_spelling_mode(binary, env, timeout) == CONFIG_SPELLING_PRE_RENAME
+    ):
+        key, value = PRE_RENAME_CONFIG_SPELLINGS[canonical]
     cmd = [str(binary), "config", "set", key, value]
     proc, elapsed_ms = command_result(cmd, env, timeout)
     if proc.returncode != 0:
@@ -5320,7 +5459,7 @@ def evaluate_pair_incremental_policy(
     canonical_graph: dict[str, Any],
     pair_equality: dict[str, Any],
 ) -> dict[str, Any]:
-    explicit_policy = config_overrides.get("incremental_derived_refresh")
+    explicit_policy = config_overrides.get("incremental_derived_results_refresh")
     policy = explicit_policy or DERIVED_REFRESH_CANDIDATE_DEFAULT
     policy_source = "explicit_override" if explicit_policy else "candidate_default"
     warnings = (
@@ -5338,7 +5477,7 @@ def evaluate_pair_incremental_policy(
     )
     immediate_freshness_met = bool(pair_freshness_met and canonical_graph.get("equal"))
     if explicit_policy:
-        immediate_freshness_expected: bool | None = policy == "eager"
+        immediate_freshness_expected: bool | None = policy == "at_publish"
         policy_conformance_met = (
             immediate_freshness_met and not stale_warning_present
             if immediate_freshness_expected
@@ -5378,8 +5517,8 @@ def evaluate_pair_incremental_policy(
         "stale_warning_present": stale_warning_present,
         "policy_conformance_met": policy_conformance_met,
         "interpretation": (
-            "eager policy requires canonical fresh semantic/similarity results"
-            if explicit_policy == "eager"
+            "at_publish policy requires canonical fresh semantic/similarity results"
+            if explicit_policy == "at_publish"
             else "explicit deferred policy requires a stale warning or canonical freshness"
             if explicit_policy
             else "candidate default is classified from observed pair freshness and warnings"
@@ -6355,9 +6494,7 @@ def parse_args() -> argparse.Namespace:
         "--rank-refresh",
         choices=(
             RANK_REFRESH_CANDIDATE_DEFAULT,
-            "eager",
-            "stale_on_exact",
-            "stale_on_incremental",
+            *RANK_REFRESH_POLICIES,
         ),
         default=DEFAULT_RANK_REFRESH,
         help=(
@@ -6572,7 +6709,7 @@ def main() -> int:
                 raise ValueError("legacy benchmark report must be a JSON object")
             embedded_context = report.get("benchmark_run_context")
             context = embedded_context if isinstance(embedded_context, dict) else {}
-            facts = normalize_benchmark_report(report, context)
+            facts = normalize_benchmark_report(report, context, imported_report=True)
             facts["artifacts"].append(
                 {
                     "run_id": facts["runs"][0]["run_id"],

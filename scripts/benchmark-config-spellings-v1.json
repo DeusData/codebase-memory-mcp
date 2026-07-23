@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "derived_results_refresh_at_publish": {
+      "canonical": "incremental_derived_results_refresh_at_publish",
+      "historical": [
+        "incremental_semantic_freshness_eager"
+      ]
+    }
+  },
+  "experiment_labels": {
+    "derived_results_refresh_at_publish": {
+      "canonical": "derived-results-refresh-at-publish",
+      "historical": [
+        "eager-derived-freshness"
+      ]
+    }
+  },
+  "config_overrides": [
+    {
+      "id": "incremental_reindex_full_rebuild",
+      "canonical": {
+        "key": "incremental_reindex",
+        "value": "full_rebuild"
+      },
+      "historical": {
+        "key": "incremental_reindex",
+        "value": "off"
+      }
+    },
+    {
+      "id": "incremental_reindex_fast_mode_indexes_only",
+      "canonical": {
+        "key": "incremental_reindex",
+        "value": "fast_mode_indexes_only"
+      },
+      "historical": {
+        "key": "incremental_reindex",
+        "value": "fast"
+      }
+    },
+    {
+      "id": "incremental_derived_results_refresh_at_publish",
+      "canonical": {
+        "key": "incremental_derived_results_refresh",
+        "value": "at_publish"
+      },
+      "historical": {
+        "key": "incremental_derived_refresh",
+        "value": "eager"
+      }
+    },
+    {
+      "id": "incremental_derived_results_refresh_defer_exact_delta_reindexes",
+      "canonical": {
+        "key": "incremental_derived_results_refresh",
+        "value": "defer_exact_delta_reindexes"
+      },
+      "historical": {
+        "key": "incremental_derived_refresh",
+        "value": "stale_on_exact"
+      }
+    },
+    {
+      "id": "incremental_derived_results_refresh_defer_all_incremental_reindexes",
+      "canonical": {
+        "key": "incremental_derived_results_refresh",
+        "value": "defer_all_incremental_reindexes"
+      },
+      "historical": {
+        "key": "incremental_derived_refresh",
+        "value": "stale_on_incremental"
+      }
+    },
+    {
+      "id": "rank_refresh_at_publish",
+      "canonical": {
+        "key": "rank_refresh",
+        "value": "at_publish"
+      },
+      "historical": {
+        "key": "rank_refresh",
+        "value": "eager"
+      }
+    },
+    {
+      "id": "rank_refresh_defer_exact_delta_reindexes",
+      "canonical": {
+        "key": "rank_refresh",
+        "value": "defer_exact_delta_reindexes"
+      },
+      "historical": {
+        "key": "rank_refresh",
+        "value": "stale_on_exact"
+      }
+    },
+    {
+      "id": "rank_refresh_defer_all_incremental_reindexes",
+      "canonical": {
+        "key": "rank_refresh",
+        "value": "defer_all_incremental_reindexes"
+      },
+      "historical": {
+        "key": "rank_refresh",
+        "value": "stale_on_incremental"
+      }
+    }
+  ]
+}

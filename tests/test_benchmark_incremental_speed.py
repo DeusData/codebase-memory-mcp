@@ -7,6 +7,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -230,13 +231,115 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
     def test_explicit_rank_refresh_writes_config_override(self) -> None:
         with mock.patch.object(BENCHMARK, "run_config_set") as run:
             applied = BENCHMARK.apply_rank_refresh_override(
-                Path("/tmp/cbm"), {}, "stale_on_exact", 30
+                Path("/tmp/cbm"), {}, "defer_exact_delta_reindexes", 30
             )
 
         self.assertTrue(applied)
         run.assert_called_once_with(
-            Path("/tmp/cbm"), {}, "rank_refresh", "stale_on_exact", 30
+            Path("/tmp/cbm"), {}, "rank_refresh", "defer_exact_delta_reindexes", 30
         )
+
+    def test_config_set_probes_registered_rank_policy_once_for_pre_rename_candidate(
+        self,
+    ) -> None:
+        binary = Path("/tmp/cbm-legacy")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="unsupported")
+        passed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        BENCHMARK.CONFIG_SPELLING_MODES.clear()
+        self.addCleanup(BENCHMARK.CONFIG_SPELLING_MODES.clear)
+        with (
+            mock.patch.object(
+                BENCHMARK,
+                "candidate_binary_identity",
+                return_value=("legacy", 1, 2),
+            ),
+            mock.patch.object(
+                BENCHMARK,
+                "command_result",
+                side_effect=[
+                    (failed, 1.0),
+                    (passed, 1.0),
+                    (passed, 1.0),
+                    (passed, 1.0),
+                ],
+            ) as run,
+        ):
+            BENCHMARK.run_config_set(
+                binary,
+                {},
+                "incremental_derived_results_refresh",
+                "at_publish",
+                30,
+            )
+            BENCHMARK.run_config_set(
+                binary,
+                {},
+                "rank_refresh",
+                "defer_exact_delta_reindexes",
+                30,
+            )
+
+        self.assertEqual(
+            [call.args[0][3:] for call in run.call_args_list],
+            [
+                ["rank_refresh", "defer_all_incremental_reindexes"],
+                ["rank_refresh", "stale_on_incremental"],
+                ["incremental_derived_refresh", "eager"],
+                ["rank_refresh", "stale_on_exact"],
+            ],
+        )
+        probe_envs = [run.call_args_list[index].args[1] for index in (0, 1)]
+        self.assertTrue(all(env.get("CBM_CACHE_DIR") for env in probe_envs))
+        self.assertEqual(probe_envs[0]["CBM_CACHE_DIR"], probe_envs[1]["CBM_CACHE_DIR"])
+        self.assertEqual(run.call_args_list[2].args[1], {})
+        self.assertEqual(run.call_args_list[3].args[1], {})
+
+    def test_config_spelling_probe_runs_once_across_concurrent_workers(self) -> None:
+        binary = Path("/tmp/cbm-current")
+        passed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        barrier = threading.Barrier(3)
+        modes: list[str] = []
+        BENCHMARK.CONFIG_SPELLING_MODES.clear()
+        self.addCleanup(BENCHMARK.CONFIG_SPELLING_MODES.clear)
+
+        def worker() -> None:
+            barrier.wait()
+            modes.append(BENCHMARK.config_spelling_mode(binary, {}, 30))
+
+        with (
+            mock.patch.object(
+                BENCHMARK,
+                "candidate_binary_identity",
+                return_value=("current", 1, 2),
+            ),
+            mock.patch.object(
+                BENCHMARK, "command_result", return_value=(passed, 1.0)
+            ) as run,
+        ):
+            workers = [threading.Thread(target=worker) for _ in range(2)]
+            for thread in workers:
+                thread.start()
+            barrier.wait()
+            for thread in workers:
+                thread.join()
+
+        self.assertEqual(modes, [BENCHMARK.CONFIG_SPELLING_CANONICAL] * 2)
+        run.assert_called_once()
+
+    def test_config_set_skips_spelling_probe_for_unchanged_key_value(self) -> None:
+        passed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with (
+            mock.patch.object(BENCHMARK, "config_spelling_mode") as probe,
+            mock.patch.object(
+                BENCHMARK, "command_result", return_value=(passed, 1.0)
+            ) as run,
+        ):
+            BENCHMARK.run_config_set(
+                Path("/tmp/cbm-upstream"), {}, "auto_index_deps", "false", 30
+            )
+
+        probe.assert_not_called()
+        self.assertEqual(run.call_args.args[0][3:], ["auto_index_deps", "false"])
 
     def test_stream_query_fingerprint_is_ordered_bounded_and_change_sensitive(
         self,
@@ -783,18 +886,18 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(unreported_stale["observed_behavior"], "unreported_stale")
         self.assertFalse(unreported_stale["policy_conformance_met"])
 
-        eager = BENCHMARK.evaluate_pair_incremental_policy(
-            {"incremental_derived_refresh": "eager"},
+        at_publish = BENCHMARK.evaluate_pair_incremental_policy(
+            {"incremental_derived_results_refresh": "at_publish"},
             stale_index,
             {"passed": True, "edge_query": {"response": {}}},
             {"equal": True},
             {"passed": True},
         )
-        self.assertEqual(eager["policy_source"], "explicit_override")
-        self.assertEqual(eager["observed_behavior"], "immediate_full_freshness")
-        self.assertTrue(eager["immediate_freshness_expected"])
-        self.assertTrue(eager["immediate_freshness_met"])
-        self.assertTrue(eager["policy_conformance_met"])
+        self.assertEqual(at_publish["policy_source"], "explicit_override")
+        self.assertEqual(at_publish["observed_behavior"], "immediate_full_freshness")
+        self.assertTrue(at_publish["immediate_freshness_expected"])
+        self.assertTrue(at_publish["immediate_freshness_met"])
+        self.assertTrue(at_publish["policy_conformance_met"])
 
     def test_search_projection_observation_separates_identity_and_property_fields(
         self,
@@ -1332,16 +1435,16 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             {},
         )
 
-    def test_incremental_semantic_freshness_eager_profile_changes_only_refresh_policy(
+    def test_incremental_derived_results_refresh_at_publish_profile_changes_only_policy(
         self,
     ) -> None:
         self.assertEqual(
             BENCHMARK.resolve_config_overrides(
-                "incremental_semantic_freshness_eager", []
+                "incremental_derived_results_refresh_at_publish", []
             ),
             {
                 **BENCHMARK.PRODUCT_DEFAULT_GRAPH_CAPABILITIES,
-                "incremental_derived_refresh": "eager",
+                "incremental_derived_results_refresh": "at_publish",
             },
         )
 
@@ -1904,8 +2007,26 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(run["implementation"]["build"]["status"], "unknown")
         self.assertEqual(run["repetition"]["status"], "unknown")
         self.assertEqual(run["capabilities"]["completeness"], "partial")
+        self.assertEqual(run["cache"]["process"]["status"], "unknown")
+        self.assertEqual(run["cache"]["repository_graph"]["status"], "unknown")
         self.assertEqual(facts["steps"][0]["cpu_ms"]["status"], "unknown")
         self.assertEqual(facts["results"][0]["status"], "failed")
+
+    def test_imported_report_with_embedded_context_remains_an_import(self) -> None:
+        facts = BENCHMARK.normalize_benchmark_report(
+            {
+                "parameters": {"transport": "mcp"},
+                "measurements": {"incremental": {"elapsed_ms": 25}},
+                "derived": {"passed": True},
+            },
+            {"cell_identity": "retained-cell", "label": "retained"},
+            imported_report=True,
+        )
+
+        run = facts["runs"][0]
+        self.assertTrue(run["legacy_import"])
+        self.assertEqual(run["cell_identity"], "retained-cell")
+        self.assertEqual(run["cache"]["process"]["status"], "unknown")
 
     def test_candidate_native_fact_manifest_does_not_invent_effective_defaults(
         self,
