@@ -259,6 +259,20 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
  * creates IMPLEMENTS + OVERRIDE edges. Returns edge count created. */
 int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
 
+/* Edge type for an explicit base-class relation, keyed off the resolved
+ * TARGET node's label: Interface → IMPLEMENTS, anything else → INHERITS.
+ * The single decision point for BOTH the sequential semantic pass and the
+ * parallel per-file resolve — the two venues must never diverge. */
+const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
+
+/* Explicit-language override detection on the full graph (serial tail).
+ * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches
+ * the class's DEFINES_METHOD children by name against the base's and creates
+ * Method→Method OVERRIDE edges (Java @Override, TS/C#/Kotlin override, PHP
+ * redefinition). Go is excluded: implicit satisfaction already covers it.
+ * Returns edge count created. */
+int cbm_pipeline_override_explicit(cbm_pipeline_ctx_t *ctx);
+
 /* ── Git diff helpers (pass_gitdiff.c) ───────────────────────────── */
 
 typedef struct {
