@@ -673,9 +673,34 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     return empty_result();
 }
 
+static bool is_same_module_receiver(const char *prefix, const char *module_qn) {
+    if (!prefix || !prefix[0]) {
+        return true; /* Bare names are always candidates for same-module resolution */
+    }
+    /* 1. Check known self-receivers */
+    static const char *const self_receivers[] = {"self", "this", "cls", "@self", NULL};
+    for (int i = 0; self_receivers[i]; i++) {
+        if (strcmp(prefix, self_receivers[i]) == 0) {
+            return true;
+        }
+    }
+    /* 2. Check if prefix matches the module name or its last segment (namespace qualified) */
+    size_t plen = strlen(prefix);
+    size_t mlen = strlen(module_qn);
+    if (mlen == plen && strcmp(module_qn, prefix) == 0) {
+        return true;
+    }
+    if (mlen > plen && module_qn[mlen - plen - 1] == '.' &&
+        strcmp(module_qn + (mlen - plen), prefix) == 0) {
+        return true;
+    }
+    return false;
+}
+
 /* Strategy 2: Same-module match */
 static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char *callee_name,
-                                            const char *suffix, const char *module_qn) {
+                                            const char *prefix, const char *suffix,
+                                            const char *module_qn) {
     char candidate[CBM_SZ_512];
     snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, callee_name);
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
@@ -683,10 +708,13 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
     }
     if (suffix && suffix[0]) {
-        snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
-        stored_key = cbm_ht_get_key(r->exact, candidate);
-        if (stored_key) {
-            return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+        if (is_same_module_receiver(prefix, module_qn)) {
+            snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
+            stored_key = cbm_ht_get_key(r->exact, candidate);
+            if (stored_key) {
+                return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE,
+                                          REG_RESOLVED};
+            }
         }
     }
     return empty_result();
@@ -778,6 +806,79 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     }
     return match;
 }
+static bool qn_ends_with_qualified(const char *qn, const char *callee_name) {
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + 1 < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else {
+            dotted[w++] = *s++;
+        }
+    }
+    dotted[w] = '\0';
+
+    size_t qlen = strlen(qn);
+    if (qlen < w) {
+        return false;
+    }
+    const char *tail = qn + (qlen - w);
+    if (strcmp(tail, dotted) != 0) {
+        return false;
+    }
+    if (tail != qn && tail[-1] != '.') {
+        return false;
+    }
+    return true;
+}
+static bool is_type_like_label(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Class") == 0 || strcmp(label, "Struct") == 0 ||
+           strcmp(label, "Interface") == 0 || strcmp(label, "Enum") == 0 ||
+           strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
+}
+
+static bool is_candidate_method(const cbm_registry_t *r, const char *qn) {
+    const char *label = cbm_registry_label_of(r, qn);
+    if (label && strcmp(label, "Method") == 0) {
+        return true;
+    }
+
+    char parent_qn[CBM_SZ_512];
+    size_t len = strlen(qn);
+    if (len >= sizeof(parent_qn)) {
+        return false;
+    }
+    strcpy(parent_qn, qn);
+    char *last_dot = strrchr(parent_qn, '.');
+    if (!last_dot) {
+        return false;
+    }
+    *last_dot = '\0';
+
+    const char *parent_label = cbm_registry_label_of(r, parent_qn);
+    if (!parent_label) {
+        const char *p_name = simple_name(parent_qn);
+        qn_array_t *arr = cbm_ht_get(r->by_name, p_name);
+        if (arr) {
+            for (int i = 0; i < arr->count; i++) {
+                const char *cand_label = cbm_registry_label_of(r, arr->items[i]);
+                if (cand_label && strcmp(cand_label, "Enum") == 0) {
+                    parent_label = "Enum";
+                    break;
+                }
+            }
+        }
+    }
+    return is_type_like_label(parent_label);
+}
+
+static bool is_qualified_callee(const char *callee_name) {
+    return strchr(callee_name, '.') != NULL || strstr(callee_name, "::") != NULL;
+}
 
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
@@ -792,36 +893,53 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
     }
 
+    cbm_resolution_t res = empty_result();
+
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
      * candidates by full qualified tail, before bare-name scoring collapses
      * them onto a single winner. */
     if (arr->count > 1) {
         const char *q = qualified_suffix_match(arr, callee_name);
         if (q) {
-            return (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
+            res = (cbm_resolution_t){q, "qualified_suffix", CONF_QUALIFIED_SUFFIX, REG_RESOLVED};
         }
     }
 
-    /* Strategy 3: unique name */
-    if (arr->count == SKIP_ONE) {
-        double conf = CONF_UNIQUE_NAME;
-        if (import_vals && import_count > 0 &&
-            !is_import_reachable(arr->items[0], import_vals, import_count)) {
-            conf *= DEFAULT_CONFIDENCE;
+    if (!(res.qualified_name && res.qualified_name[0])) {
+        /* Strategy 3: unique name */
+        if (arr->count == 1) {
+            double conf = CONF_UNIQUE_NAME;
+            if (import_vals && import_count > 0 &&
+                !is_import_reachable(arr->items[0], import_vals, import_count)) {
+                conf *= DEFAULT_CONFIDENCE;
+            }
+            res = (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
         }
-        return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
     }
 
-    /* Strategy 4: multiple candidates */
-    if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
+    if (!(res.qualified_name && res.qualified_name[0])) {
+        /* Strategy 4: multiple candidates */
+        if (import_vals && import_count > 0) {
+            res = resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
+        } else {
+            const char *best =
+                best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+            if (best) {
+                double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
+                res = (cbm_resolution_t){best, "suffix_match", conf, arr->count};
+            }
+        }
     }
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
-    if (best) {
-        double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
+
+    if (res.qualified_name && is_qualified_callee(callee_name)) {
+        if (!is_candidate_method(r, res.qualified_name)) {
+            if (!qn_ends_with_qualified(res.qualified_name, callee_name)) {
+                return empty_result();
+            }
+        }
     }
-    return empty_result();
+
+    return res;
 }
 
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
@@ -874,7 +992,7 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
         resolve_import_map(r, prefix, suffix, import_map_keys, import_map_vals, import_map_count);
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 2: same module */
-        res = resolve_same_module(r, callee_name, suffix, module_qn);
+        res = resolve_same_module(r, callee_name, prefix, suffix, module_qn);
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */

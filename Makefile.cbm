@@ -84,7 +84,7 @@ CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
 CFLAGS_TSAN = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 \
               $(TSAN_SANITIZE)
-CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
+CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -O1 \
                 $(TSAN_SANITIZE)
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
@@ -324,7 +324,7 @@ MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/src \
                   -DMI_OVERRIDE=1 \
                   $(MIMALLOC_OVERRIDE_DEFINE)
-MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
+MIMALLOC_CFLAGS_TEST = -std=c11 -O1 -w \
                        -Ivendored/mimalloc/include \
                        -Ivendored/mimalloc/src \
                        -DMI_OVERRIDE=0
@@ -334,11 +334,11 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
 # BM25 search path in search_graph (see nodes_fts virtual table in store.c).
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
 SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
-SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
+SQLITE3_CFLAGS_TEST = -std=c11 -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5
 
 # TRE regex (vendored, Windows only — POSIX uses system <regex.h>)
 TRE_SRC = vendored/tre/tre_all.c
-TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
+TRE_CFLAGS = -std=c11 -O1 -w -Ivendored/tre
 
 # yyjson (vendored)
 YYJSON_SRC = vendored/yyjson/yyjson.c
@@ -553,9 +553,9 @@ BUILD_DIR = build/c
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
 GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
-GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       $(SANITIZE)
-GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       $(TSAN_SANITIZE)
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
@@ -662,21 +662,21 @@ endif
 LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
 LZ4_OBJ_TSAN = $(BUILD_DIR)/tsan_lz4.o $(BUILD_DIR)/tsan_lz4hc.o
 $(BUILD_DIR)/test_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 $(SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/test_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 $(BUILD_DIR)/tsan_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/tsan_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (test build)
 ZSTD_OBJ_TEST = $(BUILD_DIR)/test_zstd.o
 ZSTD_OBJ_TSAN = $(BUILD_DIR)/tsan_zstd.o
 $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 $(SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 $(BUILD_DIR)/tsan_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o

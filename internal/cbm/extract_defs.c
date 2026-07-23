@@ -4042,6 +4042,12 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     for (const char **f = body_fields; *f; f++) {
         TSNode body = ts_node_child_by_field_name(class_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(body)) {
+            if (strcmp(ts_node_type(body), "enum_body") == 0) {
+                TSNode abd = cbm_find_child_by_kind(body, "enum_body_declarations");
+                if (!ts_node_is_null(abd)) {
+                    return abd;
+                }
+            }
             return body;
         }
     }
