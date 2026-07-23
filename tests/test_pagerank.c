@@ -398,7 +398,7 @@ TEST(pagerank_disabled_config_clears_rank_views) {
     PASS();
 }
 
-TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views) {
+TEST(pagerank_refresh_defer_exact_delta_reindexes_defers_only_with_stale_rank_views) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_policy", "/tmp/refresh_policy");
     int64_t a = add_node(s, "refresh_policy", "a");
@@ -410,7 +410,9 @@ TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views) {
     ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_STALE_ON_EXACT), 0);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
 
     ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_policy"), 2);
     int64_t c = add_node(s, "refresh_policy", "c");
@@ -438,7 +440,7 @@ TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views) {
     PASS();
 }
 
-TEST(pagerank_refresh_stale_on_exact_does_not_defer_containment) {
+TEST(pagerank_refresh_defer_exact_delta_reindexes_does_not_defer_containment) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_exact_only", "/tmp/refresh_exact_only");
     int64_t a = add_node(s, "refresh_exact_only", "a");
@@ -450,7 +452,9 @@ TEST(pagerank_refresh_stale_on_exact_does_not_defer_containment) {
     ASSERT_TRUE(cbm_mkdtemp(tmpdir) != NULL);
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_STALE_ON_EXACT), 0);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
 
     ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_exact_only"), 2);
     int64_t c = add_node(s, "refresh_exact_only", "c");
@@ -472,7 +476,7 @@ TEST(pagerank_refresh_stale_on_exact_does_not_defer_containment) {
     PASS();
 }
 
-TEST(pagerank_refresh_stale_on_incremental_defers_containment) {
+TEST(pagerank_refresh_defer_all_incremental_reindexes_defers_containment) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_incremental", "/tmp/refresh_incremental");
     int64_t a = add_node(s, "refresh_incremental", "a");
@@ -485,7 +489,7 @@ TEST(pagerank_refresh_stale_on_incremental_defers_containment) {
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH,
-                             CBM_RANK_REFRESH_STALE_ON_INCREMENTAL),
+                             CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES),
               0);
 
     ASSERT_EQ(cbm_pagerank_compute_default(s, "refresh_incremental"), 2);
@@ -508,7 +512,7 @@ TEST(pagerank_refresh_stale_on_incremental_defers_containment) {
     PASS();
 }
 
-TEST(pagerank_refresh_stale_on_incremental_defers_full_fallback) {
+TEST(pagerank_refresh_defer_all_incremental_reindexes_defers_full_fallback) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_fallback", "/tmp/refresh_fallback");
     int64_t a = add_node(s, "refresh_fallback", "a");
@@ -533,7 +537,9 @@ TEST(pagerank_refresh_stale_on_incremental_defers_full_fallback) {
                   s, "refresh_fallback", CBM_STORE_DERIVED_GENERATION_UNKNOWN),
               CBM_STORE_OK);
 
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_STALE_ON_EXACT), 0);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
     ASSERT_EQ(cbm_pagerank_refresh_after_publish(
                   s, "refresh_fallback", cfg, true, 0,
                   CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK),
@@ -546,7 +552,7 @@ TEST(pagerank_refresh_stale_on_incremental_defers_full_fallback) {
                   s, "refresh_fallback", CBM_STORE_DERIVED_GENERATION_UNKNOWN),
               CBM_STORE_OK);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH,
-                             CBM_RANK_REFRESH_STALE_ON_INCREMENTAL),
+                             CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES),
               0);
     ASSERT_EQ(cbm_pagerank_refresh_after_publish(
                   s, "refresh_fallback", cfg, true, 0,
@@ -593,7 +599,7 @@ TEST(pagerank_refresh_default_defers_incremental_when_rank_views_stale) {
     PASS();
 }
 
-TEST(pagerank_refresh_invalid_policy_falls_back_to_eager) {
+TEST(pagerank_refresh_invalid_policy_falls_back_to_at_publish) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "refresh_invalid_policy", "/tmp/refresh_invalid_policy");
     int64_t a = add_node(s, "refresh_invalid_policy", "a");
@@ -1435,12 +1441,12 @@ SUITE(pagerank) {
     RUN_TEST(pagerank_refresh_if_needed_recomputes_changed_graph);
     RUN_TEST(pagerank_refresh_if_needed_recomputes_reindexed_deps);
     RUN_TEST(pagerank_disabled_config_clears_rank_views);
-    RUN_TEST(pagerank_refresh_stale_on_exact_defers_only_with_stale_rank_views);
-    RUN_TEST(pagerank_refresh_stale_on_exact_does_not_defer_containment);
-    RUN_TEST(pagerank_refresh_stale_on_incremental_defers_containment);
-    RUN_TEST(pagerank_refresh_stale_on_incremental_defers_full_fallback);
+    RUN_TEST(pagerank_refresh_defer_exact_delta_reindexes_defers_only_with_stale_rank_views);
+    RUN_TEST(pagerank_refresh_defer_exact_delta_reindexes_does_not_defer_containment);
+    RUN_TEST(pagerank_refresh_defer_all_incremental_reindexes_defers_containment);
+    RUN_TEST(pagerank_refresh_defer_all_incremental_reindexes_defers_full_fallback);
     RUN_TEST(pagerank_refresh_default_defers_incremental_when_rank_views_stale);
-    RUN_TEST(pagerank_refresh_invalid_policy_falls_back_to_eager);
+    RUN_TEST(pagerank_refresh_invalid_policy_falls_back_to_at_publish);
     RUN_TEST(pagerank_recompute_replaces);
     RUN_TEST(pagerank_full_scope_includes_deps);
     RUN_TEST(pagerank_full_scope_preserves_dep_project_attribution);

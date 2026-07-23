@@ -511,6 +511,9 @@ TEST(mcp_tools_list) {
     ASSERT_NOT_NULL(strstr(json, "search_code"));
     ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code"));
+    ASSERT_NOT_NULL(
+        strstr(json, "search_code resolves its project through the same auto-indexing path"));
+    ASSERT_NULL(strstr(json, "search_code searches source files for an already indexed/current"));
     /* The deleted mega-tool must NOT appear */
     ASSERT_NULL(strstr(json, "search_code_graph"));
     /* Hidden classic tools should NOT appear as top-level tool entries */
@@ -6479,8 +6482,9 @@ TEST(tool_index_repository_exact_moderate_preserves_semantic_stale_state) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX,
                              CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS),
               0);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL),
+    ASSERT_EQ(cbm_config_set(
+                  cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                  CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES),
               0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
                              CBM_CONFIG_OVERLAY_PUBLISH_OFF),

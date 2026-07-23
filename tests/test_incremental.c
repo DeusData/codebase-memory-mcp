@@ -814,8 +814,8 @@ TEST(incr_formatter_run) {
     int calls_before = get_edge_count_by_type("CALLS");
 
     /* Simulate a semantics-preserving formatter batch. */
-    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
     int reformat_rc = reformat_files("fastapi", INCR_FORMATTER_MAX_FILES);
 
@@ -862,8 +862,8 @@ TEST(incr_formatter_run) {
     }
 
     cbm_unlink(incremental_snapshot_path);
-    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
+    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                                           CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
 
     printf("    [perf] reformat up to %d files: %.0fms, node_diff=%d edge_diff=%d "
            "calls_diff=%d\n",
@@ -1184,11 +1184,11 @@ TEST(incr_batch_add_delete) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(incr_db_deleted_recovery) {
-    /* Recovery is an exact graph oracle, so establish an eager-derived
-     * baseline instead of comparing the configured stale-on-incremental view
-     * with a clean rebuild that necessarily refreshes global semantic edges. */
-    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+    /* Recovery is an exact graph oracle, so refresh derived results at publish
+     * instead of comparing the configured deferred view with a clean rebuild
+     * that necessarily refreshes global semantic edges. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
     write_file_at("tests/incr_recovery_refresh.py",
                   "def incr_recovery_refresh():\n    return 'recovery'\n");
@@ -1225,8 +1225,8 @@ TEST(incr_db_deleted_recovery) {
     }
     cbm_unlink(recovery_baseline_path);
     delete_file_at("tests/incr_recovery_refresh.py");
-    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
+    int restore_config_rc = cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                                           CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
 
     printf("    [perf] db recovery (full reindex): %.0fms, peak=%zuMB\n", ms, peak_mb);
 
@@ -1238,9 +1238,10 @@ TEST(incr_db_deleted_recovery) {
 TEST(incr_accuracy_vs_full) {
     /* This test is the strict canonical full-vs-incremental oracle. The
      * production default may intentionally defer global semantic-derived edges,
-     * so opt into eager refresh here instead of weakening the graph comparison. */
-    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+     * so opt into derived-results refresh at publish here instead of weakening the graph
+     * comparison. */
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
 
     /* Modify a file to create a known incremental state */
@@ -1312,8 +1313,8 @@ TEST(incr_accuracy_vs_full) {
 
     delete_file_at("fastapi/incr_accuracy.py");
     cbm_unlink(incr_snapshot_path);
-    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT),
+    ASSERT_EQ(cbm_config_set(g_cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT),
               0);
     ASSERT_EQ(graph_diff_rc, 0);
     PASS();

@@ -120,10 +120,12 @@ variants bound default indexing latency, CPU, memory, and stored graph size; the
 enabled variants add installed dependency-source coverage up to `auto_dep_limit`.
 `index_dependencies` remains available for explicit packages. Disabling automation
 stops future automatic dependency indexing but does not delete dependency projects
-already indexed. `rank-disabled`, `optional-graph-disabled`, and `minimal-indexing`
-are benchmark ablations, and the CLI labels them accordingly. Environment variables
-remain higher priority than stored preset values, and preset application returns
-nonzero when an active override prevents the requested effective configuration.
+already indexed. `rank-disabled` and `minimal-indexing` are benchmark ablations, and
+the CLI labels them accordingly. The `minimal-indexing` preset disables optional graph
+passes and dependency-source automation; the post-edit reindex strategy is unchanged.
+Environment variables remain higher priority than stored preset values, and preset
+application returns nonzero when an active override prevents the requested effective
+configuration.
 
 ## 3. UI Settings
 

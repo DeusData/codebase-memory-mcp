@@ -31,10 +31,10 @@ struct cbm_config;
 #define CBM_CONFIG_RANK_REFRESH      "rank_refresh"
 #define CBM_CONFIG_RANK_ENABLED      "rank_enabled"
 
-#define CBM_RANK_REFRESH_EAGER          "eager"
-#define CBM_RANK_REFRESH_STALE_ON_EXACT "stale_on_exact"
-#define CBM_RANK_REFRESH_STALE_ON_INCREMENTAL "stale_on_incremental"
-#define CBM_RANK_REFRESH_DEFAULT        CBM_RANK_REFRESH_STALE_ON_INCREMENTAL
+#define CBM_RANK_REFRESH_AT_PUBLISH "at_publish"
+#define CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES "defer_exact_delta_reindexes"
+#define CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES "defer_all_incremental_reindexes"
+#define CBM_RANK_REFRESH_DEFAULT CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES
 
 typedef enum {
     CBM_RANK_REFRESH_PUBLISH_FULL = 0,

@@ -79,9 +79,9 @@ bool cbm_pipeline_try_lock(void) {
     (CBM_PIPELINE_LOCK_RETRY_MS * (long)CBM_NSEC_PER_MSEC)
 
 typedef enum {
-    CBM_INCREMENTAL_REINDEX_FAST = 0,
+    CBM_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY = 0,
     CBM_INCREMENTAL_REINDEX_ALWAYS,
-    CBM_INCREMENTAL_REINDEX_OFF,
+    CBM_INCREMENTAL_REINDEX_FULL_REBUILD,
 } cbm_incremental_reindex_policy_t;
 
 typedef enum {
@@ -90,10 +90,10 @@ typedef enum {
 } cbm_overlay_publish_policy_t;
 
 typedef enum {
-    CBM_INCREMENTAL_DERIVED_REFRESH_EAGER = 0,
-    CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT,
-    CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL,
-} cbm_incremental_derived_refresh_policy_t;
+    CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH = 0,
+    CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES,
+    CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
+} cbm_incremental_derived_results_refresh_policy_t;
 
 void cbm_pipeline_lock(void) {
     while (atomic_exchange(&g_pipeline_busy, 1) != 0) {
@@ -128,7 +128,7 @@ struct cbm_pipeline {
     int64_t extract_timeout_micros;
     cbm_incremental_reindex_policy_t incremental_reindex;
     cbm_overlay_publish_policy_t overlay_publish;
-    cbm_incremental_derived_refresh_policy_t incremental_derived_refresh;
+    cbm_incremental_derived_results_refresh_policy_t incremental_derived_results_refresh;
     int exact_delta_max_changed_paths;
     int exact_delta_max_affected_paths;
     atomic_int cancelled;
@@ -243,9 +243,10 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->githistory_min_coupling = 0.0;
     p->lsp_confidence_floor = 0.0;
     p->extract_timeout_micros = CBM_EXTRACT_BUDGET;
-    p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
+    p->incremental_reindex = CBM_INCREMENTAL_REINDEX_ALWAYS;
     p->overlay_publish = CBM_OVERLAY_PUBLISH_OFF;
-    p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
+    p->incremental_derived_results_refresh =
+        CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES;
     p->exact_delta_max_changed_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS;
     p->exact_delta_max_affected_paths = CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS;
     p->persistence = false;
@@ -406,13 +407,14 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
     p->extract_timeout_micros = (int64_t)extract_timeout_ms * 1000;
 
     const char *incremental =
-        cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_OFF);
+        cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT);
     if (incremental && strcmp(incremental, CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS) == 0) {
         p->incremental_reindex = CBM_INCREMENTAL_REINDEX_ALWAYS;
-    } else if (incremental && strcmp(incremental, CBM_CONFIG_INCREMENTAL_REINDEX_FAST) == 0) {
-        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST;
+    } else if (incremental &&
+               strcmp(incremental, CBM_CONFIG_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY) == 0) {
+        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY;
     } else {
-        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_OFF;
+        p->incremental_reindex = CBM_INCREMENTAL_REINDEX_FULL_REBUILD;
     }
 
     const char *overlay_publish =
@@ -423,18 +425,23 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
             ? CBM_OVERLAY_PUBLISH_SMALL_DELTAS
             : CBM_OVERLAY_PUBLISH_OFF;
 
-    const char *derived_refresh = cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                                                 CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
+    const char *derived_refresh =
+        cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                       CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
     if (derived_refresh &&
-        strcmp(derived_refresh, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL) ==
+        strcmp(derived_refresh,
+               CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES) ==
             0) {
-        p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
+        p->incremental_derived_results_refresh =
+            CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES;
     } else if (derived_refresh &&
-               strcmp(derived_refresh, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT) ==
+               strcmp(derived_refresh,
+                      CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES) ==
                    0) {
-        p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT;
+        p->incremental_derived_results_refresh =
+            CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES;
     } else {
-        p->incremental_derived_refresh = CBM_INCREMENTAL_DERIVED_REFRESH_EAGER;
+        p->incremental_derived_results_refresh = CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH;
     }
 
     int max_changed = cbm_config_get_int(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS,
@@ -837,17 +844,18 @@ bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p) {
     return p && p->overlay_publish == CBM_OVERLAY_PUBLISH_SMALL_DELTAS;
 }
 
-bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_t *p) {
-    return p &&
-           (p->incremental_derived_refresh == CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT ||
-            p->incremental_derived_refresh ==
-                CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL);
+bool cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(
+    const cbm_pipeline_t *p) {
+    return p && (p->incremental_derived_results_refresh ==
+                     CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES ||
+                 p->incremental_derived_results_refresh ==
+                     CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES);
 }
 
-bool cbm_pipeline_incremental_derived_refresh_stale_on_incremental(const cbm_pipeline_t *p) {
-    return p &&
-           p->incremental_derived_refresh ==
-               CBM_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL;
+bool cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(
+    const cbm_pipeline_t *p) {
+    return p && p->incremental_derived_results_refresh ==
+                    CBM_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES;
 }
 
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p) {
@@ -1818,8 +1826,9 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
         return CBM_NOT_FOUND;
     }
     bool allow_incremental =
-        p->incremental_reindex != CBM_INCREMENTAL_REINDEX_OFF &&
-        (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_FAST || p->mode == CBM_MODE_FAST);
+        p->incremental_reindex != CBM_INCREMENTAL_REINDEX_FULL_REBUILD &&
+        (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY ||
+         p->mode == CBM_MODE_FAST);
     cbm_store_t *check_store = cbm_store_open_path(db_path);
     bool path_only_failure = false;
     bool store_reusable =
@@ -1835,9 +1844,9 @@ static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files,
         if (!allow_incremental) {
             cbm_store_close(check_store);
             cbm_log_info("pipeline.route", "path", "full", "reason",
-                         p->incremental_reindex == CBM_INCREMENTAL_REINDEX_OFF
-                             ? "incremental_reindex=off"
-                             : "incremental_reindex=fast_requires_fast_mode");
+                         p->incremental_reindex == CBM_INCREMENTAL_REINDEX_FULL_REBUILD
+                             ? "incremental_reindex=full_rebuild"
+                             : "incremental_reindex=fast_mode_indexes_only_requires_fast_mode");
             free(db_path);
             return CBM_NOT_FOUND;
         }
@@ -2011,7 +2020,7 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
         cbm_log_error("pipeline.err", "phase", "persist_file_state", "rc", itoa_buf(state_rc));
         return state_rc;
     }
-    if (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_OFF) {
+    if (p->incremental_reindex != CBM_INCREMENTAL_REINDEX_FULL_REBUILD) {
         int owner_rc =
             cbm_store_rebuild_file_delta_owners(store, p->project_name,
                                                 CBM_PIPELINE_COMPAT_GENERATION);

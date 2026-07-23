@@ -654,7 +654,7 @@ static const char codex_instructions_content[] =
     "structural answers; examples and LIMIT are optional guidance\n"
     "- `get_architecture` — high-level summary after `_hidden_tools` reveal or in classic mode\n"
     "\n"
-    "Normal streamlined exploration uses the four core tools above as needed without a reveal. "
+    "Normal streamlined exploration uses the default tools above as needed without a reveal. "
     "Classic structural discovery uses `search_graph`, then `trace_path`, then "
     "`get_code_snippet`; use `query_graph` or `get_architecture` for broader structure. When "
     "configured, streamlined first-use indexing and first-response context are automatic. "
@@ -10041,11 +10041,6 @@ static const cbm_config_preset_value_t PRESET_RANK_DISABLED[] = {
                           "true"),
 };
 
-static const cbm_config_preset_value_t PRESET_OPTIONAL_GRAPH_DISABLED[] = {
-    PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "false", "false", "false",
-                          "false"),
-};
-
 static const cbm_config_preset_value_t PRESET_MINIMAL_INDEXING[] = {
     PRESET_QUALITY_VALUES(CBM_DEFAULT_AUTO_INDEX_DEPS_STR, "false", "false", "false", "false",
                           "false"),
@@ -10066,10 +10061,9 @@ static const cbm_config_preset_t CBM_CONFIG_PRESETS[] = {
      PRESET_CLASSIC_DEPS_ENABLED, PRESET_COUNT(PRESET_CLASSIC_DEPS_ENABLED), false},
     {"rank-disabled", "exact PageRank/LinkRank ablation; lowers measured ranking quality",
      PRESET_RANK_DISABLED, PRESET_COUNT(PRESET_RANK_DISABLED), true},
-    {"optional-graph-disabled",
-     "disable optional graph passes; dependency-source automation stays disabled",
-     PRESET_OPTIONAL_GRAPH_DISABLED, PRESET_COUNT(PRESET_OPTIONAL_GRAPH_DISABLED), true},
-    {"minimal-indexing", "disable optional graph passes and dependency-source automation",
+    {"minimal-indexing",
+     "disable optional graph passes and dependency-source automation; the post-edit reindex "
+     "strategy is unchanged",
      PRESET_MINIMAL_INDEXING, PRESET_COUNT(PRESET_MINIMAL_INDEXING), true},
     {NULL, NULL, NULL, 0, false},
 };
@@ -10179,12 +10173,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Re-index if DB is older than N seconds (0=disabled)",
      "0-2592000",
      "0=disabled. 3600=hourly, 86400=daily, 604800=weekly. Runs on startup if stale."},
-    {CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_OFF, NULL, "Indexing",
-     "When to use the disk incremental reindex path",
-     "fast|always|off",
-     "'off' rebuilds atomically from scratch and is the default until disk incremental avoids full-graph "
-     "work. 'fast' uses incremental only for fast-mode indexes. 'always' preserves the legacy route for "
-     "benchmarking and canary tests."},
+    {CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT, NULL, "Indexing",
+     "Strategy used by the reindex that runs after every edit",
+     "always|full_rebuild|fast_mode_indexes_only",
+     "Every edit triggers a reindex; this key selects the strategy. 'always' (default) uses the "
+     "disk incremental path and falls back to containment or a full rebuild when the exact-delta "
+     "caps are exceeded, preserving correctness. 'full_rebuild' rebuilds atomically from scratch "
+     "on every reindex. 'fast_mode_indexes_only' uses the incremental path only when the index was "
+     "built in fast mode."},
     {CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_OFF, NULL, "Indexing",
      "Foreground overlay publish policy for bounded incremental deltas",
      "off|small_deltas",
@@ -10226,19 +10222,20 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "limits exact-delta work before a correctness fallback; it does not bound total indexing cost "
      "because fallback may perform containment or a full rebuild. Change only with canonical-graph "
      "and latency/memory benchmarks for your workload."},
-    {CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT,
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT,
      NULL,
      "Indexing",
-     "When incremental publishes may defer global semantic/similarity edge refresh",
-     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER "|"
-     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT "|"
-     CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL,
-     "'stale_on_incremental' (default): incremental publishes mark semantic_edges stale and defer "
-     "global semantic/similarity refresh; query surfaces warn until a full/eager run rebuilds them. "
-     "'eager' preserves full/moderate publish freshness synchronously. 'stale_on_exact' lets small exact "
-     "incremental graph deltas publish after marking semantic_edges stale; semantic/similarity "
-     "queries warn until an eager index run or full reindex rebuilds those global edges."},
+     "When incremental reindexes may defer recomputing the derived results (semantic edges, "
+     "similarity edges, architecture, routes)",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH "|"
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES "|"
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
+     "'defer_all_incremental_reindexes' (default): incremental reindexes mark the derived results "
+     "stale and defer their recomputation; query surfaces warn until a full reindex or an "
+     "at_publish run rebuilds them. 'at_publish' recomputes them as part of each reindex. "
+     "'defer_exact_delta_reindexes' defers only for small exact-delta reindexes; other reindexes "
+     "recompute at publish."},
     /* ── Search ── */
     {"search_limit", "50", NULL, "Search",
      "Default max results for search_graph/search_code",
@@ -10363,16 +10360,14 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "'deps': score only dependency sub-project symbols."},
     {"rank_refresh", CBM_RANK_REFRESH_DEFAULT, NULL, "PageRank",
      "When to recompute PageRank/LinkRank after indexing",
-     CBM_RANK_REFRESH_EAGER "|" CBM_RANK_REFRESH_STALE_ON_EXACT "|"
-     CBM_RANK_REFRESH_STALE_ON_INCREMENTAL,
-     "'stale_on_incremental' (default): incremental publishes, including safe full fallbacks, may "
-     "defer rank recompute after marking rank views stale; search/trace omit stale rank until a "
-     "later refresh. "
-     "'eager': recompute after graph changes, dependency reindexes, or missing rank views. "
-     "'stale_on_exact': exact incremental graph deltas may skip synchronous rank recompute only after "
-     "rank views are marked stale. 'stale_on_incremental': also allows containment publishes and full "
-     "rebuilds reached through incremental fallback to defer; search/trace then omit stale rank until "
-     "a refresh runs."},
+     CBM_RANK_REFRESH_AT_PUBLISH "|" CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES "|"
+     CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES,
+     "'defer_all_incremental_reindexes' (default): incremental reindexes, including containment "
+     "publishes and full rebuilds reached through incremental fallback, may defer rank recompute "
+     "after marking rank views stale; search/trace omit stale rank until a later refresh. "
+     "'at_publish': recompute after graph changes, dependency reindexes, or missing rank views. "
+     "'defer_exact_delta_reindexes': only small exact-delta reindexes may skip synchronous rank "
+     "recompute, after marking rank views stale."},
     {"edge_weight_calls", "1.0", NULL, "PageRank",
      "How much importance flows along direct function/method call edges (CALLS)",
      "0.0-100.0",

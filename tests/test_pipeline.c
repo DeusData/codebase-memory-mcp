@@ -1317,6 +1317,7 @@ TEST(pipeline_full_and_incremental_persist_file_state) {
     ASSERT_EQ(cbm_store_get_file_state(s1, project1, "pkg/util/helper.go", &first), CBM_STORE_OK);
     ASSERT_STR_EQ(first.language, "Go");
     ASSERT_EQ(first.generation, CBM_PIPELINE_COMPAT_GENERATION);
+    int64_t first_generation = first.generation;
     ASSERT_NOT_NULL(first.content_hash);
     char first_hash[CBM_SZ_32];
     n = snprintf(first_hash, sizeof(first_hash), "%s", first.content_hash);
@@ -1346,7 +1347,7 @@ TEST(pipeline_full_and_incremental_persist_file_state) {
     ASSERT_EQ(cbm_store_get_file_state(s2, project2, "pkg/util/helper.go", &second),
               CBM_STORE_OK);
     ASSERT_STR_EQ(second.language, "Go");
-    ASSERT_EQ(second.generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_GT(second.generation, first_generation);
     ASSERT_NOT_NULL(second.content_hash);
     ASSERT_NEQ(strcmp(first_hash, second.content_hash), 0);
     cbm_store_file_state_free_fields(&second);
@@ -12740,21 +12741,22 @@ TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact) {
     PASS();
 }
 
-TEST(incremental_full_stale_on_exact_defers_global_derived_refresh) {
+TEST(incremental_full_defer_exact_delta_reindexes_defers_global_derived_refresh) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT),
-              0);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                       CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
 
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
-    ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(p));
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     char *project = cbm_strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
@@ -12791,7 +12793,7 @@ TEST(incremental_full_stale_on_exact_defers_global_derived_refresh) {
     PASS();
 }
 
-TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale) {
+TEST(incremental_full_defer_exact_delta_reindexes_mixed_delete_upsert_marks_semantic_stale) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -12800,9 +12802,10 @@ TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT),
-              0);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                       CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
 
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -12864,7 +12867,7 @@ TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale) {
     PASS();
 }
 
-TEST(incremental_full_stale_on_incremental_defers_containment_semantic_refresh) {
+TEST(incremental_full_defer_all_incremental_reindexes_defers_containment_semantic_refresh) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
     }
@@ -12879,8 +12882,9 @@ TEST(incremental_full_stale_on_incremental_defers_containment_semantic_refresh) 
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL),
+    ASSERT_EQ(cbm_config_set(
+                  cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                  CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES),
               0);
 
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
@@ -14048,8 +14052,8 @@ static int run_incremental_language_oracle_case(const incremental_language_oracl
     }
 
     cfg = incremental_test_config(root);
-    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                               CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER) != 0) {
+    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                               CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH) != 0) {
         snprintf(err, err_sz, "%s: incremental config setup failed", tc->name);
         goto cleanup;
     }
@@ -14292,8 +14296,8 @@ static int run_incremental_objectscript_macro_oracle(objectscript_macro_change_t
     }
 
     cfg = incremental_test_config(root);
-    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                               CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER) != 0) {
+    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                               CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH) != 0) {
         snprintf(err, err_sz, "ObjectScript incremental config setup failed");
         goto cleanup;
     }
@@ -14463,8 +14467,8 @@ TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
@@ -14542,8 +14546,8 @@ TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
@@ -15649,8 +15653,8 @@ TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -15816,6 +15820,9 @@ TEST(incremental_publish_failure_keeps_existing_db) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
@@ -15878,6 +15885,9 @@ TEST(incremental_postpass_failure_keeps_existing_db) {
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_apply_config(p, cfg);
@@ -16099,8 +16109,8 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
     cbm_config_t *cfg = incremental_test_config(tmpdir);
     ASSERT_NOT_NULL(cfg);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH,
-                             CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_EAGER),
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
               0);
 
     char path[512];
@@ -16635,8 +16645,9 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p), 17000000);
     ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
     ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
-    ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_exact(p));
-    ASSERT_TRUE(cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p));
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(p));
+    ASSERT_TRUE(
+        cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(p));
 
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
     cbm_pipeline_apply_config(p, cfg);
@@ -16969,9 +16980,12 @@ TEST(config_registry_includes_mcp_timeout_knobs) {
 TEST(config_registry_includes_incremental_reindex_policy) {
     const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_REINDEX);
     ASSERT_NOT_NULL(entry);
-    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_REINDEX_OFF);
+    ASSERT_STR_EQ(CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT, "always");
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT);
     ASSERT_STR_EQ(entry->category, "Indexing");
-    ASSERT_STR_EQ(entry->range, "fast|always|off");
+    ASSERT_STR_EQ(entry->range, "always|full_rebuild|fast_mode_indexes_only");
+    ASSERT_NOT_NULL(strstr(entry->guidance, "Every edit triggers a reindex"));
+    ASSERT_NOT_NULL(strstr(entry->guidance, "preserving correctness"));
     PASS();
 }
 
@@ -17032,27 +17046,34 @@ TEST(config_registry_includes_incremental_exact_frontier_caps) {
     PASS();
 }
 
-TEST(config_registry_includes_incremental_derived_refresh_policy) {
-    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH);
+TEST(config_registry_includes_incremental_derived_results_refresh_policy) {
+    const cbm_config_entry_t *entry =
+        find_config_entry(CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH);
     ASSERT_NOT_NULL(entry);
-    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_DEFAULT);
+    ASSERT_NULL(find_config_entry("incremental_derived_refresh"));
+    ASSERT_STR_EQ(CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT,
+                  "defer_all_incremental_reindexes");
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
     ASSERT_STR_EQ(entry->category, "Indexing");
-    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
-    ASSERT_NOT_NULL(strstr(entry->guidance,
-                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_EXACT));
-    ASSERT_NOT_NULL(strstr(entry->guidance,
-                           CBM_CONFIG_INCREMENTAL_DERIVED_REFRESH_STALE_ON_INCREMENTAL));
+    ASSERT_STR_EQ(entry->range,
+                  "at_publish|defer_exact_delta_reindexes|defer_all_incremental_reindexes");
+    ASSERT_NOT_NULL(strstr(entry->description, "semantic edges"));
+    ASSERT_NOT_NULL(strstr(entry->description, "similarity edges"));
+    ASSERT_NOT_NULL(strstr(entry->description, "architecture"));
+    ASSERT_NOT_NULL(strstr(entry->description, "routes"));
     PASS();
 }
 
 TEST(config_registry_includes_rank_refresh_policy) {
     const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_RANK_REFRESH);
     ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(CBM_RANK_REFRESH_DEFAULT, "defer_all_incremental_reindexes");
     ASSERT_STR_EQ(entry->default_val, CBM_RANK_REFRESH_DEFAULT);
     ASSERT_STR_EQ(entry->category, "PageRank");
-    ASSERT_STR_EQ(entry->range, "eager|stale_on_exact|stale_on_incremental");
-    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_EXACT));
-    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_RANK_REFRESH_STALE_ON_INCREMENTAL));
+    ASSERT_STR_EQ(entry->range,
+                  "at_publish|defer_exact_delta_reindexes|defer_all_incremental_reindexes");
+    ASSERT_NOT_NULL(strstr(entry->guidance, "small exact-delta reindexes"));
+    ASSERT_NOT_NULL(strstr(entry->guidance, "dependency reindexes"));
     PASS();
 }
 
@@ -17931,7 +17952,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_overlay_publish_policy);
     RUN_TEST(config_registry_includes_overlay_compaction_policy);
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
-    RUN_TEST(config_registry_includes_incremental_derived_refresh_policy);
+    RUN_TEST(config_registry_includes_incremental_derived_results_refresh_policy);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(config_registry_includes_capability_gates);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
@@ -18232,9 +18253,9 @@ SUITE(pipeline) {
     RUN_TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved);
     RUN_TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof);
     RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
-    RUN_TEST(incremental_full_stale_on_exact_defers_global_derived_refresh);
-    RUN_TEST(incremental_full_stale_on_exact_mixed_delete_upsert_marks_semantic_stale);
-    RUN_TEST(incremental_full_stale_on_incremental_defers_containment_semantic_refresh);
+    RUN_TEST(incremental_full_defer_exact_delta_reindexes_defers_global_derived_refresh);
+    RUN_TEST(incremental_full_defer_exact_delta_reindexes_mixed_delete_upsert_marks_semantic_stale);
+    RUN_TEST(incremental_full_defer_all_incremental_reindexes_defers_containment_semantic_refresh);
     RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild);
     RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
     RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);

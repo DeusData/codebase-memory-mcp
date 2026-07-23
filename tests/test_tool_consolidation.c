@@ -974,13 +974,14 @@ TEST(default_tool_autoindex_description_is_precise) {
     char *json = cbm_mcp_tools_list(NULL);
     ASSERT_NOT_NULL(json);
 
-    ASSERT_NOT_NULL(strstr(json, "Graph-backed default tools auto-index"));
-    ASSERT_NOT_NULL(strstr(json, "search_code searches"));
-    ASSERT_NOT_NULL(strstr(json, "already indexed/current project"));
-    ASSERT_NOT_NULL(strstr(json, "Does not index projects"));
+    ASSERT_NOT_NULL(strstr(json, "Default tools auto-index"));
+    ASSERT_NOT_NULL(
+        strstr(json, "search_code resolves its project through the same auto-indexing path"));
+    ASSERT_NOT_NULL(strstr(json, "Auto-indexes the project on first use when enabled"));
+    ASSERT_NOT_NULL(strstr(json, "using the same project resolver as the graph tools"));
     ASSERT_NOT_NULL(strstr(json, "Use file_pattern to narrow traversal"));
     ASSERT_NOT_NULL(strstr(json, "anchored literal file regexes"));
-    ASSERT_NULL(strstr(json, "Default tools auto-index"));
+    ASSERT_NULL(strstr(json, "Does not index projects"));
     ASSERT_NULL(strstr(json, "INSTEAD OF"));
 
     free(json);

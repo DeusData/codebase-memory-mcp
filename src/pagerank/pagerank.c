@@ -242,9 +242,9 @@ rollback:
 }
 
 typedef enum {
-    CBM_RANK_REFRESH_POLICY_EAGER = 0,
-    CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT,
-    CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL,
+    CBM_RANK_REFRESH_POLICY_AT_PUBLISH = 0,
+    CBM_RANK_REFRESH_POLICY_DEFER_EXACT_DELTA_REINDEXES,
+    CBM_RANK_REFRESH_POLICY_DEFER_ALL_INCREMENTAL_REINDEXES,
 } cbm_rank_refresh_policy_t;
 
 static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *cfg) {
@@ -254,24 +254,24 @@ static cbm_rank_refresh_policy_t rank_refresh_policy_from_config(cbm_config_t *c
     if (!policy || !policy[0]) {
         policy = CBM_RANK_REFRESH_DEFAULT;
     }
-    if (strcmp(policy, CBM_RANK_REFRESH_EAGER) == 0) {
-        return CBM_RANK_REFRESH_POLICY_EAGER;
+    if (strcmp(policy, CBM_RANK_REFRESH_AT_PUBLISH) == 0) {
+        return CBM_RANK_REFRESH_POLICY_AT_PUBLISH;
     }
-    if (strcmp(policy, CBM_RANK_REFRESH_STALE_ON_EXACT) == 0) {
-        return CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT;
+    if (strcmp(policy, CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES) == 0) {
+        return CBM_RANK_REFRESH_POLICY_DEFER_EXACT_DELTA_REINDEXES;
     }
-    if (strcmp(policy, CBM_RANK_REFRESH_STALE_ON_INCREMENTAL) == 0) {
-        return CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL;
+    if (strcmp(policy, CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES) == 0) {
+        return CBM_RANK_REFRESH_POLICY_DEFER_ALL_INCREMENTAL_REINDEXES;
     }
-    return CBM_RANK_REFRESH_POLICY_EAGER;
+    return CBM_RANK_REFRESH_POLICY_AT_PUBLISH;
 }
 
 static bool rank_refresh_policy_allows_defer(cbm_rank_refresh_policy_t policy,
                                              cbm_rank_refresh_publish_t publish_kind) {
-    if (policy == CBM_RANK_REFRESH_POLICY_STALE_ON_EXACT) {
+    if (policy == CBM_RANK_REFRESH_POLICY_DEFER_EXACT_DELTA_REINDEXES) {
         return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT;
     }
-    if (policy == CBM_RANK_REFRESH_POLICY_STALE_ON_INCREMENTAL) {
+    if (policy == CBM_RANK_REFRESH_POLICY_DEFER_ALL_INCREMENTAL_REINDEXES) {
         return publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_EXACT ||
                publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_CONTAINMENT ||
                publish_kind == CBM_RANK_REFRESH_PUBLISH_INCREMENTAL_FALLBACK;
