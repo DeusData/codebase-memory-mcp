@@ -63,6 +63,7 @@ struct cbm_httpd {
     struct cbm_http_conn *active;
     bool interrupted;
     int send_buffer_for_test;
+    int send_deadline_for_test_ms;
 };
 
 struct cbm_http_conn {
@@ -311,6 +312,17 @@ bool cbm_httpd_close(cbm_httpd_t *d) {
     return true;
 }
 
+void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms) {
+    /* Lets a test pin the send deadline far above (or below) the default so
+     * an observed abort has exactly ONE possible cause — the interruption
+     * tests once discriminated interrupt-abort from deadline-abort by wall
+     * clock, which sanitizer slowdown turns into a lottery. */
+    if (!d) {
+        return;
+    }
+    d->send_deadline_for_test_ms = ms;
+}
+
 void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes) {
     if (!d)
         return;
@@ -374,7 +386,8 @@ cbm_http_conn_t *cbm_httpd_accept(cbm_httpd_t *d, int timeout_ms) {
     }
     c->fd = cfd;
     c->owner = d;
-    c->send_deadline_ms = CBM_HTTP_SEND_DEADLINE_MS;
+    c->send_deadline_ms = d->send_deadline_for_test_ms > 0 ? d->send_deadline_for_test_ms
+                                                            : CBM_HTTP_SEND_DEADLINE_MS;
     atomic_init(&c->response_started, false);
 
     cbm_mutex_lock(&d->active_mutex);
