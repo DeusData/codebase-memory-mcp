@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "benchmark-terminology.schema.json",
+  "title": "Codebase Memory benchmark terminology registry",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "terminology_version",
+    "step_id_order",
+    "entries"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "docs/schema/benchmark-terminology.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "terminology_version": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]*\\.[0-9]+\\.[0-9]+$"
+    },
+    "step_id_order": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/termId"}
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "termId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "entry": {
+      "type": "object",
+      "required": [
+        "term_id",
+        "display_name",
+        "definition",
+        "status",
+        "kind",
+        "data_type",
+        "allowed_values_or_range",
+        "unit",
+        "clock_or_cpu_scope",
+        "boundary_semantics",
+        "aggregation_rule",
+        "concurrency_rule",
+        "missing_or_unsupported_behavior",
+        "configuration_precedence",
+        "capability_or_freshness_implications",
+        "source_anchors",
+        "introduced_version",
+        "deprecated_replacement",
+        "examples"
+      ],
+      "properties": {
+        "term_id": {"$ref": "#/$defs/termId"},
+        "display_name": {"type": "string", "minLength": 1},
+        "definition": {"type": "string", "minLength": 1},
+        "status": {"enum": ["existing", "proposed", "deprecated"]},
+        "kind": {"type": "string", "minLength": 1},
+        "data_type": {"type": "string", "minLength": 1},
+        "allowed_values_or_range": {"type": "string", "minLength": 1},
+        "unit": {"type": "string", "minLength": 1},
+        "clock_or_cpu_scope": {"type": "string", "minLength": 1},
+        "boundary_semantics": {"type": "string", "minLength": 1},
+        "aggregation_rule": {"type": "string", "minLength": 1},
+        "concurrency_rule": {"type": "string", "minLength": 1},
+        "missing_or_unsupported_behavior": {"type": "string", "minLength": 1},
+        "configuration_precedence": {"type": "string", "minLength": 1},
+        "capability_or_freshness_implications": {"type": "string", "minLength": 1},
+        "source_anchors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "introduced_version": {"type": "string", "minLength": 1},
+        "deprecated_replacement": {
+          "oneOf": [
+            {"$ref": "#/$defs/termId"},
+            {"type": "null"}
+          ]
+        },
+        "examples": {
+          "type": "array",
+          "items": {}
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

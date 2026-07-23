@@ -232,6 +232,11 @@ Agent: presents the call chain in plain English
 
 Benchmarked on Apple M3 Pro:
 
+Reproducible experiment runs use the fact-table contract in
+[Benchmark Experiments](docs/BENCHMARK_EXPERIMENTS.md) and the normative terms in
+[Benchmark Terminology](docs/BENCHMARK_TERMINOLOGY.md). The latter distinguishes
+lifecycle wall time from overlapping component work before any ratio is reported.
+
 | Operation | Time | Notes |
 |-----------|------|-------|
 | **Linux kernel full index** | **3 min** | 28M LOC, 75K files → 4.81M nodes, 7.72M edges |

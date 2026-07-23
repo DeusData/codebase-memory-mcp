@@ -41,11 +41,33 @@ if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
         f"unsupported benchmark config spelling schema: {CONFIG_SPELLING_SPEC_PATH}"
     )
 
+BENCHMARK_TERMINOLOGY_PATH = (
+    Path(__file__).resolve().parents[1] / "docs" / "benchmark-terminology.json"
+)
+with BENCHMARK_TERMINOLOGY_PATH.open(encoding="utf-8") as stream:
+    BENCHMARK_TERMINOLOGY = json.load(stream)
+if BENCHMARK_TERMINOLOGY.get("schema_version") != 1:
+    raise RuntimeError(
+        f"unsupported benchmark terminology schema: {BENCHMARK_TERMINOLOGY_PATH}"
+    )
+BENCHMARK_TERMINOLOGY_VERSION = BENCHMARK_TERMINOLOGY["terminology_version"]
+BENCHMARK_TERMINOLOGY_SHA256 = hashlib.sha256(
+    json.dumps(BENCHMARK_TERMINOLOGY, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+).hexdigest()
+BENCHMARK_TERMINOLOGY_MARKDOWN_PATH = (
+    BENCHMARK_TERMINOLOGY_PATH.parent / "BENCHMARK_TERMINOLOGY.md"
+)
+
 
 BENCHMARK_ARTIFACT_DIR_ENV = "CBM_BENCHMARK_ARTIFACT_DIR"
 BENCHMARK_RUN_CONTEXT_ENV = "CBM_BENCHMARK_RUN_CONTEXT"
-BENCHMARK_FACT_SCHEMA_VERSION = 1
-BENCHMARK_FACT_SCHEMA = "docs/schema/benchmark-facts-v1.schema.json"
+BENCHMARK_FACT_SCHEMA_VERSION = 2
+BENCHMARK_FACT_SCHEMA = "docs/schema/benchmark-facts-v2.schema.json"
+BENCHMARK_FACT_LEGACY_SCHEMAS = {
+    1: "docs/schema/benchmark-facts-v1.schema.json",
+}
 REPEATED_JSON_TRIALS = 3
 
 
@@ -405,6 +427,9 @@ def benchmark_harness_metadata() -> dict[str, Any]:
         "path": str(script),
         "sha256": file_sha256(script),
         "fact_schema_version": BENCHMARK_FACT_SCHEMA_VERSION,
+        "terminology_path": str(BENCHMARK_TERMINOLOGY_PATH),
+        "terminology_version": BENCHMARK_TERMINOLOGY_VERSION,
+        "terminology_sha256": BENCHMARK_TERMINOLOGY_SHA256,
     }
 
 
@@ -865,6 +890,9 @@ def normalize_benchmark_report(
     return {
         "$schema": BENCHMARK_FACT_SCHEMA,
         "schema_version": BENCHMARK_FACT_SCHEMA_VERSION,
+        "terminology_version": BENCHMARK_TERMINOLOGY_VERSION,
+        "terminology_sha256": BENCHMARK_TERMINOLOGY_SHA256,
+        "generator_revision": benchmark_harness_metadata()["sha256"],
         "runs": [run_row],
         "steps": fact_step_rows(report, run_id),
         "results": fact_result_rows(report, run_id),
@@ -875,6 +903,17 @@ def normalize_benchmark_report(
 def validate_benchmark_facts(facts: dict[str, Any]) -> None:
     if facts.get("schema_version") != BENCHMARK_FACT_SCHEMA_VERSION:
         raise ValueError("benchmark facts schema_version is unsupported")
+    if facts.get("terminology_version") != BENCHMARK_TERMINOLOGY_VERSION:
+        raise ValueError("benchmark facts terminology_version is unsupported")
+    if facts.get("terminology_sha256") != BENCHMARK_TERMINOLOGY_SHA256:
+        raise ValueError(
+            "benchmark facts terminology_sha256 does not match the registry"
+        )
+    generator_revision = facts.get("generator_revision")
+    if not isinstance(generator_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", generator_revision
+    ):
+        raise ValueError("benchmark facts generator_revision must be a SHA-256")
     for table in ("runs", "steps", "results", "artifacts"):
         rows = facts.get(table)
         if not isinstance(rows, list):
@@ -914,6 +953,41 @@ def validate_benchmark_facts(facts: dict[str, Any]) -> None:
         raise ValueError("benchmark fact step occurrence IDs must be unique")
 
 
+def load_benchmark_fact_bundle(path: Path) -> dict[str, Any]:
+    """Load current or retained v1 facts without inventing missing v1 metadata."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("benchmark fact bundle must be a JSON object")
+    version = document.get("schema_version")
+    if version == BENCHMARK_FACT_SCHEMA_VERSION:
+        if document.get("$schema") != BENCHMARK_FACT_SCHEMA:
+            raise ValueError(
+                "benchmark fact bundle schema URI does not match its version"
+            )
+        validate_benchmark_facts(document)
+        return document
+    legacy_schema = BENCHMARK_FACT_LEGACY_SCHEMAS.get(version)
+    if legacy_schema is None:
+        raise ValueError(f"unsupported benchmark fact schema_version: {version!r}")
+    if document.get("$schema") != legacy_schema:
+        raise ValueError("legacy benchmark fact bundle schema URI is invalid")
+    for table in ("runs", "steps", "results", "artifacts"):
+        if not isinstance(document.get(table), list):
+            raise ValueError(f"legacy benchmark facts {table} must be an array")
+    if len(document["runs"]) != 1 or not isinstance(document["runs"][0], dict):
+        raise ValueError("legacy benchmark facts must contain exactly one run row")
+    run_id = document["runs"][0].get("run_id")
+    if not isinstance(run_id, str) or not re.fullmatch(r"[0-9a-f]{24}", run_id):
+        raise ValueError("legacy benchmark fact run_id is invalid")
+    for table in ("steps", "results", "artifacts"):
+        if any(
+            not isinstance(row, dict) or row.get("run_id") != run_id
+            for row in document[table]
+        ):
+            raise ValueError(f"legacy benchmark facts {table} row has a foreign run_id")
+    return document
+
+
 def write_benchmark_fact_tables(facts: dict[str, Any], root: Path) -> dict[str, Any]:
     validate_benchmark_facts(facts)
     root.mkdir(parents=True, exist_ok=True)
@@ -944,6 +1018,9 @@ def write_benchmark_fact_tables(facts: dict[str, Any], root: Path) -> dict[str, 
         }
     manifest = {
         "schema_version": BENCHMARK_FACT_SCHEMA_VERSION,
+        "terminology_version": BENCHMARK_TERMINOLOGY_VERSION,
+        "terminology_sha256": BENCHMARK_TERMINOLOGY_SHA256,
+        "generator_revision": facts["generator_revision"],
         "run_id": facts["runs"][0]["run_id"],
         "files": files,
     }
@@ -6435,6 +6512,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--binary", default="build/c/codebase-memory-mcp")
     parser.add_argument(
+        "--describe-terms",
+        choices=("json", "markdown"),
+        default="",
+        help=(
+            "Print the canonical benchmark terminology registry or generated Markdown "
+            f"(version {BENCHMARK_TERMINOLOGY_VERSION}; "
+            "docs/benchmark-terminology.json), then exit."
+        ),
+    )
+    parser.add_argument(
         "--candidate-revision",
         default="",
         help=(
@@ -6698,6 +6785,18 @@ def resolve_binary_path(binary_arg: str) -> Path:
 
 def main() -> int:
     args = parse_args()
+    if args.describe_terms:
+        path = (
+            BENCHMARK_TERMINOLOGY_PATH
+            if args.describe_terms == "json"
+            else BENCHMARK_TERMINOLOGY_MARKDOWN_PATH
+        )
+        try:
+            sys.stdout.write(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            print(f"error: cannot read benchmark terminology: {exc}", file=sys.stderr)
+            return 2
+        return 0
     if args.import_report:
         if not args.facts_dir:
             print("error: --import-report requires --facts-dir", file=sys.stderr)

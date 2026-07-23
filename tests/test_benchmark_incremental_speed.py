@@ -1961,6 +1961,13 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         facts = BENCHMARK.normalize_benchmark_report(report, context)
         BENCHMARK.validate_benchmark_facts(facts)
 
+        self.assertEqual(
+            facts["terminology_version"], BENCHMARK.BENCHMARK_TERMINOLOGY_VERSION
+        )
+        self.assertEqual(
+            facts["terminology_sha256"], BENCHMARK.BENCHMARK_TERMINOLOGY_SHA256
+        )
+        self.assertRegex(facts["generator_revision"], r"^[0-9a-f]{64}$")
         run = facts["runs"][0]
         self.assertEqual(run["implementation"]["revision"], "a" * 40)
         self.assertEqual(run["implementation"]["build"]["cflags"], "-O2")
@@ -2097,12 +2104,100 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
             ]
 
         self.assertEqual(manifest_document["run_id"], facts["runs"][0]["run_id"])
+        self.assertEqual(
+            manifest_document["terminology_sha256"],
+            BENCHMARK.BENCHMARK_TERMINOLOGY_SHA256,
+        )
         self.assertEqual(bundle["$schema"], BENCHMARK.BENCHMARK_FACT_SCHEMA)
         self.assertNotIn("$schema", manifest_document)
         self.assertEqual(manifest["files"]["bundle"]["rows"], 3)
         self.assertEqual(manifest["files"]["steps"]["rows"], 1)
         self.assertEqual(step_rows[0]["step_id"], "incremental_index")
         self.assertRegex(manifest["manifest_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_benchmark_terminology_registry_is_unique_complete_and_generated(
+        self,
+    ) -> None:
+        entries = BENCHMARK.BENCHMARK_TERMINOLOGY["entries"]
+        term_ids = [entry["term_id"] for entry in entries]
+        self.assertEqual(len(term_ids), len(set(term_ids)))
+        self.assertIn("lifecycle_wall_time", term_ids)
+        self.assertIn("capability_delta_comparison", term_ids)
+        self.assertIn("dependency_package_index", term_ids)
+        required = {
+            "term_id",
+            "display_name",
+            "definition",
+            "status",
+            "kind",
+            "data_type",
+            "allowed_values_or_range",
+            "unit",
+            "clock_or_cpu_scope",
+            "boundary_semantics",
+            "aggregation_rule",
+            "concurrency_rule",
+            "missing_or_unsupported_behavior",
+            "configuration_precedence",
+            "capability_or_freshness_implications",
+            "source_anchors",
+            "introduced_version",
+            "deprecated_replacement",
+            "examples",
+        }
+        for entry in entries:
+            self.assertEqual(set(entry), required, entry["term_id"])
+        generator = SCRIPT.with_name("generate-benchmark-terminology.py")
+        process = subprocess.run(
+            [sys.executable, str(generator), "--check"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+
+    def test_describe_terms_does_not_require_benchmark_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            missing_binary = Path(tmpdir) / "missing"
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "--describe-terms",
+                    "json",
+                    "--binary",
+                    str(missing_binary),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        registry = json.loads(process.stdout)
+        self.assertEqual(
+            registry["terminology_version"],
+            BENCHMARK.BENCHMARK_TERMINOLOGY_VERSION,
+        )
+
+    def test_load_retained_v1_fact_bundle_preserves_unknown_terminology(self) -> None:
+        facts = BENCHMARK.normalize_benchmark_report(
+            {
+                "measurements": {"incremental": {"elapsed_ms": 5}},
+                "derived": {"passed": True},
+            }
+        )
+        facts["$schema"] = BENCHMARK.BENCHMARK_FACT_LEGACY_SCHEMAS[1]
+        facts["schema_version"] = 1
+        del facts["terminology_version"]
+        del facts["terminology_sha256"]
+        del facts["generator_revision"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "facts-v1.json"
+            path.write_text(json.dumps(facts), encoding="utf-8")
+            loaded = BENCHMARK.load_benchmark_fact_bundle(path)
+        self.assertEqual(loaded["schema_version"], 1)
+        self.assertNotIn("terminology_version", loaded)
+        self.assertEqual(loaded["steps"][0]["elapsed_ms"], 5.0)
 
     def test_validate_benchmark_facts_rejects_schema_required_run_field_gap(
         self,
