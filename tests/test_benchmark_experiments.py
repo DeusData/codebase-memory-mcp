@@ -338,7 +338,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
                     "automatic-dependency-source-indexing-disabled",
                     "automatic-dependency-source-indexing-enabled",
                     "upstream-equivalent",
-                    "eager-derived-freshness",
+                    "derived-results-refresh-at-publish",
                     "rank-disabled",
                     "similarity-disabled",
                     "semantic-edges-disabled",
@@ -934,9 +934,11 @@ class BenchmarkExperimentTest(unittest.TestCase):
                         "capabilities": {},
                     },
                     {
-                        "label": "eager",
-                        "config_profile": "incremental_semantic_freshness_eager",
-                        "capabilities": {"incremental_derived_refresh": "eager"},
+                        "label": "at-publish",
+                        "config_profile": "incremental_derived_results_refresh_at_publish",
+                        "capabilities": {
+                            "incremental_derived_results_refresh": "at_publish"
+                        },
                     },
                 ],
             }

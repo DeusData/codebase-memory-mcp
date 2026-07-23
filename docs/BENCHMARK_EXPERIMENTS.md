@@ -202,9 +202,11 @@ pass an unknown flag to an old binary or pretend that its default is an ablation
 The harness likewise leaves `rank_refresh` untouched by default, records
 `"rank_refresh": "candidate_default"` and
 `"rank_refresh_override_applied": false`, and therefore measures each candidate's
-real compiled/configured policy. Use `--rank-refresh eager`, `stale_on_exact`, or
-`stale_on_incremental` only for an explicit policy experiment on candidates known to
-support that value.
+real compiled/configured policy. Use `--rank-refresh at_publish`,
+`defer_exact_delta_reindexes`, or `defer_all_incremental_reindexes` only for an
+explicit policy experiment. The harness reads the versioned spelling map and
+translates these values only when running a retained candidate that predates the
+canonical names.
 
 Each semantic pair case also supplies a content-addressed replacement source. A real
 one-file mutation removes one judged positive and adds another, retaining pre/post
@@ -274,26 +276,27 @@ The optional graph-pass ablation retains the benchmark default
 The immediate semantic/similarity freshness profile is:
 
 ```text
---config-profile incremental_semantic_freshness_eager
+--config-profile incremental_derived_results_refresh_at_publish
 ```
 
-It changes only `incremental_derived_refresh=eager`. The default
-`stale_on_incremental` policy may publish an exact or containment delta after
-marking global `SIMILAR_TO`/`SEMANTICALLY_RELATED` views stale; graph queries must
-then retain an explicit freshness warning until an eager or full rebuild. Reports
-score this warning as policy conformance, not an unexplained execution failure, but
-they keep immediate semantic task quality false. The eager profile must produce the
-post-mutation judged pair set and edge scores identically to a fresh rebuild without
-a stale warning. Compare both profiles when selecting a latency/freshness Pareto
-point.
+It changes only `incremental_derived_results_refresh=at_publish`. The default
+`defer_all_incremental_reindexes` policy may publish an exact or containment delta
+after marking global `SIMILAR_TO`/`SEMANTICALLY_RELATED` views stale; graph queries
+must then retain an explicit freshness warning until an at-publish or full rebuild.
+Reports score this warning as policy conformance, not an unexplained execution
+failure, but they keep immediate semantic task quality false. The at-publish profile
+must produce the post-mutation judged pair set and edge scores identically to a fresh
+rebuild without a stale warning. Compare both profiles when selecting a
+latency/freshness Pareto point.
 
 Cross-version candidate-default cells do not assume that older binaries share the
 latest binary's derived-refresh default. With no explicit
-`incremental_derived_refresh` override, the retained policy is
+`incremental_derived_results_refresh` override, the retained policy is
 `candidate_default` and the harness classifies observed behavior as immediate pair
 freshness, deferred with a structured warning, or unreported stale output. Explicit
-eager/deferred profiles continue to validate against the requested policy. This
-keeps an older eager default from being judged against a newer deferred default.
+at-publish/deferred profiles continue to validate against the requested policy. This
+keeps an older immediate-refresh default from being judged against a newer deferred
+default.
 
 Large mutation reports keep Core graph and Full graph freshness separate. A
 `PASS: DECLARED STALE VIEWS` decision requires structured `stale_with_warning`

@@ -16,6 +16,17 @@ from pathlib import Path
 from typing import Any
 
 
+CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name(
+    "benchmark-config-spellings-v1.json"
+)
+with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
+    CONFIG_SPELLING_SPEC = json.load(stream)
+if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
+    raise RuntimeError(
+        f"unsupported benchmark config spelling schema: {CONFIG_SPELLING_SPEC_PATH}"
+    )
+
+
 def percentile(values: list[float], quantile: float) -> float | None:
     if not values:
         return None
@@ -88,6 +99,76 @@ def cases_from_report(report: dict[str, Any]) -> list[dict[str, Any]]:
     return []
 
 
+PRE_RENAME_CONFIG_OVERRIDES = {
+    (entry["historical"]["key"], entry["historical"]["value"]): (
+        entry["canonical"]["key"],
+        entry["canonical"]["value"],
+    )
+    for entry in CONFIG_SPELLING_SPEC["config_overrides"]
+}
+PRE_RENAME_CONFIG_PROFILES = {
+    historical: details["canonical"]
+    for details in CONFIG_SPELLING_SPEC["profiles"].values()
+    for historical in details["historical"]
+}
+PRE_RENAME_EXPERIMENT_LABELS = {
+    historical: details["canonical"]
+    for details in CONFIG_SPELLING_SPEC["experiment_labels"].values()
+    for historical in details["historical"]
+}
+
+
+def canonical_config_override(key: Any, value: Any) -> tuple[str, str]:
+    raw = str(key), str(value)
+    return PRE_RENAME_CONFIG_OVERRIDES.get(
+        raw,
+        raw,
+    )
+
+
+def canonical_config_overrides(overrides: dict[Any, Any]) -> dict[str, str]:
+    canonical: dict[str, str] = {}
+    for raw_key, raw_value in overrides.items():
+        key, value = canonical_config_override(raw_key, raw_value)
+        previous = canonical.get(key)
+        if previous is not None and previous != value:
+            raise ValueError(
+                f"conflicting retained config values after canonicalization: "
+                f"{key}={previous} and {key}={value}"
+            )
+        canonical[key] = value
+    return canonical
+
+
+def canonical_config_profile(profile: Any) -> Any:
+    return PRE_RENAME_CONFIG_PROFILES.get(profile, profile)
+
+
+def canonical_experiment_label(label: str) -> str:
+    return PRE_RENAME_EXPERIMENT_LABELS.get(label, label)
+
+
+def reports_use_pre_rename_config_spellings(reports: list[dict[str, Any]]) -> bool:
+    for report in reports:
+        parameters = report.get("parameters")
+        overrides = (
+            parameters.get("config_overrides", {})
+            if isinstance(parameters, dict)
+            else {}
+        )
+        if not isinstance(overrides, dict):
+            continue
+        profile = (
+            parameters.get("config_profile") if isinstance(parameters, dict) else None
+        )
+        if canonical_config_profile(profile) != profile or any(
+            canonical_config_override(key, value) != (str(key), str(value))
+            for key, value in overrides.items()
+        ):
+            return True
+    return False
+
+
 def config_label(reports: list[dict[str, Any]]) -> str:
     labels: set[str] = set()
     for report in reports:
@@ -100,8 +181,13 @@ def config_label(reports: list[dict[str, Any]]) -> str:
         profile = (
             parameters.get("config_profile") if isinstance(parameters, dict) else None
         )
+        profile = canonical_config_profile(profile)
         if isinstance(overrides, dict) and overrides:
-            expanded = ", ".join(f"{key}={overrides[key]}" for key in sorted(overrides))
+            canonical_overrides = canonical_config_overrides(overrides)
+            expanded = ", ".join(
+                f"{key}={canonical_overrides[key]}"
+                for key in sorted(canonical_overrides)
+            )
             labels.add(
                 f"{profile} ({expanded})"
                 if isinstance(profile, str) and profile
@@ -127,9 +213,7 @@ def config_signature(
         )
         if not isinstance(overrides, dict):
             return None
-        signatures.add(
-            tuple(sorted((str(key), str(value)) for key, value in overrides.items()))
-        )
+        signatures.add(tuple(sorted(canonical_config_overrides(overrides).items())))
     return next(iter(signatures)) if len(signatures) == 1 else None
 
 
@@ -622,6 +706,11 @@ def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str,
         else:
             freshness = "unexpected stale or non-canonical"
         background = case.get("background_repository")
+        freshness_policy = policy.get("policy")
+        if isinstance(freshness_policy, str):
+            freshness_policy = canonical_config_override(
+                "incremental_derived_results_refresh", freshness_policy
+            )[1]
         details.append(
             {
                 "capability": fixture.get("capability"),
@@ -639,7 +728,7 @@ def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str,
                 "incremental_f1": incremental_f1,
                 "fresh_confusion": fresh_confusion,
                 "fresh_f1": fresh_f1,
-                "freshness_policy": policy.get("policy"),
+                "freshness_policy": freshness_policy,
                 "freshness": freshness,
                 "policy_conformance_met": policy.get("policy_conformance_met"),
                 "immediate_freshness_expected": policy.get(
@@ -652,6 +741,7 @@ def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str,
 
 
 def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]:
+    canonical_label = canonical_experiment_label(label)
     cases = [case for report in reports for case in cases_from_report(report)]
     report_modes = {str(report.get("mode") or "") for report in reports}
     capability_quality = report_modes == {"capability_quality"}
@@ -1112,7 +1202,7 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
             "the structured stale warning was present and initial/fresh pair tasks passed",
         )
     return {
-        "candidate": label,
+        "candidate": canonical_label,
         "decision": decision,
         "graph_error": (
             "**GRAPH ERROR**"
@@ -1174,6 +1264,9 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         "full_range_ms": (min(full_values), max(full_values)) if full_values else None,
         "capabilities": config_label(reports),
         "capability_signature": config_signature(reports),
+        "pre_rename_config_spellings": (
+            canonical_label != label or reports_use_pre_rename_config_spellings(reports)
+        ),
         "incremental_p50_ms": percentile(incremental_ms, 0.50),
         "incremental_work_p50_ms": percentile(incremental_work_ms, 0.50),
         "incremental_peak_p50_mb": percentile(incremental_peak_rss, 0.50),
@@ -2303,6 +2396,16 @@ def render_markdown(rows: list[dict[str, Any]]) -> str:
             "",
             "* Response tokens use the recorded `utf8_bytes_div_4_ceil` deterministic estimate; "
             "bytes remain the exact default tool-response payload measurement.",
+            *(
+                (
+                    "",
+                    "* Configuration labels are display-canonicalized when retained fact bundles "
+                    "contain recorded configuration spellings used before the canonical rename; "
+                    "the immutable input artifacts are not rewritten.",
+                )
+                if any(row.get("pre_rename_config_spellings") for row in rows)
+                else ()
+            ),
             "",
             "Retrieval MRR is the mean reciprocal rank of the first expected result over applicable "
             "ranked probes; a missing expected result contributes zero. Hit@1 and Hit@5 are the "

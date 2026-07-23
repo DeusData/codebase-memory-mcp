@@ -27,6 +27,29 @@ from pathlib import Path
 from typing import Any
 
 
+CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name(
+    "benchmark-config-spellings-v1.json"
+)
+with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
+    CONFIG_SPELLING_SPEC = json.load(stream)
+if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
+    raise RuntimeError(
+        f"unsupported benchmark config spelling schema: {CONFIG_SPELLING_SPEC_PATH}"
+    )
+DERIVED_RESULTS_AT_PUBLISH_PROFILE = CONFIG_SPELLING_SPEC["profiles"][
+    "derived_results_refresh_at_publish"
+]["canonical"]
+DERIVED_RESULTS_AT_PUBLISH_EXPERIMENT_LABEL = CONFIG_SPELLING_SPEC["experiment_labels"][
+    "derived_results_refresh_at_publish"
+]["canonical"]
+CONFIG_OVERRIDE_SPELLINGS = {
+    entry["id"]: entry for entry in CONFIG_SPELLING_SPEC["config_overrides"]
+}
+DERIVED_RESULTS_AT_PUBLISH_OVERRIDE = CONFIG_OVERRIDE_SPELLINGS[
+    "incremental_derived_results_refresh_at_publish"
+]["canonical"]
+
+
 SCHEMA_VERSION = 1
 EXPERIMENT_DEFINITION_VERSION = 1
 DEFAULT_MINIMUM_FREE_BYTES = 2 * 1024 * 1024 * 1024
@@ -660,12 +683,14 @@ def build_automatic_spec(
                     },
                 },
                 {
-                    "label": "eager-derived-freshness",
-                    "config_profile": "incremental_semantic_freshness_eager",
+                    "label": DERIVED_RESULTS_AT_PUBLISH_EXPERIMENT_LABEL,
+                    "config_profile": DERIVED_RESULTS_AT_PUBLISH_PROFILE,
                     "candidate_labels": latest_labels,
                     "capabilities": {
                         **capabilities(),
-                        "incremental_derived_refresh": "eager",
+                        DERIVED_RESULTS_AT_PUBLISH_OVERRIDE[
+                            "key"
+                        ]: DERIVED_RESULTS_AT_PUBLISH_OVERRIDE["value"],
                     },
                 },
                 {
