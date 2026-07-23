@@ -58,8 +58,8 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
-CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
+CFLAGS_PROD = $(CFLAGS_COMMON) $(HARDEN_CFLAGS) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(CFLAGS_EXTRA)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) $(HARDEN_CFLAGS) -O2
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -103,7 +103,19 @@ ifeq ($(STATIC),1)
 STATIC_FLAGS := -static
 endif
 
-LDFLAGS = -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
+# Optional production hardening flags (intended for downstream package maintainers).
+# Enable with: gmake -f Makefile.cbm cbm FREEBSD_HARDENING=1
+# Disabled by default to preserve portable builds.
+FREEBSD_HARDENING ?= 0
+HARDEN_CFLAGS :=
+HARDEN_LDFLAGS :=
+
+ifeq ($(FREEBSD_HARDENING),1)
+HARDEN_CFLAGS += -fstack-protector-strong -D_FORTIFY_SOURCE=2
+HARDEN_LDFLAGS += -Wl,-z,relro -Wl,-z,now
+endif
+
+LDFLAGS = $(HARDEN_LDFLAGS) -lm -lstdc++ -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS)
 LDFLAGS_TEST = -lm -lstdc++ -lpthread -lz $(SANITIZE) $(WIN32_LIBS)
 LDFLAGS_TSAN = -lm -lstdc++ -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS)
 
