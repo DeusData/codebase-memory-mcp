@@ -11,6 +11,12 @@
  * Output format (structured log lines, parseable):
  *   level=info msg=prof phase=<pass> sub=<subphase> ms=<N> us=<N> items=<N> rate_per_s=<N>
  *
+ * Stable benchmark terms and proposed step IDs are defined in
+ * docs/benchmark-terminology.json and generated into
+ * src/foundation/profile_terms_generated.h. Profile call sites must use that
+ * registry before adding machine-readable step IDs; concurrent occurrences
+ * remain distinct and their elapsed spans are not implicitly additive.
+ *
  * Grep for `msg=prof` to get a full profile report.
  */
 #ifndef CBM_PROFILE_H

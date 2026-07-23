@@ -79,6 +79,12 @@ the dedicated `test-tsan`, `test-leak`, `test-memory`, and `test-gmalloc` target
 diagnosing concurrency or allocator lifetime behavior. These diagnostic binaries are not valid
 performance-benchmark inputs.
 
+For performance changes, use the canonical fact tables and comparison rules in
+[`docs/BENCHMARK_EXPERIMENTS.md`](docs/BENCHMARK_EXPERIMENTS.md). Field, step,
+concurrency, and lifecycle meanings come from the generated
+[`docs/BENCHMARK_TERMINOLOGY.md`](docs/BENCHMARK_TERMINOLOGY.md), whose source of
+truth is `docs/benchmark-terminology.json`.
+
 Additional build flags follow the Makefile conventions:
 
 ```bash

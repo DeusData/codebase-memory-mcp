@@ -34,7 +34,12 @@ Every new benchmark result also writes a schema-valid `facts.json` bundle, norma
 `runs.json`, `steps.jsonl`, `results.json`, and `artifacts.json` tables, and a hashed
 `manifest.json` under the experiment attempt's artifact directory. Standalone runs use
 `--facts-dir DIR`; when only `--out result.json` is given, facts default to
-`result.facts/`. The schema is `docs/schema/benchmark-facts-v1.schema.json`.
+`result.facts/`. New bundles use `docs/schema/benchmark-facts-v2.schema.json`;
+the retained v1 schema remains available for earlier runsets. The
+canonical benchmark vocabulary is `docs/benchmark-terminology.json`; its generated
+human-readable view is [BENCHMARK_TERMINOLOGY.md](BENCHMARK_TERMINOLOGY.md).
+`uv run python scripts/benchmark-incremental-speed.py --describe-terms
+json|markdown` prints either view without requiring a benchmark binary.
 
 The run row records the experiment cell ID and label, exact candidate commit,
 repetition, binary path/hash/size, build metadata, harness hash, host metadata,
@@ -43,6 +48,9 @@ each occurrence separate and distinguish elapsed work from CPU, queue, worker,
 dependency, and monotonic-boundary fields. A field absent from the historical
 measurement is an explicit `{"status":"unknown","reason":"..."}` value; it is
 never reconstructed from a preset name or treated as suitable for a parity join.
+Every fact bundle records the terminology version, canonical-content SHA-256, and
+benchmark-generator SHA-256. A retained bundle therefore identifies the exact
+definitions and normalizer that gave each field and step ID its meaning.
 Experiment cells supply the candidate commit and build metadata automatically.
 Standalone runs must pass `--candidate-revision FULL_COMMIT` and
 `--build-metadata-json '{...}'` to make those fields authoritative; otherwise the
