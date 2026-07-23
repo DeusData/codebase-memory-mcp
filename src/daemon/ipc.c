@@ -3554,13 +3554,13 @@ static void *win_token_user_query(win_security_t *security, HANDLE token, PSID *
     return buffer;
 }
 
-#define RESOLVE_ADVAPI_MEMBER(context, member, type, symbol)                   \
-    do {                                                                       \
-        (context)->member = (type)GetProcAddress((context)->advapi, (symbol)); \
-        if (!(context)->member) {                                              \
-            win_security_destroy((context));                                   \
-            return false;                                                      \
-        }                                                                      \
+#define RESOLVE_ADVAPI_MEMBER(context, member, type, symbol)                                   \
+    do {                                                                                       \
+        (context)->member = (type)(void (*)(void))GetProcAddress((context)->advapi, (symbol)); \
+        if (!(context)->member) {                                                              \
+            win_security_destroy((context));                                                   \
+            return false;                                                                      \
+        }                                                                                      \
     } while (0)
 
 static bool win_security_init(win_security_t *security) {
@@ -4619,7 +4619,8 @@ static bool win_generation_nonce(uint8_t nonce[CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE
     enum { WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG = 0x00000002 };
     HMODULE bcrypt = LoadLibraryW(L"bcrypt.dll");
     bcrypt_gen_random_fn generate =
-        bcrypt ? (bcrypt_gen_random_fn)GetProcAddress(bcrypt, "BCryptGenRandom") : NULL;
+        bcrypt ? (bcrypt_gen_random_fn)(void (*)(void))GetProcAddress(bcrypt, "BCryptGenRandom")
+               : NULL;
     LONG status = generate ? generate(NULL, nonce, CBM_DAEMON_IPC_WINDOWS_NONCE_SIZE,
                                       WIN_BCRYPT_USE_SYSTEM_PREFERRED_RNG)
                            : (LONG)-1;
@@ -5174,8 +5175,8 @@ static bool win_pipe_client_is_current_user(HANDLE pipe) {
      * has completed a read, which accept must not require. */
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     get_named_pipe_server_process_id_fn get_client_pid =
-        kernel ? (get_named_pipe_server_process_id_fn)GetProcAddress(kernel,
-                                                                     "GetNamedPipeClientProcessId")
+        kernel ? (get_named_pipe_server_process_id_fn)(void (*)(void))GetProcAddress(
+                     kernel, "GetNamedPipeClientProcessId")
                : NULL;
     if (!get_client_pid) {
         cbm_log_warn("daemon.accept.client_identity", "step", "pid_fn_missing");
@@ -5319,8 +5320,8 @@ int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_
 static bool win_pipe_server_is_current_user(HANDLE pipe) {
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     get_named_pipe_server_process_id_fn get_server_pid =
-        kernel ? (get_named_pipe_server_process_id_fn)GetProcAddress(kernel,
-                                                                     "GetNamedPipeServerProcessId")
+        kernel ? (get_named_pipe_server_process_id_fn)(void (*)(void))GetProcAddress(
+                     kernel, "GetNamedPipeServerProcessId")
                : NULL;
     ULONG process_id = 0;
     if (!get_server_pid) {
@@ -5612,7 +5613,7 @@ uint64_t cbm_daemon_ipc_connection_peer_pid(const cbm_daemon_ipc_connection_t *c
     ULONG process_id = 0;
     if (connection->role == CBM_DAEMON_IPC_PIPE_ROLE_ACCEPTED_SERVER) {
         get_named_pipe_client_process_id_fn get_client_pid =
-            kernel ? (get_named_pipe_client_process_id_fn)GetProcAddress(
+            kernel ? (get_named_pipe_client_process_id_fn)(void (*)(void))GetProcAddress(
                          kernel, "GetNamedPipeClientProcessId")
                    : NULL;
         if (!get_client_pid || !get_client_pid(connection->handle, &process_id)) {
@@ -5620,7 +5621,7 @@ uint64_t cbm_daemon_ipc_connection_peer_pid(const cbm_daemon_ipc_connection_t *c
         }
     } else if (connection->role == CBM_DAEMON_IPC_PIPE_ROLE_CONNECTED_CLIENT) {
         get_named_pipe_server_process_id_fn get_server_pid =
-            kernel ? (get_named_pipe_server_process_id_fn)GetProcAddress(
+            kernel ? (get_named_pipe_server_process_id_fn)(void (*)(void))GetProcAddress(
                          kernel, "GetNamedPipeServerProcessId")
                    : NULL;
         if (!get_server_pid || !get_server_pid(connection->handle, &process_id)) {
