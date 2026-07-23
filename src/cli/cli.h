@@ -463,6 +463,11 @@ int cbm_cmd_update(int argc, char **argv);
 /* config: get/set/list/reset runtime config values. */
 int cbm_cmd_config(int argc, char **argv);
 
+/* emit-plugin: generate the Claude Code plugin tree under out_dir.
+ * version may be NULL (uses cbm_cli_get_version()). Wholly owns out_dir. */
+int cbm_emit_plugin(const char *out_dir, const char *version);
+int cbm_cmd_emit_plugin(int argc, char **argv);
+
 /* hook-augment: stdin-driven Claude Code PreToolUse augmenter.
  * Reads the hook JSON from stdin and emits hookSpecificOutput.additionalContext
  * with search_graph hits for Grep/Glob calls. NEVER blocks: every failure

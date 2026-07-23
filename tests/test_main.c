@@ -677,6 +677,7 @@ extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
 extern void suite_agent_profiles(void);
+extern void suite_plugin_emit(void);
 extern void suite_config_json_like(void);
 extern void suite_config_toml_edit(void);
 extern void suite_config_yaml_edit(void);
@@ -944,6 +945,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(cli);
     RUN_SELECTED_SUITE(agent_clients);
     RUN_SELECTED_SUITE(agent_profiles);
+    RUN_SELECTED_SUITE(plugin_emit);
     RUN_SELECTED_SUITE(config_json_like);
     RUN_SELECTED_SUITE(config_toml_edit);
     RUN_SELECTED_SUITE(config_yaml_edit);

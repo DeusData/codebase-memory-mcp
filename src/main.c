@@ -896,6 +896,9 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         if (strcmp(argv[i], "config") == 0) {
             return cbm_cmd_config(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
+        if (strcmp(argv[i], "emit-plugin") == 0) {
+            return cbm_cmd_emit_plugin(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
     }
     return CBM_NOT_FOUND;
 }

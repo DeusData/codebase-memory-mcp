@@ -1,0 +1,14 @@
+{
+  "SessionStart": [
+    { "hooks": [ { "type": "command", "command": "npx -y codebase-memory-mcp hook-augment --event SessionStart" } ] }
+  ],
+  "SubagentStart": [
+    { "hooks": [ { "type": "command", "command": "npx -y codebase-memory-mcp hook-augment --event SubagentStart" } ] }
+  ],
+  "PreToolUse": [
+    { "matcher": "Grep|Glob", "hooks": [ { "type": "command", "command": "npx -y codebase-memory-mcp hook-augment" } ] }
+  ],
+  "PostToolUse": [
+    { "matcher": "Read", "hooks": [ { "type": "command", "command": "npx -y codebase-memory-mcp hook-augment" } ] }
+  ]
+}

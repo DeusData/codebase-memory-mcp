@@ -6997,6 +6997,217 @@ int cbm_cmd_config(int argc, char **argv) {
     return rc;
 }
 
+/* ── emit-plugin: Claude Code plugin generator ──────────────────── */
+
+/* Recursively delete path (file or directory tree). Missing path is not an
+ * error — emit re-runs are idempotent against a from-scratch out_dir.
+ * Built entirely on the cross-platform cbm_opendir/readdir/unlink/rmdir
+ * primitives in compat_fs.c, so no platform-specific code is needed here. */
+static int emit_rm_rf(const char *path) {
+    cbm_dir_t *d = cbm_opendir(path);
+    if (!d) {
+        return CLI_OK; /* not a directory (missing, or a plain file) */
+    }
+    int rc = CLI_OK;
+    cbm_dirent_t *e;
+    while (rc == CLI_OK && (e = cbm_readdir(d)) != NULL) {
+        char child[CLI_BUF_1K];
+        snprintf(child, sizeof(child), "%s/%s", path, e->name);
+        rc = e->is_dir ? emit_rm_rf(child) : (cbm_unlink(child) == 0 ? CLI_OK : CLI_ERR);
+    }
+    cbm_closedir(d);
+    if (rc != CLI_OK) {
+        return rc;
+    }
+    return cbm_rmdir(path) == 0 ? CLI_OK : CLI_ERR;
+}
+
+static int emit_write_file(const char *path, const char *content) {
+    if (!path || !content || ensure_parent_dir(path) != CLI_OK) {
+        return CLI_ERR;
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return CLI_ERR;
+    }
+    size_t len = strlen(content);
+    size_t wrote = fwrite(content, 1, len, f);
+    int close_rc = fclose(f);
+    return (wrote == len && close_rc == 0) ? CLI_OK : CLI_ERR;
+}
+
+/* Copy src into dst (size cap) as a JSON-safe string body: escape " and \,
+ * drop control chars < 0x20. Only version needs this — later artifacts write
+ * static literals or verbatim source, not interpolated untrusted data. */
+static void json_escape_into(char *dst, size_t dst_sz, const char *src) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j + 2 < dst_sz; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == '"' || c == '\\') {
+            dst[j++] = '\\';
+        } else if (c < 0x20) {
+            continue;
+        }
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
+static int emit_plugin_json(const char *out_dir, const char *version) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.claude-plugin/plugin.json", out_dir);
+    char ver_esc[CLI_BUF_1K];
+    json_escape_into(ver_esc, sizeof(ver_esc), version);
+    char json[CLI_BUF_1K];
+    snprintf(json, sizeof(json),
+             "{\n"
+             "  \"name\": \"codebase-memory\",\n"
+             "  \"version\": \"%s\",\n"
+             "  \"description\": \"Codebase knowledge graph for AI agents — "
+             "159 languages, sub-ms queries, 99%% fewer tokens.\"\n"
+             "}\n",
+             ver_esc);
+    return emit_write_file(path, json);
+}
+
+static int emit_skills(const char *out_dir) {
+    const cbm_skill_t *skill_list = cbm_get_skills();
+    for (int i = 0; i < CBM_SKILL_COUNT; i++) {
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/skills/%s/SKILL.md", out_dir, skill_list[i].name);
+        if (emit_write_file(path, skill_list[i].content) != CLI_OK) {
+            return CLI_ERR;
+        }
+    }
+    return CLI_OK;
+}
+
+static int emit_agents(const char *out_dir) {
+    for (cbm_graph_tier_t tier = CBM_GRAPH_TIER_SCOUT; tier < CBM_GRAPH_TIER_COUNT; tier++) {
+        char *profile =
+            cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, tier, CBM_GRAPH_ACCESS_DIRECT, NULL);
+        const char *slug = cbm_graph_tier_slug(tier);
+        if (!profile || !slug) {
+            free(profile);
+            return CLI_ERR;
+        }
+        char path[CLI_BUF_1K];
+        snprintf(path, sizeof(path), "%s/agents/%s.md", out_dir, slug);
+        int rc = emit_write_file(path, profile);
+        free(profile);
+        if (rc != CLI_OK) {
+            return CLI_ERR;
+        }
+    }
+    return CLI_OK;
+}
+
+static int emit_mcp_json(const char *out_dir) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/.mcp.json", out_dir);
+    static const char body[] = "{\n"
+                               "  \"mcpServers\": {\n"
+                               "    \"codebase-memory-mcp\": {\n"
+                               "      \"type\": \"stdio\",\n"
+                               "      \"command\": \"npx\",\n"
+                               "      \"args\": [\"-y\", \"codebase-memory-mcp\"]\n"
+                               "    }\n"
+                               "  }\n"
+                               "}\n";
+    return emit_write_file(path, body);
+}
+
+static int emit_hooks_json(const char *out_dir) {
+    char path[CLI_BUF_1K];
+    snprintf(path, sizeof(path), "%s/hooks/hooks.json", out_dir);
+    static const char body[] =
+        "{\n"
+        "  \"SessionStart\": [\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment --event SessionStart\" } ] }\n"
+        "  ],\n"
+        "  \"SubagentStart\": [\n"
+        "    { \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment --event SubagentStart\" } ] }\n"
+        "  ],\n"
+        "  \"PreToolUse\": [\n"
+        "    { \"matcher\": \"Grep|Glob\", \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment\" } ] }\n"
+        "  ],\n"
+        "  \"PostToolUse\": [\n"
+        "    { \"matcher\": \"Read\", \"hooks\": [ { \"type\": \"command\", \"command\": "
+        "\"npx -y codebase-memory-mcp hook-augment\" } ] }\n"
+        "  ]\n"
+        "}\n";
+    return emit_write_file(path, body);
+}
+
+int cbm_emit_plugin(const char *out_dir, const char *version) {
+    if (!out_dir || out_dir[0] == '\0') {
+        return CLI_ERR;
+    }
+    const char *ver = (version && version[0]) ? version : cbm_cli_get_version();
+    /* Refuse to wipe a directory that isn't already an emitted plugin tree —
+     * emit-plugin recursively clears out_dir, so guard against `emit-plugin .`
+     * or a typo destroying real files. Safe when the dir is absent or already
+     * contains our marker. */
+    struct stat st;
+    if (stat(out_dir, &st) == 0) {
+        char marker[CLI_BUF_1K];
+        snprintf(marker, sizeof(marker), "%s/.claude-plugin/plugin.json", out_dir);
+        struct stat mst;
+        if (stat(marker, &mst) != 0) {
+            (void)fprintf(stderr,
+                          "error: refusing to clear %s: not an emitted plugin directory "
+                          "(missing .claude-plugin/plugin.json). Emit into a fresh or "
+                          "previously-emitted directory.\n",
+                          out_dir);
+            return CLI_ERR;
+        }
+    }
+    if (emit_rm_rf(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_plugin_json(out_dir, ver) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_skills(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_agents(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_mcp_json(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    if (emit_hooks_json(out_dir) != CLI_OK) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+int cbm_cmd_emit_plugin(int argc, char **argv) {
+    const char *out_dir = NULL;
+    const char *version = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--version") == 0 && i + 1 < argc) {
+            version = argv[++i];
+        } else if (argv[i][0] != '-' && !out_dir) {
+            out_dir = argv[i];
+        }
+    }
+    if (!out_dir) {
+        (void)fprintf(stderr, "usage: codebase-memory-mcp emit-plugin <dir> [--version X]\n");
+        return CLI_ERR;
+    }
+    if (cbm_emit_plugin(out_dir, version) != CLI_OK) {
+        (void)fprintf(stderr, "error: emit-plugin failed for %s\n", out_dir);
+        return CLI_ERR;
+    }
+    printf("Emitted Claude Code plugin to %s\n", out_dir);
+    return CLI_OK;
+}
+
 /* ── Interactive prompt ───────────────────────────────────────── */
 
 /* Global auto-answer mode: 0=interactive, 1=always yes, -1=always no */
