@@ -323,7 +323,7 @@ jobs:
           export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
           export TMP="$TEMP"
           export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
-          scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer' || '' }}
+          scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && '"SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer"' || '' }}
         env:
           CBM_TEST_SHARD: ${{ matrix.shard }}
           CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}

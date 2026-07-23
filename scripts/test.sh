@@ -43,15 +43,19 @@ source "$ROOT/scripts/path-safety.sh"
 # Forward CC/CXX and collect make-passthrough args. BUILD_DIR is honored for
 # the explicit target path below so containerized legs can build in their own
 # directory instead of clobbering the host's native build/c artifacts.
-MAKE_ARGS=""
+# MAKE_ARGS is an ARRAY so a VAR=VAL whose value contains spaces (the
+# windows-11-arm leg passes SANITIZE with four flags) survives as ONE make
+# argument. The old string accumulation re-split it at every expansion and
+# make swallowed the second flag's leading -f as its makefile option.
+MAKE_ARGS=()
 BUILD_DIR="build/c"
 for arg in "$@"; do
     case "$arg" in
         CC=*|CXX=*) export "${arg}" ;;
         --arch|--arch=*) ;; # already handled
         arm64|x86_64) ;; # already handled
-        BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS="$MAKE_ARGS $arg" ;;
-        *=*) MAKE_ARGS="$MAKE_ARGS $arg" ;; # forward any VAR=VAL to make
+        BUILD_DIR=*) BUILD_DIR="${arg#BUILD_DIR=}"; MAKE_ARGS+=("$arg") ;;
+        *=*) MAKE_ARGS+=("$arg") ;; # forward any VAR=VAL to make
     esac
 done
 
@@ -92,11 +96,11 @@ BUILD_DIR="$BUILD_DIR" scripts/clean.sh
 # the suite set is enumerated from the runner itself and union-guarded, and
 # pass/fail/skip totals aggregate to the same numbers as the sequential run).
 # CBM_TEST_SEQUENTIAL=1 restores the single-process runner.
-make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" $MAKE_ARGS
+make -j"$NPROC" -f Makefile.cbm "$BUILD_DIR/test-runner" ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 if [ "${CBM_TEST_SEQUENTIAL:-0}" = "1" ]; then
-    make -f Makefile.cbm test $MAKE_ARGS
+    make -f Makefile.cbm test ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 else
-    make -f Makefile.cbm test-par $MAKE_ARGS
+    make -f Makefile.cbm test-par ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 fi
 
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
@@ -111,7 +115,7 @@ fi
 # Step 5: Parent-death watchdog regression (#406/#407). Builds the prod stdio
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
-make -j"$NPROC" -f Makefile.cbm cbm $MAKE_ARGS
+make -j"$NPROC" -f Makefile.cbm cbm ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 bash "$ROOT/tests/test_parent_watchdog.sh"
 
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
