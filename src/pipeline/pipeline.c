@@ -401,7 +401,19 @@ static int effective_worker_count(bool initial) {
     if (st && st[0] == '1') {
         return 1;
     }
-    return cbm_default_worker_count(initial);
+    /* Keep the explicit override available for parallel regression tests and
+     * deliberate diagnostics. It is opt-in; the production default below stays
+     * on the crash-free sequential path. */
+    if (getenv("CBM_WORKERS")) {
+        return cbm_default_worker_count(initial);
+    }
+    (void)initial;
+    /* Parallel extraction currently corrupts heap state on real mixed-language
+     * repositories (reproduced with two or more workers on Serena). Keep the
+     * production indexing path deterministic and crash-free until the shared
+     * parser/allocator race is fixed. Correctness is more important than the
+     * parallel speedup. */
+    return 1;
 }
 
 /* Resolve the DB path for this pipeline. Caller must free(). */

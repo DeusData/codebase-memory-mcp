@@ -7192,6 +7192,9 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     ASSERT_TRUE(cbm_mem_over_budget());
 
     cbm_pp_bp_nap_cycles_reset();
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/backpressure.db", g_tmpdir);
     cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
@@ -7201,6 +7204,12 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
 
     /* Restore the caller-visible budget BEFORE asserting. */
     cbm_mem_set_budget_for_tests(saved_budget);
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
     cbm_pipeline_free(p);
     teardown_test_repo();
 
