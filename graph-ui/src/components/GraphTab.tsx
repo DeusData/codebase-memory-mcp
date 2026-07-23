@@ -262,12 +262,35 @@ export function GraphTab({ project }: GraphTabProps) {
       if (!filteredData || !path || nodeIds.size === 0) {
         setHighlightedIds(null);
         setSelectedPath(null);
+        setSelectedNode(null);
         setCameraTarget(null);
         return;
       }
       setSelectedPath(path);
-      setHighlightedIds(nodeIds);
-      setCameraTarget(computeCameraTarget(filteredData.nodes, nodeIds));
+
+      /* Single node picked from the sidebar → also show the detail panel
+       * on the right and highlight its direct connections, matching the
+       * behaviour of clicking a node in the 3D scene. */
+      if (nodeIds.size === 1) {
+        const nodeId = [...nodeIds][0];
+        const node = filteredData.nodes.find((n) => n.id === nodeId) ?? null;
+        setSelectedNode(node);
+
+        const connectedIds = new Set<number>([nodeId]);
+        for (const edge of filteredData.edges) {
+          if (edge.source === nodeId) connectedIds.add(edge.target);
+          if (edge.target === nodeId) connectedIds.add(edge.source);
+        }
+        setHighlightedIds(connectedIds);
+        setCameraTarget(
+          computeCameraTarget(filteredData.nodes, connectedIds),
+        );
+      } else {
+        /* Directory with multiple nodes → don't show a detail panel. */
+        setSelectedNode(null);
+        setHighlightedIds(nodeIds);
+        setCameraTarget(computeCameraTarget(filteredData.nodes, nodeIds));
+      }
     },
     [filteredData],
   );
