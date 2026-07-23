@@ -310,6 +310,8 @@ static const char *dialect_tool_prefix(cbm_graph_profile_dialect_t dialect) {
         return "codebase-memory-mcp_";
     case CBM_GRAPH_DIALECT_KIRO:
         return "@codebase-memory-mcp/";
+    case CBM_GRAPH_DIALECT_OMP:
+        return "mcp__codebase_memory_mcp_";
     default:
         return NULL;
     }
@@ -605,6 +607,16 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "tools:\n  - readFile\n---\n") &&
                profile_buffer_append(buffer, prompt);
+    case CBM_GRAPH_DIALECT_OMP:
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools:\n  - read\n  - grep\n  - glob\n") ||
+            (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
+            !profile_buffer_append(
+                buffer, "read-summarize: false\nautoloadSkills: [codebase-memory]\n---\n") ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     default:
         return false;
     }
