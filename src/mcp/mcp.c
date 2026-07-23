@@ -1269,7 +1269,8 @@ static const tool_def_t TOOLS[] = {
 
     {"search_code", "Search code",
      "Search source code in an indexed/current project with text or regex patterns. "
-     "Does not index projects; use search_graph or index_repository first. "
+     "Auto-indexes the project on first use when enabled, using the same project resolver as the "
+     "graph tools. "
      "Case-insensitive by default. "
      "Use for string literals, error messages, and config values not in the knowledge graph. "
      "Use file_pattern to narrow traversal; path_filter filters result paths and can fast-scope "
@@ -2546,9 +2547,9 @@ static bool cbm_mcp_incremental_metadata_enabled(cbm_mcp_server_t *srv) {
     const char *policy =
         srv && srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_INCREMENTAL_REINDEX,
-                             CBM_CONFIG_INCREMENTAL_REINDEX_OFF)
-            : CBM_CONFIG_INCREMENTAL_REINDEX_OFF;
-    return policy && strcmp(policy, CBM_CONFIG_INCREMENTAL_REINDEX_OFF) != 0;
+                             CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT)
+            : CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT;
+    return policy && strcmp(policy, CBM_CONFIG_INCREMENTAL_REINDEX_FULL_REBUILD) != 0;
 }
 
 static bool cbm_mcp_overlay_compaction_after_publish(cbm_mcp_server_t *srv) {
@@ -3086,22 +3087,23 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
             yyjson_mut_val *hint_tool = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_str(doc, hint_tool, "name", "_hidden_tools");
             yyjson_mut_obj_add_str(doc, hint_tool, "title", "Advanced tools");
-            yyjson_mut_obj_add_str(doc, hint_tool, "description",
-            "Advanced tools are normally hidden in streamlined mode. "
-            "Advanced tools: index_repository, get_code_snippet, "
-            "get_graph_schema, get_architecture, list_projects, "
-            "delete_project, index_status, check_index_coverage, detect_changes, manage_adr, "
-            "ingest_traces, index_dependencies. "
-            "Graph-backed default tools auto-index the server CWD or explicit directory projects "
-            "when auto_index=true and auto_index_limit is not exceeded; search_code searches "
-            "source files for an already indexed/current project. "
-            "Call this tool to reveal these tools in tools/list for clients that "
-            "only allow discovered tools. "
-            "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
-            "Enable one: config set tool_<name> true (e.g. tool_index_repository true). "
-            "Resources: codebase://schema (labels, edge types, Cypher examples), "
-            "codebase://architecture (key functions, graph overview), "
-            "codebase://status (index state: ready/indexing/not_indexed/empty).");
+            yyjson_mut_obj_add_str(
+                doc, hint_tool, "description",
+                "Advanced tools are normally hidden in streamlined mode. "
+                "Advanced tools: index_repository, get_code_snippet, "
+                "get_graph_schema, get_architecture, list_projects, "
+                "delete_project, index_status, check_index_coverage, detect_changes, manage_adr, "
+                "ingest_traces, index_dependencies. "
+                "Default tools auto-index the server CWD or explicit directory projects "
+                "when auto_index=true and auto_index_limit is not exceeded; search_code resolves "
+                "its project through the same auto-indexing path and then searches source files. "
+                "Call this tool to reveal these tools in tools/list for clients that "
+                "only allow discovered tools. "
+                "Enable all: set env CBM_TOOL_MODE=classic or config set tool_mode classic. "
+                "Enable one: config set tool_<name> true (e.g. tool_index_repository true). "
+                "Resources: codebase://schema (labels, edge types, Cypher examples), "
+                "codebase://architecture (key functions, graph overview), "
+                "codebase://status (index state: ready/indexing/not_indexed/empty).");
         /* inputSchema MUST be a JSON object, not a string — Claude Code rejects
          * the entire tools/list if any tool has a string inputSchema. */
             yyjson_mut_val *hint_schema = yyjson_mut_obj(doc);

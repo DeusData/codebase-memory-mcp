@@ -902,7 +902,7 @@ TEST(cli_codex_instructions) {
     ASSERT(strstr(instr, "get_code` in streamlined mode") != NULL);
     ASSERT(strstr(instr, "auto_index_deps") != NULL);
     ASSERT(strstr(instr, "auto_dep_limit") != NULL);
-    ASSERT(strstr(instr, "Normal streamlined exploration uses the four core tools") != NULL);
+    ASSERT(strstr(instr, "Normal streamlined exploration uses the default tools") != NULL);
     ASSERT(strstr(instr, "get_architecture` — high-level summary") != NULL);
     ASSERT(strstr(instr, "retry that operation with escalation") != NULL);
     ASSERT(strstr(instr, "MCP approval and shell sandbox authorization are separate") != NULL);
@@ -7117,13 +7117,7 @@ TEST(cli_config_presets_apply_exact_capability_sets) {
     ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
     ASSERT_TRUE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, false));
 
-    ASSERT_EQ(cbm_config_apply_preset(cfg, "optional-graph-disabled"), 0);
-    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));
-    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, true));
-    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SIMILARITY_ENABLED, true));
-    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, true));
-    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_GITHISTORY_ENABLED, true));
-    ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, true));
+    ASSERT_EQ(cbm_config_apply_preset(cfg, "optional-graph-disabled"), -1);
 
     ASSERT_EQ(cbm_config_apply_preset(cfg, "minimal-indexing"), 0);
     ASSERT_FALSE(cbm_config_get_bool(cfg, CBM_CONFIG_RANK_ENABLED, true));

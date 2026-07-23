@@ -2161,7 +2161,7 @@ static int incr_try_exact_upsert_route(cbm_pipeline_t *p, cbm_store_t *store, co
         incr_changed_has_unsupported_scoped_exact_gap(changed_files, changed_count);
     bool exact_deferred_global_derived =
         cbm_pipeline_get_mode(p) < CBM_MODE_FAST &&
-        cbm_pipeline_incremental_derived_refresh_stale_on_exact(p);
+        cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(p);
     if (unsupported_scoped_exact_gap) {
         cbm_pipeline_set_exact_delta_stats_with_limit(
             p, input_path_count, input_path_count, -1, max_affected_paths, false);
@@ -3223,7 +3223,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             pipeline_rc = CBM_NOT_FOUND;
         } else {
             bool refresh_global_semantic_edges =
-                !cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p);
+                !cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(
+                    p);
             pipeline_rc = run_postpasses(&ctx, changed_files, ci, project,
                                          refresh_global_semantic_edges);
         }
@@ -3271,7 +3272,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_set_committed_counts(p, cbm_gbuf_node_count(existing),
                                       cbm_gbuf_edge_count(existing));
     bool semantic_edges_refreshed =
-        !cbm_pipeline_incremental_derived_refresh_stale_on_incremental(p);
+        !cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(p);
     int persist_rc = publish_and_persist(existing, db_path, project, files, file_count,
                                          cls.mode_skipped, cls.mode_skipped_count,
                                          cbm_pipeline_repo_path(p), pass_fingerprint,

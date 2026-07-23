@@ -1281,8 +1281,10 @@ void cbm_pipeline_set_graph_changed(cbm_pipeline_t *p, bool changed);
 void cbm_pipeline_set_publish_kind(cbm_pipeline_t *p, cbm_pipeline_publish_kind_t kind);
 void cbm_pipeline_set_publish_reason(cbm_pipeline_t *p, const char *reason);
 bool cbm_pipeline_overlay_publish_small_deltas(const cbm_pipeline_t *p);
-bool cbm_pipeline_incremental_derived_refresh_stale_on_exact(const cbm_pipeline_t *p);
-bool cbm_pipeline_incremental_derived_refresh_stale_on_incremental(const cbm_pipeline_t *p);
+bool cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(
+    const cbm_pipeline_t *p);
+bool cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(
+    const cbm_pipeline_t *p);
 void cbm_pipeline_set_exact_delta_stats(cbm_pipeline_t *p, int changed_paths,
                                         int affected_paths, int published_paths);
 void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int changed_paths,
