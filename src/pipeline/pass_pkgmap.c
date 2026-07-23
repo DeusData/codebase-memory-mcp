@@ -3,7 +3,7 @@
  *
  * Scans discovered files for manifest files (package.json, go.mod, Cargo.toml,
  * pyproject.toml, composer.json, pubspec.yaml, pom.xml, build.gradle, mix.exs,
- * *.gemspec) and builds a hash table mapping bare package specifiers to resolved
+ * *.gemspec, Package.swift) and builds a hash table mapping bare package specifiers to resolved
  * module QNs. This enables IMPORTS edges for non-relative imports like
  * "@myorg/pkg", "github.com/foo/bar", "use my_crate::foo".
  *
@@ -665,6 +665,220 @@ static void parse_gemspec(const char *source, int source_len, const char *rel_pa
     }
 }
 
+/* Swift: Package.swift — SwiftPM manifest.
+ *
+ * Package.swift is executable Swift, not declarative, so this is a
+ * hand-rolled literal pattern-extractor (same spirit as parse_cargo_toml),
+ * not a Swift evaluator: it locates `.target(...)` / `.library(...)` call
+ * expressions by literal prefix and pulls only their quoted-string-literal
+ * `name:` / `targets:` arguments. Anything computed or concatenated is
+ * skipped, not guessed — fail-closed, like every other parser here.
+ *
+ * `.package(url:)` / `.package(path:)` dependencies, and target-to-target
+ * dependency references, are NOT used to mint entries: mirroring
+ * package.json/Cargo.toml, only a manifest's OWN products/targets are
+ * self-registered — a dependency resolves because the DEPENDENCY's own
+ * Package.swift registers itself when the repo-wide manifest walk
+ * (cbm_pkgmap_scan_repo) reaches it, exactly like a JS workspace sibling's
+ * package.json (see repro_issue408.c). */
+
+/* Find the matching ')' for the '(' at `open`, scanning forward to `end`.
+ * Tracks string-literal spans (with backslash-escape handling) so a ')' or
+ * '(' inside a quoted argument value never perturbs the depth count.
+ * Returns NULL for an unbalanced/unterminated call — the caller treats
+ * that span as unparseable and skips it (fail-closed). */
+static const char *swift_match_paren(const char *open, const char *end) {
+    int depth = 0;
+    bool in_str = false;
+    for (const char *p = open; p < end; p++) {
+        if (in_str) {
+            if (*p == '\\' && p + SKIP_ONE < end) {
+                p++;
+                continue;
+            }
+            if (*p == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        if (*p == '"') {
+            in_str = true;
+        } else if (*p == '(') {
+            depth++;
+        } else if (*p == ')') {
+            depth--;
+            if (depth == 0) {
+                return p;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Extract a bare double-quoted string-literal value at `p` (after skipping
+ * leading whitespace), requiring the closing quote be immediately followed
+ * by a comma or `end` — rejects `name: "Foo" + suffix`-style concatenation,
+ * which a plain quote-scan alone cannot tell apart from a true literal.
+ * Returns heap string, or NULL (fail-closed). */
+static char *swift_quoted_literal(const char *p, const char *end) {
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p >= end || *p != '"') {
+        return NULL;
+    }
+    p++;
+    const char *start = p;
+    while (p < end && *p != '"' && *p != '\n') {
+        p++;
+    }
+    if (p >= end || *p != '"') {
+        return NULL;
+    }
+    char *value = cbm_strndup(start, (size_t)(p - start));
+    p++; /* past closing quote */
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p < end && (*p == ',' || *p == ')')) {
+        return value;
+    }
+    free(value);
+    return NULL;
+}
+
+/* Search [start, end) for `needle`, then extract the bare quoted-literal
+ * argument immediately following it via swift_quoted_literal. Bounded to
+ * `end` so a match can never leak past the enclosing call's own argument
+ * list into a later, unrelated declaration. Returns heap string or NULL. */
+static char *swift_extract_after(const char *start, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || start + nlen > end) {
+        return NULL;
+    }
+    for (const char *p = start; p + nlen <= end; p++) {
+        if (memcmp(p, needle, nlen) == 0) {
+            return swift_quoted_literal(p + nlen, end);
+        }
+    }
+    return NULL;
+}
+
+/* Search [start, end) for `needle: [...]` and extract the FIRST array
+ * element as a string literal (representative target of a product's
+ * `targets:` list, mirroring import_candidate_symbol's first-member
+ * convention elsewhere in this file). NULL (fail-closed) when the array is
+ * absent, empty, or its first element is not a bare literal. */
+static char *swift_first_array_literal(const char *start, const char *end, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || start + nlen > end) {
+        return NULL;
+    }
+    for (const char *p = start; p + nlen <= end; p++) {
+        if (memcmp(p, needle, nlen) != 0) {
+            continue;
+        }
+        const char *q = p + nlen;
+        while (q < end && (*q == ' ' || *q == '\t')) {
+            q++;
+        }
+        if (q >= end || *q != '[') {
+            return NULL;
+        }
+        q++; /* past '[' */
+        while (q < end && (*q == ' ' || *q == '\t' || *q == '\n')) {
+            q++;
+        }
+        if (q >= end || *q != '"') {
+            return NULL; /* first element isn't a bare literal */
+        }
+        return extract_quoted(q, end);
+    }
+    return NULL;
+}
+
+/* Register `entry_name` → the conventional `Sources/<target_name>` dir
+ * (fixed-convention, same approach parse_cargo_toml takes for `src/lib`).
+ * Both arguments are borrowed; caller retains ownership. */
+static void swift_register_target(const char *rel_path, const char *entry_name,
+                                  const char *target_name, cbm_pkg_entries_t *entries) {
+    if (!entry_name || !entry_name[0] || !target_name || !target_name[0]) {
+        return;
+    }
+    char suffix[PKGMAP_PATH_BUF];
+    snprintf(suffix, sizeof(suffix), "Sources/%s", target_name);
+    char *entry = build_entry_path(rel_path, suffix);
+    if (entry) {
+        pkg_entries_push(entries, strdup(entry_name), entry);
+    }
+}
+
+/* Scan for `.target(name: "Foo", ...)` declarations. Non-overlapping: the
+ * scan resumes AFTER each matched close paren, so a
+ * `dependencies: [.target(name: "Bar")]` reference nested inside Foo's own
+ * argument list is never re-visited as a second top-level target. */
+static void swift_scan_targets(const char *source, const char *end, const char *rel_path,
+                               cbm_pkg_entries_t *entries) {
+    static const char prefix[] = ".target(";
+    const char *cursor = source;
+    while (cursor < end) {
+        const char *hit = strstr(cursor, prefix);
+        if (!hit || hit >= end) {
+            return;
+        }
+        const char *open = hit + strlen(prefix) - SKIP_ONE;
+        const char *close = swift_match_paren(open, end);
+        if (!close) {
+            return; /* unbalanced — nothing further here is trustworthy */
+        }
+        char *name = swift_extract_after(open, close, "name:");
+        if (name) {
+            swift_register_target(rel_path, name, name, entries);
+            free(name);
+        }
+        cursor = close + SKIP_ONE;
+    }
+}
+
+/* Scan for `.library(name: "Foo", targets: ["Bar", ...])` product
+ * declarations. Registers the PRODUCT name against the first listed
+ * target's conventional source directory; a product with a missing,
+ * non-literal, or empty `targets:` array is skipped, not guessed. */
+static void swift_scan_products(const char *source, const char *end, const char *rel_path,
+                                cbm_pkg_entries_t *entries) {
+    static const char prefix[] = ".library(";
+    const char *cursor = source;
+    while (cursor < end) {
+        const char *hit = strstr(cursor, prefix);
+        if (!hit || hit >= end) {
+            return;
+        }
+        const char *open = hit + strlen(prefix) - SKIP_ONE;
+        const char *close = swift_match_paren(open, end);
+        if (!close) {
+            return;
+        }
+        char *product_name = swift_extract_after(open, close, "name:");
+        if (product_name) {
+            char *target_name = swift_first_array_literal(open, close, "targets:");
+            if (target_name) {
+                swift_register_target(rel_path, product_name, target_name, entries);
+                free(target_name);
+            }
+            free(product_name);
+        }
+        cursor = close + SKIP_ONE;
+    }
+}
+
+/* SwiftPM: Package.swift — library products + targets → Sources/<name> */
+static void parse_package_swift(const char *source, int source_len, const char *rel_path,
+                                cbm_pkg_entries_t *entries) {
+    const char *end = source + source_len;
+    swift_scan_targets(source, end, rel_path, entries);
+    swift_scan_products(source, end, rel_path, entries);
+}
+
 /* ── Public: manifest detection + parsing ──────────────────────── */
 
 bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char *source,
@@ -711,6 +925,10 @@ bool cbm_pkgmap_try_parse(const char *basename, const char *rel_path, const char
     }
     if (ends_with(basename, ".gemspec")) {
         parse_gemspec(source, source_len, rel_path, entries);
+        return true;
+    }
+    if (strcmp(basename, "Package.swift") == 0) {
+        parse_package_swift(source, source_len, rel_path, entries);
         return true;
     }
     return false;
@@ -773,7 +991,8 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
         strcmp(basename, "Cargo.toml") == 0 || strcmp(basename, "pyproject.toml") == 0 ||
         strcmp(basename, "composer.json") == 0 || strcmp(basename, "pubspec.yaml") == 0 ||
         strcmp(basename, "pom.xml") == 0 || strcmp(basename, "build.gradle") == 0 ||
-        strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0) {
+        strcmp(basename, "build.gradle.kts") == 0 || strcmp(basename, "mix.exs") == 0 ||
+        strcmp(basename, "Package.swift") == 0) {
         return true;
     }
     return ends_with(basename, ".gemspec");
