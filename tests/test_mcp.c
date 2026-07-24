@@ -2159,7 +2159,7 @@ TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
         cbm_mcp_handle_tool(srv, "check_index_coverage",
                             "{\"project\":\"test-project\","
                             "\"paths\":[\"main.go\",\"generated/pkg/a.c\",\"../escape.c\"],"
-                            "\"scopes\":[\".\"]}");
+                            "\"scopes\":[\".\",\"src\"]}");
     ASSERT_NOT_NULL(coverage);
     char *inner = extract_text_content(coverage);
     ASSERT_NOT_NULL(inner);
@@ -2172,6 +2172,8 @@ TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
     ASSERT_NOT_NULL(strstr(inner, "not_indexed_dir"));
     ASSERT_NOT_NULL(strstr(inner, "outside_project"));
     ASSERT_NOT_NULL(strstr(inner, "src/skip.c"));
+    ASSERT_NOT_NULL(strstr(inner, "\"requested_scope\":\"src\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"scope\":\"src\""));
     ASSERT_NOT_NULL(strstr(inner, "file exceeds cap"));
     ASSERT_NOT_NULL(strstr(inner, "best_effort"));
 
@@ -7044,6 +7046,26 @@ TEST(tool_resolve_store_by_internal_name_issue704) {
     ASSERT_NULL(strstr(list, "gamma704"));     /* filename must NOT be advertised (RED before) */
     ASSERT_NULL(strstr(list, "ghost704"));     /* 0-byte ghost filtered (RED before) */
     free(list);
+
+    char *page = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"list_projects\","
+             "\"arguments\":{\"offset\":0,\"limit\":1}}}");
+    ASSERT_NOT_NULL(page);
+    ASSERT_NOT_NULL(strstr(page, "\\\"total\\\":3"));
+    ASSERT_NOT_NULL(strstr(page, "\\\"limit\\\":1"));
+    ASSERT_NOT_NULL(strstr(page, "\\\"returned\\\":1"));
+    ASSERT_NOT_NULL(strstr(page, "\\\"has_more\\\":true"));
+    ASSERT_NULL(strstr(page, "\\\"nodes\\\"")); /* details are opt-in */
+    free(page);
+
+    char *details = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"list_projects\","
+             "\"arguments\":{\"offset\":0,\"limit\":1,\"include_details\":true}}}");
+    ASSERT_NOT_NULL(details);
+    ASSERT_NOT_NULL(strstr(details, "\\\"nodes\\\""));
+    free(details);
 
     /* ── B: the drifted project resolves by its INTERNAL name ──────── */
     char *q_beta = cbm_mcp_server_handle(
