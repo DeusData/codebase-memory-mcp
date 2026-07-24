@@ -2165,6 +2165,78 @@ TEST(pipeline_go_cross_package_call) {
     PASS();
 }
 
+/* End-to-end (issue #551 item 1): two SwiftPM packages, Core and App,
+ * indexed under one root. App declares a local path dependency on Core and
+ * a target dependency on Core's product; App.swift does a bare
+ * `import Core`. This only resolves because Core's OWN Package.swift
+ * self-registers "Core" -> Core/Sources/Core in the shared pkgmap, landing
+ * App.swift's IMPORTS edge on that directory's Folder node -- proving real
+ * cross-package resolution, mirroring repro_issue408.c/repro_issue56.c. */
+TEST(pipeline_swift_cross_package_import) {
+    const char *files[] = {
+        "Core/Package.swift",
+        "Core/Sources/Core/Core.swift",
+        "App/Package.swift",
+        "App/Sources/App/App.swift",
+    };
+    const char *contents[] = {
+        ("let package = Package(\n"
+         "    name: \"Core\",\n"
+         "    products: [.library(name: \"Core\", targets: [\"Core\"])],\n"
+         "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+         ")\n"),
+
+        "public func coreValue() -> Int {\n    return 1\n}\n",
+
+        ("let package = Package(\n"
+         "    name: \"App\",\n"
+         "    dependencies: [.package(path: \"../Core\")],\n"
+         "    targets: [.target(name: \"App\", dependencies: [\n"
+         "        .product(name: \"Core\", package: \"Core\")\n"
+         "    ])]\n"
+         ")\n"),
+
+        ("import Core\n\n"
+         "func run() -> Int {\n    return coreValue()\n}\n"),
+    };
+
+    if (setup_lang_repo(files, contents, 4) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_edge_t *edges = NULL;
+    int ec = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_type(s, proj, "IMPORTS", &edges, &ec), CBM_STORE_OK);
+
+    bool found_cross_package = false;
+    for (int i = 0; i < ec && !found_cross_package; i++) {
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(s, edges[i].target_id, &tgt) == CBM_STORE_OK) {
+            if (tgt.qualified_name && strstr(tgt.qualified_name, "Core")) {
+                found_cross_package = true;
+            }
+        }
+        cbm_node_free_fields(&tgt);
+    }
+    ASSERT_TRUE(found_cross_package);
+
+    if (edges)
+        cbm_store_free_edges(edges, ec);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 TEST(pipeline_python_cross_module_call) {
     /* Port of TestPythonCrossModuleCallViaImport */
     const char *files[] = {"utils.py", "main.py"};
@@ -5247,6 +5319,180 @@ static int pkg_entries_has_name(const cbm_pkg_entries_t *e, const char *name) {
     return 0;
 }
 
+/* Helper: return the entry_rel registered for `name`, or NULL. */
+static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char *name) {
+    for (int i = 0; i < e->count; i++) {
+        if (e->items[i].pkg_name && strcmp(e->items[i].pkg_name, name) == 0)
+            return e->items[i].entry_rel;
+    }
+    return NULL;
+}
+
+/* ── SwiftPM Package.swift manifest resolution (issue #551 item 1) ──
+ *
+ * parse_package_swift is a literal pattern-extractor (mirrors
+ * parse_cargo_toml), not a Swift evaluator. These call cbm_pkgmap_try_parse
+ * directly, covering the five RED categories the maintainer asked for
+ * (local path deps, remote identities, products, targets, target-name
+ * deps) plus fail-closed ambiguous-name cases. See
+ * pipeline_swift_cross_package_import above for the full end-to-end proof. */
+
+TEST(pkgmap_swift_targets_registers_module) {
+    static const char src[] =
+        "// swift-tools-version:5.9\n"
+        "import PackageDescription\n"
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+TEST(pkgmap_swift_products_registers_target_dir) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Core\",\n"
+        "    products: [.library(name: \"CoreKit\", targets: [\"CoreImpl\"])],\n"
+        "    targets: [.target(name: \"CoreImpl\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    /* Product name resolves to the FIRST listed target's conventional dir. */
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreKit"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreKit"), "Core/Sources/CoreImpl");
+    /* The underlying target is separately (and correctly) self-registered too. */
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "CoreImpl"), "Core/Sources/CoreImpl");
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Local path + remote url dependencies (`.package(path:)` / `.package(url:)`)
+ * mint NO entries of their own -- mirroring package.json/Cargo.toml, only a
+ * manifest's OWN products/targets self-register. A local sibling's name is
+ * produced by ITS OWN Package.swift when the repo-wide walk reaches it
+ * (see repro_issue408.c's JS-workspace analog); a remote dependency has no
+ * local path to point at, so nothing is minted (fail-closed). */
+TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    dependencies: [\n"
+        "        .package(path: \"../Core\"),\n"
+        "        .package(url: \"https://github.com/example/RemoteKit.git\", from: \"1.0.0\")\n"
+        "    ],\n"
+        "    targets: [.target(name: \"App\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "RemoteKit"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Only App itself (the declaring target) registers -- a bare same-package
+ * target-name dependency ("Core") and a cross-package product dependency
+ * (Utils/UtilsPkg) name OTHER modules, not this manifest's own
+ * products/targets, so neither mints an entry. */
+TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\", dependencies: [\n"
+        "        \"Core\",\n"
+        "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+        "    ])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
+                                   (int)strlen(src), &entries);
+    ASSERT_TRUE(ok);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "Utils"));
+    ASSERT_FALSE(pkg_entries_has_name(&entries, "UtilsPkg"));
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Fail-closed on any `name:` that is not a bare literal: a computed
+ * variable, and a literal concatenated with a dynamic suffix (which a
+ * naive quote-scan would wrongly accept as "App"). Neither mints an entry,
+ * though the manifest is still recognized and parsed. */
+TEST(pkgmap_swift_ambiguous_target_name_fails_closed) {
+    static const char dynamic_src[] =
+        "let generatedName = \"App\" + String(buildNumber)\n"
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: generatedName, dependencies: [])]\n"
+        ")\n";
+    static const char concat_src[] =
+        "let package = Package(\n"
+        "    name: \"App\",\n"
+        "    targets: [.target(name: \"App\" + suffix, dependencies: [])]\n"
+        ")\n";
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", dynamic_src,
+                                     (int)strlen(dynamic_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", concat_src,
+                                     (int)strlen(concat_src), &entries));
+    ASSERT_EQ(entries.count, 0);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* The repo-wide manifest walker must also recognize "Package.swift" -- a
+ * second code path (is_pkgmap_manifest_basename) from the direct
+ * cbm_pkgmap_try_parse calls above. */
+TEST(pkgmap_swift_scan_repo_finds_nested_manifest) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_swift_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/Core", tmpdir);
+    cbm_mkdir(dir);
+    write_temp_file(tmpdir, "Core/Package.swift",
+                    "let package = Package(\n"
+                    "    name: \"Core\",\n"
+                    "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                    ")\n");
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
+    cbm_pkg_entries_free(&entries);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* The pkgmap repo walk must honor discovery exclusions (issue #792: a
  * gitignored huge subtree kept the pkgmap walk busy for 15 minutes).
  * Control run first (no exclusions → BOTH manifests parsed) so the
@@ -7362,6 +7608,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
@@ -7471,6 +7718,13 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
     RUN_TEST(envscan_non_url_values_skipped);
+    /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
+    RUN_TEST(pkgmap_swift_targets_registers_module);
+    RUN_TEST(pkgmap_swift_products_registers_target_dir);
+    RUN_TEST(pkgmap_swift_dependencies_do_not_leak_entries);
+    RUN_TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry);
+    RUN_TEST(pkgmap_swift_ambiguous_target_name_fails_closed);
+    RUN_TEST(pkgmap_swift_scan_repo_finds_nested_manifest);
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
