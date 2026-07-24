@@ -52,6 +52,7 @@ static const char *CBM_MANIFEST_FILES[] = {
 #define CBM_DEFAULT_AUTO_DEP_LIMIT 20
 #define CBM_MAX_AUTO_DEP_LIMIT 10000
 #define CBM_DEFAULT_DEP_MAX_FILES 1000
+#define CBM_MAX_DEP_MAX_FILES 1000000
 
 /* Config key strings */
 #define CBM_CONFIG_AUTO_INDEX_DEPS "auto_index_deps"
@@ -129,6 +130,18 @@ typedef struct {
     const char *version; /* version or NULL (heap) */
 } cbm_dep_discovered_t;
 
+typedef struct {
+    int effective_package_limit; /* 0=disabled, <0=unlimited, >0=cap */
+    int candidates_observed;     /* resolved candidates seen before package-cap truncation */
+    int packages_selected;
+    int packages_current;
+    int packages_reindexed;
+    int packages_failed;
+    bool package_limit_hit;
+    int dependency_file_limit; /* 0=unlimited */
+    int packages_skipped_file_limit;
+} cbm_dep_auto_index_stats_t;
+
 /* Discover installed deps by querying the indexed graph.
  * store: open store with freshly indexed project.
  * Returns 0 on success. Caller must call cbm_dep_discovered_free(). */
@@ -156,6 +169,15 @@ int cbm_dep_auto_index_effective(const char *project_name, const char *project_r
                                  cbm_store_t *store, int effective_max_deps,
                                  cbm_config_t *cfg);
 
+/* Observable variant used by MCP responses and logs. The legacy return value
+ * remains the number of dependency projects reindexed in this call. */
+int cbm_dep_auto_index_effective_with_stats(const char *project_name,
+                                            const char *project_root,
+                                            cbm_store_t *store,
+                                            int effective_max_deps,
+                                            cbm_config_t *cfg,
+                                            cbm_dep_auto_index_stats_t *stats);
+
 /* ── Cross-Boundary Edges ──────────────────────────────────────── */
 
 /* Create IMPORTS edges from project code to dep modules.
@@ -170,5 +192,9 @@ int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit);
 /* Normalize an enabled auto_dep_limit value: 0 is unlimited, valid positive
  * values are retained, and out-of-range values fall back to a bounded default. */
 int cbm_dep_normalize_configured_limit(int limit, int default_limit);
+
+/* Normalize dep_max_files: 0 is unlimited, valid positive values are retained,
+ * and out-of-range values fall back to the bounded default. */
+int cbm_dep_normalize_file_limit(int limit);
 
 #endif /* CBM_DEPINDEX_H */

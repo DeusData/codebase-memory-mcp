@@ -2609,13 +2609,15 @@ static cbm_store_t *cbm_mcp_writable_existing_store(cbm_store_t *resolved,
 
 static int cbm_mcp_auto_index_deps(cbm_mcp_server_t *srv, const char *project,
                                    const char *root_path, cbm_store_t *store,
-                                   int effective_dep_limit, int *out_rc) {
+                                   int effective_dep_limit,
+                                   cbm_dep_auto_index_stats_t *out_stats,
+                                   int *out_rc) {
     if (out_rc) {
         *out_rc = CBM_STORE_OK;
     }
-    int deps_reindexed =
-        cbm_dep_auto_index_effective(project, root_path, store, effective_dep_limit,
-                                     srv ? srv->config : NULL);
+    int deps_reindexed = cbm_dep_auto_index_effective_with_stats(
+        project, root_path, store, effective_dep_limit,
+        srv ? srv->config : NULL, out_stats);
     if (deps_reindexed > 0 && cbm_mcp_incremental_metadata_enabled(srv)) {
         int owner_rc = cbm_store_rebuild_file_delta_owners(
             store, project, CBM_PIPELINE_FILE_DELTA_GENERATION);
@@ -2633,6 +2635,58 @@ static int cbm_mcp_auto_index_deps(cbm_mcp_server_t *srv, const char *project,
     return deps_reindexed;
 }
 
+static void cbm_mcp_add_dependency_auto_index_stats(
+    yyjson_mut_doc *doc, yyjson_mut_val *root,
+    const cbm_dep_auto_index_stats_t *stats) {
+    if (!doc || !root || !stats || stats->effective_package_limit == 0) {
+        return;
+    }
+    yyjson_mut_val *detail = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_bool(doc, detail, "enabled", true);
+    yyjson_mut_obj_add_int(
+        doc, detail, "package_limit",
+        stats->effective_package_limit < 0 ? 0 : stats->effective_package_limit);
+    yyjson_mut_obj_add_bool(doc, detail, "package_limit_unlimited",
+                           stats->effective_package_limit < 0);
+    yyjson_mut_obj_add_int(doc, detail, "candidates_observed",
+                           stats->candidates_observed);
+    yyjson_mut_obj_add_int(doc, detail, "packages_selected",
+                           stats->packages_selected);
+    yyjson_mut_obj_add_int(doc, detail, "packages_current",
+                           stats->packages_current);
+    yyjson_mut_obj_add_int(doc, detail, "packages_reindexed",
+                           stats->packages_reindexed);
+    yyjson_mut_obj_add_int(doc, detail, "packages_failed",
+                           stats->packages_failed);
+    yyjson_mut_obj_add_bool(doc, detail, "package_limit_hit",
+                            stats->package_limit_hit);
+    yyjson_mut_obj_add_int(doc, detail, "dependency_file_limit",
+                           stats->dependency_file_limit);
+    yyjson_mut_obj_add_bool(doc, detail, "dependency_file_limit_unlimited",
+                            stats->dependency_file_limit == 0);
+    yyjson_mut_obj_add_int(doc, detail, "packages_skipped_file_limit",
+                           stats->packages_skipped_file_limit);
+    if (stats->package_limit_hit && stats->packages_skipped_file_limit > 0) {
+        yyjson_mut_obj_add_str(
+            doc, detail, "hint",
+            "Call index_dependencies for packages omitted by either bound, or "
+            "raise auto_dep_limit and dep_max_files (0 means unlimited for each) "
+            "before re-running index_repository.");
+    } else if (stats->package_limit_hit) {
+        yyjson_mut_obj_add_str(
+            doc, detail, "hint",
+            "Call index_dependencies for omitted packages, or raise "
+            "auto_dep_limit before re-running index_repository.");
+    } else if (stats->packages_skipped_file_limit > 0) {
+        yyjson_mut_obj_add_str(
+            doc, detail, "hint",
+            "Call index_dependencies for skipped packages, or raise "
+            "dep_max_files (0 means unlimited) before retrying automatic "
+            "dependency indexing.");
+    }
+    yyjson_mut_obj_add_val(doc, root, "dependency_auto_index", detail);
+}
+
 /* Complete the shared post-index work against a writable handle. Query routes
  * cache read-only handles, so both session-root and explicit-path auto-indexing
  * must use this path before returning the resolved query store. */
@@ -2646,7 +2700,7 @@ static void cbm_mcp_refresh_auto_indexed_store(cbm_mcp_server_t *srv,
     if (writable_store) {
         int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
         (void)cbm_mcp_auto_index_deps(srv, project, root_path, writable_store,
-                                      effective_dep_limit, NULL);
+                                      effective_dep_limit, NULL, NULL);
         cbm_pagerank_compute_with_config(writable_store, project, srv->config);
     }
     if (owned_writable_store) {
@@ -11930,9 +11984,11 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             CBM_PROF_START(prof_index_deps);
             int dep_owner_rc = CBM_STORE_OK;
             int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, args);
+            cbm_dep_auto_index_stats_t dep_stats = {0};
             int deps_reindexed =
                 cbm_mcp_auto_index_deps(srv, project_name, repo_path, store,
-                                        effective_dep_limit, &dep_owner_rc);
+                                        effective_dep_limit, &dep_stats,
+                                        &dep_owner_rc);
             CBM_PROF_END("index_repository", "dep_auto_index", prof_index_deps);
 
             if (dep_owner_rc != CBM_STORE_OK) {
@@ -11958,6 +12014,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_int(doc, root, "edges", edges);
             if (deps_reindexed > 0)
                 yyjson_mut_obj_add_int(doc, root, "dependencies_indexed", deps_reindexed);
+            cbm_mcp_add_dependency_auto_index_stats(doc, root, &dep_stats);
 
             CBM_PROF_START(prof_index_ecosystem);
             cbm_pkg_manager_t eco = cbm_detect_ecosystem(repo_path);
@@ -15588,7 +15645,7 @@ static void *autoindex_thread(void *arg) {
             int effective_dep_limit = cbm_mcp_effective_auto_dep_limit(srv, NULL);
             int deps_reindexed = cbm_mcp_auto_index_deps(
                 srv, srv->session_project, srv->session_root, store,
-                effective_dep_limit, NULL);
+                effective_dep_limit, NULL, NULL);
             (void)cbm_pagerank_refresh_after_publish(
                 store, srv->session_project, srv->config, graph_changed, deps_reindexed,
                 cbm_rank_refresh_publish_from_pipeline(publish_kind, incremental_fallback));

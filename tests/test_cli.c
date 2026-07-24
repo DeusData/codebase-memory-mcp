@@ -4284,6 +4284,7 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "false"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, "3"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_DEP_MAX_FILES, "7"), 0);
     cbm_config_close(cfg);
 
     output = cbm_hook_augment_lifecycle_json(input);
@@ -4296,6 +4297,7 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     ASSERT(strstr(output, "_hidden_tools") == NULL);
     ASSERT(strstr(output, "auto_index=false") != NULL);
     ASSERT(strstr(output, "auto_dep_limit=3") != NULL);
+    ASSERT(strstr(output, "dep_max_files=7") != NULL);
     free(output);
 
     ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_AUTO_DEP_LIMIT, "-1"), 0);
@@ -4306,6 +4308,24 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
              CBM_DEFAULT_AUTO_DEP_LIMIT);
     ASSERT(strstr(output, expected_dep_limit) != NULL);
     ASSERT(strstr(output, "auto_dep_limit=0 (unlimited)") == NULL);
+    free(output);
+
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_DEP_MAX_FILES, "-1"), 0);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    char expected_file_limit[64];
+    snprintf(expected_file_limit, sizeof(expected_file_limit), "dep_max_files=%d",
+             CBM_DEFAULT_DEP_MAX_FILES);
+    ASSERT(strstr(output, expected_file_limit) != NULL);
+    ASSERT(strstr(output, "dep_max_files=-1") == NULL);
+    free(output);
+
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_AUTO_DEP_LIMIT, "0"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_DEP_MAX_FILES, "0"), 0);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    ASSERT(strstr(output, "auto_dep_limit=0 and dep_max_files=0 (unlimited)") != NULL);
+    ASSERT(strstr(output, "index_dependencies for a package omitted") == NULL);
     free(output);
 
     /* Environment-only configuration must still shape guidance when no config

@@ -512,6 +512,7 @@ codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-in
 codebase-memory-mcp config set tool_mode streamlined     # concise surface; reveal advanced tools on demand
 codebase-memory-mcp config set auto_index_deps true      # index installed dependency APIs
 codebase-memory-mcp config set auto_dep_limit 20         # import-ranked dependency package cap; 0=unlimited
+codebase-memory-mcp config set dep_max_files 1000        # per-package source-file cap; 0=unlimited
 codebase-memory-mcp config preset list                   # list named capability/API configurations
 codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-disabled
 codebase-memory-mcp config preset apply streamlined-automatic-dependency-source-indexing-enabled
@@ -527,7 +528,8 @@ indexing and first-response codebase context are automatic when configured. Use
 directly and uses `search_graph`, then `trace_path`, then `get_code_snippet` for
 structural discovery. Automatic repository indexing obeys
 `auto_index`/`auto_index_limit`; automatic dependency indexing obeys
-`auto_index_deps`/`auto_dep_limit` and is disabled by default. Explicit
+`auto_index_deps`/`auto_dep_limit`/`dep_max_files` and is disabled by default.
+Packages above `dep_max_files` are skipped rather than partially indexed. Explicit
 `index_dependencies` calls remain available; disabling automation does not delete
 dependency projects that are already indexed.
 

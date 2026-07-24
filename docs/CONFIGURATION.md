@@ -88,6 +88,7 @@ for any registry key):
 | `rank_enabled` | `true` | Compute PageRank, LinkRank, and degree views used by relevance ranking. |
 | `auto_index_deps` | `false` | Automatically index installed dependency source for cross-package search and tracing. |
 | `auto_dep_limit` | `20` | Import-ranked automatic dependency package cap; `0` is unlimited. |
+| `dep_max_files` | `1000` | Maximum source files per automatically indexed dependency package; larger packages are skipped atomically, and `0` is unlimited. |
 | `similarity_enabled` | `true` | Create MinHash similarity edges in applicable index modes. |
 | `semantic_edges_enabled` | `true` | Create semantic-related edges in applicable index modes. |
 | `githistory_enabled` | `true` | Create Git co-change coupling edges. |
@@ -117,7 +118,8 @@ The four product presets pair the `streamlined` or `classic` tool surface with a
 explicit automatic dependency-source indexing state. All four enable the same rank,
 similarity, semantic-edge, Git-history, and HTTP-link capabilities. The disabled
 variants bound default indexing latency, CPU, memory, and stored graph size; the
-enabled variants add installed dependency-source coverage up to `auto_dep_limit`.
+enabled variants add installed dependency-source coverage up to `auto_dep_limit`;
+`dep_max_files` skips oversized packages rather than publishing partial API coverage.
 `index_dependencies` remains available for explicit packages. Disabling automation
 stops future automatic dependency indexing but does not delete dependency projects
 already indexed. `rank-disabled` and `minimal-indexing` are benchmark ablations, and

@@ -5402,6 +5402,10 @@ static bool cbm_config_value_is_valid(const char *key, const char *value) {
         !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_AUTO_DEP_LIMIT)) {
         return false;
     }
+    if (key && strcmp(key, CBM_CONFIG_DEP_MAX_FILES) == 0 &&
+        !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_DEP_MAX_FILES)) {
+        return false;
+    }
     for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
             return cbm_config_value_matches_enum(CBM_CONFIG_REGISTRY[i].range, value);
@@ -10560,11 +10564,12 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "When more packages are installed than this limit, the most-imported packages are selected "
      "(ranked by project import references, ties broken by name). Raise to 100+ for comprehensive "
      "dependency analysis. 0 = unlimited (may be very slow for large dependency trees)."},
-    {"dep_max_files", "1000", NULL, "Dependencies",
-     "Max source files per dependency package (0=unlimited)",
-     "0-1000000",
-     "Caps indexing of large packages (TensorFlow, LLVM). 1000 covers most packages. "
-     "Set 0 for unlimited if you need complete large-package analysis."},
+    {CBM_CONFIG_DEP_MAX_FILES, CBM_STRINGIFY(CBM_DEFAULT_DEP_MAX_FILES), NULL, "Dependencies",
+     "Max indexable source files allowed per automatically indexed dependency package",
+     "0-" CBM_STRINGIFY(CBM_MAX_DEP_MAX_FILES),
+     "Packages above the bound are skipped atomically rather than published with partial API "
+     "coverage; index_repository reports the skip count and server logs identify each package. "
+     "Raise for measured large-package workloads. Set 0 for unlimited files per dependency."},
     {NULL, NULL, NULL, NULL, NULL, NULL, NULL} /* sentinel */
 };
 // clang-format on
