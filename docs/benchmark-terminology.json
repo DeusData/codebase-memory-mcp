@@ -2064,6 +2064,102 @@
       "status": "proposed",
       "term_id": "first_all_fresh_query",
       "unit": "not_applicable"
+    },
+    {
+      "aggregation_rule": "not_applicable",
+      "allowed_values_or_range": "exactly `parity_manifest_and_contract_v1`",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "requires identical effective capability, scope, cache, and correctness-contract records",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; compared durations retain their recorded occurrence structure",
+      "configuration_precedence": "not_applicable",
+      "data_type": "stable string identifier",
+      "definition": "The `parity_manifest_and_contract_v1` join ID selects two cells only when mode, effective capabilities, scope, cache state, host, benchmark contract, and correctness contract are canonically equal, both capability manifests are complete, and no required manifest value is unknown.",
+      "deprecated_replacement": null,
+      "display_name": "Parity Manifest and Contract Join v1",
+      "examples": [],
+      "introduced_version": "1.1.0",
+      "kind": "join_id",
+      "missing_or_unsupported_behavior": "classify the pair as not eligible and emit no ratio",
+      "source_anchors": [
+        "docs/schema/benchmark-comparisons-v1.schema.json",
+        "scripts/benchmark_fact_comparisons.py"
+      ],
+      "status": "existing",
+      "term_id": "parity_manifest_and_contract_v1",
+      "unit": "not_applicable"
+    },
+    {
+      "aggregation_rule": "not_applicable",
+      "allowed_values_or_range": "exactly `capability_delta_manifest_v1`",
+      "boundary_semantics": "not_applicable",
+      "capability_or_freshness_implications": "requires one or more explicitly recorded capability differences",
+      "clock_or_cpu_scope": "not_applicable",
+      "concurrency_rule": "does not imply serial execution; compared durations retain their recorded occurrence structure",
+      "configuration_precedence": "not_applicable",
+      "data_type": "stable string identifier",
+      "definition": "The `capability_delta_manifest_v1` join ID selects two cells only when mode, scope, cache state, host, benchmark contract, and correctness contract are canonically equal, both capability manifests are complete, and at least one effective capability differs; it never authorizes a cross-implementation speed ratio.",
+      "deprecated_replacement": null,
+      "display_name": "Capability Delta Manifest Join v1",
+      "examples": [],
+      "introduced_version": "1.1.0",
+      "kind": "join_id",
+      "missing_or_unsupported_behavior": "classify the pair as not eligible when required equal fields differ or either capability manifest is incomplete",
+      "source_anchors": [
+        "docs/schema/benchmark-comparisons-v1.schema.json",
+        "scripts/benchmark_fact_comparisons.py"
+      ],
+      "status": "existing",
+      "term_id": "capability_delta_manifest_v1",
+      "unit": "not_applicable"
+    },
+    {
+      "aggregation_rule": "apply to all recorded elapsed_ms values for one step ID in one exact cell group",
+      "allowed_values_or_range": "exactly `median_elapsed_ms_v1`",
+      "boundary_semantics": "uses each source occurrence's registered monotonic start and end boundaries",
+      "capability_or_freshness_implications": "none beyond the enclosing cell manifest",
+      "clock_or_cpu_scope": "wall time for each named occurrence",
+      "concurrency_rule": "does not sum overlapping occurrences; it takes the median of the selected occurrence durations",
+      "configuration_precedence": "not_applicable",
+      "data_type": "stable string identifier",
+      "definition": "The `median_elapsed_ms_v1` formula ID sorts the selected elapsed_ms values and returns the middle value for an odd count or the arithmetic mean of the two middle values for an even count.",
+      "deprecated_replacement": null,
+      "display_name": "Median Elapsed Milliseconds Formula v1",
+      "examples": [],
+      "introduced_version": "1.1.0",
+      "kind": "formula_id",
+      "missing_or_unsupported_behavior": "omit the aggregate when no numeric elapsed_ms occurrence is recorded",
+      "source_anchors": [
+        "docs/schema/benchmark-comparisons-v1.schema.json",
+        "scripts/benchmark_fact_comparisons.py"
+      ],
+      "status": "existing",
+      "term_id": "median_elapsed_ms_v1",
+      "unit": "milliseconds"
+    },
+    {
+      "aggregation_rule": "divide the left cell's median_elapsed_ms_v1 result by the right cell's median_elapsed_ms_v1 result for the same step ID",
+      "allowed_values_or_range": "exactly `left_elapsed_divided_by_right_elapsed_v1`",
+      "boundary_semantics": "inherits the source occurrences used by both median operands",
+      "capability_or_freshness_implications": "valid only for a parity_manifest_and_contract_v1 join",
+      "clock_or_cpu_scope": "ratio of wall-time medians",
+      "concurrency_rule": "does not sum component durations; both operands preserve their recorded occurrence boundaries",
+      "configuration_precedence": "not_applicable",
+      "data_type": "stable string identifier",
+      "definition": "The `left_elapsed_divided_by_right_elapsed_v1` formula ID divides the left cell's median elapsed milliseconds by the right cell's median elapsed milliseconds for the same step ID; values above 1 mean the left cell took longer.",
+      "deprecated_replacement": null,
+      "display_name": "Left/Right Elapsed Ratio Formula v1",
+      "examples": [],
+      "introduced_version": "1.1.0",
+      "kind": "formula_id",
+      "missing_or_unsupported_behavior": "emit null when the right median is zero and emit no ratio unless the pair passed the parity join",
+      "source_anchors": [
+        "docs/schema/benchmark-comparisons-v1.schema.json",
+        "scripts/benchmark_fact_comparisons.py"
+      ],
+      "status": "existing",
+      "term_id": "left_elapsed_divided_by_right_elapsed_v1",
+      "unit": "dimensionless"
     }
   ],
   "schema_version": 1,
@@ -2086,5 +2182,5 @@
     "first_core_query",
     "first_all_fresh_query"
   ],
-  "terminology_version": "1.0.0"
+  "terminology_version": "1.1.0"
 }

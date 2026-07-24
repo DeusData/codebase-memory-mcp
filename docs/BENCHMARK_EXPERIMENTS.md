@@ -57,6 +57,27 @@ Standalone runs must pass `--candidate-revision FULL_COMMIT` and
 current checkout HEAD is retained separately as measurement context and the binary's
 source revision/build flags remain `unknown`.
 
+When every completed experiment cell has a canonical fact bundle, report generation
+also writes `*.comparisons.json` and `*.fact-appendix.md`. The JSON conforms to
+`docs/schema/benchmark-comparisons-v1.schema.json` and retains the source bundle,
+run, and occurrence IDs behind every derived row. It classifies each cell pair as:
+
+- `parity_comparison`: identical mode, complete effective capabilities, scope,
+  cache state, host, benchmark contract, and correctness contract, with no unknown
+  required value. Only this class may report a cross-implementation elapsed-time
+  ratio.
+- `capability_delta_comparison`: identical mode, scope, cache state, host, benchmark
+  contract, and correctness contract, but explicitly different complete capability
+  manifests. It reports the differences and no speed ratio.
+- `not_eligible`: a required equality failed or required evidence is incomplete or
+  unknown. The record states each rejection reason.
+
+The emitted `join_id` and `formula_id` values have normative definitions in the
+terminology registry. Lifecycle tables select recorded outer lifecycle occurrences;
+they never construct wall time by summing child spans that may overlap or execute on
+different threads or processes. Reports for retained runs that predate fact bundles
+still render, but state that fact-derived comparisons are unavailable.
+
 Retained reports from earlier harness versions remain usable:
 
 ```bash
