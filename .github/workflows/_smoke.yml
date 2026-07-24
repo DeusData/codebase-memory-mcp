@@ -139,6 +139,7 @@ jobs:
         run: scripts/smoke-test.sh ./codebase-memory-mcp
         env:
           SMOKE_DOWNLOAD_URL: http://localhost:18080
+          SMOKE_UPDATE_FIXTURE_DIR: /tmp/smoke-server
 
       - name: Security audits
         run: |
@@ -210,17 +211,27 @@ jobs:
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           ARCH=${{ matrix.arch }}
           unzip -o "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip"
-          [ -n "$SUFFIX" ] && cp "codebase-memory-mcp${SUFFIX}.exe" codebase-memory-mcp.exe || true
+          test -s codebase-memory-mcp.exe
+          test -s codebase-memory-mcp.payload.exe
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          LAUNCH_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-version.XXXXXX")"
+          trap 'rm -rf "$LAUNCH_DIR"' EXIT
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$LAUNCH_DIR/"
+          "$LAUNCH_DIR/codebase-memory-mcp.payload.exe" --version
+          "$LAUNCH_DIR/codebase-memory-mcp.exe" --version
 
       - name: Start artifact server
         shell: msys2 {0}
         run: |
           mkdir -p /tmp/smoke-server
-          cp codebase-memory-mcp.exe /tmp/smoke-server/
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md /tmp/smoke-server/
           SUFFIX=${{ matrix.variant == 'ui' && '-ui' || '' }}
           ARCH=${{ matrix.arch }}
           cd /tmp/smoke-server
-          zip -q "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" codebase-memory-mcp.exe
+          zip -q "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
           if [ -n "$SUFFIX" ]; then
             cp "codebase-memory-mcp${SUFFIX}-windows-${ARCH}.zip" "codebase-memory-mcp-windows-${ARCH}.zip"
           fi
@@ -232,35 +243,51 @@ jobs:
 
       - name: Smoke test
         shell: msys2 {0}
-        run: scripts/smoke-test.sh ./codebase-memory-mcp.exe
+        run: |
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-smoke.XXXXXX")"
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SMOKE_DIR/"
+          CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" \
+            SMOKE_TEMP_ROOT="$SMOKE_DIR" \
+            scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
         env:
           SMOKE_DOWNLOAD_URL: http://127.0.0.1:18080
+          SMOKE_UPDATE_FIXTURE_DIR: /tmp/smoke-server
           SMOKE_ARCH: ${{ matrix.arch }}
 
       - name: Security audits
         shell: msys2 {0}
         run: |
           scripts/security-strings.sh ./codebase-memory-mcp.exe
-          scripts/security-install.sh ./codebase-memory-mcp.exe
+          scripts/security-strings.sh ./codebase-memory-mcp.payload.exe
+          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
+          SECURITY_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-release-security.XXXXXX")"
+          trap 'rm -rf "$SECURITY_DIR"' EXIT
+          cp codebase-memory-mcp.exe codebase-memory-mcp.payload.exe "$SECURITY_DIR/"
+          TMPDIR="$SECURITY_DIR" \
+            scripts/security-install.sh "$SECURITY_DIR/codebase-memory-mcp.exe"
 
       - name: Windows Defender scan
         shell: pwsh
         run: |
           & "C:\Program Files\Windows Defender\MpCmdRun.exe" -SignatureUpdate 2>$null
-          $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$PWD\codebase-memory-mcp.exe" -DisableRemediation
-          $code = $LASTEXITCODE
-          Write-Host $result
-          # MpCmdRun -Scan exit codes: 0 = clean, 2 = threat found. Any OTHER non-zero
-          # means the scan engine could not run at all (e.g. hr=0x800106ba: the Defender
-          # antimalware service is unavailable on the runner) — that is NOT a detection.
-          # Fail soft on an engine failure so a transient runner-side AV outage can't
-          # false-fail a release; only a real detection (exit 2) hard-blocks.
-          if ($code -eq 2) {
-            Write-Host "BLOCKED: Windows Defender flagged binary!"; exit 1
-          } elseif ($code -ne 0) {
-            Write-Host "::warning::Windows Defender scan could not run (exit $code) - skipping AV gate on this runner"
-          } else {
-            Write-Host "=== Windows Defender: clean ==="
+          foreach ($binary in @("codebase-memory-mcp.exe", "codebase-memory-mcp.payload.exe")) {
+            $result = & "C:\Program Files\Windows Defender\MpCmdRun.exe" -Scan -ScanType 3 -File "$PWD\$binary" -DisableRemediation
+            $code = $LASTEXITCODE
+            Write-Host $result
+            # MpCmdRun -Scan exit codes: 0 = clean, 2 = threat found. Any OTHER non-zero
+            # means the scan engine could not run at all (e.g. hr=0x800106ba: the Defender
+            # antimalware service is unavailable on the runner) — that is NOT a detection.
+            # Fail soft on an engine failure so a transient runner-side AV outage can't
+            # false-fail a release; only a real detection (exit 2) hard-blocks.
+            if ($code -eq 2) {
+              Write-Host "BLOCKED: Windows Defender flagged $binary!"; exit 1
+            } elseif ($code -ne 0) {
+              Write-Host "::warning::Windows Defender scan could not run for $binary (exit $code) - skipping AV gate on this runner"
+            } else {
+              Write-Host "=== Windows Defender: $binary clean ==="
+            }
           }
 
   smoke-linux-portable:

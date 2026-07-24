@@ -32,10 +32,15 @@ done
 
 # shellcheck source=env.sh
 source "$ROOT/scripts/env.sh"
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
 
-# Parse remaining arguments
+# Parse remaining arguments. BUILD_DIR is tracked for the clean step below so
+# containerized legs can build in their own directory instead of deleting and
+# clobbering the host's native build/c artifacts.
 WITH_UI=false
 VERSION=""
+BUILD_DIR="build/c"
 EXTRA_MAKE_ARGS=()
 
 prev_arg=""
@@ -55,6 +60,10 @@ for arg in "$@"; do
             ;;
         --arch|--arch=*)
             ;; # already handled
+        BUILD_DIR=*)
+            BUILD_DIR="${arg#BUILD_DIR=}"
+            EXTRA_MAKE_ARGS+=("$arg")
+            ;;
         CC=*|CXX=*)
             export "${arg}"
             EXTRA_MAKE_ARGS+=("$arg")
@@ -85,7 +94,7 @@ echo "  ui=$WITH_UI version=${VERSION:-dev}"
 verify_compiler "$CC"
 
 # Step 1: Clean C build artifacts only (not node_modules — npm ci handles that)
-rm -rf "$ROOT/build/c"
+cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
 
 # Step 2: Build (Makefile applies $ARCHFLAGS for the target arch on macOS)
 if $WITH_UI; then
@@ -96,4 +105,4 @@ else
         CFLAGS_EXTRA="$CFLAGS_EXTRA" "${EXTRA_MAKE_ARGS[@]+"${EXTRA_MAKE_ARGS[@]}"}"
 fi
 
-echo "=== Build complete: build/c/codebase-memory-mcp ==="
+echo "=== Build complete: ${BUILD_DIR}/codebase-memory-mcp ==="

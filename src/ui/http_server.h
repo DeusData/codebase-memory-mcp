@@ -10,26 +10,46 @@
 #ifndef CBM_UI_HTTP_SERVER_H
 #define CBM_UI_HTTP_SERVER_H
 
+#include "ui/httpd.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
 
+/* Daemon-owned index boundary. The callback blocks until the coordinated
+ * operation finishes; the HTTP server runs it on a tracked, joinable thread. */
+typedef int (*cbm_http_index_executor_fn)(void *context, const char *root_path,
+                                          const char *project_name);
+typedef bool (*cbm_http_project_mutation_begin_fn)(void *context, const char *project);
+typedef void (*cbm_http_project_mutation_end_fn)(void *context, const char *project);
+
 /* Create an HTTP server on the given port.
  * Creates its own cbm_mcp_server_t with a separate read-only SQLite connection.
  * Returns NULL on failure (e.g. port in use). */
 cbm_http_server_t *cbm_http_server_new(int port);
 
-/* Free the HTTP server (call after thread has been joined). */
-void cbm_http_server_free(cbm_http_server_t *srv);
+/* Free a quiescent HTTP server. Returns false without freeing if the run loop
+ * or an index callback can still access it; callers must fail-stop rather than
+ * continue cleanup in that state. */
+bool cbm_http_server_free(cbm_http_server_t *srv);
 
 /* Signal the HTTP server to stop (safe to call from any thread). */
 void cbm_http_server_stop(cbm_http_server_t *srv);
 
-/* Run the HTTP server event loop (call from background thread).
+/* Claim a future run before handing the server pointer to a new thread. This
+ * closes the create-to-child-start lifetime gap. If thread creation fails,
+ * cancel the still-scheduled run before freeing. */
+bool cbm_http_server_schedule_run(cbm_http_server_t *srv);
+bool cbm_http_server_cancel_scheduled_run(cbm_http_server_t *srv);
+
+/* Run the scheduled HTTP server event loop from the background thread.
  * Blocks until cbm_http_server_stop() is called. */
 void cbm_http_server_run(cbm_http_server_t *srv);
+
+/* Observation-only phase seam for deterministic concurrency tests. */
+cbm_httpd_activity_t cbm_http_server_activity_for_test(cbm_http_server_t *srv);
 
 /* Check if the server started successfully (listener bound). */
 bool cbm_http_server_is_running(const cbm_http_server_t *srv);
@@ -42,6 +62,18 @@ void cbm_http_server_set_recv_deadline_ms(cbm_http_server_t *srv, int ms);
 
 /* Set external watcher reference for UI project lifecycle actions. Not owned. */
 void cbm_http_server_set_watcher(cbm_http_server_t *srv, struct cbm_watcher *watcher);
+
+/* Route UI indexing through the daemon's shared operation registry. */
+void cbm_http_server_set_index_executor(cbm_http_server_t *srv, cbm_http_index_executor_fn executor,
+                                        void *context);
+
+/* Route direct UI mutations and /rpc mutation tools through the daemon's
+ * per-project coordination gate. Direct UI calls are non-blocking: begin=false
+ * is returned to the browser as a retryable locked response. */
+void cbm_http_server_set_project_mutation_guard(cbm_http_server_t *srv,
+                                                cbm_http_project_mutation_begin_fn begin,
+                                                cbm_http_project_mutation_end_fn end,
+                                                void *context);
 
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);

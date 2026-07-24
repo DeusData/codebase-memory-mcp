@@ -42,7 +42,11 @@ def list_fixed_drives():
     listdrives = getattr(os, "listdrives", None)
     if listdrives:
         try:
-            return [d for d in listdrives()]
+            # os.listdrives() returns every mounted letter, including empty
+            # optical drives and offline volumes. The picker contract under
+            # test is "advertised == browsable", so only ready roots count
+            # (isdir fails on a letter without a readable medium).
+            return [d for d in listdrives() if os.path.isdir(d)]
         except Exception:
             pass
     found = []

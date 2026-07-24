@@ -10,13 +10,21 @@
  * Total: 47 Go tests → 47 C tests
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
+#include <cli/progress_sink.h>
+#include <daemon/bootstrap.h>
+#include <daemon/runtime.h>
+#include <daemon/version_cohort.h>
+#include <foundation/constants.h>
+#include <foundation/platform.h>
 #include <mcp/mcp.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -26,8 +34,134 @@
 #ifndef _WIN32
 #include <sys/wait.h>
 #endif
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#endif
 #include <errno.h>
+#include <limits.h>
 #include <zlib.h>
+
+/* Internal prompt seam used to restore process-global state after command
+ * tests that exercise --yes. */
+void cbm_set_auto_answer_for_test(int value);
+int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
+int cbm_cli_checksum_manifest_digest(const char *manifest_path, const char *archive_name, char *out,
+                                     size_t out_size);
+void cbm_cli_set_activation_cleanup_failure_for_test(bool enabled);
+int cbm_cli_activation_abort_cleanup_probe_for_test(void);
+bool cbm_cli_activation_test_ops_installed(void);
+
+TEST(cli_progress_visibility_policy) {
+    ASSERT_TRUE(cbm_cli_progress_enabled(true, false));
+    ASSERT_TRUE(cbm_cli_progress_enabled(false, true));
+    ASSERT_FALSE(cbm_cli_progress_enabled(false, false));
+    PASS();
+}
+
+TEST(cli_raw_mcp_result_preserves_tool_error_status) {
+    ASSERT_TRUE(cbm_cli_mcp_result_is_error("{\"content\":[],\"isError\":true}"));
+    ASSERT_FALSE(cbm_cli_mcp_result_is_error("{\"content\":[],\"isError\":false}"));
+    ASSERT_FALSE(
+        cbm_cli_mcp_result_is_error("{\"content\":[{\"text\":\"\\\"isError\\\":true\"}]}"));
+    ASSERT_FALSE(cbm_cli_mcp_result_is_error("{\"isError\":\"true\"}"));
+    ASSERT_FALSE(cbm_cli_mcp_result_is_error("not-json"));
+    ASSERT_FALSE(cbm_cli_mcp_result_is_error(NULL));
+    PASS();
+}
+
+TEST(cli_maintenance_cancellation_forces_failure_status) {
+    ASSERT_EQ(cbm_cli_exit_status_after_maintenance(EXIT_SUCCESS, false), EXIT_SUCCESS);
+    ASSERT_EQ(cbm_cli_exit_status_after_maintenance(7, false), 7);
+    ASSERT_EQ(cbm_cli_exit_status_after_maintenance(EXIT_SUCCESS, true), EXIT_FAILURE);
+    ASSERT_EQ(cbm_cli_exit_status_after_maintenance(7, true), 7);
+    PASS();
+}
+
+TEST(cli_progress_sink_accepts_worker_json_logs) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+
+    cbm_progress_sink_init(out);
+    cbm_progress_sink_fn("{\"level\":\"info\",\"event\":\"pipeline.discover\",\"files\":\"3\"}");
+    cbm_progress_sink_fn("{\"level\":\"info\",\"event\":\"pass.start\",\"pass\":\"structure\"}");
+    cbm_progress_sink_fini();
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[512] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_NOT_NULL(strstr(rendered, "Discovering files (3 found)"));
+    ASSERT_NOT_NULL(strstr(rendered, "[1/9] Building file structure"));
+    PASS();
+}
+
+enum { CLI_PROGRESS_RACE_THREADS = 4, CLI_PROGRESS_RACE_ROUNDS = 32 };
+
+typedef struct {
+    atomic_bool *start;
+    int worker_id;
+} cli_progress_race_arg_t;
+
+static void *cli_progress_race_worker(void *opaque) {
+    cli_progress_race_arg_t *arg = opaque;
+    char counts[128];
+    char progress[128];
+    (void)snprintf(counts, sizeof(counts), "level=info msg=gbuf.dump nodes=%d edges=%d",
+                   1000 + arg->worker_id, 2000 + arg->worker_id);
+    (void)snprintf(progress, sizeof(progress),
+                   "level=info msg=parallel.extract.progress done=%d total=%d", arg->worker_id + 1,
+                   CLI_PROGRESS_RACE_THREADS);
+
+    while (!atomic_load_explicit(arg->start, memory_order_acquire)) {
+        cbm_usleep(100);
+    }
+    for (int round = 0; round < CLI_PROGRESS_RACE_ROUNDS; round++) {
+        cbm_progress_sink_fn(counts);
+        cbm_progress_sink_fn(progress);
+    }
+    return NULL;
+}
+
+/* A normal run checks that concurrent callback delivery remains usable. More
+ * importantly, this is the focused TSan guard for progress-sink state: all
+ * worker threads write the node/edge summary and carriage-line state after the
+ * same release, so an unsynchronized implementation reports a data race. */
+TEST(cli_progress_sink_serializes_concurrent_callbacks) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    cbm_progress_sink_init(out);
+
+    atomic_bool start = ATOMIC_VAR_INIT(false);
+    cbm_thread_t threads[CLI_PROGRESS_RACE_THREADS];
+    cli_progress_race_arg_t args[CLI_PROGRESS_RACE_THREADS];
+    int created = 0;
+    for (; created < CLI_PROGRESS_RACE_THREADS; created++) {
+        args[created].start = &start;
+        args[created].worker_id = created;
+        if (cbm_thread_create(&threads[created], 0, cli_progress_race_worker, &args[created]) !=
+            0) {
+            break;
+        }
+    }
+    atomic_store_explicit(&start, true, memory_order_release);
+    for (int i = 0; i < created; i++) {
+        ASSERT_EQ(cbm_thread_join(&threads[i]), 0);
+    }
+    ASSERT_EQ(created, CLI_PROGRESS_RACE_THREADS);
+
+    cbm_progress_sink_fn("level=info msg=pipeline.done elapsed_ms=1");
+    cbm_progress_sink_fini();
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[16384] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_NOT_NULL(strstr(rendered, "Done: "));
+    PASS();
+}
 
 /* Helper: create a file with content */
 static int write_test_file(const char *path, const char *content) {
@@ -246,6 +380,151 @@ static void test_rmdir_r(const char *path) {
     th_rmtree(path);
 }
 
+/* Mandatory-daemon activation guard fixture. The production path uses the
+ * stable per-account endpoint directly; these callbacks make every race
+ * ordering deterministic without exposing a CLI flag or environment bypass. */
+typedef struct {
+    int mutation_count;
+    int mutation_result;
+    const char *guarded_path_a;
+    const char *guarded_text_a;
+    const char *guarded_path_b;
+    const char *guarded_text_b;
+    bool guarded_files_visible_before_unlock;
+    int mutation_reserve_result;
+    int mutation_reserve_count;
+    int quiesce_count;
+    int mutation_lease_release_count;
+    bool participants_active;
+    bool mutation_lease_held;
+    bool mutation_saw_lease;
+    const char *release_marker;
+    char diagnostic[512];
+} cli_activation_fake_t;
+
+static int cli_activation_fake_reserve_mutation(void *opaque,
+                                                cbm_cli_activation_lock_t *lease_out) {
+    cli_activation_fake_t *fake = opaque;
+    fake->mutation_reserve_count++;
+    if (fake->mutation_reserve_result != 1) {
+        *lease_out = NULL;
+        return fake->mutation_reserve_result;
+    }
+    if (fake->participants_active) {
+        fake->quiesce_count++;
+        fake->participants_active = false;
+    }
+    fake->mutation_lease_held = true;
+    *lease_out = fake;
+    return 1;
+}
+
+static void cli_activation_fake_release_mutation(void *opaque, cbm_cli_activation_lock_t lease) {
+    cli_activation_fake_t *fake = opaque;
+    if (lease == fake && fake->mutation_lease_held) {
+        bool path_a_visible = true;
+        bool path_b_visible = true;
+        if (fake->guarded_path_a) {
+            const char *data = read_test_file(fake->guarded_path_a);
+            path_a_visible = data && (!fake->guarded_text_a || strstr(data, fake->guarded_text_a));
+        }
+        if (fake->guarded_path_b) {
+            const char *data = read_test_file(fake->guarded_path_b);
+            path_b_visible = data && (!fake->guarded_text_b || strstr(data, fake->guarded_text_b));
+        }
+        fake->guarded_files_visible_before_unlock |= path_a_visible && path_b_visible;
+        fake->mutation_lease_held = false;
+        fake->mutation_lease_release_count++;
+        if (fake->release_marker) {
+            (void)write_test_file(fake->release_marker, "released\n");
+        }
+    }
+}
+
+static void cli_activation_fake_diagnostic(void *opaque, const char *message) {
+    cli_activation_fake_t *fake = opaque;
+    snprintf(fake->diagnostic, sizeof(fake->diagnostic), "%s", message ? message : "");
+}
+
+static int cli_activation_fake_mutation(void *opaque) {
+    cli_activation_fake_t *fake = opaque;
+    fake->mutation_count++;
+    fake->mutation_saw_lease = fake->mutation_lease_held;
+    return fake->mutation_result;
+}
+
+static cbm_cli_activation_ops_t cli_activation_fake_ops(cli_activation_fake_t *fake) {
+    cbm_cli_activation_ops_t ops = {
+        .context = fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+    return ops;
+}
+
+/* Every install/update/uninstall in this suite dispatches through here. On
+ * Windows a test that has not installed its own activation ops gets a default
+ * fake for the duration of the command: without the seam, the portable-payload
+ * gate (correctly) refuses managed mutations before the shared agent-config
+ * logic these tests verify ever runs. POSIX behavior is untouched — tests
+ * without ops keep exercising the real activation machinery. */
+static cli_activation_fake_t g_cli_test_seam_fake;
+static cbm_cli_activation_ops_t g_cli_test_seam_ops;
+
+static int cli_test_cmd_dispatch(int (*command)(int, char **), int argc, char **argv) {
+#ifdef _WIN32
+    bool engage = !cbm_cli_activation_test_ops_installed();
+#else
+    bool engage = false;
+#endif
+    if (engage) {
+        memset(&g_cli_test_seam_fake, 0, sizeof(g_cli_test_seam_fake));
+        g_cli_test_seam_fake.mutation_reserve_result = 1;
+        g_cli_test_seam_ops = cli_activation_fake_ops(&g_cli_test_seam_fake);
+        cbm_cli_set_activation_ops_for_test(&g_cli_test_seam_ops);
+    }
+    int rc = command(argc, argv);
+    if (engage) {
+        cbm_cli_set_activation_ops_for_test(NULL);
+    }
+    return rc;
+}
+
+static int cli_test_cmd_install(int argc, char **argv) {
+    return cli_test_cmd_dispatch(cbm_cmd_install, argc, argv);
+}
+
+static int cli_test_cmd_uninstall(int argc, char **argv) {
+    return cli_test_cmd_dispatch(cbm_cmd_uninstall, argc, argv);
+}
+
+static int cli_test_cmd_update(int argc, char **argv) {
+    return cli_test_cmd_dispatch(cbm_cmd_update, argc, argv);
+}
+
+static void cli_activation_save_env(char **home_out, char **cache_out) {
+    const char *home = getenv("HOME");
+    const char *cache = getenv("CBM_CACHE_DIR");
+    *home_out = home ? strdup(home) : NULL;
+    *cache_out = cache ? strdup(cache) : NULL;
+}
+
+static void cli_activation_restore_env(char *home, char *cache) {
+    if (home) {
+        cbm_setenv("HOME", home, 1);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (cache) {
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(home);
+    free(cache);
+}
+
 /* Helper: create tar.gz with a single file */
 static unsigned char *create_test_targz(const char *filename, const unsigned char *content,
                                         int content_len, int *out_len) {
@@ -315,6 +594,1159 @@ static unsigned char *create_test_targz(const char *filename, const unsigned cha
     deflateEnd(&strm);
     free(tar);
     return gz;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Mandatory daemon activation safety
+ * ═══════════════════════════════════════════════════════════════════ */
+
+TEST(cli_activation_quiesces_active_cohort_before_mutation) {
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 0);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.quiesce_count, 1);
+    ASSERT_FALSE(fake.participants_active);
+    ASSERT_EQ(fake.mutation_count, 1);
+    ASSERT_TRUE(fake.mutation_saw_lease);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_FALSE(fake.mutation_lease_held);
+    PASS();
+}
+
+TEST(cli_activation_refuses_when_cohort_does_not_drain) {
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 1);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_TRUE(fake.participants_active);
+    ASSERT_EQ(fake.mutation_count, 0);
+    ASSERT_EQ(fake.mutation_lease_release_count, 0);
+    ASSERT_FALSE(fake.mutation_lease_held);
+    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+TEST(cli_activation_refuses_unsafe_cohort_reservation) {
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = -1,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 1);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_count, 0);
+    ASSERT_EQ(fake.mutation_lease_release_count, 0);
+    ASSERT_FALSE(fake.mutation_lease_held);
+    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+TEST(cli_activation_releases_maintenance_lease_after_success) {
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 0);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_count, 1);
+    ASSERT_TRUE(fake.mutation_saw_lease);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_FALSE(fake.mutation_lease_held);
+    PASS();
+}
+
+TEST(cli_activation_releases_maintenance_lease_when_mutation_fails) {
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+        .mutation_result = 7,
+    };
+    cbm_cli_activation_ops_t ops = {
+        .context = &fake,
+        .reserve_for_mutation = cli_activation_fake_reserve_mutation,
+        .mutation_lease_release = cli_activation_fake_release_mutation,
+        .visible_diagnostic = cli_activation_fake_diagnostic,
+    };
+
+    ASSERT_EQ(cbm_cli_activation_guard_with_ops(&ops, cli_activation_fake_mutation, &fake), 7);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_count, 1);
+    ASSERT_TRUE(fake.mutation_saw_lease);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_FALSE(fake.mutation_lease_held);
+    PASS();
+}
+
+#ifndef _WIN32
+static int cli_activation_abort_cleanup_probe_mutation(void *opaque) {
+    (void)opaque;
+    return cbm_cli_activation_abort_cleanup_probe_for_test();
+}
+
+/* A transaction whose recovery cannot be completed must not return through
+ * the ordinary activation guard: doing so would release the maintenance lease
+ * and allow another daemon generation to observe an uncertain executable. */
+TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-activation-cleanup-fail-stop-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char release_marker[512];
+    snprintf(release_marker, sizeof(release_marker), "%s/released", tmpdir);
+
+    pid_t child = fork();
+    if (child < 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("fork failed");
+    }
+    if (child == 0) {
+        cli_activation_fake_t fake = {
+            .mutation_reserve_result = 1,
+            .release_marker = release_marker,
+        };
+        cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+        cbm_cli_set_activation_cleanup_failure_for_test(true);
+        int rc = cbm_cli_activation_guard_with_ops(
+            &ops, cli_activation_abort_cleanup_probe_mutation, NULL);
+        cbm_cli_set_activation_cleanup_failure_for_test(false);
+        _Exit(rc == 0 ? EXIT_SUCCESS : 2);
+    }
+
+    int status = 0;
+    bool waited = waitpid(child, &status, 0) == child;
+    struct stat marker_status;
+    bool lease_release_skipped = stat(release_marker, &marker_status) != 0;
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(waited);
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_NEQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(lease_release_skipped);
+    PASS();
+}
+
+/* Model the real bootstrap inversion: an admitted participant can already
+ * retain lifetime SH and startup when activation publishes maintenance EX.
+ * Keep startup longer than activation's two-second control deadline. A
+ * quiesce callback that waits for startup fails before the participant can
+ * drain; a callback that directly attempts OP8 and lets lifetime EX prove the
+ * drain succeeds, then acquires startup for the final re-probe and mutation. */
+TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-activation-order-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char runtime_parent[512];
+    snprintf(runtime_parent, sizeof(runtime_parent), "%s/runtime", tmpdir);
+    if (test_mkdirp(runtime_parent) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("runtime parent setup failed");
+    }
+    int ready_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("pipe failed");
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready_pipe[0]);
+        cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+        cbm_version_cohort_manager_t *manager =
+            endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+        char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+        cbm_daemon_build_identity_t identity = {
+            .semantic_version = "cli-activation-test",
+            .build_fingerprint = fingerprint,
+            .cache_fingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            .protocol_abi = CBM_DAEMON_RUNTIME_WIRE_ABI,
+            .store_abi = 1,
+            .feature_abi = 1,
+        };
+        cbm_version_cohort_lease_t *lease = NULL;
+        cbm_daemon_conflict_t conflict;
+        cbm_daemon_ipc_startup_lock_t *startup = NULL;
+        bool setup =
+            endpoint && manager &&
+            cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fingerprint) &&
+            cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 45000U, &lease,
+                                       &conflict) == CBM_VERSION_COHORT_OK &&
+            cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup) == 1 && startup;
+        char ready = setup ? 'R' : 'E';
+        (void)write(ready_pipe[1], &ready, 1);
+        bool saw_maintenance = false;
+        /* The installer only reaches the cohort barrier after STAGING the
+         * candidate — three tamper-defense SHA-256 passes over the whole
+         * binary. The candidate here is this test runner itself (~1 GB with
+         * sanitizers), which costs ~40 s on container/CI I/O, so the
+         * observation window must cover worst-case staging. On success the
+         * child exits the moment it observes the request, so the fast path
+         * stays fast. */
+        uint64_t maintenance_deadline = cbm_now_ms() + 120000U;
+        while (setup && cbm_now_ms() < maintenance_deadline) {
+            cbm_version_cohort_maintenance_presence_t presence =
+                cbm_version_cohort_maintenance_presence(manager);
+            if (presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED) {
+                saw_maintenance = true;
+                break;
+            }
+            if (presence == CBM_VERSION_COHORT_MAINTENANCE_UNSAFE ||
+                presence == CBM_VERSION_COHORT_MAINTENANCE_IO) {
+                break;
+            }
+            /* REQUESTED is level-triggered: the installer holds maintenance EX
+             * for the whole mutation window, which cannot complete before this
+             * child releases its lease. A realistic probe cadence therefore
+             * cannot miss it; a 1 kHz probe storm would only be an observer
+             * artifact no production participant produces. */
+            cbm_usleep(25000);
+        }
+        uint64_t bootstrap_stall_deadline = cbm_now_ms() + 3000U;
+        while (saw_maintenance && cbm_now_ms() < bootstrap_stall_deadline) {
+            cbm_usleep(1000);
+        }
+        if (startup) {
+            (void)cbm_daemon_ipc_startup_lock_release(&startup);
+        }
+        while (lease && cbm_version_cohort_lease_release(&lease) != CBM_PRIVATE_FILE_LOCK_OK) {
+            cbm_usleep(1000);
+        }
+        while (manager && cbm_version_cohort_manager_free(&manager) != CBM_PRIVATE_FILE_LOCK_OK) {
+            cbm_usleep(1000);
+        }
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        close(ready_pipe[1]);
+        _exit(setup && saw_maintenance ? 0 : 1);
+    }
+    close(ready_pipe[1]);
+    char ready = 0;
+    bool child_ready = child > 0 && read(ready_pipe[0], &ready, 1) == 1 && ready == 'R';
+    close(ready_pipe[0]);
+
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *shell = getenv("SHELL");
+    char *old_shell = shell ? strdup(shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    char cache_dir[512];
+    char install_dir[512];
+    char target_path[640];
+    char activation_log[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(install_dir, sizeof(install_dir), "%s/custom/bin", tmpdir);
+    snprintf(target_path, sizeof(target_path), "%s/codebase-memory-mcp", install_dir);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson", cache_dir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_cli_set_activation_runtime_parent_for_test(runtime_parent);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
+    char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
+    int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
+    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    int child_status = 0;
+    bool child_ok = child > 0 && waitpid(child, &child_status, 0) == child &&
+                    WIFEXITED(child_status) && WEXITSTATUS(child_status) == 0;
+    struct stat target_status;
+    struct stat log_status;
+    bool target_exists = stat(target_path, &target_status) == 0;
+    bool log_private = stat(activation_log, &log_status) == 0 && (log_status.st_mode & 0077) == 0;
+    const char *events = read_test_file(activation_log);
+    const char *requested = events ? strstr(events, "\"phase\":\"requested\"") : NULL;
+    const char *stopped = events ? strstr(events, "\"phase\":\"daemon_stopped\"") : NULL;
+    const char *completed = events ? strstr(events, "\"phase\":\"completed\"") : NULL;
+    bool event_order = requested && stopped && completed && requested < stopped &&
+                       stopped < completed && strstr(events, "\"restart_required\":true") != NULL;
+
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(child_ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(child_ok);
+    ASSERT_TRUE(target_exists);
+    ASSERT_TRUE(log_private);
+    ASSERT_TRUE(event_order);
+    PASS();
+}
+#endif
+
+TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "old binary must survive");
+
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--force"};
+    int rc = cli_test_cmd_install(1, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+
+    const char *installed = read_test_file(bin_target);
+    bool preserved = installed && strcmp(installed, "old binary must survive") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(preserved);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.quiesce_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    PASS();
+}
+
+TEST(cli_install_dir_and_skip_config_stage_first_install_safely) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-dir-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *shell = getenv("SHELL");
+    char *old_shell = shell ? strdup(shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    char cache_dir[512];
+    char install_dir[512];
+    char target_path[640];
+    char codex_dir[512];
+    char codex_config[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(install_dir, sizeof(install_dir), "%s/custom/new/bin", tmpdir);
+    snprintf(target_path, sizeof(target_path),
+#ifdef _WIN32
+             "%s/codebase-memory-mcp.exe", install_dir);
+#else
+             "%s/codebase-memory-mcp", install_dir);
+#endif
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(codex_config, sizeof(codex_config), "%s/config.toml", codex_dir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(codex_dir);
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--force", "--skip-config", "--yes", "--dir", install_dir};
+    int rc = cli_test_cmd_install(5, argv);
+    char equals_arg[640];
+    snprintf(equals_arg, sizeof(equals_arg), "--dir=%s", install_dir);
+    char *dry_argv[] = {"--force", "--skip-config", "--dry-run", equals_arg};
+    int dry_rc = cli_test_cmd_install(4, dry_argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat target_status;
+    struct stat config_status;
+    bool target_exists = stat(target_path, &target_status) == 0;
+    bool config_absent = stat(codex_config, &config_status) != 0;
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(dry_rc, 0);
+    ASSERT_TRUE(target_exists);
+    ASSERT_TRUE(config_absent);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    PASS();
+}
+
+TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *missing_dir[] = {"--dir"};
+    char *empty_dir[] = {"--dir="};
+    char *bad_install[] = {"--skip-config=value"};
+    char *bad_update[] = {"--not-an-update-option"};
+    char *bad_uninstall[] = {"--not-an-uninstall-option"};
+    int missing_rc = cli_test_cmd_install(1, missing_dir);
+    int empty_rc = cli_test_cmd_install(1, empty_dir);
+    int install_rc = cli_test_cmd_install(1, bad_install);
+    int update_rc = cli_test_cmd_update(1, bad_update);
+    int uninstall_rc = cli_test_cmd_uninstall(1, bad_uninstall);
+    cbm_cli_set_activation_ops_for_test(NULL);
+
+    ASSERT_EQ(missing_rc, 1);
+    ASSERT_EQ(empty_rc, 1);
+    ASSERT_EQ(install_rc, 1);
+    ASSERT_EQ(update_rc, 1);
+    ASSERT_EQ(uninstall_rc, 1);
+    ASSERT_EQ(fake.mutation_reserve_count, 0);
+    PASS();
+}
+
+TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-reset-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must survive final-guard refusal");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "old binary must survive");
+
+    /* The prompt and candidate staging complete first. If the coordinated
+     * cohort still cannot drain, neither binary publication nor index reset
+     * may run. */
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--force", "--reset-indexes", "--yes"};
+    int rc = cli_test_cmd_install(3, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *index = read_test_file(index_path);
+    bool index_preserved = index && strcmp(index, "index must survive final-guard refusal") == 0;
+    const char *installed = read_test_file(bin_target);
+    bool binary_preserved = installed && strcmp(installed, "old binary must survive") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(index_preserved);
+    ASSERT_TRUE(binary_preserved);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 0);
+    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+TEST(cli_install_config_only_waits_for_cohort_drain) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-config-race-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *raw_shell = getenv("SHELL");
+    char *old_shell = raw_shell ? strdup(raw_shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char codex_dir[512];
+    char codex_config[640];
+    char shell_rc[512];
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(codex_config, sizeof(codex_config), "%s/config.toml", codex_dir);
+    snprintf(shell_rc, sizeof(shell_rc), "%s/.zshrc", tmpdir);
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(codex_dir);
+    test_mkdirp(bin_dir);
+    write_test_file(shell_rc, "# path must survive final-guard refusal\n");
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "existing binary selected by the user");
+
+    /* No binary replacement and no index reset are requested. Config and PATH
+     * writes still require the same maintenance lease. */
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cbm_set_auto_answer_for_test(-1);
+    int rc = cli_test_cmd_install(0, NULL);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *shell_data = read_test_file(shell_rc);
+    bool path_preserved = shell_data && strstr(shell_data, "export PATH") == NULL;
+    struct stat config_status;
+    bool config_absent = stat(codex_config, &config_status) != 0;
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(path_preserved);
+    ASSERT_TRUE(config_absent);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 0);
+    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+TEST(cli_install_config_and_path_finish_before_guard_release) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-window-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *raw_shell = getenv("SHELL");
+    char *old_shell = raw_shell ? strdup(raw_shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char codex_dir[512];
+    char codex_config[640];
+    char shell_rc[512];
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(codex_config, sizeof(codex_config), "%s/config.toml", codex_dir);
+    snprintf(shell_rc, sizeof(shell_rc), "%s/.zshrc", tmpdir);
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(codex_dir);
+    test_mkdirp(bin_dir);
+    write_test_file(shell_rc, "# existing shell config\n");
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "existing binary selected by the user");
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+        .guarded_path_a = codex_config,
+        .guarded_text_a = "codebase-memory-mcp",
+#ifndef _WIN32
+        /* Windows configures PATH through the user registry, not a shell rc,
+         * so the rc-file visibility guard is a POSIX-only expectation. */
+        .guarded_path_b = shell_rc,
+        .guarded_text_b = "export PATH",
+#endif
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cbm_set_auto_answer_for_test(-1);
+    int rc = cli_test_cmd_install(0, NULL);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_TRUE(fake.guarded_files_visible_before_unlock);
+    PASS();
+}
+
+/* Regression: config installation is not atomic across every supported agent.
+ * Once the verified executable has been published, rolling only that binary
+ * back on one agent-config refusal leaves any successful config writes pointing
+ * at the wrong (or, for a fresh install, missing) executable. */
+TEST(cli_install_config_failure_keeps_published_binary) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-partial-config-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    char *old_path = save_test_env("PATH");
+    char *old_shell = save_test_env("SHELL");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+
+    char cache_dir[512];
+    char openclaw_dir[512];
+    char openclaw_config[640];
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(openclaw_dir, sizeof(openclaw_dir), "%s/.openclaw", tmpdir);
+    snprintf(openclaw_config, sizeof(openclaw_config), "%s/openclaw.json", openclaw_dir);
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(openclaw_dir);
+    test_mkdirp(bin_dir);
+    const char *malformed = "{ invalid config\n";
+    write_test_file(openclaw_config, malformed);
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--force", "--yes"};
+    int rc = cli_test_cmd_install(2, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat binary_status;
+    bool binary_published = stat(bin_target, &binary_status) == 0;
+    char *after = read_test_file_alloc(openclaw_config);
+    bool malformed_preserved = after && strcmp(after, malformed) == 0;
+    free(after);
+    restore_test_env("PATH", old_path);
+    restore_test_env("SHELL", old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(binary_published);
+    ASSERT_TRUE(malformed_preserved);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_NOT_NULL(strstr(fake.diagnostic, "executable was kept"));
+    PASS();
+}
+
+TEST(cli_update_download_failure_does_not_quiesce_sessions) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-update-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *download = getenv("CBM_DOWNLOAD_URL");
+    char *old_download = download ? strdup(download) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_DOWNLOAD_URL", "file:///cbm-update-does-not-exist", 1);
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must survive");
+
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--force", "--standard", "--yes"};
+    int rc = cli_test_cmd_update(3, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *index = read_test_file(index_path);
+    bool preserved = index && strcmp(index, "index must survive") == 0;
+    if (old_download) {
+        cbm_setenv("CBM_DOWNLOAD_URL", old_download, 1);
+    } else {
+        cbm_unsetenv("CBM_DOWNLOAD_URL");
+    }
+    free(old_download);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(preserved);
+    ASSERT_EQ(fake.mutation_reserve_count, 0);
+    PASS();
+}
+
+TEST(cli_update_already_current_does_not_quiesce_sessions) {
+#ifdef _WIN32
+    /* The deterministic fake-curl fixture below is POSIX-only. The guarded
+     * ordering it exercises is platform-independent. */
+    PASS();
+#else
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-update-current-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *raw_path = getenv("PATH");
+    const char *raw_download = getenv("CBM_DOWNLOAD_URL");
+    char *old_path = raw_path ? strdup(raw_path) : NULL;
+    char *old_download = raw_download ? strdup(raw_download) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_unsetenv("CBM_DOWNLOAD_URL");
+
+    char bin_dir[512];
+    char fake_curl[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/bin", tmpdir);
+    snprintf(fake_curl, sizeof(fake_curl), "%s/curl", bin_dir);
+    test_mkdirp(bin_dir);
+    write_test_file(
+        fake_curl,
+        "#!/bin/sh\n"
+        "printf '%s\\n' 'HTTP/1.1 302 Found' "
+        "'location: https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.0.0'\n");
+    bool fixture_ready = chmod(fake_curl, 0700) == 0;
+    cbm_setenv("PATH", bin_dir, 1);
+
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--standard"};
+    int rc = fixture_ready ? cli_test_cmd_update(1, argv) : -1;
+    cbm_cli_set_activation_ops_for_test(NULL);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+    } else {
+        cbm_unsetenv("PATH");
+    }
+    if (old_download) {
+        cbm_setenv("CBM_DOWNLOAD_URL", old_download, 1);
+    } else {
+        cbm_unsetenv("CBM_DOWNLOAD_URL");
+    }
+    free(old_path);
+    free(old_download);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(fake.mutation_reserve_count, 0);
+    PASS();
+#endif
+}
+
+TEST(cli_update_agent_configs_finish_before_guard_release) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-update-window-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *download_env = getenv("CBM_DOWNLOAD_URL");
+    char *old_download = download_env ? strdup(download_env) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char codex_dir[512];
+    char codex_config[640];
+    char release_dir[512];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(codex_config, sizeof(codex_config), "%s/config.toml", codex_dir);
+    snprintf(release_dir, sizeof(release_dir), "%s/release", tmpdir);
+    test_mkdirp(codex_dir);
+    test_mkdirp(release_dir);
+
+#ifdef _WIN32
+    /* The existing ZIP fixture helper is intentionally exercised elsewhere;
+     * this activation-window regression uses the tar update path. */
+    cli_activation_restore_env(old_home, old_cache);
+    if (old_download) {
+        cbm_setenv("CBM_DOWNLOAD_URL", old_download, 1);
+    } else {
+        cbm_unsetenv("CBM_DOWNLOAD_URL");
+    }
+    free(old_download);
+    test_rmdir_r(tmpdir);
+    PASS();
+#else
+    char archive_path[768];
+    char checksum_path[640];
+#if defined(__APPLE__)
+#if defined(__aarch64__) || defined(__arm64__)
+    const char *asset_name = "codebase-memory-mcp-darwin-arm64.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-darwin-amd64.tar.gz";
+#endif
+#else
+#if defined(__aarch64__)
+    const char *asset_name = "codebase-memory-mcp-linux-arm64-portable.tar.gz";
+#else
+    const char *asset_name = "codebase-memory-mcp-linux-amd64-portable.tar.gz";
+#endif
+#endif
+#ifdef __APPLE__
+    /* Use the structurally real test runner rather than re-signing an Apple
+     * platform binary. Turning /usr/bin/true's arm64e/platform signature into
+     * an ad-hoc signature is OS-policy-dependent on older macOS runners. */
+    char native_fixture_path[CBM_SZ_4K] = {0};
+    uint32_t native_fixture_size = (uint32_t)sizeof(native_fixture_path);
+    ASSERT_EQ(_NSGetExecutablePath(native_fixture_path, &native_fixture_size), 0);
+    const char *native_fixture = native_fixture_path;
+#else
+    const char *native_fixture = "/bin/true";
+#endif
+    FILE *native_file = fopen(native_fixture, "rb");
+    ASSERT_NOT_NULL(native_file);
+    ASSERT_EQ(fseek(native_file, 0, SEEK_END), 0);
+    long native_size = ftell(native_file);
+    ASSERT_GT(native_size, 0);
+    ASSERT_LTE(native_size, INT_MAX);
+    ASSERT_EQ(fseek(native_file, 0, SEEK_SET), 0);
+    unsigned char *replacement = malloc((size_t)native_size);
+    ASSERT_NOT_NULL(replacement);
+    ASSERT_EQ(fread(replacement, 1, (size_t)native_size, native_file), (size_t)native_size);
+    ASSERT_EQ(fclose(native_file), 0);
+    int archive_len = 0;
+    unsigned char *archive =
+        create_test_targz("codebase-memory-mcp", replacement, (int)native_size, &archive_len);
+    free(replacement);
+    ASSERT_NOT_NULL(archive);
+    snprintf(archive_path, sizeof(archive_path), "%s/%s", release_dir, asset_name);
+    FILE *archive_file = fopen(archive_path, "wb");
+    ASSERT_NOT_NULL(archive_file);
+    ASSERT_EQ(fwrite(archive, 1, (size_t)archive_len, archive_file), (size_t)archive_len);
+    ASSERT_EQ(fclose(archive_file), 0);
+    free(archive);
+
+    char digest[65];
+    ASSERT_EQ(cbm_cli_sha256_file(archive_path, digest, sizeof(digest)), 0);
+    snprintf(checksum_path, sizeof(checksum_path), "%s/checksums.txt", release_dir);
+    FILE *checksum_file = fopen(checksum_path, "w");
+    ASSERT_NOT_NULL(checksum_file);
+    ASSERT_TRUE(fprintf(checksum_file, "%s  %s\n", digest, asset_name) > 0);
+    ASSERT_EQ(fclose(checksum_file), 0);
+
+    char download_url[640];
+    snprintf(download_url, sizeof(download_url), "file://%s", release_dir);
+    cbm_setenv("CBM_DOWNLOAD_URL", download_url, 1);
+
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+        .guarded_path_a = codex_config,
+        .guarded_text_a = "codebase-memory-mcp",
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--force", "--standard"};
+    int rc = cli_test_cmd_update(2, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+
+    /* Re-run against a known old target while one independently detected agent
+     * refuses its config. The new executable must remain published because
+     * earlier agent configs may already have been refreshed for it. */
+    char openclaw_dir[512];
+    char openclaw_config[640];
+    char bin_target[640];
+    snprintf(openclaw_dir, sizeof(openclaw_dir), "%s/.openclaw", tmpdir);
+    snprintf(openclaw_config, sizeof(openclaw_config), "%s/openclaw.json", openclaw_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+    test_mkdirp(openclaw_dir);
+    write_test_file(openclaw_config, "{ invalid config\n");
+    static const char old_binary[] = "old binary before partial update";
+    write_test_file(bin_target, old_binary);
+
+    cli_activation_fake_t config_failure = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t failure_ops = cli_activation_fake_ops(&config_failure);
+    cbm_cli_set_activation_ops_for_test(&failure_ops);
+    int config_failure_rc = cli_test_cmd_update(2, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    struct stat updated_status;
+    bool replacement_kept = stat(bin_target, &updated_status) == 0 &&
+                            updated_status.st_size != (off_t)(sizeof(old_binary) - 1U);
+
+    if (old_download) {
+        cbm_setenv("CBM_DOWNLOAD_URL", old_download, 1);
+    } else {
+        cbm_unsetenv("CBM_DOWNLOAD_URL");
+    }
+    free(old_download);
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    ASSERT_TRUE(fake.guarded_files_visible_before_unlock);
+    ASSERT_EQ(config_failure_rc, 1);
+    ASSERT_TRUE(replacement_kept);
+    ASSERT_EQ(config_failure.mutation_reserve_count, 1);
+    ASSERT_EQ(config_failure.mutation_lease_release_count, 1);
+    ASSERT_NOT_NULL(strstr(config_failure.diagnostic, "executable was kept"));
+    PASS();
+#endif
+}
+
+TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must survive active-daemon refusal");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "binary must survive active-daemon refusal");
+
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *index = read_test_file(index_path);
+    bool index_preserved = index && strcmp(index, "index must survive active-daemon refusal") == 0;
+    const char *installed = read_test_file(bin_target);
+    bool binary_preserved =
+        installed && strcmp(installed, "binary must survive active-daemon refusal") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_FALSE(index_preserved);
+    ASSERT_FALSE(binary_preserved);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.quiesce_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 1);
+    PASS();
+}
+
+TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-uninstall-race-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must survive uninstall race");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_target, "binary must survive uninstall race");
+
+    /* Prompts and removal staging happen first. A failed cohort drain must
+     * preserve both the executable and optional index cleanup. */
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 0,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *index = read_test_file(index_path);
+    bool index_preserved = index && strcmp(index, "index must survive uninstall race") == 0;
+    const char *installed = read_test_file(bin_target);
+    bool binary_preserved =
+        installed && strcmp(installed, "binary must survive uninstall race") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(index_preserved);
+    ASSERT_TRUE(binary_preserved);
+    ASSERT_EQ(fake.mutation_reserve_count, 1);
+    ASSERT_EQ(fake.mutation_lease_release_count, 0);
+    ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-stateless-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *install_dry[] = {"--force", "--dry-run"};
+    char *install_plan[] = {"--force", "--plan"};
+    char *update_dry[] = {"--force", "--dry-run", "--standard"};
+    char *uninstall_dry[] = {"--dry-run", "--yes"};
+    int install_dry_rc = cli_test_cmd_install(2, install_dry);
+    int install_plan_rc = cli_test_cmd_install(2, install_plan);
+    int update_dry_rc = cli_test_cmd_update(3, update_dry);
+    int uninstall_dry_rc = cli_test_cmd_uninstall(2, uninstall_dry);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(install_dry_rc, 0);
+    ASSERT_EQ(install_plan_rc, 0);
+    ASSERT_EQ(update_dry_rc, 0);
+    ASSERT_EQ(uninstall_dry_rc, 0);
+    ASSERT_EQ(fake.mutation_reserve_count, 0);
+    PASS();
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1216,7 +2648,8 @@ TEST(cli_openclaw_compaction_preserves_user_owned_section) {
                                      "OPENCLAW_STATE_DIR",
                                      "OPENCLAW_CONFIG_PATH",
                                      "OPENCLAW_WORKSPACE_DIR",
-                                     "OPENCLAW_PROFILE"};
+                                     "OPENCLAW_PROFILE",
+                                     "CBM_CACHE_DIR"};
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         saved_env[i] = save_test_env(env_names[i]);
@@ -1234,7 +2667,7 @@ TEST(cli_openclaw_compaction_preserves_user_owned_section) {
     free(installed);
 
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *uninstalled = read_test_file_alloc(config_path);
     bool preserved_user =
         uninstalled && strstr(uninstalled, "Codebase Memory") && strstr(uninstalled, "User Notes");
@@ -1242,11 +2675,20 @@ TEST(cli_openclaw_compaction_preserves_user_owned_section) {
         uninstalled && !strstr(uninstalled, "Codebase Knowledge Graph (codebase-memory-mcp)");
     free(uninstalled);
 
+    const size_t cache_env_index = sizeof(env_names) / sizeof(env_names[0]) - 1;
+    const char *cache_after_uninstall = getenv("CBM_CACHE_DIR");
+    bool cache_environment_restored =
+        saved_env[cache_env_index]
+            ? cache_after_uninstall &&
+                  strcmp(cache_after_uninstall, saved_env[cache_env_index]) == 0
+            : cache_after_uninstall == NULL;
+
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         restore_test_env(env_names[i], saved_env[i]);
     }
     test_rmdir_r(tmpdir);
-    if (!installed_owned || !retained_existing || rc != 0 || !preserved_user || !removed_owned)
+    if (!installed_owned || !retained_existing || rc != 0 || !preserved_user || !removed_owned ||
+        !cache_environment_restored)
         FAIL("OpenClaw uninstall must remove only its namespaced compaction section");
     PASS();
 }
@@ -1314,7 +2756,7 @@ TEST(cli_openclaw_uninstall_removes_compaction_when_workspace_is_ambiguous) {
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(config_path);
     bool removed = after && !strstr(after, "Codebase Knowledge Graph (codebase-memory-mcp)");
 
@@ -1425,7 +2867,7 @@ TEST(cli_vscode_profile_mcp_uninstall) {
     cbm_setenv("APPDATA", appdata, 1);
 #endif
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *base = read_test_file_alloc(base_config);
     char *profile = read_test_file_alloc(profile_config);
     bool removed = base && profile && !strstr(base, "codebase-memory-mcp") &&
@@ -1904,6 +3346,249 @@ static unsigned char *create_test_zip_stored(const char *filename, const unsigne
     return zip;
 }
 
+static void test_zip_put_u16(unsigned char *output, uint16_t value) {
+    output[0] = (unsigned char)value;
+    output[1] = (unsigned char)(value >> 8);
+}
+
+static void test_zip_put_u32(unsigned char *output, uint32_t value) {
+    output[0] = (unsigned char)value;
+    output[1] = (unsigned char)(value >> 8);
+    output[2] = (unsigned char)(value >> 16);
+    output[3] = (unsigned char)(value >> 24);
+}
+
+typedef struct {
+    const char *name;
+    const unsigned char *content;
+    size_t content_size;
+} test_zip_entry_t;
+
+static unsigned char *create_test_zip_entries(const test_zip_entry_t *entries, size_t entry_count,
+                                              int *out_len) {
+    enum { TEST_ZIP_ENTRY_MAX = 8 };
+    if (!entries || !out_len || entry_count == 0 || entry_count > TEST_ZIP_ENTRY_MAX) {
+        return NULL;
+    }
+    size_t local_size = 0;
+    size_t central_size = 0;
+    for (size_t index = 0; index < entry_count; index++) {
+        size_t name_size = strlen(entries[index].name);
+        local_size += 30U + name_size + entries[index].content_size;
+        central_size += 46U + name_size;
+    }
+    size_t total = local_size + central_size + 22U;
+    if (total > INT_MAX) {
+        return NULL;
+    }
+    unsigned char *zip = calloc(1, total);
+    if (!zip) {
+        return NULL;
+    }
+    uint32_t local_offsets[TEST_ZIP_ENTRY_MAX];
+    uint32_t crcs[TEST_ZIP_ENTRY_MAX];
+    size_t cursor = 0;
+    for (size_t index = 0; index < entry_count; index++) {
+        size_t name_size = strlen(entries[index].name);
+        local_offsets[index] = (uint32_t)cursor;
+        crcs[index] =
+            (uint32_t)crc32(0L, entries[index].content, (uInt)entries[index].content_size);
+        zip[cursor] = 0x50;
+        zip[cursor + 1U] = 0x4b;
+        zip[cursor + 2U] = 0x03;
+        zip[cursor + 3U] = 0x04;
+        test_zip_put_u16(zip + cursor + 4U, 20U);
+        test_zip_put_u32(zip + cursor + 14U, crcs[index]);
+        test_zip_put_u32(zip + cursor + 18U, (uint32_t)entries[index].content_size);
+        test_zip_put_u32(zip + cursor + 22U, (uint32_t)entries[index].content_size);
+        test_zip_put_u16(zip + cursor + 26U, (uint16_t)name_size);
+        memcpy(zip + cursor + 30U, entries[index].name, name_size);
+        cursor += 30U + name_size;
+        memcpy(zip + cursor, entries[index].content, entries[index].content_size);
+        cursor += entries[index].content_size;
+    }
+
+    size_t central_offset = cursor;
+    for (size_t index = 0; index < entry_count; index++) {
+        size_t name_size = strlen(entries[index].name);
+        zip[cursor] = 0x50;
+        zip[cursor + 1U] = 0x4b;
+        zip[cursor + 2U] = 0x01;
+        zip[cursor + 3U] = 0x02;
+        test_zip_put_u16(zip + cursor + 4U, 20U);
+        test_zip_put_u16(zip + cursor + 6U, 20U);
+        test_zip_put_u32(zip + cursor + 16U, crcs[index]);
+        test_zip_put_u32(zip + cursor + 20U, (uint32_t)entries[index].content_size);
+        test_zip_put_u32(zip + cursor + 24U, (uint32_t)entries[index].content_size);
+        test_zip_put_u16(zip + cursor + 28U, (uint16_t)name_size);
+        test_zip_put_u32(zip + cursor + 42U, local_offsets[index]);
+        memcpy(zip + cursor + 46U, entries[index].name, name_size);
+        cursor += 46U + name_size;
+    }
+    size_t central_length = cursor - central_offset;
+    zip[cursor] = 0x50;
+    zip[cursor + 1U] = 0x4b;
+    zip[cursor + 2U] = 0x05;
+    zip[cursor + 3U] = 0x06;
+    test_zip_put_u16(zip + cursor + 8U, (uint16_t)entry_count);
+    test_zip_put_u16(zip + cursor + 10U, (uint16_t)entry_count);
+    test_zip_put_u32(zip + cursor + 12U, (uint32_t)central_length);
+    test_zip_put_u32(zip + cursor + 16U, (uint32_t)central_offset);
+    *out_len = (int)total;
+    return zip;
+}
+
+static unsigned char *create_test_zip_pair(const test_zip_entry_t entries[2], int *out_len) {
+    return create_test_zip_entries(entries, 2U, out_len);
+}
+
+static unsigned char *create_test_windows_release_zip(const char *launcher_name,
+                                                      const char *payload_name, int *out_len) {
+    static const unsigned char launcher[] = "MZ-launcher";
+    static const unsigned char payload[] = "MZ-payload";
+    static const unsigned char license[] = "license";
+    static const unsigned char installer[] = "installer";
+    static const unsigned char notices[] = "notices";
+    test_zip_entry_t entries[5] = {
+        {
+            .name = launcher_name,
+            .content = launcher,
+            .content_size = sizeof(launcher) - 1U,
+        },
+        {
+            .name = payload_name,
+            .content = payload,
+            .content_size = sizeof(payload) - 1U,
+        },
+        {"LICENSE", license, sizeof(license) - 1U},
+        {"install.ps1", installer, sizeof(installer) - 1U},
+        {"THIRD_PARTY_NOTICES.md", notices, sizeof(notices) - 1U},
+    };
+    return create_test_zip_entries(entries, 5U, out_len);
+}
+
+TEST(cli_extract_windows_release_pair_rejects_incomplete_release_namespace) {
+    static const unsigned char launcher[] = "MZ-launcher";
+    static const unsigned char payload[] = "MZ-payload";
+    const test_zip_entry_t entries[2] = {
+        {"codebase-memory-mcp.exe", launcher, sizeof(launcher) - 1U},
+        {"codebase-memory-mcp.payload.exe", payload, sizeof(payload) - 1U},
+    };
+    int zip_length = 0;
+    unsigned char *zip = create_test_zip_pair(entries, &zip_length);
+    ASSERT_NOT_NULL(zip);
+    cbm_windows_release_pair_t pair;
+    ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
+    cbm_windows_release_pair_free(&pair);
+    free(zip);
+    PASS();
+}
+
+/* Release archives retain their legal notices and the standalone installer.
+ * The updater must accept that exact official namespace while extracting only
+ * the launcher/payload pair. Synthetic two-file fixtures previously hid that
+ * every published Windows update would be rejected. */
+TEST(cli_extract_windows_release_pair_accepts_official_release_namespace) {
+    static const unsigned char launcher[] = "MZ-launcher";
+    static const unsigned char payload[] = "MZ-payload";
+    static const unsigned char license[] = "license";
+    static const unsigned char installer[] = "installer";
+    static const unsigned char notices[] = "notices";
+    const test_zip_entry_t entries[] = {
+        {"codebase-memory-mcp.exe", launcher, sizeof(launcher) - 1U},
+        {"codebase-memory-mcp.payload.exe", payload, sizeof(payload) - 1U},
+        {"LICENSE", license, sizeof(license) - 1U},
+        {"install.ps1", installer, sizeof(installer) - 1U},
+        {"THIRD_PARTY_NOTICES.md", notices, sizeof(notices) - 1U},
+    };
+    int zip_length = 0;
+    unsigned char *zip =
+        create_test_zip_entries(entries, sizeof(entries) / sizeof(entries[0]), &zip_length);
+    ASSERT_NOT_NULL(zip);
+    cbm_windows_release_pair_t pair;
+    ASSERT_TRUE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
+    ASSERT_EQ(pair.launcher_len, 11);
+    ASSERT_EQ(pair.payload_len, 10);
+    ASSERT_MEM_EQ(pair.launcher, "MZ-launcher", 11);
+    ASSERT_MEM_EQ(pair.payload, "MZ-payload", 10);
+    cbm_windows_release_pair_free(&pair);
+    free(zip);
+    PASS();
+}
+
+TEST(cli_extract_windows_release_pair_rejects_unknown_release_member) {
+    static const unsigned char content[] = "x";
+    const test_zip_entry_t entries[] = {
+        {"codebase-memory-mcp.exe", content, sizeof(content) - 1U},
+        {"codebase-memory-mcp.payload.exe", content, sizeof(content) - 1U},
+        {"LICENSE", content, sizeof(content) - 1U},
+        {"install.ps1", content, sizeof(content) - 1U},
+        {"unexpected.dll", content, sizeof(content) - 1U},
+    };
+    int zip_length = 0;
+    unsigned char *zip =
+        create_test_zip_entries(entries, sizeof(entries) / sizeof(entries[0]), &zip_length);
+    ASSERT_NOT_NULL(zip);
+    cbm_windows_release_pair_t pair;
+    ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
+    cbm_windows_release_pair_free(&pair);
+    free(zip);
+    PASS();
+}
+
+TEST(cli_extract_windows_release_pair_rejects_aliases_and_duplicates) {
+    static const struct {
+        const char *launcher;
+        const char *payload;
+    } attacks[] = {
+        {
+            "CODEBASE-MEMORY-MCP.EXE",
+            "codebase-memory-mcp.payload.exe",
+        },
+        {
+            "codebase-memory-mcp.exe",
+            "codebase-memory-mcp.exe",
+        },
+        {
+            ".\\codebase-memory-mcp.exe",
+            "codebase-memory-mcp.payload.exe",
+        },
+        {
+            "codebase-memory-mcp.exe.",
+            "codebase-memory-mcp.payload.exe",
+        },
+        {
+            "codebase-memory-mcp.exe",
+            "codebase-memory-mcp.payload.exe ",
+        },
+    };
+    for (size_t index = 0; index < sizeof(attacks) / sizeof(attacks[0]); index++) {
+        int zip_length = 0;
+        unsigned char *zip = create_test_windows_release_zip(attacks[index].launcher,
+                                                             attacks[index].payload, &zip_length);
+        ASSERT_NOT_NULL(zip);
+        cbm_windows_release_pair_t pair;
+        ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
+        cbm_windows_release_pair_free(&pair);
+        free(zip);
+    }
+    PASS();
+}
+
+TEST(cli_extract_windows_release_pair_rejects_local_central_mismatch) {
+    int zip_length = 0;
+    unsigned char *zip = create_test_windows_release_zip(
+        "codebase-memory-mcp.exe", "codebase-memory-mcp.payload.exe", &zip_length);
+    ASSERT_NOT_NULL(zip);
+    /* Local name starts at offset 30; central metadata remains unchanged. */
+    zip[30] = 'x';
+    cbm_windows_release_pair_t pair;
+    ASSERT_FALSE(cbm_extract_windows_release_pair_from_zip(zip, zip_length, &pair));
+    cbm_windows_release_pair_free(&pair);
+    free(zip);
+    PASS();
+}
+
 TEST(cli_extract_binary_from_zip) {
     const char *content = "#!/bin/sh\necho test\n";
     int zip_len = 0;
@@ -2139,21 +3824,42 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     const char *malformed = "{ invalid config\n";
     write_test_file(config_path, malformed);
 
+    char bin_dir[512];
+    char bin_path[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+#ifdef _WIN32
+    snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp.exe", bin_dir);
+#else
+    snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp", bin_dir);
+#endif
+    write_test_file(bin_path, "installed binary must remain live\n");
+
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
-    char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    cli_activation_fake_t fake = {
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
     char *after = read_test_file_alloc(config_path);
     bool preserved = after && strcmp(after, malformed) == 0;
+    struct stat binary_status;
+    bool binary_preserved = stat(bin_path, &binary_status) == 0;
 
     free(after);
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     test_rmdir_r(tmpdir);
-    if (rc == 0 || !preserved)
-        FAIL("agent uninstall must return failure when a safe editor refuses a config");
+    if (rc == 0 || !preserved || !binary_preserved || fake.mutation_reserve_count != 1 ||
+        fake.mutation_lease_release_count != 1 || !strstr(fake.diagnostic, "executable was kept"))
+        FAIL("agent uninstall refusal must fail before removing the live binary");
     PASS();
 }
 
@@ -2175,7 +3881,7 @@ TEST(cli_special_hook_failures_propagate_from_install_and_uninstall) {
     cbm_setenv("PATH", tmpdir, 1);
     int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
 
     char *after = read_test_file_alloc(hooks_path);
     bool unchanged = after && strcmp(after, "[]\n") == 0;
@@ -3361,7 +5067,7 @@ TEST(cli_cline_data_dir_only_redirects_data_state) {
     free(preserved_hook);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     preserved_hook = read_test_file_alloc(hook_paths[3]);
     bool removed =
         stat(skill, &state) != 0 && preserved_hook && strcmp(preserved_hook, modified_hook) == 0;
@@ -3434,7 +5140,7 @@ TEST(cli_warp_installs_shared_skill_without_mcp_or_permissions) {
     const char *modified = "---\nname: codebase-memory\n---\nUser-owned Warp skill.\n";
     write_test_file(skill_path, modified);
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *preserved = read_test_file_alloc(skill_path);
     bool ownership_safe = preserved && strcmp(preserved, modified) == 0;
     free(preserved);
@@ -3503,7 +5209,7 @@ TEST(cli_owned_durable_profiles_preserve_user_files) {
     write_test_file(copilot_skill, modified_skill);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *codex_after = read_test_file_alloc(codex_agent);
     char *skill_after = read_test_file_alloc(copilot_skill);
     cursor_after = read_test_file_alloc(cursor_agent);
@@ -3592,7 +5298,7 @@ TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall) {
     const char *modified_verify = "name = \"codebase-memory\"\nuser_note = \"preserve verify\"\n";
     write_test_file(verify_path, modified_verify);
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     scout = read_test_file_alloc(scout_path);
     verify = read_test_file_alloc(verify_path);
     struct stat state;
@@ -3662,7 +5368,7 @@ TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets) {
     }
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     struct stat state;
     bool removed = uninstall_rc == 0;
     for (size_t i = 0U; removed && i < 3U; i++) {
@@ -3741,7 +5447,7 @@ TEST(cli_junie_current_durable_context_contract) {
     free(skill_twice);
 
     char *argv[] = {"uninstall", "--yes"};
-    int exact_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int exact_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     bool exact_removed = stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0;
 
     const char *modified_skill = "---\nname: codebase-memory\n---\nUser-owned Junie skill.\n";
@@ -3751,7 +5457,7 @@ TEST(cli_junie_current_durable_context_contract) {
         cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
     write_test_file(skill_path, modified_skill);
     write_test_file(agent_path, modified_agent);
-    int modified_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int modified_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *skill_after = read_test_file_alloc(skill_path);
     char *agent_after = read_test_file_alloc(agent_path);
     bool modified_preserved = skill_after && agent_after &&
@@ -3812,7 +5518,7 @@ TEST(cli_rovo_installs_documented_global_memory) {
     free(second);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(memory_path);
     bool cleaned = uninstall_rc == 0 && after && strcmp(after, personal) == 0;
     free(after);
@@ -3876,7 +5582,7 @@ TEST(cli_hermes_stable_shell_context_contract) {
     free(installed);
 
     char *argv[] = {"uninstall", "--yes"};
-    int exact_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int exact_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *after_exact = read_test_file_alloc(config_path);
     bool exact_removed = after_exact && strstr(after_exact, "theme: solarized") &&
                          strstr(after_exact, "/usr/bin/user-hermes-hook") &&
@@ -3893,7 +5599,7 @@ TEST(cli_hermes_stable_shell_context_contract) {
         write_test_file(config_path, modified);
     }
     free(modified);
-    int modified_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int modified_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *after_modified = read_test_file_alloc(config_path);
     bool modified_preserved = hook_was_modified && after_modified &&
                               strstr(after_modified, "--dialect xermes") &&
@@ -4165,7 +5871,7 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     free(qoder_data);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     qoder_data = read_test_file_alloc(qoder_settings);
     qoder_doc = qoder_data ? yyjson_read(qoder_data, strlen(qoder_data), 0) : NULL;
     qoder_root = qoder_doc ? yyjson_doc_get_root(qoder_doc) : NULL;
@@ -4384,7 +6090,7 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
     free(amp_skill_twice);
 
     char *argv[] = {"uninstall", "--yes"};
-    int exact_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int exact_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *kimi_after_uninstall = read_test_file_alloc(kimi_instructions);
     char *kimi_config_after_uninstall = read_test_file_alloc(kimi_config);
     char *amp_after_uninstall = read_test_file_alloc(amp_instructions);
@@ -4411,7 +6117,7 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
     write_test_file(kimi_skill, modified_kimi_skill);
     write_test_file(rovo_agent, modified_rovo_agent);
     write_test_file(amp_skill, modified_amp_skill);
-    int modified_uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int modified_uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *kimi_skill_after = read_test_file_alloc(kimi_skill);
     char *rovo_agent_after = read_test_file_alloc(rovo_agent);
     char *amp_skill_after = read_test_file_alloc(amp_skill);
@@ -4582,7 +6288,7 @@ TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     free(devin_agents_data);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     gitlab_data = read_test_file_alloc(gitlab_hooks);
     devin_data = read_test_file_alloc(devin_config);
     devin_agents_data = read_test_file_alloc(devin_agents);
@@ -4669,7 +6375,7 @@ TEST(cli_registry_hook_cleanup_is_independent_from_mcp_ownership) {
     }
 
     char *argv[] = {"uninstall", "--yes"};
-    int foreign_mcp_uninstall = cbm_cmd_uninstall(2, argv);
+    int foreign_mcp_uninstall = cli_test_cmd_uninstall(2, argv);
     bool independent_cleanup = foreign_mcp_uninstall == 0;
     for (size_t i = 0U; i < sizeof(paths) / sizeof(paths[0]); i++) {
         char *data = read_test_file_alloc(paths[i]);
@@ -4709,7 +6415,7 @@ TEST(cli_registry_hook_cleanup_is_independent_from_mcp_ownership) {
         fflush(stdout);
         redirected = dup2(fileno(capture), STDOUT_FILENO) >= 0;
     }
-    int modified_hook_uninstall = redirected ? cbm_cmd_uninstall(2, argv) : -1;
+    int modified_hook_uninstall = redirected ? cli_test_cmd_uninstall(2, argv) : -1;
     if (redirected) {
         fflush(stdout);
         (void)dup2(saved_stdout, STDOUT_FILENO);
@@ -4954,7 +6660,7 @@ TEST(cli_registry_installs_codebuddy_bob_and_pochi_durable_context) {
         first_rc == 0 && second_rc == 0 && codebuddy_installed && bob_installed && pochi_installed;
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *codebuddy_after = read_test_file_alloc(codebuddy_memory);
     char *bob_after = read_test_file_alloc(bob_rule);
     char *pochi_after = read_test_file_alloc(pochi_rules);
@@ -5159,7 +6865,7 @@ TEST(cli_gemini_installs_dedicated_graph_subagent) {
     free(plan);
 
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
     struct stat state;
     bool removed = stat(scout_path, &state) != 0 && stat(agent_path, &state) != 0 &&
                    stat(auditor_path, &state) != 0;
@@ -5593,7 +7299,7 @@ TEST(cli_augment_installs_session_context_and_subagent) {
     free(plan);
 
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
     char *settings_after = read_test_file_alloc(settings_path);
     struct stat removed_state;
     bool removed = (!settings_after || (!strstr(settings_after, "codebase-memory-mcp") &&
@@ -5927,7 +7633,7 @@ TEST(cli_uninstall_preserves_hook_script_with_modified_binary) {
     free(installed);
 
     char *args[] = {"-n"};
-    int uninstall_rc = cbm_cmd_uninstall(1, args);
+    int uninstall_rc = cli_test_cmd_uninstall(1, args);
     char *after = read_test_file_alloc(script_path);
     bool preserved = modified && after && strcmp(after, modified) == 0;
     free(after);
@@ -6320,7 +8026,7 @@ TEST(cli_copilot_uninstall_preserves_foreign_named_manifest) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("COPILOT_HOME");
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(manifest_path);
     bool preserved = after && strcmp(after, foreign) == 0;
 
@@ -6364,7 +8070,7 @@ TEST(cli_copilot_uninstall_preserves_canonical_shaped_foreign_manifest) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("COPILOT_HOME");
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     char *after = read_test_file_alloc(manifest_path);
     bool preserved = after && strcmp(after, foreign) == 0;
 
@@ -6451,7 +8157,7 @@ TEST(cli_vscode_only_installs_copilot_durable_context) {
     const char *modified = "user-modified-vscode-agent\n";
     write_test_file(agent_path, modified);
     char *argv[] = {"uninstall", "--yes"};
-    int rc = cbm_cmd_uninstall(2, argv);
+    int rc = cli_test_cmd_uninstall(2, argv);
     struct stat removed_hook;
     struct stat removed_skill;
     char *preserved = read_test_file_alloc(agent_path);
@@ -6539,7 +8245,7 @@ TEST(cli_lifecycle_hooks_preserve_foreign_substring_commands) {
     free(factory_after_install);
 
     char *argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
     char *qwen_after_uninstall = read_test_file_alloc(qwen_settings);
     char *factory_after_uninstall = read_test_file_alloc(factory_hooks);
     bool qwen_uninstall_preserved = qwen_after_uninstall &&
@@ -6741,6 +8447,14 @@ TEST(cli_installer_rejects_symlinked_agent_roots) {
     snprintf(junie_link, sizeof(junie_link), "%s/.junie", tmpdir);
     if (symlink(qoder_target, qoder_link) != 0 || symlink(junie_target, junie_link) != 0)
         FAIL("symlink failed");
+    /* Root-owned symlinks are deliberately trusted as infrastructure (distro
+     * /home indirection, macOS /tmp) — only root can create them, so they are
+     * outside the attacker model. The contract under test is refusal of
+     * USER-planted links; a root test run (containers) must demote its links
+     * to an unprivileged owner or it would assert against the wrong model. */
+    if (geteuid() == 0 &&
+        (lchown(qoder_link, 65534, 65534) != 0 || lchown(junie_link, 65534, 65534) != 0))
+        FAIL("lchown to unprivileged owner failed");
 
     char qoder_executable[512];
     snprintf(qoder_executable, sizeof(qoder_executable), "%s/qodercli", tmpdir);
@@ -7692,7 +9406,7 @@ TEST(cli_uninstall_removes_claude_hook_scripts) {
     cbm_install_agent_configs(tmpdir, binary, false, false);
 
     char *args[] = {"-n"};
-    int rc = cbm_cmd_uninstall(1, args);
+    int rc = cli_test_cmd_uninstall(1, args);
 #ifdef _WIN32
     const char *const names[] = {
         "cbm-code-discovery-gate.cmd",
@@ -7753,7 +9467,7 @@ TEST(cli_uninstall_preserves_modified_claude_hook_script) {
     const char *sentinel = "#!/bin/sh\necho user-modified-session-hook\n";
     write_test_file(modified_path, sentinel);
     char *args[] = {"-n"};
-    (void)cbm_cmd_uninstall(1, args);
+    (void)cli_test_cmd_uninstall(1, args);
     char *after = read_test_file_alloc(modified_path);
     bool preserved = after && strcmp(after, sentinel) == 0;
     free(after);
@@ -8776,7 +10490,7 @@ TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
     }
 
     char *uninstall_argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = cbm_cmd_uninstall(2, uninstall_argv);
+    int uninstall_rc = cli_test_cmd_uninstall(2, uninstall_argv);
     char *uninstalled_settings = read_test_file_alloc(settings_path);
     yyjson_doc *uninstalled_doc =
         uninstalled_settings ? yyjson_read(uninstalled_settings, strlen(uninstalled_settings), 0)
@@ -8905,7 +10619,7 @@ TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes) {
                            write_test_file(legacy_path, current_scripts[i]) == 0;
     }
     char *uninstall_argv[] = {"uninstall", "--yes"};
-    int uninstall_rc = uninstall_seeded ? cbm_cmd_uninstall(2, uninstall_argv) : -1;
+    int uninstall_rc = uninstall_seeded ? cli_test_cmd_uninstall(2, uninstall_argv) : -1;
     bool all_owned_shapes_removed = uninstall_rc == 0;
     for (size_t i = 0U; i < sizeof(legacy_names) / sizeof(legacy_names[0]); i++) {
         char current_path[768];
@@ -9376,6 +11090,91 @@ TEST(cli_config_get_set) {
     PASS();
 }
 
+typedef struct {
+    cbm_config_t *config;
+    const char *key;
+    const char *expected;
+    atomic_int *phase;
+    bool first_reader;
+    bool completed_handoff;
+    bool value_preserved;
+    uintptr_t storage_address;
+} cli_config_read_thread_t;
+
+static void *cli_config_read_with_handoff(void *opaque) {
+    cli_config_read_thread_t *read = opaque;
+    if (read->first_reader) {
+        const char *value = cbm_config_get(read->config, read->key, NULL);
+        read->storage_address = (uintptr_t)value;
+        atomic_store_explicit(read->phase, 1, memory_order_release);
+        for (int spins = 0;
+             spins < 5000 && atomic_load_explicit(read->phase, memory_order_acquire) < 2; spins++) {
+            cbm_usleep(1000);
+        }
+        read->completed_handoff = atomic_load_explicit(read->phase, memory_order_acquire) == 2;
+        read->value_preserved =
+            read->completed_handoff && value && strcmp(value, read->expected) == 0;
+        return NULL;
+    }
+
+    for (int spins = 0; spins < 5000 && atomic_load_explicit(read->phase, memory_order_acquire) < 1;
+         spins++) {
+        cbm_usleep(1000);
+    }
+    read->completed_handoff = atomic_load_explicit(read->phase, memory_order_acquire) == 1;
+    const char *value = cbm_config_get(read->config, read->key, NULL);
+    read->storage_address = (uintptr_t)value;
+    read->value_preserved = read->completed_handoff && value && strcmp(value, read->expected) == 0;
+    atomic_store_explicit(read->phase, 2, memory_order_release);
+    return NULL;
+}
+
+/* One daemon-owned config store is shared across concurrent session threads.
+ * A later read in one thread must not overwrite a borrowed result that another
+ * live thread is still consuming. */
+TEST(cli_config_get_result_storage_is_per_thread) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-thread-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, "first", "alpha"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, "second", "beta"), 0);
+
+    atomic_int phase;
+    atomic_init(&phase, 0);
+    cli_config_read_thread_t reads[2] = {
+        {.config = cfg, .key = "first", .expected = "alpha", .phase = &phase, .first_reader = true},
+        {.config = cfg, .key = "second", .expected = "beta", .phase = &phase},
+    };
+    cbm_thread_t threads[2];
+    bool started0 = cbm_thread_create(&threads[0], 0, cli_config_read_with_handoff, &reads[0]) == 0;
+    bool started1 = cbm_thread_create(&threads[1], 0, cli_config_read_with_handoff, &reads[1]) == 0;
+    if (started0) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (started1) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+
+    bool separate_storage = reads[0].storage_address != 0 && reads[1].storage_address != 0 &&
+                            reads[0].storage_address != reads[1].storage_address;
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(started0);
+    ASSERT_TRUE(started1);
+    ASSERT_TRUE(reads[0].completed_handoff);
+    ASSERT_TRUE(reads[1].completed_handoff);
+    ASSERT_TRUE(separate_storage);
+    ASSERT_TRUE(reads[0].value_preserved);
+    ASSERT_TRUE(reads[1].value_preserved);
+    PASS();
+}
+
 TEST(cli_config_get_bool) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -9664,8 +11463,6 @@ TEST(cli_print_tool_help_issue680) {
  * algorithm, from a bad macro rename inside the shell string) makes every
  * digest fail, and the caller then falls through and installs unverified.
  * Guard the digest itself against a known vector. */
-extern int cbm_cli_sha256_file(const char *path, char *out, size_t out_size);
-
 /* Hash `content` (len bytes) via a temp file and compare to expected hex.
  * Returns 1 on match, 0 otherwise. */
 static int sha256_vector_ok(const void *content, size_t len, const char *expected) {
@@ -9690,6 +11487,105 @@ static int sha256_vector_ok(const void *content, size_t len, const char *expecte
     return rc == 0 && strcmp(digest, expected) == 0;
 }
 
+static bool cli_checksum_manifest_path(char *path, size_t path_size) {
+    int written = snprintf(path, path_size, "%s/cbm-checksum-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || (size_t)written >= path_size) {
+        return false;
+    }
+    int descriptor = cbm_mkstemp(path);
+    if (descriptor < 0) {
+        return false;
+    }
+    FILE *file = fdopen(descriptor, "wb");
+    if (!file) {
+#ifdef _WIN32
+        (void)_close(descriptor);
+#else
+        (void)close(descriptor);
+#endif
+        (void)cbm_unlink(path);
+        return false;
+    }
+    return fclose(file) == 0;
+}
+
+TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star) {
+    static const char lower_digest[] =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    static const char upper_digest[] =
+        "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+    static const char other_digest[] =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const char *artifact = "codebase-memory-mcp-linux-amd64-portable.tar.gz";
+    char path[512];
+    ASSERT_TRUE(cli_checksum_manifest_path(path, sizeof(path)));
+    char manifest[1024];
+    ASSERT_TRUE(snprintf(manifest, sizeof(manifest), "%s  prefix-%s\n%s *%s\n%s  %s\n",
+                         other_digest, artifact, upper_digest, artifact, lower_digest,
+                         artifact) > 0);
+    ASSERT_EQ(write_test_file(path, manifest), 0);
+
+    char parsed[65] = {0};
+    int status = cbm_cli_checksum_manifest_digest(path, artifact, parsed, sizeof(parsed));
+    (void)cbm_unlink(path);
+
+    ASSERT_EQ(status, 0);
+    ASSERT_STR_EQ(parsed, lower_digest);
+    PASS();
+}
+
+TEST(cli_checksum_manifest_rejects_invalid_missing_and_conflicting_digest) {
+    static const char digest_a[] =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    static const char digest_b[] =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    static const char invalid_digest[] =
+        "za7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const char *artifact = "codebase-memory-mcp-darwin-arm64.tar.gz";
+    char path[512];
+    ASSERT_TRUE(cli_checksum_manifest_path(path, sizeof(path)));
+    char manifest[1024];
+    char parsed[65] = {0};
+
+    ASSERT_TRUE(snprintf(manifest, sizeof(manifest), "%s  prefix-%s\n", digest_a, artifact) > 0);
+    ASSERT_EQ(write_test_file(path, manifest), 0);
+    ASSERT_NEQ(cbm_cli_checksum_manifest_digest(path, artifact, parsed, sizeof(parsed)), 0);
+
+    ASSERT_TRUE(snprintf(manifest, sizeof(manifest), "%s  %s\n", invalid_digest, artifact) > 0);
+    ASSERT_EQ(write_test_file(path, manifest), 0);
+    ASSERT_NEQ(cbm_cli_checksum_manifest_digest(path, artifact, parsed, sizeof(parsed)), 0);
+
+    ASSERT_TRUE(snprintf(manifest, sizeof(manifest), "%s  %s\n%s *%s\n", digest_a, artifact,
+                         digest_b, artifact) > 0);
+    ASSERT_EQ(write_test_file(path, manifest), 0);
+    ASSERT_NEQ(cbm_cli_checksum_manifest_digest(path, artifact, parsed, sizeof(parsed)), 0);
+    (void)cbm_unlink(path);
+    PASS();
+}
+
+TEST(cli_checksum_manifest_rejects_oversized_input) {
+    static const char digest[] = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    const char *artifact = "codebase-memory-mcp-windows-amd64.zip";
+    char path[512];
+    ASSERT_TRUE(cli_checksum_manifest_path(path, sizeof(path)));
+    FILE *manifest = fopen(path, "wb");
+    ASSERT_NOT_NULL(manifest);
+    ASSERT_TRUE(fprintf(manifest, "%s  %s\n", digest, artifact) > 0);
+    unsigned char padding[1024];
+    memset(padding, 'x', sizeof(padding));
+    for (int i = 0; i < 65; i++) {
+        ASSERT_EQ(fwrite(padding, 1, sizeof(padding), manifest), sizeof(padding));
+    }
+    ASSERT_EQ(fclose(manifest), 0);
+
+    char parsed[65] = {0};
+    int status = cbm_cli_checksum_manifest_digest(path, artifact, parsed, sizeof(parsed));
+    (void)cbm_unlink(path);
+
+    ASSERT_NEQ(status, 0);
+    PASS();
+}
+
 /* NIST FIPS 180-4 SHA-256 test vectors: empty input, a single block ("abc"),
  * and a 56-byte input that forces the length padding into a second block. */
 TEST(cli_sha256_file_matches_known_vector) {
@@ -9703,12 +11599,131 @@ TEST(cli_sha256_file_matches_known_vector) {
     PASS();
 }
 
+#ifdef _WIN32
+/* The fail-closed release contract, asserted with the activation seam OFF:
+ * these calls take the exact dispatch a release binary ships (the portable
+ * body is unreachable), so the gates themselves keep direct unit coverage. */
+TEST(cli_windows_release_gates_refuse_portable_mutations) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-portable-refusal-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+    write_test_file(bin_target, "portable refusal must not touch this");
+
+    /* A one-shot portable payload (this test runner has no launcher context)
+     * may never self-mutate a managed surface. */
+    char *uninstall_argv[] = {"--yes"};
+    int uninstall_rc = cbm_cmd_uninstall(1, uninstall_argv);
+    char *update_argv[] = {"--yes"};
+    int update_rc = cbm_cmd_update(1, update_argv);
+
+    const char *installed = read_test_file(bin_target);
+    bool preserved = installed && strcmp(installed, "portable refusal must not touch this") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(uninstall_rc, 1);
+    ASSERT_EQ(update_rc, 1);
+    ASSERT_TRUE(preserved);
+    PASS();
+}
+
+TEST(cli_windows_release_gate_refuses_foreign_install_target) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-foreign-target-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp.exe", bin_dir);
+    write_test_file(bin_target, "foreign binary must be preserved");
+
+    /* An unmanaged file at the canonical launcher path is a conflict the
+     * managed transaction refuses to adopt or replace — even under --force
+     * with prompts auto-answered. */
+    cbm_set_auto_answer_for_test(-1);
+    char *argv[] = {"--force", "-y"};
+    int rc = cbm_cmd_install(2, argv);
+    cbm_set_auto_answer_for_test(0);
+
+    const char *installed = read_test_file(bin_target);
+    bool preserved = installed && strcmp(installed, "foreign binary must be preserved") == 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(preserved);
+    PASS();
+}
+#endif /* _WIN32 */
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Suite definition
  * ═══════════════════════════════════════════════════════════════════ */
 
 SUITE(cli) {
+    RUN_TEST(cli_progress_visibility_policy);
+    RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);
+    RUN_TEST(cli_maintenance_cancellation_forces_failure_status);
+    RUN_TEST(cli_progress_sink_accepts_worker_json_logs);
+    RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
+    RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
+    RUN_TEST(cli_checksum_manifest_rejects_invalid_missing_and_conflicting_digest);
+    RUN_TEST(cli_checksum_manifest_rejects_oversized_input);
+    /* Mandatory daemon activation safety */
+    RUN_TEST(cli_activation_quiesces_active_cohort_before_mutation);
+    RUN_TEST(cli_activation_refuses_when_cohort_does_not_drain);
+    RUN_TEST(cli_activation_refuses_unsafe_cohort_reservation);
+    RUN_TEST(cli_activation_releases_maintenance_lease_after_success);
+    RUN_TEST(cli_activation_releases_maintenance_lease_when_mutation_fails);
+#ifndef _WIN32
+    RUN_TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release);
+    RUN_TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup);
+#endif
+    RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
+    RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
+    RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
+    RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
+    RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
+    RUN_TEST(cli_install_config_and_path_finish_before_guard_release);
+    RUN_TEST(cli_install_config_failure_keeps_published_binary);
+    RUN_TEST(cli_update_download_failure_does_not_quiesce_sessions);
+    RUN_TEST(cli_update_already_current_does_not_quiesce_sessions);
+    RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
+    RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
+    RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
+    RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
+#ifdef _WIN32
+    RUN_TEST(cli_windows_release_gates_refuse_portable_mutations);
+    RUN_TEST(cli_windows_release_gate_refuses_foreign_install_target);
+#endif
+
     /* Version (2 tests — selfupdate_test.go) */
     RUN_TEST(cli_compare_versions);
     RUN_TEST(cli_version_get_set);
@@ -9782,6 +11797,11 @@ SUITE(cli) {
     RUN_TEST(cli_extract_binary_from_targz_not_found);
     RUN_TEST(cli_extract_binary_from_targz_invalid_data);
     RUN_TEST(cli_extract_binary_from_zip);
+    RUN_TEST(cli_extract_windows_release_pair_rejects_incomplete_release_namespace);
+    RUN_TEST(cli_extract_windows_release_pair_accepts_official_release_namespace);
+    RUN_TEST(cli_extract_windows_release_pair_rejects_unknown_release_member);
+    RUN_TEST(cli_extract_windows_release_pair_rejects_aliases_and_duplicates);
+    RUN_TEST(cli_extract_windows_release_pair_rejects_local_central_mismatch);
     RUN_TEST(cli_extract_binary_from_zip_not_found);
     RUN_TEST(cli_extract_binary_from_zip_path_traversal);
     RUN_TEST(cli_extract_binary_from_zip_invalid);
@@ -9981,9 +12001,10 @@ SUITE(cli) {
     /* Skill directive descriptions (1 test — group E) */
     RUN_TEST(cli_skill_descriptions_directive);
 
-    /* Config store (6 tests — group F) */
+    /* Config store (7 tests — group F) */
     RUN_TEST(cli_config_open_close);
     RUN_TEST(cli_config_get_set);
+    RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_delete);

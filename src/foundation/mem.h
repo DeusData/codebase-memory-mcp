@@ -21,6 +21,11 @@ double cbm_mem_ram_fraction_for_total(size_t total_ram_bytes);
  * Configures mimalloc options for reduced upfront memory. */
 void cbm_mem_init(double ram_fraction);
 
+/* Worker-only initialization cap carried on the build-bound internal argv.
+ * The existing user override is still resolved first; a lower explicit
+ * CBM_MEM_BUDGET_MB wins, while a larger/default budget is capped. */
+void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes);
+
 /* Result of cbm_mem_resolve_budget: the resolved budget plus the metadata
  * cbm_mem_init logs — so the parse/clamp logic lives in exactly ONE place and
  * the caller never re-parses the env string. */
@@ -29,6 +34,7 @@ typedef struct {
     const char *source; /* log token: "ram_fraction" | "CBM_MEM_BUDGET_MB" */
     bool clamped;       /* override was valid but exceeded total_ram → clamped down */
     bool invalid;       /* override was present but unparseable / out-of-range / ≤0 */
+    bool hard_capped;   /* internal worker hard cap reduced the resolved budget */
 } cbm_mem_budget_t;
 
 /* Pure budget resolver shared by cbm_mem_init (exposed for testing).
@@ -39,6 +45,10 @@ typedef struct {
  * fall back to the fraction-derived value. Reads no globals/env. */
 cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
                                         const char *budget_mb);
+
+/* Pure capped variant used by supervised workers and deterministic tests. */
+cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
+                                               const char *budget_mb, size_t hard_cap_bytes);
 
 /* Current RSS in bytes via mi_process_info().
  * Falls back to OS-specific queries when MI_OVERRIDE=0 (ASan builds). */

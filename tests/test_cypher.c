@@ -5,8 +5,11 @@
  * Covers lexer, parser, and end-to-end execution.
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
 #include <cypher/cypher.h>
 #include <store/store.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1584,6 +1587,116 @@ TEST(cypher_edge_prop_access) {
     PASS();
 }
 
+typedef struct {
+    atomic_int *ready;
+    atomic_int *start;
+    bool succeeded;
+} cypher_edge_thread_ctx_t;
+
+static void *cypher_edge_props_concurrently(void *opaque) {
+    cypher_edge_thread_ctx_t *ctx = opaque;
+    cbm_store_t *store = setup_cypher_http_store();
+    if (!store) {
+        return NULL;
+    }
+
+    /* Keep projection busy after the store scan has completed.  A single-edge
+     * query can be incidentally ordered by SQLite's internal mutexes, masking
+     * the independent Cypher scratch-buffer race from TSan. */
+    cbm_node_t source = {.project = "test",
+                         .label = "Function",
+                         .name = "HandleOrder",
+                         .qualified_name = "test.main.HandleOrder",
+                         .file_path = "main.go",
+                         .start_line = 10,
+                         .end_line = 30};
+    int64_t source_id = cbm_store_upsert_node(store, &source);
+    for (int i = 0; i < 256; i++) {
+        char name[64];
+        char qualified_name[96];
+        snprintf(name, sizeof(name), "ConcurrentTarget%d", i);
+        snprintf(qualified_name, sizeof(qualified_name), "test.concurrent.%s", name);
+        cbm_node_t target = {.project = "test",
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qualified_name,
+                             .file_path = "concurrent.go"};
+        int64_t target_id = cbm_store_upsert_node(store, &target);
+        cbm_edge_t edge = {
+            .project = "test",
+            .source_id = source_id,
+            .target_id = target_id,
+            .type = "HTTP_CALLS",
+            .properties_json =
+                "{\"url_path\":\"/api/orders\",\"confidence\":0.85,\"method\":\"POST\"}"};
+        if (source_id < 0 || target_id < 0 || cbm_store_insert_edge(store, &edge) < 0) {
+            cbm_store_close(store);
+            return NULL;
+        }
+    }
+
+    atomic_fetch_add_explicit(ctx->ready, 1, memory_order_release);
+    while (atomic_load_explicit(ctx->start, memory_order_acquire) == 0) {
+        cbm_usleep(1000);
+    }
+    ctx->succeeded = true;
+    for (int i = 0; i < 128; i++) {
+        cbm_cypher_result_t result = {0};
+        int rc = cbm_cypher_execute(store,
+                                    "MATCH (a:Function)-[r:HTTP_CALLS]->(b:Function) "
+                                    "RETURN r.url_path, r.confidence, r.method",
+                                    "test", 0, &result);
+        if (rc != 0 || result.row_count != 257 ||
+            strcmp(cypher_get_col(&result, 0, "r.url_path"), "/api/orders") != 0 ||
+            strcmp(cypher_get_col(&result, 0, "r.confidence"), "0.85") != 0 ||
+            strcmp(cypher_get_col(&result, 0, "r.method"), "POST") != 0) {
+            ctx->succeeded = false;
+        }
+        cbm_cypher_result_free(&result);
+        if (!ctx->succeeded) {
+            break;
+        }
+    }
+    cbm_store_close(store);
+    return NULL;
+}
+
+/* Daemon sessions execute independent graph queries concurrently. TSan must
+ * see no shared rotating edge-property scratch buffer between those threads. */
+TEST(cypher_edge_prop_storage_is_per_thread) {
+    atomic_int ready;
+    atomic_int start;
+    atomic_init(&ready, 0);
+    atomic_init(&start, 0);
+    cypher_edge_thread_ctx_t ctx[2] = {
+        {.ready = &ready, .start = &start},
+        {.ready = &ready, .start = &start},
+    };
+    cbm_thread_t threads[2];
+    bool started0 = cbm_thread_create(&threads[0], 0, cypher_edge_props_concurrently, &ctx[0]) == 0;
+    bool started1 = cbm_thread_create(&threads[1], 0, cypher_edge_props_concurrently, &ctx[1]) == 0;
+    for (int spins = 0; started0 && started1 && spins < 5000 &&
+                        atomic_load_explicit(&ready, memory_order_acquire) < 2;
+         spins++) {
+        cbm_usleep(1000);
+    }
+    bool both_ready = atomic_load_explicit(&ready, memory_order_acquire) == 2;
+    atomic_store_explicit(&start, 1, memory_order_release);
+    if (started0) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (started1) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+
+    ASSERT_TRUE(started0);
+    ASSERT_TRUE(started1);
+    ASSERT_TRUE(both_ready);
+    ASSERT_TRUE(ctx[0].succeeded);
+    ASSERT_TRUE(ctx[1].succeeded);
+    PASS();
+}
+
 TEST(cypher_edge_prop_in_where) {
     cbm_store_t *s = setup_cypher_http_store();
     cbm_cypher_result_t r = {0};
@@ -3135,6 +3248,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_where_numeric);
     /* Edge property tests (ported from cypher_test.go Feature 2) */
     RUN_TEST(cypher_edge_prop_access);
+    RUN_TEST(cypher_edge_prop_storage_is_per_thread);
     RUN_TEST(cypher_edge_prop_in_where);
     RUN_TEST(cypher_edge_type_prop);
     RUN_TEST(cypher_edge_filter_contains);

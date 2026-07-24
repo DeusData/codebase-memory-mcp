@@ -5,10 +5,13 @@
  * proximity, diffuse, corpus lifecycle, get_config.
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_thread.h"
 #include <semantic/rotsq.h>
 #include <semantic/semantic.h>
 
 #include <math.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -21,7 +24,8 @@ TEST(sem_tokenize_camel) {
     ASSERT_STR_EQ(tokens[0], "parse");
     ASSERT_STR_EQ(tokens[1], "user");
     ASSERT_STR_EQ(tokens[2], "input");
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
@@ -32,7 +36,8 @@ TEST(sem_tokenize_snake) {
     ASSERT_STR_EQ(tokens[0], "handle");
     ASSERT_STR_EQ(tokens[1], "http");
     ASSERT_STR_EQ(tokens[2], "request");
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
@@ -43,7 +48,8 @@ TEST(sem_tokenize_dot) {
     ASSERT_STR_EQ(tokens[0], "net");
     ASSERT_STR_EQ(tokens[1], "http");
     ASSERT_STR_EQ(tokens[2], "client");
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
@@ -57,7 +63,8 @@ TEST(sem_tokenize_max_out) {
     char *tokens[3];
     int n = cbm_sem_tokenize("a_b_c_d_e_f_g", tokens, 3);
     ASSERT_EQ(n, 3);
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
@@ -68,20 +75,26 @@ TEST(sem_tokenize_abbrev_expansion) {
     ASSERT_GTE(n, 4);
     bool has_ctx = false, has_context = false, has_err = false, has_error = false;
     for (int i = 0; i < n; i++) {
-        if (strcmp(tokens[i], "ctx") == 0) has_ctx = true;
-        if (strcmp(tokens[i], "context") == 0) has_context = true;
-        if (strcmp(tokens[i], "err") == 0) has_err = true;
-        if (strcmp(tokens[i], "error") == 0) has_error = true;
+        if (strcmp(tokens[i], "ctx") == 0)
+            has_ctx = true;
+        if (strcmp(tokens[i], "context") == 0)
+            has_context = true;
+        if (strcmp(tokens[i], "err") == 0)
+            has_err = true;
+        if (strcmp(tokens[i], "error") == 0)
+            has_error = true;
     }
     ASSERT_TRUE(has_ctx && has_context && has_err && has_error);
-    for (int i = 0; i < n; i++) free(tokens[i]);
+    for (int i = 0; i < n; i++)
+        free(tokens[i]);
     PASS();
 }
 
 /* ── Cosine similarity ───────────────────────────────────────────── */
 
 static void fill_vec(cbm_sem_vec_t *v, float val) {
-    for (int i = 0; i < CBM_SEM_DIM; i++) v->v[i] = val;
+    for (int i = 0; i < CBM_SEM_DIM; i++)
+        v->v[i] = val;
 }
 
 TEST(sem_cosine_identical) {
@@ -145,7 +158,8 @@ TEST(sem_normalize_scales) {
     fill_vec(&v, 2.0f);
     cbm_sem_normalize(&v);
     float mag_sq = 0.0f;
-    for (int i = 0; i < CBM_SEM_DIM; i++) mag_sq += v.v[i] * v.v[i];
+    for (int i = 0; i < CBM_SEM_DIM; i++)
+        mag_sq += v.v[i] * v.v[i];
     float mag = sqrtf(mag_sq);
     ASSERT_FLOAT_EQ(mag, 1.0f, 0.01f);
     PASS();
@@ -180,8 +194,8 @@ TEST(sem_vec_add_scaled_basic) {
 TEST(sem_vec_add_scaled_null) {
     cbm_sem_vec_t v;
     fill_vec(&v, 1.0f);
-    cbm_sem_vec_add_scaled(NULL, &v, 1.0f);  /* should not crash */
-    cbm_sem_vec_add_scaled(&v, NULL, 1.0f);  /* should not crash */
+    cbm_sem_vec_add_scaled(NULL, &v, 1.0f); /* should not crash */
+    cbm_sem_vec_add_scaled(&v, NULL, 1.0f); /* should not crash */
     PASS();
 }
 
@@ -267,7 +281,8 @@ TEST(sem_diffuse_single_neighbor) {
     cbm_sem_diffuse(&v, &nb, 1, 0.3f);
     /* After diffuse+normalize, result should still be unit-length */
     float mag_sq = 0.0f;
-    for (int i = 0; i < CBM_SEM_DIM; i++) mag_sq += v.v[i] * v.v[i];
+    for (int i = 0; i < CBM_SEM_DIM; i++)
+        mag_sq += v.v[i] * v.v[i];
     ASSERT_FLOAT_EQ(sqrtf(mag_sq), 1.0f, 0.01f);
     /* Component 0 should be pulled toward neighbor's strong dim-0 */
     ASSERT_TRUE(v.v[0] > 0.0f);
@@ -341,6 +356,63 @@ TEST(sem_get_config_defaults) {
 
 /* ── RaBitQ estimator quality (from-paper 4-bit quantization) ────── */
 
+typedef struct {
+    atomic_int *ready;
+    atomic_int *start;
+    float value;
+    cbm_rsq_code_t code;
+} rotsq_thread_ctx_t;
+
+static void *rotsq_concurrent_first_encode(void *opaque) {
+    rotsq_thread_ctx_t *ctx = opaque;
+    float vec[CBM_RSQ_IN_DIM];
+    for (int i = 0; i < CBM_RSQ_IN_DIM; i++) {
+        vec[i] = ctx->value + (float)i / (float)CBM_RSQ_IN_DIM;
+    }
+    atomic_fetch_add_explicit(ctx->ready, 1, memory_order_release);
+    while (atomic_load_explicit(ctx->start, memory_order_acquire) == 0) {
+        cbm_usleep(1000);
+    }
+    cbm_rsq_encode(vec, &ctx->code);
+    return NULL;
+}
+
+/* The daemon can initialize semantic encoders from multiple request threads.
+ * Run this first so ThreadSanitizer observes the one-time initialization. */
+TEST(sem_rotsq_concurrent_first_encode) {
+    atomic_int ready;
+    atomic_int start;
+    atomic_init(&ready, 0);
+    atomic_init(&start, 0);
+    rotsq_thread_ctx_t ctx[2] = {
+        {.ready = &ready, .start = &start, .value = 0.25F},
+        {.ready = &ready, .start = &start, .value = -0.5F},
+    };
+    cbm_thread_t threads[2];
+    bool started0 = cbm_thread_create(&threads[0], 0, rotsq_concurrent_first_encode, &ctx[0]) == 0;
+    bool started1 = cbm_thread_create(&threads[1], 0, rotsq_concurrent_first_encode, &ctx[1]) == 0;
+    for (int spins = 0; started0 && started1 && spins < 5000 &&
+                        atomic_load_explicit(&ready, memory_order_acquire) < 2;
+         spins++) {
+        cbm_usleep(1000);
+    }
+    bool both_ready = atomic_load_explicit(&ready, memory_order_acquire) == 2;
+    atomic_store_explicit(&start, 1, memory_order_release);
+    if (started0) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (started1) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+
+    ASSERT_TRUE(started0);
+    ASSERT_TRUE(started1);
+    ASSERT_TRUE(both_ready);
+    ASSERT_TRUE(ctx[0].code.scale > 0.0F);
+    ASSERT_TRUE(ctx[1].code.scale > 0.0F);
+    PASS();
+}
+
 /* Deterministic pseudo-random unit vectors; validates that the quantized
  * inner-product estimator tracks the exact float IP within tight bounds.
  * These bounds gate the semantic pass's use of the codes: cosine scores are
@@ -400,6 +472,7 @@ TEST(sem_rotsq_ip_error_bounds) {
 /* ── Suite ───────────────────────────────────────────────────────── */
 
 SUITE(semantic) {
+    RUN_TEST(sem_rotsq_concurrent_first_encode);
     RUN_TEST(sem_rotsq_ip_error_bounds);
     RUN_TEST(sem_tokenize_camel);
     RUN_TEST(sem_tokenize_snake);

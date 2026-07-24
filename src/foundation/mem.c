@@ -134,6 +134,7 @@ cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
         .source = "ram_fraction",
         .clamped = false,
         .invalid = false,
+        .hard_capped = false,
     };
 
     if (budget_mb == NULL || budget_mb[0] == '\0') {
@@ -173,7 +174,18 @@ cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
     return result;
 }
 
-void cbm_mem_init(double ram_fraction) {
+cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
+                                               const char *budget_mb, size_t hard_cap_bytes) {
+    cbm_mem_budget_t result = cbm_mem_resolve_budget(total_ram, ram_fraction, budget_mb);
+    if (hard_cap_bytes > 0 && (result.budget == 0 || result.budget > hard_cap_bytes)) {
+        result.budget = hard_cap_bytes;
+        result.source = "daemon_worker_cap";
+        result.hard_capped = true;
+    }
+    return result;
+}
+
+void cbm_mem_init_with_cap(double ram_fraction, size_t hard_cap_bytes) {
     int expected = 0;
     if (!atomic_compare_exchange_strong(&g_initialized, &expected, 1)) {
         return;
@@ -210,7 +222,8 @@ void cbm_mem_init(double ram_fraction) {
 
     char env_buf[CBM_SZ_32];
     const char *env = cbm_safe_getenv("CBM_MEM_BUDGET_MB", env_buf, sizeof(env_buf), NULL);
-    cbm_mem_budget_t resolved = cbm_mem_resolve_budget(info.total_ram, ram_fraction, env);
+    cbm_mem_budget_t resolved =
+        cbm_mem_resolve_budget_capped(info.total_ram, ram_fraction, env, hard_cap_bytes);
     g_budget = resolved.budget;
 
     /* The resolver is the single source of truth for the parse + clamp; this
@@ -222,6 +235,11 @@ void cbm_mem_init(double ram_fraction) {
         snprintf(cap_mb, sizeof(cap_mb), "%zu", info.total_ram / MB_DIVISOR);
         cbm_log_warn("mem.budget.clamped", "requested_mb", env, "cap_mb", cap_mb);
     }
+    if (resolved.hard_capped) {
+        char cap_bytes[CBM_SZ_32];
+        snprintf(cap_bytes, sizeof(cap_bytes), "%zu", hard_cap_bytes);
+        cbm_log_info("mem.budget.worker_cap", "cap_bytes", cap_bytes);
+    }
 
     char budget_mb[CBM_SZ_32];
     char ram_mb[CBM_SZ_32];
@@ -229,6 +247,10 @@ void cbm_mem_init(double ram_fraction) {
     snprintf(ram_mb, sizeof(ram_mb), "%zu", info.total_ram / MB_DIVISOR);
     cbm_log_info("mem.init", "budget_mb", budget_mb, "total_ram_mb", ram_mb, "source",
                  resolved.source);
+}
+
+void cbm_mem_init(double ram_fraction) {
+    cbm_mem_init_with_cap(ram_fraction, 0);
 }
 
 size_t cbm_mem_rss(void) {
