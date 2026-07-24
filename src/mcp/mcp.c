@@ -3158,8 +3158,8 @@ static char *cbm_mcp_tools_list_range(cbm_mcp_server_t *srv, int offset, int lim
                 "Resources: codebase://schema (labels, edge types, Cypher examples), "
                 "codebase://architecture (key functions, graph overview), "
                 "codebase://status (index state: ready/indexing/not_indexed/empty).");
-        /* inputSchema MUST be a JSON object, not a string — Claude Code rejects
-         * the entire tools/list if any tool has a string inputSchema. */
+            /* inputSchema MUST be a JSON object, not a string — Claude Code rejects
+             * the entire tools/list if any tool has a string inputSchema. */
             yyjson_mut_val *hint_schema = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_str(doc, hint_schema, "type", "object");
             yyjson_mut_val *hint_props = yyjson_mut_obj(doc);
