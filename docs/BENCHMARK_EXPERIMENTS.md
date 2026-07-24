@@ -316,12 +316,15 @@ handler recognition, and requires server processes and reader threads to be reap
 These probes establish discovery and dispatch parity; functional quality claims
 must still come from the capability fixtures and repository workloads below.
 
-The optional graph-pass ablation retains the benchmark default
-`auto_index_deps=false` and is:
+The minimal-indexing ablation disables every optional graph cost center and retains
+`auto_index_deps=false`:
 
 ```text
---config-profile optional_graph_disabled
+--config-profile minimal_indexing
 ```
+
+`optional_graph_disabled` is accepted only when loading retained plans and resolves
+to this same manifest. Do not use the retired spelling in new plans.
 
 The immediate semantic/similarity freshness profile is:
 

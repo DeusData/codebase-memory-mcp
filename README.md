@@ -382,7 +382,7 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with its tools listed (a streamlined subset by default; set `CBM_TOOL_MODE=classic` for all 15).
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with its tools listed (a streamlined subset by default; set `CBM_TOOL_MODE=classic` for all 16).
 
 </details>
 

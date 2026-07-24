@@ -530,11 +530,11 @@ static char *mcp_tools_list_classic_snapshot(void) {
 }
 
 TEST(mcp_tools_list_classic_mode) {
-    /* Classic mode (CBM_TOOL_MODE=classic) emits the original 15 split tools,
-     * not the streamlined consolidated set. The env var is read at call time
-     * (src/mcp/mcp.c:870), so set it, capture the list, then unset it BEFORE any
-     * ASSERT — a failed assert must not leak the classic setting into sibling
-     * tests (which expect the streamlined default). */
+    /* Classic mode (CBM_TOOL_MODE=classic) emits the 16 canonical tools,
+     * not the streamlined consolidated set. The env var is read at call time,
+     * so set it, capture the list, then unset it BEFORE any ASSERT — a failed
+     * assert must not leak the classic setting into sibling tests (which expect
+     * the streamlined default). */
     char *json = mcp_tools_list_classic_snapshot();
     ASSERT_NOT_NULL(json);
     /* Classic split tools are present (TOOLS[] in mcp.c). */
