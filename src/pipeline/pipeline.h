@@ -377,6 +377,7 @@ bool cbm_perl_is_builtin(const char *name);
 /* True for registry strategies that are only weak short-name guesses. Strong
  * same-module and import-map matches return false. */
 bool cbm_registry_strategy_is_weak_short_name(const char *strategy);
+bool cbm_registry_strategy_is_import_map(const char *strategy);
 
 /* Decide whether a resolved Perl call edge is generic-resolver noise to drop
  * (#476): true only for Perl, only for a builtin/method call, and only when the

@@ -680,6 +680,11 @@ char *cbm_pipeline_import_edge_local_name_dup(const cbm_gbuf_edge_t *edge);
 int cbm_pipeline_build_import_map_from_edges(const cbm_gbuf_t *gbuf, const char *project_name,
                                              const char *rel_path, const char ***out_keys,
                                              const char ***out_vals, int *out_count);
+bool cbm_pipeline_import_map_entry_is_reexport(const cbm_gbuf_t *gbuf,
+                                               const char *project_name,
+                                               const char *rel_path,
+                                               const char *local_name,
+                                               const char *resolved_qn);
 void cbm_pipeline_free_import_map(const char **keys, const char **vals, int count);
 
 /* Build a store-level per-file delta descriptor from graph-buffer facts.

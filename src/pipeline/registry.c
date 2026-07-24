@@ -412,11 +412,16 @@ bool cbm_registry_strategy_is_weak_short_name(const char *strategy) {
     if (!strategy || !strategy[0]) {
         return false;
     }
-    if (strcmp(strategy, "same_module") == 0 || strcmp(strategy, "import_map") == 0 ||
+    if (strcmp(strategy, "same_module") == 0 ||
+        cbm_registry_strategy_is_import_map(strategy) ||
         strcmp(strategy, "import_map_suffix") == 0) {
         return false;
     }
     return true;
+}
+
+bool cbm_registry_strategy_is_import_map(const char *strategy) {
+    return strategy && strcmp(strategy, "import_map") == 0;
 }
 
 /* TS/JS analogue of the Perl guard above (#592/#606 direction; precedent #477).

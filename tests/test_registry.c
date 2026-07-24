@@ -832,6 +832,14 @@ TEST(tsjs_suppress_drops_weak_method_matches) {
     PASS();
 }
 
+TEST(registry_strategy_identifies_direct_import_map) {
+    ASSERT_TRUE(cbm_registry_strategy_is_import_map("import_map"));
+    ASSERT_FALSE(cbm_registry_strategy_is_import_map("import_map_suffix"));
+    ASSERT_FALSE(cbm_registry_strategy_is_import_map("same_module"));
+    ASSERT_FALSE(cbm_registry_strategy_is_import_map(NULL));
+    PASS();
+}
+
 TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
     /* Keep every receiver-/import-aware strategy. Because the PARALLEL resolver
      * runs lsp_* strategies through this same guard variable, an explicit
@@ -979,5 +987,6 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
+    RUN_TEST(registry_strategy_identifies_direct_import_map);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
 }

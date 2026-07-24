@@ -13,6 +13,7 @@
 #include "graph_buffer/graph_buffer.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pipeline.h"
+#include "cli/cli.h"
 #include "store/store.h"
 #include "foundation/compat.h"
 
@@ -1115,8 +1116,15 @@ TEST(pipeline_minhash_incremental_new_clone) {
         "}\n");
 
     /* Step 3: Reindex (will be incremental if DB exists, or full) */
+    cbm_config_t *cfg = cbm_config_open(g_sim_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(
+                  cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                  CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
     cbm_pipeline_t *p2 = cbm_pipeline_new(g_sim_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
+    cbm_pipeline_apply_config(p2, cfg);
     rc = cbm_pipeline_run(p2);
     ASSERT_EQ(rc, 0);
 
@@ -1131,6 +1139,7 @@ TEST(pipeline_minhash_incremental_new_clone) {
     }
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
+    cbm_config_close(cfg);
 
     teardown_sim_test_repo();
     PASS();
