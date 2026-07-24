@@ -492,6 +492,60 @@ TEST(cypher_exec_match_all_functions) {
     PASS();
 }
 
+/* Regression: an OPTIONAL MATCH whose label matches zero nodes drove
+ * cross_join_nodes with extra_count == 0. The old allocation
+ * (bind_count * 0 + 1) reserved a single binding slot, but the OPTIONAL
+ * fallback then wrote one binding per existing row — a heap buffer overflow
+ * once the first MATCH bound more than one node (ASan: heap-buffer-overflow).
+ * (The same function also used a plain-int bind_count*extra_count product,
+ * which wraps to a tiny malloc on large graphs; the count is now computed and
+ * bounds-checked in size_t by cbm_cypher_cross_join_alloc — exercised at its
+ * arithmetic boundary by cypher_cross_join_alloc_rejects_overflow below.)
+ * The query text is agent-controlled via the MCP query tool. */
+TEST(cypher_exec_optional_empty_label_no_overflow) {
+    cbm_store_t *s = setup_cypher_store(); /* 4 Function nodes */
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a:Function) OPTIONAL MATCH (b:NoSuchLabel) RETURN a.name", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    /* One row per Function, each with b left unbound (dead-code semantics). */
+    ASSERT_EQ(r.row_count, 4);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Arithmetic-boundary companion to the zero-label overflow above: the node
+ * cross-join sizes its buffer from bind_count * extra_count. As a plain int that
+ * product wraps past INT_MAX to a negative/garbage malloc size (the large-graph
+ * #627 failure mode). cbm_cypher_cross_join_alloc now computes it in size_t and
+ * rejects a count that would not fit the int binding counter or overflow the
+ * byte size. Tested directly so the boundary is exercised without allocating
+ * billions of bindings. */
+TEST(cypher_cross_join_alloc_rejects_overflow) {
+    size_t n = 0;
+
+    /* 46341 * 46341 = 2147488281 > INT_MAX (2147483647): pre-fix the int product
+     * wrapped negative -> tiny malloc -> heap OOB. Now rejected. */
+    ASSERT_TRUE(cbm_cypher_cross_join_alloc(46341, 46341, false, &n) != 0);
+
+    /* A normal join still succeeds: bind_count * extra_count + 1 slots. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(4, 3, false, &n), 0);
+    ASSERT_EQ(n, (size_t)13);
+
+    /* OPTIONAL with no extra nodes reserves one fallback row per binding + 1. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(4, 0, true, &n), 0);
+    ASSERT_EQ(n, (size_t)5);
+
+    /* Non-OPTIONAL with no extra nodes: just the sentinel slot. */
+    ASSERT_EQ(cbm_cypher_cross_join_alloc(4, 0, false, &n), 0);
+    ASSERT_EQ(n, (size_t)1);
+
+    PASS();
+}
+
 TEST(cypher_exec_where_eq) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -3193,6 +3247,8 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_deadline_aborts_runaway_query_issue601);
     RUN_TEST(cypher_exec_deadline_allows_normal_query_issue601);
     RUN_TEST(cypher_exec_match_all_functions);
+    RUN_TEST(cypher_exec_optional_empty_label_no_overflow);
+    RUN_TEST(cypher_cross_join_alloc_rejects_overflow);
     RUN_TEST(cypher_issue240_labels_function);
     RUN_TEST(cypher_issue237_distinct_order_limit);
     RUN_TEST(cypher_issue873_distinct_order_limit_dedupes_before_limit);

@@ -36,6 +36,7 @@ enum {
 #define CYP_DBL_MAX 1e308
 
 #include <ctype.h>
+#include <limits.h> // INT_MAX
 #include "foundation/compat_regex.h"
 #include <stddef.h>
 #include <stdint.h> // int64_t
@@ -4401,19 +4402,53 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
     }
 }
 
-/* Cross-join node-only pattern into existing bindings */
-static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
-                             int extra_count, const char *nvar, bool opt) {
-    binding_t *new_bindings = malloc(((*bind_count * extra_count) + SKIP_ONE) * sizeof(binding_t));
-    int new_count = 0;
+/* Worst-case binding_t slot count for a node cross-join: one row per
+ * (existing binding × extra node), plus — for an OPTIONAL join with no extra
+ * nodes — one fallback row per existing binding, plus a trailing sentinel slot.
+ *
+ * The plain-int product bind_count * extra_count overflows to a negative/garbage
+ * malloc size on large graphs (the failure mode fixed for cross_join_with_rels),
+ * so the count is computed in size_t and rejected if it would not fit the int
+ * binding counter or would overflow the size_t byte size. Returns 0 and writes
+ * *out_n on success, CBM_NOT_FOUND on overflow. Non-static so the arithmetic
+ * boundary can be unit-tested directly. */
+int cbm_cypher_cross_join_alloc(int bind_count, int extra_count, bool opt, size_t *out_n) {
+    size_t per_binding = extra_count > 0 ? (size_t)extra_count : (opt ? (size_t)SKIP_ONE : 0U);
+    size_t rows = (size_t)bind_count * per_binding;
+    if (rows > (size_t)INT_MAX) {
+        return CBM_NOT_FOUND; /* new_count would not fit the int binding counter */
+    }
+    size_t n = rows + SKIP_ONE;
+    if (n > SIZE_MAX / sizeof(binding_t)) {
+        return CBM_NOT_FOUND; /* alloc_n * sizeof(binding_t) would overflow size_t */
+    }
+    *out_n = n;
+    return 0;
+}
+
+/* Cross-join node-only pattern into existing bindings. Returns 0 on success,
+ * CBM_NOT_FOUND when the allocation is refused (overflow) or fails (OOM); the
+ * caller propagates that as a query error rather than silently skipping the
+ * MATCH, which would return a wrong (short) result. */
+static int cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *extra_nodes,
+                            int extra_count, const char *nvar, bool opt) {
+    size_t alloc_n = 0;
+    if (cbm_cypher_cross_join_alloc(*bind_count, extra_count, opt, &alloc_n) != 0) {
+        return CBM_NOT_FOUND; /* product overflows int/size_t: fail the query */
+    }
+    binding_t *new_bindings = malloc(alloc_n * sizeof(binding_t));
+    if (!new_bindings) {
+        return CBM_NOT_FOUND; /* OOM: propagate, don't silently skip the MATCH */
+    }
+    size_t new_count = 0;
     for (int bi = 0; bi < *bind_count; bi++) {
-        for (int ni = 0; ni < extra_count; ni++) {
+        for (int ni = 0; ni < extra_count && new_count < alloc_n; ni++) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
             new_bindings[new_count++] = nb;
         }
-        if (opt && extra_count == 0) {
+        if (opt && extra_count == 0 && new_count < alloc_n) {
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             new_bindings[new_count++] = nb;
@@ -4424,7 +4459,8 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
     }
     free(*bindings);
     *bindings = new_bindings;
-    *bind_count = new_count;
+    *bind_count = (int)new_count; /* new_count <= INT_MAX, guaranteed above */
+    return 0;
 }
 
 /* Cross-join pattern-with-rels into existing bindings */
@@ -4563,9 +4599,9 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
 }
 
 /* Expand additional MATCH patterns (pi >= 1) */
-static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
-                                       int max_rows, binding_t **bindings, int *bind_count,
-                                       int *bind_cap) {
+static int expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const char *project,
+                                      int max_rows, binding_t **bindings, int *bind_count,
+                                      int *bind_cap) {
     for (int pi = SKIP_ONE; pi < q->pattern_count; pi++) {
         cbm_pattern_t *patn = &q->patterns[pi];
         bool opt = q->pattern_optional[pi];
@@ -4594,14 +4630,19 @@ static void expand_additional_patterns(cbm_store_t *store, cbm_query_t *q, const
         cbm_node_t *extra_nodes = NULL;
         int extra_count = 0;
         scan_pattern_nodes(store, project, max_rows, &patn->nodes[0], &extra_nodes, &extra_count);
+        int rc = 0;
         if (patn->rel_count == 0) {
-            cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
+            rc = cross_join_nodes(bindings, bind_count, extra_nodes, extra_count, nvar, opt);
         } else {
             cross_join_with_rels(store, patn, bindings, bind_count, extra_nodes, extra_count, nvar,
                                  opt);
         }
         cbm_store_free_nodes(extra_nodes, extra_count);
+        if (rc != 0) {
+            return rc; /* allocation refused/failed: propagate as a query error */
+        }
     }
+    return 0;
 }
 
 /* Project RETURN clause results */
@@ -4668,7 +4709,15 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
                         q->pattern_optional[0]);
 
     /* Step 2b: Additional patterns */
-    expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count, &bind_cap);
+    if (expand_additional_patterns(store, q, project, max_rows, &bindings, &bind_count,
+                                   &bind_cap) != 0) {
+        for (int bi = 0; bi < bind_count; bi++) {
+            binding_free(&bindings[bi]);
+        }
+        free(bindings);
+        cbm_store_free_nodes(scanned, scan_count);
+        return CBM_NOT_FOUND; /* cross-join allocation refused/failed */
+    }
 
     /* Step 3: Late WHERE */
     if (q->where && (pat0->rel_count > 0 || q->pattern_count > SKIP_ONE)) {
@@ -4713,9 +4762,10 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     }
 
     result_builder_t rb = {0};
-    // cppcheck-suppress knownConditionTrueFalse
     if (execute_single(store, q, project, max_rows, &rb) < 0) {
+        rb_free(&rb);
         cbm_query_free(q);
+        out->error = heap_strdup("query aborted: out of memory or an allocation limit was reached");
         return CBM_NOT_FOUND;
     }
 
@@ -4723,11 +4773,12 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     cbm_query_t *uq = q->union_next;
     while (uq) {
         result_builder_t rb2 = {0};
-        // cppcheck-suppress knownConditionTrueFalse
         if (execute_single(store, uq, project, max_rows, &rb2) < 0) {
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
+            out->error =
+                heap_strdup("query aborted: out of memory or an allocation limit was reached");
             return CBM_NOT_FOUND;
         }
         /* Concatenate rows from rb2 into rb */
