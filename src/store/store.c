@@ -23,6 +23,7 @@ enum {
     ST_COL_7 = 7,
     ST_COL_8 = 8,
     ST_COL_9 = 9,
+    ST_COL_10 = 10,
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
@@ -61,6 +62,8 @@ enum {
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
     ST_HANDLER_PROP_LEN = 9,
+    ST_BFS_CTE_ROW_MULTIPLIER = 8,
+    ST_BFS_MAX_CTE_ROWS = 4096,
 };
 
 #define SLEN(s) (sizeof(s) - 1)
@@ -3908,8 +3911,21 @@ static void bfs_build_types_clause(int edge_type_count, char *buf, int buf_sz) {
     }
 }
 
-int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
-                  int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out) {
+static int bfs_cte_row_limit(int max_results) {
+    int result_budget = max_results > 0 ? max_results : ST_INIT_CAP_16;
+    long row_budget = (long)result_budget * ST_BFS_CTE_ROW_MULTIPLIER + SKIP_ONE;
+    if (row_budget > ST_BFS_MAX_CTE_ROWS) {
+        return ST_BFS_MAX_CTE_ROWS;
+    }
+    if (row_budget < ST_INIT_CAP_16) {
+        return ST_INIT_CAP_16;
+    }
+    return (int)row_budget;
+}
+
+static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
+                     const char **edge_types, int edge_type_count, int max_depth, int max_results,
+                     bool trail, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
 
     cbm_node_t root = {0};
@@ -3936,32 +3952,53 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         next_id = "e.target_id";
     }
 
-    snprintf(sql, sizeof(sql),
-             /* SHORTEST-PATH semantics: the UNION dedupes (node, hop) PAIRS,
-              * so a single self-loop minted every hop level for every node it
-              * could reach — walk-padding that fabricated *k..k Cypher matches
-              * of arbitrary length and exploded the row set to nodes x depth
-              * (#797). MIN(hop) GROUP BY node returns each node once at its
-              * minimal distance. */
-             "WITH RECURSIVE bfs(node_id, hop) AS ("
-             "  SELECT %lld, 0"
-             "  UNION"
-             "  SELECT %s, bfs.hop + 1"
-             "  FROM bfs"
-             "  JOIN edges e ON %s"
-             "  WHERE e.type IN (%s) AND bfs.hop < %d"
-             ")"
-             "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
-             "FROM bfs "
-             "JOIN nodes n ON n.id = bfs.node_id "
-             "WHERE bfs.hop > 0 " /* exclude root at hop 0 (self via a loop still appears) */
-             "GROUP BY n.id "
-             /* (hop, id) is a unique total order — deterministic pagination
-              * watermarks and reproducible trace output depend on it. */
-             "ORDER BY hop, n.id "
-             "LIMIT %d;",
-             (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+    int cte_row_limit = 0;
+    if (trail) {
+        cte_row_limit = bfs_cte_row_limit(max_results);
+        snprintf(sql, sizeof(sql),
+                 "WITH RECURSIVE bfs(node_id, hop, edge_path) AS ("
+                 "  SELECT %lld, 0, ''"
+                 "  UNION"
+                 "  SELECT %s, bfs.hop + 1,"
+                 "         CASE WHEN bfs.edge_path = '' THEN CAST(e.id AS TEXT)"
+                 "              ELSE bfs.edge_path || ',' || e.id END"
+                 "  FROM bfs"
+                 "  JOIN edges e ON %s"
+                 "  WHERE e.type IN (%s) AND bfs.hop < %d"
+                 "    AND instr(',' || bfs.edge_path || ',', ',' || e.id || ',') = 0"
+                 "  LIMIT %d"
+                 ")"
+                 "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
+                 "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop, "
+                 "(SELECT count(*) FROM bfs) "
+                 "FROM bfs JOIN nodes n ON n.id = bfs.node_id "
+                 "WHERE bfs.hop > 0 ORDER BY bfs.hop LIMIT %d;",
+                 (long long)start_id, next_id, join_cond, types_clause, max_depth,
+                 cte_row_limit + SKIP_ONE, max_results);
+    } else {
+        snprintf(sql, sizeof(sql),
+                 /* SHORTEST-PATH semantics: the UNION dedupes (node, hop) pairs.
+                  * MIN(hop) GROUP BY node returns each node once at its minimal
+                  * distance, while relationship-trail state remains scoped to
+                  * Cypher variable-length expansion. */
+                 "WITH RECURSIVE bfs(node_id, hop) AS ("
+                 "  SELECT %lld, 0"
+                 "  UNION"
+                 "  SELECT %s, bfs.hop + 1"
+                 "  FROM bfs"
+                 "  JOIN edges e ON %s"
+                 "  WHERE e.type IN (%s) AND bfs.hop < %d"
+                 ")"
+                 "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                 "n.file_path, n.start_line, n.end_line, n.properties, MIN(bfs.hop) AS hop "
+                 "FROM bfs "
+                 "JOIN nodes n ON n.id = bfs.node_id "
+                 "WHERE bfs.hop > 0 "
+                 "GROUP BY n.id "
+                 "ORDER BY hop, n.id "
+                 "LIMIT %d;",
+                 (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+    }
 
     sqlite3_stmt *stmt = NULL;
     rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
@@ -3981,6 +4018,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
 
     int cap = ST_INIT_CAP_16;
     int n = 0;
+    int cte_rows = 0;
     cbm_node_hop_t *visited = malloc(cap * sizeof(cbm_node_hop_t));
 
     int scan_rc15;
@@ -3991,6 +4029,9 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
         }
         scan_node(stmt, &visited[n].node);
         visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        if (trail) {
+            cte_rows = sqlite3_column_int(stmt, ST_COL_10);
+        }
         n++;
     }
     if (scan_rc15 != SQLITE_DONE) { /* SCANCHK:15:stmt */
@@ -4002,6 +4043,12 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     }
 
     sqlite3_finalize(stmt);
+
+    if (trail && cte_rows > cte_row_limit) {
+        char limit_buf[16];
+        snprintf(limit_buf, sizeof(limit_buf), "%d", cte_row_limit);
+        cbm_log_warn("cypher.trail_truncated", "cte_rows", limit_buf, "result", "partial");
+    }
 
     out->visited = visited;
     out->visited_count = n;
@@ -4016,6 +4063,19 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
     }
 
     return CBM_STORE_OK;
+}
+
+int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
+                  int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out) {
+    return store_bfs(s, start_id, direction, edge_types, edge_type_count, max_depth, max_results,
+                     false, out);
+}
+
+int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
+                        const char **edge_types, int edge_type_count, int max_depth,
+                        int max_results, cbm_traverse_result_t *out) {
+    return store_bfs(s, start_id, direction, edge_types, edge_type_count, max_depth, max_results,
+                     true, out);
 }
 
 /* Multi-source BFS: one recursive CTE anchored on ALL seeds (via a temp
