@@ -847,10 +847,12 @@ TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime) {
     typedef BOOL(WINAPI * ipc_test_set_dacl_fn)(PSECURITY_DESCRIPTOR, BOOL, PACL, BOOL);
     HMODULE advapi = LoadLibraryW(L"advapi32.dll");
     ipc_test_initialize_sd_fn initialize_sd =
-        advapi ? (ipc_test_initialize_sd_fn)GetProcAddress(advapi, "InitializeSecurityDescriptor")
+        advapi ? (ipc_test_initialize_sd_fn)(void (*)(void))GetProcAddress(
+                     advapi, "InitializeSecurityDescriptor")
                : NULL;
-    ipc_test_set_dacl_fn set_dacl =
-        advapi ? (ipc_test_set_dacl_fn)GetProcAddress(advapi, "SetSecurityDescriptorDacl") : NULL;
+    ipc_test_set_dacl_fn set_dacl = advapi ? (ipc_test_set_dacl_fn)(void (*)(void))GetProcAddress(
+                                                 advapi, "SetSecurityDescriptorDacl")
+                                           : NULL;
     SECURITY_DESCRIPTOR unsafe_descriptor;
     bool unsafe_descriptor_ok = initialize_sd && set_dacl &&
                                 initialize_sd(&unsafe_descriptor, SECURITY_DESCRIPTOR_REVISION) &&

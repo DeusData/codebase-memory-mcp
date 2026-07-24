@@ -883,7 +883,9 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz) {
     }
     DWORD needed =
         GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    if (needed == 0 || needed == MAXDWORD || (size_t)needed > SIZE_MAX / sizeof(wchar_t) - 1) {
+    /* MAXDWORD keeps the +1 below safe; calloc rejects an unrepresentable
+     * capacity * sizeof(wchar_t) allocation on narrower size_t targets. */
+    if (needed == 0 || needed == MAXDWORD) {
         (void)CloseHandle(handle);
         return 0;
     }
