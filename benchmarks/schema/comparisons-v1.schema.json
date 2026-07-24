@@ -17,7 +17,7 @@
     "lifecycle_rows"
   ],
   "properties": {
-    "$schema": {"const": "docs/schema/benchmark-comparisons-v1.schema.json"},
+    "$schema": {"const": "benchmarks/schema/comparisons-v1.schema.json"},
     "schema_version": {"const": 1},
     "generated_at_utc": {"type": "string", "format": "date-time"},
     "terminology_version": {"type": "string", "minLength": 1},

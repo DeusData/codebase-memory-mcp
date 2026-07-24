@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 SCRIPT = (
-    Path(__file__).resolve().parents[1] / "scripts" / "run-benchmark-experiments.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "run_experiments.py"
 )
 SPEC = importlib.util.spec_from_file_location("run_benchmark_experiments", SCRIPT)
 assert SPEC and SPEC.loader
@@ -19,7 +19,7 @@ EXPERIMENT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPERIMENT)
 
 BENCHMARK_SCRIPT = (
-    Path(__file__).resolve().parents[1] / "scripts" / "benchmark-incremental-speed.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "incremental_speed.py"
 )
 BENCHMARK_SPEC = importlib.util.spec_from_file_location(
     "benchmark_incremental_speed_for_experiments", BENCHMARK_SCRIPT

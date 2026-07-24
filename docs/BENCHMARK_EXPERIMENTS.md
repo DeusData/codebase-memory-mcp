@@ -1,6 +1,6 @@
 # Reproducible benchmark experiments
 
-`scripts/run-benchmark-experiments.py` runs a JSON plan sequentially and keeps every
+`benchmarks/run_experiments.py` runs a JSON plan sequentially and keeps every
 attempt under a content-addressed cell directory. It is intended for release-build
 comparisons where correctness and query-result quality are gates, not optional
 context around a speed claim. New automation uses this entry point and
@@ -12,6 +12,20 @@ Use a durable ignored experiment root. Automatic runs continue to use
 The runner rejects the operating-system temporary tree by default because a crash
 or reboot can otherwise erase manifests, results, and logs. Do not track generated
 results or the generated Markdown report in Git.
+
+## Repository layout
+
+Canonical benchmark code, active schemas, terminology, configuration data, and
+fixtures live under `benchmarks/`. Human-facing guides remain under `docs/`, tests
+under `tests/`, and the generated profiling header under `src/` because those files
+belong to their respective integration surfaces.
+
+Historical entry points under `scripts/` are compatibility frontends for retained
+automation. New commands and source anchors use `benchmarks/`. The frozen
+`docs/schema/benchmark-facts-v1.schema.json` remains at its original URI because
+retained v1 bundles embed that exact identifier. The loaders also accept the former
+v2 schema URI and its recorded terminology hash, while new bundles emit only the
+canonical `benchmarks/schema/facts-v2.schema.json` URI.
 
 ## Cell identity
 
@@ -34,11 +48,11 @@ Every new benchmark result also writes a schema-valid `facts.json` bundle, norma
 `runs.json`, `steps.jsonl`, `results.json`, and `artifacts.json` tables, and a hashed
 `manifest.json` under the experiment attempt's artifact directory. Standalone runs use
 `--facts-dir DIR`; when only `--out result.json` is given, facts default to
-`result.facts/`. New bundles use `docs/schema/benchmark-facts-v2.schema.json`;
+`result.facts/`. New bundles use `benchmarks/schema/facts-v2.schema.json`;
 the retained v1 schema remains available for earlier runsets. The
-canonical benchmark vocabulary is `docs/benchmark-terminology.json`; its generated
+canonical benchmark vocabulary is `benchmarks/terminology.json`; its generated
 human-readable view is [BENCHMARK_TERMINOLOGY.md](BENCHMARK_TERMINOLOGY.md).
-`uv run python scripts/benchmark-incremental-speed.py --describe-terms
+`uv run python benchmarks/incremental_speed.py --describe-terms
 json|markdown` prints either view without requiring a benchmark binary.
 
 The run row records the experiment cell ID and label, exact candidate commit,
@@ -59,7 +73,7 @@ source revision/build flags remain `unknown`.
 
 When every completed experiment cell has a canonical fact bundle, report generation
 also writes `*.comparisons.json` and `*.fact-appendix.md`. The JSON conforms to
-`docs/schema/benchmark-comparisons-v1.schema.json` and retains the source bundle,
+`benchmarks/schema/comparisons-v1.schema.json` and retains the source bundle,
 run, and occurrence IDs behind every derived row. It classifies each cell pair as:
 
 - `parity_comparison`: identical mode, complete effective capabilities, scope,
@@ -81,7 +95,7 @@ still render, but state that fact-derived comparisons are unavailable.
 Retained reports from earlier harness versions remain usable:
 
 ```bash
-uv run python scripts/benchmark-incremental-speed.py \
+uv run python benchmarks/incremental_speed.py \
   --import-report path/to/result.json \
   --facts-dir path/to/recovered-facts
 ```
@@ -142,10 +156,10 @@ changing the fact-table contract.
       "transport": "mcp",
       "scenario": "self_dogfood",
       "repetition": 1,
-      "harness_version": "benchmark-incremental-speed.py:<sha256>",
+      "harness_version": "incremental_speed.py:<sha256>",
       "cwd": "/absolute/path/to/codebase-memory-mcp",
       "command": [
-        "uv", "run", "python", "scripts/benchmark-incremental-speed.py",
+        "uv", "run", "python", "benchmarks/incremental_speed.py",
         "--binary", "/absolute/path/to/release-binary",
         "--self-dogfood", "--repo-root", "/absolute/path/to/codebase-memory-mcp",
         "--transport", "mcp", "--out", "{result_path}"
@@ -280,7 +294,7 @@ PageRank/LinkRank ablation is:
 --config-profile rank_disabled
 ```
 
-`scripts/autotune.py` is a safe frontend for the corresponding PageRank parameter
+`benchmarks/autotune.py` is a safe frontend for the corresponding PageRank parameter
 sweep. It requires exact build metadata, generates a content-addressed rank-quality
 experiment, interleaves candidate-default and ablation repetitions, and stores the
 plan, results, logs, and report under a durable ignored result root. It does not
@@ -359,7 +373,7 @@ same configuration.
 ## Run and resume
 
 ```sh
-uv run python scripts/run-benchmark-experiments.py \
+uv run python benchmarks/run_experiments.py \
   --plan .worktrees/benchmark-campaign/plan.json \
   --experiment-root .worktrees/benchmark-campaign/results
 ```
@@ -429,7 +443,7 @@ comparison point.
 
 ## Cross-experiment composition
 
-Use `scripts/summarize-benchmark-results.py --composition-spec SPEC --out REPORT`
+Use `benchmarks/summarize_results.py --composition-spec SPEC --out REPORT`
 to combine incremental correctness and capability-quality evidence into one
 configuration row. A composition input may name an exact matrix spec or the immutable
 expanded plan already archived in its durable experiment root. The generator validates

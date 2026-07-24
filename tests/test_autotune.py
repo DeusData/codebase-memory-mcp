@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "autotune.py"
+SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "autotune.py"
 SPEC = importlib.util.spec_from_file_location("autotune", SCRIPT)
 assert SPEC and SPEC.loader
 AUTOTUNE = importlib.util.module_from_spec(SPEC)

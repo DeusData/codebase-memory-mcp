@@ -12,7 +12,7 @@
   ],
   "properties": {
     "$schema": {
-      "const": "docs/schema/benchmark-terminology.schema.json"
+      "const": "benchmarks/schema/terminology.schema.json"
     },
     "schema_version": {
       "const": 1
