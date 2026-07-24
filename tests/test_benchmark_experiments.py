@@ -1396,6 +1396,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
                 root, [planned], root / "reports" / "summary.md"
             )
             self.assertEqual(report["input_count"], 1)
+            self.assertEqual(report["fact_comparisons"]["status"], "unavailable")
             self.assertTrue((root / "reports" / "summary.md").is_file())
             self.assertIn(
                 "latest-rank-off-r1", (root / "reports" / "summary.md").read_text()

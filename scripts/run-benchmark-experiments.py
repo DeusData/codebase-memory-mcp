@@ -1925,6 +1925,78 @@ def completed_report_inputs(
     return inputs
 
 
+def completed_fact_inputs(
+    experiment_root: Path, cells: list[dict[str, Any]]
+) -> tuple[list[Path], list[str]]:
+    inputs: list[Path] = []
+    missing: list[str] = []
+    for cell in cells:
+        identity = cell_identity(cell)
+        cell_root = experiment_root / "runs" / identity
+        completion = valid_completion(cell_root, cell)
+        if completion is None:
+            continue
+        attempt = completion.get("attempt")
+        if not isinstance(attempt, str) or not attempt:
+            missing.append(identity)
+            continue
+        path = cell_root / "attempts" / attempt / "artifacts" / "facts" / "facts.json"
+        if path.is_file():
+            inputs.append(path)
+        else:
+            missing.append(identity)
+    return inputs, missing
+
+
+def generate_fact_comparisons(
+    experiment_root: Path,
+    cells: list[dict[str, Any]],
+    report_output: Path,
+) -> dict[str, Any]:
+    inputs, missing = completed_fact_inputs(experiment_root, cells)
+    if missing or len(inputs) != len(cells):
+        return {
+            "status": "unavailable",
+            "reason": "one or more retained completed cells predate canonical fact bundles",
+            "fact_input_count": len(inputs),
+            "missing_cell_identities": sorted(missing),
+        }
+    comparison_output = report_output.with_suffix(".comparisons.json")
+    appendix_output = report_output.with_suffix(".fact-appendix.md")
+    generator = Path(__file__).resolve().with_name("benchmark_fact_comparisons.py")
+    command = [sys.executable, str(generator)]
+    for path in inputs:
+        command.extend(("--fact", str(path)))
+    command.extend(
+        (
+            "--out",
+            str(comparison_output),
+            "--markdown-out",
+            str(appendix_output),
+        )
+    )
+    process = subprocess.run(command, capture_output=True, text=True, check=False)
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"fact comparison generator exited with {process.returncode}: "
+            f"{process.stderr.strip()}"
+        )
+    appendix = appendix_output.read_text(encoding="utf-8")
+    report = report_output.read_text(encoding="utf-8").rstrip()
+    atomic_write_bytes(
+        report_output, (report + "\n\n" + appendix.rstrip() + "\n").encode("utf-8")
+    )
+    return {
+        "status": "generated",
+        "path": str(comparison_output),
+        "sha256": file_sha256(comparison_output),
+        "appendix_path": str(appendix_output),
+        "appendix_sha256": file_sha256(appendix_output),
+        "fact_input_count": len(inputs),
+        "generator": str(generator),
+    }
+
+
 def materialize_report_input(
     experiment_root: Path, cell: dict[str, Any], result_path: Path
 ) -> Path:
@@ -1974,11 +2046,13 @@ def generate_report(
         raise RuntimeError(
             f"report generator exited with {process.returncode}: {process.stderr.strip()}"
         )
+    fact_comparisons = generate_fact_comparisons(experiment_root, cells, output)
     return {
         "path": str(output),
         "sha256": file_sha256(output),
         "input_count": len(inputs),
         "generator": str(summarizer),
+        "fact_comparisons": fact_comparisons,
     }
 
 

@@ -1,0 +1,379 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "benchmark-comparisons-v1.schema.json",
+  "title": "Codebase Memory benchmark fact-derived comparisons",
+  "type": "object",
+  "required": [
+    "$schema",
+    "schema_version",
+    "generated_at_utc",
+    "terminology_version",
+    "terminology_sha256",
+    "joins",
+    "formulas",
+    "source_bundles",
+    "cell_groups",
+    "comparisons",
+    "lifecycle_rows"
+  ],
+  "properties": {
+    "$schema": {"const": "docs/schema/benchmark-comparisons-v1.schema.json"},
+    "schema_version": {"const": 1},
+    "generated_at_utc": {"type": "string", "format": "date-time"},
+    "terminology_version": {"type": "string", "minLength": 1},
+    "terminology_sha256": {"$ref": "#/$defs/sha256"},
+    "joins": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/join"}
+    },
+    "formulas": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/formula"}
+    },
+    "source_bundles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/sourceBundle"}
+    },
+    "cell_groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/cellGroup"}
+    },
+    "comparisons": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/comparison"}
+    },
+    "lifecycle_rows": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/lifecycleRow"}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "contentId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{24}$"
+    },
+    "stringArray": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "join": {
+      "type": "object",
+      "required": [
+        "join_id",
+        "fields",
+        "unknown_values_allowed",
+        "ratio_allowed"
+      ],
+      "properties": {
+        "join_id": {
+          "enum": [
+            "parity_manifest_and_contract_v1",
+            "capability_delta_manifest_v1"
+          ]
+        },
+        "fields": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string"}
+        },
+        "unknown_values_allowed": {"type": "boolean"},
+        "ratio_allowed": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "formula": {
+      "type": "object",
+      "required": ["formula_id", "expression"],
+      "properties": {
+        "formula_id": {
+          "enum": [
+            "median_elapsed_ms_v1",
+            "left_elapsed_divided_by_right_elapsed_v1"
+          ]
+        },
+        "expression": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "sourceBundle": {
+      "type": "object",
+      "required": ["path", "sha256", "schema_version", "run_id"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "schema_version": {"enum": [1, 2]},
+        "run_id": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "stepAggregate": {
+      "type": "object",
+      "required": [
+        "step_id",
+        "formula_id",
+        "count",
+        "median_elapsed_ms",
+        "min_elapsed_ms",
+        "max_elapsed_ms",
+        "source_occurrence_ids"
+      ],
+      "properties": {
+        "step_id": {"type": "string", "minLength": 1},
+        "formula_id": {"const": "median_elapsed_ms_v1"},
+        "count": {"type": "integer", "minimum": 1},
+        "median_elapsed_ms": {"type": "number", "minimum": 0},
+        "min_elapsed_ms": {"type": "number", "minimum": 0},
+        "max_elapsed_ms": {"type": "number", "minimum": 0},
+        "source_occurrence_ids": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "resultAggregate": {
+      "type": "object",
+      "required": [
+        "result_id",
+        "kind",
+        "statuses",
+        "all_passed",
+        "source_run_ids"
+      ],
+      "properties": {
+        "result_id": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "minLength": 1},
+        "statuses": {"$ref": "#/$defs/stringArray"},
+        "all_passed": {"type": "boolean"},
+        "source_run_ids": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "cellGroup": {
+      "type": "object",
+      "required": [
+        "cell_group_id",
+        "label",
+        "mode",
+        "implementation",
+        "capabilities",
+        "scope",
+        "cache",
+        "host",
+        "benchmark_contract",
+        "result_contract",
+        "source_run_ids",
+        "source_fact_paths",
+        "step_aggregates",
+        "result_aggregates"
+      ],
+      "properties": {
+        "cell_group_id": {"$ref": "#/$defs/contentId"},
+        "label": {"type": "string", "minLength": 1},
+        "mode": {"type": "string", "minLength": 1},
+        "implementation": {"type": "object"},
+        "capabilities": {"type": "object"},
+        "scope": {"type": "object"},
+        "cache": {"type": "object"},
+        "host": {"type": "object"},
+        "benchmark_contract": {"type": "object"},
+        "result_contract": {"type": "array", "items": {"type": "object"}},
+        "source_run_ids": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1, "uniqueItems": true}
+          ]
+        },
+        "source_fact_paths": {
+          "allOf": [
+            {"$ref": "#/$defs/stringArray"},
+            {"minItems": 1, "uniqueItems": true}
+          ]
+        },
+        "step_aggregates": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/stepAggregate"}
+        },
+        "result_aggregates": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/resultAggregate"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilityDifference": {
+      "type": "object",
+      "required": ["capability_id", "left", "right"],
+      "properties": {
+        "capability_id": {"type": "string", "minLength": 1},
+        "left": {},
+        "right": {}
+      },
+      "additionalProperties": false
+    },
+    "stepComparison": {
+      "type": "object",
+      "required": [
+        "step_id",
+        "formula_id",
+        "left_median_elapsed_ms",
+        "right_median_elapsed_ms",
+        "left_elapsed_divided_by_right_elapsed",
+        "left_source_occurrence_ids",
+        "right_source_occurrence_ids"
+      ],
+      "properties": {
+        "step_id": {"type": "string", "minLength": 1},
+        "formula_id": {
+          "const": "left_elapsed_divided_by_right_elapsed_v1"
+        },
+        "left_median_elapsed_ms": {"type": "number", "minimum": 0},
+        "right_median_elapsed_ms": {"type": "number", "minimum": 0},
+        "left_elapsed_divided_by_right_elapsed": {
+          "type": ["number", "null"],
+          "minimum": 0
+        },
+        "left_source_occurrence_ids": {"$ref": "#/$defs/stringArray"},
+        "right_source_occurrence_ids": {"$ref": "#/$defs/stringArray"}
+      },
+      "additionalProperties": false
+    },
+    "comparison": {
+      "type": "object",
+      "required": [
+        "comparison_id",
+        "left_cell_group_id",
+        "right_cell_group_id",
+        "left_source_run_ids",
+        "right_source_run_ids",
+        "comparison_kind",
+        "join_id",
+        "ratio_allowed",
+        "capability_differences",
+        "step_comparisons",
+        "limitations"
+      ],
+      "properties": {
+        "comparison_id": {"$ref": "#/$defs/contentId"},
+        "left_cell_group_id": {"$ref": "#/$defs/contentId"},
+        "right_cell_group_id": {"$ref": "#/$defs/contentId"},
+        "left_source_run_ids": {"$ref": "#/$defs/stringArray"},
+        "right_source_run_ids": {"$ref": "#/$defs/stringArray"},
+        "comparison_kind": {
+          "enum": [
+            "parity_comparison",
+            "capability_delta_comparison",
+            "not_eligible"
+          ]
+        },
+        "join_id": {
+          "enum": [
+            "parity_manifest_and_contract_v1",
+            "capability_delta_manifest_v1",
+            null
+          ]
+        },
+        "ratio_allowed": {"type": "boolean"},
+        "capability_differences": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/capabilityDifference"}
+        },
+        "step_comparisons": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/stepComparison"}
+        },
+        "limitations": {"$ref": "#/$defs/stringArray"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"comparison_kind": {"const": "parity_comparison"}},
+            "required": ["comparison_kind"]
+          },
+          "then": {
+            "properties": {
+              "join_id": {"const": "parity_manifest_and_contract_v1"},
+              "ratio_allowed": {"const": true},
+              "capability_differences": {"maxItems": 0},
+              "limitations": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "comparison_kind": {"const": "capability_delta_comparison"}
+            },
+            "required": ["comparison_kind"]
+          },
+          "then": {
+            "properties": {
+              "join_id": {"const": "capability_delta_manifest_v1"},
+              "ratio_allowed": {"const": false},
+              "capability_differences": {"minItems": 1},
+              "step_comparisons": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"comparison_kind": {"const": "not_eligible"}},
+            "required": ["comparison_kind"]
+          },
+          "then": {
+            "properties": {
+              "join_id": {"type": "null"},
+              "ratio_allowed": {"const": false},
+              "step_comparisons": {"maxItems": 0},
+              "limitations": {"minItems": 1}
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    },
+    "lifecycleRow": {
+      "type": "object",
+      "required": [
+        "cell_group_id",
+        "label",
+        "source_run_ids",
+        "steps",
+        "wall_time_rule"
+      ],
+      "properties": {
+        "cell_group_id": {"$ref": "#/$defs/contentId"},
+        "label": {"type": "string", "minLength": 1},
+        "source_run_ids": {"$ref": "#/$defs/stringArray"},
+        "steps": {
+          "type": "array",
+          "items": {
+            "allOf": [
+              {"$ref": "#/$defs/stepAggregate"},
+              {
+                "properties": {
+                  "step_id": {
+                    "enum": [
+                      "initial_index",
+                      "incremental_index",
+                      "clean_rebuild_index"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "wall_time_rule": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    }
+  }
+}

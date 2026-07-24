@@ -771,6 +771,150 @@ def fact_result_rows(report: dict[str, Any], run_id: str) -> list[dict[str, Any]
                 "provenance": "report.error",
             }
         )
+    cases = report.get("cases")
+    if isinstance(cases, list):
+        for index, case in enumerate(cases):
+            if not isinstance(case, dict):
+                continue
+            scenario = case.get("scenario")
+            scenario_id = (
+                re.sub(r"[^a-zA-Z0-9_.-]+", "_", scenario)
+                if isinstance(scenario, str) and scenario
+                else str(index)
+            )
+            case_passed = case.get("passed")
+            rows.append(
+                {
+                    "run_id": run_id,
+                    "result_id": f"case.{scenario_id}.contract",
+                    "kind": "correctness_contract",
+                    "status": (
+                        "passed"
+                        if case_passed is True
+                        else "failed"
+                        if case_passed is False
+                        else "unknown"
+                    ),
+                    "value": {
+                        "scenario": scenario,
+                        "publish_kind": (
+                            case.get("incremental", {}).get("publish_kind")
+                            if isinstance(case.get("incremental"), dict)
+                            else None
+                        ),
+                        "exact_reason": case.get("exact_reason"),
+                    },
+                    "provenance": f"report.cases[{index}]",
+                }
+            )
+            for field, kind in (
+                ("graph_gate", "graph_oracle"),
+                ("canonical_graph", "graph_equality"),
+                ("freshness_scoped_graph", "freshness_oracle"),
+            ):
+                value = case.get(field)
+                if not isinstance(value, dict):
+                    continue
+                passed_value = value.get("passed", value.get("equal"))
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "result_id": f"case.{scenario_id}.{field}",
+                        "kind": kind,
+                        "status": (
+                            "passed"
+                            if passed_value is True
+                            else "failed"
+                            if passed_value is False
+                            else "unknown"
+                        ),
+                        "value": {
+                            key: value[key]
+                            for key in (
+                                "policy",
+                                "reason",
+                                "equal",
+                                "canonical_equal",
+                                "freshness_scoped_equal",
+                                "declared_stale_views",
+                                "excluded_edge_types",
+                                "left_count",
+                                "right_count",
+                                "left_sha256",
+                                "right_sha256",
+                            )
+                            if key in value
+                        },
+                        "provenance": f"report.cases[{index}].{field}",
+                    }
+                )
+            oracles = case.get("oracles")
+            if not isinstance(oracles, dict):
+                continue
+            quality = oracles.get("quality")
+            if isinstance(quality, dict):
+                quality_passed = quality.get("passed")
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "result_id": f"case.{scenario_id}.quality",
+                        "kind": "retrieval_quality",
+                        "status": (
+                            "passed"
+                            if quality_passed is True
+                            else "failed"
+                            if quality_passed is False
+                            else "unknown"
+                        ),
+                        "value": dict(quality),
+                        "provenance": f"report.cases[{index}].oracles.quality",
+                    }
+                )
+            for oracle_name, oracle in sorted(oracles.items()):
+                if oracle_name in {"passed", "quality"} or not isinstance(oracle, dict):
+                    continue
+                oracle_quality = oracle.get("quality")
+                if not isinstance(oracle_quality, dict):
+                    continue
+                applicable = oracle_quality.get("applicable")
+                oracle_passed = oracle_quality.get("passed")
+                rows.append(
+                    {
+                        "run_id": run_id,
+                        "result_id": (
+                            f"case.{scenario_id}.oracle."
+                            + re.sub(r"[^a-zA-Z0-9_.-]+", "_", oracle_name)
+                        ),
+                        "kind": "retrieval_task",
+                        "status": (
+                            "skipped"
+                            if applicable is False
+                            else "passed"
+                            if oracle_passed is True
+                            else "failed"
+                            if oracle_passed is False
+                            else "unknown"
+                        ),
+                        "value": {
+                            "scenario": scenario,
+                            "criterion": oracle_quality.get("criterion"),
+                            "expected_substring": oracle_quality.get(
+                                "expected_substring"
+                            ),
+                            "applicable": applicable,
+                            "rank": oracle_quality.get("rank"),
+                            "reciprocal_rank": oracle_quality.get("reciprocal_rank"),
+                            "hit_at_1": oracle_quality.get("hit_at_1"),
+                            "hit_at_5": oracle_quality.get("hit_at_5"),
+                            "ndcg_at_5": oracle_quality.get("ndcg_at_5"),
+                            "freshness": oracle.get("freshness"),
+                            "freshness_state": oracle.get("freshness_state"),
+                        },
+                        "provenance": (
+                            f"report.cases[{index}].oracles.{oracle_name}.quality"
+                        ),
+                    }
+                )
     return rows
 
 
