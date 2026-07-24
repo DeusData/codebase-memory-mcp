@@ -7296,6 +7296,81 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+TEST(pipeline_ensemble_routing_routes_to_edges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* Production class with two items */
+    snprintf(path, sizeof(path), "%s/MyProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.MyProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.MyProduction\">\n"
+               "  <Item Name=\"MyService\" ClassName=\"MyApp.MyService\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"MyOperation\" ClassName=\"MyApp.MyOperation\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    /* Service class with OnProcessInput that routes to MyOperation via literal */
+    snprintf(path, sizeof(path), "%s/MyService.cls", tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen service");
+    }
+    fprintf(f, "Class MyApp.MyService Extends Ens.BusinessService\n"
+               "{\n"
+               "Method OnProcessInput(pRequest As %%Library.Object,"
+               " Output pResponse As %%Library.Object) As %%Status\n"
+               "{\n"
+               "    Do ..SendRequestSync(\"MyOperation\", pRequest, .pResponse)\n"
+               "    Quit $$$OK\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* EnsembleItem nodes emitted for both production items */
+    cbm_node_t *items = NULL;
+    int item_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "EnsembleItem", &items, &item_count);
+    ASSERT_GTE(item_count, 2);
+    cbm_store_free_nodes(items, item_count);
+
+    /* At least one ROUTES_TO edge from SendRequestSync literal match */
+    int routes = cbm_store_count_edges_by_type(s, project, "ROUTES_TO");
+    ASSERT_GTE(routes, 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 SUITE(pipeline) {
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
@@ -7579,4 +7654,6 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+    /* Ensemble routing pass */
+    RUN_TEST(pipeline_ensemble_routing_routes_to_edges);
 }

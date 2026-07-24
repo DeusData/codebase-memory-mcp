@@ -256,6 +256,7 @@ PIPELINE_SRCS = \
     src/pipeline/pass_complexity.c \
     src/pipeline/pass_cross_repo.c \
     src/pipeline/artifact.c \
+    src/pipeline/pass_ensemble_routing.c \
     src/pipeline/pass_pkgmap.c
 
 # SimHash / MinHash module
