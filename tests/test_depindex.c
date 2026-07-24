@@ -760,6 +760,70 @@ TEST(test_auto_index_npm_reads_actual_package_json_shape) {
     PASS();
 }
 
+TEST(test_discover_vendored_deps_unlimited_uses_actual_capacity) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_vendor_unlimited_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char dep_a[CBM_SZ_1K];
+    char dep_b[CBM_SZ_1K];
+    snprintf(dep_a, sizeof(dep_a), "%s/vendor/alpha", tmp);
+    snprintf(dep_b, sizeof(dep_b), "%s/vendor/beta", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(dep_a, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(dep_b, 0700));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "vendor-unlimited", tmp), CBM_STORE_OK);
+
+    cbm_dep_discovered_t *deps = NULL;
+    int dep_count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_MAKE, tmp, store,
+                                          "vendor-unlimited", &deps, &dep_count,
+                                          INT_MAX),
+              0);
+    ASSERT_EQ(dep_count, 2);
+    cbm_dep_discovered_free(deps, dep_count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
+TEST(test_discover_manifest_deps_unlimited_saturates_query_limit) {
+    char tmp[CBM_SZ_256];
+    ASSERT_EQ(setup_uv_fixture(tmp, sizeof(tmp)), 0);
+
+    char proj_dir[CBM_SZ_1K];
+    int n = snprintf(proj_dir, sizeof(proj_dir), "%s/project", tmp);
+    ASSERT(n > 0 && (size_t)n < sizeof(proj_dir));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "manifest-unlimited";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, proj_dir), CBM_STORE_OK);
+
+    cbm_node_t dep_manifest = {0};
+    dep_manifest.project = project;
+    dep_manifest.label = "Variable";
+    dep_manifest.name = "requests";
+    dep_manifest.qualified_name = "manifest-unlimited.pyproject.dependencies.requests";
+    dep_manifest.file_path = "pyproject.toml";
+    dep_manifest.properties_json = "{}";
+    ASSERT_GT(cbm_store_upsert_node(store, &dep_manifest), 0);
+
+    cbm_dep_discovered_t *deps = NULL;
+    int dep_count = 0;
+    ASSERT_EQ(cbm_discover_installed_deps(CBM_PKG_UV, proj_dir, store, project,
+                                          &deps, &dep_count, INT_MAX),
+              0);
+    ASSERT_EQ(dep_count, 1);
+    ASSERT_STR_EQ(deps[0].package, "requests");
+    cbm_dep_discovered_free(deps, dep_count);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
+    PASS();
+}
+
 TEST(test_pipeline_set_project_name) {
     cbm_pipeline_t *p = cbm_pipeline_new("/tmp", NULL, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
@@ -1343,6 +1407,8 @@ SUITE(depindex) {
     RUN_TEST(test_is_manifest_path);
     RUN_TEST(test_resolve_npm_node_modules);
     RUN_TEST(test_auto_index_npm_reads_actual_package_json_shape);
+    RUN_TEST(test_discover_vendored_deps_unlimited_uses_actual_capacity);
+    RUN_TEST(test_discover_manifest_deps_unlimited_saturates_query_limit);
     RUN_TEST(test_pipeline_set_project_name);
     RUN_TEST(test_dep_reindex_replaces);
     RUN_TEST(test_auto_index_deps_refreshes_nodes_fts);

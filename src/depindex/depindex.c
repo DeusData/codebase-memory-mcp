@@ -381,6 +381,31 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count) {
     free(deps);
 }
 
+static int dep_discovery_initial_capacity(int max_results) {
+    return max_results < CBM_DEP_DISCOVERY_INITIAL_CAPACITY
+               ? max_results
+               : CBM_DEP_DISCOVERY_INITIAL_CAPACITY;
+}
+
+static bool dep_discovery_grow(cbm_dep_discovered_t **results, int *capacity,
+                               int max_results) {
+    if (!results || !*results || !capacity || *capacity >= max_results) {
+        return false;
+    }
+    int next_capacity =
+        *capacity > max_results / 2 ? max_results : *capacity * 2;
+    cbm_dep_discovered_t *grown =
+        realloc(*results, (size_t)next_capacity * sizeof(**results));
+    if (!grown) {
+        return false;
+    }
+    memset(grown + *capacity, 0,
+           (size_t)(next_capacity - *capacity) * sizeof(*grown));
+    *results = grown;
+    *capacity = next_capacity;
+    return true;
+}
+
 static char *read_dependency_manifest(const char *path, size_t *out_len) {
     if (out_len)
         *out_len = 0;
@@ -441,9 +466,7 @@ static int discover_npm_deps(cbm_pkg_manager_t mgr, const char *project_root,
         return 0;
     }
 
-    int capacity = max_results < CBM_DEP_DISCOVERY_INITIAL_CAPACITY
-                       ? max_results
-                       : CBM_DEP_DISCOVERY_INITIAL_CAPACITY;
+    int capacity = dep_discovery_initial_capacity(max_results);
     cbm_dep_discovered_t *results = calloc((size_t)capacity, sizeof(*results));
     CBMHashTable *seen = cbm_ht_create((uint32_t)capacity);
     if (!results || !seen) {
@@ -473,20 +496,13 @@ static int discover_npm_deps(cbm_pkg_manager_t mgr, const char *project_root,
             cbm_dep_resolved_t resolved = {0};
             if (cbm_resolve_pkg_source(mgr, package, project_root, &resolved) != 0)
                 continue;
-            if (result_count == capacity) {
-                int next_capacity = capacity > max_results / 2 ? max_results : capacity * 2;
-                cbm_dep_discovered_t *grown =
-                    realloc(results, (size_t)next_capacity * sizeof(*results));
-                if (!grown) {
-                    cbm_dep_resolved_free(&resolved);
-                    cbm_dep_discovered_free(results, result_count);
-                    cbm_ht_free(seen);
-                    yyjson_doc_free(doc);
-                    return -1;
-                }
-                memset(grown + capacity, 0, (size_t)(next_capacity - capacity) * sizeof(*results));
-                results = grown;
-                capacity = next_capacity;
+            if (result_count == capacity &&
+                !dep_discovery_grow(&results, &capacity, max_results)) {
+                cbm_dep_resolved_free(&resolved);
+                cbm_dep_discovered_free(results, result_count);
+                cbm_ht_free(seen);
+                yyjson_doc_free(doc);
+                return -1;
             }
             results[result_count].package = cbm_strdup(package);
             if (!results[result_count].package) {
@@ -520,7 +536,8 @@ static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t
         "_vendor", "submodules", NULL
     };
 
-    *out = calloc((size_t)max_results, sizeof(cbm_dep_discovered_t));
+    int capacity = dep_discovery_initial_capacity(max_results);
+    *out = calloc((size_t)capacity, sizeof(cbm_dep_discovered_t));
     if (!*out) return -1;
     *count = 0;
 
@@ -535,8 +552,23 @@ static int discover_vendored_deps(const char *project_root, cbm_dep_discovered_t
             char sub[CBM_DEP_PATH_MAX];
             snprintf(sub, sizeof(sub), "%s/%s", dir_path, ent->name);
             if (!cbm_is_dir(sub)) continue;
+            if (*count == capacity &&
+                !dep_discovery_grow(out, &capacity, max_results)) {
+                cbm_closedir(d);
+                cbm_dep_discovered_free(*out, *count);
+                *out = NULL;
+                *count = 0;
+                return -1;
+            }
             (*out)[*count].package = cbm_strdup(ent->name);
             (*out)[*count].path    = cbm_strdup(sub);
+            if (!(*out)[*count].package || !(*out)[*count].path) {
+                cbm_closedir(d);
+                cbm_dep_discovered_free(*out, *count + 1);
+                *out = NULL;
+                *count = 0;
+                return -1;
+            }
             (*count)++;
         }
         cbm_closedir(d);
@@ -677,7 +709,10 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
          * to today whenever the true distinct-package count is within
          * max_results — only the retention cap grows to let ranking see more
          * of the SAME raw window. */
-        params.limit = max_results * 5; /* over-fetch since we filter post-query */
+        params.limit =
+            max_results > INT_MAX / CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER
+                ? INT_MAX
+                : max_results * CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER;
 
         cbm_search_output_t search_out = {0};
         rc = cbm_store_search(store, &params, &search_out);
@@ -686,14 +721,20 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
             return -1;
         }
 
-        cbm_dep_discovered_t *results = calloc((size_t)fetch_limit, sizeof(cbm_dep_discovered_t));
+        int capacity = search_out.count < fetch_limit ? search_out.count : fetch_limit;
+        if (capacity == 0) {
+            cbm_store_search_free(&search_out);
+            return 0;
+        }
+        cbm_dep_discovered_t *results =
+            calloc((size_t)capacity, sizeof(cbm_dep_discovered_t));
         if (!results) {
             cbm_store_search_free(&search_out);
             return -1;
         }
 
         int n = 0;
-        for (int i = 0; i < search_out.count && n < fetch_limit; i++) {
+        for (int i = 0; i < search_out.count && n < capacity; i++) {
             const char *fp = search_out.results[i].node.file_path;
             const char *name = search_out.results[i].node.name;
             if (!fp || !name || !name[0]) continue;
