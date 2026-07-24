@@ -1176,8 +1176,10 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
     result.auto_index_limit =
         cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT,
                                      CBM_DEFAULT_AUTO_INDEX_LIMIT);
-    result.auto_dep_limit = cbm_config_get_effective_int(
-        cfg, CBM_CONFIG_AUTO_DEP_LIMIT, CBM_DEFAULT_AUTO_DEP_LIMIT);
+    int configured_dep_limit =
+        cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, CBM_DEFAULT_AUTO_DEP_LIMIT);
+    result.auto_dep_limit =
+        cbm_dep_normalize_configured_limit(configured_dep_limit, CBM_DEFAULT_AUTO_DEP_LIMIT);
     if (cfg) {
         cbm_config_close(cfg);
     }

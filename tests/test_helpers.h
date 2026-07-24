@@ -14,8 +14,10 @@
 
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
 
 #include <stdio.h>
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -76,6 +78,34 @@ static inline int th_append_file(const char *path, const char *content) {
     }
     fclose(f);
     return 0;
+}
+
+/* Write a config row without public-setter validation. Tests use this only to
+ * model retained databases from older builds or manual edits. */
+static inline int th_set_raw_config_value(const char *cache_dir, const char *key,
+                                          const char *value) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/_config.db", cache_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_open(path, &db);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+                                -1, &stmt, NULL);
+    }
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(db);
+    }
+    sqlite3_finalize(stmt);
+    if (db && sqlite3_close(db) != SQLITE_OK) {
+        rc = SQLITE_BUSY;
+    }
+    return rc == SQLITE_OK ? 0 : -1;
 }
 
 /* ── Directory creation ───────────────────────────────────────── */

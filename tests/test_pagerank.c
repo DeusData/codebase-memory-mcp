@@ -45,34 +45,6 @@ static int64_t add_edge(cbm_store_t *s, const char *project,
     return cbm_store_insert_edge(s, &e);
 }
 
-/* Simulate a legacy or manually edited config database without weakening the
- * validated public setter. Runtime readers must remain safe when old state
- * contains a value that current releases no longer accept. */
-static int set_raw_config_value(const char *cache_dir, const char *key, const char *value) {
-    char path[CBM_PATH_MAX];
-    int n = snprintf(path, sizeof(path), "%s/_config.db", cache_dir);
-    if (n < 0 || (size_t)n >= sizeof(path)) {
-        return -1;
-    }
-    sqlite3 *db = NULL;
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_open(path, &db);
-    if (rc == SQLITE_OK) {
-        rc = sqlite3_prepare_v2(
-            db, "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)", -1, &stmt, NULL);
-    }
-    if (rc == SQLITE_OK) {
-        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(db);
-    }
-    sqlite3_finalize(stmt);
-    if (db && sqlite3_close(db) != SQLITE_OK) {
-        rc = SQLITE_BUSY;
-    }
-    return rc == SQLITE_OK ? 0 : -1;
-}
-
 static double get_pr(cbm_store_t *s, int64_t node_id) {
     return cbm_pagerank_get(s, node_id);
 }
@@ -612,7 +584,7 @@ TEST(pagerank_refresh_invalid_policy_falls_back_to_at_publish) {
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, "bogus"), -1);
-    ASSERT_EQ(set_raw_config_value(tmpdir, CBM_CONFIG_RANK_REFRESH, "bogus"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_RANK_REFRESH, "bogus"), 0);
 
     const char *rank_views[] = {CBM_STORE_DERIVED_VIEW_PAGERANK,
                                 CBM_STORE_DERIVED_VIEW_LINKRANK,
@@ -730,7 +702,7 @@ TEST(pagerank_rank_scope_config_controls_scope_and_clears_stale_rows) {
     ASSERT_TRUE(get_pr(s, dep) == 0.0);
 
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_RANK_SCOPE, "invalid"), -1);
-    ASSERT_EQ(set_raw_config_value(tmpdir, CBM_CONFIG_RANK_SCOPE, "invalid"), 0);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_RANK_SCOPE, "invalid"), 0);
     ASSERT_EQ(cbm_pagerank_compute_with_config(s, "cfgscope", cfg), 2);
     ASSERT_TRUE(get_pr(s, dep) > 0.0);
 
