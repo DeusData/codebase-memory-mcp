@@ -42,4 +42,6 @@ PRETRAINED_VECTOR_BLOB_END:
     .p2align 2
 PRETRAINED_VECTOR_BLOB_LEN:
     .long PRETRAINED_VECTOR_BLOB_END - PRETRAINED_VECTOR_BLOB
+
+    .section .note.GNU-stack,"",@progbits
 #endif
