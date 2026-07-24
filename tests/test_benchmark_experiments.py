@@ -10,9 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCRIPT = (
-    Path(__file__).resolve().parents[1] / "benchmarks" / "run_experiments.py"
-)
+SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "run_experiments.py"
 SPEC = importlib.util.spec_from_file_location("run_benchmark_experiments", SCRIPT)
 assert SPEC and SPEC.loader
 EXPERIMENT = importlib.util.module_from_spec(SPEC)
@@ -418,7 +416,6 @@ class BenchmarkExperimentTest(unittest.TestCase):
                     "semantic-edges-disabled",
                     "git-history-disabled",
                     "http-links-disabled",
-                    "optional-graph-disabled",
                     "minimal-indexing",
                 ],
             )
@@ -440,6 +437,18 @@ class BenchmarkExperimentTest(unittest.TestCase):
                     ),
                     profile["label"],
                 )
+            signatures = [
+                (
+                    tuple(profile.get("candidate_labels", ())),
+                    tuple(sorted(profile["capabilities"].items())),
+                )
+                for profile in full["profiles"]
+            ]
+            self.assertEqual(
+                len(signatures),
+                len(set(signatures)),
+                "automatic plans must not emit duplicate candidate/capability cells",
+            )
             expanded = EXPERIMENT.expand_matrix_spec(quick)
             self.assertEqual(
                 expanded["cells"][0]["parameters"]["repository_background"][

@@ -8,6 +8,9 @@ context around a speed claim. New automation uses this entry point and
 script path, the loader resolves that path to the canonical entry point; no executable
 compatibility wrapper is installed. Legacy flag aliases, persisted JSON keys, and the
 `.worktrees/benchmark-campaign/` location remain readable for retained runs.
+Retained plans may also name the removed `optional_graph_disabled` profile; it resolves
+to the same capability manifest as `minimal_indexing`, which is the only one new
+automatic plans emit.
 
 Use a durable ignored experiment root. Automatic runs continue to use
 `.worktrees/benchmark-campaign/` so existing retained runsets resume in place.
