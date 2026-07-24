@@ -2849,6 +2849,37 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     return NULL;
 }
 
+/* Issue #1006: JS/TS template-literal URLs must flatten ${...} substitutions
+ * to the canonical "{}" placeholder, both as call arguments (HTTP_CALLS) and
+ * as URL-shaped string_refs collected from const/return positions. */
+TEST(extract_ts_template_string_url_issue1006) {
+    CBMFileResult *r = extract("export function detailPath(id: string): string {\n"
+                               "  return `/api/v1/things/${id}/detail`;\n"
+                               "}\n"
+                               "export function load(id: string) {\n"
+                               "  return fetch(`/api/v1/things/${id}`);\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "paths.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "fetch");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/things/{}");
+    int found = 0;
+    for (int i = 0; i < r->string_refs.count; i++) {
+        if (r->string_refs.items[i].value &&
+            strcmp(r->string_refs.items[i].value, "/api/v1/things/{}/detail") == 0) {
+            found = 1;
+            break;
+        }
+    }
+    ASSERT(found);
+    cbm_free_result(r);
+    PASS();
+}
+
+
 /* Reproduce-first: Java module QN must derive from the CONTAINING DIRECTORY, not
  * the filename stem, so a top-level class `Outer` in `Outer.java` is `t.Outer`,
  * NOT the doubled `t.Outer.Outer`. The nested method def QN must also equal the
@@ -4937,6 +4968,7 @@ SUITE(extraction) {
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_ts_template_string_url_issue1006);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
     RUN_TEST(extract_large_ts_has_functions_issue213);
