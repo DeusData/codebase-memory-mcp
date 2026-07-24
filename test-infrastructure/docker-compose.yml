@@ -52,6 +52,9 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/arm64
+    # make is PID 1 for this service. Give orphaned subprocess-test descendants
+    # a real reaper so killed zombies do not keep process groups appearing live.
+    init: true
     volumes:
       - ..:/src
       - cbm-build:/src/build
@@ -75,6 +78,7 @@ services:
       context: ..
       dockerfile: test-infrastructure/Dockerfile
     platform: linux/amd64
+    init: true
     volumes:
       - ..:/src
       - cbm-build:/src/build
@@ -146,7 +150,7 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
-        scripts/smoke-test.sh ./build/linux-arm64/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/linux-arm64/codebase-memory-mcp
 
   smoke-amd64:
     build:
@@ -159,7 +163,7 @@ services:
     command:
       - |
         scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-amd64 &&
-        scripts/smoke-test.sh ./build/linux-amd64/codebase-memory-mcp
+        scripts/smoke-local.sh ./build/linux-amd64/codebase-memory-mcp
 
   # ── Windows smoke (cross-compile + Wine) ──────────────────
   smoke-windows:

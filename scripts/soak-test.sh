@@ -41,7 +41,60 @@ mkdir -p "$RESULTS_DIR"
 # Isolate daemon coordination from interactive CBM sessions and give this run
 # a deterministic host-side daemon log. Wine needs a Windows-form cache path
 # in the child environment while this Bash harness retains the host path.
-SOAK_CACHE_DIR_HOST=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-cache.XXXXXX")
+#
+# On native Windows the cache CANNOT live under msys /tmp: the server's
+# cache-private executable-identity check walks the cache path's ancestors
+# and fails closed on C:\msys64, whose DACL grants mutation to Authenticated
+# Users. Place it under the user profile and stamp a reset-first strict DACL.
+soak_stamp_windows_dir() {
+    local dir_w me output
+    dir_w="$(cygpath -w "$1")"
+    me="$(whoami | tr -d '\r')"
+    if ! output=$(MSYS2_ARG_CONV_EXCL='*' icacls "$dir_w" /reset /Q 2>&1); then
+        echo "FAIL: soak DACL normalize failed (dir=$dir_w user=$me)" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+    if ! output=$(MSYS2_ARG_CONV_EXCL='*' icacls "$dir_w" /inheritance:r \
+        /grant:r "${me}:(OI)(CI)F" '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' \
+        /Q 2>&1); then
+        echo "FAIL: soak DACL stamp failed (dir=$dir_w user=$me)" >&2
+        printf '%s\n' "$output" >&2
+        return 1
+    fi
+}
+
+SOAK_WIN_ROOT=""
+if [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1 &&
+    ! command -v winepath >/dev/null 2>&1; then
+    # The server's cache-private hardening walks the FULL ancestor chain of
+    # both the executable and the cache dir and fails (or silently disables
+    # diagnostics) on any ancestor granting mutation to untrusted SIDs. The
+    # msys /tmp tree and repo checkouts both carry such ACEs, so neither can
+    # host the soak. The user profile is the one ancestry that is clean on
+    # runners and dev machines alike — the Windows guard suites already run
+    # their binaries from copies there for the same reason. Copy the binary
+    # into a stamped root under USERPROFILE and cache beside it.
+    SOAK_WIN_ROOT=$(mktemp -d "$(cygpath "$USERPROFILE")/cbm-soak.XXXXXX")
+    if ! soak_stamp_windows_dir "$SOAK_WIN_ROOT"; then
+        rm -rf -- "$SOAK_WIN_ROOT"
+        exit 1
+    fi
+    cp "$BINARY" "$SOAK_WIN_ROOT/codebase-memory-mcp.exe"
+    BINARY="$SOAK_WIN_ROOT/codebase-memory-mcp.exe"
+    SOAK_CACHE_DIR_HOST="$SOAK_WIN_ROOT/cache"
+    mkdir -p "$SOAK_CACHE_DIR_HOST"
+    SOAK_WIN_ROOT_W="$(cygpath -w "$SOAK_WIN_ROOT")"
+    if ! SOAK_DACL_OUTPUT=$(MSYS2_ARG_CONV_EXCL='*' icacls "${SOAK_WIN_ROOT_W}\\*" \
+        /reset /T /C /Q 2>&1); then
+        echo "FAIL: soak child DACL reset failed (dir=$SOAK_WIN_ROOT_W)" >&2
+        printf '%s\n' "$SOAK_DACL_OUTPUT" >&2
+        rm -rf -- "$SOAK_WIN_ROOT"
+        exit 1
+    fi
+else
+    SOAK_CACHE_DIR_HOST=$(mktemp -d "${TMPDIR:-/tmp}/cbm-soak-cache.XXXXXX")
+fi
 SOAK_CACHE_DIR_VALUE="$SOAK_CACHE_DIR_HOST"
 if [[ "$BINARY" == *.exe ]] && command -v winepath >/dev/null 2>&1; then
     SOAK_CACHE_DIR_VALUE=$(winepath -w "$SOAK_CACHE_DIR_HOST")
@@ -101,6 +154,7 @@ soak_cleanup() {
         cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-daemon.log" 2>/dev/null || true
     fi
     rm -rf -- "$SOAK_PROJECT" "$SOAK_CACHE_DIR_HOST"
+    [ -z "${SOAK_WIN_ROOT:-}" ] || rm -rf -- "$SOAK_WIN_ROOT"
 }
 
 trap soak_cleanup EXIT
@@ -488,6 +542,8 @@ sleep 3
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "FAIL: server did not start"
+    echo "--- server stderr (tail) ---"
+    tail -40 "$RESULTS_DIR/server-stderr.log" 2>/dev/null || echo "(no stderr captured)"
     exec 3>&- 4<&-
     rm -f "$SERVER_IN" "$SERVER_OUT"
     exit 1
@@ -496,6 +552,8 @@ echo "OK: server running (pid=$SERVER_PID)"
 
 if ! wait_for_diagnostics_snapshot; then
     echo "FAIL: daemon did not emit a usable diagnostics.start path"
+    echo "--- server stderr (tail) ---"
+    tail -40 "$RESULTS_DIR/server-stderr.log" 2>/dev/null || echo "(no stderr captured)"
     exec 3>&- 4<&-
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true

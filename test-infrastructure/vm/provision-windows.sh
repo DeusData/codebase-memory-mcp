@@ -56,6 +56,7 @@ vm() { # vm <env> <command...>
     "${SSH[@]}" "C:\\msys64\\msys2_shell.cmd -defterm -no-start -${env} -c \"set -e -o pipefail; $*\""
 }
 vm_cmd() { "${SSH[@]}" "$@"; } # plain cmd.exe
+vm_powershell() { cbm_vm_run_powershell "$1" "${SSH[@]}"; }
 
 step() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 
@@ -65,11 +66,12 @@ vm_cmd "echo VM_OK & ver" | grep -q VM_OK || {
     echo "Run windows-bootstrap.ps1 inside the VM first (see README.md)." >&2
     exit 1
 }
+cbm_vm_sync_windows_clock "${SSH[@]}"
 
 if [ "${1:-}" != "--update" ]; then
     step "1/6 msys2 base (skip if present)"
     if ! vm_cmd "if exist C:\\msys64\\usr\\bin\\bash.exe echo MSYS2_PRESENT" | grep -q MSYS2_PRESENT; then
-        vm_cmd "powershell -NoProfile -Command \"\$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '${MSYS2_SFX_URL}' -OutFile C:\\msys2.sfx.exe; \$actual=(Get-FileHash -LiteralPath C:\\msys2.sfx.exe -Algorithm SHA256).Hash.ToLowerInvariant(); if (\$actual -ne '${MSYS2_SFX_SHA256}') { Remove-Item -LiteralPath C:\\msys2.sfx.exe -Force; throw 'MSYS2 installer SHA-256 mismatch' }\""
+        vm_powershell "\$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol='Tls12'; Invoke-WebRequest -Uri '${MSYS2_SFX_URL}' -OutFile C:\\msys2.sfx.exe; \$actual=(Get-FileHash -LiteralPath C:\\msys2.sfx.exe -Algorithm SHA256).Hash.ToLowerInvariant(); if (\$actual -ne '${MSYS2_SFX_SHA256}') { Remove-Item -LiteralPath C:\\msys2.sfx.exe -Force; throw 'MSYS2 installer SHA-256 mismatch' }"
         vm_cmd "C:\\msys2.sfx.exe -y -oC:\\" >/dev/null
         vm_cmd "del C:\\msys2.sfx.exe"
         vm "msys" "pacman-key --init && pacman-key --populate msys2"
@@ -81,7 +83,7 @@ if [ "${1:-}" != "--update" ]; then
 
     step "3/6 toolchains: CLANGARM64 (native, fast) + CLANG64 (x86_64 = CI arch, ASan)"
     vm "msys" "pacman -S --noconfirm --noprogressbar --needed \
-        git make coreutils \
+        git make coreutils curl zip unzip \
         mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-zlib \
         mingw-w64-clang-aarch64-python mingw-w64-clang-aarch64-ccache \
         mingw-w64-clang-x86_64-clang mingw-w64-clang-x86_64-compiler-rt \
@@ -94,10 +96,10 @@ if [ "${1:-}" != "--update" ]; then
     NODE_VERSION="v22.23.1"
     NODE_SHA256="b470fdfe3502c05151656e06d495e3f47544f2ee8b1d9c8705090f2dd5996bd0"
     if ! vm_cmd "if exist C:\\node\\node.exe echo NODE_PRESENT" | grep -q NODE_PRESENT; then
-        vm_cmd "powershell -NoProfile -Command \"\$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-win-arm64.zip' -OutFile C:\\node.zip; \$actual=(Get-FileHash -LiteralPath C:\\node.zip -Algorithm SHA256).Hash.ToLowerInvariant(); if (\$actual -ne '${NODE_SHA256}') { Remove-Item C:\\node.zip; throw 'node SHA-256 mismatch' }; Expand-Archive -LiteralPath C:\\node.zip -DestinationPath C:\\; Move-Item C:\\node-${NODE_VERSION}-win-arm64 C:\\node; Remove-Item C:\\node.zip\""
+        vm_powershell "\$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-win-arm64.zip' -OutFile C:\\node.zip; \$actual=(Get-FileHash -LiteralPath C:\\node.zip -Algorithm SHA256).Hash.ToLowerInvariant(); if (\$actual -ne '${NODE_SHA256}') { Remove-Item C:\\node.zip; throw 'node SHA-256 mismatch' }; Expand-Archive -LiteralPath C:\\node.zip -DestinationPath C:\\; Move-Item C:\\node-${NODE_VERSION}-win-arm64 C:\\node; Remove-Item C:\\node.zip"
     fi
     if ! vm_cmd "if exist C:\\Windows\\System32\\vcruntime140.dll echo VCR_PRESENT" | grep -q VCR_PRESENT; then
-        vm_cmd "powershell -NoProfile -Command \"\$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.arm64.exe' -OutFile C:\\vc_redist.arm64.exe; \$sig = Get-AuthenticodeSignature C:\\vc_redist.arm64.exe; if (\$sig.Status -ne 'Valid') { throw 'vc_redist unsigned' }; Start-Process C:\\vc_redist.arm64.exe -ArgumentList '/install','/quiet','/norestart' -Wait; Remove-Item C:\\vc_redist.arm64.exe\""
+        vm_powershell "\$ProgressPreference='SilentlyContinue'; Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vc_redist.arm64.exe' -OutFile C:\\vc_redist.arm64.exe; \$sig = Get-AuthenticodeSignature C:\\vc_redist.arm64.exe; if (\$sig.Status -ne 'Valid') { throw 'vc_redist unsigned' }; Start-Process C:\\vc_redist.arm64.exe -ArgumentList '/install','/quiet','/norestart' -Wait; Remove-Item C:\\vc_redist.arm64.exe"
     fi
 fi
 

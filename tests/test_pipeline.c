@@ -7153,7 +7153,9 @@ TEST(pipeline_committed_counts_match_persisted) {
  * FIXED: the first futile cycle flips a shared flag; later pulls proceed with
  * the designed soft overshoot. Cycle count then can't exceed one cycle per
  * worker (workers already inside the gate when the flag flips) plus re-probes.
- * RED on the unfixed gate: cycles == file count (64) > cores+2.
+ * Four workers keep this semantic regression deterministic under TSan while
+ * still exercising the parallel path. RED on the unfixed gate: cycles == file
+ * count (64) > workers+2.
  * The counter (cbm_pp_bp_nap_cycles) makes this deterministic — no timing.
  *
  * The gate lives ONLY in the parallel extract path, so the fixture MUST exceed
@@ -7196,14 +7198,41 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     snprintf(db_path, sizeof(db_path), "%s/backpressure.db", g_tmpdir);
     cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+
+    /* This test measures the shared futility latch, not allocator scalability.
+     * High-core TSan runs can turn unrelated slab bookkeeping into an 18-way
+     * lock convoy. Four workers preserve the parallel semantic while making its
+     * bound host-independent. cbm_pipeline_run joins its workers before return,
+     * so restoring the process environment after freeing p cannot race them. */
+    enum { TEST_WORKERS = 4 };
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    if (old_workers && !saved_workers) {
+        cbm_mem_set_budget_for_tests(saved_budget);
+        cbm_pipeline_free(p);
+        teardown_test_repo();
+        FAIL("failed to save CBM_WORKERS");
+    }
+    if (cbm_setenv("CBM_WORKERS", "4", 1) != 0) {
+        free(saved_workers);
+        cbm_mem_set_budget_for_tests(saved_budget);
+        cbm_pipeline_free(p);
+        teardown_test_repo();
+        FAIL("failed to set CBM_WORKERS");
+    }
+
     int rc = cbm_pipeline_run(p);
     long cycles = cbm_pp_bp_nap_cycles();
 
     /* Restore the caller-visible budget BEFORE asserting. */
     cbm_mem_set_budget_for_tests(saved_budget);
     cbm_pipeline_free(p);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
     teardown_test_repo();
 
+    ASSERT_EQ(restore_workers_rc, 0);
     ASSERT_EQ(rc, 0);
     /* Engagement guard (anti-vacuous): the gate must have actually run — the
      * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
@@ -7214,7 +7243,7 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     }
     /* Futile napping must disengage: at most one in-flight cycle per worker
      * plus a small margin, never one per file (64). */
-    long bound = (long)cbm_system_info().total_cores + 2;
+    long bound = TEST_WORKERS + 2;
     if (cycles > bound) {
         char msg[128];
         snprintf(msg, sizeof(msg), "nap cycles %ld > bound %ld (gate re-paid per pull)", cycles,

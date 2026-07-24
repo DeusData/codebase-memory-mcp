@@ -78,6 +78,38 @@ for entrypoint in "$driver" "$provisioner"; do
         exit 1
     fi
 done
+if ! grep -Fq 'cbm_vm_sync_windows_clock()' \
+    "$ROOT/test-infrastructure/vm/ssh-common.sh"; then
+    echo "FAIL: Windows VM drivers need a shared, verified host-to-guest clock sync" >&2
+    exit 1
+fi
+clock_helper=$(sed -n '/^cbm_vm_sync_windows_clock() {$/,/^}$/p' \
+    "$ROOT/test-infrastructure/vm/ssh-common.sh")
+clock_retry_line=$(printf '%s\n' "$clock_helper" | grep -nF 'for attempt in 1 2 3; do' |
+    cut -d: -f1)
+clock_capture_line=$(printf '%s\n' "$clock_helper" |
+    grep -nF "host_utc=\"\$(date -u '+%Y-%m-%dT%H:%M:%SZ')\"" | cut -d: -f1)
+if [ -z "$clock_retry_line" ] || [ -z "$clock_capture_line" ] ||
+    [ "$clock_capture_line" -le "$clock_retry_line" ]; then
+    echo "FAIL: Windows VM clock sync must retry a bounded three times with a fresh host timestamp" >&2
+    exit 1
+fi
+for entrypoint in "$driver" "$provisioner"; do
+    if ! grep -Fq 'cbm_vm_sync_windows_clock "${SSH[@]}"' "$entrypoint"; then
+        echo "FAIL: Windows VM entry point must repair suspended-guest clock drift: $entrypoint" >&2
+        exit 1
+    fi
+done
+if ! grep -Fq 'cbm_vm_run_powershell()' \
+    "$ROOT/test-infrastructure/vm/ssh-common.sh" ||
+    [ "$(grep -c 'vm_powershell ' "$provisioner")" -lt 3 ]; then
+    echo "FAIL: Windows provisioning must transport PowerShell as UTF-16LE encoded commands" >&2
+    exit 1
+fi
+if grep -Fq 'powershell -NoProfile -Command' "$provisioner"; then
+    echo "FAIL: Windows provisioning must not expose PowerShell metacharacters to remote shell parsing" >&2
+    exit 1
+fi
 if ! grep -Fq "JOBS='\$(nproc)'" "$provisioner" ||
     ! grep -Fq 'make -j${JOBS}' "$provisioner"; then
     echo "FAIL: Windows VM provisioner must expand the remote core count exactly once" >&2

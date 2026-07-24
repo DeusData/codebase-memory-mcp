@@ -19,6 +19,9 @@ for required in \
     'SOAK_PROJECT_JSON=$(python3 -c' \
     'mcp_response_project()' \
     'PROJ_NAME=$(mcp_response_project "$MCP_LAST_RESPONSE")' \
+    'FAIL: soak DACL normalize' \
+    'FAIL: soak DACL stamp' \
+    'FAIL: soak child DACL reset' \
     'def handle_${i}(request):' \
     'trace_path "{\"project\":\"$PROJ_NAME\",\"function_name\":\"handle_1\",\"direction\":\"both\"}"' \
     'wait_for_daemon_stop "$DAEMON_STOP_COUNT"' \
@@ -30,6 +33,11 @@ for required in \
         exit 1
     fi
 done
+
+if grep -Fq 'WARN: soak DACL stamp failed' "$soak"; then
+    echo "FAIL: native-Windows soak must fail closed when its trusted-root DACL cannot be set" >&2
+    exit 1
+fi
 
 if grep -Fq '"repo_path":"$SOAK_PROJECT"' "$soak"; then
     echo "FAIL: soak must not send an unconverted host/MSYS project path to a Windows binary" >&2
