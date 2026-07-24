@@ -1006,6 +1006,44 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
 
+    /* VB.NET: `invocation` carries the callee in a `target` field (identifier
+     * or member_access); `new_expression` carries the constructed type in
+     * `type`. `Me.X()`/`MyClass.X()` are self-calls — strip the receiver so
+     * they resolve like bare same-class calls. Generic `(Of T)` suffixes are
+     * stripped from constructed types like the '<' strip elsewhere. */
+    if (lang == CBM_LANG_VISUALBASIC) {
+        if (strcmp(nk, "invocation") == 0) {
+            TSNode target = ts_node_child_by_field_name(node, TS_FIELD("target"));
+            if (!ts_node_is_null(target)) {
+                char *t = cbm_node_text(a, target, source);
+                if (t && t[0]) {
+                    if (strncmp(t, "Me.", 3) == 0 && strchr(t + 3, '.') == NULL) {
+                        return t + 3;
+                    }
+                    if (strncmp(t, "MyClass.", 8) == 0 && strchr(t + 8, '.') == NULL) {
+                        return t + 8;
+                    }
+                    return t;
+                }
+            }
+            return NULL;
+        }
+        if (strcmp(nk, "new_expression") == 0) {
+            TSNode ty = ts_node_child_by_field_name(node, TS_FIELD("type"));
+            if (!ts_node_is_null(ty)) {
+                char *t = cbm_node_text(a, ty, source);
+                if (t && t[0]) {
+                    char *paren = strchr(t, '(');
+                    if (paren) {
+                        *paren = '\0';
+                    }
+                    return t;
+                }
+            }
+            return NULL;
+        }
+    }
+
     /* Python dict-dispatch call `funcs["a"](v)`: the call's `function` field is a
      * subscript whose base is the identifier holding the dispatch table. Emit the
      * base identifier ("funcs") as the textual callee so a CALLS edge exists; the
