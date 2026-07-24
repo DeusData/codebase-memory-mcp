@@ -605,6 +605,9 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (!target_node || source_node->id == target_node->id) {
         return 0;
     }
+    if (cbm_pipeline_should_suppress_weak_noncallable_call_target(target_node, res.strategy)) {
+        return 0;
+    }
     if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
                              imp_vals, imp_count, tsjs_drop_plain_call) &&
         !cbm_service_pattern_is_global_fetch(call->callee_name)) {
