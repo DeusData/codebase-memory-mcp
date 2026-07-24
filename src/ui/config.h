@@ -21,8 +21,9 @@ typedef struct {
 /* Load config from disk. Missing/corrupt file → defaults. */
 void cbm_ui_config_load(cbm_ui_config_t *cfg);
 
-/* Save config to disk. Creates directory if needed. */
-void cbm_ui_config_save(const cbm_ui_config_t *cfg);
+/* Atomically save one complete config generation. Creates the directory if
+ * needed and reports write/sync/replace failures. */
+bool cbm_ui_config_save(const cbm_ui_config_t *cfg);
 
 /* Get the config file path. Writes to buf (up to bufsz bytes).
  * Exposed for testing. */

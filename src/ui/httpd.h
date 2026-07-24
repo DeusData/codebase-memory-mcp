@@ -7,8 +7,8 @@
  * Design constraints (deliberate — do not "improve" without reading this):
  *   - SINGLE-THREADED, sequential request handling. The routing layer
  *     (http_server.c) keeps per-request state in static buffers; a thread
- *     pool would break it. One stalled client can hold the loop for at most
- *     the receive deadline (default 5 s) — acceptable for a localhost tool.
+ *     pool would break it. Reads and writes have hard deadlines, and stop
+ *     interrupts the event-loop-owned active socket from another thread.
  *   - Binds 127.0.0.1 only (IPv4 loopback). Never any other interface.
  *   - Every response carries explicit Content-Length and "Connection: close";
  *     keep-alive is intentionally NOT implemented (smaller parsing surface;
@@ -37,19 +37,27 @@
 #define CBM_HTTP_MAX_BODY (1024 * 1024)
 /* Default per-connection receive deadline. */
 #define CBM_HTTP_RECV_DEADLINE_MS 5000
-
 typedef struct cbm_httpd cbm_httpd_t;         /* listener */
 typedef struct cbm_http_conn cbm_http_conn_t; /* accepted connection */
 
+/* Observable transport phase used by deterministic lifecycle tests. */
+typedef enum {
+    CBM_HTTPD_ACTIVITY_IDLE = 0,
+    CBM_HTTPD_ACTIVITY_READING_REQUEST = 1,
+    CBM_HTTPD_ACTIVITY_RESPONDING = 2,
+} cbm_httpd_activity_t;
+
 /* A parsed request. `path` and `query` are raw (NOT percent-decoded).
- * `origin` and `accept_language` are the header values consumed by the
- * routing layer ("" when absent). `body` is heap-allocated, NUL-terminated. */
+ * Selected headers are copied for the routing/security layer ("" when
+ * absent). `body` is heap-allocated and NUL-terminated. */
 typedef struct {
     char method[16];
     char path[2048];
     char query[2048];
+    unsigned char http_minor; /* 0 for HTTP/1.0, 1 for HTTP/1.1 */
     char origin[256];
     char host[256];
+    char content_type[128];
     char accept_language[256];
     char *body;
     size_t body_len;
@@ -67,7 +75,22 @@ int cbm_httpd_port(const cbm_httpd_t *d);
 /* Override the per-connection receive deadline (tests use short values). */
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms);
 
-void cbm_httpd_close(cbm_httpd_t *d);
+/* Interrupt the current accepted connection, if any. Safe from another
+ * thread; the event-loop thread retains close/free ownership. */
+void cbm_httpd_interrupt(cbm_httpd_t *d);
+
+/* Interrupt and free a quiescent listener. Returns false without freeing while
+ * an accepted connection still owns the listener; its event-loop owner must
+ * close that connection before the caller retries. */
+bool cbm_httpd_close(cbm_httpd_t *d);
+
+/* Snapshot the active connection phase under the listener lifecycle lock.
+ * This is an observation-only seam for deterministic concurrency tests. */
+cbm_httpd_activity_t cbm_httpd_activity_for_test(cbm_httpd_t *d);
+/* Caps SO_SNDBUF on subsequently accepted sockets so a non-reading peer
+ * produces a deterministic backpressure point on every platform. */
+void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes);
+void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms);
 
 /* ── Connection handling ──────────────────────────────────────── */
 
@@ -114,8 +137,7 @@ int cbm_http_parse_head(const char *data, size_t len, cbm_http_req_t *req, size_
                         size_t *content_length);
 
 /* Exact match, or prefix match when `pattern` ends with '*'.
- * Used for both route patterns ("/api/layout*", "/assets" + star) and the
- * CORS origin allow-list ("http://localhost:*", "http://127.0.0.1:*"). */
+ * Used by route patterns such as "/api/layout*" and "/assets" + star. */
 bool cbm_http_path_match(const char *str, const char *pattern);
 
 /* Extract a query parameter value, percent-decoded (%XX and '+' → space).

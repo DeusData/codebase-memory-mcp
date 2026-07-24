@@ -26,6 +26,7 @@ Usage:
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -82,6 +83,20 @@ def main():
             return 2
         print("control: search_graph finds %s in project %s" % (SYMBOL, name))
 
+        # Hooks are connect-only under the mandatory daemon: they never spawn
+        # one and fail open when none is active. Bring up a permanent daemon
+        # first — the supported way to keep hooks armed outside MCP sessions —
+        # and retire it afterwards (with a kill-by-pid backstop so a stuck stop
+        # can never hang CI).
+        start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
+        start_out = (start.stdout or b"").decode("utf-8", "replace")
+        print("daemon start rc=%d %r" % (start.returncode, start_out[:120]))
+        if start.returncode != 0:
+            print("SETUP FAIL: permanent daemon did not start")
+            return 2
+        pid_match = re.search(r"pid (\d+)", start_out)
+        daemon_pid = int(pid_match.group(1)) if pid_match else 0
+
         # Invoke hook-augment exactly as the installed PreToolUse hook does.
         payload = json.dumps({
             "hook_event_name": "PreToolUse",
@@ -89,7 +104,21 @@ def main():
             "cwd": repo_fwd,
             "tool_input": {"pattern": SYMBOL},
         }).encode("utf-8")
-        ha = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60)
+        try:
+            ha = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60)
+        finally:
+            stopped = False
+            try:
+                stop = run_cli(binary, cache, ["daemon", "stop"], timeout=30)
+                stopped = stop.returncode == 0
+            except subprocess.TimeoutExpired:
+                pass
+            if not stopped and daemon_pid:
+                subprocess.run(["taskkill" if os.name == "nt" else "kill",
+                                "/F" if os.name == "nt" else "-9",
+                                "/PID" if os.name == "nt" else str(daemon_pid)] +
+                               ([str(daemon_pid)] if os.name == "nt" else []),
+                               capture_output=True, timeout=30)
         out = (ha.stdout or b"").decode("utf-8", "replace").strip()
         print("hook-augment rc=%d stdout=%r" % (ha.returncode, out[:200]))
 

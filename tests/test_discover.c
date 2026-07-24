@@ -6,6 +6,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "discover/discover.h"
+#include "foundation/platform.h"
 
 typedef struct {
     char *home;
@@ -324,6 +325,73 @@ TEST(discover_simple) {
 
     cbm_discover_free(files, count);
     th_cleanup(base);
+    PASS();
+}
+
+/* A directory with more immediate subdirectories than the walk stack's
+ * initial capacity must still be fully discovered — dotnet/runtime's
+ * src/tests/JIT/Regression/JitBlue holds 855 sibling dirs and made the whole
+ * pipeline hard-fail with files=0 (walk_push_subdir treated the fixed cap as
+ * a hard error instead of growing). */
+TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack) {
+    char *base = th_mktempdir("cbm_disc_wide");
+    ASSERT(base != NULL);
+
+    enum { WIDE_SIBLINGS = 600 };
+    for (int i = 0; i < WIDE_SIBLINGS; i++) {
+        char rel[64];
+        (void)snprintf(rel, sizeof(rel), "wide/d%03d/f.py", i);
+        th_write_file(TH_PATH(base, rel), "x = 1\n");
+    }
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, WIDE_SIBLINGS);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+TEST(discover_bounded_count_is_allocation_free_and_limit_exact) {
+    char *base = th_mktempdir("cbm_disc_bounded");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "src/first.c"), "int first;\n");
+    th_write_file(TH_PATH(base, "src/second.py"), "second = 2\n");
+    th_write_file(TH_PATH(base, "src/ignored.png"), "not source\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    int limited_count = -1;
+    cbm_discover_status_t limited =
+        cbm_discover_count_bounded(base, &opts, 1, cbm_now_ms() + 2000, &limited_count);
+    int exact_count = -1;
+    cbm_discover_status_t exact =
+        cbm_discover_count_bounded(base, &opts, 2, cbm_now_ms() + 2000, &exact_count);
+
+    th_cleanup(base);
+    ASSERT_EQ(limited, CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT_EQ(limited_count, 1);
+    ASSERT_EQ(exact, CBM_DISCOVER_OK);
+    ASSERT_EQ(exact_count, 2);
+    PASS();
+}
+
+TEST(discover_bounded_count_fails_closed_after_deadline) {
+    char *base = th_mktempdir("cbm_disc_deadline");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "source.c"), "int source;\n");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    int count = 99;
+    cbm_discover_status_t status = cbm_discover_count_bounded(base, &opts, 100, 1, &count);
+
+    th_cleanup(base);
+    ASSERT_EQ(status, CBM_DISCOVER_ERROR);
+    ASSERT_EQ(count, -1);
     PASS();
 }
 
@@ -1090,8 +1158,10 @@ TEST(discover_git_info_exclude_stacks_with_gitignore) {
     bool found_log = false;
     bool found_scratch = false;
     for (int i = 0; i < count; i++) {
-        if (strstr(files[i].rel_path, ".log"))    found_log     = true;
-        if (strstr(files[i].rel_path, "scratch")) found_scratch = true;
+        if (strstr(files[i].rel_path, ".log"))
+            found_log = true;
+        if (strstr(files[i].rel_path, "scratch"))
+            found_scratch = true;
     }
     ASSERT_FALSE(found_log);
     ASSERT_FALSE(found_scratch);
@@ -1241,6 +1311,51 @@ TEST(discover_nested_gitignore_stacks_with_root) {
     PASS();
 }
 
+/* A repository may have one nested .gitignore per package. Ownership is
+ * cumulative across the walk, not bounded by the traversal depth, so more than
+ * 64 sibling matchers must remain valid for both full discovery and the
+ * allocation-free bounded count used by daemon auto-index admission. */
+TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership) {
+    enum { PACKAGE_COUNT = 65 };
+    char *base = th_mktempdir("cbm_disc_many_ngi");
+    ASSERT(base != NULL);
+
+    bool fixture_ready = true;
+    for (int i = 0; i < PACKAGE_COUNT; i++) {
+        char ignore_path[1024];
+        char source_path[1024];
+        int ignore_written =
+            snprintf(ignore_path, sizeof(ignore_path), "%s/package-%02d/.gitignore", base, i);
+        int source_written =
+            snprintf(source_path, sizeof(source_path), "%s/package-%02d/source.go", base, i);
+        fixture_ready = fixture_ready && ignore_written > 0 &&
+                        (size_t)ignore_written < sizeof(ignore_path) && source_written > 0 &&
+                        (size_t)source_written < sizeof(source_path) &&
+                        th_write_file(ignore_path, "ignored.tmp\n") == 0 &&
+                        th_write_file(source_path, "package fixture\n") == 0;
+    }
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int discover_rc = fixture_ready ? cbm_discover(base, &opts, &files, &count) : -1;
+    int bounded_count = -1;
+    cbm_discover_status_t bounded_status =
+        fixture_ready
+            ? cbm_discover_count_bounded(base, &opts, PACKAGE_COUNT + 1, 0, &bounded_count)
+            : CBM_DISCOVER_ERROR;
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(discover_rc, 0);
+    ASSERT_EQ(count, PACKAGE_COUNT);
+    ASSERT_EQ(bounded_status, CBM_DISCOVER_OK);
+    ASSERT_EQ(bounded_count, PACKAGE_COUNT);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
@@ -1314,6 +1429,9 @@ SUITE(discover) {
 
     /* Integration tests (cross-platform) */
     RUN_TEST(discover_simple);
+    RUN_TEST(discover_wide_sibling_fanout_exceeds_initial_walk_stack);
+    RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
+    RUN_TEST(discover_bounded_count_fails_closed_after_deadline);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);
@@ -1356,4 +1474,5 @@ SUITE(discover) {
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
+    RUN_TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership);
 }

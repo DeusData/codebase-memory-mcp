@@ -24,6 +24,9 @@ TOTAL=0
 # Temp directory for input files (avoids pipe/stdin issues with timeout)
 FUZZ_TMPDIR=$(mktemp -d)
 trap 'rm -rf "$FUZZ_TMPDIR"' EXIT
+FUZZ_HOME="$FUZZ_TMPDIR/home"
+FUZZ_CACHE="$FUZZ_TMPDIR/cache"
+mkdir -p "$FUZZ_HOME" "$FUZZ_CACHE"
 
 # Helper: send a payload to the MCP server and check it doesn't crash.
 # Uses temp file + perl alarm for portable timeout (works on macOS + Linux).
@@ -34,17 +37,24 @@ test_payload() {
 
     # Write session input to a temp file (avoids pipe/stdin issues)
     local tmpinput="$FUZZ_TMPDIR/input_${TOTAL}.jsonl"
-    printf '%s\n%s\n%s\n' \
+    local tmpoutput="$FUZZ_TMPDIR/output_${TOTAL}.jsonl"
+    local acknowledgement_id=$((900000 + TOTAL))
+    printf '%s\n%s\n%s\n%s\n' \
         '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"fuzz","version":"1.0"}}}' \
         '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-        "$payload" > "$tmpinput"
+        "$payload" \
+        "{\"jsonrpc\":\"2.0\",\"id\":$acknowledgement_id,\"method\":\"ping\",\"params\":{}}" \
+        > "$tmpinput"
 
     # Run with 10s timeout: GNU timeout → perl alarm fallback
     local ec=0
     if command -v timeout &>/dev/null; then
-        timeout 10 "$BINARY" < "$tmpinput" > /dev/null 2>&1 || ec=$?
+        HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
+            timeout 10 "$BINARY" < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
     else
-        perl -e 'alarm(10); exec @ARGV' -- "$BINARY" < "$tmpinput" > /dev/null 2>&1 || ec=$?
+        HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
+            perl -e 'alarm(10); exec @ARGV' -- "$BINARY" \
+            < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
     fi
 
     # Acceptable exits:
@@ -53,12 +63,41 @@ test_payload() {
     #   142 = SIGALRM (perl timeout — hung process, same as GNU timeout 124)
     #   124 = GNU timeout
     if [[ $ec -eq 0 || $ec -eq 141 ]]; then
-        PASS=$((PASS + 1))
+        if grep -Eq "\"id\"[[:space:]]*:[[:space:]]*$acknowledgement_id([^0-9]|$).*\"result\"[[:space:]]*:" \
+            "$tmpoutput"; then
+            PASS=$((PASS + 1))
+        else
+            echo "FAIL: $name — target exited before acknowledging payload processing"
+            FAIL=$((FAIL + 1))
+        fi
     elif [[ $ec -eq 124 || $ec -eq 142 ]]; then
         echo "FAIL: $name — timed out (hung for 10s)"
         FAIL=$((FAIL + 1))
     else
         echo "FAIL: $name — crashed with exit code $ec"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+# Mutating operations are session-owned and intentionally cancel on EOF. Keep
+# stdin open until the invalid-path response and a subsequent ping arrive so
+# this case tests robustness without racing the disconnect contract.
+test_invalid_index_interactive() {
+    local name="index nonexistent path"
+    TOTAL=$((TOTAL + 1))
+    local tmpoutput="$FUZZ_TMPDIR/output_${TOTAL}.jsonl"
+    local ec=0
+
+    HOME="$FUZZ_HOME" CBM_CACHE_DIR="$FUZZ_CACHE" \
+        python3 "$(dirname "$0")/test_mcp_interactive.py" "$BINARY" \
+        --scenario invalid-index --repo-path /nonexistent/path/abc123 \
+        --response-timeout 45 --exit-timeout 15 > "$tmpoutput" 2>&1 || ec=$?
+
+    if [[ $ec -eq 0 ]]; then
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL: $name — interactive session failed"
+        sed -n '1,20p' "$tmpoutput"
         FAIL=$((FAIL + 1))
     fi
 }
@@ -108,7 +147,7 @@ test_payload "path traversal in qualified_name" '{"jsonrpc":"2.0","id":2,"method
 test_payload "shell injection in file_pattern" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_code","arguments":{"pattern":"test","file_pattern":"*.py'\'' ; cat /etc/passwd #"}}}'
 
 # index_repository with non-existent path (should return error, not crash)
-test_payload "index nonexistent path" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"index_repository","arguments":{"repo_path":"/nonexistent/path/abc123"}}}'
+test_invalid_index_interactive
 
 # Negative/zero values for numeric params
 test_payload "negative limit" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"search_graph","arguments":{"name_pattern":"test","limit":-1}}}'

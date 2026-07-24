@@ -52,6 +52,7 @@ jobs:
     with:
       skip_perf: ${{ inputs.skip_perf }}
       broad_platforms: true
+      shard_suites: true
 
   # ── 3. Build all platforms ──────────────────────────────────────
   build:

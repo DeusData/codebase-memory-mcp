@@ -5549,6 +5549,121 @@ static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
 }
 
+/* Atomic-publish cancellation seam. Production invokes this hook after the
+ * staging database is complete, closed, and integrity-valid, but immediately
+ * before it can replace the last committed database. Keeping the hook on the
+ * pipeline instance avoids process-global failpoints and makes cancellation
+ * tests deterministic even when test runners gain concurrency. */
+extern void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+
+typedef struct {
+    const char *project;
+    const char *candidate;
+    char staging_path[768];
+    int calls;
+    bool staging_existed;
+    bool staging_was_valid;
+    int staged_candidates;
+} publish_cancel_ctx_t;
+
+typedef struct {
+    char staging_path[CBM_SZ_4K];
+    int calls;
+    bool staging_was_valid;
+} publish_observe_ctx_t;
+
+static void observe_publish_boundary(cbm_pipeline_t *p, const char *staging_path, void *arg) {
+    (void)p;
+    publish_observe_ctx_t *ctx = (publish_observe_ctx_t *)arg;
+    ctx->calls++;
+    if (!staging_path) {
+        return;
+    }
+    int n = snprintf(ctx->staging_path, sizeof(ctx->staging_path), "%s", staging_path);
+    if (n < 0 || (size_t)n >= sizeof(ctx->staging_path)) {
+        ctx->staging_path[0] = '\0';
+        return;
+    }
+    cbm_store_t *staging = cbm_store_open_path_existing(staging_path);
+    if (staging) {
+        ctx->staging_was_valid = cbm_store_check_integrity(staging);
+        cbm_store_close(staging);
+    }
+}
+
+typedef struct {
+    int calls;
+} publish_rename_fail_ctx_t;
+
+static int fail_publish_rename(const char *staging_path, const char *final_path, void *arg) {
+    publish_rename_fail_ctx_t *ctx = (publish_rename_fail_ctx_t *)arg;
+    ctx->calls++;
+    return staging_path && final_path ? CBM_NOT_FOUND : 0;
+}
+
+static bool pipeline_fixture_file_equals(const char *path, const char *expected) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    size_t expected_len = strlen(expected);
+    char actual[64];
+    size_t n = fread(actual, 1, sizeof(actual), f);
+    bool ok = n == expected_len && memcmp(actual, expected, expected_len) == 0 && fgetc(f) == EOF;
+    (void)fclose(f);
+    return ok;
+}
+
+static void cancel_at_publish_boundary(cbm_pipeline_t *p, const char *staging_path, void *arg) {
+    publish_cancel_ctx_t *ctx = (publish_cancel_ctx_t *)arg;
+    ctx->calls++;
+    if (staging_path && staging_path[0]) {
+        snprintf(ctx->staging_path, sizeof(ctx->staging_path), "%s", staging_path);
+        struct stat st;
+        ctx->staging_existed = stat(staging_path, &st) == 0;
+        if (ctx->staging_existed) {
+            cbm_store_t *staging = cbm_store_open_path(staging_path);
+            if (staging) {
+                ctx->staging_was_valid = cbm_store_check_integrity(staging);
+                ctx->staged_candidates = count_nodes_named(staging, ctx->project, ctx->candidate);
+                cbm_store_close(staging);
+            }
+        }
+    }
+    cbm_pipeline_cancel(p);
+}
+
+static bool sqlite_artifacts_absent(const char *db_path) {
+    struct stat st;
+    if (!db_path || !db_path[0] || stat(db_path, &st) == 0) {
+        return false;
+    }
+    char sidecar[832];
+    snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+    if (stat(sidecar, &st) == 0) {
+        return false;
+    }
+    snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+    if (stat(sidecar, &st) == 0) {
+        return false;
+    }
+    snprintf(sidecar, sizeof(sidecar), "%s-journal", db_path);
+    return stat(sidecar, &st) != 0;
+}
+
+static bool write_go_file(const char *dir, const char *name, const char *source) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    bool ok = fputs(source, f) >= 0;
+    fclose(f);
+    return ok;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  FastAPI Depends() edge tracking (PR #66, fix #27)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -5806,6 +5921,306 @@ TEST(incremental_new_file_added) {
     cleanup_incremental_repo();
     PASS();
 }
+
+/* Cancellation at the final publish boundary must never destroy the last good
+ * full index. Adding two files to the two-file baseline deliberately exceeds
+ * the incremental router's 1.5x file-count bound (4 > 2 + 2/2), forcing the
+ * full-reindex path while an existing committed DB is present. */
+TEST(cancelled_full_reindex_preserves_committed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    ASSERT_TRUE(cbm_store_check_integrity(live));
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    int baseline_helper = count_nodes_named(live, project, "Helper");
+    ASSERT_GT(baseline_nodes, 0);
+    ASSERT_GT(baseline_helper, 0);
+    ASSERT_EQ(count_nodes_named(live, project, "CandidateFull"), 0);
+    cbm_store_close(live);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "candidate_full.go",
+                              "package main\n\nfunc CandidateFull() int { return 41 }\n"));
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "force_full.go",
+                              "package main\n\nfunc ForceFullRoute() int { return 42 }\n"));
+
+    publish_cancel_ctx_t hook = {
+        .project = project,
+        .candidate = "CandidateFull",
+    };
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, cancel_at_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    int helper_after = count_nodes_named(live, project, "Helper");
+    int published_candidates = count_nodes_named(live, project, "CandidateFull");
+    cbm_store_close(live);
+    bool staging_cleaned = sqlite_artifacts_absent(hook.staging_path);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(hook.staging_existed);
+    ASSERT_TRUE(hook.staging_was_valid);
+    ASSERT_GT(hook.staged_candidates, 0); /* anti-vacuous: new full output was staged */
+    ASSERT_EQ(rc, -1);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    ASSERT_EQ(helper_after, baseline_helper);
+    ASSERT_EQ(published_candidates, 0);
+    ASSERT_TRUE(staging_cleaned);
+    PASS();
+}
+
+/* The same contract applies to the incremental path: the modified file is
+ * present in a complete staging DB at the hook, but cancellation leaves the
+ * prior committed snapshot queryable and removes every staging artifact. */
+TEST(cancelled_incremental_reindex_preserves_committed_db) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    ASSERT_TRUE(cbm_store_check_integrity(live));
+    int baseline_nodes = cbm_store_count_nodes(live, project);
+    int baseline_helper = count_nodes_named(live, project, "Helper");
+    ASSERT_GT(baseline_nodes, 0);
+    ASSERT_GT(baseline_helper, 0);
+    ASSERT_EQ(count_nodes_named(live, project, "CandidateIncremental"), 0);
+    cbm_store_close(live);
+
+    ASSERT_TRUE(write_go_file(g_incr_tmpdir, "helper.go",
+                              "package main\n\n"
+                              "func Helper() string { return \"hello\" }\n\n"
+                              "func CandidateIncremental() int { return 43 }\n"));
+
+    publish_cancel_ctx_t hook = {
+        .project = project,
+        .candidate = "CandidateIncremental",
+    };
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, cancel_at_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    live = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(live);
+    bool live_valid = cbm_store_check_integrity(live);
+    int nodes_after = cbm_store_count_nodes(live, project);
+    int helper_after = count_nodes_named(live, project, "Helper");
+    int published_candidates = count_nodes_named(live, project, "CandidateIncremental");
+    cbm_store_close(live);
+    bool staging_cleaned = sqlite_artifacts_absent(hook.staging_path);
+
+    free(project);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(hook.staging_existed);
+    ASSERT_TRUE(hook.staging_was_valid);
+    ASSERT_GT(hook.staged_candidates, 0); /* anti-vacuous: changed output was staged */
+    ASSERT_EQ(rc, -1);
+    ASSERT_TRUE(live_valid);
+    ASSERT_EQ(nodes_after, baseline_nodes);
+    ASSERT_EQ(helper_after, baseline_helper);
+    ASSERT_EQ(published_candidates, 0);
+    ASSERT_TRUE(staging_cleaned);
+    PASS();
+}
+
+TEST(backup_failed_publish_failure_preserves_final_sidecars) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char final_path[512];
+    char wal_path[544];
+    char shm_path[544];
+    char journal_path[544];
+    snprintf(final_path, sizeof(final_path), "%s/blocked.db", g_incr_tmpdir);
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", final_path);
+    snprintf(shm_path, sizeof(shm_path), "%s-shm", final_path);
+    snprintf(journal_path, sizeof(journal_path), "%s-journal", final_path);
+
+    /* Invalid SQLite makes backup fail. The live sidecars may contain the only
+     * recoverable state, so the rebuilt generation must be refused without
+     * changing any member of the old database family. */
+    ASSERT_EQ(th_write_file(final_path, "corrupt-main"), 0);
+    ASSERT_EQ(th_write_file(wal_path, "live-wal"), 0);
+    ASSERT_EQ(th_write_file(shm_path, "live-shm"), 0);
+    ASSERT_EQ(th_write_file(journal_path, "live-journal"), 0);
+
+    publish_observe_ctx_t hook = {0};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main");
+    bool wal_preserved = pipeline_fixture_file_equals(wal_path, "live-wal");
+    bool shm_preserved = pipeline_fixture_file_equals(shm_path, "live-shm");
+    bool journal_preserved = pipeline_fixture_file_equals(journal_path, "live-journal");
+
+    (void)cbm_unlink(final_path);
+    (void)cbm_unlink(wal_path);
+    (void)cbm_unlink(shm_path);
+    (void)cbm_unlink(journal_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(hook.staging_was_valid);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(final_preserved);
+    ASSERT_TRUE(wal_preserved);
+    ASSERT_TRUE(shm_preserved);
+    ASSERT_TRUE(journal_preserved);
+    PASS();
+}
+
+TEST(backup_failed_rename_failure_preserves_corrupt_main) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char final_path[512];
+    snprintf(final_path, sizeof(final_path), "%s/corrupt.db", g_incr_tmpdir);
+    ASSERT_EQ(th_write_file(final_path, "corrupt-main-before-rename"), 0);
+
+    publish_observe_ctx_t observe = {0};
+    publish_rename_fail_ctx_t rename_fail = {0};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &observe);
+    cbm_pipeline_set_rename_hook_for_tests(p, fail_publish_rename, &rename_fail);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main-before-rename");
+    (void)cbm_unlink(final_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(observe.calls, 1);
+    ASSERT_TRUE(observe.staging_was_valid);
+    ASSERT_EQ(rename_fail.calls, 1);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(final_preserved);
+    PASS();
+}
+
+#ifdef __linux__
+static void cleanup_long_db_fixture(char *deep_dir, const char *root, const char *db_path,
+                                    const char *staging_path) {
+    (void)cbm_unlink(db_path);
+    (void)cbm_remove_db_sidecars(db_path);
+
+    /* The unfixed full-dump path writes to the first 1023 bytes of the
+     * staging name. Remove that sibling so the RED test cleans up after
+     * itself as well as the fixed implementation. */
+    if (staging_path && strlen(staging_path) >= CBM_SZ_1K) {
+        char truncated[CBM_SZ_1K];
+        memcpy(truncated, staging_path, sizeof(truncated) - 1);
+        truncated[sizeof(truncated) - 1] = '\0';
+        (void)cbm_unlink(truncated);
+        (void)cbm_remove_db_sidecars(truncated);
+    }
+
+    size_t root_len = strlen(root);
+    while (strlen(deep_dir) > root_len) {
+        (void)cbm_rmdir(deep_dir);
+        char *slash = strrchr(deep_dir, '/');
+        if (!slash) {
+            break;
+        }
+        *slash = '\0';
+    }
+    (void)cbm_rmdir(root);
+}
+
+TEST(full_reindex_preserves_exact_long_db_path) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    char *created_root = th_mktempdir("cbm_long_db");
+    ASSERT_NOT_NULL(created_root);
+    char root[256];
+    snprintf(root, sizeof(root), "%s", created_root);
+
+    char deep_dir[1600];
+    snprintf(deep_dir, sizeof(deep_dir), "%s", root);
+    static const char component[] =
+        "/segment_abcdefghijklmnopqrstuvwxyz_ABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789";
+    while (strlen(deep_dir) < 1100) {
+        size_t used = strlen(deep_dir);
+        ASSERT_TRUE(used + sizeof(component) < sizeof(deep_dir));
+        memcpy(deep_dir + used, component, sizeof(component));
+    }
+    ASSERT_TRUE(cbm_mkdir_p(deep_dir, 0755));
+
+    char db_path[1600];
+    int db_n = snprintf(db_path, sizeof(db_path), "%s/graph.db", deep_dir);
+    ASSERT_TRUE(db_n > CBM_SZ_1K && (size_t)db_n < sizeof(db_path));
+
+    publish_observe_ctx_t hook = {0};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &hook);
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    int node_count = -1;
+    cbm_store_t *published = rc == 0 ? cbm_store_open_path_existing(db_path) : NULL;
+    if (published) {
+        node_count = cbm_store_count_nodes(published, project);
+        cbm_store_close(published);
+    }
+    bool stray_truncated_db = false;
+    if (strlen(hook.staging_path) >= CBM_SZ_1K) {
+        char truncated[CBM_SZ_1K];
+        memcpy(truncated, hook.staging_path, sizeof(truncated) - 1);
+        truncated[sizeof(truncated) - 1] = '\0';
+        stray_truncated_db = access(truncated, F_OK) == 0;
+    }
+
+    free(project);
+    cleanup_long_db_fixture(deep_dir, root, db_path, hook.staging_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(hook.calls, 1);
+    ASSERT_TRUE(strlen(hook.staging_path) >= CBM_SZ_1K);
+    ASSERT_EQ(rc, 0);
+    ASSERT_GT(node_count, 0);
+    ASSERT_FALSE(stray_truncated_db);
+    PASS();
+}
+#endif
 
 TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
@@ -7095,6 +7510,13 @@ SUITE(pipeline) {
     RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
+    RUN_TEST(cancelled_full_reindex_preserves_committed_db);
+    RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
+    RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
+    RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);
+#ifdef __linux__
+    RUN_TEST(full_reindex_preserves_exact_long_db_path);
+#endif
     RUN_TEST(incremental_fast_preserves_mode_skipped_tools_dir);
     RUN_TEST(incremental_k8s_manifest_indexed);
     RUN_TEST(incremental_kustomize_module_indexed);
