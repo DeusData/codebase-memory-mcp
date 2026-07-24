@@ -2469,6 +2469,28 @@ TEST(cypher_exec_count_star) {
     PASS();
 }
 
+/* #1111: type(r) grouped with count(*) must return the actual relationship type,
+ * not the row count. ret_agg_build_key/ret_agg_emit_row classified aggregate vs.
+ * scalar columns with a bare `item->func` truthy check, so type(r) (a non-aggregate
+ * function, func != NULL) was misrouted into the aggregate-value branch and
+ * formatted via format_agg_value's default case, silently substituting the row
+ * count for the relationship type. */
+TEST(cypher_issue1111_return_type_count_group) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (a)-[r]->(b) RETURN type(r) AS t, count(*) AS n ORDER BY n DESC", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "CALLS");
+    ASSERT_STR_EQ(r.rows[0][1], "3");
+    ASSERT_STR_EQ(r.rows[1][0], "DEFINES");
+    ASSERT_STR_EQ(r.rows[1][1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_skip) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -2648,6 +2670,51 @@ TEST(cypher_exec_with_node_groupvar_prop) {
     ASSERT_EQ(r.row_count, 1);
     ASSERT_STR_EQ(r.rows[0][0], "validate.go"); /* was "" before the fix */
     ASSERT_STR_EQ(r.rows[0][1], "ValidateOrder");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1111, WITH variant: the same misrouting in with_agg_build_key/with_agg_accumulate/
+ * execute_with_aggregate's per-column func check. */
+TEST(cypher_issue1111_with_type_count_group) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s,
+        "MATCH (a)-[r]->(b) WITH type(r) AS t, count(*) AS n RETURN t, n ORDER BY n DESC",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(r.rows[0][0], "CALLS");
+    ASSERT_STR_EQ(r.rows[0][1], "3");
+    ASSERT_STR_EQ(r.rows[1][0], "DEFINES");
+    ASSERT_STR_EQ(r.rows[1][1], "1");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #1111 follow-up (review from DeusData on #1221): with_agg_find_or_create's
+ * bare-node-carry check only tested `!property && variable`, so an entity-
+ * introspection alias like `labels(f) AS l` (variable set, property NULL, func
+ * set) was ALSO tagged with the source node's id. A later `l.file_path` then
+ * hit node_prop's stub re-fetch heuristic (id set, file_path/label both NULL on
+ * the virtual stub) and silently returned HandleOrder's real file_path instead
+ * of "" for the non-node alias `l`. */
+TEST(cypher_issue1111_with_scalar_func_alias_no_node_leak) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) WHERE f.name = \"HandleOrder\" "
+                                "WITH labels(f) AS l, COUNT(*) AS c "
+                                "RETURN l, l.file_path, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "[\"Function\"]");
+    ASSERT_STR_EQ(r.rows[0][1], ""); /* was "handler.go" before the fix */
+    ASSERT_STR_EQ(r.rows[0][2], "1");
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
@@ -3301,6 +3368,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_max);
     RUN_TEST(cypher_exec_collect);
     RUN_TEST(cypher_exec_count_star);
+    RUN_TEST(cypher_issue1111_return_type_count_group);
     RUN_TEST(cypher_parse_skip);
     RUN_TEST(cypher_parse_sum_avg);
     RUN_TEST(cypher_parse_collect);
@@ -3314,6 +3382,8 @@ SUITE(cypher) {
     /* Phase 6: WITH clause */
     RUN_TEST(cypher_exec_with_rename);
     RUN_TEST(cypher_exec_with_count);
+    RUN_TEST(cypher_issue1111_with_type_count_group);
+    RUN_TEST(cypher_issue1111_with_scalar_func_alias_no_node_leak);
     RUN_TEST(cypher_exec_with_node_groupvar_prop);
     RUN_TEST(cypher_exec_with_where);
     RUN_TEST(cypher_exec_with_orderby_limit);
