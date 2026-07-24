@@ -65,9 +65,20 @@ CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
 EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
-	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1
-CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
+	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1
+# The build system is the single source of truth for "is this binary
+# instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
+# clang's feature-check spelling and every non-ASan sanitizer, so the
+# trap-UBSan leg once ran NATIVE timing budgets on an instrumented
+# binary. Any non-empty SANITIZE ⇒ sanitized budgets everywhere.
+ifneq ($(strip $(SANITIZE)),)
+SANITIZED_DEFINE = -DCBM_SANITIZED_BUILD=1
+else
+SANITIZED_DEFINE =
+endif
+CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer
@@ -78,12 +89,13 @@ CXXFLAGS_TSAN = $(CXXFLAGS_COMMON) -g -O1 \
 
 # Windows needs ws2_32 (Winsock), psapi (GetProcessMemoryInfo), shell32
 # (CommandLineToArgvW — the UTF-8 argv path in main.c, #423/#20), and
+# advapi32 (owner-only activation-candidate ACLs), plus
 # --allow-multiple-definition (MinGW CRT symbol clashes).
 # Auto-detected via compiler; no manual override needed.
 IS_MINGW := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q 'define _WIN32 ' && echo yes || echo no)
 WIN32_LIBS :=
 ifeq ($(IS_MINGW),yes)
-WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
+WIN32_LIBS := -lws2_32 -lpsapi -lshell32 -ladvapi32 -Wl,--allow-multiple-definition -Wl,--stack,8388608 -static
 endif
 
 # STATIC=1 produces a fully static binary (for Alpine/musl portable builds)
@@ -117,7 +129,10 @@ FOUNDATION_SRCS = \
     src/foundation/dump_verify.c \
     src/foundation/limits.c \
     src/foundation/subprocess.c \
-    src/foundation/sha256.c
+    src/foundation/sha256.c \
+    src/foundation/macos_acl.c \
+    src/foundation/private_file_lock.c \
+    src/foundation/lock_registry.c
 
 # Existing extraction C code (compiled from current location)
 EXTRACTION_SRCS = \
@@ -156,6 +171,13 @@ LSP_UNITY_DEPS = $(CBM_DIR)/lsp_all.c \
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
+TS_RUNTIME_DEPS = \
+	$(TS_RUNTIME_SRC) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/include/tree_sitter/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/*.c) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/portable/*.h) \
+	$(wildcard $(CBM_DIR)/vendored/ts_runtime/src/unicode/*.h)
 
 # All 64 grammar shim files
 GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
@@ -180,6 +202,19 @@ CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
 MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+
+# Shared MCP daemon coordination and local transport
+DAEMON_SRCS = \
+    src/daemon/daemon.c \
+    src/daemon/project_lock.c \
+    src/daemon/version_cohort.c \
+    src/daemon/service.c \
+    src/daemon/runtime.c \
+    src/daemon/application.c \
+    src/daemon/frontend.c \
+    src/daemon/host.c \
+    src/daemon/bootstrap.c \
+    src/daemon/ipc.c
 
 # Discover module (new)
 DISCOVER_SRCS = \
@@ -245,7 +280,12 @@ GIT_SRCS = src/git/git_context.c
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
-	src/cli/config_text_edit.c
+	src/cli/config_text_edit.c src/cli/activation_transaction.c \
+	src/cli/windows_launcher_state.c
+
+# Tiny permanent Windows launcher.  It deliberately links only the stable
+# launcher-state module and Windows SDK libraries, never the parser/indexer.
+WINDOWS_LAUNCHER_SRC = src/launcher/windows_launcher.c
 
 # UI module (graph visualization)
 UI_SRCS = \
@@ -304,7 +344,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -319,8 +359,11 @@ TEST_FOUNDATION_SRCS = \
     tests/test_log.c \
     tests/test_str_util.c \
     tests/test_platform.c \
+    tests/test_diagnostics.c \
     tests/test_dump_verify.c \
-    tests/test_subprocess.c
+    tests/test_subprocess.c \
+    tests/test_private_file_lock.c \
+    tests/test_lock_registry.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -346,7 +389,19 @@ TEST_CYPHER_SRCS = \
     tests/test_cypher.c
 
 TEST_MCP_SRCS = \
-    tests/test_mcp.c
+    tests/test_mcp.c \
+    tests/test_index_supervisor.c
+
+TEST_DAEMON_SRCS = \
+    tests/test_daemon.c \
+    tests/test_project_lock.c \
+    tests/test_version_cohort.c \
+    tests/test_daemon_version.c \
+    tests/test_daemon_runtime.c \
+    tests/test_daemon_application.c \
+    tests/test_daemon_frontend.c \
+    tests/test_daemon_bootstrap.c \
+    tests/test_daemon_ipc.c
 
 TEST_DISCOVER_SRCS = \
     tests/test_language.c \
@@ -357,7 +412,7 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
+TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -403,7 +458,9 @@ TEST_TRACES_SRCS = tests/test_traces.c
 
 TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_config_json_like.c \
-	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c
+	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
+	tests/test_activation_transaction.c \
+	tests/test_windows_launcher_state.c
 
 TEST_MEM_SRCS = tests/test_mem.c
 
@@ -485,7 +542,7 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -513,7 +570,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-launcher cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -531,7 +588,7 @@ test-foundation: $(BUILD_DIR)/test-foundation
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
-$(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+$(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
 $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
@@ -543,7 +600,7 @@ $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
-$(BUILD_DIR)/tsan_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+$(BUILD_DIR)/tsan_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
 $(BUILD_DIR)/tsan_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
@@ -669,7 +726,29 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
 
-TEST_TSAN_SUITES ?= mem slab_alloc parallel
+# Every threaded production surface that runs clean AND stable under TSan:
+# allocator concurrency (mem, slab_alloc), the parallel extraction worker pool
+# (parallel, worker_pool, pipeline), the filesystem watcher (watcher), the
+# embedded HTTP server (httpd), diagnostics sampling (diagnostics), the MCP
+# server + mutation guard (mcp, mcp_mutation_guard), subprocess supervision
+# (subprocess), and the runnable daemon-coordination paths (daemon,
+# daemon_application). Was `mem slab_alloc parallel` — a keyhole that ran TSan
+# over no real threaded production code.
+#
+# Deliberately EXCLUDED (documented, not forgotten):
+#   daemon_runtime   — deadlocks under TSan: it forks after going
+#                      multi-threaded and the child re-enters the runtime, a
+#                      combination TSan's runtime does not support (hangs).
+#   daemon_ipc       — a TEST-harness data race (a helper thread writes a
+#                      main-thread stack slot without synchronization,
+#                      test_daemon_ipc.c:2088); production IPC is not implicated.
+#   daemon_frontend  — TEST-harness thread leaks (fixture threads left unjoined,
+#                      test_daemon_frontend.c:698) plus a fork-under-TSan fixture
+#                      failure. Test-quality work, tracked separately.
+# Re-enabling these three needs test-harness synchronization + a TSan-fork
+# strategy; it is out of scope for the current sanitizer-coverage pass.
+TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
+                    diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
 TSAN_OPTIONS ?= halt_on_error=1
 
 $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR)
@@ -682,6 +761,12 @@ $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
 	cd $(CURDIR) && TSAN_OPTIONS="$(TSAN_OPTIONS)" $(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
 
+# Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
+# an explicit Make invocation requires a clean rendezvous and fails rather than
+# silently skipping an occupied one. Deterministic C tests cover Windows IPC.
+test-daemon-smoke: $(BUILD_DIR)/codebase-memory-mcp
+	cd $(CURDIR) && CBM_DAEMON_SMOKE_REQUIRE_RUN=1 python3 tests/test_daemon_smoke.py $(BUILD_DIR)/codebase-memory-mcp
+
 # ── Production binary ────────────────────────────────────────────
 
 # Grammar/TS/LSP objects for production (compiled with relaxed warnings, -O2)
@@ -693,7 +778,7 @@ PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
-$(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
@@ -718,6 +803,26 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
+WINDOWS_LAUNCHER_TARGET :=
+ifeq ($(IS_MINGW),yes)
+WINDOWS_LAUNCHER_TARGET := $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
+endif
+
+# Keep the explicit .exe target even on non-Windows hosts: packaging contracts
+# and native-Windows invocations share this single artifact name.  A non-Windows
+# direct invocation builds a diagnostic stub and is not part of `cbm`.
+$(BUILD_DIR)/codebase-memory-mcp-launcher.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -o $@ \
+		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
+		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
+
+# Native-Windows compatibility fixture: its launcher ABI intentionally does
+# not fit the production payload's default [1,1] range.  It is never packaged.
+$(BUILD_DIR)/codebase-memory-mcp-launcher-abi2.exe: $(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c src/cli/windows_launcher_state.h | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) -DCBM_WINDOWS_LAUNCHER_ABI_CURRENT=2 -o $@ \
+		$(WINDOWS_LAUNCHER_SRC) src/cli/windows_launcher_state.c \
+		$(if $(filter yes,$(IS_MINGW)),-municode -lbcrypt $(WIN32_LIBS),)
+
 $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
@@ -725,8 +830,11 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
-cbm: $(BUILD_DIR)/codebase-memory-mcp
+cbm: $(BUILD_DIR)/codebase-memory-mcp $(WINDOWS_LAUNCHER_TARGET)
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
+
+cbm-launcher: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe
+	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp-launcher.exe"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
@@ -743,7 +851,7 @@ frontend:
 embed: frontend
 	scripts/embed-frontend.sh graph-ui/dist $(BUILD_DIR)/embedded
 
-cbm-with-ui: embed $(OBJS_VENDORED_PROD)
+cbm-with-ui: embed $(OBJS_VENDORED_PROD) $(WINDOWS_LAUNCHER_TARGET)
 	$(CC) $(CFLAGS_PROD) -o $(BUILD_DIR)/codebase-memory-mcp \
 		$(MAIN_SRC) $(PROD_SRCS_WITH_ASSETS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -752,8 +860,9 @@ cbm-with-ui: embed $(OBJS_VENDORED_PROD)
 		$(LDFLAGS)
 	@echo "Built with UI: $(BUILD_DIR)/codebase-memory-mcp"
 
+clean-c: export BUILD_DIR := $(BUILD_DIR)
 clean-c:
-	rm -rf $(BUILD_DIR)
+	@bash -c 'source scripts/path-safety.sh && cbm_remove_build_dir "$$PWD" "$$BUILD_DIR"'
 
 # ── Linting ─────────────────────────────────────────────────────
 
@@ -769,10 +878,10 @@ SYSROOT = $(shell xcrun --show-sdk-path 2>/dev/null)
 SYSROOT_FLAG = $(if $(SYSROOT),-isysroot $(SYSROOT),)
 
 # Our source files (excluding vendored, grammars, tree-sitter runtime)
-LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) \
+LINT_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) \
             $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) \
             $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
-            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC)
+            $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(MAIN_SRC) $(WINDOWS_LAUNCHER_SRC)
 LINT_HDRS = $(wildcard src/**/*.h src/*.h $(CBM_DIR)/*.h)
 LINT_TEST_SRCS = $(ALL_TEST_SRCS)
 

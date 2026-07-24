@@ -17,6 +17,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "discover/discover.h" /* cbm_ignored_file_t (#963) */
 
@@ -60,6 +61,12 @@ int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
+
+/* Bind cancellation to a caller-owned atomic flag. The flag must outlive the
+ * pipeline and should be initialized before binding. This lets a long-lived
+ * daemon request cancellation without retaining/dereferencing a pipeline
+ * pointer that its request thread may concurrently retire. */
+void cbm_pipeline_bind_cancel_flag(cbm_pipeline_t *p, atomic_int *cancelled);
 
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */

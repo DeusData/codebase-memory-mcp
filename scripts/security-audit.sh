@@ -58,22 +58,51 @@ while IFS= read -r file; do
     done
 done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 
-# ── 1b. Raw network calls (must not exist) ──────────────────────
+# ── 1b. Raw network calls (count-bounded explicit exceptions) ───
 #
 # The graph-UI HTTP server (src/ui/httpd.c) is the one component that owns a
 # listening socket. It is first-party, binds 127.0.0.1 only, and is audited
 # separately by scripts/security-ui.sh (binding + CORS checks), so it is
-# exempt from this scan. No other source file may make raw network calls.
+# exempt from this scan. The coordination transport may use only explicitly
+# count-bounded AF_UNIX calls recorded in the security allow-list.
 
 echo ""
-echo "--- Scanning for raw network calls (must not exist) ---"
+echo "--- Scanning for raw network calls ---"
 
-NETWORK_FUNCS='[^a-z_]connect\(|[^a-z_]socket\(|[^a-z_]sendto\('
-if grep -rn -E "$NETWORK_FUNCS" "$ROOT/src/" --include='*.c' 2>/dev/null | grep -v '^\s*//' | grep -v '^\s*\*' | grep -v 'test' | grep -v 'src/ui/httpd.c'; then
-    echo "BLOCKED: Raw network calls found in src/."
-    fail
-else
-    echo "OK: No raw network calls outside the graph-UI server."
+NETWORK_OK=true
+while IFS= read -r file; do
+    relfile="${file#"$ROOT/"}"
+    [[ "$relfile" == "src/ui/httpd.c" ]] && continue
+    for func in socket connect sendto; do
+        matches=$(grep -n -E "[^a-z_]${func}\\(" "$file" 2>/dev/null \
+            | grep -v '^\s*//' | grep -v '^\s*\*' || true)
+        [[ -z "$matches" ]] && continue
+        actual_count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+        allowance=$(grep -E "^NETWORK:${relfile}:${func}:[0-9]+:" \
+            "$ALLOWLIST" 2>/dev/null || true)
+        allowance_count=$(printf '%s\n' "$allowance" | grep -c . || true)
+        expected_count=$(printf '%s\n' "$allowance" | cut -d: -f4)
+        semantic_ok=true
+        if [[ "$func" == "socket" ]] &&
+           printf '%s\n' "$matches" | grep -v 'socket(AF_UNIX' >/dev/null; then
+            semantic_ok=false
+        fi
+        if [[ "$allowance_count" != "1" ||
+              "$actual_count" != "$expected_count" ||
+              "$semantic_ok" != "true" ]]; then
+            echo "BLOCKED: ${relfile}: unexpected raw ${func}() surface"
+            echo "  expected=${expected_count:-none} actual=${actual_count} semantic_ok=${semantic_ok}"
+            printf '%s\n' "$matches" | sed 's/^/  /'
+            fail
+            NETWORK_OK=false
+        else
+            echo "REVIEWED: ${relfile}: ${actual_count} count-bounded ${func}() call(s)"
+        fi
+    done
+done < <(find "$ROOT/src" -name '*.c' -type f | sort)
+
+if $NETWORK_OK; then
+    echo "OK: Raw network calls are absent or explicitly count-bounded."
 fi
 
 # ── 2. Hardcoded URLs in string literals ─────────────────────────
@@ -170,20 +199,32 @@ echo ""
 echo "--- Scanning for unexpected file writes in src/ ---"
 
 FOPEN_FOUND=false
-while IFS= read -r match; do
-    [[ -z "$match" ]] && continue
-    file=$(echo "$match" | cut -d: -f1)
+while IFS= read -r file; do
     relfile="${file#"$ROOT/"}"
+    matches=$(grep -n 'fopen.*"w' "$file" 2>/dev/null \
+        | grep -v '^\s*//' || true)
+    [[ -z "$matches" ]] && continue
     case "$relfile" in
         src/cli/cli.c|src/store/store.c|src/pipeline/*.c|src/foundation/log.c|src/foundation/diagnostics.c|src/ui/http_server.c|src/ui/config.c|src/mcp/mcp.c)
             ;; # Known safe (diagnostics.c: atomic .tmp+rename metrics dump to configured path)
         *)
-            echo "REVIEW: ${match}"
-            echo "  -> Unexpected fopen(\"w\") in ${relfile}"
-            FOPEN_FOUND=true
+            actual_count=$(printf '%s\n' "$matches" | wc -l | tr -d ' ')
+            allowance=$(grep -E "^WRITE:${relfile}:[0-9]+:" \
+                "$ALLOWLIST" 2>/dev/null || true)
+            allowance_count=$(printf '%s\n' "$allowance" | grep -c . || true)
+            expected_count=$(printf '%s\n' "$allowance" | cut -d: -f3)
+            if [[ "$allowance_count" != "1" ||
+                  "$actual_count" != "$expected_count" ]]; then
+                echo "REVIEW: ${relfile}: unexpected fopen(\"w\") surface"
+                echo "  expected=${expected_count:-none} actual=${actual_count}"
+                printf '%s\n' "$matches" | sed 's/^/  /'
+                FOPEN_FOUND=true
+            else
+                echo "REVIEWED: ${relfile}: ${actual_count} count-bounded private write(s)"
+            fi
             ;;
     esac
-done < <(grep -rn 'fopen.*"w' "$ROOT/src/" --include='*.c' 2>/dev/null | grep -v '/test' | grep -v '^\s*//' || true)
+done < <(find "$ROOT/src" -name '*.c' -type f | sort)
 
 if ! $FOPEN_FOUND; then
     echo "OK: All file writes are in expected locations."
@@ -247,10 +288,10 @@ if [ -f "$MCP_FILE" ]; then
     # - HTTP transport: reads the incoming request body (content-length bound)
     # Count fopen/fread calls and compare against expected
     FOPEN_COUNT=$(grep -c 'fopen\|fread\|read_file' "$MCP_FILE" 2>/dev/null || echo "0")
-    # Update this when legitimate reads are added. 13 reads audited as of the
+    # Update this when legitimate reads are added. 15 reads audited as of the
     # search/ADR/Windows-support commits — all path-contained or transport
     # reads, no new exfiltration surface.
-    EXPECTED_MAX=13
+    EXPECTED_MAX=15
     if [ "$FOPEN_COUNT" -gt "$EXPECTED_MAX" ]; then
         echo "REVIEW: src/mcp/mcp.c has $FOPEN_COUNT file read operations (expected max $EXPECTED_MAX)"
         echo "  New file reads in MCP tool handlers must be reviewed for data exfiltration risk."

@@ -3,6 +3,7 @@
  */
 #include "semantic/rotsq.h"
 
+#include <stdatomic.h>
 #include <string.h>
 
 #define XXH_INLINE_ALL
@@ -11,17 +12,32 @@
 /* ── Deterministic ±1 diagonal (seeded, generated once) ─────────────── */
 
 static float g_rsq_diag[CBM_RSQ_DIM];
-static int g_rsq_diag_ready = 0;
+enum {
+    RSQ_DIAG_UNINITIALIZED = 0,
+    RSQ_DIAG_INITIALIZING,
+    RSQ_DIAG_READY,
+};
+static atomic_int g_rsq_diag_state = ATOMIC_VAR_INIT(RSQ_DIAG_UNINITIALIZED);
 
 static void rsq_init_diag(void) {
-    if (g_rsq_diag_ready) {
+    if (atomic_load_explicit(&g_rsq_diag_state, memory_order_acquire) == RSQ_DIAG_READY) {
         return;
     }
-    for (int d = 0; d < CBM_RSQ_DIM; d++) {
-        uint64_t h = XXH3_64bits_withSeed(&d, sizeof(d), 0x5bd1e995u);
-        g_rsq_diag[d] = (h & 1u) ? 1.0F : -1.0F;
+
+    int expected = RSQ_DIAG_UNINITIALIZED;
+    if (atomic_compare_exchange_strong_explicit(&g_rsq_diag_state, &expected, RSQ_DIAG_INITIALIZING,
+                                                memory_order_acq_rel, memory_order_acquire)) {
+        for (int d = 0; d < CBM_RSQ_DIM; d++) {
+            uint64_t h = XXH3_64bits_withSeed(&d, sizeof(d), 0x5bd1e995u);
+            g_rsq_diag[d] = (h & 1u) ? 1.0F : -1.0F;
+        }
+        atomic_store_explicit(&g_rsq_diag_state, RSQ_DIAG_READY, memory_order_release);
+        return;
     }
-    g_rsq_diag_ready = 1;
+
+    /* Initialization is bounded and cannot fail.  Acquire pairs with the
+     * initializer's release so readers observe the fully populated table. */
+    while (atomic_load_explicit(&g_rsq_diag_state, memory_order_acquire) != RSQ_DIAG_READY) {}
 }
 
 /* ── Fast Walsh–Hadamard Transform (in place, unnormalized) ─────────── */

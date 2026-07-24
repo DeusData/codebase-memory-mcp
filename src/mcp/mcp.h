@@ -11,6 +11,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include "mcp/index_supervisor.h"
+
 /* ── Forward declarations ─────────────────────────────────────── */
 
 typedef struct cbm_store cbm_store_t; /* from store/store.h */
@@ -108,6 +110,21 @@ int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
 /* Restricted servers must not start a second unrestricted HTTP/RPC surface. */
 bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile);
 
+/* Optional daemon-owned physical index executor. repo_path is canonical and
+ * already authorized against this session; args_json contains that canonical
+ * path plus all caller options. The callback returns a complete malloc-owned
+ * MCP tool result. A NULL result is reported as an error and never degrades to
+ * an uncoordinated in-process index. */
+typedef char *(*cbm_mcp_index_executor_fn)(void *context, const char *repo_path,
+                                           const char *args_json);
+
+/* Daemon-owned exclusive lease for operations that mutate a published project
+ * database. begin may wait, but must remain cancellable by its session owner;
+ * every successful begin is paired with exactly one end. Standalone/worker
+ * servers leave these callbacks unset. */
+typedef bool (*cbm_mcp_project_mutation_begin_fn)(void *context, const char *project);
+typedef void (*cbm_mcp_project_mutation_end_fn)(void *context, const char *project);
+
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
@@ -122,6 +139,44 @@ void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
+
+/* Set an explicit session context for an embedded/daemon-backed server.
+ * session_root is copied and its project name is derived using the same naming
+ * rule as indexing. allowed_root is copied when non-NULL; an explicit NULL
+ * disables the workspace boundary for this server instead of falling back to
+ * CBM_ALLOWED_ROOT. Returns false when the context is invalid or cannot be
+ * copied. */
+bool cbm_mcp_server_set_session_context(cbm_mcp_server_t *srv, const char *session_root,
+                                        const char *allowed_root);
+
+/* Read-only session context accessors. Returned strings are owned by srv. */
+const char *cbm_mcp_server_session_root(const cbm_mcp_server_t *srv);
+const char *cbm_mcp_server_session_project(const cbm_mcp_server_t *srv);
+const char *cbm_mcp_server_allowed_root(const cbm_mcp_server_t *srv);
+
+/* Enable/disable per-server update checks and automatic indexing. Enabled by
+ * default for standalone servers; daemon sessions disable these so the shared
+ * coordinator owns background work. */
+void cbm_mcp_server_set_background_tasks(cbm_mcp_server_t *srv, bool enabled);
+
+void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_executor_fn executor,
+                                       void *context);
+
+/* Relay supervised worker logs to one local request (for CLI progress). The
+ * callback/context are borrowed until the synchronous tool call returns. */
+void cbm_mcp_server_set_index_log_callback(cbm_mcp_server_t *srv, cbm_proc_log_cb callback,
+                                           void *context);
+
+void cbm_mcp_server_set_project_mutation_guard(cbm_mcp_server_t *srv,
+                                               cbm_mcp_project_mutation_begin_fn begin,
+                                               cbm_mcp_project_mutation_end_fn end, void *context);
+
+/* Read one complete MCP message from in. Supports newline-delimited JSON and
+ * Content-Length framing, including additional headers. Returns 1 on success,
+ * 0 on clean EOF, and -1 on invalid input or an I/O/allocation error. On
+ * success, *message is heap-allocated and *content_length_framed identifies the
+ * transport framing used by the request. */
+int cbm_mcp_read_message(FILE *in, char **message, bool *content_length_framed);
 
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
@@ -138,14 +193,30 @@ char *cbm_mcp_handle_tool(cbm_mcp_server_t *srv, const char *tool_name, const ch
 
 /* ── Supervised background index (RSS isolation, #832) ────────── */
 
+/* One shared policy gate for supervised-index callers. Only an explicitly safe
+ * terminal can yield a result or enter crash/hang recovery; cancellation,
+ * failed tree containment, and unavailable worker startup are terminal. The
+ * FALLBACK disposition is an internal classification used to build an explicit
+ * error response, never permission for a marked host to index in-process.
+ * Exposed so the security boundary is directly regression-tested. */
+typedef enum {
+    CBM_MCP_SUPERVISED_RESULT_FALLBACK = 0,
+    CBM_MCP_SUPERVISED_RESULT_SUCCESS,
+    CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE,
+    CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL,
+} cbm_mcp_supervised_result_disposition_t;
+
+cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
+    int spawn_result, const cbm_index_worker_result_t *worker_result);
+
 /* Run a full index of root_path in a supervised worker SUBPROCESS (the same
  * crash/hang-isolating runner used by handle_index_repository), so the child
  * returns 100% of its RSS to the OS on exit instead of ratcheting the long-lived
  * parent. Builds {"repo_path": root_path} internally. Returns the worker's
- * response string (caller frees) on success, or NULL to signal the caller must
- * degrade to the in-process path (kill switch set, spawn failure, or the process
- * is not a supervisor host). This is the shared entry the watcher re-index
- * (main.c) and the session auto-index (mcp.c) route through. */
+ * response or an explicit contained-error response (caller frees). NULL is
+ * reserved for invalid input/request construction failure; a marked host must
+ * stop rather than use it as permission to index in-process. This is the shared
+ * entry the session auto-index routes through. */
 char *cbm_mcp_index_run_supervised_path(const char *root_path);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
@@ -174,6 +245,18 @@ struct cbm_pipeline; /* forward decl */
 /* Get the currently active pipeline (for signal handler cancellation).
  * Returns NULL if no pipeline is running. */
 struct cbm_pipeline *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv);
+
+/* Thread-safe cancellation for daemon connection teardown. Returns false when
+ * no request scope is active. Long-running request operations share the atomic
+ * cancellation token and own any process-tree teardown before returning. */
+bool cbm_mcp_server_cancel_active(cbm_mcp_server_t *srv);
+
+/* Publish an outer request lifetime before crossing an asynchronous transport
+ * boundary. The daemon application uses this to close the short interval
+ * between accepting a request token and entering JSON-RPC/tool dispatch. Each
+ * successful begin must be paired with end. */
+bool cbm_mcp_server_request_scope_begin(cbm_mcp_server_t *srv);
+void cbm_mcp_server_request_scope_end(cbm_mcp_server_t *srv);
 
 /* ── URI helpers ───────────────────────────────────────────────── */
 

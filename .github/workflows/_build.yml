@@ -170,11 +170,15 @@ jobs:
       - name: Archive standard binary
         shell: msys2 {0}
         run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
+          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
+          PAYLOAD=build/c/codebase-memory-mcp
+          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
+          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
+          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-windows-amd64.zip \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
       - name: Attest standard binary provenance
         if: ${{ inputs.attest }}
@@ -196,11 +200,15 @@ jobs:
       - name: Archive UI binary
         shell: msys2 {0}
         run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
+          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
+          PAYLOAD=build/c/codebase-memory-mcp
+          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
+          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
+          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-amd64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-ui-windows-amd64.zip \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
       - name: Attest UI binary provenance
         if: ${{ inputs.attest }}
@@ -251,11 +259,15 @@ jobs:
       - name: Archive standard binary
         shell: msys2 {0}
         run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
+          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
+          PAYLOAD=build/c/codebase-memory-mcp
+          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
+          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
+          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-windows-arm64.zip \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
       - name: Attest standard binary provenance
         if: ${{ inputs.attest }}
@@ -277,11 +289,15 @@ jobs:
       - name: Archive UI binary
         shell: msys2 {0}
         run: |
-          BIN=build/c/codebase-memory-mcp
-          [ -f "${BIN}.exe" ] && BIN="${BIN}.exe"
-          cp "$BIN" codebase-memory-mcp.exe
+          make -f Makefile.cbm build/c/codebase-memory-mcp-launcher.exe CC=clang CXX=clang++
+          PAYLOAD=build/c/codebase-memory-mcp
+          [ -f "${PAYLOAD}.exe" ] && PAYLOAD="${PAYLOAD}.exe"
+          cp build/c/codebase-memory-mcp-launcher.exe codebase-memory-mcp.exe
+          cp "$PAYLOAD" codebase-memory-mcp.payload.exe
           scripts/gen-third-party-notices.sh THIRD_PARTY_NOTICES.md
-          zip codebase-memory-mcp-ui-windows-arm64.zip codebase-memory-mcp.exe LICENSE install.ps1 THIRD_PARTY_NOTICES.md
+          zip codebase-memory-mcp-ui-windows-arm64.zip \
+            codebase-memory-mcp.exe codebase-memory-mcp.payload.exe \
+            LICENSE install.ps1 THIRD_PARTY_NOTICES.md
 
       - name: Attest UI binary provenance
         if: ${{ inputs.attest }}

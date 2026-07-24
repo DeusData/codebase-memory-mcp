@@ -11,10 +11,17 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-echo "=== Cleaning build artifacts ==="
+# shellcheck source=path-safety.sh
+source "$ROOT/scripts/path-safety.sh"
+
+# Containerized legs build in their own directory (BUILD_DIR env) so a
+# container clean never deletes the host's native build/c mid-build.
+BUILD_DIR="${BUILD_DIR:-build/c}"
+
+echo "=== Cleaning build artifacts ($BUILD_DIR) ==="
 
 # C build artifacts
-rm -rf "$ROOT/build/c"
+cbm_remove_build_dir "$ROOT" "$BUILD_DIR"
 
 # Frontend build artifacts
 rm -rf "$ROOT/graph-ui/dist"

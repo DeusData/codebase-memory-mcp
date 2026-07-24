@@ -12,6 +12,10 @@ on:
         description: 'Test the broad platform matrix (older glibc + extra OS versions) instead of the core set'
         type: boolean
         default: false
+      shard_suites:
+        description: 'Split each C-suite leg across parallel shard jobs (ubuntu x3, windows x2); off = one job per leg, byte-identical to the pre-shard topology'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -31,6 +35,7 @@ jobs:
         id: set
         env:
           BROAD: ${{ inputs.broad_platforms }}
+          SHARDS: ${{ inputs.shard_suites }}
         run: |
           CORE_UNIX='[
             {"os":"ubuntu-latest","cc":"gcc","cxx":"g++"},
@@ -63,6 +68,25 @@ jobs:
             UNIX=$(jq -cn --argjson a "$CORE_UNIX" '$a')
             WIN=$(jq -cn --argjson a "$CORE_WIN" '$a')
           fi
+          # Suite sharding (opt-in via the shard_suites input): each platform's
+          # C-suite run is split across N runner jobs. CBM_TEST_SHARD="i/N"
+          # slices deterministically inside run-tests-parallel.sh; each
+          # shard's union guard proves it ran exactly its slice; shards are
+          # minted HERE from one expansion so a missing shard cannot be
+          # configured silently; and the shard-completeness job re-proves the
+          # cross-shard union at runtime. Ubuntu runners are plentiful (3
+          # shards); Windows gets 2 (every extra shard re-pays ~5 min of
+          # MSYS2 setup); macOS stays at 1 — mac legs are not the critical
+          # path and mac runner concurrency ceilings are the tightest.
+          if [ "$SHARDS" = "true" ]; then
+            UNIX=$(jq -c '[.[] | . as $e
+              | (if ($e.os | startswith("ubuntu")) then 3 else 1 end) as $n
+              | range(1; $n + 1) as $i
+              | $e + {shard: "\($i)/\($n)"}]' <<< "$UNIX")
+            WIN=$(jq -c '[.[] | . as $e
+              | range(1; 3) as $i
+              | $e + {shard: "\($i)/2"}]' <<< "$WIN")
+          fi
           echo "unix={\"include\":$UNIX}" >> "$GITHUB_OUTPUT"
           echo "windows={\"include\":$WIN}" >> "$GITHUB_OUTPUT"
 
@@ -81,24 +105,134 @@ jobs:
 
       - name: Install deps (Ubuntu)
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
+
+      - name: Install ccache (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: command -v ccache >/dev/null 2>&1 || brew install ccache
+
+      # Verified compiler cache: CCACHE_COMPILERCHECK=content keys every entry
+      # on the compiler-binary CONTENT plus the fully preprocessed input, so a
+      # hit is provably the identical compilation — a stale or foreign cache
+      # can only miss, never return wrong output (see scripts/env.sh).
+      # Keys embed github.ref; the final ref-less restore key falls back to
+      # the newest cache GitHub's scoping permits (a PR can only ever see its
+      # own ref and the base branch, and base-branch caches are written only
+      # by base-branch runs), so a fresh PR starts from main's warm cache
+      # instead of building cold. Content verification is what makes that
+      # safe; the fallback buys ~8-12 minutes on every first-of-ref build.
+      - name: Compiler cache (content-verified, restore)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-${{ github.sha }}
+          # The cross-ref fallback is what keeps fresh PRs warm: without it a
+          # new PR always started from a cold cache (observed 0% hit legs).
+          # ccache verifies content hashes itself, so a stale cache can only
+          # miss, never mis-compile.
+          restore-keys: |
+            ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-
+            ccache-test-${{ matrix.os }}-${{ matrix.cc }}-
 
       - name: Test
         run: scripts/test.sh CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
         env:
+          CBM_TEST_SHARD: ${{ matrix.shard }}
+          CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.cc }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
 
+      # Every shard of a leg builds the identical runner, so one shard's
+      # cache carries the complete object set: shard 1 (or the unsharded
+      # job) saves, the rest only restore — same save volume as before
+      # sharding, no quota thrash, no same-key save races. Saving on failure
+      # too keeps red iterations warm.
+      - name: Shard manifest (completeness proof)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shard-manifest-${{ matrix.os }}-${{ matrix.cc }}-${{ strategy.job-index }}
+          path: build/c/test-logs/shard-manifest.txt
+          if-no-files-found: error
+
+      - name: Compiler cache (save)
+        if: always() && (matrix.shard == null || startsWith(matrix.shard, '1/'))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.cc }}-${{ github.ref }}-${{ github.sha }}
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+  # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
+  # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable
+  # daemon-coordination paths) plus allocator concurrency all run under TSan
+  # here — see TEST_TSAN_SUITES in Makefile.cbm. Runs on both Linux
+  # architectures AND native ARM64 macOS: the threading code is shared, so a
+  # race is usually caught on all three, but scheduler differences mean each
+  # platform can surface a race the others miss. Windows has no TSan runtime on
+  # any toolchain (documented irreducible gap); this shared-code coverage is
+  # its substitute.
   test-tsan:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, cc: clang, cxx: clang++ }
+          - { os: ubuntu-24.04-arm, cc: clang, cxx: clang++ }
+          - { os: macos-14, cc: cc, cxx: c++ }
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install deps (Ubuntu)
-        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang zlib1g-dev ccache
+
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ccache
+
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-tsan-${{ matrix.os }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-tsan-${{ matrix.os }}-${{ github.ref }}-
+            ccache-tsan-${{ matrix.os }}-
 
       - name: ThreadSanitizer tests
-        run: make -f Makefile.cbm test-tsan CC=clang CXX=clang++
+        # Calls make directly (no env.sh), so route the compilers through
+        # ccache's masquerade dir: /usr/lib/ccache on Debian, libexec under the
+        # Homebrew prefix on macOS. On Linux, reduce mmap ASLR entropy first:
+        # modern (esp. aarch64) kernels randomize high enough that TSan's
+        # shadow mapping aborts with "unexpected memory mapping" before any
+        # test runs. macOS TSan needs no such adjustment.
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            export PATH="$(brew --prefix ccache)/libexec:$PATH"
+          else
+            export PATH=/usr/lib/ccache:$PATH
+            sudo sysctl -w vm.mmap_rnd_bits=28 || true
+          fi
+          export CCACHE_COMPILERCHECK=content
+          make -f Makefile.cbm test-tsan CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
 
   test-windows:
     needs: setup-matrix
@@ -119,20 +253,166 @@ jobs:
             mingw-w64-clang-${{ matrix.pkg }}-clang
             mingw-w64-clang-${{ matrix.pkg }}-compiler-rt
             mingw-w64-clang-${{ matrix.pkg }}-zlib
+            mingw-w64-clang-${{ matrix.pkg }}-ccache
             make
             git
+
+      - name: Create protected per-user temp root
+        # The daemon suites fail closed on the MSYS-shared /tmp and on the
+        # runner's inherited LocalAppData\Temp ACLs. Give the whole harness a
+        # per-user root under the profile with an owner-stamped, protected
+        # current-SID DACL, matching the launcher/daemon trust policy.
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:USERPROFILE ("cbm-ci-tmp-" + [guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Path $root | Out-Null
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $acl = [System.Security.AccessControl.DirectorySecurity]::new()
+          $acl.SetOwner($sid)
+          $acl.SetAccessRuleProtection($true, $false)
+          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid,
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            ([System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+              [System.Security.AccessControl.InheritanceFlags]::ObjectInherit),
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)
+          $acl.AddAccessRule($rule) | Out-Null
+          Set-Acl -LiteralPath $root -AclObject $acl
+          "CBM_CI_TEMP_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Pre-create the build directory with the same protected DACL so
+          # every build product inherits it. The workspace drive root grants
+          # Authenticated Users Modify by inheritance — a shape real user
+          # checkouts (under the profile) do not have — and the activation
+          # transaction's source-directory policy correctly refuses it, which
+          # would fail the install-flow tests on the environment, not the code.
+          $build = Join-Path $env:GITHUB_WORKSPACE "build\c"
+          New-Item -ItemType Directory -Path $build -Force | Out-Null
+          $bacl = [System.Security.AccessControl.DirectorySecurity]::new()
+          $bacl.SetOwner($sid)
+          $bacl.SetAccessRuleProtection($true, $false)
+          $bacl.AddAccessRule($rule) | Out-Null
+          Set-Acl -LiteralPath $build -AclObject $bacl
+
+      - name: Compiler cache (content-verified)
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-
+            ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-
 
       - name: Test
         shell: msys2 {0}
         # AddressSanitizer is unavailable on native ARM64 Windows (LLVM ships no
         # libclang_rt.asan for aarch64-w64-windows-gnu) and cannot intercept the
-        # system DLLs under x86-64 emulation either, so windows-11-arm runs the
-        # native ARM64 build with SANITIZE= (no sanitizer) — still a real
-        # functional gate. ASan/UBSan coverage comes from the other 9 legs,
-        # including native-ARM Linux/macOS. x86-64 Windows keeps full sanitizers.
-        run: scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && 'SANITIZE=' || '' }}
+        # system DLLs under x86-64 emulation either. Instead of running the
+        # ARM64 leg unsanitized, it runs UBSan in TRAP mode: -fsanitize-trap
+        # needs no runtime library (the very thing aarch64-w64-windows-gnu
+        # lacks), so it instruments natively and turns any undefined behavior
+        # into an illegal-instruction trap; -fstack-protector-strong adds
+        # stack-smash coverage the heap tools miss. To see WHICH check fired,
+        # reproduce under the emulated x86_64 UBSan (win.sh ubsan-build), which
+        # carries the full message. x86-64 Windows keeps full ASan+UBSan; the
+        # other native-ARM legs (Linux/macOS) carry ASan+LSan+TSan.
+        run: |
+          # Native tests resolve temp via TEMP/TMP (cbm_tmpdir); shell tools use
+          # TMPDIR. Route both through the protected root created above so no
+          # fixture lands under a shared or ACL-inherited ancestry.
+          export TEMP="$(cygpath -m "$CBM_CI_TEMP_ROOT")"
+          export TMP="$TEMP"
+          export TMPDIR="$(cygpath -u "$CBM_CI_TEMP_ROOT")"
+          scripts/test.sh CC=clang CXX=clang++ ${{ matrix.os == 'windows-11-arm' && '"SANITIZE=-fsanitize=undefined -fsanitize-trap=undefined -fstack-protector-strong -fno-omit-frame-pointer"' || '' }}
         env:
+          CBM_TEST_SHARD: ${{ matrix.shard }}
+          CBM_TEST_LEG: ${{ matrix.os }}-${{ matrix.msystem }}
           CBM_SKIP_PERF: ${{ inputs.skip_perf && '1' || '' }}
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
+
+      - name: ccache stats
+        if: always()
+        shell: msys2 {0}
+        run: ccache -s || true
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+      - name: Shard manifest (completeness proof)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shard-manifest-${{ matrix.os }}-${{ matrix.msystem }}-${{ strategy.job-index }}
+          path: build/c/test-logs/shard-manifest.txt
+          if-no-files-found: error
+
+      # Shard 1 (or the unsharded job) saves the compiler cache; every shard
+      # builds the identical runner, so one cache carries the full object set.
+      - name: Compiler cache (save)
+        if: always() && (matrix.shard == null || startsWith(matrix.shard, '1/'))
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-test-${{ matrix.os }}-${{ matrix.msystem }}-${{ github.ref }}-${{ github.sha }}
+
+  # Cross-shard completeness: re-proves at runtime that each leg's shards
+  # agreed on the full suite list and that the union of their slices IS that
+  # list. This is the guard the per-shard union checks cannot provide: a
+  # mis-plumbed CBM_TEST_SHARD (two jobs running the same slice) passes every
+  # per-shard guard while a slice runs nowhere — only a cross-shard view
+  # catches it. Runs and gates on unsharded topologies too (every leg then
+  # contributes one 1/1 manifest whose slice must equal the full list).
+  shard-completeness:
+    needs: [test-unix, test-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: shard-manifest-*
+          path: manifests
+
+      - name: Verify cross-shard union per leg
+        run: |
+          set -eu
+          files=$(find manifests -name shard-manifest.txt | sort)
+          if [ -z "$files" ]; then
+            echo "FAIL: no shard manifests were uploaded" >&2
+            exit 1
+          fi
+          rc=0
+          for leg in $(grep -h '^leg=' $files | sort -u | sed 's/^leg=//'); do
+            leg_files=$(grep -l "^leg=$leg\$" $files)
+            n=$(grep -h '^shard=' $leg_files | sed 's|.*/||' | sort -u)
+            if [ "$(printf '%s\n' "$n" | wc -l)" -ne 1 ]; then
+              echo "FAIL: $leg shards disagree on shard count: $n" >&2
+              rc=1
+              continue
+            fi
+            indices=$(grep -h '^shard=' $leg_files | sed 's/^shard=//;s|/.*||' | sort -n)
+            if [ "$indices" != "$(seq 1 "$n")" ]; then
+              echo "FAIL: $leg shard indices [$indices] != 1..$n" >&2
+              rc=1
+              continue
+            fi
+            list_sha=$(grep -h '^list_sha256=' $leg_files | sed 's/^list_sha256=//' | sort -u)
+            if [ "$(printf '%s\n' "$list_sha" | wc -l)" -ne 1 ]; then
+              echo "FAIL: $leg shards saw different suite lists" >&2
+              rc=1
+              continue
+            fi
+            union_sha=$(for f in $leg_files; do
+              sed -n '/^--- slice ---$/,$p' "$f" | tail -n +2
+            done | sort | sha256sum | awk '{print $1}')
+            if [ "$union_sha" != "$list_sha" ]; then
+              echo "FAIL: $leg union of shard slices != full suite list (GATE-QUALITY LOSS)" >&2
+              rc=1
+              continue
+            fi
+            echo "OK: $leg — $n shard(s), union of slices == full suite list"
+          done
+          exit "$rc"
 
   # Windows product-surface regression guards. Distinct from test-windows above
   # (the sanitizer C suite): these drive a real product binary + embedded HTTP UI
@@ -155,6 +435,7 @@ jobs:
           install: >-
             mingw-w64-clang-x86_64-clang
             mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-ccache
             make
             git
 
@@ -162,16 +443,32 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Test npm wrapper failure handling
+        working-directory: pkg/npm
+        run: npm test
+
+      - name: Compiler cache (content-verified)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/.ccache
+          key: ccache-guards-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-guards-${{ github.ref }}-
+            ccache-guards-
+
       - name: Build product binary with embedded UI
         shell: msys2 {0}
         # --with-ui builds the frontend (npm) and embeds it, so the drive-picker
         # guard's HTTP UI is available. Functional gate only (no sanitizers).
         run: scripts/build.sh --with-ui CC=clang CXX=clang++
+        env:
+          CCACHE_DIR: ${{ github.workspace }}/.ccache
+          CCACHE_MAXSIZE: 1500M
 
       - name: Windows regression guards (#636/#357, #618, #548, #423/#20)
         shell: pwsh
-        # -GuardsOnly runs the four green guards and gates on them. The runner sets
-        # CBM_INDEX_SUPERVISOR=0 for determinism, but the non-ASCII CLI guard drops that
-        # override so it exercises the real supervisor->worker spawn (where #423/#20's
-        # second half lives); the other guards test path/hook/drive fixes in-process.
+        # -GuardsOnly runs the four green guards and gates on them. All guards run
+        # against the real supervisor->worker spawn path: under the mandatory
+        # coordination daemon, CBM_INDEX_SUPERVISOR=0 is a fail-closed refusal, so
+        # the driver no longer sets it anywhere.
         run: ./scripts/test-windows.ps1 -GuardsOnly -Binary build/c/codebase-memory-mcp.exe

@@ -653,19 +653,29 @@ static int store_authorizer(void *user_data, int action, const char *p3, const c
     }
 }
 
-static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
+static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool create) {
     cbm_store_t *s = calloc(CBM_ALLOC_ONE, sizeof(cbm_store_t));
     if (!s) {
         return NULL;
     }
 
-    int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+    int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
     if (in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
+    char open_path[4096];
+    const char *effective_path = path;
+    if (path && !in_memory) {
+        if (!cbm_path_for_file_api(path, open_path, sizeof(open_path))) {
+            free(s);
+            return NULL;
+        }
+        effective_path = open_path;
+    }
+    int rc = sqlite3_open_v2(effective_path, &s->db, flags, NULL);
     if (rc != SQLITE_OK) {
+        sqlite3_close(s->db);
         free(s);
         return NULL;
     }
@@ -703,14 +713,21 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
 }
 
 cbm_store_t *cbm_store_open_memory(void) {
-    return store_open_internal(":memory:", true);
+    return store_open_internal(":memory:", true, true);
 }
 
 cbm_store_t *cbm_store_open_path(const char *db_path) {
     if (!db_path) {
         return NULL;
     }
-    return store_open_internal(db_path, false);
+    return store_open_internal(db_path, false, true);
+}
+
+cbm_store_t *cbm_store_open_path_existing(const char *db_path) {
+    if (!db_path) {
+        return NULL;
+    }
+    return store_open_internal(db_path, false, false);
 }
 
 const char *cbm_store_db_path(const cbm_store_t *s) {
@@ -799,7 +816,12 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    char open_path[4096];
+    if (!cbm_path_for_file_api(db_path, open_path, sizeof(open_path))) {
+        free(s);
+        return NULL;
+    }
+    int rc = sqlite3_open_v2(open_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
@@ -951,7 +973,7 @@ cbm_store_t *cbm_store_open(const char *project) {
     }
     char path[CBM_SZ_1K];
     snprintf(path, sizeof(path), "%s/%s.db", cdir, project);
-    return store_open_internal(path, false);
+    return store_open_internal(path, false, true);
 }
 
 static void finalize_stmt(sqlite3_stmt **s) {
@@ -1114,6 +1136,99 @@ int cbm_store_checkpoint(cbm_store_t *s) {
                      "concurrent readers block the WAL reset — the -wal file keeps growing");
     }
     return exec_sql(s, "PRAGMA optimize;");
+}
+
+static int prepare_sqlite_for_publish(sqlite3 *db) {
+    if (!db) {
+        return CBM_STORE_ERR;
+    }
+    int log_frames = -1;
+    int checkpointed_frames = -1;
+    int rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log_frames,
+                                       &checkpointed_frames);
+    if (rc != SQLITE_OK || (log_frames >= 0 && checkpointed_frames != log_frames)) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA journal_mode=DELETE;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bool delete_mode = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+        delete_mode = mode && strcmp(mode, "delete") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return delete_mode ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+int cbm_store_prepare_for_publish(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    return prepare_sqlite_for_publish(s->db);
+}
+
+int cbm_store_prepare_path_for_replace(const char *path) {
+    if (!path) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(db, 10000);
+    int result = prepare_sqlite_for_publish(db);
+    if (sqlite3_close(db) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    return result;
+}
+
+int cbm_store_backup_path(const char *source_path, const char *staging_path) {
+    if (!source_path || !staging_path) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_remove_db_sidecars(staging_path) != 0) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3 *source = NULL;
+    sqlite3 *dest = NULL;
+    int rc = sqlite3_open_v2(source_path, &source, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(source, 10000);
+    rc = sqlite3_open_v2(staging_path, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(dest);
+        sqlite3_close(source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(dest, 10000);
+
+    sqlite3_backup *backup = sqlite3_backup_init(dest, "main", source, "main");
+    int result = CBM_STORE_ERR;
+    if (backup) {
+        int step_rc = sqlite3_backup_step(backup, CBM_NOT_FOUND);
+        int finish_rc = sqlite3_backup_finish(backup);
+        if (step_rc == SQLITE_DONE && finish_rc == SQLITE_OK) {
+            result = CBM_STORE_OK;
+        }
+    }
+    if (sqlite3_close(dest) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    if (sqlite3_close(source) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    return result;
 }
 
 /* #1083: the WAL size limit configured on this (write) connection, in bytes.

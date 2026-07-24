@@ -45,7 +45,8 @@ class McpServer:
             [self.binary],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=self.env, cwd=self.cwd, bufsize=0)
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
 
     def _drain_stderr(self):
         try:
@@ -80,7 +81,10 @@ class McpServer:
             raise McpError("read error: %r" % result["exc"])
         line = result.get("line", b"")
         if not line:
-            raise McpError("EOF / server closed stdout")
+            self._stderr_thread.join(timeout=1)
+            stderr = self.stderr_text().strip()
+            detail = ": %s" % stderr[-1200:] if stderr else ""
+            raise McpError("EOF / server closed stdout%s" % detail)
         # strict: an invalid-UTF-8 JSON-RPC response is itself a failure.
         return json.loads(line.decode("utf-8", "strict"))
 
