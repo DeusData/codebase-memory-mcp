@@ -55,4 +55,5 @@ make -f Makefile.cbm test-gmalloc   # Guard Malloc (libgmalloc): guard page per 
 ## Project Structure (C server)
 
 Sources live under `src/`; tests under `tests/`; vendored C libs under `vendored/`.
-The Go layer (`cmd/`, `internal/`) wraps the C server via CGO — see `CONTRIBUTING.md` for the Go side.
+Tree-sitter extraction and its vendored language grammars live under `internal/cbm/`.
+See `CONTRIBUTING.md` for the complete source layout and contribution workflow.
