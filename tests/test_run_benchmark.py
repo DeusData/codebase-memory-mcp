@@ -13,9 +13,7 @@ from unittest import mock
 from pathlib import Path
 
 
-SCRIPT = (
-    Path(__file__).resolve().parents[1] / "benchmarks" / "run_benchmark.py"
-)
+SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "run_benchmark.py"
 SPEC = importlib.util.spec_from_file_location("run_benchmark", SCRIPT)
 assert SPEC and SPEC.loader
 BENCHMARK = importlib.util.module_from_spec(SPEC)
@@ -1414,6 +1412,11 @@ class RunBenchmarkTest(unittest.TestCase):
                 "semantic_edges_enabled": "false",
                 "similarity_enabled": "false",
             },
+        )
+        self.assertEqual(
+            BENCHMARK.resolve_config_overrides("optional_graph_disabled", []),
+            overrides,
+            "retained plans must keep loading the removed duplicate profile",
         )
 
     def test_automatic_dependency_source_profiles_change_only_dependency_indexing(

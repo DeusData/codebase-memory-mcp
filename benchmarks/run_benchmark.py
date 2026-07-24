@@ -116,6 +116,7 @@ CONFIG_PROFILE_SIMILARITY_DISABLED = "similarity_disabled"
 CONFIG_PROFILE_SEMANTIC_EDGES_DISABLED = "semantic_edges_disabled"
 CONFIG_PROFILE_GIT_HISTORY_DISABLED = "git_history_disabled"
 CONFIG_PROFILE_HTTP_LINKS_DISABLED = "http_links_disabled"
+# Retained plans may still name this removed duplicate profile.
 CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED = "optional_graph_disabled"
 CONFIG_PROFILE_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH = CONFIG_SPELLING_SPEC[
     "profiles"
@@ -163,6 +164,15 @@ def product_default_graph_capabilities(**changes: str) -> dict[str, str]:
     return values
 
 
+MINIMAL_INDEXING_CAPABILITIES = product_default_graph_capabilities(
+    rank_enabled="false",
+    similarity_enabled="false",
+    semantic_edges_enabled="false",
+    githistory_enabled="false",
+    httplinks_enabled="false",
+)
+
+
 CONFIG_PROFILES: dict[str, dict[str, str]] = {
     CONFIG_PROFILE_CANDIDATE_NATIVE: {},
     CONFIG_PROFILE_AUTOMATIC_DEPENDENCY_SOURCE_INDEXING_DISABLED: product_default_graph_capabilities(),
@@ -190,20 +200,8 @@ CONFIG_PROFILES: dict[str, dict[str, str]] = {
             "value"
         ],
     },
-    CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: product_default_graph_capabilities(
-        rank_enabled="false",
-        similarity_enabled="false",
-        semantic_edges_enabled="false",
-        githistory_enabled="false",
-        httplinks_enabled="false",
-    ),
-    CONFIG_PROFILE_MINIMAL_INDEXING: product_default_graph_capabilities(
-        rank_enabled="false",
-        similarity_enabled="false",
-        semantic_edges_enabled="false",
-        githistory_enabled="false",
-        httplinks_enabled="false",
-    ),
+    CONFIG_PROFILE_OPTIONAL_GRAPH_DISABLED: MINIMAL_INDEXING_CAPABILITIES,
+    CONFIG_PROFILE_MINIMAL_INDEXING: MINIMAL_INDEXING_CAPABILITIES,
 }
 INDEX_MODES = ("fast", "moderate", "full")
 PROJECT_DB_SUFFIX = ".db"

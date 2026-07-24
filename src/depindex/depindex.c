@@ -798,8 +798,8 @@ int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit) {
     }
 
     int limit = cbm_config_get_int(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, default_limit);
-    /* The direct API keeps max_deps=0 as disabled. The config registry documents
-     * auto_dep_limit=0 as unlimited, so map configured callers to -1 here. */
+    /* Effective limits use 0 as disabled. The config registry documents
+     * auto_dep_limit=0 as unlimited, so normalize configured zero to -1. */
     return cbm_dep_normalize_configured_limit(limit, default_limit);
 }
 

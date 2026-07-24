@@ -754,18 +754,6 @@ def build_automatic_spec(
                     "capabilities": capabilities(httplinks_enabled="false"),
                 },
                 {
-                    "label": "optional-graph-disabled",
-                    "config_profile": "optional_graph_disabled",
-                    "candidate_labels": latest_labels,
-                    "capabilities": capabilities(
-                        rank_enabled="false",
-                        similarity_enabled="false",
-                        semantic_edges_enabled="false",
-                        githistory_enabled="false",
-                        httplinks_enabled="false",
-                    ),
-                },
-                {
                     "label": "minimal-indexing",
                     "config_profile": "minimal_indexing",
                     "candidate_labels": latest_labels,
