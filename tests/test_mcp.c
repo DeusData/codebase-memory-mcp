@@ -3530,6 +3530,76 @@ TEST(search_code_multi_word) {
     PASS();
 }
 
+/* Regression guard: search_code full results must preserve valid UTF-8 source. */
+TEST(search_code_full_preserves_utf8_source) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_utf8_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmp) != NULL);
+
+    char project_dir[640];
+    snprintf(project_dir, sizeof(project_dir), "%s/project", tmp);
+    ASSERT_EQ(cbm_mkdir(project_dir), 0);
+    char design_dir[768];
+    snprintf(design_dir, sizeof(design_dir), "%s/design", project_dir);
+    ASSERT_EQ(cbm_mkdir(design_dir), 0);
+
+    char source_path[768];
+    snprintf(source_path, sizeof(source_path), "%s/design.md", design_dir);
+    FILE *fp = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(fp);
+    const char source[] = "# accounting-design\nРусский текст: бухгалтерский учет.\n";
+    ASSERT_EQ(fwrite(source, 1, sizeof(source) - SKIP_ONE, fp), sizeof(source) - SKIP_ONE);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    const char *project = "utf8-search";
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, project_dir);
+
+    cbm_node_t section = {.project = project,
+                          .label = "Section",
+                          .name = "accounting-design",
+                          .qualified_name = "utf8-search.design.accounting-design",
+                          .file_path = "design/design.md",
+                          .start_line = 1,
+                          .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(st, &section), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":97,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{"
+             "\"project\":\"utf8-search\",\"pattern\":\"accounting-design\","
+             "\"file_pattern\":\"*.md\",\"path_filter\":\"^design/\","
+             "\"mode\":\"full\",\"format\":\"json\",\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *rows = yyjson_obj_get(yyjson_doc_get_root(doc), "rows");
+    ASSERT_NOT_NULL(rows);
+    ASSERT_TRUE(yyjson_arr_size(rows) > 0);
+    yyjson_val *row = yyjson_arr_get(rows, 0);
+    yyjson_val *source_obj = yyjson_arr_get(row, 7);
+    yyjson_val *source_val = yyjson_obj_get(source_obj, "source");
+    ASSERT_NOT_NULL(source_val);
+    ASSERT_STR_EQ(yyjson_get_str(source_val), source);
+    yyjson_doc_free(doc);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_unlink(source_path);
+    cbm_rmdir(design_dir);
+    cbm_rmdir(project_dir);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
 /* Reproduce-first (#687): scoped content search over a repo whose ROOT PATH
  * contains a space. write_scoped_filelist emits "<root>/<file>" records that the
  * Unix pipeline pipes to grep via xargs. With plain `xargs` (newline-split) the
@@ -9410,6 +9480,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_missing_pattern);
     RUN_TEST(tool_search_code_no_project);
     RUN_TEST(search_code_multi_word);
+    RUN_TEST(search_code_full_preserves_utf8_source);
     RUN_TEST(search_code_scoped_path_with_spaces_issue687);
 #ifdef _WIN32
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);

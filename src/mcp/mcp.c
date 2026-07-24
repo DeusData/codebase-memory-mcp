@@ -8287,16 +8287,6 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── search_code v2: graph-augmented code search ─────────────── */
 
-/* Strip non-ASCII bytes to guarantee valid UTF-8 JSON output */
-enum { ASCII_MAX = 127 };
-static void sanitize_ascii(char *s) {
-    for (unsigned char *p = (unsigned char *)s; *p; p++) {
-        if (*p > ASCII_MAX) {
-            *p = '?';
-        }
-    }
-}
-
 /* Intermediate grep match */
 typedef struct {
     char file[CBM_SZ_512];
@@ -8497,8 +8487,11 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
         }
         char *source = read_file_lines(abs_path, s, e);
         if (source) {
-            sanitize_ascii(source);
-            yyjson_mut_obj_add_strcpy(doc, item, "source", source);
+            char *safe_source = sanitize_utf8_lossy(source);
+            if (safe_source) {
+                yyjson_mut_obj_add_strcpy(doc, item, "source", safe_source);
+                free(safe_source);
+            }
             free(source);
             if (truncated) {
                 yyjson_mut_obj_add_int(doc, item, "source_start", s);
@@ -8513,8 +8506,11 @@ static void attach_result_source(yyjson_mut_doc *doc, yyjson_mut_val *item, sear
         }
         char *ctx = read_file_lines(abs_path, ctx_start, ctx_end);
         if (ctx) {
-            sanitize_ascii(ctx);
-            yyjson_mut_obj_add_strcpy(doc, item, "context", ctx);
+            char *safe_context = sanitize_utf8_lossy(ctx);
+            if (safe_context) {
+                yyjson_mut_obj_add_strcpy(doc, item, "context", safe_context);
+                free(safe_context);
+            }
             yyjson_mut_obj_add_int(doc, item, "context_start", ctx_start);
             free(ctx);
         }
@@ -8783,7 +8779,11 @@ static char *assemble_search_output(search_result_t *sr, int sr_count, grep_matc
 
     char *json = yy_doc_to_str(doc);
     if (json) {
-        sanitize_ascii(json);
+        char *safe_json = sanitize_utf8_lossy(json);
+        if (safe_json) {
+            free(json);
+            json = safe_json;
+        }
     }
     yyjson_mut_doc_free(doc);
 
@@ -8854,8 +8854,10 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
         safe_grow(gm, gm_count, gm_cap, PAIR_LEN);
         snprintf(gm[gm_count].file, sizeof(gm[0].file), "%s", file);
         gm[gm_count].line = (int)strtol(sep1 + SKIP_ONE, NULL, CBM_DECIMAL_BASE);
-        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s", sep2 + SKIP_ONE);
-        sanitize_ascii(gm[gm_count].content);
+        char *safe_content = sanitize_utf8_lossy(sep2 + SKIP_ONE);
+        snprintf(gm[gm_count].content, sizeof(gm[0].content), "%s",
+                 safe_content ? safe_content : sep2 + SKIP_ONE);
+        free(safe_content);
         gm_count++;
     }
 
