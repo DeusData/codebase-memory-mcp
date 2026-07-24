@@ -1425,6 +1425,21 @@ static bool app_wait_for_atomic_int_at_least(atomic_int *value, int minimum) {
     return false;
 }
 
+static bool app_wait_for_background_initializes(int minimum) {
+    /* Positive completion signal for the request-handler's background tail:
+     * negatives about auto-index admission ("nothing was started") are only
+     * meaningful once the admission pass has RUN — a fixed sleep loses that
+     * race in both directions. */
+    uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+    while (cbm_now_ms() < deadline) {
+        if (cbm_daemon_application_background_initializes_for_test() >= minimum) {
+            return true;
+        }
+        cbm_usleep(1000);
+    }
+    return false;
+}
+
 static bool app_wait_for_atomic_bool(atomic_bool *value, bool expected) {
     uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
     while (cbm_now_ms() < deadline) {
@@ -1856,13 +1871,14 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
         sessions[i] = app_test_open(&callbacks, (cbm_daemon_client_id_t)(4110U + i));
     }
 
+    int bg_baseline = cbm_daemon_application_background_initializes_for_test();
     bool scout_initialized = app_test_initialize_profile(&callbacks, sessions[2], root,
                                                          CBM_MCP_TOOL_PROFILE_SCOUT, NULL, NULL);
     bool hook_initialized = app_test_initialize_profile(
         &callbacks, sessions[3], root, CBM_MCP_TOOL_PROFILE_ALL, "SessionStart", "copilot");
-    cbm_usleep(50000);
+    bool admissions_evaluated = app_wait_for_background_initializes(bg_baseline + 2);
     bool restricted_started_nothing =
-        atomic_load(&fake.starts) == 0 && application && project &&
+        admissions_evaluated && atomic_load(&fake.starts) == 0 && application && project &&
         cbm_daemon_application_job_subscribers(application, project) == 0 &&
         atomic_load(&update.starts) == 0;
 
@@ -1990,10 +2006,12 @@ TEST(daemon_application_auto_index_honors_tracked_file_limit) {
         cbm_daemon_application_runtime_callbacks(application);
     cbm_daemon_runtime_application_session_t *session =
         application ? app_test_open(&callbacks, 4190) : NULL;
+    int bg_baseline = cbm_daemon_application_background_initializes_for_test();
     bool initialized = app_test_initialize_profile(&callbacks, session, root,
                                                    CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
-    cbm_usleep(50000);
-    bool limit_prevented_admission = initialized && atomic_load(&fake.starts) == 0 &&
+    bool admission_evaluated = app_wait_for_background_initializes(bg_baseline + 1);
+    bool limit_prevented_admission = initialized && admission_evaluated &&
+                                     atomic_load(&fake.starts) == 0 &&
                                      cbm_daemon_application_active_jobs(application) == 0;
 
     if (session) {
@@ -2126,11 +2144,12 @@ TEST(daemon_application_auto_index_retries_transient_busy_admission) {
         cbm_daemon_application_runtime_callbacks(application);
     cbm_daemon_runtime_application_session_t *session =
         application ? app_test_open(&callbacks, 4191) : NULL;
+    int bg_baseline = cbm_daemon_application_background_initializes_for_test();
     bool initialized =
         occupied_admitted && app_test_initialize_profile(&callbacks, session, auto_root,
                                                          CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
-    cbm_usleep(20000);
-    bool initially_deferred = initialized && atomic_load(&fake.starts) == 1;
+    bool admission_evaluated = app_wait_for_background_initializes(bg_baseline + 1);
+    bool initially_deferred = initialized && admission_evaluated && atomic_load(&fake.starts) == 1;
 
     atomic_store(&fake.allow_completion, true);
     if (occupied_started) {
@@ -3002,11 +3021,17 @@ TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
         encoded && cbm_thread_create(&request_thread, 0, app_request_thread, &request) == 0;
     bool subscribed =
         thread_started && app_wait_for_subscribers(fixture.application, fixture.project, 1);
-    if (subscribed) {
+    /* Cancel only after the WORKER exists: subscription precedes worker
+     * start, and a cancel that wins that window legally aborts the job with
+     * no worker (and no worker-cancel op) ever invoked — that interleaving
+     * has its own deterministic test below. From worker start onward, cancel
+     * delivery to the worker is guaranteed. */
+    bool worker_started = subscribed && app_wait_for_atomic_int_at_least(&fixture.fake.starts, 1);
+    if (worker_started) {
         fixture.callbacks.request_cancel(fixture.callbacks.context, fixture.session,
                                          request.request_token);
     }
-    bool request_returned = subscribed && app_wait_for_atomic_bool(&request.done, true);
+    bool request_returned = worker_started && app_wait_for_atomic_bool(&request.done, true);
     if (!request_returned) {
         /* Keep cleanup bounded if the RED path fails to detach the request. */
         atomic_store(&fixture.fake.allow_completion, true);
@@ -3038,6 +3063,7 @@ TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
     ASSERT_TRUE(encoded);
     ASSERT_TRUE(thread_started);
     ASSERT_TRUE(subscribed);
+    ASSERT_TRUE(worker_started);
     ASSERT_TRUE(request_returned);
     ASSERT_TRUE(thread_joined);
     ASSERT_EQ(request.status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
@@ -3051,6 +3077,67 @@ TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session) {
     ASSERT_TRUE(worker_cancelled);
     ASSERT_EQ(worker_starts, 1);
     ASSERT_EQ(worker_destroys, 1);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+/* Deterministic sibling of the test above: with every job thread parked
+ * before its first pre-start cancel check, the cancel WINS the pre-start
+ * window by construction — the request must still report CANCELLED with the
+ * watch preserved, while the worker is never started and none of its ops
+ * are ever invoked. A loaded CI runner produced this interleaving by
+ * chance; here it is forced (CI is never a lottery). */
+TEST(daemon_application_cancel_before_worker_start_skips_worker) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 3022);
+    char args[APP_TEST_PATH_CAP + 32];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", fixture.root);
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    bool encoded =
+        fixture_ready && app_test_tool_request("index_repository", args, &tool, &tool_length);
+    cbm_daemon_application_hold_job_before_start_for_test(true);
+    app_request_thread_t request = {
+        .callbacks = fixture.callbacks,
+        .session = fixture.session,
+        .request_token = UINT64_C(8301),
+        .request = tool,
+        .request_length = tool_length,
+        .status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR,
+    };
+    atomic_init(&request.done, false);
+    cbm_thread_t request_thread;
+    bool thread_started =
+        encoded && cbm_thread_create(&request_thread, 0, app_request_thread, &request) == 0;
+    bool subscribed =
+        thread_started && app_wait_for_subscribers(fixture.application, fixture.project, 1);
+    if (subscribed) {
+        fixture.callbacks.request_cancel(fixture.callbacks.context, fixture.session,
+                                         request.request_token);
+    }
+    bool request_returned = subscribed && app_wait_for_atomic_bool(&request.done, true);
+    cbm_daemon_application_hold_job_before_start_for_test(false);
+    bool thread_joined = thread_started && cbm_thread_join(&request_thread) == 0;
+    int watch_count_after_cancel = fixture.watcher ? cbm_watcher_watch_count(fixture.watcher) : -1;
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+    int worker_starts = atomic_load(&fixture.fake.starts);
+    int worker_cancels = atomic_load(&fixture.fake.cancels);
+    int worker_destroys = atomic_load(&fixture.fake.destroys);
+    free(request.response);
+    free(tool);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_TRUE(encoded);
+    ASSERT_TRUE(thread_started);
+    ASSERT_TRUE(subscribed);
+    ASSERT_TRUE(request_returned);
+    ASSERT_TRUE(thread_joined);
+    ASSERT_EQ(request.status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
+    ASSERT_NULL(request.response);
+    ASSERT_EQ(watch_count_after_cancel, 1);
+    ASSERT_EQ(worker_starts, 0);
+    ASSERT_EQ(worker_cancels, 0);
+    ASSERT_EQ(worker_destroys, 0);
     ASSERT_TRUE(cleaned);
     PASS();
 }
@@ -3973,10 +4060,9 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
     }
     cbm_project_lock_lease_t *terminal_other_probe = NULL;
     cbm_private_file_lock_status_t terminal_other_status =
-        other_worker_acquired
-            ? app_project_lock_try_acquire_until_released(locks.probe_locks, other_project,
-                                                          &terminal_other_probe)
-            : CBM_PRIVATE_FILE_LOCK_IO;
+        other_worker_acquired ? app_project_lock_try_acquire_until_released(
+                                    locks.probe_locks, other_project, &terminal_other_probe)
+                              : CBM_PRIVATE_FILE_LOCK_IO;
     bool other_lock_released_at_terminal =
         terminal_other_status == CBM_PRIVATE_FILE_LOCK_OK && terminal_other_probe;
     bool terminal_other_probe_released = app_project_lock_release(&terminal_other_probe);
@@ -3993,10 +4079,9 @@ TEST(daemon_application_worker_lock_serializes_external_mutation) {
     }
     cbm_project_lock_lease_t *blocked_probe = NULL;
     cbm_private_file_lock_status_t terminal_blocked_status =
-        blocked_worker_acquired
-            ? app_project_lock_try_acquire_until_released(locks.probe_locks, blocked_project,
-                                                          &blocked_probe)
-            : CBM_PRIVATE_FILE_LOCK_IO;
+        blocked_worker_acquired ? app_project_lock_try_acquire_until_released(
+                                      locks.probe_locks, blocked_project, &blocked_probe)
+                                : CBM_PRIVATE_FILE_LOCK_IO;
     bool blocked_lock_released_at_terminal =
         terminal_blocked_status == CBM_PRIVATE_FILE_LOCK_OK && blocked_probe;
     bool blocked_probe_released = app_project_lock_release(&blocked_probe);
@@ -4507,7 +4592,32 @@ TEST(daemon_application_thread_start_failure_rolls_back_job_reservation) {
     PASS();
 }
 
-TEST(daemon_application_enforces_global_physical_job_limit) {
+/* Session-request worker: issues one runtime request and records the raw
+ * response, so a request that legitimately BLOCKS (queued behind the
+ * physical job limit) can run off the test thread. */
+typedef struct {
+    cbm_daemon_runtime_application_callbacks_t *callbacks;
+    cbm_daemon_runtime_application_session_t *session;
+    uint8_t *payload;
+    uint32_t payload_length;
+    uint8_t *response;
+    uint32_t response_length;
+    int status;
+} app_session_request_thread_t;
+
+static void *app_session_request_thread(void *opaque) {
+    app_session_request_thread_t *request = opaque;
+    request->status =
+        app_test_request(request->callbacks, request->session, request->payload,
+                         request->payload_length, &request->response, &request->response_length);
+    return NULL;
+}
+
+/* An explicit index request that hits the physical job limit QUEUES (parked,
+ * observable via the busy-queue-wait counter) instead of erroring, and runs
+ * to completion once the occupying job finishes. The non-session coordinator
+ * API keeps its non-blocking busy answer. */
+TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
     cbm_daemon_application_worker_ops_t worker_ops = {
@@ -4539,7 +4649,10 @@ TEST(daemon_application_enforces_global_physical_job_limit) {
         application && roots_ok && cbm_thread_create(&thread, 0, app_index_thread, &first) == 0;
     bool admitted = started && app_wait_for_subscribers(application, "cap-first", 1) &&
                     app_wait_for_atomic_int(&fake.starts, 1);
+    /* The programmatic coordinator API stays non-blocking: callers with their
+     * own retry policy (watcher, auto-index) still get the busy answer. */
     int busy = admitted ? cbm_daemon_application_index(application, "cap-second", second_root) : -1;
+
     cbm_daemon_runtime_application_callbacks_t callbacks =
         cbm_daemon_application_runtime_callbacks(application);
     cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 51);
@@ -4553,18 +4666,49 @@ TEST(daemon_application_enforces_global_physical_job_limit) {
                            app_test_context_request(second_root, second_root, &session_context,
                                                     &session_context_length) &&
                            app_test_tool_request("index_repository", args, &tool, &tool_length);
-    uint8_t *response = NULL;
-    uint32_t response_length = 0;
-    bool session_busy =
-        session_encoded &&
-        app_test_request(&callbacks, session, session_context, session_context_length, &response,
-                         &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
-    free(response);
-    response = NULL;
-    session_busy = session_busy &&
-                   app_test_request(&callbacks, session, tool, tool_length, &response,
-                                    &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-                   response && strstr((char *)response, "physical index job limit reached");
+    uint8_t *context_response = NULL;
+    uint32_t context_response_length = 0;
+    bool context_ok = session_encoded &&
+                      app_test_request(&callbacks, session, session_context, session_context_length,
+                                       &context_response, &context_response_length) ==
+                          CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(context_response);
+
+    int queue_waits_baseline = cbm_daemon_application_busy_queue_waits_for_test();
+    app_session_request_thread_t queued = {
+        .callbacks = &callbacks,
+        .session = session,
+        .payload = tool,
+        .payload_length = tool_length,
+        .status = -1,
+    };
+    cbm_thread_t request_thread;
+    bool request_started =
+        context_ok &&
+        cbm_thread_create(&request_thread, 0, app_session_request_thread, &queued) == 0;
+    /* Positive queue signal: the request entered the busy-wait loop instead
+     * of erroring — and no second worker was started while parked. */
+    bool queued_parked = false;
+    if (request_started) {
+        uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+        while (cbm_now_ms() < deadline) {
+            if (cbm_daemon_application_busy_queue_waits_for_test() > queue_waits_baseline) {
+                queued_parked = true;
+                break;
+            }
+            cbm_usleep(1000);
+        }
+    }
+    bool no_second_start_while_parked = queued_parked && atomic_load(&fake.starts) == 1;
+
+    /* Release the slot: the first job completes, the queued request must be
+     * admitted and complete on its own. */
+    atomic_store(&fake.allow_completion, true);
+    bool request_joined = request_started && cbm_thread_join(&request_thread) == 0;
+    bool queued_succeeded = request_joined && queued.status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                            queued.response && strstr((char *)queued.response, "indexed") != NULL &&
+                            strstr((char *)queued.response, "physical index job limit") == NULL;
+
     callbacks.session_close(callbacks.context, session);
     bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
     if (started) {
@@ -4573,17 +4717,20 @@ TEST(daemon_application_enforces_global_physical_job_limit) {
     cbm_daemon_application_free(application);
     free(session_context);
     free(tool);
-    free(response);
+    free(queued.response);
 
     ASSERT_TRUE(roots_ok);
     ASSERT_TRUE(started);
     ASSERT_TRUE(admitted);
     ASSERT_EQ(busy, 1);
-    ASSERT_TRUE(session_busy);
+    ASSERT_TRUE(context_ok);
+    ASSERT_TRUE(request_started);
+    ASSERT_TRUE(queued_parked);
+    ASSERT_TRUE(no_second_start_while_parked);
+    ASSERT_TRUE(queued_succeeded);
     ASSERT_TRUE(stopped);
-    ASSERT_EQ(atomic_load(&fake.starts), 1);
-    ASSERT_EQ(atomic_load(&fake.cancels), 1);
-    ASSERT_EQ(atomic_load(&fake.destroys), 1);
+    ASSERT_EQ(atomic_load(&fake.starts), 2);
+    ASSERT_EQ(atomic_load(&fake.destroys), 2);
 
     (void)cbm_rmdir(first_root);
     (void)cbm_rmdir(second_root);
@@ -4750,6 +4897,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_cancels_physical_job_only_after_final_session);
     RUN_TEST(daemon_application_disconnect_before_request_callback_is_sticky);
     RUN_TEST(daemon_application_request_cancel_preserves_persistent_watch_and_session);
+    RUN_TEST(daemon_application_cancel_before_worker_start_skips_worker);
     RUN_TEST(daemon_application_cancel_drops_watch_before_inflight_request_returns);
     RUN_TEST(daemon_application_stale_watcher_callback_is_rejected_at_job_admission);
     RUN_TEST(daemon_application_final_cancel_drains_admitted_watcher_job);
@@ -4766,7 +4914,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_recovers_with_unique_per_job_quarantine_files);
     RUN_TEST(daemon_application_cancellation_between_recovery_attempts_stops_retry);
     RUN_TEST(daemon_application_thread_start_failure_rolls_back_job_reservation);
-    RUN_TEST(daemon_application_enforces_global_physical_job_limit);
+    RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);

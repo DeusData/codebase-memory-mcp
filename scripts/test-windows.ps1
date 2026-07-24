@@ -227,9 +227,16 @@ foreach ($t in $guards) {
     } elseif ($code -eq 1 -or $t -eq "tests\windows\test_windows_launcher.py") {
         Write-Host "RED ($t) - REGRESSION: a fixed Windows bug is broken again" -ForegroundColor Red
         $guardFailures += $t
-    } else {
-        Write-Host "PRECONDITION ($t) exit=$code - skipped (see message above)" -ForegroundColor Yellow
+    } elseif ($code -eq 2) {
+        # Exit 2 is the guards' DOCUMENTED precondition-skip contract; every
+        # other unexpected code (a crashed python, an access-violation status,
+        # a mistyped guard) is a FAILURE - an uncontracted exit once let a
+        # crashing guard read as an invisible skip under a green banner.
+        Write-Host "PRECONDITION ($t) exit=2 - skipped (see message above)" -ForegroundColor Yellow
         $guardSkips += $t
+    } else {
+        Write-Host "FAILED ($t) exit=$code - crashed or exited outside the guard contract 0/1/2" -ForegroundColor Red
+        $guardFailures += $t
     }
 }
 
@@ -265,6 +272,10 @@ if ($guardSkips.Count -gt 0) {
 }
 if ($fixedKeepers.Count -gt 0) {
     Write-Host ("Known-red repros that are now GREEN (promote to guards): {0}" -f ($fixedKeepers -join ", ")) -ForegroundColor Green
+}
+if ($guardSkips.Count -eq $guards.Count -and $guards.Count -gt 0) {
+    Write-Host "FAIL: every guard skipped - nothing was actually verified" -ForegroundColor Red
+    exit 1
 }
 if ($guardFailures.Count -gt 0) {
     Write-Host ("REGRESSION: {0} green guard(s) went red: {1}" -f $guardFailures.Count, ($guardFailures -join ", ")) -ForegroundColor Red

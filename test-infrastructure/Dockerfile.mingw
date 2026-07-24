@@ -7,7 +7,10 @@
 #   docker compose -f test-infrastructure/docker-compose.yml run --rm build-windows
 #   docker compose -f test-infrastructure/docker-compose.yml run --rm test-windows
 
-FROM mstorsjo/llvm-mingw:latest
+# Pinned by digest (supply-chain: no floating tags). This is the multi-arch
+# manifest-list digest of mstorsjo/llvm-mingw:latest as of 2026-07-23; bump
+# deliberately by re-resolving the digest, never back to a bare tag.
+FROM mstorsjo/llvm-mingw:latest@sha256:5cbf421906f889e01c8d4005787474e302df6daa197286ebf212d419024966af
 
 # curl+zstd are required (zlib sysroot fetch below). Wine is BEST-EFFORT: it
 # only runs the .exe, and its i386 packages are unavailable on an arm64 Docker
@@ -19,10 +22,16 @@ RUN (dpkg --add-architecture i386 && apt-get update && \
      apt-get install -y --no-install-recommends wine64 && rm -rf /var/lib/apt/lists/*) \
     || echo "WARN: Wine unavailable on this host arch -> compile-only mode"
 
-# Install zlib into the llvm-mingw sysroot (from MSYS2 CLANG64 repo)
+# Install zlib into the llvm-mingw sysroot (from MSYS2 CLANG64 repo).
+# The package is verified against its pinned sha256 before extraction —
+# a bare curl|tar would execute whatever the mirror serves.
 RUN mkdir -p /tmp/zlib-pkg && \
     curl -sL "https://mirror.msys2.org/mingw/clang64/mingw-w64-clang-x86_64-zlib-1.3.1-1-any.pkg.tar.zst" \
-    | zstd -d | tar xf - -C /tmp/zlib-pkg && \
+    -o /tmp/zlib.pkg.tar.zst && \
+    echo "b7f0c06e6d48128209a3a441f96b92351e565a0d031278c56a8db8a9b5ec291a  /tmp/zlib.pkg.tar.zst" \
+    | sha256sum -c - && \
+    zstd -d < /tmp/zlib.pkg.tar.zst | tar xf - -C /tmp/zlib-pkg && \
+    rm /tmp/zlib.pkg.tar.zst && \
     cp -rn /tmp/zlib-pkg/clang64/include/* /opt/llvm-mingw/x86_64-w64-mingw32/include/ && \
     cp -rn /tmp/zlib-pkg/clang64/lib/* /opt/llvm-mingw/x86_64-w64-mingw32/lib/ && \
     rm -rf /tmp/zlib-pkg

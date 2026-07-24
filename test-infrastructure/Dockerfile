@@ -6,7 +6,9 @@
 # Build:  docker build -t cbm-test test-infrastructure/
 # Run:    docker run --rm -v $(pwd):/src cbm-test
 
-FROM ubuntu:noble
+# Pinned by digest (supply-chain: no floating tags) — multi-arch manifest-list
+# digest of ubuntu:noble as of 2026-07-23; bump deliberately, never to a tag.
+FROM ubuntu:noble@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
 # Minimal: gcc + zlib only. sqlite3 is vendored (compiled from source with ASan).
 # curl + zsh mirror the GitHub runner images: the self-update tests shell out

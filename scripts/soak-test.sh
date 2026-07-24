@@ -340,6 +340,19 @@ mcp_call() {
         MCP_LAST_RESPONSE="$resp"
         if json_rpc_response_ok "$id" "$resp"; then
             exit_code=0
+        else
+            # A stale (previous, late) response desyncs every later
+            # round-trip: drain queued lines until the matching id shows up
+            # or the stream runs dry, so one slow reply costs one failed op
+            # instead of corrupting the whole run's verdicts.
+            local drain=""
+            while read -r -t 2 drain <&4 2>/dev/null; do
+                MCP_LAST_RESPONSE="$drain"
+                if json_rpc_response_ok "$id" "$drain"; then
+                    exit_code=0
+                    break
+                fi
+            done
         fi
     fi
     local t1
@@ -426,7 +439,9 @@ wait_for_diagnostics_snapshot() {
     return 1
 }
 
+SNAPSHOT_ATTEMPTS=0
 collect_snapshot() {
+    SNAPSHOT_ATTEMPTS=$((SNAPSHOT_ATTEMPTS + 1))
     refresh_diagnostics_paths || return 0
     if [ -f "$DIAG_FILE" ]; then
         python3 -c "
@@ -680,6 +695,16 @@ if ! wait_for_daemon_stop "$FINAL_DAEMON_STOP_COUNT"; then
 fi
 
 # ── Analysis ─────────────────────────────────────────────────────
+
+# Check 0: the analysis must have DATA. Snapshot collection silently
+# tolerates transient misses, so a run where diagnostics never materialized
+# used to sail through every check vacuously — the leak/FD/latency verdicts
+# below are only meaningful if most sampling attempts actually landed.
+SNAPSHOT_ROWS=$(($(wc -l < "$METRICS_CSV") - 1))
+if [ "$SNAPSHOT_ATTEMPTS" -gt 0 ] && [ $((SNAPSHOT_ROWS * 10)) -lt $((SNAPSHOT_ATTEMPTS * 6)) ]; then
+    echo "FAIL: only ${SNAPSHOT_ROWS}/${SNAPSHOT_ATTEMPTS} snapshots collected — analysis would be vacuous" | tee -a "$SUMMARY"
+    PASS=false
+fi
 
 # Check 1: Memory leak detection via RSS trend
 # This is the primary leak detector on ALL platforms (including Windows

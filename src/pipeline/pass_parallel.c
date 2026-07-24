@@ -2539,7 +2539,11 @@ static void resolve_def_inherits(resolve_ctx_t *rc, resolve_worker_state_t *ws,
         }
         const cbm_gbuf_node_t *bn = cbm_gbuf_find_by_qn(rc->main_gbuf, bqn);
         if (bn && node->id != bn->id) {
-            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id, "INHERITS", "{}");
+            /* Same Interface-label split as the sequential semantic pass —
+             * hardcoding INHERITS here demoted every explicit `implements`
+             * on large (parallel-path) corpora. */
+            cbm_gbuf_insert_edge(ws->local_edge_buf, node->id, bn->id,
+                                 cbm_semantic_base_edge_type(bn), "{}");
             ws->semantic_resolved++;
         }
     }
@@ -3009,6 +3013,10 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     /* Go-style implicit interface satisfaction (needs full graph, serial) */
     int go_impl = cbm_pipeline_implements_go(ctx);
+
+    /* Explicit-language override detection (same serial full-graph tail the
+     * sequential pipeline runs — the two venues must emit identical graphs). */
+    total_lsp_overrides += cbm_pipeline_override_explicit(ctx);
 
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;

@@ -90,6 +90,7 @@ cbm_httpd_activity_t cbm_httpd_activity_for_test(cbm_httpd_t *d);
 /* Caps SO_SNDBUF on subsequently accepted sockets so a non-reading peer
  * produces a deterministic backpressure point on every platform. */
 void cbm_httpd_set_send_buffer_for_test(cbm_httpd_t *d, int bytes);
+void cbm_httpd_set_send_deadline_for_test(cbm_httpd_t *d, int ms);
 
 /* ── Connection handling ──────────────────────────────────────── */
 

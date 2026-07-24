@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The fuzzer IS python3; without it this gate would run zero mutations while
+# still reporting green. Fail loudly instead.
+command -v python3 >/dev/null 2>&1 || {
+    echo "FAIL: python3 missing — the fuzz gate cannot generate payloads" >&2
+    exit 1
+}
+# Reproducibility: every payload derives from a logged seed, so any crash is
+# re-runnable by construction (CBM_FUZZ_SEED overrides for replay).
+FUZZ_SEED="${CBM_FUZZ_SEED:-$$}"
+echo "fuzz seed: $FUZZ_SEED (replay: CBM_FUZZ_SEED=$FUZZ_SEED)"
+
 # Fuzz testing: feeds random/mutated inputs to the MCP server and CLI
 # to find crashes, hangs, and memory errors. Runs for a limited time.
 #
@@ -25,11 +36,15 @@ END_TIME=$((SECONDS + DURATION))
 
 # Portable timeout
 run_with_timeout() {
+    # PRESERVES the child's exit status: the whole gate exists to observe
+    # crash codes (139/134/136), and an `|| true` here once made EC
+    # unconditionally 0 — the crash checks were dead code and a SIGSEGV
+    # read green. Timeout reports 124, which the checks correctly ignore.
     local secs="$1"; shift
     if command -v timeout &>/dev/null; then
-        timeout "$secs" "$@" || true
+        timeout "$secs" "$@"
     else
-        perl -e "alarm($secs); exec @ARGV" -- "$@" || true
+        perl -e "alarm($secs); exec @ARGV" -- "$@"
     fi
 }
 
@@ -43,6 +58,7 @@ while [ $SECONDS -lt $END_TIME ]; do
     # Generate a random mutated JSON-RPC payload
     PAYLOAD=$(python3 -c "
 import random, string, json
+random.seed($FUZZ_SEED + $ITERATIONS)
 
 # Base valid request
 base = {
@@ -111,8 +127,8 @@ except:
     printf '%s\n%s\n' "$INIT" "$PAYLOAD" > "$FUZZ_TMPDIR/input.jsonl"
 
     # Run and check for crashes (not exit code — we expect errors, just not crashes)
-    run_with_timeout 5 "$BINARY" < "$FUZZ_TMPDIR/input.jsonl" > /dev/null 2>&1
-    EC=$?
+    EC=0
+    run_with_timeout 5 "$BINARY" < "$FUZZ_TMPDIR/input.jsonl" > /dev/null 2>&1 || EC=$?
 
     # 139 = SIGSEGV, 134 = SIGABRT, 136 = SIGFPE — real crashes
     if [ $EC -eq 139 ] || [ $EC -eq 134 ] || [ $EC -eq 136 ]; then
@@ -135,7 +151,8 @@ while [ $SECONDS -lt $CLI_END ]; do
     CLI_ITERATIONS=$((CLI_ITERATIONS + 1))
 
     QUERY=$(python3 -c "
-import random, string
+import random
+random.seed($FUZZ_SEED + 100000 + $CLI_ITERATIONS), string
 parts = ['MATCH', 'WHERE', 'RETURN', '(', ')', '-[', ']->', '<-[', ']-',
          'n', 'r', '.name', '.label', '=', '\"', \"'\", ';', '--', 'DROP',
          'DELETE', 'ATTACH', 'DETACH', '*', 'COUNT', 'LIMIT', 'ORDER BY']
@@ -146,7 +163,8 @@ if random.random() > 0.5:
 print(q)
 " 2>/dev/null || echo "MATCH (n) RETURN n")
 
-    run_with_timeout 3 "$BINARY" cli query_graph "{\"query\":\"$QUERY\"}" > /dev/null 2>&1
+    EC=0
+    run_with_timeout 3 "$BINARY" cli query_graph "{\"query\":\"$QUERY\"}" > /dev/null 2>&1 || EC=$?
     EC=$?
 
     if [ $EC -eq 139 ] || [ $EC -eq 134 ] || [ $EC -eq 136 ]; then

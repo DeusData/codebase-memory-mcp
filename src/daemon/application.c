@@ -211,6 +211,35 @@ void cbm_daemon_application_fail_next_job_thread_start_for_test(void) {
                           memory_order_release);
 }
 
+static atomic_bool g_application_hold_job_before_start_for_test = ATOMIC_VAR_INIT(false);
+
+/* Counts completed background-initialize passes (the request-handler tail
+ * that evaluates auto-index admission). The client can observe its
+ * initialize RESPONSE before this tail finishes, so a test asserting the
+ * tail's NEGATIVE outcome ("no job was admitted") needs this positive
+ * completion signal — a fixed sleep is a lottery in both directions. */
+static atomic_int g_application_background_initializes_for_test = ATOMIC_VAR_INIT(0);
+
+int cbm_daemon_application_background_initializes_for_test(void) {
+    return atomic_load_explicit(&g_application_background_initializes_for_test,
+                                memory_order_acquire);
+}
+
+/* Counts iterations of the explicit-index busy-queue wait loop. A test that
+ * needs "the request is parked behind the physical job limit" waits for a
+ * DELTA here — the positive signal that queueing (not an error return)
+ * happened — before releasing the slot. */
+static atomic_int g_application_busy_queue_waits_for_test = ATOMIC_VAR_INIT(0);
+
+int cbm_daemon_application_busy_queue_waits_for_test(void) {
+    return atomic_load_explicit(&g_application_busy_queue_waits_for_test, memory_order_acquire);
+}
+
+void cbm_daemon_application_hold_job_before_start_for_test(bool hold) {
+    atomic_store_explicit(&g_application_hold_job_before_start_for_test, hold,
+                          memory_order_release);
+}
+
 static int application_job_thread_create(cbm_thread_t *thread, void *context) {
     if (atomic_exchange_explicit(&g_application_fail_next_job_thread_start_for_test, false,
                                  memory_order_acq_rel)) {
@@ -1541,6 +1570,15 @@ static void *application_job_thread(void *opaque) {
     cbm_daemon_application_job_t *job = opaque;
     application_job_execution_t execution;
     application_job_execution_init(&execution);
+    /* Deterministic-interleaving seam: a held gate parks this thread before
+     * its first pre-start cancel check, so tests can force the
+     * cancel-wins-before-worker-start ordering that otherwise needs a
+     * descheduled thread on a loaded runner (CI is never a lottery: the
+     * interleaving must be reproducible by construction). */
+    while (
+        atomic_load_explicit(&g_application_hold_job_before_start_for_test, memory_order_acquire)) {
+        cbm_usleep(1000);
+    }
 
     /* The linked non-terminal job is the daemon-internal reservation: it
      * coalesces identical requests and blocks same-project daemon mutations.
@@ -1982,7 +2020,7 @@ static char *application_auto_index_args(const char *root_path) {
     return args;
 }
 
-static void application_background_initialize(cbm_daemon_application_session_t *session) {
+static void application_background_initialize_impl(cbm_daemon_application_session_t *session) {
     if (!session || !session->application || !session->context_set ||
         session->tool_profile != CBM_MCP_TOOL_PROFILE_ALL || session->hook_event ||
         session->hook_dialect) {
@@ -2059,6 +2097,12 @@ static void application_background_initialize(cbm_daemon_application_session_t *
     cbm_mutex_unlock(&application->mutex);
     free(args);
     application_refresh_watch(session);
+}
+
+static void application_background_initialize(cbm_daemon_application_session_t *session) {
+    application_background_initialize_impl(session);
+    atomic_fetch_add_explicit(&g_application_background_initializes_for_test, 1,
+                              memory_order_release);
 }
 
 static bool application_jsonrpc_success(const char *response) {
@@ -2244,18 +2288,36 @@ static char *application_index_execute(void *context, const char *root_path,
         return cbm_mcp_text_result("failed to derive index project identity", true);
     }
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
-    cbm_daemon_application_job_t *job = application_job_subscribe(
-        session->application, project_key, root_path, args_json, &subscribe_status);
+    cbm_daemon_application_job_t *job = NULL;
+    for (;;) {
+        job = application_job_subscribe(session->application, project_key, root_path, args_json,
+                                        &subscribe_status);
+        if (job || (subscribe_status != APPLICATION_JOB_SUBSCRIBE_BUSY &&
+                    subscribe_status != APPLICATION_JOB_SUBSCRIBE_CANCELLING)) {
+            break;
+        }
+        /* Physical job limit reached (or a same-project cancel still
+         * draining): QUEUE instead of surfacing a raw busy error. The
+         * request thread blocks for the whole index anyway, so waiting for
+         * a slot is the same contract — and the wait stays cancellable and
+         * shutdown-aware (a stopping coordinator answers UNAVAILABLE, which
+         * exits this loop with the error below). */
+        atomic_fetch_add_explicit(&g_application_busy_queue_waits_for_test, 1,
+                                  memory_order_release);
+        cbm_mutex_lock(&session->application->mutex);
+        bool queued_cancelled = application_request_cancelled_locked(session);
+        cbm_mutex_unlock(&session->application->mutex);
+        if (queued_cancelled) {
+            free(project_key);
+            return cbm_mcp_text_result("index operation cancelled for this session", true);
+        }
+        cbm_usleep(APPLICATION_JOB_POLL_US);
+    }
     free(project_key);
     if (!job) {
         const char *message = "daemon index coordinator is stopping or unavailable";
         if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_OPTIONS_CONFLICT) {
             message = "another index operation for this project is active with different options";
-        } else if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_BUSY) {
-            message =
-                "daemon index coordinator is busy: physical index job limit reached; retry later";
-        } else if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_CANCELLING) {
-            message = "another index operation for this project is cancelling; retry shortly";
         } else if (subscribe_status == APPLICATION_JOB_SUBSCRIBE_ALLOCATION_FAILED) {
             message = "daemon index coordinator could not allocate an index job";
         }

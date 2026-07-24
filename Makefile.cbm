@@ -67,8 +67,18 @@ EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
 	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1
-CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) -g -O1 $(SANITIZE)
-CXXFLAGS_TEST = $(CXXFLAGS_COMMON) -g -O1 $(SANITIZE)
+# The build system is the single source of truth for "is this binary
+# instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
+# clang's feature-check spelling and every non-ASan sanitizer, so the
+# trap-UBSan leg once ran NATIVE timing budgets on an instrumented
+# binary. Any non-empty SANITIZE ⇒ sanitized budgets everywhere.
+ifneq ($(strip $(SANITIZE)),)
+SANITIZED_DEFINE = -DCBM_SANITIZED_BUILD=1
+else
+SANITIZED_DEFINE =
+endif
+CFLAGS_TEST = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
+CXXFLAGS_TEST = $(CXXFLAGS_COMMON) $(SANITIZED_DEFINE) -g -O1 $(SANITIZE)
 
 # TSan (can't combine with ASan)
 TSAN_SANITIZE = -fsanitize=thread -fno-omit-frame-pointer

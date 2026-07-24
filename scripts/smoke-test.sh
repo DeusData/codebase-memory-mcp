@@ -82,6 +82,21 @@ retire_account_daemon() {
   fi
 }
 
+# Tolerate ERRORS, never CRASHES: the adversarial phases assert "doesn't
+# crash", and a bare `|| true` discards exactly the crash exit the claim is
+# about. rc >= 128 means killed by signal / fatal status (SIGSEGV=139,
+# SIGABRT=134 — ASan aborts land here too).
+run_no_crash() {
+  local label="$1"; shift
+  local rc=0
+  "$@" > /dev/null 2>&1 || rc=$?
+  if [ "$rc" -ge 128 ]; then
+    echo "FAIL $label: crashed (rc=$rc)"
+    exit 1
+  fi
+  return 0
+}
+
 TMPDIR=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
@@ -2596,7 +2611,12 @@ echo "--- Phase 9b: adversarial install/uninstall tests ---"
 # completes without crash and prints "Detected agents:" line.
 EMPTY_HOME=$(smoke_mktemp_dir)
 mkdir -p "$EMPTY_HOME/.local/bin"
-INSTALL_OUT=$(HOME="$EMPTY_HOME" LOCALAPPDATA="$EMPTY_HOME/AppData/Local" "$BINARY" install -y 2>&1) || true
+INSTALL_RC=0
+INSTALL_OUT=$(HOME="$EMPTY_HOME" LOCALAPPDATA="$EMPTY_HOME/AppData/Local" "$BINARY" install -y 2>&1) || INSTALL_RC=$?
+if [ "$INSTALL_RC" -ge 128 ]; then
+  echo "FAIL 9b-1: install crashed (rc=$INSTALL_RC)"
+  exit 1
+fi
 if ! echo "$INSTALL_OUT" | grep -qi 'detected agents'; then
   echo "FAIL 9b-1: install output missing 'Detected agents' line"
   exit 1
@@ -2609,12 +2629,12 @@ rm -rf "$EMPTY_HOME"
 IDEM_HOME=$(smoke_mktemp_dir)
 mkdir -p "$IDEM_HOME/.claude" "$IDEM_HOME/.local/bin"
 copy_smoke_binary "$IDEM_HOME/.local/bin/codebase-memory-mcp"
-HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$BINARY" install -y 2>&1 > /dev/null || true
+run_no_crash 9b-2 env HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$BINARY" install -y
 IDEM_INSTALLER="$BINARY"
 if [[ "$BINARY" == *.exe ]]; then
   IDEM_INSTALLER="$IDEM_HOME/.local/bin/codebase-memory-mcp.exe"
 fi
-HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$IDEM_INSTALLER" install -y 2>&1 > /dev/null || true
+run_no_crash 9b-2-second env HOME="$IDEM_HOME" LOCALAPPDATA="$IDEM_HOME/AppData/Local" "$IDEM_INSTALLER" install -y
 # Count MCP entries — should be exactly 1
 COUNT=$(cat "$IDEM_HOME/.claude.json" 2>/dev/null | python3 -c "
 import json, sys
@@ -2632,7 +2652,12 @@ rm -rf "$IDEM_HOME"
 # 9b-3: Uninstall without prior install
 CLEAN_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CLEAN_HOME/.claude" "$CLEAN_HOME/.local/bin"
-UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$BINARY" uninstall -y -n 2>&1) || true
+UNINSTALL_RC=0
+UNINSTALL_OUT=$(HOME="$CLEAN_HOME" "$BINARY" uninstall -y -n 2>&1) || UNINSTALL_RC=$?
+if [ "$UNINSTALL_RC" -ge 128 ]; then
+  echo "FAIL 9b-3: uninstall crashed (rc=$UNINSTALL_RC)"
+  exit 1
+fi
 echo "OK 9b-3: uninstall without install doesn't crash"
 retire_account_daemon "9b-3-cleanup"
 rm -rf "$CLEAN_HOME"
@@ -2642,7 +2667,7 @@ CORRUPT_HOME=$(smoke_mktemp_dir)
 mkdir -p "$CORRUPT_HOME/.claude" "$CORRUPT_HOME/.local/bin"
 copy_smoke_binary "$CORRUPT_HOME/.local/bin/codebase-memory-mcp"
 echo '{invalid json here' > "$CORRUPT_HOME/.claude.json"
-HOME="$CORRUPT_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
+run_no_crash 9b-4 env HOME="$CORRUPT_HOME" "$BINARY" install -y
 # Should either fix it or handle gracefully — not crash
 echo "OK 9b-4: install over corrupt JSON doesn't crash"
 retire_account_daemon "9b-4-cleanup"
@@ -2652,13 +2677,13 @@ rm -rf "$CORRUPT_HOME"
 DBL_HOME=$(smoke_mktemp_dir)
 mkdir -p "$DBL_HOME/.claude" "$DBL_HOME/.local/bin"
 copy_smoke_binary "$DBL_HOME/.local/bin/codebase-memory-mcp"
-HOME="$DBL_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
+run_no_crash 9b-8-install env HOME="$DBL_HOME" "$BINARY" install -y
 DBL_UNINSTALLER="$BINARY"
 if [[ "$BINARY" == *.exe ]]; then
   DBL_UNINSTALLER="$DBL_HOME/.local/bin/codebase-memory-mcp.exe"
 fi
-HOME="$DBL_HOME" "$DBL_UNINSTALLER" uninstall -y -n 2>&1 > /dev/null || true
-HOME="$DBL_HOME" "$BINARY" uninstall -y -n 2>&1 > /dev/null || true
+run_no_crash 9b-8-first env HOME="$DBL_HOME" "$DBL_UNINSTALLER" uninstall -y -n
+run_no_crash 9b-8-second env HOME="$DBL_HOME" "$BINARY" uninstall -y -n
 echo "OK 9b-8: double uninstall doesn't crash"
 retire_account_daemon "9b-8-cleanup"
 rm -rf "$DBL_HOME"
@@ -2783,7 +2808,8 @@ echo "=== Phase 11: process kill E2E ==="
 # Start MCP server in background
 MCP_KILL_INPUT=$(smoke_mktemp_file)
 echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"kill-test","version":"1.0"}}}' > "$MCP_KILL_INPUT"
-"$BINARY" < "$MCP_KILL_INPUT" > /dev/null 2>&1 &
+KILL_OUT=$(smoke_mktemp_file)
+"$BINARY" < "$MCP_KILL_INPUT" > "$KILL_OUT" 2>&1 &
 KILL_PID=$!
 sleep 1
 
@@ -2798,8 +2824,20 @@ if kill -0 "$KILL_PID" 2>/dev/null; then
   fi
   echo "OK 11c-d: process killed successfully"
 else
-  echo "OK 11: MCP server already exited (clean shutdown on EOF)"
+  # The server ended before the probe: distinguish clean shutdown-on-EOF
+  # from an instant crash — the old branch treated both as OK with the
+  # output discarded, so a startup segfault read as a clean pass on any
+  # fast machine. A clean run must have exited 0 AND produced the
+  # initialize response.
+  KILL_RC=0
+  wait "$KILL_PID" 2>/dev/null || KILL_RC=$?
+  if [ "$KILL_RC" -ge 128 ] || ! grep -q '"jsonrpc"' "$KILL_OUT"; then
+    echo "FAIL 11: server exited before probe with rc=$KILL_RC and $(wc -c < "$KILL_OUT") bytes of output — crash, not clean EOF shutdown"
+    exit 1
+  fi
+  echo "OK 11: MCP server already exited (clean shutdown on EOF, initialize answered)"
 fi
+rm -f "$KILL_OUT"
 
 rm -f "$MCP_KILL_INPUT"
 
@@ -3228,13 +3266,24 @@ fi
 echo ""
 echo "=== Phase 15: UI HTTP server ==="
 
-UI_PORT=19876
+# A kernel-assigned free port instead of a fixed one: a squatter on a fixed
+# port made the whole phase read as SKIP. The tiny TOCTOU window between
+# probe and bind is the residual risk, not the common case.
+UI_PORT=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 UI_INPUT=$(smoke_mktemp_file)
 "$BINARY" --port "$UI_PORT" < "$UI_INPUT" > /dev/null 2>&1 &
 UI_PID=$!
-sleep 1
+# Readiness poll instead of a fixed sleep: SKIP is legitimate ONLY when the
+# process exited (the documented no-embedded-assets case); a slow start on a
+# loaded runner must not masquerade as it.
+UI_READY=0
+for _ in $(seq 1 100); do
+  if ! kill -0 "$UI_PID" 2>/dev/null; then break; fi
+  if curl -sf "http://127.0.0.1:$UI_PORT/" -o /dev/null 2>/dev/null; then UI_READY=1; break; fi
+  sleep 0.1
+done
 
-if kill -0 "$UI_PID" 2>/dev/null; then
+if [ "$UI_READY" -eq 1 ] || kill -0 "$UI_PID" 2>/dev/null; then
   # 15a: GET / returns 200 with HTML content
   UI_BODY=$(curl -sf "http://127.0.0.1:$UI_PORT/" 2>/dev/null || echo "")
   if echo "$UI_BODY" | grep -qi "<html"; then
@@ -3258,6 +3307,8 @@ if kill -0 "$UI_PID" 2>/dev/null; then
     echo "SKIP 15b: /rpc not reachable"
   else
     echo "FAIL 15b: /rpc did not return JSON-RPC"
+    kill "$UI_PID" 2>/dev/null || true
+    exit 1
   fi
 
   kill "$UI_PID" 2>/dev/null || true
