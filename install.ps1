@@ -262,7 +262,17 @@ if (($launcherItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -o
 # Verify the complete launcher/payload path before it asks all coordinated CBM
 # processes to stop.
 try {
-    $candidateVersion = & $DownloadedLauncher --version 2>&1
+    # Windows PowerShell 5.1 wraps redirected native stderr in ErrorRecords, so
+    # under $ErrorActionPreference = "Stop" a healthy candidate that prints any
+    # warning would abort here. Probe with EAP relaxed; failure detection stays
+    # on $LASTEXITCODE.
+    $PrevErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $candidateVersion = & $DownloadedLauncher --version 2>&1
+    } finally {
+        $ErrorActionPreference = $PrevErrorActionPreference
+    }
     if ($LASTEXITCODE -ne 0) { throw "candidate exited with $LASTEXITCODE" }
     Write-Host "Verified candidate: $candidateVersion"
 } catch {
@@ -285,7 +295,14 @@ if ($LASTEXITCODE -ne 0) {
 
 # Verify
 try {
-    $ver = & $Dest --version 2>&1
+    # Same PS 5.1 stderr-wrapping hazard as the candidate probe above.
+    $PrevErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $ver = & $Dest --version 2>&1
+    } finally {
+        $ErrorActionPreference = $PrevErrorActionPreference
+    }
     if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {
