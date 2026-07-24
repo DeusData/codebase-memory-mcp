@@ -167,6 +167,7 @@ extern const TSLanguage *tree_sitter_pine(void);
 extern const TSLanguage *tree_sitter_mojo(void);
 extern const TSLanguage *tree_sitter_objectscript_udl(void);
 extern const TSLanguage *tree_sitter_objectscript_routine(void);
+extern const TSLanguage *tree_sitter_plsql(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -1614,6 +1615,28 @@ static const char *mojo_branch_types[] = {"if_statement",
                                           NULL};
 static const char *mojo_var_types[] = {"assignment", NULL};
 static const char *mojo_assign_types[] = {"assignment", "augmented_assignment", NULL};
+// ==================== PL/SQL ====================
+// Node names verified against AndreasMaierDe/tree-sitter-plsql grammar.js.
+static const char *plsql_func_types[] = {"create_function",
+                                         "create_procedure",
+                                         "function_definition",
+                                         "procedure_definition",
+                                         "function_declaration",
+                                         "procedure_declaration",
+                                         NULL};
+static const char *plsql_class_types[] = {"create_package",   "create_package_body", "create_type",
+                                          "create_type_body", "create_trigger",      NULL};
+static const char *plsql_module_types[] = {"source_file", NULL};
+static const char *plsql_call_types[] = {"ref_call", NULL};
+static const char *plsql_branch_types[] = {"if_statement",
+                                           "case_statement",
+                                           "basic_loop_statement",
+                                           "for_loop_statement",
+                                           "while_loop_statement",
+                                           "exception_handler",
+                                           NULL};
+static const char *plsql_assign_types[] = {"assignment_statement", NULL};
+static const char *plsql_throw_types[] = {"raise_statement", NULL};
 
 // InterSystems ObjectScript. Node names verified against
 // intersystems/tree-sitter-objectscript grammar.
@@ -1632,6 +1655,7 @@ static const char *objectscript_routine_func_types[] = {"tag", NULL};
 static const char *objectscript_routine_call_types[] = {"extrinsic_function", "routine_tag_call",
                                                         NULL};
 static const char *objectscript_routine_module_types[] = {"source_file", NULL};
+
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -2635,6 +2659,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
     // cbm_lang_spec()/cbm_ts_language() directly. Left as a zero spec.
+
+    // CBM_LANG_PLSQL — Oracle PL/SQL. AndreasMaierDe/tree-sitter-plsql (MIT).
+    [CBM_LANG_PLSQL] = {CBM_LANG_PLSQL, plsql_func_types, plsql_class_types, empty_types,
+                        plsql_module_types, plsql_call_types, empty_types, empty_types,
+                        plsql_branch_types, empty_types, plsql_assign_types, plsql_throw_types,
+                        NULL, empty_types, NULL, NULL, tree_sitter_plsql, NULL},
 
 };
 

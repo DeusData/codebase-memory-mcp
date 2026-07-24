@@ -1071,6 +1071,67 @@ TEST(form_procedure) {
     PASS();
 }
 
+/* --- Oracle PL/SQL --- */
+TEST(plsql_package_and_call) {
+    const char *src =
+        "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+        "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+        "    v_sal NUMBER;\n"
+        "  BEGIN\n"
+        "    v_sal := util_pkg.calc_salary(p_name);\n"
+        "    IF v_sal > 0 THEN\n"
+        "      RETURN v_sal;\n"
+        "    END IF;\n"
+        "    RAISE no_data_found;\n"
+        "  END;\n"
+        "END emp_pkg;\n"
+        "/\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "emp_pkg.pkb");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "emp_pkg"));
+    /* Package-body members are Methods when the package is the enclosing Class. */
+    ASSERT(has_def_any(r, "hire"));
+    ASSERT(has_call(r, "util_pkg.calc_salary"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(plsql_standalone_function) {
+    /* create_function wraps a body (which ends with END) plus an outer END. */
+    const char *src = "CREATE OR REPLACE FUNCTION get_bonus RETURN NUMBER IS\n"
+                      "BEGIN\n"
+                      "  RETURN 1;\n"
+                      "END;\n"
+                      "END get_bonus;\n"
+                      "/\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "get_bonus.fnc");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "get_bonus"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(plsql_create_type_as_object_limitation) {
+    /* Known grammar limitation: CREATE TYPE ... AS OBJECT yields ERROR nodes
+     * (AndreasMaierDe/tree-sitter-plsql). Documented in
+     * tests/fixtures/plsql/create_type_as_object_limitation.tps — do not expect
+     * a Class def until the upstream grammar improves. */
+    const char *src = "CREATE OR REPLACE TYPE address_t AS OBJECT (\n"
+                      "  street VARCHAR2(100),\n"
+                      "  city   VARCHAR2(50)\n"
+                      ");\n"
+                      "/\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "address.tps");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* Must not crash; Class extraction is best-effort and may be absent. */
+    ASSERT(!has_def(r, "Class", "address_t"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Wolfram --- */
 TEST(wolfram_function) {
     CBMFileResult *r =
@@ -4794,6 +4855,9 @@ SUITE(extraction) {
     RUN_TEST(matlab_function);
     RUN_TEST(lean_function);
     RUN_TEST(form_procedure);
+    RUN_TEST(plsql_package_and_call);
+    RUN_TEST(plsql_standalone_function);
+    RUN_TEST(plsql_create_type_as_object_limitation);
     RUN_TEST(wolfram_function);
     RUN_TEST(magma_function);
 
