@@ -9,6 +9,7 @@ records use "experiment" consistently.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 import hashlib
 import json
 import math
@@ -27,9 +28,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
-CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name(
-    "config-spellings-v1.json"
-)
+CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
 with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
     CONFIG_SPELLING_SPEC = json.load(stream)
 if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
@@ -1716,13 +1715,11 @@ def stop_cell_process_tree(
     """Stop an isolated benchmark process group, allowing harness cleanup first."""
     if process.poll() is not None:
         return process.returncode
-    try:
+    with suppress(OSError, ProcessLookupError):
         if os.name == "nt":
             process.send_signal(signal.CTRL_BREAK_EVENT)
         else:
             os.killpg(process.pid, initial_signal)
-    except (OSError, ProcessLookupError):
-        pass
     try:
         return process.wait(timeout=grace_seconds)
     except subprocess.TimeoutExpired:
@@ -1735,10 +1732,8 @@ def stop_cell_process_tree(
             check=False,
         )
     else:
-        try:
+        with suppress(OSError, ProcessLookupError):
             os.killpg(process.pid, signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
     try:
         return process.wait(timeout=10)
     except subprocess.TimeoutExpired:

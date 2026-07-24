@@ -9,9 +9,10 @@ measurements. Every workload uses an isolated cache and removes only paths it cr
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, suppress
 import gzip
 import hashlib
+from itertools import pairwise
 import json
 import math
 import os
@@ -31,9 +32,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name(
-    "config-spellings-v1.json"
-)
+CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
 with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
     CONFIG_SPELLING_SPEC = json.load(stream)
 if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
@@ -1908,6 +1907,7 @@ def command_result(
         capture_output=True,
         text=True,
         timeout=timeout,
+        check=False,
     )
     return proc, now_ms() - start
 
@@ -1923,7 +1923,7 @@ def parse_list_project_counts(raw: str) -> list[int]:
         ) from exc
     if not counts or any(count <= 0 for count in counts):
         raise ValueError("list project counts must contain positive integers")
-    if any(left >= right for left, right in zip(counts, counts[1:])):
+    if any(left >= right for left, right in pairwise(counts)):
         raise ValueError("list project counts must be strictly increasing")
     return counts
 
@@ -2039,6 +2039,7 @@ def command_stdout_bytes(
         env=dict(os.environ),
         capture_output=True,
         timeout=timeout,
+        check=False,
     )
     if proc.returncode != 0:
         rendered = " ".join(cmd)
@@ -3546,7 +3547,7 @@ def build_tool_probe_result(
     result: dict[str, Any] = {
         "elapsed_ms": elapsed_ms_value,
         "stdout_bytes": stdout_bytes,
-        "response_keys": sorted(str(key) for key in data.keys()),
+        "response_keys": sorted(str(key) for key in data),
         "stderr_tail": log_tail(stderr),
     }
     if include_logs:
@@ -4593,7 +4594,8 @@ def git_metadata(repo_root: Path, timeout: int) -> dict[str, Any]:
     def maybe(args: list[str]) -> str:
         try:
             return command_stdout(["git", *args], timeout, repo_root)
-        except Exception as exc:  # noqa: BLE001 - metadata should not abort benchmark execution.
+        except Exception as exc:
+            # Metadata collection must not abort the benchmark measurement.
             return f"<error: {type(exc).__name__}: {exc}>"
 
     return {
@@ -5636,10 +5638,8 @@ def observed_pairs_from_query_response(
             continue
         score = row[2] if len(row) > 2 else None
         if isinstance(score, str):
-            try:
+            with suppress(ValueError):
                 score = float(score)
-            except ValueError:
-                pass
         values = {
             column_names[index]: value
             for index, value in enumerate(row)
