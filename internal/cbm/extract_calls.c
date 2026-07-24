@@ -1557,8 +1557,22 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
             ca->index = positional_idx++;
             if (is_string_like(ak) && ca->expr) {
                 ca->value = strip_quotes(ctx->arena, ca->expr);
+            } else if (strcmp(ak, "template_string") == 0) {
+                /* Flattened {} form so downstream url-arg detection joins the
+                 * canonical server route shape (issue #1006/#1009). */
+                ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
+            } else if (strcmp(ak, "call_expression") == 0) {
+                /* URL-builder helper call (issue #1009): resolve
+                 * client(buildPath(id)) through the per-file builder map. */
+                TSNode fn = ts_node_child_by_field_name(arg_node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                    if (fname) {
+                        ca->value = lookup_string_constant(ctx, fname);
+                    }
+                }
             }
             call->arg_count++;
         }
@@ -1606,6 +1620,9 @@ static bool is_queue_topic_field(const char *key) {
 // Extract string value from a node (literal or constant reference).
 static const char *extract_string_value(CBMExtractCtx *ctx, TSNode val_node) {
     const char *vk = ts_node_type(val_node);
+    if (strcmp(vk, "template_string") == 0) {
+        return cbm_template_string_text(ctx->arena, val_node, ctx->source);
+    }
     if (is_string_like(vk)) {
         char *text = cbm_node_text(ctx->arena, val_node, ctx->source);
         if (text && text[0]) {
@@ -1706,6 +1723,14 @@ static const char *extract_keyword_url(CBMExtractCtx *ctx, TSNode arg) {
 
 // Try to extract URL/topic from a positional argument (string or constant).
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
+    /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
+     * client URL joins the server route's canonical placeholder (issue #1006). */
+    if (strcmp(ak, "template_string") == 0) {
+        const char *flat = cbm_template_string_text(ctx->arena, arg, ctx->source);
+        if (flat) {
+            return strip_and_validate_string_arg(ctx->arena, (char *)flat);
+        }
+    }
     if (is_string_like(ak)) {
         char *text = cbm_node_text(ctx->arena, arg, ctx->source);
         const char *validated = strip_and_validate_string_arg(ctx->arena, text);
@@ -1749,6 +1774,19 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             const char *val = extract_composite_queue_field(ctx, arg);
             if (val) {
                 return val;
+            }
+        }
+
+        /* URL-builder helper call (issue #1009): `client(buildPath(id))` — the
+         * builder's returned URL was recorded in the per-file constant map. */
+        if (strcmp(ak, "call_expression") == 0) {
+            TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+            if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                const char *val = fname ? lookup_string_constant(ctx, fname) : NULL;
+                if (val) {
+                    return val;
+                }
             }
         }
 
