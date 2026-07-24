@@ -73,6 +73,9 @@ static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] =
      CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL, "pi", NULL, NULL},
     {CBM_AGENT_CLIENT_SOURCEGRAPH_CODY, "sourcegraph-cody", "Sourcegraph Cody", CBM_AGENT_OPT_IN,
      CBM_AGENT_CAP_MCP, NULL, agent_install_callback, agent_remove_callback},
+    {CBM_AGENT_CLIENT_OMP, "omp", "Oh My Pi (omp)", CBM_AGENT_STABLE,
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
+     "omp", agent_install_callback, agent_remove_callback},
 };
 
 size_t cbm_agent_client_count(void) {
@@ -581,6 +584,8 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
                                ".bob/mcp_settings.json");
     case CBM_AGENT_CLIENT_POCHI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pochi/config.jsonc");
+    case CBM_AGENT_CLIENT_OMP:
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent/mcp.json");
     case CBM_AGENT_CLIENT_PI:
         return 1;
     case CBM_AGENT_CLIENT_SOURCEGRAPH_CODY:
@@ -646,6 +651,8 @@ static int agent_client_marker_path(cbm_agent_client_id_t id,
         return 1;
     case CBM_AGENT_CLIENT_POCHI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pochi");
+    case CBM_AGENT_CLIENT_OMP:
+        return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent");
     case CBM_AGENT_CLIENT_PI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pi/agent");
     default:
@@ -1064,7 +1071,8 @@ static char *agent_json_canonical(cbm_agent_client_id_t id, const char *binary_p
         return NULL;
     }
     const char *extra = "";
-    if (id == CBM_AGENT_CLIENT_GITLAB_DUO || id == CBM_AGENT_CLIENT_VISUAL_STUDIO) {
+    if (id == CBM_AGENT_CLIENT_GITLAB_DUO || id == CBM_AGENT_CLIENT_VISUAL_STUDIO ||
+        id == CBM_AGENT_CLIENT_OMP) {
         extra = ", \"type\": \"stdio\"";
     } else if (id == CBM_AGENT_CLIENT_ROVO_DEV) {
         extra = ", \"transport\": \"stdio\"";
@@ -1445,6 +1453,7 @@ static bool agent_json_client(cbm_agent_client_id_t id) {
     case CBM_AGENT_CLIENT_ROO_CODE:
     case CBM_AGENT_CLIENT_AMAZON_Q:
     case CBM_AGENT_CLIENT_CODEBUDDY:
+    case CBM_AGENT_CLIENT_OMP:
     case CBM_AGENT_CLIENT_IBM_BOB_IDE:
     case CBM_AGENT_CLIENT_IBM_BOB_SHELL:
     case CBM_AGENT_CLIENT_POCHI:

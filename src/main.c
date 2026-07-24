@@ -832,7 +832,7 @@ static void print_help(void) {
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
-    printf("\nSupported automatic/conditional client surfaces (43):\n");
+    printf("\nSupported automatic/conditional client surfaces (44):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
     printf("  Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands,\n");
@@ -841,7 +841,7 @@ static void print_help(void) {
     printf("  Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn,\n");
     printf("  Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE,\n");
     printf("  CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi,\n");
-    printf("  Sourcegraph Cody\n");
+    printf("  Sourcegraph Cody, Oh My Pi (omp)\n");
     printf("  Conditional/explicit targets are changed only when their documented\n");
     printf("  platform, marker, or explicit existing config path is present.\n");
     printf("  Manual/UI MCP boundaries: Qodo, Warp, JetBrains AI/ACP, Replit,\n");

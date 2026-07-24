@@ -158,6 +158,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
+        "omp",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -178,6 +179,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
         CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
         CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
     };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));
@@ -826,6 +828,7 @@ TEST(agent_clients_json_schemas_are_exact_and_policy_neutral) {
         {CBM_AGENT_CLIENT_IBM_BOB_IDE, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_IBM_BOB_SHELL, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_POCHI, "\"mcp\""},
+        {CBM_AGENT_CLIENT_OMP, "\"type\": \"stdio\""},
     };
     const char *binary = "/opt/Codebase Memory/bin/cbm\\\"special";
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -863,6 +866,7 @@ TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
         CBM_AGENT_CLIENT_IBM_BOB_IDE,
         CBM_AGENT_CLIENT_IBM_BOB_SHELL,
         CBM_AGENT_CLIENT_POCHI,
+        CBM_AGENT_CLIENT_OMP,
     };
     for (size_t i = 0U; i < sizeof(clients) / sizeof(clients[0]); i++) {
         const char *foreign =
