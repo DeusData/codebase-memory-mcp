@@ -44,7 +44,9 @@ static const char *CBM_MANIFEST_FILES[] = {
     NULL
 };
 
-/* Default limits (convention: -1=unlimited, 0=disabled, >0=limit) */
+/* Configuration defaults: auto_index_deps=false disables automation;
+ * configured auto_dep_limit=0 is unlimited and positive values are caps.
+ * Internal effective limits use 0=disabled, <0=unlimited, and >0=cap. */
 #define CBM_DEFAULT_AUTO_INDEX_DEPS false
 #define CBM_DEFAULT_AUTO_INDEX_DEPS_STR "false"
 #define CBM_DEFAULT_AUTO_DEP_LIMIT 20
@@ -141,7 +143,8 @@ void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count);
 /* Detect ecosystem, discover deps from fresh graph, index via flush.
  * Called AFTER dump_to_sqlite by index_repository, watcher, autoindex.
  * cfg may be NULL; when present, dependency pipelines use the same indexing
- * thresholds as the parent project pipeline.
+ * thresholds as the parent project pipeline and max_deps is the fallback
+ * configured package cap. Without cfg, max_deps is already effective.
  * Returns number of deps indexed, or 0 if none. */
 int cbm_dep_auto_index(const char *project_name, const char *project_root,
                        cbm_store_t *store, int max_deps, cbm_config_t *cfg);

@@ -4298,6 +4298,16 @@ TEST(cli_hook_augment_guidance_tracks_tool_and_dependency_config) {
     ASSERT(strstr(output, "auto_dep_limit=3") != NULL);
     free(output);
 
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_AUTO_DEP_LIMIT, "-1"), 0);
+    output = cbm_hook_augment_lifecycle_json(input);
+    ASSERT_NOT_NULL(output);
+    char expected_dep_limit[64];
+    snprintf(expected_dep_limit, sizeof(expected_dep_limit), "auto_dep_limit=%d",
+             CBM_DEFAULT_AUTO_DEP_LIMIT);
+    ASSERT(strstr(output, expected_dep_limit) != NULL);
+    ASSERT(strstr(output, "auto_dep_limit=0 (unlimited)") == NULL);
+    free(output);
+
     /* Environment-only configuration must still shape guidance when no config
      * database exists, and the hook must not create one while reading it. */
     char missing_cache[512];

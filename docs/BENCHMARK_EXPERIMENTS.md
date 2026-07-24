@@ -4,7 +4,9 @@
 attempt under a content-addressed cell directory. It is intended for release-build
 comparisons where correctness and query-result quality are gates, not optional
 context around a speed claim. New automation uses this entry point and
-`--experiment-root`. The legacy script name, flag aliases, persisted JSON keys, and
+`--experiment-root`. When retained plan or command records name a retired benchmark
+script path, the loader resolves that path to the canonical entry point; no executable
+compatibility wrapper is installed. Legacy flag aliases, persisted JSON keys, and the
 `.worktrees/benchmark-campaign/` location remain readable for retained runs.
 
 Use a durable ignored experiment root. Automatic runs continue to use
