@@ -37,7 +37,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **One command across supported agents** — `install` auto-detects Claude Code, Claude Desktop, Codex CLI, Gemini CLI, Qwen Code, ForgeCode, Zed, OpenCode, Antigravity, Aider, standalone Kilo, the legacy Kilo VS Code extension, VS Code, Cursor, Windsurf, OpenClaw, Kiro, and Junie, then adds only the MCP entries, owned instruction blocks, skills, and hooks each client supports.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749` (optional UI binary variant).
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** (classic mode; a streamlined subset is the default) — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **16 MCP tools** (classic mode; a streamlined subset is the default) — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
@@ -635,7 +635,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 ```
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
-  mcp/                MCP server (15 classic tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (16 classic tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (10 agents, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)
