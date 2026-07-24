@@ -31,6 +31,10 @@
  * "no incremental route; continue with a full index" sentinel. */
 #define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
 
+/* Stable internal serialization used by Project metadata, coverage metadata,
+ * and route diagnostics. */
+const char *cbm_pipeline_mode_name(cbm_index_mode_t mode);
+
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
  * handlers rendezvous on the same Route QN regardless of framework syntax.
@@ -634,9 +638,12 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
 
 /* Run incremental re-index on an existing disk DB.
  * Classifies files by mtime+size, deletes changed nodes, re-parses changed
- * files, merges into disk DB. Returns 0 on success. */
+ * files with effective_mode capabilities, then merges into disk DB. The
+ * pipeline's requested mode still owns discovery/exclusions. Returns 0 on
+ * success, or CBM_PIPELINE_ABORT_PRESERVE_DB when the existing coverage
+ * table is unreadable and the on-disk DB must be left untouched. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
-                                 int file_count);
+                                 int file_count, cbm_index_mode_t effective_mode);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
