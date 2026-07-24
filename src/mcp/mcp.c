@@ -640,9 +640,13 @@ static const tool_def_t TOOLS[] = {
      "\"required\":"
      "[\"project\"]}"},
 
-    {"manage_adr", "Manage ADR", "Create or update Architecture Decision Records",
+    {"manage_adr", "Manage ADR", "Create, update or append to Architecture Decision Records",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"content\":{\"type\":\"string\"},"
+     "\"string\",\"enum\":[\"get\",\"update\",\"append\",\"sections\"],\"description\":"
+     "\"get = read; update = REPLACE the whole document; append = add content to the end of "
+     "the stored document (use this to add an entry without re-sending the ADR); "
+     "sections = list markdown headers.\"},\"content\":{\"type\":\"string\",\"description\":"
+     "\"Full document for update, or just the chunk to add for append.\"},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},\"required\":[\"project\"]"
      "}"},
 
@@ -10141,6 +10145,45 @@ static char *adr_read_legacy_file(const char *root_path) {
     return buf;
 }
 
+/* Join the stored ADR with an appended chunk for mode='append'.
+ *
+ * 'update' replaces the whole document, so adding one entry costs a full
+ * re-send of the ADR — expensive for large documents and an opportunity to
+ * silently drop existing text on the way back in. Appending concatenates
+ * server-side instead, so the stored copy is the only source of the prefix.
+ *
+ * Trailing newlines on the existing content are trimmed and exactly one blank
+ * line is inserted, so repeated appends can't accumulate whitespace. An empty
+ * or missing ADR degrades to a plain create (no leading blank line).
+ * Returns a heap buffer (caller frees), or NULL on bad input / OOM. */
+static char *adr_append_content(const char *existing, const char *addition) {
+    if (!addition) {
+        return NULL;
+    }
+    if (!existing || existing[0] == '\0') {
+        return heap_strdup(addition);
+    }
+    size_t elen = strlen(existing);
+    while (elen > 0 && (existing[elen - SKIP_ONE] == '\n' || existing[elen - SKIP_ONE] == '\r')) {
+        elen--;
+    }
+    if (elen == 0) {
+        return heap_strdup(addition);
+    }
+    static const char sep[] = "\n\n";
+    size_t seplen = sizeof(sep) - SKIP_ONE;
+    size_t alen = strlen(addition);
+    char *out = malloc(elen + seplen + alen + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, existing, elen);
+    memcpy(out + elen, sep, seplen);
+    memcpy(out + elen + seplen, addition, alen);
+    out[elen + seplen + alen] = '\0';
+    return out;
+}
+
 #define ADR_EMPTY_HINT                                                             \
     "No ADR yet. Create one with manage_adr(mode='update', "                       \
     "content='## PURPOSE\\n...\\n\\n## STACK\\n...\\n\\n## ARCHITECTURE\\n..."     \
@@ -10269,6 +10312,29 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
             is_error = true;
         }
+    } else if (strcmp(mode_str, "append") == 0) {
+        char *merged = content ? adr_append_content(have_adr ? adr.content : NULL, content) : NULL;
+        if (!content) {
+            /* Explicit failure rather than falling through to 'get': a caller
+             * that meant to append must not read a success-shaped response. */
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "missing_content");
+            yyjson_mut_obj_add_str(doc, root_obj, "error",
+                                   "mode='append' requires 'content' (the chunk to add)");
+            is_error = true;
+        } else if (!merged) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+            is_error = true;
+        } else if (cbm_store_adr_store(store, project, merged) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "appended");
+            /* Callers verify an append landed without re-fetching the whole
+             * document, which for large ADRs is the expensive part. */
+            yyjson_mut_obj_add_uint(doc, root_obj, "content_length", (uint64_t)strlen(merged));
+            yyjson_mut_obj_add_uint(doc, root_obj, "appended_length", (uint64_t)strlen(content));
+        } else {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+            is_error = true;
+        }
+        free(merged);
     } else if (strcmp(mode_str, "sections") == 0) {
         adr_list_sections_from_content(doc, root_obj, have_adr ? adr.content : NULL);
     } else { /* get */
