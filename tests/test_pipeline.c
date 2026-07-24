@@ -11460,6 +11460,10 @@ TEST(import_map_from_edges_follows_package_reexport) {
     ASSERT_EQ(import_count, 1);
     ASSERT_STR_EQ(keys[0], "Header");
     ASSERT_STR_EQ(vals[0], "proj.fastapi.param_functions.Header");
+    ASSERT_TRUE(cbm_pipeline_import_map_entry_is_reexport(
+        gb, "proj", "app/main.py", "Header", "proj.fastapi.param_functions.Header"));
+    ASSERT_FALSE(cbm_pipeline_import_map_entry_is_reexport(
+        gb, "proj", "app/main.py", "Header", "proj.fastapi.openapi.models.Header"));
 
     cbm_pipeline_free_import_map(keys, vals, import_count);
     cbm_gbuf_free(gb);

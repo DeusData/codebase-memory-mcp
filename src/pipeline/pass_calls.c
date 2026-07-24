@@ -352,14 +352,13 @@ static bool calls_suppress_python_file_weak_dotted_match(const cbm_gbuf_node_t *
            !cbm_registry_is_import_reachable(res->qualified_name, imp_vals, imp_count);
 }
 
-/* Exact-delta scratch graphs can supply a narrower store-backed LSP registry
- * than a full rebuild. When both resolvers select the same canonical node,
- * keep the stronger registry result so edge metadata does not depend on which
- * equivalent registry shape happened to run. Do not let textual resolution
- * override an LSP target: a different target remains type-aware evidence. */
-static cbm_resolution_t calls_prefer_stronger_same_target_resolution(
-    const cbm_pipeline_ctx_t *ctx, const CBMCall *call, const char *module_qn,
-    const char **imp_keys, const char **imp_vals, int imp_count,
+/* Exact-delta persisted LSP scope can retain metadata for a package re-export
+ * whose target changed. When the current import map proves that re-export and
+ * selects the same target more strongly, use its metadata so exact publication
+ * matches a fresh rebuild. Direct imports retain normal LSP precedence. */
+static cbm_resolution_t calls_refresh_reexport_resolution(
+    const cbm_pipeline_ctx_t *ctx, const CBMCall *call, const char *source_path,
+    const char *module_qn, const char **imp_keys, const char **imp_vals, int imp_count,
     const cbm_gbuf_node_t *lsp_target, cbm_resolution_t lsp_resolution) {
     if (!ctx || !ctx->store_backed_node_lookup || !ctx->registry || !call ||
         !call->callee_name || !lsp_target || !lsp_target->qualified_name || imp_count <= 0) {
@@ -369,8 +368,12 @@ static cbm_resolution_t calls_prefer_stronger_same_target_resolution(
         cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
                              imp_count);
     if (registry_resolution.qualified_name &&
+        cbm_registry_strategy_is_import_map(registry_resolution.strategy) &&
         strcmp(registry_resolution.qualified_name, lsp_target->qualified_name) == 0 &&
-        registry_resolution.confidence > lsp_resolution.confidence) {
+        registry_resolution.confidence > lsp_resolution.confidence &&
+        cbm_pipeline_import_map_entry_is_reexport(ctx->gbuf, ctx->project_name, source_path,
+                                                  call->callee_name,
+                                                  registry_resolution.qualified_name)) {
         return registry_resolution;
     }
     return lsp_resolution;
@@ -406,8 +409,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
-            res = calls_prefer_stronger_same_target_resolution(
-                ctx, call, module_qn, imp_keys, imp_vals, imp_count, target_node, res);
+            res = calls_refresh_reexport_resolution(ctx, call, rel, module_qn, imp_keys, imp_vals,
+                                                    imp_count, target_node, res);
             if (emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn,
                                      imp_keys, imp_vals, imp_count, false) &&
                 !cbm_service_pattern_is_global_fetch(call->callee_name)) {
