@@ -4100,6 +4100,11 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
+    /* Production correctly honors CODEX_HOME, but this fixture must not inherit
+     * the developer or CI runner's real Codex home. */
+    char *saved_codex_home = save_test_env("CODEX_HOME");
+    cbm_unsetenv("CODEX_HOME");
+
     /* Make Cursor + Codex "detected". */
     char dir[512];
     snprintf(dir, sizeof(dir), "%s/.cursor", tmpdir);
@@ -4108,24 +4113,26 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     test_mkdirp(dir);
 
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
-    ASSERT_NOT_NULL(json);
-    ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
-    ASSERT(strstr(json, "writes_started") != NULL);
-    ASSERT(strstr(json, "next_safe_command") != NULL);
-    ASSERT(strstr(json, "cursor") != NULL);
-    ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
-    ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    bool receipt_valid = json && strstr(json, "agent.install.plan.v1") &&
+                         strstr(json, "writes_started") && strstr(json, "next_safe_command") &&
+                         strstr(json, "cursor") && strstr(json, ".cursor/mcp.json") &&
+                         strstr(json, ".codex/config.toml");
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
     char cfg[512];
     struct stat st;
     snprintf(cfg, sizeof(cfg), "%s/.cursor/mcp.json", tmpdir);
-    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    bool cursor_untouched = stat(cfg, &st) != 0;
     snprintf(cfg, sizeof(cfg), "%s/.codex/config.toml", tmpdir);
-    ASSERT(stat(cfg, &st) != 0); /* must not exist */
+    bool codex_untouched = stat(cfg, &st) != 0;
 
+    restore_test_env("CODEX_HOME", saved_codex_home);
     test_rmdir_r(tmpdir);
+    if (!receipt_valid)
+        FAIL("install plan receipt must describe the detected Cursor and Codex fixtures");
+    if (!cursor_untouched || !codex_untouched)
+        FAIL("building an install plan must not create agent config files");
     PASS();
 }
 
