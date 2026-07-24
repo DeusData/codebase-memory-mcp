@@ -9974,8 +9974,8 @@ void cbm_cli_print_main_help(void) {
     printf("  search_code, get_code, _hidden_tools\n");
     printf("\nAdvanced and CLI-callable tools: index_repository, get_code_snippet,\n");
     printf("  get_graph_schema, get_architecture, list_projects, delete_project,\n");
-    printf("  index_status, detect_changes, manage_adr, ingest_traces,\n");
-    printf("  index_dependencies\n");
+    printf("  index_status, check_index_coverage, detect_changes, manage_adr,\n");
+    printf("  ingest_traces, index_dependencies\n");
 }
 
 double cbm_config_get_double(cbm_config_t *cfg, const char *key, double default_val) {
