@@ -3769,8 +3769,12 @@ static int with_agg_find_or_create(with_agg_t **aggs, int *agg_cnt, int *agg_cap
         (*aggs)[found].group_vals[ci] = heap_strdup(v);
         /* If this group item is a bare node variable, remember its id so the
          * carried virtual var can re-fetch any property (group_vals holds only
-         * the name). */
-        if (!wc->items[ci].property && wc->items[ci].variable) {
+         * the name). Excludes entity-introspection funcs (labels/id/keys/
+         * properties): those project a scalar off the node (via project_item
+         * above), not the node itself, so the carried id must not be set or a
+         * later alias.property re-fetches the source node's real properties
+         * instead of returning empty for the non-node alias. */
+        if (!wc->items[ci].func && !wc->items[ci].property && wc->items[ci].variable) {
             cbm_node_t *gn = binding_get(b, wc->items[ci].variable);
             if (gn) {
                 (*aggs)[found].group_node_ids[ci] = gn->id;
