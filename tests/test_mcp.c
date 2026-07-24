@@ -4060,6 +4060,138 @@ TEST(tool_manage_adr_unified_backend_issue256) {
     PASS();
 }
 
+/* mode='append' adds to the stored ADR instead of replacing it, so callers can
+ * add one entry without re-sending the whole document (the re-send is both
+ * expensive and a chance to silently drop existing text). */
+TEST(tool_manage_adr_append_extends_without_replacing) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "adr-append", "/tmp/adr-append");
+    cbm_mcp_server_set_project(srv, "adr-append");
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-append\",\"mode\":\"update\","
+                                     "\"content\":\"## PURPOSE\\nFirst entry.\\n\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-append\",\"mode\":\"append\","
+                               "\"content\":\"## DECISIONS\\nSecond entry.\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "appended"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    free(resp);
+
+    /* The prefix must survive verbatim, and the new chunk must land after it. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, "adr-append", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    const char *first = strstr(adr.content, "First entry.");
+    const char *second = strstr(adr.content, "Second entry.");
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT(first < second);
+    /* Exactly one blank line joins them — repeated appends must not pile up
+     * whitespace, so the trailing newline of the stored copy is trimmed. */
+    ASSERT_NOT_NULL(strstr(adr.content, "First entry.\n\n## DECISIONS"));
+    cbm_store_adr_free(&adr);
+
+    /* Both sections are now discoverable via mode='sections'. */
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-append\",\"mode\":\"sections\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "## PURPOSE"));
+    ASSERT_NOT_NULL(strstr(resp, "## DECISIONS"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Appending to a project that has no ADR yet behaves as a plain create — no
+ * leading blank line, no error. */
+TEST(tool_manage_adr_append_creates_when_absent) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "adr-append-new", "/tmp/adr-append-new");
+    cbm_mcp_server_set_project(srv, "adr-append-new");
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-append-new\",\"mode\":\"append\","
+                                     "\"content\":\"## PURPOSE\\nOnly entry.\\n\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "appended"));
+    free(resp);
+
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, "adr-append-new", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nOnly entry.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* append without content must fail loudly. Falling through to 'get' would hand
+ * the caller a response that looks like a successful read while nothing was
+ * written. */
+TEST(tool_manage_adr_append_without_content_errors) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "adr-append-empty", "/tmp/adr-append-empty");
+    cbm_mcp_server_set_project(srv, "adr-append-empty");
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"adr-append-empty\",\"mode\":\"update\","
+                                     "\"content\":\"## PURPOSE\\nUntouched.\\n\"}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                               "{\"project\":\"adr-append-empty\",\"mode\":\"append\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "missing_content"));
+    free(resp);
+
+    /* And the stored ADR is untouched. */
+    cbm_adr_t adr;
+    memset(&adr, 0, sizeof(adr));
+    ASSERT_EQ(cbm_store_adr_get(st, "adr-append-empty", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, "## PURPOSE\nUntouched.\n");
+    cbm_store_adr_free(&adr);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The mode must be advertised, otherwise callers never learn it exists and
+ * keep paying for whole-document rewrites. */
+TEST(tool_manage_adr_append_is_advertised) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}");
+    ASSERT_NOT_NULL(resp);
+    const char *adr_tool = strstr(resp, "manage_adr");
+    ASSERT_NOT_NULL(adr_tool);
+    ASSERT_NOT_NULL(strstr(adr_tool, "append"));
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_manage_adr_mutation_guard_balances_success) {
     const char *project = "guard-adr-success";
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -9423,6 +9555,10 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);
+    RUN_TEST(tool_manage_adr_append_extends_without_replacing);
+    RUN_TEST(tool_manage_adr_append_creates_when_absent);
+    RUN_TEST(tool_manage_adr_append_without_content_errors);
+    RUN_TEST(tool_manage_adr_append_is_advertised);
     RUN_TEST(tool_index_repository_reports_store_backed_adr);
     RUN_TEST(tool_index_repository_dot_uses_absolute_project_key_and_preserves_adr);
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
