@@ -716,7 +716,8 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         /* Swift and newer tree-sitter-kotlin: function_declaration has no `name`
          * field; the function name is a `simple_identifier` child. */
         if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-            strcmp(kind, "function_declaration") == 0) {
+            (strcmp(kind, "function_declaration") == 0 ||
+             strcmp(kind, "protocol_function_declaration") == 0)) {
             TSNode si = cbm_find_child_by_kind(node, "simple_identifier");
             if (!ts_node_is_null(si)) {
                 return si;
@@ -2752,7 +2753,7 @@ static const char *class_label_for_kind(const char *kind) {
         return "Interface";
     }
     if (strcmp(kind, "enum_specifier") == 0 || strcmp(kind, "enum_declaration") == 0 ||
-        strcmp(kind, "enum_item") == 0) {
+        strcmp(kind, "enum_item") == 0 || strcmp(kind, "enum_class_body") == 0) {
         return "Enum";
     }
     if (strcmp(kind, "type_alias_declaration") == 0 || strcmp(kind, "type_item") == 0 ||
@@ -3636,6 +3637,13 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         (ctx->language == CBM_LANG_SWIFT || ctx->language == CBM_LANG_KOTLIN)) {
         name_node = cbm_find_child_by_kind(node, "type_identifier");
     }
+    if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_SWIFT &&
+        strcmp(kind, "enum_class_body") == 0) {
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent)) {
+            name_node = cbm_find_child_by_kind(parent, "type_identifier");
+        }
+    }
     // Protobuf: service_name / message_name / enum_name children
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_PROTOBUF) {
         name_node = cbm_find_child_by_kind(node, "service_name");
@@ -4087,6 +4095,7 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     static const char *body_types[] = {"class_body",
                                        "interface_body",
                                        "enum_body",
+                                       "protocol_body",
                                        "template_body",
                                        "interface_type",
                                        "struct_type",
@@ -4191,7 +4200,8 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     }
 
     if ((lang == CBM_LANG_SWIFT || lang == CBM_LANG_KOTLIN) &&
-        strcmp(ck, "function_declaration") == 0) {
+        (strcmp(ck, "function_declaration") == 0 ||
+         strcmp(ck, "protocol_function_declaration") == 0)) {
         return cbm_find_child_by_kind(child, "simple_identifier");
     }
 
@@ -4370,6 +4380,14 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
                 continue;
             }
             method_node = def;
+        }
+        if (ctx->language == CBM_LANG_SWIFT &&
+            !cbm_kind_in_set(method_node, spec->function_node_types)) {
+            TSNode nested =
+                find_first_descendant_by_kind(method_node, "protocol_function_declaration", 3);
+            if (!ts_node_is_null(nested)) {
+                method_node = nested;
+            }
         }
 
         // TS/JS class-field arrow functions: `handleClick = () => {...}` is a
