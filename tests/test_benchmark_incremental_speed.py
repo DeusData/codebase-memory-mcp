@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 SCRIPT = (
-    Path(__file__).resolve().parents[1] / "scripts" / "benchmark-incremental-speed.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "incremental_speed.py"
 )
 SPEC = importlib.util.spec_from_file_location("benchmark_incremental_speed", SCRIPT)
 assert SPEC and SPEC.loader
@@ -2147,7 +2147,7 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         }
         for entry in entries:
             self.assertEqual(set(entry), required, entry["term_id"])
-        generator = SCRIPT.with_name("generate-benchmark-terminology.py")
+        generator = SCRIPT.with_name("generate_terminology.py")
         process = subprocess.run(
             [sys.executable, str(generator), "--check"],
             capture_output=True,
@@ -2198,6 +2198,27 @@ class BenchmarkIncrementalSpeedTest(unittest.TestCase):
         self.assertEqual(loaded["schema_version"], 1)
         self.assertNotIn("terminology_version", loaded)
         self.assertEqual(loaded["steps"][0]["elapsed_ms"], 5.0)
+
+    def test_load_retained_v2_fact_bundle_accepts_old_uri_and_contract_hash(
+        self,
+    ) -> None:
+        facts = BENCHMARK.normalize_benchmark_report(
+            {
+                "measurements": {"incremental": {"elapsed_ms": 7}},
+                "derived": {"passed": True},
+            }
+        )
+        facts["$schema"] = "docs/schema/benchmark-facts-v2.schema.json"
+        facts["terminology_version"] = "1.0.0"
+        facts["terminology_sha256"] = "a" * 64
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "facts-v2-old-uri.json"
+            path.write_text(json.dumps(facts), encoding="utf-8")
+            loaded = BENCHMARK.load_benchmark_fact_bundle(path)
+
+        self.assertEqual(loaded["schema_version"], 2)
+        self.assertEqual(loaded["terminology_version"], "1.0.0")
+        self.assertEqual(loaded["terminology_sha256"], "a" * 64)
 
     def test_validate_benchmark_facts_rejects_schema_required_run_field_gap(
         self,

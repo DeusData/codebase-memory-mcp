@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 SCRIPT = (
-    Path(__file__).resolve().parents[1] / "scripts" / "summarize-benchmark-results.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "summarize_results.py"
 )
 SPEC = importlib.util.spec_from_file_location("summarize_benchmark_results", SCRIPT)
 assert SPEC and SPEC.loader

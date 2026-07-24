@@ -5,8 +5,8 @@ This document moved to [`docs/BENCHMARK_EXPERIMENTS.md`](BENCHMARK_EXPERIMENTS.m
 New documentation and interfaces use "experiment". These legacy compatibility
 names remain available for existing runsets and automation:
 
-- `scripts/run-benchmark-campaign.py` still works unchanged as a backwards-compatible
-  shim for `scripts/run-benchmark-experiments.py`.
+- `scripts/run-benchmark-campaign.py` remains available as a backwards-compatible
+  shim for `benchmarks/run_experiments.py`.
 - `--campaign-root` still works as an alias for `--experiment-root`.
 - Automatic runs retain `.worktrees/benchmark-campaign/` so old results resume.
 

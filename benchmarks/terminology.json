@@ -1,5 +1,5 @@
 {
-  "$schema": "docs/schema/benchmark-terminology.schema.json",
+  "$schema": "benchmarks/schema/terminology.schema.json",
   "entries": [
     {
       "aggregation_rule": "must not be aggregated unless a referenced formula defines the operation",
@@ -18,8 +18,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "benchmark_run",
@@ -42,8 +42,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "repetition",
@@ -66,8 +66,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "benchmark_cell",
@@ -90,8 +90,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "user_lifecycle",
@@ -114,8 +114,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "step",
@@ -138,8 +138,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "step_occurrence",
@@ -162,8 +162,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "parent_relation",
@@ -186,8 +186,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "dependency_relation",
@@ -210,8 +210,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "benchmark_result",
@@ -234,8 +234,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "retained_artifact",
@@ -258,8 +258,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "implementation_identity",
@@ -282,8 +282,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "production_build",
@@ -306,8 +306,8 @@
       "kind": "capability_state",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "capability",
@@ -330,8 +330,8 @@
       "kind": "capability_state",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "effective_capability_value",
@@ -354,8 +354,8 @@
       "kind": "capability_state",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "enabled_capability",
@@ -378,8 +378,8 @@
       "kind": "capability_state",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "disabled_capability",
@@ -402,8 +402,8 @@
       "kind": "capability_state",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "unsupported_capability",
@@ -426,8 +426,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "scope_manifest",
@@ -450,8 +450,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "cache_manifest",
@@ -474,8 +474,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "core_graph",
@@ -498,8 +498,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "core_answer",
@@ -522,8 +522,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "derived_view",
@@ -546,8 +546,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "source_generation",
@@ -570,8 +570,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "view_generation",
@@ -594,8 +594,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "fresh_view",
@@ -618,8 +618,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "stale_view",
@@ -642,8 +642,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "eager_refresh",
@@ -666,8 +666,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "deferred_refresh",
@@ -690,8 +690,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "requested_fresh_endpoint",
@@ -714,8 +714,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "all_fresh_endpoint",
@@ -738,8 +738,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "correctness_contract",
@@ -762,8 +762,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "clean_rebuild_graph_oracle",
@@ -786,8 +786,8 @@
       "kind": "freshness_and_correctness",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "graph_equality",
@@ -810,8 +810,8 @@
       "kind": "comparison_kind",
       "missing_or_unsupported_behavior": "reject the comparison when a required join field is unknown",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "parity_comparison",
@@ -834,8 +834,8 @@
       "kind": "comparison_kind",
       "missing_or_unsupported_behavior": "reject the comparison when a required join field is unknown",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "shared_work_projection",
@@ -858,8 +858,8 @@
       "kind": "comparison_kind",
       "missing_or_unsupported_behavior": "reject the comparison when a required join field is unknown",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "capability_delta_comparison",
@@ -882,8 +882,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "timer_boundary",
@@ -906,8 +906,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "elapsed_time",
@@ -930,8 +930,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "lifecycle_wall_time",
@@ -954,8 +954,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "work_time",
@@ -978,8 +978,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "cpu_time",
@@ -1002,8 +1002,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "queue_wait",
@@ -1026,8 +1026,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "overlap",
@@ -1050,8 +1050,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "critical_path",
@@ -1074,8 +1074,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "parallelism",
@@ -1098,8 +1098,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "worker_utilization",
@@ -1122,8 +1122,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "peak_rss",
@@ -1146,8 +1146,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "rss_delta",
@@ -1170,8 +1170,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "ratio",
@@ -1194,8 +1194,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "speedup",
@@ -1218,8 +1218,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "median",
@@ -1242,8 +1242,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "p95",
@@ -1266,8 +1266,8 @@
       "kind": "measurement",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "confidence_interval",
@@ -1290,8 +1290,8 @@
       "kind": "quality_metric",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "mrr",
@@ -1314,8 +1314,8 @@
       "kind": "quality_metric",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "hit_at_k",
@@ -1338,8 +1338,8 @@
       "kind": "quality_metric",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "ndcg_at_k",
@@ -1362,8 +1362,8 @@
       "kind": "quality_metric",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "semantic_pair_f1",
@@ -1386,8 +1386,8 @@
       "kind": "quality_metric",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "task_success",
@@ -1410,8 +1410,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "invalid_benchmark_record",
@@ -1434,8 +1434,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "product_failure",
@@ -1458,8 +1458,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "observer_effect",
@@ -1482,8 +1482,8 @@
       "kind": "benchmark_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "generated_source",
@@ -1506,8 +1506,8 @@
       "kind": "algorithm_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "semantic_vector",
@@ -1530,8 +1530,8 @@
       "kind": "algorithm_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "lsh_index",
@@ -1554,8 +1554,8 @@
       "kind": "step_id",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "pagerank",
@@ -1578,8 +1578,8 @@
       "kind": "step_id",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "linkrank",
@@ -1602,8 +1602,8 @@
       "kind": "algorithm_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "node_degree",
@@ -1626,8 +1626,8 @@
       "kind": "algorithm_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "graph_publication",
@@ -1650,8 +1650,8 @@
       "kind": "algorithm_concept",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "dependency_artifact_reuse",
@@ -1674,8 +1674,8 @@
       "kind": "evidence_status",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "existing_behavior",
@@ -1698,8 +1698,8 @@
       "kind": "evidence_status",
       "missing_or_unsupported_behavior": "record an explicit unknown fact; do not infer the value from a label or preset",
       "source_anchors": [
-        "docs/schema/benchmark-facts-v2.schema.json",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/schema/facts-v2.schema.json",
+        "benchmarks/incremental_speed.py"
       ],
       "status": "existing",
       "term_id": "proposed_behavior",
@@ -1723,7 +1723,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "startup",
@@ -1747,7 +1747,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "project_discovery",
@@ -1771,7 +1771,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "change_classification",
@@ -1795,7 +1795,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "parse_extract",
@@ -1819,7 +1819,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "exact_delta",
@@ -1843,7 +1843,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "semantic_vectors",
@@ -1867,7 +1867,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "semantic_lsh",
@@ -1891,7 +1891,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "semantic_pairs",
@@ -1915,7 +1915,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "graph_publish_delete",
@@ -1939,7 +1939,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "graph_publish_upsert",
@@ -1963,7 +1963,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "graph_publish_indexes",
@@ -1987,7 +1987,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "dependency_discovery",
@@ -2011,7 +2011,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "dependency_package_index",
@@ -2035,7 +2035,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "first_core_query",
@@ -2059,7 +2059,7 @@
       "missing_or_unsupported_behavior": "omit no required occurrence; mark the benchmark record invalid if detail collection overflows",
       "source_anchors": [
         "src/foundation/profile.h",
-        "scripts/benchmark-incremental-speed.py"
+        "benchmarks/incremental_speed.py"
       ],
       "status": "proposed",
       "term_id": "first_all_fresh_query",
@@ -2069,7 +2069,7 @@
       "aggregation_rule": "not_applicable",
       "allowed_values_or_range": "exactly `parity_manifest_and_contract_v1`",
       "boundary_semantics": "not_applicable",
-      "capability_or_freshness_implications": "requires identical effective capability, scope, cache, and correctness-contract records",
+      "capability_or_freshness_implications": "requires identical effective capability, scope, cache, host, benchmark-contract, and correctness-contract records",
       "clock_or_cpu_scope": "not_applicable",
       "concurrency_rule": "does not imply serial execution; compared durations retain their recorded occurrence structure",
       "configuration_precedence": "not_applicable",
@@ -2082,8 +2082,8 @@
       "kind": "join_id",
       "missing_or_unsupported_behavior": "classify the pair as not eligible and emit no ratio",
       "source_anchors": [
-        "docs/schema/benchmark-comparisons-v1.schema.json",
-        "scripts/benchmark_fact_comparisons.py"
+        "benchmarks/schema/comparisons-v1.schema.json",
+        "benchmarks/fact_comparisons.py"
       ],
       "status": "existing",
       "term_id": "parity_manifest_and_contract_v1",
@@ -2106,8 +2106,8 @@
       "kind": "join_id",
       "missing_or_unsupported_behavior": "classify the pair as not eligible when required equal fields differ or either capability manifest is incomplete",
       "source_anchors": [
-        "docs/schema/benchmark-comparisons-v1.schema.json",
-        "scripts/benchmark_fact_comparisons.py"
+        "benchmarks/schema/comparisons-v1.schema.json",
+        "benchmarks/fact_comparisons.py"
       ],
       "status": "existing",
       "term_id": "capability_delta_manifest_v1",
@@ -2130,8 +2130,8 @@
       "kind": "formula_id",
       "missing_or_unsupported_behavior": "omit the aggregate when no numeric elapsed_ms occurrence is recorded",
       "source_anchors": [
-        "docs/schema/benchmark-comparisons-v1.schema.json",
-        "scripts/benchmark_fact_comparisons.py"
+        "benchmarks/schema/comparisons-v1.schema.json",
+        "benchmarks/fact_comparisons.py"
       ],
       "status": "existing",
       "term_id": "median_elapsed_ms_v1",
@@ -2154,8 +2154,8 @@
       "kind": "formula_id",
       "missing_or_unsupported_behavior": "emit null when the right median is zero and emit no ratio unless the pair passed the parity join",
       "source_anchors": [
-        "docs/schema/benchmark-comparisons-v1.schema.json",
-        "scripts/benchmark_fact_comparisons.py"
+        "benchmarks/schema/comparisons-v1.schema.json",
+        "benchmarks/fact_comparisons.py"
       ],
       "status": "existing",
       "term_id": "left_elapsed_divided_by_right_elapsed_v1",

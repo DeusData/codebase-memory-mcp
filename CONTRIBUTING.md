@@ -83,7 +83,7 @@ For performance changes, use the canonical fact tables and comparison rules in
 [`docs/BENCHMARK_EXPERIMENTS.md`](docs/BENCHMARK_EXPERIMENTS.md). Field, step,
 concurrency, and lifecycle meanings come from the generated
 [`docs/BENCHMARK_TERMINOLOGY.md`](docs/BENCHMARK_TERMINOLOGY.md), whose source of
-truth is `docs/benchmark-terminology.json`.
+truth is `benchmarks/terminology.json`.
 
 Additional build flags follow the Makefile conventions:
 

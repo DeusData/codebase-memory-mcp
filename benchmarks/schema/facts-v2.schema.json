@@ -15,7 +15,7 @@
     "artifacts"
   ],
   "properties": {
-    "$schema": {"const": "docs/schema/benchmark-facts-v2.schema.json"},
+    "$schema": {"const": "benchmarks/schema/facts-v2.schema.json"},
     "schema_version": {"const": 2},
     "terminology_version": {
       "type": "string",

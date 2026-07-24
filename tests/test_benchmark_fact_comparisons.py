@@ -6,7 +6,7 @@ import unittest
 
 
 SCRIPT = (
-    Path(__file__).resolve().parents[1] / "scripts" / "benchmark_fact_comparisons.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "fact_comparisons.py"
 )
 SPEC = importlib.util.spec_from_file_location("benchmark_fact_comparisons", SCRIPT)
 assert SPEC and SPEC.loader
@@ -27,9 +27,10 @@ def fact_bundle(
     terminology_sha256: str = "a" * 64,
     generator_revision: str = "b" * 64,
     binary_path: str = "/build/cbm",
+    schema_uri: str = "benchmarks/schema/facts-v2.schema.json",
 ) -> dict:
     return {
-        "$schema": "docs/schema/benchmark-facts-v2.schema.json",
+        "$schema": schema_uri,
         "schema_version": 2,
         "terminology_version": "1.0.0",
         "terminology_sha256": terminology_sha256,
@@ -54,7 +55,7 @@ def fact_bundle(
                 "host": host or {"machine": "arm64", "platform": "fixture"},
                 "harness": {
                     "fact_schema_version": 2,
-                    "path": "/repo/scripts/benchmark-incremental-speed.py",
+                    "path": "/repo/benchmarks/incremental_speed.py",
                     "sha256": "c" * 64,
                 },
             }
@@ -287,6 +288,47 @@ class BenchmarkFactComparisonTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "duplicate fact run_id"):
             self.generate([bundle, bundle])
+
+    def test_old_v2_schema_uri_remains_readable(self) -> None:
+        bundle = fact_bundle(
+            run_id="c" * 24,
+            label="old-v2",
+            revision="a" * 40,
+            capabilities=complete_capabilities(),
+            elapsed_ms=12,
+            schema_uri="docs/schema/benchmark-facts-v2.schema.json",
+        )
+
+        document = self.generate([bundle])
+
+        self.assertEqual(document["source_bundles"][0]["schema_version"], 2)
+
+    def test_external_source_paths_are_hashed_not_disclosed(self) -> None:
+        source = Path("/private/user/retained/facts.json")
+
+        portable = COMPARISONS.portable_source_path(source)
+
+        self.assertRegex(portable, r"^external/[0-9a-f]{12}/facts\.json$")
+        self.assertNotIn("/private/user", portable)
+
+    def test_nested_absolute_manifest_paths_are_not_disclosed(self) -> None:
+        portable = COMPARISONS.portable_value(
+            {
+                "scope": {
+                    "repo": "/private/user/repository",
+                    "policy": "detached_worktree",
+                }
+            }
+        )
+
+        self.assertRegex(
+            portable["scope"]["repo"], r"^external/[0-9a-f]{12}/repository$"
+        )
+        self.assertEqual(portable["scope"]["policy"], "detached_worktree")
+        self.assertRegex(
+            COMPARISONS.portable_value(r"C:\Users\person\repository"),
+            r"^external/[0-9a-f]{12}/repository$",
+        )
 
 
 if __name__ == "__main__":

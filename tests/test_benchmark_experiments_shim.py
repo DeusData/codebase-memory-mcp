@@ -6,8 +6,10 @@ import unittest
 from pathlib import Path
 
 
-SCRIPTS_ROOT = Path(__file__).resolve().parents[1] / "scripts"
-EXPERIMENTS_SCRIPT = SCRIPTS_ROOT / "run-benchmark-experiments.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS_ROOT = REPO_ROOT / "scripts"
+EXPERIMENTS_SCRIPT = REPO_ROOT / "benchmarks" / "run_experiments.py"
+COMPATIBILITY_SCRIPT = SCRIPTS_ROOT / "run-benchmark-experiments.py"
 LEGACY_SCRIPT = SCRIPTS_ROOT / "run-benchmark-campaign.py"
 
 
@@ -20,6 +22,9 @@ def _load(path: Path, name: str):
 
 
 EXPERIMENTS = _load(EXPERIMENTS_SCRIPT, "run_benchmark_experiments_direct")
+COMPATIBILITY_SHIM = _load(
+    COMPATIBILITY_SCRIPT, "run_benchmark_experiments_compatibility_direct"
+)
 LEGACY_SHIM = _load(LEGACY_SCRIPT, "run_benchmark_campaign_shim_direct")
 
 
@@ -47,14 +52,19 @@ class BenchmarkExperimentsEntryPointTest(unittest.TestCase):
     def test_campaign_shim_resolves_and_re_exports_the_experiments_implementation(
         self,
     ) -> None:
-        # The shim loads run-benchmark-experiments.py by path and republishes its
+        # The shim loads benchmarks/run_experiments.py by path and republishes its
         # public names, so retained callers that import run-benchmark-campaign.py
         # directly keep working. Each
         # `_load` call in this test file execs a fresh module, so function objects
         # differ by identity even though the source is identical; assert the shim
         # loaded the canonical file and re-exports behaviorally identical names.
         self.assertEqual(
-            Path(LEGACY_SHIM._impl.__file__).resolve(), EXPERIMENTS_SCRIPT.resolve()
+            Path(LEGACY_SHIM._benchmark_implementation.__file__).resolve(),
+            EXPERIMENTS_SCRIPT.resolve(),
+        )
+        self.assertEqual(
+            Path(COMPATIBILITY_SHIM._benchmark_implementation.__file__).resolve(),
+            EXPERIMENTS_SCRIPT.resolve(),
         )
         self.assertTrue(hasattr(LEGACY_SHIM, "main"))
         self.assertTrue(hasattr(LEGACY_SHIM, "parse_arguments"))
@@ -74,7 +84,7 @@ class BenchmarkExperimentsEntryPointTest(unittest.TestCase):
     def test_experiment_root_flag_is_an_alias_for_campaign_root_on_both_entry_points(
         self,
     ) -> None:
-        for module in (EXPERIMENTS, LEGACY_SHIM):
+        for module in (EXPERIMENTS, COMPATIBILITY_SHIM, LEGACY_SHIM):
             via_alias = module.parse_arguments(
                 ["--experiment-root", "runs-here", "--plan", "plan.json"]
             )
@@ -85,7 +95,7 @@ class BenchmarkExperimentsEntryPointTest(unittest.TestCase):
             self.assertEqual(via_alias.experiment_root, via_legacy.experiment_root)
 
     def test_allow_temporary_experiment_root_flag_is_an_alias(self) -> None:
-        for module in (EXPERIMENTS, LEGACY_SHIM):
+        for module in (EXPERIMENTS, COMPATIBILITY_SHIM, LEGACY_SHIM):
             via_alias = module.parse_arguments(
                 [
                     "--allow-temporary-experiment-root",
