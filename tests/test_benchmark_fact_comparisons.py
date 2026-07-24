@@ -5,9 +5,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = (
-    Path(__file__).resolve().parents[1] / "benchmarks" / "fact_comparisons.py"
-)
+SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "fact_comparisons.py"
 SPEC = importlib.util.spec_from_file_location("benchmark_fact_comparisons", SCRIPT)
 assert SPEC and SPEC.loader
 COMPARISONS = importlib.util.module_from_spec(SPEC)
