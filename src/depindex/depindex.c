@@ -667,13 +667,20 @@ static int rank_by_import_usage(cbm_store_t *store, const char *project_name,
  * Runtime: O(search_limit) for query + O(N) for filtering + O(N) for resolution.
  * Memory: O(fetch_limit) for the results array before ranking truncates it to
  * max_results (see CBM_DEP_DISCOVERY_OVERFETCH_MULTIPLIER/_MAX). */
-int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
-                                cbm_store_t *store, const char *project_name,
-                                cbm_dep_discovered_t **out, int *count,
-                                int max_results) {
+static int discover_installed_deps_with_stats(cbm_pkg_manager_t mgr,
+                                               const char *project_root,
+                                               cbm_store_t *store,
+                                               const char *project_name,
+                                               cbm_dep_discovered_t **out,
+                                               int *count,
+                                               int max_results,
+                                               int *candidates_observed,
+                                               bool *package_limit_hit) {
     if (!store || !project_name || !out || !count) return -1;
     *out = NULL;
     *count = 0;
+    if (candidates_observed) *candidates_observed = 0;
+    if (package_limit_hit) *package_limit_hit = false;
     if (max_results <= 0) max_results = CBM_DEFAULT_AUTO_DEP_LIMIT;
 
     /* Over-fetch so usage ranking has more candidates to choose from than the
@@ -762,6 +769,8 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
      * cap; otherwise the result is byte-identical to today regardless of the
      * (larger) internal fetch_limit used above — see the callers of this
      * function in cbm_dep_auto_index_effective(). */
+    if (candidates_observed) *candidates_observed = *count;
+    if (package_limit_hit) *package_limit_hit = *count > max_results;
     if (*count > max_results) {
         if (rank_by_import_usage(store, project_name, *out, *count) != 0) {
             /* Fail open: store query failed, keep discovery order (today's
@@ -776,6 +785,14 @@ int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
     }
 
     return 0;
+}
+
+int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root,
+                                cbm_store_t *store, const char *project_name,
+                                cbm_dep_discovered_t **out, int *count,
+                                int max_results) {
+    return discover_installed_deps_with_stats(mgr, project_root, store, project_name,
+                                               out, count, max_results, NULL, NULL);
 }
 
 /* ── Auto-Index ────────────────────────────────────────────────── */
@@ -803,13 +820,36 @@ int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit) {
     return cbm_dep_normalize_configured_limit(limit, default_limit);
 }
 
-/* Auto-detect ecosystem, discover deps, index each via flush_to_store.
- * Runtime: O(N_deps * pipeline_run) where pipeline_run is O(files * parse_time).
- * With max 1000 files/dep at ~1ms/file: ~1s/dep * 20 deps = ~20s worst case.
- * Memory: O(symbols_per_dep) peak per dep pipeline, freed between iterations. */
-int cbm_dep_auto_index_effective(const char *project_name, const char *project_root,
-                                 cbm_store_t *store, int effective_max_deps,
-                                 cbm_config_t *cfg) {
+/* Auto-detect the ecosystem, discover dependencies, and index each through
+ * flush_to_store. Each selected package first performs one bounded
+ * dependency-mode file walk; packages above dep_max_files are skipped before
+ * parsing so the store never receives partial dependency API coverage.
+ * Runtime: O(N_deps * (bounded_file_walk + pipeline_run)); the pipeline itself
+ * remains O(files * parse_time). Memory: O(symbols_per_dep) peak because
+ * dependency pipelines run serially and are freed between iterations. */
+int cbm_dep_normalize_file_limit(int limit) {
+    return limit >= 0 && limit <= CBM_MAX_DEP_MAX_FILES
+               ? limit
+               : CBM_DEFAULT_DEP_MAX_FILES;
+}
+
+static int dep_effective_file_limit(cbm_config_t *cfg) {
+    int limit = cbm_config_get_int(cfg, CBM_CONFIG_DEP_MAX_FILES,
+                                   CBM_DEFAULT_DEP_MAX_FILES);
+    return cbm_dep_normalize_file_limit(limit);
+}
+
+int cbm_dep_auto_index_effective_with_stats(const char *project_name,
+                                            const char *project_root,
+                                            cbm_store_t *store,
+                                            int effective_max_deps,
+                                            cbm_config_t *cfg,
+                                            cbm_dep_auto_index_stats_t *stats) {
+    cbm_dep_auto_index_stats_t local_stats = {
+        .effective_package_limit = effective_max_deps,
+        .dependency_file_limit = dep_effective_file_limit(cfg),
+    };
+    if (stats) *stats = local_stats;
     if (effective_max_deps == 0) return 0;
     int effective_max = (effective_max_deps < 0) ? INT_MAX : effective_max_deps;
     cbm_pkg_manager_t mgr = cbm_detect_ecosystem(project_root);
@@ -817,16 +857,66 @@ int cbm_dep_auto_index_effective(const char *project_name, const char *project_r
 
     cbm_dep_discovered_t *deps = NULL;
     int dep_count = 0;
-    if (cbm_discover_installed_deps(mgr, project_root, store, project_name,
-                                    &deps, &dep_count, effective_max) != 0) {
+    if (discover_installed_deps_with_stats(
+            mgr, project_root, store, project_name, &deps, &dep_count,
+            effective_max, &local_stats.candidates_observed,
+            &local_stats.package_limit_hit) != 0) {
+        local_stats.packages_failed++;
+        if (stats) *stats = local_stats;
         return 0;
+    }
+    local_stats.packages_selected = dep_count;
+    if (local_stats.package_limit_hit) {
+        char observed_buf[CBM_SZ_32];
+        char limit_buf[CBM_SZ_32];
+        snprintf(observed_buf, sizeof(observed_buf), "%d",
+                 local_stats.candidates_observed);
+        snprintf(limit_buf, sizeof(limit_buf), "%d", effective_max_deps);
+        cbm_log_warn("dep.auto_index.cap", "candidates_observed", observed_buf,
+                     "package_limit", limit_buf, "recovery",
+                     "call_index_dependencies_or_raise_auto_dep_limit");
     }
 
     int reindexed = 0;
     for (int i = 0; i < dep_count; i++) {
         if (!deps[i].path || !deps[i].package || !deps[i].package[0]) continue;
+        if (local_stats.dependency_file_limit > 0) {
+            cbm_discover_opts_t opts = {
+                .mode = CBM_MODE_DEP,
+                .ignore_file = NULL,
+                .max_file_size = 0,
+            };
+            int observed_files = 0;
+            int count_rc = cbm_discover_count_bounded(
+                deps[i].path, &opts, local_stats.dependency_file_limit,
+                &observed_files);
+            if (count_rc != 0 ||
+                observed_files > local_stats.dependency_file_limit) {
+                char observed_buf[CBM_SZ_32];
+                char limit_buf[CBM_SZ_32];
+                snprintf(observed_buf, sizeof(observed_buf), "%d",
+                         observed_files);
+                snprintf(limit_buf, sizeof(limit_buf), "%d",
+                         local_stats.dependency_file_limit);
+                cbm_log_warn(
+                    "dep.auto_index.skip", "reason",
+                    count_rc == 0 ? "too_many_files" : "file_count_failed",
+                    "package", deps[i].package, "files_observed", observed_buf,
+                    "dep_max_files", limit_buf, "recovery",
+                    "call_index_dependencies_or_raise_dep_max_files_or_set_zero_for_unlimited");
+                if (count_rc == 0) {
+                    local_stats.packages_skipped_file_limit++;
+                } else {
+                    local_stats.packages_failed++;
+                }
+                continue;
+            }
+        }
         char *dep_proj = cbm_dep_project_name(project_name, deps[i].package);
-        if (!dep_proj) continue;
+        if (!dep_proj) {
+            local_stats.packages_failed++;
+            continue;
+        }
 
         cbm_pipeline_t *dp = cbm_pipeline_new(deps[i].path, NULL, CBM_MODE_DEP);
         if (dp) {
@@ -835,13 +925,20 @@ int cbm_dep_auto_index_effective(const char *project_name, const char *project_r
             bool current = false;
             int current_rc = cbm_pipeline_store_project_current(dp, store, &current);
             if (current_rc == CBM_STORE_OK && current) {
+                local_stats.packages_current++;
                 cbm_pipeline_free(dp);
                 free(dep_proj);
                 continue;
             }
             cbm_pipeline_set_flush_store(dp, store);
-            if (cbm_pipeline_run(dp) == 0) reindexed++;
+            if (cbm_pipeline_run(dp) == 0) {
+                reindexed++;
+            } else {
+                local_stats.packages_failed++;
+            }
             cbm_pipeline_free(dp);
+        } else {
+            local_stats.packages_failed++;
         }
         free(dep_proj);
     }
@@ -859,7 +956,17 @@ int cbm_dep_auto_index_effective(const char *project_name, const char *project_r
         }
     }
 
+    local_stats.packages_reindexed = reindexed;
+    if (stats) *stats = local_stats;
     return reindexed;
+}
+
+int cbm_dep_auto_index_effective(const char *project_name, const char *project_root,
+                                 cbm_store_t *store, int effective_max_deps,
+                                 cbm_config_t *cfg) {
+    return cbm_dep_auto_index_effective_with_stats(project_name, project_root,
+                                                   store, effective_max_deps,
+                                                   cfg, NULL);
 }
 
 int cbm_dep_auto_index(const char *project_name, const char *project_root,

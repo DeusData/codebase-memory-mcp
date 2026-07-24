@@ -1150,6 +1150,7 @@ typedef struct {
     bool auto_index_deps;
     int auto_index_limit;
     int auto_dep_limit;
+    int dep_max_files;
 } ha_guidance_config_t;
 
 static ha_guidance_config_t ha_load_guidance_config(void) {
@@ -1161,6 +1162,7 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
         .auto_index_deps = CBM_DEFAULT_AUTO_INDEX_DEPS,
         .auto_index_limit = CBM_DEFAULT_AUTO_INDEX_LIMIT,
         .auto_dep_limit = CBM_DEFAULT_AUTO_DEP_LIMIT,
+        .dep_max_files = CBM_DEFAULT_DEP_MAX_FILES,
     };
     const char *cache_dir = cbm_resolve_cache_dir();
     cbm_config_t *cfg = cache_dir ? cbm_config_open_readonly(cache_dir) : NULL;
@@ -1180,6 +1182,9 @@ static ha_guidance_config_t ha_load_guidance_config(void) {
         cbm_config_get_effective_int(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, CBM_DEFAULT_AUTO_DEP_LIMIT);
     result.auto_dep_limit =
         cbm_dep_normalize_configured_limit(configured_dep_limit, CBM_DEFAULT_AUTO_DEP_LIMIT);
+    int configured_dep_max_files = cbm_config_get_effective_int(
+        cfg, CBM_CONFIG_DEP_MAX_FILES, CBM_DEFAULT_DEP_MAX_FILES);
+    result.dep_max_files = cbm_dep_normalize_file_limit(configured_dep_max_files);
     if (cfg) {
         cbm_config_close(cfg);
     }
@@ -1214,14 +1219,28 @@ static void ha_format_dependency_guidance(const ha_guidance_config_t *cfg, char 
         snprintf(out, out_size,
                  "Dependencies: auto_index_deps=false; use index_dependencies for required "
                  "packages.");
+    } else if (cfg->auto_dep_limit <= 0 && cfg->dep_max_files == 0) {
+        snprintf(out, out_size,
+                 "Dependencies: automatic; auto_dep_limit=0 and dep_max_files=0 "
+                 "(unlimited).");
     } else if (cfg->auto_dep_limit <= 0) {
         snprintf(out, out_size,
-                 "Dependencies: automatic, auto_dep_limit=0 (unlimited).");
+                 "Dependencies: automatic; auto_dep_limit=0 (unlimited), "
+                 "dep_max_files=%d per package; use index_dependencies for a package "
+                 "omitted by dep_max_files.",
+                 cfg->dep_max_files);
+    } else if (cfg->dep_max_files == 0) {
+        snprintf(out, out_size,
+                 "Dependencies: automatic; auto_dep_limit=%d (import-ranked), "
+                 "dep_max_files=0 (unlimited); use index_dependencies for a package "
+                 "omitted by auto_dep_limit.",
+                 cfg->auto_dep_limit);
     } else {
         snprintf(out, out_size,
-                 "Dependencies: automatic, auto_dep_limit=%d (import-ranked); use "
-                 "index_dependencies for packages beyond the cap.",
-                 cfg->auto_dep_limit);
+                 "Dependencies: automatic; auto_dep_limit=%d (import-ranked), "
+                 "dep_max_files=%d per package; use index_dependencies for a package "
+                 "omitted by either cap.",
+                 cfg->auto_dep_limit, cfg->dep_max_files);
     }
 }
 

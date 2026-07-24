@@ -488,10 +488,65 @@ TEST(dep_discover_skips_test_dirs) {
 }
 
 TEST(dep_discover_max_files_guard) {
-    /* Verify concept: if a package has >1000 files, we cap at 1000.
-     * We won't create 1000 files in the test — just verify the constant. */
-    int max_files_default = 1000;
-    ASSERT_EQ(max_files_default, 1000);
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_dep_file_limit_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char dep_dir[CBM_SZ_1K];
+    snprintf(dep_dir, sizeof(dep_dir), "%s/vendor/oversized", tmp);
+    ASSERT_TRUE(cbm_mkdir_p(dep_dir, 0700));
+
+    char path[CBM_SZ_1K];
+    snprintf(path, sizeof(path), "%s/Makefile", tmp);
+    FILE *fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fprintf(fp, "all:\n\tcc main.c\n"), 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    snprintf(path, sizeof(path), "%s/first.c", dep_dir);
+    fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fprintf(fp, "int first(void) { return 1; }\n"), 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    snprintf(path, sizeof(path), "%s/second.c", dep_dir);
+    fp = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(fp);
+    ASSERT_GT(fprintf(fp, "int second(void) { return 2; }\n"), 0);
+    ASSERT_EQ(fclose(fp), 0);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "dep-file-limit";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, tmp), CBM_STORE_OK);
+
+    cbm_config_t *cfg = cbm_config_open(tmp);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_DEPS, "true"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_DEP_MAX_FILES, "1"), 0);
+
+    cbm_dep_auto_index_stats_t stats = {0};
+    ASSERT_EQ(cbm_dep_auto_index_effective_with_stats(project, tmp, store, 1,
+                                                      cfg, &stats),
+              0);
+    ASSERT_EQ(cbm_store_count_nodes(store, "dep-file-limit.dep.oversized"), 0);
+    ASSERT_EQ(stats.dependency_file_limit, 1);
+    ASSERT_EQ(stats.packages_skipped_file_limit, 1);
+    ASSERT_EQ(stats.packages_reindexed, 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_DEP_MAX_FILES, "0"), 0);
+    memset(&stats, 0, sizeof(stats));
+    ASSERT_EQ(cbm_dep_auto_index_effective_with_stats(project, tmp, store, 1,
+                                                      cfg, &stats),
+              1);
+    ASSERT_GT(cbm_store_count_nodes(store, "dep-file-limit.dep.oversized"), 0);
+    ASSERT_EQ(stats.dependency_file_limit, 0);
+    ASSERT_EQ(stats.packages_skipped_file_limit, 0);
+    ASSERT_EQ(stats.packages_reindexed, 1);
+
+    cbm_config_close(cfg);
+    cbm_store_close(store);
+    cleanup_fixture_dir(tmp);
     PASS();
 }
 
@@ -1166,6 +1221,9 @@ TEST(test_auto_index_deps_config_limit_policy) {
     char over_limit[CBM_SZ_32];
     snprintf(over_limit, sizeof(over_limit), "%d", CBM_MAX_AUTO_DEP_LIMIT + 1);
     ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_AUTO_DEP_LIMIT, over_limit), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_DEP_MAX_FILES, "-1"), 0);
+    snprintf(over_limit, sizeof(over_limit), "%d", CBM_MAX_DEP_MAX_FILES + 1);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_DEP_MAX_FILES, over_limit), 0);
 
     cbm_config_close(cfg);
     cleanup_fixture_dir(cache_tmp);
