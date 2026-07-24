@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Measure fast-mode exact incremental indexing against a fresh full rebuild.
+"""Run one isolated indexing benchmark and emit auditable fact tables.
 
-This is an explicit opt-in performance gate. It creates a synthetic Go repo in
-a temporary work root, uses an isolated CBM_CACHE_DIR, enables disk incremental
-indexing only for that cache, and removes only paths it created.
+The default workload gates fast-mode exact incremental indexing against a fresh
+full rebuild. Additional flags select self-dogfood, quality, scaling, and surface
+measurements. Every workload uses an isolated cache and removes only paths it created.
 """
 
 from __future__ import annotations
@@ -6667,7 +6667,11 @@ def run_self_dogfood(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Gate exact fast-mode incremental indexing against a fresh full rebuild."
+        description=(
+            "Run one isolated benchmark workload and emit report JSON plus canonical "
+            "fact tables. The default workload compares exact fast-mode incremental "
+            "indexing with a fresh full rebuild."
+        )
     )
     parser.add_argument("--binary", default="build/c/codebase-memory-mcp")
     parser.add_argument(

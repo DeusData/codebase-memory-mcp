@@ -1,16 +1,12 @@
 import importlib.util
 import subprocess
-import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS_ROOT = REPO_ROOT / "scripts"
 EXPERIMENTS_SCRIPT = REPO_ROOT / "benchmarks" / "run_experiments.py"
-COMPATIBILITY_SCRIPT = SCRIPTS_ROOT / "run-benchmark-experiments.py"
-LEGACY_SCRIPT = SCRIPTS_ROOT / "run-benchmark-campaign.py"
 
 
 def _load(path: Path, name: str):
@@ -22,10 +18,6 @@ def _load(path: Path, name: str):
 
 
 EXPERIMENTS = _load(EXPERIMENTS_SCRIPT, "run_benchmark_experiments_direct")
-COMPATIBILITY_SHIM = _load(
-    COMPATIBILITY_SCRIPT, "run_benchmark_experiments_compatibility_direct"
-)
-LEGACY_SHIM = _load(LEGACY_SCRIPT, "run_benchmark_campaign_shim_direct")
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
@@ -49,124 +41,37 @@ class BenchmarkExperimentsEntryPointTest(unittest.TestCase):
             ),
         )
 
-    def test_campaign_shim_resolves_and_re_exports_the_experiments_implementation(
-        self,
-    ) -> None:
-        # The shim loads benchmarks/run_experiments.py by path and republishes its
-        # public names, so retained callers that import run-benchmark-campaign.py
-        # directly keep working. Each
-        # `_load` call in this test file execs a fresh module, so function objects
-        # differ by identity even though the source is identical; assert the shim
-        # loaded the canonical file and re-exports behaviorally identical names.
-        self.assertEqual(
-            Path(LEGACY_SHIM._benchmark_implementation.__file__).resolve(),
-            EXPERIMENTS_SCRIPT.resolve(),
+    def test_experiment_root_flag_accepts_retained_campaign_root_spelling(self) -> None:
+        via_current = EXPERIMENTS.parse_arguments(
+            ["--experiment-root", "runs-here", "--plan", "plan.json"]
         )
-        self.assertEqual(
-            Path(COMPATIBILITY_SHIM._benchmark_implementation.__file__).resolve(),
-            EXPERIMENTS_SCRIPT.resolve(),
+        via_retained = EXPERIMENTS.parse_arguments(
+            ["--campaign-root", "runs-here", "--plan", "plan.json"]
         )
-        self.assertTrue(hasattr(LEGACY_SHIM, "main"))
-        self.assertTrue(hasattr(LEGACY_SHIM, "parse_arguments"))
-        self.assertTrue(hasattr(LEGACY_SHIM, "build_automatic_spec"))
-        self.assertEqual(
-            LEGACY_SHIM.DEFAULT_CANDIDATE_REFS, EXPERIMENTS.DEFAULT_CANDIDATE_REFS
-        )
-        self.assertEqual(
-            LEGACY_SHIM.parse_arguments(
-                ["--experiment-root", "r", "--plan", "p.json"]
-            ).experiment_root,
-            EXPERIMENTS.parse_arguments(
-                ["--experiment-root", "r", "--plan", "p.json"]
-            ).experiment_root,
-        )
-
-    def test_experiment_root_flag_is_an_alias_for_campaign_root_on_both_entry_points(
-        self,
-    ) -> None:
-        for module in (EXPERIMENTS, COMPATIBILITY_SHIM, LEGACY_SHIM):
-            via_alias = module.parse_arguments(
-                ["--experiment-root", "runs-here", "--plan", "plan.json"]
-            )
-            via_legacy = module.parse_arguments(
-                ["--campaign-root", "runs-here", "--plan", "plan.json"]
-            )
-            self.assertEqual(via_alias.experiment_root, Path("runs-here"))
-            self.assertEqual(via_alias.experiment_root, via_legacy.experiment_root)
+        self.assertEqual(via_current.experiment_root, Path("runs-here"))
+        self.assertEqual(via_current.experiment_root, via_retained.experiment_root)
 
     def test_allow_temporary_experiment_root_flag_is_an_alias(self) -> None:
-        for module in (EXPERIMENTS, COMPATIBILITY_SHIM, LEGACY_SHIM):
-            via_alias = module.parse_arguments(
-                [
-                    "--allow-temporary-experiment-root",
-                    "--plan",
-                    "p.json",
-                    "--campaign-root",
-                    "r",
-                ]
-            )
-            via_legacy = module.parse_arguments(
-                [
-                    "--allow-temporary-campaign-root",
-                    "--plan",
-                    "p.json",
-                    "--campaign-root",
-                    "r",
-                ]
-            )
-            self.assertTrue(via_alias.allow_temporary_experiment_root)
-            self.assertTrue(via_legacy.allow_temporary_experiment_root)
-
-    def test_legacy_campaign_root_flag_still_works_without_any_alias(self) -> None:
-        args = LEGACY_SHIM.parse_arguments(
-            ["--campaign-root", "legacy-results", "--plan", "p.json"]
+        via_current = EXPERIMENTS.parse_arguments(
+            [
+                "--allow-temporary-experiment-root",
+                "--plan",
+                "p.json",
+                "--experiment-root",
+                "r",
+            ]
         )
-        self.assertEqual(args.experiment_root, Path("legacy-results"))
-
-    def test_plan_invocation_is_byte_identical_between_old_and_new_script_names(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            experiment_root = root / "results"
-            experiment_root.mkdir()
-            plan_path = root / "plan.json"
-            plan_path.write_text('{"schema_version": 1, "cells": []}', encoding="utf-8")
-            # An empty cells array is rejected by validate_plan before any cell
-            # runs, so this proves argument parsing and early validation are
-            # identical without touching the filesystem beyond the experiment root.
-            legacy = subprocess.run(
-                [
-                    sys.executable,
-                    str(LEGACY_SCRIPT),
-                    "--plan",
-                    str(plan_path),
-                    "--campaign-root",
-                    str(experiment_root),
-                    "--allow-temporary-campaign-root",
-                    "--audit-only",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            new = subprocess.run(
-                [
-                    sys.executable,
-                    str(EXPERIMENTS_SCRIPT),
-                    "--plan",
-                    str(plan_path),
-                    "--experiment-root",
-                    str(experiment_root),
-                    "--allow-temporary-experiment-root",
-                    "--audit-only",
-                ],
-                capture_output=True,
-                text=True,
-            )
-            self.assertEqual(legacy.returncode, new.returncode)
-            self.assertEqual(legacy.stdout, new.stdout)
-            self.assertIn("cells must be a non-empty array", legacy.stderr)
-            self.assertIn("cells must be a non-empty array", new.stderr)
+        via_retained = EXPERIMENTS.parse_arguments(
+            [
+                "--allow-temporary-campaign-root",
+                "--plan",
+                "p.json",
+                "--campaign-root",
+                "r",
+            ]
+        )
+        self.assertTrue(via_current.allow_temporary_experiment_root)
+        self.assertTrue(via_retained.allow_temporary_experiment_root)
 
 
 class CandidateRefOverrideTest(unittest.TestCase):

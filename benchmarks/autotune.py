@@ -21,7 +21,7 @@ from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
-BENCHMARK = ROOT / "benchmarks" / "incremental_speed.py"
+BENCHMARK = ROOT / "benchmarks" / "run_benchmark.py"
 EXPERIMENT_RUNNER = ROOT / "benchmarks" / "run_experiments.py"
 DEFAULT_EXPERIMENT_ROOT = ROOT / ".worktrees" / "benchmark-experiments" / "autotune"
 
@@ -125,7 +125,7 @@ def build_matrix_spec(
     runner = load_experiment_runner()
     return {
         "schema_version": 1,
-        "harness_version": f"incremental_speed.py:{runner.file_sha256(BENCHMARK)}",
+        "harness_version": f"run_benchmark.py:{runner.file_sha256(BENCHMARK)}",
         "benchmark_script": str(BENCHMARK),
         "capability_quality": "rank",
         "index_mode": "full",

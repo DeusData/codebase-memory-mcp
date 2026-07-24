@@ -69,7 +69,7 @@ the release notes.
 - `dry-run.yml` completes successfully with the release candidate commit.
 - Local performance benchmarks are run on the release operator's machine using
   the release candidate binary and CLI indexing, not test-only shortcuts.
-- `benchmarks/index.sh` records results for the Linux kernel and for at
+- `scripts/benchmark-index.sh` records results for the Linux kernel and for at
   least one large open-source project per supported Hybrid LSP family.
 - Benchmark results are compared against the previous release's benchmark logs
   using the same machine class, same repository revisions, same indexing mode,
