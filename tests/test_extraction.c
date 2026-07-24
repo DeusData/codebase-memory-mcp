@@ -2839,6 +2839,30 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* A comment between decorators must not drop the decorators above it.
+ * Comments are NAMED tree-sitter nodes, so the prev-sibling walk used to stop
+ * at one — a documented route (@Post + @HttpCode above an explanatory comment)
+ * silently lost those decorators and disappeared from route/authz queries. */
+TEST(extract_ts_decorators_survive_interleaved_comment) {
+    CBMFileResult *r = extract("class AuthController {\n"
+                               "  @Post('login')\n"
+                               "  @HttpCode(HttpStatus.OK)\n"
+                               "  // throttled per IP and per account\n"
+                               "  @Throttle({ default: { ttl: 900_000, limit: 5 } })\n"
+                               "  async login(dto: LoginDto) { return 1; }\n"
+                               "}\n",
+                               CBM_LANG_TYPESCRIPT, "t", "auth.controller.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "login");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "Throttle"));  /* below the comment — always worked */
+    ASSERT(decorators_contain(m, "HttpCode"));  /* above the comment — was dropped */
+    ASSERT(decorators_contain(m, "Post"));      /* above the comment — was dropped */
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Find an in-body call by its raw callee text; returns the call or NULL. */
 static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -4963,6 +4987,7 @@ SUITE(extraction) {
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
+    RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
 
     cbm_shutdown();
 }
