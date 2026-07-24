@@ -362,6 +362,38 @@ scripts/build.sh --with-ui          # with graph visualization
 # Binary at: build/c/codebase-memory-mcp
 ```
 
+### Nix (flake)
+
+The flake exposes two server packages plus the standalone frontend:
+
+| Package | Contents |
+|---------|----------|
+| `default` (`codebase-memory-mcp`) | Standard server, no UI |
+| `codebase-memory-mcp-ui` | Server with the graph UI embedded (`--ui=true` works) |
+| `graph-ui` | Just the built frontend assets (`dist/`) |
+
+Run directly without installing:
+
+```bash
+# Standard server
+nix run github:DeusData/codebase-memory-mcp
+
+# Server with the embedded graph UI
+nix run github:DeusData/codebase-memory-mcp#codebase-memory-mcp-ui -- --ui=true --port=9749
+# then open http://127.0.0.1:9749
+```
+
+Or build a binary into `./result/bin/codebase-memory-mcp`:
+
+```bash
+nix build github:DeusData/codebase-memory-mcp                          # standard
+nix build github:DeusData/codebase-memory-mcp#codebase-memory-mcp-ui   # with UI
+```
+
+Working in a clone? Use `.` in place of the flake URL, e.g. `nix run .#codebase-memory-mcp-ui -- --ui=true`, or drop into a shell that puts the binary on `PATH` with `nix shell .#codebase-memory-mcp-ui`.
+
+> **Note:** launched by hand (not from an MCP client) the server exits as soon as `stdin` closes — that's normal MCP behaviour. Keep `stdin` open while testing the UI, e.g. `sleep infinity | codebase-memory-mcp --ui=true --port=9749`. The `codebase-memory-mcp-ui` package embeds the UI at build time; `nix run`'ing the standard `default` package with `--ui=true` will refuse to start the HTTP server.
+
 ### Manual MCP Configuration
 
 <details>
