@@ -162,11 +162,7 @@ def implementation_projection(implementation: Any) -> dict[str, Any]:
     return {
         "revision": implementation.get("revision"),
         "binary": (
-            {
-                key: binary.get(key)
-                for key in ("sha256", "size_bytes")
-                if key in binary
-            }
+            {key: binary.get(key) for key in ("sha256", "size_bytes") if key in binary}
             if isinstance(binary, dict)
             else {}
         ),
@@ -345,17 +341,15 @@ def capability_differences(left: Any, right: Any) -> list[dict[str, Any]]:
     right_values = right.get("values", {}) if isinstance(right, dict) else {}
     if not isinstance(left_values, dict) or not isinstance(right_values, dict):
         return []
-    differences = []
-    for key in sorted(set(left_values) | set(right_values)):
-        if left_values.get(key) != right_values.get(key):
-            differences.append(
-                {
-                    "capability_id": key,
-                    "left": left_values.get(key),
-                    "right": right_values.get(key),
-                }
-            )
-    return differences
+    return [
+        {
+            "capability_id": key,
+            "left": left_values.get(key),
+            "right": right_values.get(key),
+        }
+        for key in sorted(set(left_values) | set(right_values))
+        if left_values.get(key) != right_values.get(key)
+    ]
 
 
 def manifest_equal(left: dict[str, Any], right: dict[str, Any], key: str) -> bool:
@@ -493,7 +487,9 @@ def classify_pair(left: dict[str, Any], right: dict[str, Any]) -> dict[str, Any]
         if not matched:
             reasons.append(reason)
     if manifest_unknown:
-        reasons.append("required manifest or benchmark contract contains unknown values")
+        reasons.append(
+            "required manifest or benchmark contract contains unknown values"
+        )
     return {
         **common,
         "comparison_kind": "not_eligible",
@@ -625,12 +621,14 @@ def render_markdown(document: dict[str, Any]) -> str:
         "|---|---|---:|---:|---|",
     ]
     for lifecycle in document["lifecycle_rows"]:
-        for step in lifecycle["steps"]:
-            lines.append(
+        lines.extend(
+            (
                 f"| {lifecycle['label']} | `{step['step_id']}` | "
                 f"{step['median_elapsed_ms']:.3f} | {step['count']} | "
                 f"`{', '.join(step['source_occurrence_ids'])}` |"
             )
+            for step in lifecycle["steps"]
+        )
     lines.extend(
         (
             "",

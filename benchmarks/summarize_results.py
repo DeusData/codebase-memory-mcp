@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
 import hashlib
 import importlib.util
 import json
@@ -16,9 +17,7 @@ from pathlib import Path
 from typing import Any
 
 
-CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name(
-    "config-spellings-v1.json"
-)
+CONFIG_SPELLING_SPEC_PATH = Path(__file__).with_name("config-spellings-v1.json")
 with CONFIG_SPELLING_SPEC_PATH.open(encoding="utf-8") as stream:
     CONFIG_SPELLING_SPEC = json.load(stream)
 if CONFIG_SPELLING_SPEC.get("schema_version") != 1:
@@ -451,15 +450,18 @@ def mutation_reindex_details(
                 if isinstance(path, str) and path
             )
         scenario_metadata = case.get("scenario_metadata")
-        if not group["descriptions"] and isinstance(scenario_metadata, dict):
-            if scenario_metadata.get("source") == "synthetic_inbound_frontier":
-                language = scenario_metadata.get("cross_file_resolver_language")
-                if not isinstance(language, str) or not language:
-                    language = scenario_metadata.get("language")
-                if isinstance(language, str) and language:
-                    group["descriptions"].add(
-                        f"synthetic {language} inbound-frontier definition edit"
-                    )
+        if (
+            not group["descriptions"]
+            and isinstance(scenario_metadata, dict)
+            and scenario_metadata.get("source") == "synthetic_inbound_frontier"
+        ):
+            language = scenario_metadata.get("cross_file_resolver_language")
+            if not isinstance(language, str) or not language:
+                language = scenario_metadata.get("language")
+            if isinstance(language, str) and language:
+                group["descriptions"].add(
+                    f"synthetic {language} inbound-frontier definition edit"
+                )
         incremental = lifecycle.get("incremental_index", case.get("incremental"))
         if isinstance(incremental, dict):
             if isinstance(incremental.get("elapsed_ms"), (int, float)):
@@ -669,6 +671,20 @@ def quality_miss_is_explicit_ablation(
     return value is False or (isinstance(value, str) and value.lower() == "false")
 
 
+def semantic_pair_classification(
+    lifecycle: dict[str, Any], stage: str
+) -> tuple[dict[str, int] | None, float | None]:
+    """Return one lifecycle stage's confusion matrix and F1 score."""
+    oracles = lifecycle.get(f"{stage}_oracles")
+    pair = oracles.get("pair_classification") if isinstance(oracles, dict) else None
+    confusion = pair.get("confusion") if isinstance(pair, dict) else None
+    f1 = pair.get("f1") if isinstance(pair, dict) else None
+    return (
+        confusion if isinstance(confusion, dict) else None,
+        float(f1) if isinstance(f1, (int, float)) else None,
+    )
+
+
 def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str, Any]]:
     details: list[dict[str, Any]] = []
     for case in cases:
@@ -679,23 +695,13 @@ def semantic_pair_quality_details(cases: list[dict[str, Any]]) -> list[dict[str,
         policy = lifecycle.get("incremental_policy")
         policy = policy if isinstance(policy, dict) else {}
 
-        def classification(stage: str) -> tuple[dict[str, int] | None, float | None]:
-            oracles = lifecycle.get(f"{stage}_oracles")
-            pair = (
-                oracles.get("pair_classification")
-                if isinstance(oracles, dict)
-                else None
-            )
-            confusion = pair.get("confusion") if isinstance(pair, dict) else None
-            f1 = pair.get("f1") if isinstance(pair, dict) else None
-            return (
-                confusion if isinstance(confusion, dict) else None,
-                float(f1) if isinstance(f1, (int, float)) else None,
-            )
-
-        initial_confusion, initial_f1 = classification("initial")
-        incremental_confusion, incremental_f1 = classification("incremental")
-        fresh_confusion, fresh_f1 = classification("fresh")
+        initial_confusion, initial_f1 = semantic_pair_classification(
+            lifecycle, "initial"
+        )
+        incremental_confusion, incremental_f1 = semantic_pair_classification(
+            lifecycle, "incremental"
+        )
+        fresh_confusion, fresh_f1 = semantic_pair_classification(lifecycle, "fresh")
         if policy.get("immediate_freshness_met") is True:
             freshness = "fresh and canonical"
         elif (
@@ -1163,10 +1169,8 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
         if not isinstance(overrides, dict):
             continue
         raw_cap = overrides.get("incremental_exact_max_affected_paths")
-        try:
+        with suppress(TypeError, ValueError):
             exact_caps.add(int(raw_cap))
-        except (TypeError, ValueError):
-            pass
     full_values = full_ms or initial_full_ms
     disabled_pair_capabilities = {
         str(detail.get("capability"))
@@ -1315,6 +1319,25 @@ def summarize_group(label: str, reports: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
+def historical_speedup(
+    baseline: dict[str, Any],
+    latest: dict[str, Any],
+    metric: str,
+    *,
+    comparable: bool,
+) -> float | None:
+    """Return a ratio only when the two quality-gated rows are comparable."""
+    if not comparable:
+        return None
+    old = baseline.get(metric)
+    new = latest.get(metric)
+    return (
+        old / new
+        if isinstance(old, (int, float)) and isinstance(new, (int, float)) and new > 0
+        else None
+    )
+
+
 def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest_by_signature = {
         row.get("capability_signature"): row
@@ -1394,26 +1417,19 @@ def historical_delta_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 )
         comparable = not comparison_status.startswith("not comparable")
 
-        def speedup(metric: str) -> float | None:
-            if not comparable:
-                return None
-            old = baseline.get(metric)
-            new = latest.get(metric)
-            return (
-                old / new
-                if isinstance(old, (int, float))
-                and isinstance(new, (int, float))
-                and new > 0
-                else None
-            )
-
         comparisons.append(
             {
                 "latest": latest["candidate"],
                 "baseline": baseline["candidate"],
-                "incremental_speedup": speedup("incremental_p50_ms"),
-                "full_speedup": speedup("full_p50_ms"),
-                "query_speedup": speedup("query_latency_p50_ms"),
+                "incremental_speedup": historical_speedup(
+                    baseline, latest, "incremental_p50_ms", comparable=comparable
+                ),
+                "full_speedup": historical_speedup(
+                    baseline, latest, "full_p50_ms", comparable=comparable
+                ),
+                "query_speedup": historical_speedup(
+                    baseline, latest, "query_latency_p50_ms", comparable=comparable
+                ),
                 "latest_quality": latest.get("overall_quality_score"),
                 "baseline_quality": baseline.get("overall_quality_score"),
                 "baseline_decision": baseline.get("decision"),
