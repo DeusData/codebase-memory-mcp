@@ -5,9 +5,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = (
-    Path(__file__).resolve().parents[1] / "benchmarks" / "summarize_results.py"
-)
+SCRIPT = Path(__file__).resolve().parents[1] / "benchmarks" / "summarize_results.py"
 SPEC = importlib.util.spec_from_file_location("summarize_benchmark_results", SCRIPT)
 assert SPEC and SPEC.loader
 SUMMARY = importlib.util.module_from_spec(SPEC)
