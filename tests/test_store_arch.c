@@ -741,6 +741,52 @@ TEST(adr_render_empty) {
     PASS();
 }
 
+/* Helper: allocate a NUL-terminated buffer of `len` 'x' characters. */
+static char *adr_test_fill(int len) {
+    char *s = malloc((size_t)len + 1);
+    if (s) {
+        memset(s, 'x', (size_t)len);
+        s[len] = '\0';
+    }
+    return s;
+}
+
+/* Regression: sections whose combined size exceeds the fixed render buffer used
+ * to overflow it. adr_render_section advanced pos by snprintf's return value
+ * (the length it WOULD have written); once pos passed buf_sz the next section
+ * computed a wrapped (huge) remaining size from (buf_sz - pos) and wrote past
+ * the stack buffer (ASan: stack-buffer-overflow WRITE).
+ *
+ * The render buffer is ST_MAX_DEGREE*ST_GROWTH = 16384. Sizes below drive the
+ * cursor to exactly buf_sz+8 after section "B" (a truncating write that stays
+ * in bounds), so section "C" performs the first out-of-bounds write right at
+ * the buffer's tail — into ASan's redzone, where it is reliably caught.
+ * Non-canonical keys render in alphabetical order (A, B, C). */
+TEST(adr_render_oversized_sections_no_overflow) {
+    enum { ADR_RENDER_BUFSZ = 16384 };
+    cbm_adr_sections_t sec = {.count = 3};
+    /* A is first: header "## A\n" (5) + value -> pos = 16000. */
+    sec.keys[0] = strdup("A");
+    sec.values[0] = adr_test_fill(15995);
+    /* B: header "\n\n## B\n" (7) + value -> intended pos = 16000+7+385 = 16392
+     * (= buf_sz + 8); the write itself truncates safely in bounds. */
+    sec.keys[1] = strdup("B");
+    sec.values[1] = adr_test_fill(385);
+    /* C: rendered with pos = 16392 > buf_sz -> "\n\n" written at buf+16392. */
+    sec.keys[2] = strdup("C");
+    sec.values[2] = strdup("z");
+    for (int i = 0; i < 3; i++) {
+        ASSERT_NOT_NULL(sec.values[i]);
+    }
+    char *rendered = cbm_adr_render(&sec);
+    /* Must not crash; result must be NUL-terminated within the render buffer. */
+    ASSERT_NOT_NULL(rendered);
+    ASSERT_TRUE(strlen(rendered) < ADR_RENDER_BUFSZ);
+    free(rendered);
+    cbm_adr_sections_free(&sec);
+    PASS();
+}
+
 TEST(adr_parse_render_roundtrip) {
     const char *original =
         "## PURPOSE\nTest project\n\n## STACK\n- Go: speed\n- SQLite: embedded\n\n"
@@ -1393,6 +1439,7 @@ SUITE(store_arch) {
     RUN_TEST(adr_render_all_sections);
     RUN_TEST(adr_render_non_canonical);
     RUN_TEST(adr_render_empty);
+    RUN_TEST(adr_render_oversized_sections_no_overflow);
     RUN_TEST(adr_parse_render_roundtrip);
     RUN_TEST(adr_update_sections);
     RUN_TEST(adr_update_overflow);

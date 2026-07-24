@@ -7117,12 +7117,33 @@ cbm_adr_sections_t cbm_adr_parse_sections(const char *content) {
     return result;
 }
 
-/* Append a section to the render buffer. */
+/* Append a section to the render buffer.
+ *
+ * snprintf returns the length it WOULD have written, so a section larger than
+ * the space left would otherwise push pos past buf_sz; the next call would then
+ * compute a wrapped (huge) remaining size from (buf_sz - pos) and write out of
+ * bounds. Clamp pos into [0, buf_sz-1] after every write so each snprintf gets
+ * a positive size and the returned cursor never escapes the buffer. */
 static int adr_render_section(char *buf, int buf_sz, int pos, const char *key, const char *value) {
-    if (pos > 0) {
-        pos += snprintf(buf + pos, buf_sz - pos, "\n\n");
+    if (buf_sz <= 0) {
+        return 0;
     }
-    pos += snprintf(buf + pos, buf_sz - pos, "## %s\n%s", key, value);
+    if (pos < 0) {
+        pos = 0;
+    }
+    if (pos >= buf_sz) {
+        return buf_sz - SKIP_ONE;
+    }
+    if (pos > 0) {
+        pos += snprintf(buf + pos, (size_t)(buf_sz - pos), "\n\n");
+        if (pos >= buf_sz) {
+            return buf_sz - SKIP_ONE;
+        }
+    }
+    pos += snprintf(buf + pos, (size_t)(buf_sz - pos), "## %s\n%s", key, value);
+    if (pos >= buf_sz) {
+        pos = buf_sz - SKIP_ONE;
+    }
     return pos;
 }
 
