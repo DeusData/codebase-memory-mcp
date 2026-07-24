@@ -6880,18 +6880,21 @@ TEST(cli_config_get_int) {
     cbm_config_t *cfg = cbm_config_open(tmpdir);
     ASSERT_NOT_NULL(cfg);
 
-    ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
+    ASSERT_EQ(cbm_config_get_int(cfg, "limit", CBM_DEFAULT_AUTO_INDEX_LIMIT),
+              CBM_DEFAULT_AUTO_INDEX_LIMIT);
 
     cbm_config_set(cfg, "limit", "20000");
-    ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 20000);
+    ASSERT_EQ(cbm_config_get_int(cfg, "limit", CBM_DEFAULT_AUTO_INDEX_LIMIT), 20000);
 
     /* Non-numeric → default */
     cbm_config_set(cfg, "limit", "abc");
-    ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
+    ASSERT_EQ(cbm_config_get_int(cfg, "limit", CBM_DEFAULT_AUTO_INDEX_LIMIT),
+              CBM_DEFAULT_AUTO_INDEX_LIMIT);
 
     /* Values outside int range must not wrap into a valid limit. */
     cbm_config_set(cfg, "limit", "999999999999999999999999");
-    ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
+    ASSERT_EQ(cbm_config_get_int(cfg, "limit", CBM_DEFAULT_AUTO_INDEX_LIMIT),
+              CBM_DEFAULT_AUTO_INDEX_LIMIT);
 
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
