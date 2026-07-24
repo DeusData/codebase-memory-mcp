@@ -842,6 +842,26 @@ if ! echo "$INSTALL_OUT" | grep -qi 'dry-run'; then
 fi
 echo "OK: install --dry-run completed"
 
+# The Windows smoke redirects PATH writes to a pre-created GUID leaf. A
+# malformed seam must fail closed instead of silently falling back to the live
+# HKCU\Environment\Path.
+if [[ "$BINARY" == *.exe ]] &&
+   [ -n "${CBM_TEST_WINDOWS_USER_PATH_RUN_ID:-}" ]; then
+  if INVALID_PATH_OUT=$(
+    CBM_TEST_WINDOWS_USER_PATH_RUN_ID=invalid \
+      run_dryrun_env "$BINARY" install --dry-run -y 2>&1
+  ); then
+    echo "FAIL: invalid Windows PATH smoke seam fell back to the live registry"
+    exit 1
+  fi
+  if ! echo "$INVALID_PATH_OUT" | grep -qi 'PATH configuration failed'; then
+    echo "FAIL: invalid Windows PATH smoke seam did not fail at PATH configuration"
+    echo "$INVALID_PATH_OUT"
+    exit 1
+  fi
+  echo "OK: invalid Windows PATH smoke seam fails closed"
+fi
+
 # 6b: uninstall --dry-run -y
 echo "--- Phase 6b: uninstall --dry-run ---"
 if [[ "$BINARY" == *.exe ]]; then
@@ -2871,8 +2891,13 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   else
     cp "$BINARY" "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
     chmod 755 "$UPDATE_HOME/.local/bin/codebase-memory-mcp"
+    mkdir -p "$UPDATE_HOME/retired-install"
+    cp "$BINARY" "$UPDATE_HOME/retired-install/codebase-memory-mcp"
+    chmod 755 "$UPDATE_HOME/retired-install/codebase-memory-mcp"
     if [ "$(uname -s)" = "Darwin" ]; then
       codesign --sign - --force "$UPDATE_HOME/.local/bin/codebase-memory-mcp" 2>/dev/null || true
+      codesign --sign - --force "$UPDATE_HOME/retired-install/codebase-memory-mcp" \
+        2>/dev/null || true
     fi
   fi
 
@@ -2888,14 +2913,30 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
       echo "FAIL 14a: managed Windows launcher missing after install"
       exit 1
     fi
+  else
+    RETIRED_DIR=$(cd "$UPDATE_HOME/retired-install" && pwd -P)
+    UPDATE_DRIVER="$RETIRED_DIR/codebase-memory-mcp"
   fi
 
-  # Pre-install agent config with a WRONG binary path (simulates stale config)
-  echo '{"mcpServers":{"codebase-memory-mcp":{"command":"/old/stale/path"}}}' > "$UPDATE_HOME/.claude.json"
+  # Pre-install agent config with positive prior-install identity. POSIX runs
+  # update from that exact retired CBM image, so refresh requires only string
+  # equality with OS-reported self identity and never probes config paths.
+  # Windows retains its fixed-drive missing-path classification coverage.
+  if [[ "$BINARY" == *.exe ]]; then
+    STALE_CMD="$UPDATE_HOME/retired-install/codebase-memory-mcp.exe"
+  else
+    STALE_CMD="$UPDATE_DRIVER"
+  fi
+  if command -v cygpath &>/dev/null; then
+    STALE_CMD=$(cygpath -m "$STALE_CMD")
+  fi
+  STALE_CMD="$STALE_CMD" python3 -c \
+    'import json, os; print(json.dumps({"mcpServers":{"codebase-memory-mcp":{"command":os.environ["STALE_CMD"]}}}))' \
+    > "$UPDATE_HOME/.claude.json"
 
   # 14a: Run actual update command (detect variant from available archive)
   UPDATE_VARIANT="--standard"
-  if curl -sf "$SMOKE_DOWNLOAD_URL/" 2>/dev/null | grep -q "ui-"; then
+  if curl --noproxy '*' -sf "$SMOKE_DOWNLOAD_URL/" 2>/dev/null | grep -q "ui-"; then
     UPDATE_VARIANT="--ui"
   fi
   HOME="$UPDATE_HOME" CBM_DOWNLOAD_URL="$UPDATE_DOWNLOAD_URL" \
@@ -2920,17 +2961,19 @@ if [ -n "${SMOKE_DOWNLOAD_URL:-}" ]; then
   fi
   echo "OK 14b: updated binary runs"
 
-  # 14c: Verify agent config was refreshed (stale path replaced)
+  # 14c: Verify agent config was refreshed to the exact installed binary.
   UPD_CMD=$(cat "$UPDATE_HOME/.claude.json" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('mcpServers',{}).get('codebase-memory-mcp',{}).get('command',''))" 2>/dev/null || echo "")
-  if [ "$UPD_CMD" = "/old/stale/path" ]; then
-    echo "FAIL 14c: agent config still has stale path after update"
+  EXPECTED_UPD_CMD="$UPD_BIN"
+  if command -v cygpath &>/dev/null; then
+    EXPECTED_UPD_CMD=$(cygpath -w "$UPD_BIN")
+  fi
+  if [ "$UPD_CMD" != "$EXPECTED_UPD_CMD" ]; then
+    echo "FAIL 14c: agent config does not point at the updated binary"
+    echo "  expected: $EXPECTED_UPD_CMD"
+    echo "  actual:   ${UPD_CMD:-<missing>}"
     exit 1
   fi
-  if [ -n "$UPD_CMD" ]; then
-    echo "OK 14c: agent config refreshed (path=$UPD_CMD)"
-  else
-    echo "OK 14c: agent config refreshed (no stale path)"
-  fi
+  echo "OK 14c: agent config refreshed (path=$UPD_CMD)"
 
   # ── 14d-f: Real uninstall with binary removal ──
   # First verify binary + configs exist
@@ -3038,14 +3081,15 @@ echo "--- Phase 12a: curl download ---"
 # var present on some runners (notably windows-11-arm) made curl fail to reach
 # 127.0.0.1 while the app's own downloader (WinHTTP) bypassed it. On failure,
 # surface curl's stderr instead of swallowing it so the reason is visible.
-if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>/tmp/cbm-curl12a.err; then
+CURL12_ERR="$DL_DIR/curl12a.err"
+if ! curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE" 2>"$CURL12_ERR"; then
   # Try UI variant
-  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>/tmp/cbm-curl12a.err; then
+  if curl -fSL --noproxy '*' -o "$DL_DIR/$DL_ARCHIVE_UI" "$SMOKE_DOWNLOAD_URL/$DL_ARCHIVE_UI" 2>>"$CURL12_ERR"; then
     DL_ARCHIVE="$DL_ARCHIVE_UI"
   else
     echo "FAIL 12a: curl download failed (tried standard and ui variants)"
     echo "--- curl stderr (url: $SMOKE_DOWNLOAD_URL/$DL_ARCHIVE) ---"
-    cat /tmp/cbm-curl12a.err 2>/dev/null || true
+    cat "$CURL12_ERR" 2>/dev/null || true
     exit 1
   fi
 fi
@@ -3057,7 +3101,8 @@ echo "OK 12a: archive downloaded ($(wc -c < "$DL_DIR/$DL_ARCHIVE") bytes)"
 
 # 12b: checksum download
 echo "--- Phase 12b: checksum verification ---"
-if ! curl -fsSL -o "$DL_DIR/checksums.txt" "$SMOKE_DOWNLOAD_URL/checksums.txt"; then
+if ! curl --noproxy '*' -fsSL -o "$DL_DIR/checksums.txt" \
+  "$SMOKE_DOWNLOAD_URL/checksums.txt"; then
   echo "FAIL 12b: checksums.txt download failed"
   exit 1
 fi
@@ -3226,10 +3271,16 @@ elif [ -f "$REPO_ROOT/install.ps1" ] && command -v powershell.exe &>/dev/null; t
   # 13f: run install.ps1
   # Pass the known-correct arch: powershell runs under x64 emulation on ARM64, so
   # install.ps1's own detection can't tell it's arm64. DL_ARCH is authoritative here.
-  HOME="$PS1_TEST_HOME" CBM_DOWNLOAD_URL="$WIN_URL" CBM_ARCH="$DL_ARCH" \
-    powershell.exe -NoProfile -ExecutionPolicy ByPass -Command \
-      '$env:TEMP=$args[0]; $env:TMP=$args[0]; & $args[1] $args[2]' \
-      "$WIN_HOME" "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1 || true
+  # Every path is already in native Windows form. Disable MSYS argv rewriting
+  # and invoke the script directly: powershell.exe -Command appends native argv
+  # to the command text instead of reliably exposing it through $args.
+  if ! HOME="$WIN_HOME" TEMP="$WIN_HOME" TMP="$WIN_HOME" \
+    CBM_DOWNLOAD_URL="$WIN_URL" CBM_ARCH="$DL_ARCH" MSYS2_ARG_CONV_EXCL='*' \
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File \
+      "$WIN_SCRIPT" "--dir=$WIN_DIR" 2>&1; then
+    echo "FAIL 13f: install.ps1 execution failed"
+    exit 1
+  fi
 
   # 13g: binary placed
   PS1_BIN="$PS1_TEST_DIR/codebase-memory-mcp.exe"

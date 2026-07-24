@@ -85,6 +85,12 @@ bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 echo "=== Step 0g: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
+echo "=== Step 0h: smoke release-fixture contract ==="
+bash "$ROOT/tests/test_smoke_fixture_contract.sh"
+
+echo "=== Step 0i: parallel suite scheduler contract ==="
+bash "$ROOT/tests/test_parallel_harness_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
@@ -116,13 +122,14 @@ fi
 # binary and verifies it self-exits when its launching parent is killed.
 echo "=== Step 5: parent-death watchdog regression (#406/#407) ==="
 make -j"$NPROC" -f Makefile.cbm cbm ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
-bash "$ROOT/tests/test_parent_watchdog.sh"
+WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
 # (`cli --index-worker …`) whose supervisor dies must self-exit instead of
 # indexing on as an orphan. Reuses the prod binary built in Step 5.
 echo "=== Step 5b: worker-mode watchdog regression (#845) ==="
-bash "$ROOT/tests/test_worker_watchdog.sh"
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

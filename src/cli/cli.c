@@ -1762,29 +1762,328 @@ static size_t cbm_json_mcp_ownership_fields(cbm_json_mcp_schema_t schema, const 
     return 3U;
 }
 
-static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary) {
+/* The running executable is trustworthy identity evidence: install/update can
+ * replace an exact-shape entry that still names the binary which initiated the
+ * coordinated activation. It is scoped to that synchronous refresh and never
+ * populated from config content. */
+static CBM_TLS const char *g_previous_managed_mcp_command = NULL;
+
+static bool cbm_json_mcp_owned_command(const char *command, const char *expected_binary,
+                                       const char *previous_managed_binary) {
     if (!command || command[0] == '\0') {
         return false;
     }
     if (expected_binary && expected_binary[0] && strcmp(command, expected_binary) == 0) {
         return true;
     }
+    if (previous_managed_binary && previous_managed_binary[0] &&
+        strcmp(command, previous_managed_binary) == 0) {
+        return true;
+    }
     return strcmp(command, "codebase-memory-mcp") == 0 ||
            strcmp(command, "codebase-memory-mcp.exe") == 0;
 }
 
+/* Ownership state beyond the config_json_like enum: the entry has exactly
+ * OUR schema shape under OUR reserved name, but its command is a concrete
+ * absolute Windows path that the local fixed-drive walk conclusively reports
+ * missing. Upsert repairs it; remove leaves it alone like any other non-owned
+ * entry. POSIX never probes config-supplied paths: only the running executable
+ * identity above can authorize a moved-install refresh. */
+enum { CBM_JSON_MCP_OWNERSHIP_STALE = 100 };
+
+#ifdef _WIN32
+typedef enum {
+    CBM_JSON_MCP_COMMAND_UNKNOWN = 0,
+    CBM_JSON_MCP_COMMAND_PRESENT,
+    CBM_JSON_MCP_COMMAND_MISSING,
+} cbm_json_mcp_command_availability_t;
+#endif
+
+#if defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
+static bool cbm_json_mcp_command_path_probe_safe_for_platform(const char *command, bool windows) {
+    if (!command || !command[0]) {
+        return false;
+    }
+    if (windows) {
+        size_t length = strlen(command);
+        /* Never probe UNC or Win32 device namespaces from config content.
+         * GetFileAttributesW on those paths can perform outbound SMB
+         * authentication or block on an attacker-controlled endpoint. */
+        return length >= 3U && isalpha((unsigned char)command[0]) && command[1] == ':' &&
+               (command[2] == '/' || command[2] == '\\');
+    }
+    /* A slash-absolute POSIX path can cross autofs, NFS, FUSE, or a symlink
+     * before stat returns. Config bytes therefore never authorize a POSIX
+     * filesystem probe. */
+    return false;
+}
+#endif
+
+#ifdef _WIN32
+static bool cbm_json_mcp_command_path_probe_safe(const char *command) {
+    return cbm_json_mcp_command_path_probe_safe_for_platform(command, true);
+}
+#endif
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+static CBM_TLS int *g_mcp_command_path_probe_counter = NULL;
+
+bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows) {
+    return cbm_json_mcp_command_path_probe_safe_for_platform(command, windows);
+}
+
+void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter) {
+    g_mcp_command_path_probe_counter = counter;
+}
+#endif
+
+#ifdef _WIN32
+static bool cbm_json_mcp_windows_path_character_forbidden(wchar_t character) {
+    return character < L' ' || character == L':' || character == L'*' || character == L'?' ||
+           character == L'"' || character == L'<' || character == L'>' || character == L'|';
+}
+
+static bool cbm_json_mcp_windows_path_syntax_valid(const wchar_t *path) {
+    size_t length = path ? wcslen(path) : 0U;
+    bool ascii_drive = length >= 1U && ((path[0] >= L'A' && path[0] <= L'Z') ||
+                                        (path[0] >= L'a' && path[0] <= L'z'));
+    if (length < 3U || !ascii_drive || path[1] != L':' || path[2] != L'\\') {
+        return false;
+    }
+    size_t component_start = 3U;
+    for (size_t index = component_start; index <= length; index++) {
+        if (index < length && path[index] != L'\\') {
+            if (cbm_json_mcp_windows_path_character_forbidden(path[index])) {
+                return false;
+            }
+            continue;
+        }
+        if (index == component_start) {
+            return length == 3U && index == length;
+        }
+        size_t component_length = index - component_start;
+        const wchar_t *component = path + component_start;
+        if ((component_length == 1U && component[0] == L'.') ||
+            (component_length == 2U && component[0] == L'.' && component[1] == L'.') ||
+            component[component_length - 1U] == L'.' || component[component_length - 1U] == L' ') {
+            return false;
+        }
+        component_start = index + 1U;
+    }
+    return true;
+}
+
+static wchar_t *cbm_json_mcp_windows_path_from_utf8(const char *path) {
+    int needed = path ? MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0) : 0;
+    if (needed <= 0 || needed > MAX_PATH) {
+        return NULL;
+    }
+    wchar_t *wide = malloc((size_t)needed * sizeof(*wide));
+    if (!wide || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, needed) <= 0) {
+        free(wide);
+        return NULL;
+    }
+    for (int index = 0; index < needed - 1; index++) {
+        if (wide[index] == L'/') {
+            wide[index] = L'\\';
+        }
+    }
+    if (!cbm_json_mcp_windows_path_syntax_valid(wide)) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static bool cbm_json_mcp_windows_handle_is_local(HANDLE handle, wchar_t expected_drive,
+                                                 BY_HANDLE_FILE_INFORMATION *information_out) {
+    BY_HANDLE_FILE_INFORMATION information;
+    if (handle == INVALID_HANDLE_VALUE || GetFileType(handle) != FILE_TYPE_DISK ||
+        !GetFileInformationByHandle(handle, &information) ||
+        (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        return false;
+    }
+    DWORD capacity =
+        GetFinalPathNameByHandleW(handle, NULL, 0, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (capacity < 8U || capacity > 32768U) {
+        return false;
+    }
+    wchar_t *resolved = malloc((size_t)capacity * sizeof(*resolved));
+    if (!resolved) {
+        return false;
+    }
+    DWORD length = GetFinalPathNameByHandleW(handle, resolved, capacity,
+                                             FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    wchar_t actual_drive = length >= 7U ? resolved[4] : L'\0';
+    if (actual_drive >= L'a' && actual_drive <= L'z') {
+        actual_drive -= L'a' - L'A';
+    }
+    if (expected_drive >= L'a' && expected_drive <= L'z') {
+        expected_drive -= L'a' - L'A';
+    }
+    bool valid = length >= 7U && length < capacity && resolved[0] == L'\\' &&
+                 resolved[1] == L'\\' && resolved[2] == L'?' && resolved[3] == L'\\' &&
+                 resolved[5] == L':' && resolved[6] == L'\\' && actual_drive == expected_drive;
+    free(resolved);
+    if (valid && information_out) {
+        *information_out = information;
+    }
+    return valid;
+}
+
+static cbm_json_mcp_command_availability_t cbm_json_mcp_probe_windows_command_path(
+    const char *path) {
+    wchar_t *wide = cbm_json_mcp_windows_path_from_utf8(path);
+    if (!wide) {
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    wchar_t volume_root[4] = {wide[0], L':', L'\\', L'\0'};
+    UINT drive_type = GetDriveTypeW(volume_root);
+    if (drive_type != DRIVE_FIXED && drive_type != DRIVE_RAMDISK) {
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+
+    size_t length = wcslen(wide);
+    if (length == 3U) {
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_PRESENT;
+    }
+    wchar_t *partial = malloc((length + 1U) * sizeof(*partial));
+    HANDLE *component_handles = calloc(length + 1U, sizeof(*component_handles));
+    if (!partial || !component_handles) {
+        free(component_handles);
+        free(partial);
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    memcpy(partial, wide, (length + 1U) * sizeof(*partial));
+    cbm_json_mcp_command_availability_t availability = CBM_JSON_MCP_COMMAND_UNKNOWN;
+    size_t component_handle_count = 0U;
+
+    /* Retain every validated ancestor without write/delete sharing until the
+     * classification is complete. Otherwise a same-account concurrent writer
+     * could replace a checked directory with a junction before the next
+     * absolute-path open, causing that open to follow an SMB target. */
+    HANDLE root_handle =
+        CreateFileW(volume_root, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    BY_HANDLE_FILE_INFORMATION root_information;
+    if (!cbm_json_mcp_windows_handle_is_local(root_handle, wide[0], &root_information) ||
+        (root_information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        if (root_handle != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(root_handle);
+        }
+        free(component_handles);
+        free(partial);
+        free(wide);
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    component_handles[component_handle_count++] = root_handle;
+
+    for (size_t index = 3U; index <= length; index++) {
+        if (index < length && partial[index] != L'\\') {
+            continue;
+        }
+        bool final_component = index == length;
+        wchar_t saved = partial[index];
+        partial[index] = L'\0';
+        HANDLE component =
+            CreateFileW(partial, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+        DWORD error = component == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+        BY_HANDLE_FILE_INFORMATION information;
+        bool local = cbm_json_mcp_windows_handle_is_local(component, wide[0], &information);
+        if (local) {
+            component_handles[component_handle_count++] = component;
+        } else if (component != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(component);
+        }
+        partial[index] = saved;
+
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) {
+            availability = CBM_JSON_MCP_COMMAND_MISSING;
+            break;
+        }
+        if (error != ERROR_SUCCESS || !local ||
+            (!final_component && (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)) {
+            availability = CBM_JSON_MCP_COMMAND_UNKNOWN;
+            break;
+        }
+        if (final_component) {
+            availability = CBM_JSON_MCP_COMMAND_PRESENT;
+            break;
+        }
+    }
+    for (size_t handle_index = 0U; handle_index < component_handle_count; handle_index++) {
+        (void)CloseHandle(component_handles[handle_index]);
+    }
+    free(component_handles);
+    free(partial);
+    free(wide);
+    return availability;
+}
+#endif
+
+#ifdef _WIN32
+static cbm_json_mcp_command_availability_t cbm_json_mcp_probe_command_path(const char *path) {
+#ifdef CBM_CLI_ENABLE_TEST_API
+    if (g_mcp_command_path_probe_counter) {
+        (*g_mcp_command_path_probe_counter)++;
+    }
+#endif
+    return cbm_json_mcp_probe_windows_command_path(path);
+}
+
+/* Repair only a concrete fixed-drive path with a conclusive local "not found"
+ * result. Bare/relative/templated commands and filesystem errors remain
+ * fail-closed. POSIX never enters this classifier. */
+static cbm_json_mcp_command_availability_t cbm_json_mcp_command_availability(const char *command) {
+    if (!cbm_json_mcp_command_path_probe_safe(command) || strchr(command, '$') ||
+        strchr(command, '%')) {
+        return CBM_JSON_MCP_COMMAND_UNKNOWN;
+    }
+    cbm_json_mcp_command_availability_t availability = cbm_json_mcp_probe_command_path(command);
+    if (availability != CBM_JSON_MCP_COMMAND_MISSING) {
+        return availability;
+    }
+    const char *slash = strrchr(command, '/');
+    const char *backslash = strrchr(command, '\\');
+    const char *basename = slash && backslash
+                               ? (slash > backslash ? slash + 1 : backslash + 1)
+                               : (slash ? slash + 1 : (backslash ? backslash + 1 : command));
+    if (!basename[0] || strchr(basename, '.')) {
+        return CBM_JSON_MCP_COMMAND_MISSING;
+    }
+    /* An extensionless command can resolve through a client-specific or
+     * custom PATHEXT suffix that is not present in the installer's process.
+     * Absence of the literal file therefore never proves absence of the
+     * command. Preserve it unless positive prior-image identity matched. */
+    availability = CBM_JSON_MCP_COMMAND_UNKNOWN;
+    return availability;
+}
+#endif
+
 static int cbm_json_mcp_snapshot_ownership(const char *document, size_t document_length,
                                            const char *const *object_path, size_t path_len,
                                            cbm_json_mcp_schema_t schema, const char *entry_name,
-                                           const char *argument, const char *expected_binary) {
+                                           const char *argument, const char *expected_binary,
+                                           const char *previous_managed_binary) {
     cbm_json_like_object_field_t fields[3];
     size_t field_count = cbm_json_mcp_ownership_fields(schema, argument, fields);
     char *command = NULL;
     int result = cbm_json_like_match_object_entry(document, document_length, object_path, path_len,
                                                   entry_name, fields, field_count, &command);
     if (result == CBM_JSON_LIKE_OBJECT_MATCH &&
-        !cbm_json_mcp_owned_command(command, expected_binary)) {
+        !cbm_json_mcp_owned_command(command, expected_binary, previous_managed_binary)) {
+#ifdef _WIN32
+        result = cbm_json_mcp_command_availability(command) == CBM_JSON_MCP_COMMAND_MISSING
+                     ? CBM_JSON_MCP_OWNERSHIP_STALE
+                     : CBM_JSON_LIKE_OBJECT_MISMATCH;
+#else
         result = CBM_JSON_LIKE_OBJECT_MISMATCH;
+#endif
     }
     free(command);
     return result;
@@ -1804,10 +2103,13 @@ static int cbm_upsert_json_named_mcp(const char *binary_path, const char *config
         return CLI_ERR;
     }
     if (read_result == 0) {
-        int ownership =
-            cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len,
-                                            schema, entry_name, argument, binary_path);
-        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING) {
+        int ownership = cbm_json_mcp_snapshot_ownership(
+            document, document_length, object_path, path_len, schema, entry_name, argument,
+            binary_path, g_previous_managed_mcp_command);
+        /* STALE (our exact shape, dead binary path) is repairable — that is
+         * the update contract. Only a genuinely foreign shape refuses. */
+        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
+            ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             free(document);
             return CLI_ERR;
         }
@@ -1853,8 +2155,9 @@ static int cbm_remove_json_named_mcp(const char *config_path, const char *const 
     }
     int ownership =
         cbm_json_mcp_snapshot_ownership(document, document_length, object_path, path_len, schema,
-                                        entry_name, argument, expected_binary);
-    if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH) {
+                                        entry_name, argument, expected_binary, NULL);
+    if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH ||
+        ownership == CBM_JSON_MCP_OWNERSHIP_STALE) {
         free(document);
         return CLI_OK;
     }
@@ -1881,6 +2184,18 @@ int cbm_install_editor_mcp(const char *binary_path, const char *config_path) {
     static const char *const path[] = {"mcpServers"};
     return cbm_upsert_json_mcp(binary_path, config_path, path, 1U, CBM_JSON_MCP_STANDARD);
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
+                                                     const char *previous_binary_path,
+                                                     const char *config_path) {
+    const char *saved = g_previous_managed_mcp_command;
+    g_previous_managed_mcp_command = previous_binary_path;
+    int result = cbm_install_editor_mcp(binary_path, config_path);
+    g_previous_managed_mcp_command = saved;
+    return result;
+}
+#endif
 
 int cbm_remove_editor_mcp(const char *config_path) {
     static const char *const path[] = {"mcpServers"};
@@ -3552,10 +3867,11 @@ static int cbm_junie_mcp_preflight(const char *binary_path, const char *config_p
     }
     int result = CLI_OK;
     for (size_t i = 0U; i < sizeof(entries) / sizeof(entries[0]); i++) {
-        int ownership = cbm_json_mcp_snapshot_ownership(document, document_length, path, 1U,
-                                                        CBM_JSON_MCP_STANDARD, entries[i].name,
-                                                        entries[i].argument, binary_path);
-        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING) {
+        int ownership = cbm_json_mcp_snapshot_ownership(
+            document, document_length, path, 1U, CBM_JSON_MCP_STANDARD, entries[i].name,
+            entries[i].argument, binary_path, g_previous_managed_mcp_command);
+        if (ownership != CBM_JSON_LIKE_OBJECT_MATCH && ownership != CBM_JSON_LIKE_OBJECT_MISSING &&
+            ownership != CBM_JSON_MCP_OWNERSHIP_STALE) {
             result = CLI_ERR;
             break;
         }
@@ -3579,6 +3895,18 @@ int cbm_upsert_junie_mcp(const char *binary_path, const char *config_path) {
     }
     return CLI_OK;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
+                                                   const char *previous_binary_path,
+                                                   const char *config_path) {
+    const char *saved = g_previous_managed_mcp_command;
+    g_previous_managed_mcp_command = previous_binary_path;
+    int result = cbm_upsert_junie_mcp(binary_path, config_path);
+    g_previous_managed_mcp_command = saved;
+    return result;
+}
+#endif
 
 int cbm_remove_junie_mcp(const char *config_path) {
     static const char *const path[] = {"mcpServers"};
@@ -5600,15 +5928,104 @@ static bool cli_windows_path_segment_equal(const wchar_t *segment, size_t segmen
     return segment_length == directory_length && _wcsnicmp(segment, directory, segment_length) == 0;
 }
 
+static bool cli_windows_smoke_download_url_valid(void) {
+    wchar_t url[CLI_BUF_128];
+    DWORD length =
+        GetEnvironmentVariableW(L"SMOKE_DOWNLOAD_URL", url, (DWORD)(sizeof(url) / sizeof(url[0])));
+    if (length == 0U || length >= (DWORD)(sizeof(url) / sizeof(url[0]))) {
+        return false;
+    }
+    static const wchar_t prefix[] = L"http://127.0.0.1:";
+    if (wcsncmp(url, prefix, (sizeof(prefix) / sizeof(prefix[0])) - 1U) != 0) {
+        return false;
+    }
+    const wchar_t *cursor = url + (sizeof(prefix) / sizeof(prefix[0])) - 1U;
+    unsigned long port = 0UL;
+    if (*cursor < L'0' || *cursor > L'9') {
+        return false;
+    }
+    while (*cursor >= L'0' && *cursor <= L'9') {
+        unsigned long digit = (unsigned long)(*cursor - L'0');
+        if (port > (65535UL - digit) / 10UL) {
+            return false;
+        }
+        port = port * 10UL + digit;
+        cursor++;
+    }
+    return *cursor == L'\0' && port > 0UL;
+}
+
+/* The release smoke must exercise the production registry query/append/write
+ * path without ever mutating the developer's live HKCU\Environment\Path.
+ * A pre-created, GUID-named leaf is accepted only under the complete local
+ * loopback smoke contract. Presence with any invalid gate fails closed. */
+static int cli_windows_open_user_path_key(HKEY *environment) {
+    if (!environment) {
+        return CLI_ERR;
+    }
+    *environment = NULL;
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD needed = GetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", NULL, 0U);
+    DWORD run_id_error = GetLastError();
+    if (needed == 0U && run_id_error == ERROR_ENVVAR_NOT_FOUND) {
+        return RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_QUERY_VALUE | KEY_SET_VALUE,
+                             environment) == ERROR_SUCCESS
+                   ? CLI_OK
+                   : CLI_ERR;
+    }
+
+    wchar_t run_id[CLI_BUF_32 + 1U];
+    if (needed != CLI_BUF_32 + 1U ||
+        GetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", run_id,
+                                (DWORD)(sizeof(run_id) / sizeof(run_id[0]))) != CLI_BUF_32) {
+        return CLI_ERR;
+    }
+    for (size_t index = 0; index < CLI_BUF_32; index++) {
+        wchar_t value = run_id[index];
+        if (!((value >= L'0' && value <= L'9') || (value >= L'a' && value <= L'f') ||
+              (value >= L'A' && value <= L'F'))) {
+            return CLI_ERR;
+        }
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    DWORD smoke_root_needed = GetEnvironmentVariableW(L"SMOKE_TEMP_ROOT", NULL, 0U);
+    if (smoke_root_needed <= 1U || !cli_windows_smoke_download_url_valid()) {
+        return CLI_ERR;
+    }
+
+    wchar_t key_path[CLI_BUF_128];
+    int key_length = swprintf(key_path, sizeof(key_path) / sizeof(key_path[0]),
+                              L"Software\\CodebaseMemoryMCP\\Smoke\\%ls", run_id);
+    if (key_length <= 0 || (size_t)key_length >= sizeof(key_path) / sizeof(key_path[0]) ||
+        RegOpenKeyExW(HKEY_CURRENT_USER, key_path, 0,
+                      KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY,
+                      environment) != ERROR_SUCCESS) {
+        return CLI_ERR;
+    }
+
+    wchar_t sentinel[CLI_BUF_32 + 1U] = {0};
+    DWORD sentinel_type = 0U;
+    DWORD sentinel_bytes = (DWORD)sizeof(sentinel);
+    LONG sentinel_status = RegQueryValueExW(*environment, L"CbmSmokeRunId", NULL, &sentinel_type,
+                                            (BYTE *)sentinel, &sentinel_bytes);
+    if (sentinel_status != ERROR_SUCCESS || sentinel_type != REG_SZ ||
+        sentinel_bytes != (CLI_BUF_32 + 1U) * sizeof(wchar_t) || wcscmp(sentinel, run_id) != 0) {
+        RegCloseKey(*environment);
+        *environment = NULL;
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
 /* Persist the current-user PATH while the activation lease is held. The
  * installer script may update only its process-local PATH after this returns;
  * it must not perform a second persistent mutation outside coordination. */
 static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     wchar_t *wide_dir = cli_windows_utf8_to_wide(bin_dir);
     HKEY environment = NULL;
-    if (!wide_dir ||
-        RegOpenKeyExW(HKEY_CURRENT_USER, L"Environment", 0, KEY_QUERY_VALUE | KEY_SET_VALUE,
-                      &environment) != ERROR_SUCCESS) {
+    if (!wide_dir || cli_windows_open_user_path_key(&environment) != CLI_OK) {
         free(wide_dir);
         return CLI_ERR;
     }
@@ -9259,6 +9676,18 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
     return g_agent_install_errors == 0 ? CLI_OK : CLI_ERR;
 }
 
+#if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
+static int cbm_install_agent_configs_with_previous(const char *home, const char *binary_path,
+                                                   const char *previous_managed_binary_path,
+                                                   bool force, bool dry_run) {
+    const char *saved = g_previous_managed_mcp_command;
+    g_previous_managed_mcp_command = previous_managed_binary_path;
+    int result = cbm_install_agent_configs(home, binary_path, force, dry_run);
+    g_previous_managed_mcp_command = saved;
+    return result;
+}
+#endif
+
 /* Count .db files in the cache directory. */
 static int count_db_indexes(const char *home) {
     const char *cache_dir = get_cache_dir(home);
@@ -9356,21 +9785,33 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
  * activation/agent-config semantics, while release Windows binaries compile
  * exclusively the managed launcher transaction. */
 #if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
-/* Detect the running binary's path at runtime. Falls back to ~/.local/bin/. */
-static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
+/* Detect the running binary's path at runtime. The return value distinguishes
+ * OS-reported identity (safe ownership evidence) from the ~/.local/bin fallback
+ * used only as an install copy source. */
+static bool cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     buf[0] = '\0';
+    bool exact = false;
 #ifdef _WIN32
-    GetModuleFileNameA(NULL, buf, (DWORD)buf_sz);
-    cbm_normalize_path_sep(buf);
+    DWORD length = GetModuleFileNameA(NULL, buf, (DWORD)buf_sz);
+    exact = length > 0 && (size_t)length < buf_sz;
+    if (exact) {
+        cbm_normalize_path_sep(buf);
+    } else {
+        buf[0] = '\0';
+    }
 #elif defined(__APPLE__)
     uint32_t sp_sz = (uint32_t)buf_sz;
-    if (_NSGetExecutablePath(buf, &sp_sz) != 0) {
+    exact = _NSGetExecutablePath(buf, &sp_sz) == 0;
+    if (!exact) {
         buf[0] = '\0';
     }
 #else
     ssize_t sp_len = readlink("/proc/self/exe", buf, buf_sz - SKIP_ONE);
-    if (sp_len > 0) {
+    exact = sp_len > 0 && (size_t)sp_len < buf_sz - SKIP_ONE;
+    if (exact) {
         buf[sp_len] = '\0';
+    } else {
+        buf[0] = '\0';
     }
 #endif
     if (!buf[0]) {
@@ -9380,6 +9821,7 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
         snprintf(buf, buf_sz, "%s/.local/bin/codebase-memory-mcp", home);
 #endif
     }
+    return exact;
 }
 #endif /* !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API) */
 
@@ -9526,6 +9968,9 @@ static int cli_install_activate(void *opaque) {
         !activation->shell_rc) {
         return CLI_TRUE;
     }
+    char previous_managed_binary[CLI_BUF_1K] = {0};
+    bool previous_managed_binary_exact = cbm_detect_self_path(
+        previous_managed_binary, sizeof(previous_managed_binary), activation->home);
     if (activation->copy_binary) {
         if (activation->dry_run) {
             printf("Would install binary -> %s\n\n", activation->bin_target);
@@ -9571,8 +10016,10 @@ static int cli_install_activate(void *opaque) {
      * including same-binary and non-force installs. */
     int agent_config_rc = CLI_OK;
     if (!activation->skip_config) {
-        agent_config_rc = cbm_install_agent_configs(activation->home, activation->bin_target,
-                                                    activation->force, activation->dry_run);
+        agent_config_rc = cbm_install_agent_configs_with_previous(
+            activation->home, activation->bin_target,
+            previous_managed_binary_exact ? previous_managed_binary : NULL, activation->force,
+            activation->dry_run);
     }
     if (agent_config_rc != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
@@ -10539,7 +10986,7 @@ int cbm_cmd_install(int argc, char **argv) {
 
 #if !defined(_WIN32) || defined(CBM_CLI_ENABLE_TEST_API)
     char self_path[CLI_BUF_1K] = {0};
-    cbm_detect_self_path(self_path, sizeof(self_path), home);
+    (void)cbm_detect_self_path(self_path, sizeof(self_path), home);
 
     struct stat target_status;
     bool target_exists = (stat(bin_target, &target_status) == 0);
@@ -12553,6 +13000,9 @@ static int cli_update_activate_binary(void *opaque) {
     if (!activation || !activation->bin_dest || !activation->binary_transaction) {
         return CLI_TRUE;
     }
+    char previous_managed_binary[CLI_BUF_1K] = {0};
+    bool previous_managed_binary_exact = cbm_detect_self_path(
+        previous_managed_binary, sizeof(previous_managed_binary), activation->home);
     if (cli_activation_transaction_commit_validated(activation->binary_transaction,
                                                     &activation->binary_validator,
                                                     CLI_OCTAL_PERM) != CLI_OK) {
@@ -12565,7 +13015,10 @@ static int cli_update_activate_binary(void *opaque) {
      * exact-build activation window. Otherwise another CBM process can start
      * after the binary swap but before its MCP/hook entries are refreshed. */
     printf("Refreshing agent configurations...\n");
-    if (cbm_install_agent_configs(activation->home, activation->bin_dest, true, false) != CLI_OK) {
+    if (cbm_install_agent_configs_with_previous(
+            activation->home, activation->bin_dest,
+            previous_managed_binary_exact ? previous_managed_binary : NULL, true,
+            false) != CLI_OK) {
         cli_activation_transaction_finalize_committed_or_fail_stop(
             &activation->binary_transaction, "update_transaction_config_failure_finalize");
         (void)fprintf(stderr, "error: one or more agent configurations failed; the "

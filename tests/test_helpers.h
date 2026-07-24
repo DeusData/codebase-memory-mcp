@@ -20,6 +20,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include "../src/foundation/win_utf8.h"
+#endif
 
 /* ── Path building ────────────────────────────────────────────── */
 
@@ -88,15 +91,35 @@ static inline int th_mkdir_p(const char *path) {
 
 /* ── Recursive directory removal ──────────────────────────────── */
 
+/* Git for Windows marks loose objects read-only. Match rm -rf semantics in
+ * test cleanup without broadening production cbm_unlink behavior. */
+static inline int th_unlink_force(const char *path) {
+    int result = cbm_unlink(path);
+#ifdef _WIN32
+    if (result != 0) {
+        wchar_t *wide = cbm_path_to_wide(path);
+        DWORD attributes = wide ? GetFileAttributesW(wide) : INVALID_FILE_ATTRIBUTES;
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_READONLY) != 0U &&
+            SetFileAttributesW(wide, attributes & ~((DWORD)FILE_ATTRIBUTE_READONLY))) {
+            result = cbm_unlink(path);
+        }
+        free(wide);
+    }
+#endif
+    return result;
+}
+
 /* Remove a file or directory tree recursively. Cross-platform rm -rf. */
 static inline int th_rmtree(const char *path) {
-    struct stat st;
-    if (stat(path, &st) != 0) {
+    /* The platform wrappers preserve UTF-8 and add the extended-length prefix
+     * on Windows; narrow CRT stat() silently treats paths beyond MAX_PATH as
+     * absent and leaves their parents nonempty. */
+    if (!cbm_file_exists(path)) {
         return 0; /* doesn't exist — success */
     }
 
-    if (!S_ISDIR(st.st_mode)) {
-        return cbm_unlink(path);
+    if (!cbm_is_dir(path)) {
+        return th_unlink_force(path);
     }
 
     /* Directory — recurse into children */
@@ -118,13 +141,15 @@ static inline int th_rmtree(const char *path) {
                 rc = -1;
             }
         } else {
-            if (cbm_unlink(child) != 0) {
+            if (th_unlink_force(child) != 0) {
                 rc = -1;
             }
         }
     }
     cbm_closedir(d);
-    cbm_rmdir(path);
+    if (cbm_rmdir(path) != 0) {
+        rc = -1;
+    }
     return rc;
 }
 
@@ -136,8 +161,10 @@ static inline char *th_mktempdir(const char *prefix) {
     static char buf[256];
 #ifdef _WIN32
     const char *tmp = getenv("TEMP");
-    if (!tmp) tmp = getenv("TMP");
-    if (!tmp) tmp = "C:\\Temp";
+    if (!tmp)
+        tmp = getenv("TMP");
+    if (!tmp)
+        tmp = "C:\\Temp";
     snprintf(buf, sizeof(buf), "%s\\%s_XXXXXX", tmp, prefix);
 #else
     snprintf(buf, sizeof(buf), "/tmp/%s_XXXXXX", prefix);

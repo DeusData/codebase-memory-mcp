@@ -59,7 +59,7 @@ jobs:
           # The paginated files endpoint remains filename-only for this gate.
           FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
           printf '%s\n' "$FILES"
-          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|scripts/build\.sh|scripts/smoke-test\.sh|scripts/env\.sh|Makefile\.cbm)'; then
+          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
@@ -70,8 +70,8 @@ jobs:
   #    time (e.g. the Windows CreateProcess argv-quoting class that previously
   #    only surfaced in the release dry run). The full broad/emulated smoke stays
   #    in the dry run. Only product-code PRs pay this; every leg gates.
-  #    SMOKE_DOWNLOAD_URL is intentionally unset — the download/update phases of
-  #    smoke-test.sh self-skip; the core index/search/trace phases still run. ──
+  #    The maintained local wrappers add a race-free release fixture so the
+  #    download/checksum/install/update phases run here as well. ──
   pr-smoke:
     needs: [changes]
     if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
@@ -104,6 +104,9 @@ jobs:
             mingw-w64-clang-x86_64-ccache
             make
             coreutils
+            curl
+            zip
+            unzip
 
       # Verified compiler cache — content-keyed, stale hits impossible by
       # construction (see scripts/env.sh).
@@ -119,7 +122,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: |
           scripts/build.sh CC=gcc CXX=g++
-          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -129,7 +132,7 @@ jobs:
         run: |
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp
-          scripts/smoke-test.sh "$(pwd)/build/c/codebase-memory-mcp"
+          scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -139,19 +142,7 @@ jobs:
         shell: msys2 {0}
         run: |
           scripts/build.sh CC=clang CXX=clang++
-          # MSYS2 /tmp is intentionally shared. The launcher correctly rejects
-          # a bundle below that writable ancestor. RUNNER_TEMP is also below
-          # the shared D:\a tree, so stage in the runner account's profile.
-          PROFILE_ROOT="$(cygpath -u "$USERPROFILE")"
-          SMOKE_DIR="$(mktemp -d "$PROFILE_ROOT/cbm-pr-smoke.XXXXXX")"
-          trap 'rm -rf "$SMOKE_DIR"' EXIT
-          cp build/c/codebase-memory-mcp-launcher.exe \
-            "$SMOKE_DIR/codebase-memory-mcp.exe"
-          cp build/c/codebase-memory-mcp.exe \
-            "$SMOKE_DIR/codebase-memory-mcp.payload.exe"
-          CBM_CACHE_DIR="$(cygpath -m "$SMOKE_DIR/cache")" \
-            SMOKE_TEMP_ROOT="$SMOKE_DIR" \
-            scripts/smoke-test.sh "$SMOKE_DIR/codebase-memory-mcp.exe"
+          SMOKE_ARCH=amd64 bash test-infrastructure/vm/vm-smoke.sh
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M

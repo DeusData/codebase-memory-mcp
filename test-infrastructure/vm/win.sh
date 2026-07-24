@@ -62,6 +62,9 @@ vm() { local env="$1"; shift
 vm_cmd() { "${SSH[@]}" "$@"; } # plain cmd.exe (CI-shaped environment)
 
 cmd="${1:-status}"; shift || true
+if [ "$cmd" != "status" ]; then
+    cbm_vm_sync_windows_clock "${SSH[@]}"
+fi
 case "$cmd" in
 status)
     "${SSH[@]}" "echo VM_REACHABLE & ver"

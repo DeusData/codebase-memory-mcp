@@ -9,6 +9,7 @@
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
+#include "../src/foundation/subprocess.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <cli/cli.h>
@@ -180,6 +181,101 @@ static bool mcp_command_hook_probe(void *context, const char *command) {
     }
     probe->diff_calls++;
     return true;
+}
+
+typedef struct {
+    const char *name;
+    char *value;
+    bool present;
+} mcp_test_env_backup_t;
+
+static void mcp_test_restore_env(mcp_test_env_backup_t *backups, size_t count) {
+    for (size_t index = 0; index < count; index++) {
+        if (backups[index].present) {
+            (void)cbm_setenv(backups[index].name, backups[index].value, 1);
+        } else {
+            (void)cbm_unsetenv(backups[index].name);
+        }
+        free(backups[index].value);
+    }
+}
+
+static int mcp_test_git(const char *root, const char *const *arguments) {
+    char empty_config[CBM_SZ_4K];
+    int config_length =
+        snprintf(empty_config, sizeof(empty_config), "%s/.cbm-empty-gitconfig", root);
+    if (config_length <= 0 || (size_t)config_length >= sizeof(empty_config)) {
+        return -1;
+    }
+    FILE *config = cbm_fopen(empty_config, "wb");
+    if (!config) {
+        return -1;
+    }
+    if (fclose(config) != 0) {
+        return -1;
+    }
+
+    mcp_test_env_backup_t backups[] = {
+        {.name = "GIT_CONFIG_GLOBAL"},     {.name = "GIT_CONFIG_SYSTEM"},
+        {.name = "GIT_CONFIG_NOSYSTEM"},   {.name = "GIT_CONFIG_COUNT"},
+        {.name = "GIT_CONFIG_PARAMETERS"},
+    };
+    bool snapshot_ok = true;
+    for (size_t index = 0; index < sizeof(backups) / sizeof(backups[0]); index++) {
+        const char *value = getenv(backups[index].name);
+        backups[index].present = value != NULL;
+        backups[index].value = value ? strdup(value) : NULL;
+        snapshot_ok = snapshot_ok && (!value || backups[index].value);
+    }
+    if (!snapshot_ok) {
+        for (size_t index = 0; index < sizeof(backups) / sizeof(backups[0]); index++) {
+            free(backups[index].value);
+        }
+        return -1;
+    }
+    bool environment_ok = cbm_setenv("GIT_CONFIG_GLOBAL", empty_config, 1) == 0 &&
+                          cbm_setenv("GIT_CONFIG_SYSTEM", empty_config, 1) == 0 &&
+                          cbm_setenv("GIT_CONFIG_NOSYSTEM", "1", 1) == 0 &&
+                          cbm_setenv("GIT_CONFIG_COUNT", "0", 1) == 0 &&
+                          cbm_unsetenv("GIT_CONFIG_PARAMETERS") == 0;
+    if (!environment_ok) {
+        mcp_test_restore_env(backups, sizeof(backups) / sizeof(backups[0]));
+        return -1;
+    }
+
+    const char *git = "git";
+#ifdef _WIN32
+    char git_executable[CBM_SZ_4K];
+    const char *resolved = cbm_find_cli("git", cbm_get_home_dir());
+    int resolved_length =
+        resolved ? snprintf(git_executable, sizeof(git_executable), "%s", resolved) : -1;
+    if (resolved_length <= 0 || (size_t)resolved_length >= sizeof(git_executable)) {
+        mcp_test_restore_env(backups, sizeof(backups) / sizeof(backups[0]));
+        return -1;
+    }
+    git = git_executable;
+#endif
+    const char *argv[24] = {git, "-C", root};
+    size_t index = 3;
+    while (arguments && *arguments && index + 1 < sizeof(argv) / sizeof(argv[0])) {
+        argv[index++] = *arguments++;
+    }
+    if ((arguments && *arguments) || index >= sizeof(argv) / sizeof(argv[0])) {
+        mcp_test_restore_env(backups, sizeof(backups) / sizeof(backups[0]));
+        return -1;
+    }
+    argv[index] = NULL;
+
+    cbm_proc_opts_t options = {
+        .bin = git,
+        .argv = argv,
+        .quiet_timeout_ms = 10000,
+    };
+    cbm_proc_result_t result = {0};
+    int run_result =
+        cbm_subprocess_run(&options, &result) == 0 && result.outcome == CBM_PROC_CLEAN ? 0 : -1;
+    mcp_test_restore_env(backups, sizeof(backups) / sizeof(backups[0]));
+    return run_result;
 }
 
 static bool mcp_mutation_guard_probe_begin(void *context, const char *project) {
@@ -5654,17 +5750,99 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     char cache[512];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-detect-contained-XXXXXX", cbm_tmpdir());
     bool cache_created = cbm_mkdtemp(cache) != NULL;
+    char repo[CBM_SZ_4K];
+    (void)snprintf(repo, sizeof(repo), "%s/cbm-detect-repo-XXXXXX", cbm_tmpdir());
+    bool repo_created = cbm_mkdtemp(repo) != NULL;
+    char empty_template[CBM_SZ_4K];
+    char empty_hooks[CBM_SZ_4K];
+    char template_argument[CBM_SZ_4K];
+    char hooks_config[CBM_SZ_4K];
+    char hostile_template[CBM_SZ_4K];
+    char hostile_template_hooks[CBM_SZ_4K];
+    char hostile_hooks[CBM_SZ_4K];
+    char hostile_hook[CBM_SZ_4K];
+    char hostile_config[CBM_SZ_4K];
+    int template_length =
+        snprintf(empty_template, sizeof(empty_template), "%s/.cbm-empty-template", repo);
+    int hooks_length = snprintf(empty_hooks, sizeof(empty_hooks), "%s/.cbm-empty-hooks", repo);
+    int template_argument_length =
+        snprintf(template_argument, sizeof(template_argument), "--template=%s", empty_template);
+    int hooks_config_length =
+        snprintf(hooks_config, sizeof(hooks_config), "core.hooksPath=%s", empty_hooks);
+    int hostile_template_length =
+        snprintf(hostile_template, sizeof(hostile_template), "%s/.cbm-hostile-template", repo);
+    int hostile_template_hooks_length = snprintf(
+        hostile_template_hooks, sizeof(hostile_template_hooks), "%s/hooks", hostile_template);
+    int hostile_hooks_length =
+        snprintf(hostile_hooks, sizeof(hostile_hooks), "%s/.cbm-hostile-hooks", repo);
+    int hostile_hook_length =
+        snprintf(hostile_hook, sizeof(hostile_hook), "%s/pre-commit", hostile_hooks);
+    int hostile_config_length =
+        snprintf(hostile_config, sizeof(hostile_config), "%s/.cbm-hostile-gitconfig", repo);
+    bool git_isolation_ready =
+        repo_created && template_length > 0 && (size_t)template_length < sizeof(empty_template) &&
+        hooks_length > 0 && (size_t)hooks_length < sizeof(empty_hooks) &&
+        template_argument_length > 0 &&
+        (size_t)template_argument_length < sizeof(template_argument) && hooks_config_length > 0 &&
+        (size_t)hooks_config_length < sizeof(hooks_config) && cbm_mkdir(empty_template) == 0 &&
+        cbm_mkdir(empty_hooks) == 0;
+    bool hostile_paths_ready =
+        git_isolation_ready && hostile_template_length > 0 &&
+        (size_t)hostile_template_length < sizeof(hostile_template) &&
+        hostile_template_hooks_length > 0 &&
+        (size_t)hostile_template_hooks_length < sizeof(hostile_template_hooks) &&
+        hostile_hooks_length > 0 && (size_t)hostile_hooks_length < sizeof(hostile_hooks) &&
+        hostile_hook_length > 0 && (size_t)hostile_hook_length < sizeof(hostile_hook) &&
+        hostile_config_length > 0 && (size_t)hostile_config_length < sizeof(hostile_config) &&
+        cbm_mkdir(hostile_template) == 0 && cbm_mkdir(hostile_template_hooks) == 0 &&
+        cbm_mkdir(hostile_hooks) == 0;
+    FILE *hostile_hook_file = hostile_paths_ready ? cbm_fopen(hostile_hook, "wb") : NULL;
+    bool hostile_hook_ready = false;
+    if (hostile_hook_file) {
+        bool hook_written = fputs("#!/bin/sh\nexit 91\n", hostile_hook_file) >= 0;
+        bool hook_closed = fclose(hostile_hook_file) == 0;
+        hostile_hook_ready = hook_written && hook_closed && chmod(hostile_hook, 0700) == 0;
+    }
+    FILE *hostile_config_file = hostile_hook_ready ? cbm_fopen(hostile_config, "wb") : NULL;
+    bool hostile_config_ready = false;
+    if (hostile_config_file) {
+        bool config_written =
+            fprintf(hostile_config_file, "[init]\n\ttemplateDir = %s\n[core]\n\thooksPath = %s\n",
+                    hostile_template, hostile_hooks) > 0;
+        bool config_closed = fclose(hostile_config_file) == 0;
+        hostile_config_ready = config_written && config_closed;
+    }
+    mcp_test_env_backup_t ambient_git = {.name = "GIT_CONFIG_GLOBAL"};
+    const char *ambient_git_value = getenv(ambient_git.name);
+    ambient_git.present = ambient_git_value != NULL;
+    ambient_git.value = ambient_git_value ? strdup(ambient_git_value) : NULL;
+    bool ambient_git_saved = !ambient_git_value || ambient_git.value;
+    bool hostile_environment_ready = hostile_config_ready && ambient_git_saved &&
+                                     cbm_setenv("GIT_CONFIG_GLOBAL", hostile_config, 1) == 0;
+    const char *const init_args[] = {"init", "-q", template_argument, NULL};
+    const char *const commit_args[] = {
+        "-c",      "user.name=cbm-test",
+        "-c",      "user.email=cbm-test@example.invalid",
+        "-c",      "commit.gpgsign=false",
+        "-c",      hooks_config,
+        "commit",  "--allow-empty",
+        "-q",      "-m",
+        "fixture", NULL,
+    };
+    bool repo_ready = hostile_environment_ready && mcp_test_git(repo, init_args) == 0 &&
+                      mcp_test_git(repo, commit_args) == 0;
+    if (ambient_git_saved) {
+        mcp_test_restore_env(&ambient_git, 1U);
+    }
     const char *saved_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
     bool environment_ready = cache_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
 
-    char root[CBM_SZ_4K] = {0};
-    bool root_ready = cbm_getcwd(root, sizeof(root)) != NULL;
     const char *project = "detect-contained-project";
-    cbm_mcp_server_t *srv = environment_ready && root_ready ? cbm_mcp_server_new(NULL) : NULL;
+    cbm_mcp_server_t *srv = environment_ready && repo_ready ? cbm_mcp_server_new(NULL) : NULL;
     bool server_ready = srv != NULL;
     cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
-    bool project_ready = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    bool project_ready = store && cbm_store_upsert_project(store, project, repo) == CBM_STORE_OK;
     mcp_command_hook_probe_t command_probe = {.reject_merge_base = true};
     if (project_ready) {
         cbm_mcp_server_set_project(srv, project);
@@ -5710,10 +5888,14 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     restore_cache_dir(saved_cache_copy);
     free(saved_cache_copy);
     bool cleaned = !cache_created || th_rmtree(cache) == 0;
+    /* Git for Windows makes loose objects read-only; the shared test cleanup
+     * must still remove the entire self-contained fixture. */
+    bool repo_cleaned = !repo_created || th_rmtree(repo) == 0;
 
     ASSERT_TRUE(cache_created);
+    ASSERT_TRUE(repo_created);
+    ASSERT_TRUE(repo_ready);
     ASSERT_TRUE(environment_ready);
-    ASSERT_TRUE(root_ready);
     ASSERT_TRUE(server_ready);
     ASSERT_TRUE(project_ready);
     ASSERT_TRUE(invalid_rejected);
@@ -5725,6 +5907,7 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     ASSERT_EQ(command_probe.diff_calls, 3);
     ASSERT_EQ(command_probe.merge_base_calls, 2);
     ASSERT_TRUE(cleaned);
+    ASSERT_TRUE(repo_cleaned);
     PASS();
 }
 

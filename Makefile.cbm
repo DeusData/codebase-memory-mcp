@@ -750,6 +750,11 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
                     diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application
 TSAN_OPTIONS ?= halt_on_error=1
+# A fixed concurrent envelope keeps TSan deterministic across developer hosts
+# and GitHub runners. Four workers still exercise real races without turning
+# sanitizer-instrumented allocator bookkeeping into a high-core lock convoy.
+# Normal ASan/native/soak paths remain uncapped. High-worker TSan diagnostics
+# invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
 $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -o $@ \
@@ -759,7 +764,9 @@ $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 
 		$(LDFLAGS_TSAN)
 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
-	cd $(CURDIR) && TSAN_OPTIONS="$(TSAN_OPTIONS)" $(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
+	@echo "ThreadSanitizer workers: 4"
+	cd $(CURDIR) && CBM_WORKERS=4 TSAN_OPTIONS="$(TSAN_OPTIONS)" \
+		$(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
 
 # Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
 # an explicit Make invocation requires a clean rendezvous and fails rather than

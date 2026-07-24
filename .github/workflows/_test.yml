@@ -253,6 +253,7 @@ jobs:
             mingw-w64-clang-${{ matrix.pkg }}-clang
             mingw-w64-clang-${{ matrix.pkg }}-compiler-rt
             mingw-w64-clang-${{ matrix.pkg }}-zlib
+            mingw-w64-clang-${{ matrix.pkg }}-python3
             mingw-w64-clang-${{ matrix.pkg }}-ccache
             make
             git

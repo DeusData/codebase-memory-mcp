@@ -220,6 +220,14 @@ bool cbm_hook_augment_invocation_supported_for_testing(const char *dialect,
 bool cbm_hook_path_contains_for_testing(const char *root, const char *candidate,
                                         bool case_insensitive);
 const char *cbm_hook_no_project_index_guidance_for_testing(const char *event);
+bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows);
+void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter);
+int cbm_install_editor_mcp_with_previous_for_testing(const char *binary_path,
+                                                     const char *previous_binary_path,
+                                                     const char *config_path);
+int cbm_upsert_junie_mcp_with_previous_for_testing(const char *binary_path,
+                                                   const char *previous_binary_path,
+                                                   const char *config_path);
 #endif
 
 /* ── Agent MCP config upsert (per agent) ──────────────────────── */
