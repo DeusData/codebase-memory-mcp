@@ -1490,6 +1490,27 @@ TEST(contract_edge_commonjs_require_call_resolves_issue871) {
     PASS();
 }
 
+/* A weak short-name call match must not bind executable source to a Variable
+ * extracted from an unrelated data file. This exact shape previously made
+ * incremental and clean benchmark graphs depend on registry insertion order. */
+TEST(contract_call_weak_match_rejects_noncallable_data_symbol) {
+    LangProj lp;
+    static const LangFile f[] = {
+        {"caller.c", "void caller(void) {\n    format();\n}\n"},
+        {"benchmarks/schema/example.schema.json",
+         "{\"type\":\"object\",\"properties\":{\"format\":{\"type\":\"string\"}}}\n"}};
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+    int false_target = calls_edge_targets(store, lp.project, "Variable", ".format");
+    if (false_target) {
+        fprintf(stderr,
+                "  weak call resolution must not target unrelated JSON Variable `format`\n");
+    }
+    ASSERT_TRUE(!false_target);
+    lang_cleanup(&lp, store);
+    PASS();
+}
+
 /* DEPENDS_ON — Helm Chart.yaml `dependencies:` -> per-dependency Chart node.
  * Basename must be exactly "Chart.yaml"; pass_k8s runs in both pipeline paths. */
 TEST(contract_edge_depends_on) {
@@ -1704,6 +1725,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_edge_no_infra_routes_from_ci_configs_issue999);
     RUN_TEST(contract_edge_infra_routes_from_deploy_configs_still_minted);
     RUN_TEST(contract_edge_commonjs_require_call_resolves_issue871);
+    RUN_TEST(contract_call_weak_match_rejects_noncallable_data_symbol);
     RUN_TEST(contract_edge_depends_on);
     RUN_TEST(contract_edge_parallel_service_edges);
     RUN_TEST(contract_edge_file_changes_with);

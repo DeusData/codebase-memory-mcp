@@ -160,6 +160,19 @@ static inline bool cbm_pipeline_node_is_callable_scope(const cbm_gbuf_node_t *no
            (strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0);
 }
 
+/* Weak registry fallbacks may resolve a call to an unrelated Variable or Field
+ * with the same short name, including symbols extracted from another language.
+ * Preserve type-like constructor targets and strong same-module/import matches,
+ * which can legitimately identify callable variables such as C callbacks. */
+static inline bool cbm_pipeline_should_suppress_weak_noncallable_call_target(
+    const cbm_gbuf_node_t *target, const char *strategy) {
+    if (!target || !target->label || !cbm_registry_strategy_is_weak_short_name(strategy)) {
+        return false;
+    }
+    return strcmp(target->label, "Function") != 0 && strcmp(target->label, "Method") != 0 &&
+           !cbm_label_is_type_like(target->label);
+}
+
 /* A textual `super().__init__` does not identify a local constructor without
  * receiver-type information. A registry suffix match can therefore select an
  * unrelated project Method merely because it is named `__init__`. Keep

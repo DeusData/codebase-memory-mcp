@@ -2100,6 +2100,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
             continue;
         }
+        if (target_node != lsp_target &&
+            cbm_pipeline_should_suppress_weak_noncallable_call_target(target_node, res.strategy)) {
+            continue;
+        }
         _rc_t0 = extract_now_ns();
         emit_service_edge(ws->local_edge_buf, source_node, target_node, call, &res, module_qn,
                           rc->registry, rc->main_gbuf, imp_keys, imp_vals, imp_count,

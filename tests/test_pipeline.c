@@ -651,6 +651,28 @@ TEST(pipeline_call_edge_props_include_args_and_line) {
     PASS();
 }
 
+TEST(pipeline_weak_call_target_suppression) {
+    cbm_gbuf_node_t function_target = {.label = "Function"};
+    cbm_gbuf_node_t class_target = {.label = "Class"};
+    cbm_gbuf_node_t variable_target = {.label = "Variable"};
+    cbm_gbuf_node_t field_target = {.label = "Field"};
+
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &function_target, "unique_name"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &class_target, "suffix_match"));
+    ASSERT_TRUE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &variable_target, "unique_name"));
+    ASSERT_TRUE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &field_target, "suffix_match"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &variable_target, "same_module"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &variable_target, "import_map"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(NULL, "unique_name"));
+    PASS();
+}
+
 TEST(pipeline_sequential_call_edges_preserve_eighth_arg) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -18026,6 +18048,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_project_name_derived);
     RUN_TEST(pipeline_mode_global_semantic_edges_policy);
     RUN_TEST(pipeline_call_edge_props_include_args_and_line);
+    RUN_TEST(pipeline_weak_call_target_suppression);
     RUN_TEST(pipeline_sequential_call_edges_preserve_eighth_arg);
     RUN_TEST(pipeline_fast_mode);
     /* Definitions pass */
