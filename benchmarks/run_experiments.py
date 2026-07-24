@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Run an immutable, resumable benchmark experiment plan and retain an auditable disk trail.
 
-This is the canonical entry point. The legacy `run-benchmark-campaign.py` filename,
-flags, persisted keys, and `.worktrees/benchmark-campaign/` directory remain readable
-for compatibility; new interfaces and records use "experiment" consistently.
+This is the canonical multi-run entry point. Retained flag spellings, persisted keys,
+and `.worktrees/benchmark-campaign/` directories remain readable; new interfaces and
+records use "experiment" consistently.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
@@ -68,6 +68,11 @@ DEFAULT_CANDIDATE_REFS = (
 # point. Once api-consolidation merges to main and "upstream" stops existing, this
 # lets --quick/--full keep working without editing DEFAULT_CANDIDATE_REFS.
 UPSTREAM_MAIN_FALLBACK_REFS = ("upstream/main", "origin/main", "main")
+CANONICAL_BENCHMARK_SCRIPT = Path(__file__).with_name("run_benchmark.py")
+LEGACY_BENCHMARK_SCRIPT_SUFFIXES = (
+    ("scripts", "benchmark-incremental-speed.py"),
+    ("benchmarks", "incremental_speed.py"),
+)
 IDENTITY_FIELDS = (
     "identity_version",
     "revision",
@@ -603,6 +608,32 @@ def read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
+def is_legacy_benchmark_script_path(value: str) -> bool:
+    """Return whether value names a retired single-run benchmark location."""
+    path_parts = (
+        PurePosixPath(value).parts,
+        PureWindowsPath(value).parts,
+    )
+    return any(
+        tuple(parts[-len(suffix) :]) == suffix
+        for parts in path_parts
+        for suffix in LEGACY_BENCHMARK_SCRIPT_SUFFIXES
+    )
+
+
+def resolve_benchmark_script_path(value: str) -> Path:
+    """Resolve current paths and narrowly migrate retained benchmark script paths."""
+    if is_legacy_benchmark_script_path(value):
+        canonical = CANONICAL_BENCHMARK_SCRIPT.resolve()
+        if not canonical.is_file():
+            raise ValueError(f"canonical benchmark script does not exist: {canonical}")
+        return canonical
+    candidate = Path(value).expanduser().resolve()
+    if not candidate.is_file():
+        raise ValueError(f"benchmark script does not exist: {candidate}")
+    return candidate
+
+
 def build_automatic_spec(
     repository: Path,
     benchmark_script: Path,
@@ -1057,9 +1088,7 @@ def expand_matrix_spec(spec: dict[str, Any]) -> dict[str, Any]:
     cell_timeout = spec.get("cell_timeout_seconds", benchmark_timeout * 4)
     if not _is_positive_json_integer(cell_timeout):
         raise ValueError("cell_timeout_seconds must be a positive integer")
-    benchmark_path = Path(benchmark_script).expanduser().resolve()
-    if not benchmark_path.is_file():
-        raise ValueError(f"benchmark_script does not exist: {benchmark_path}")
+    benchmark_path = resolve_benchmark_script_path(benchmark_script)
     benchmark_sha256 = file_sha256(benchmark_path)
 
     candidates = _nonempty_list(spec.get("candidates"), "candidates")
@@ -1647,7 +1676,32 @@ def expanded_command(
         "{attempt_dir}": str(attempt_root),
         "{result_path}": str(result_path),
     }
-    return [replacements.get(item, item) for item in command]
+    expanded = [replacements.get(item, item) for item in command]
+    if expanded and is_legacy_benchmark_script_path(expanded[0]):
+        expanded[0] = str(resolve_benchmark_script_path(expanded[0]))
+    return expanded
+
+
+def validate_benchmark_script_digest(
+    command: list[str], parameters: dict[str, Any]
+) -> None:
+    """Reject a retained cell when its resolved harness bytes changed."""
+    expected = parameters.get("benchmark_script_sha256")
+    if expected is None:
+        return
+    if not isinstance(expected, str) or len(expected) != 64:
+        raise ValueError("benchmark_script_sha256 must be a SHA-256 string")
+    if not command:
+        raise ValueError("benchmark command must not be empty")
+    script = Path(command[0]).expanduser().resolve()
+    if not script.is_file():
+        raise ValueError(f"benchmark script does not exist: {script}")
+    actual = file_sha256(script)
+    if actual != expected:
+        raise ValueError(
+            "benchmark script SHA-256 mismatch after path resolution: "
+            f"expected {expected}, got {actual}; generate a new experiment plan"
+        )
 
 
 def cell_process_group_options() -> dict[str, Any]:
@@ -1722,6 +1776,7 @@ def run_cell(
         artifact_root = attempt_root / "artifacts"
         result_path = attempt_root / "result.json"
         command = expanded_command(cell["command"], attempt_root, result_path)
+        validate_benchmark_script_digest(command, cell.get("parameters") or {})
         cwd = Path(cell.get("cwd") or Path.cwd()).expanduser().resolve()
         environment = dict(os.environ)
         overrides = cell.get("environment", {})
@@ -2213,7 +2268,7 @@ def prepare_automatic_experiment(
         )
         for label, ref in effective_candidate_refs
     ]
-    benchmark_script = repository / "benchmarks" / "incremental_speed.py"
+    benchmark_script = CANONICAL_BENCHMARK_SCRIPT
     spec = build_automatic_spec(
         repository,
         benchmark_script,

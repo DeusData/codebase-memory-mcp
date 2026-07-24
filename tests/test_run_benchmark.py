@@ -14,15 +14,15 @@ from pathlib import Path
 
 
 SCRIPT = (
-    Path(__file__).resolve().parents[1] / "benchmarks" / "incremental_speed.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "run_benchmark.py"
 )
-SPEC = importlib.util.spec_from_file_location("benchmark_incremental_speed", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("run_benchmark", SCRIPT)
 assert SPEC and SPEC.loader
 BENCHMARK = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(BENCHMARK)
 
 
-class BenchmarkIncrementalSpeedTest(unittest.TestCase):
+class RunBenchmarkTest(unittest.TestCase):
     def test_build_env_rejects_inherited_live_cache_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             live_cache = Path(tmpdir) / "live-cache"

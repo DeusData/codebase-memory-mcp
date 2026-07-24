@@ -55,7 +55,7 @@ def fact_bundle(
                 "host": host or {"machine": "arm64", "platform": "fixture"},
                 "harness": {
                     "fact_schema_version": 2,
-                    "path": "/repo/benchmarks/incremental_speed.py",
+                    "path": "/repo/benchmarks/run_benchmark.py",
                     "sha256": "c" * 64,
                 },
             }

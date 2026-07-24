@@ -15,17 +15,19 @@ results or the generated Markdown report in Git.
 
 ## Repository layout
 
-Canonical benchmark code, active schemas, terminology, configuration data, and
-fixtures live under `benchmarks/`. Human-facing guides remain under `docs/`, tests
-under `tests/`, and the generated profiling header under `src/` because those files
-belong to their respective integration surfaces.
+Branch-created benchmark code, active schemas, terminology, configuration data, and
+fixtures live under `benchmarks/`. The three benchmark shell scripts inherited from
+upstream remain at their established `scripts/` paths. Human-facing guides remain
+under `docs/`, tests under `tests/`, and the generated profiling header under `src/`
+because those files belong to their respective integration surfaces.
 
-Historical entry points under `scripts/` are compatibility frontends for retained
-automation. New commands and source anchors use `benchmarks/`. The frozen
+New commands and source anchors use `benchmarks/`. The frozen
 `docs/schema/benchmark-facts-v1.schema.json` remains at its original URI because
-retained v1 bundles embed that exact identifier. The loaders also accept the former
-v2 schema URI and its recorded terminology hash, while new bundles emit only the
-canonical `benchmarks/schema/facts-v2.schema.json` URI.
+retained v1 bundles embed that exact identifier. The loaders accept the former v2
+schema URI and recorded terminology hash, while new bundles emit only the canonical
+`benchmarks/schema/facts-v2.schema.json` URI. The experiment runner resolves the
+retired single-run script path in retained plans without shipping a duplicate
+entry point.
 
 ## Cell identity
 
@@ -52,7 +54,7 @@ Every new benchmark result also writes a schema-valid `facts.json` bundle, norma
 the retained v1 schema remains available for earlier runsets. The
 canonical benchmark vocabulary is `benchmarks/terminology.json`; its generated
 human-readable view is [BENCHMARK_TERMINOLOGY.md](BENCHMARK_TERMINOLOGY.md).
-`uv run python benchmarks/incremental_speed.py --describe-terms
+`uv run python benchmarks/run_benchmark.py --describe-terms
 json|markdown` prints either view without requiring a benchmark binary.
 
 The run row records the experiment cell ID and label, exact candidate commit,
@@ -95,7 +97,7 @@ still render, but state that fact-derived comparisons are unavailable.
 Retained reports from earlier harness versions remain usable:
 
 ```bash
-uv run python benchmarks/incremental_speed.py \
+uv run python benchmarks/run_benchmark.py \
   --import-report path/to/result.json \
   --facts-dir path/to/recovered-facts
 ```
@@ -156,10 +158,10 @@ changing the fact-table contract.
       "transport": "mcp",
       "scenario": "self_dogfood",
       "repetition": 1,
-      "harness_version": "incremental_speed.py:<sha256>",
+      "harness_version": "run_benchmark.py:<sha256>",
       "cwd": "/absolute/path/to/codebase-memory-mcp",
       "command": [
-        "uv", "run", "python", "benchmarks/incremental_speed.py",
+        "uv", "run", "python", "benchmarks/run_benchmark.py",
         "--binary", "/absolute/path/to/release-binary",
         "--self-dogfood", "--repo-root", "/absolute/path/to/codebase-memory-mcp",
         "--transport", "mcp", "--out", "{result_path}"
@@ -378,8 +380,9 @@ uv run python benchmarks/run_experiments.py \
   --experiment-root .worktrees/benchmark-campaign/results
 ```
 
-The legacy `run-benchmark-campaign.py` entry point and `--campaign-root` flag remain
-accepted so retained automation can open and resume existing experiment roots.
+The retained `--campaign-root` spelling remains accepted. Archived plans that name
+the former single-run script path resolve it to `benchmarks/run_benchmark.py` at
+execution time without rewriting the archived plan or changing its cell identity.
 
 Rerunning the same command resumes validated cells. The runner executes cells
 sequentially by default so concurrent indexing does not distort latency or peak RSS.

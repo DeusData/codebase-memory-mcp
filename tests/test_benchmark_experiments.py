@@ -19,10 +19,10 @@ EXPERIMENT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPERIMENT)
 
 BENCHMARK_SCRIPT = (
-    Path(__file__).resolve().parents[1] / "benchmarks" / "incremental_speed.py"
+    Path(__file__).resolve().parents[1] / "benchmarks" / "run_benchmark.py"
 )
 BENCHMARK_SPEC = importlib.util.spec_from_file_location(
-    "benchmark_incremental_speed_for_experiments", BENCHMARK_SCRIPT
+    "run_benchmark_for_experiments", BENCHMARK_SCRIPT
 )
 assert BENCHMARK_SPEC and BENCHMARK_SPEC.loader
 BENCHMARK = importlib.util.module_from_spec(BENCHMARK_SPEC)
@@ -48,6 +48,80 @@ def cell(command: list[str], **overrides: object) -> dict:
 
 
 class BenchmarkExperimentTest(unittest.TestCase):
+    def test_legacy_benchmark_script_paths_resolve_to_canonical_entry_point(
+        self,
+    ) -> None:
+        canonical = (
+            Path(__file__).resolve().parents[1] / "benchmarks" / "run_benchmark.py"
+        ).resolve()
+
+        for legacy in (
+            "/retained/checkout/scripts/benchmark-incremental-speed.py",
+            r"C:\retained\checkout\scripts\benchmark-incremental-speed.py",
+            "benchmarks/incremental_speed.py",
+        ):
+            self.assertEqual(
+                EXPERIMENT.resolve_benchmark_script_path(legacy), canonical
+            )
+
+    def test_benchmark_script_resolver_honors_existing_explicit_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            explicit = Path(tmpdir) / "custom_benchmark.py"
+            explicit.write_text("# fixture\n", encoding="utf-8")
+
+            self.assertEqual(
+                EXPERIMENT.resolve_benchmark_script_path(str(explicit)),
+                explicit.resolve(),
+            )
+
+    def test_benchmark_script_resolver_rejects_unrelated_missing_path(self) -> None:
+        with self.assertRaisesRegex(ValueError, "benchmark script does not exist"):
+            EXPERIMENT.resolve_benchmark_script_path(
+                "/retained/checkout/scripts/not-a-benchmark.py"
+            )
+
+    def test_expanded_command_remaps_legacy_entry_without_mutating_plan(self) -> None:
+        command = [
+            "/retained/checkout/scripts/benchmark-incremental-speed.py",
+            "--out",
+            "{result_path}",
+        ]
+        original = list(command)
+
+        expanded = EXPERIMENT.expanded_command(
+            command, Path("/attempt"), Path("/attempt/result.json")
+        )
+
+        self.assertEqual(command, original)
+        self.assertEqual(
+            expanded[0],
+            str(
+                (
+                    Path(__file__).resolve().parents[1]
+                    / "benchmarks"
+                    / "run_benchmark.py"
+                ).resolve()
+            ),
+        )
+        self.assertEqual(expanded[-1], "/attempt/result.json")
+
+    def test_resolved_benchmark_script_digest_must_match_retained_plan(self) -> None:
+        canonical = (
+            Path(__file__).resolve().parents[1] / "benchmarks" / "run_benchmark.py"
+        )
+        command = [str(canonical)]
+        expected = EXPERIMENT.file_sha256(canonical)
+
+        EXPERIMENT.validate_benchmark_script_digest(
+            command, {"benchmark_script_sha256": expected}
+        )
+        with self.assertRaisesRegex(
+            ValueError, "SHA-256 mismatch after path resolution"
+        ):
+            EXPERIMENT.validate_benchmark_script_digest(
+                command, {"benchmark_script_sha256": "0" * 64}
+            )
+
     def test_filename_datetime_is_sortable_explicit_utc_and_filename_safe(self) -> None:
         stamp = EXPERIMENT.filename_datetime(
             datetime(2026, 7, 19, 21, 13, 58, 123456, tzinfo=timezone.utc)
@@ -568,7 +642,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             root = Path(tmpdir)
             binary = root / "cbm"
             binary.write_bytes(b"optimized-binary")
-            benchmark = root / "benchmark-incremental-speed.py"
+            benchmark = root / "run_benchmark.py"
             benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             spec = {
                 "schema_version": 1,
@@ -739,7 +813,7 @@ class BenchmarkExperimentTest(unittest.TestCase):
             root = Path(tmpdir)
             binary = root / "cbm"
             binary.write_bytes(b"optimized-binary")
-            benchmark = root / "benchmark-incremental-speed.py"
+            benchmark = root / "run_benchmark.py"
             benchmark.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
             spec = {
                 "schema_version": 1,
