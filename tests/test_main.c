@@ -749,6 +749,70 @@ extern void cbm_kind_in_set_free_cache(void);
 #define TEST_ARTIFACT_DIR_ENV "CBM_TEST_ARTIFACT_DIR"
 
 static char test_cache_dir[TEST_CACHE_DIR_CAP];
+static char test_repository_root[CBM_PATH_MAX];
+
+static bool tf_source_checkout_at(const char *candidate) {
+    if (!candidate || !candidate[0]) {
+        return false;
+    }
+    char makefile_path[CBM_PATH_MAX];
+    char fixture_path[CBM_PATH_MAX];
+    int makefile_written =
+        snprintf(makefile_path, sizeof(makefile_path), "%s/Makefile.cbm", candidate);
+    int fixture_written = snprintf(fixture_path, sizeof(fixture_path),
+                                   "%s/vendored/xxhash/xxhash.h", candidate);
+    return makefile_written > 0 && (size_t)makefile_written < sizeof(makefile_path) &&
+           fixture_written > 0 && (size_t)fixture_written < sizeof(fixture_path) &&
+           cbm_file_exists(makefile_path) && cbm_file_exists(fixture_path);
+}
+
+static bool tf_find_source_checkout_upward(char *candidate) {
+    while (candidate && candidate[0]) {
+        if (tf_source_checkout_at(candidate)) {
+            return true;
+        }
+        char *slash = strrchr(candidate, '/');
+        char *backslash = strrchr(candidate, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (!slash) {
+            break;
+        }
+        if (slash == candidate) {
+            candidate[1] = '\0';
+            return tf_source_checkout_at(candidate);
+        }
+        *slash = '\0';
+    }
+    return false;
+}
+
+static void tf_capture_repository_root(const char *runner_path) {
+    test_repository_root[0] = '\0';
+    if (runner_path && runner_path[0] &&
+        cbm_canonical_path(runner_path, test_repository_root, sizeof(test_repository_root))) {
+        char *slash = strrchr(test_repository_root, '/');
+        char *backslash = strrchr(test_repository_root, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (slash) {
+            *slash = '\0';
+            if (tf_find_source_checkout_upward(test_repository_root)) {
+                return;
+            }
+        }
+    }
+    if (!cbm_canonical_path(".", test_repository_root, sizeof(test_repository_root)) ||
+        !tf_find_source_checkout_upward(test_repository_root)) {
+        test_repository_root[0] = '\0';
+    }
+}
+
+const char *tf_repository_root(void) {
+    return test_repository_root[0] ? test_repository_root : NULL;
+}
 
 static int cleanup_test_cache(void) {
     if (!test_cache_dir[0]) {
@@ -798,6 +862,7 @@ int main(int argc, char **argv) {
         (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
                          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
     }
+    tf_capture_repository_root(argc > 0 ? argv[0] : NULL);
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
         return blocking_git_rc;

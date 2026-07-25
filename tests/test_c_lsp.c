@@ -27,6 +27,8 @@
 #include "lsp/go_lsp.h"
 #include "lsp/type_registry.h"
 #include "arena.h"
+#include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -691,9 +693,19 @@ TEST(clsp_calls_attributed_to_function_issue220) {
  * this drives the vendored xxhash.h (~7.5k lines, same macro-dense family)
  * through C extraction as a proxy/regression guard. Runs under ASan. */
 TEST(clsp_nocrash_issue355_xxhash_header) {
-    FILE *fp = fopen("vendored/xxhash/xxhash.h", "rb");
+    const char *repository_root = tf_repository_root();
+    if (!repository_root) {
+        FAIL("test runner is not inside a source checkout");
+    }
+    char fixture_path[CBM_PATH_MAX];
+    int fixture_written = snprintf(fixture_path, sizeof(fixture_path),
+                                   "%s/vendored/xxhash/xxhash.h", repository_root);
+    if (fixture_written <= 0 || (size_t)fixture_written >= sizeof(fixture_path)) {
+        FAIL("vendored xxhash fixture path is too long");
+    }
+    FILE *fp = cbm_fopen(fixture_path, "rb");
     if (!fp) {
-        FAIL("vendored/xxhash/xxhash.h not found (run from repo root)");
+        FAIL("vendored/xxhash/xxhash.h not found under test repository root");
     }
     fseek(fp, 0, SEEK_END);
     long n = ftell(fp);
