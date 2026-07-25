@@ -93,6 +93,35 @@ typedef enum {
     CBM_MODE_FAST = 2,     /* Fast: aggressive filtering, no similarity/semantic edges */
     CBM_MODE_DEP  = 3,     /* Dep: like FAST but keeps vendor/, .d.ts, third_party/ (fork depindex) */
 } cbm_index_mode_t;
+
+/* Single source of truth for the caller-facing spelling of each mode, kept
+ * adjacent to the enum on purpose: the comment above records a prior defect where
+ * two definitions of this vocabulary drifted and fast-mode filtering silently
+ * no-opped. Adding a mode is one edit here; the name lookup, the parser, and the
+ * accepted-value list in error messages all derive from it and cannot disagree.
+ * The third column marks whether a caller may select the mode by name: dependency
+ * indexing picks CBM_MODE_DEP internally (src/depindex/depindex.c) and is not a
+ * spelling the index tool accepts. */
+#define CBM_INDEX_MODE_TABLE(X)                                                    \
+    X(CBM_MODE_FULL, "full", true)                                                 \
+    X(CBM_MODE_MODERATE, "moderate", true)                                         \
+    X(CBM_MODE_FAST, "fast", true)                                                 \
+    X(CBM_MODE_DEP, "dep", false)
+
+/* Caller-facing name for a mode; "unknown" for a value outside the table. */
+const char *cbm_index_mode_name(cbm_index_mode_t mode);
+
+/* Parse a caller-supplied mode spelling. Returns false and leaves *out unchanged
+ * when the spelling is absent from the table, so callers reject loudly instead of
+ * silently falling back to CBM_MODE_FULL. caller_selectable_out, when non-NULL,
+ * reports whether the spelling is one a caller is allowed to request. */
+bool cbm_index_mode_from_name(const char *name, cbm_index_mode_t *out,
+                              bool *caller_selectable_out);
+
+/* Write the caller-selectable spellings as "full|moderate|fast" for error
+ * messages, derived from the table rather than restated. Returns the number of
+ * characters written excluding the NUL; output is always NUL-terminated. */
+int cbm_index_mode_accepted(char *buf, int bufsize);
 #endif
 
 /* Check if a directory name should always be skipped (e.g. .git, node_modules).
@@ -123,12 +152,27 @@ typedef struct {
     int64_t max_file_size;   /* 0 = no limit */
 } cbm_discover_opts_t;
 
+typedef enum {
+    CBM_DISCOVER_ERROR = -1,
+    CBM_DISCOVER_OK = 0,
+    CBM_DISCOVER_LIMIT_EXCEEDED = 1,
+} cbm_discover_status_t;
+
 /* Walk a repository directory tree and discover all source files.
  * Applies hardcoded filters, gitignore patterns, and language detection.
  * Returns 0 on success, -1 on error.
  * Caller must call cbm_discover_free() on the results. */
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count);
+
+/* Apply the exact same full discovery/filter policy without retaining a file
+ * array. Stops before counting more than max_files and performs no per-file
+ * allocation. deadline_ms is an absolute cbm_now_ms() deadline; zero disables
+ * it. Returns LIMIT_EXCEEDED when at least max_files + 1 indexable files exist,
+ * ERROR on traversal/deadline/allocation failure, or OK with the exact count. */
+cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
+                                                 const cbm_discover_opts_t *opts, int max_files,
+                                                 uint64_t deadline_ms, int *count_out);
 
 /* Like cbm_discover(), but also reports the directory subtrees that were
  * skipped during the walk (hardcoded ALWAYS_SKIP/FAST_SKIP dirs + gitignore
@@ -141,13 +185,6 @@ int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_fil
  * Returns 0 on success, -1 on error. */
 int cbm_discover_ex(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                     int *count, char ***excluded_out, int *excluded_count_out);
-
-/* Count indexable files using the same filters as cbm_discover(), without
- * allocating per-file path records. If max_count > 0, the walk stops after
- * count exceeds max_count so callers can enforce limits cheaply; *count may
- * then be max_count + 1. */
-int cbm_discover_count_bounded(const char *repo_path, const cbm_discover_opts_t *opts,
-                               int max_count, int *count);
 
 /* One deliberately-not-indexed file (#963): an individual file dropped by an
  * ignore mechanism during the walk (its parent directory was NOT excluded —

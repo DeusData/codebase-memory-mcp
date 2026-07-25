@@ -11,6 +11,9 @@
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "store/store.h"
+#ifdef _WIN32
+#include "foundation/win_utf8.h"
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,7 +65,7 @@ TEST(config_save_and_reload) {
 
     /* Save */
     cbm_ui_config_t cfg = {.ui_enabled = true, .ui_port = 8080};
-    cbm_ui_config_save(&cfg);
+    ASSERT_TRUE(cbm_ui_config_save(&cfg));
 
     /* Reload */
     cbm_ui_config_t loaded;
@@ -79,6 +82,81 @@ TEST(config_save_and_reload) {
     PASS();
 }
 
+TEST(config_save_atomically_replaces_a_complete_generation) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_test_config_atomic_XXXXXX");
+    char *td = cbm_mkdtemp(tmpdir);
+    ASSERT_NOT_NULL(td);
+
+    char *old_cache = getenv("CBM_CACHE_DIR") ? strdup(getenv("CBM_CACHE_DIR")) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", td, 1), 0);
+
+    cbm_ui_config_t old_generation = {
+        .ui_enabled = false,
+        .ui_port = 11111,
+    };
+    ASSERT_TRUE(cbm_ui_config_save(&old_generation));
+
+    char path[1024];
+    cbm_ui_config_path(path, (int)sizeof(path));
+#ifdef _WIN32
+    wchar_t *wide_path = cbm_utf8_to_wide(path);
+    ASSERT_NOT_NULL(wide_path);
+    HANDLE old_handle =
+        CreateFileW(wide_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    free(wide_path);
+    ASSERT_TRUE(old_handle != INVALID_HANDLE_VALUE);
+#else
+    FILE *old_handle = cbm_fopen(path, "rb");
+    ASSERT_NOT_NULL(old_handle);
+#endif
+
+    cbm_ui_config_t new_generation = {
+        .ui_enabled = true,
+        .ui_port = 22222,
+    };
+    /* Capture everything, clean up, and only then assert: an assert firing
+     * before the env restore leaks CBM_CACHE_DIR into every later test in the
+     * process, turning one regression into a cascade. */
+    bool saved = cbm_ui_config_save(&new_generation);
+
+    char old_bytes[512] = {0};
+#ifdef _WIN32
+    DWORD old_length = 0;
+    bool old_read = ReadFile(old_handle, old_bytes, (DWORD)sizeof(old_bytes) - 1U, &old_length,
+                             NULL) != 0 &&
+                    old_length > 0;
+    bool old_closed = CloseHandle(old_handle) != 0;
+#else
+    size_t old_length = fread(old_bytes, 1, sizeof(old_bytes) - 1, old_handle);
+    bool old_read = old_length > 0;
+    bool old_closed = fclose(old_handle) == 0;
+#endif
+
+    cbm_ui_config_t loaded = {0};
+    cbm_ui_config_load(&loaded);
+
+    if (old_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", old_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(old_cache);
+    (void)th_rmtree(td);
+
+    ASSERT_TRUE(saved);
+    ASSERT_TRUE(old_read);
+    ASSERT_TRUE(old_closed);
+    /* An in-place truncate/rewrite mutates the already-open handle. Atomic
+     * replacement leaves it attached to the complete prior generation. */
+    ASSERT_NOT_NULL(strstr(old_bytes, "11111"));
+    ASSERT_NULL(strstr(old_bytes, "22222"));
+    ASSERT_TRUE(loaded.ui_enabled);
+    ASSERT_EQ(loaded.ui_port, 22222);
+    PASS();
+}
+
 TEST(config_overwrite) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_test_config_XXXXXX");
@@ -90,11 +168,11 @@ TEST(config_overwrite) {
 
     /* Save with ui_enabled=true */
     cbm_ui_config_t cfg1 = {.ui_enabled = true, .ui_port = 9749};
-    cbm_ui_config_save(&cfg1);
+    ASSERT_TRUE(cbm_ui_config_save(&cfg1));
 
     /* Overwrite with ui_enabled=false */
     cbm_ui_config_t cfg2 = {.ui_enabled = false, .ui_port = 9749};
-    cbm_ui_config_save(&cfg2);
+    ASSERT_TRUE(cbm_ui_config_save(&cfg2));
 
     /* Reload should show false */
     cbm_ui_config_t loaded;
@@ -787,6 +865,7 @@ SUITE(ui) {
     /* Config */
     RUN_TEST(config_load_defaults);
     RUN_TEST(config_save_and_reload);
+    RUN_TEST(config_save_atomically_replaces_a_complete_generation);
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);

@@ -8,6 +8,11 @@
 
 services:
   # ── Linux test (ASan + UBSan + LeakSanitizer) ──────────────
+  # Always full-parallel: the suite is designed to be core-count-independent
+  # for correctness — timing/scheduling/subprocess suites assert invariants
+  # (ordering, bounded-return, RUNNING poll state), not wall-clock, so they
+  # pass at any parallelism. Artificial CPU starvation belongs to smoke/soak
+  # (CBM_LOCAL_CI_CPUS), not the regular suite.
   test:
     build:
       context: ..
@@ -15,7 +20,13 @@ services:
     platform: linux/arm64
     volumes:
       - ..:/src
-    command: ["CC=gcc", "CXX=g++"]
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64"]
 
   test-amd64:
     build:
@@ -24,7 +35,57 @@ services:
     platform: linux/amd64
     volumes:
       - ..:/src
-    command: ["CC=gcc", "CXX=g++"]
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-amd64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64"]
+
+  # ── ThreadSanitizer (data-race gate) ───────────────────────────
+  # Overrides the default test.sh entrypoint to build + run the widened TSan
+  # suite set. /usr/lib/ccache is first on PATH in the image, so CC=gcc is
+  # ccache-masqueraded automatically (same as the ASan legs).
+  test-tsan:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/arm64
+    volumes:
+      - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-arm64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    # TSan's shadow memory needs a predictable address space; modern aarch64
+    # kernels' high-entropy mmap ASLR makes its runtime abort with "unexpected
+    # memory mapping" before any test runs. setarch -R (ADDR_NO_RANDOMIZE)
+    # fixes it, but the personality() syscall it uses is blocked by the default
+    # seccomp profile — unconfined is safe here (the container runs only our own
+    # test code). The no-randomize personality inherits to the make child.
+    security_opt: ["seccomp=unconfined"]
+    entrypoint: ["setarch", "-R", "make", "-f", "Makefile.cbm", "test-tsan"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64-tsan"]
+
+  test-tsan-amd64:
+    build:
+      context: ..
+      dockerfile: test-infrastructure/Dockerfile
+    platform: linux/amd64
+    volumes:
+      - ..:/src
+      - cbm-build:/src/build
+      - cbm-fixture-cache:/root/.cache/cbm-test-fixtures
+      - cbm-ccache-amd64:/root/.ccache
+    environment:
+      CCACHE_DIR: /root/.ccache
+      CCACHE_MAXSIZE: 1500M
+    security_opt: ["seccomp=unconfined"]
+    entrypoint: ["setarch", "-R", "make", "-f", "Makefile.cbm", "test-tsan"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64-tsan"]
 
   # ── Linux production build (-O2 -Werror) ───────────────────
   build:
@@ -35,7 +96,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["scripts/build.sh"]
-    command: ["CC=gcc", "CXX=g++"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-arm64"]
 
   build-amd64:
     build:
@@ -45,7 +106,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["scripts/build.sh"]
-    command: ["CC=gcc", "CXX=g++"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/linux-amd64"]
 
   # ── Windows cross-compile + test (llvm-mingw + Wine) ────────
   build-windows:
@@ -64,12 +125,13 @@ services:
     volumes:
       - ..:/src
     command: >-
-      make -j4 -f Makefile.cbm clean-c &&
-      make -j4 -f Makefile.cbm build/c/test-runner
+      make -j4 -f Makefile.cbm clean-c BUILD_DIR=build/win-cross &&
+      make -j4 -f Makefile.cbm build/win-cross/test-runner
+        BUILD_DIR=build/win-cross
         CC=x86_64-w64-mingw32-clang
         CXX=x86_64-w64-mingw32-clang++ &&
       echo '=== Running tests under Wine ===' &&
-      WINEDEBUG=-all wine64 build/c/test-runner.exe &&
+      WINEDEBUG=-all wine64 build/win-cross/test-runner.exe &&
       echo '=== Windows test: OK ==='
 
   # ── Smoke test (build + run smoke-test.sh) ──────────────────
@@ -83,8 +145,8 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=gcc CXX=g++ &&
-        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+        scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-arm64 &&
+        scripts/smoke-test.sh ./build/linux-arm64/codebase-memory-mcp
 
   smoke-amd64:
     build:
@@ -96,8 +158,8 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=gcc CXX=g++ &&
-        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+        scripts/build.sh CC=gcc CXX=g++ BUILD_DIR=build/linux-amd64 &&
+        scripts/smoke-test.sh ./build/linux-amd64/codebase-memory-mcp
 
   # ── Windows smoke (cross-compile + Wine) ──────────────────
   smoke-windows:
@@ -110,24 +172,29 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ &&
-        mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
-        WINEDEBUG=-all scripts/smoke-test.sh ./build/c/codebase-memory-mcp.exe
+        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ BUILD_DIR=build/win-cross &&
+        mv build/win-cross/codebase-memory-mcp build/win-cross/codebase-memory-mcp.exe 2>/dev/null || true &&
+        WINEDEBUG=-all scripts/smoke-test.sh ./build/win-cross/codebase-memory-mcp.exe
 
   # ── Windows soak (cross-compile + Wine) ───────────────────
+  # Soak is the one place a CPU cap is meaningful: sustained runs under
+  # deliberate resource starvation surface scheduling/backpressure behaviour the
+  # full-parallel correctness suite does not target. Opt in with
+  # CBM_LOCAL_CI_CPUS=<n>; default 0 = unlimited, so normal soak runs stay fast.
   soak-windows:
     build:
       context: ..
       dockerfile: test-infrastructure/Dockerfile.mingw
     platform: linux/amd64
+    cpus: ${CBM_LOCAL_CI_CPUS:-0}
     volumes:
       - ..:/src
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ &&
-        mv build/c/codebase-memory-mcp build/c/codebase-memory-mcp.exe 2>/dev/null || true &&
-        CBM_DIAGNOSTICS=1 WINEDEBUG=-all scripts/soak-test.sh ./build/c/codebase-memory-mcp.exe 10
+        scripts/build.sh CC=x86_64-w64-mingw32-clang CXX=x86_64-w64-mingw32-clang++ BUILD_DIR=build/win-cross &&
+        mv build/win-cross/codebase-memory-mcp build/win-cross/codebase-memory-mcp.exe 2>/dev/null || true &&
+        CBM_DIAGNOSTICS=1 WINEDEBUG=-all scripts/soak-test.sh ./build/win-cross/codebase-memory-mcp.exe 10
 
   # ── Linux portable (Alpine musl static) ────────────────────
   test-portable:
@@ -138,7 +205,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["bash", "scripts/test.sh"]
-    command: ["CC=gcc", "CXX=g++"]
+    command: ["CC=gcc", "CXX=g++", "BUILD_DIR=build/alpine"]
 
   build-portable:
     build:
@@ -148,7 +215,7 @@ services:
     volumes:
       - ..:/src
     entrypoint: ["bash", "scripts/build.sh"]
-    command: ["CC=gcc", "CXX=g++", "STATIC=1"]
+    command: ["CC=gcc", "CXX=g++", "STATIC=1", "BUILD_DIR=build/alpine"]
 
   smoke-portable:
     build:
@@ -160,10 +227,10 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        scripts/build.sh CC=gcc CXX=g++ STATIC=1 &&
-        file build/c/codebase-memory-mcp | grep -q "statically linked" &&
+        scripts/build.sh CC=gcc CXX=g++ STATIC=1 BUILD_DIR=build/alpine &&
+        file build/alpine/codebase-memory-mcp | grep -q "statically linked" &&
         echo "=== Verified: statically linked ===" &&
-        scripts/smoke-test.sh ./build/c/codebase-memory-mcp
+        scripts/smoke-test.sh ./build/alpine/codebase-memory-mcp
 
   # ── Lint ────────────────────────────────────────────────────
   lint:
@@ -172,3 +239,14 @@ services:
       dockerfile: test-infrastructure/Dockerfile.lint
     volumes:
       - ..:/src
+    command: ["--ci", "CLANG_FORMAT=clang-format-20"]
+
+volumes:
+  cbm-ccache-arm64:
+  cbm-ccache-amd64:
+  # Build artifacts and the incremental-suite fixture cache stay on the VM's
+  # native filesystem: object writes over the virtiofs bind mount are the
+  # container legs' largest avoidable I/O cost, and the fixture cache makes
+  # the network clone once-per-volume instead of once-per-container.
+  cbm-build:
+  cbm-fixture-cache:

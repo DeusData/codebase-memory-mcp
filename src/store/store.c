@@ -202,6 +202,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_delete_file_state;
     sqlite3_stmt *stmt_upsert_dirty_file;
     sqlite3_stmt *stmt_clear_dirty_file;
+    sqlite3_stmt *stmt_list_dirty_files;
     sqlite3_stmt *stmt_count_dirty_files;
     sqlite3_stmt *stmt_upsert_node_owner;
     sqlite3_stmt *stmt_upsert_edge_owner;
@@ -1203,15 +1204,21 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory, bool c
         return NULL;
     }
 
-    int flags = SQLITE_OPEN_READWRITE;
-    if (create) {
-        flags |= SQLITE_OPEN_CREATE;
-    }
+    int flags = SQLITE_OPEN_READWRITE | (create ? SQLITE_OPEN_CREATE : 0);
     if (in_memory) {
         flags |= SQLITE_OPEN_MEMORY;
     }
 
-    int rc = sqlite3_open_v2(path, &s->db, flags, NULL);
+    char open_path[4096];
+    const char *effective_path = path;
+    if (path && !in_memory) {
+        if (!cbm_path_for_file_api(path, open_path, sizeof(open_path))) {
+            free(s);
+            return NULL;
+        }
+        effective_path = open_path;
+    }
+    int rc = sqlite3_open_v2(effective_path, &s->db, flags, NULL);
     if (rc != SQLITE_OK) {
         /* sqlite3_open_v2 may return a live error handle even when opening
          * fails (for example, READWRITE without CREATE on a missing path).
@@ -1377,7 +1384,12 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
      *
      * No SQLITE_OPEN_CREATE on either path — a missing DB must return NULL
      * (no ghost .db for unknown/unindexed projects). */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
+    char open_path[4096];
+    if (!cbm_path_for_file_api(db_path, open_path, sizeof(open_path))) {
+        free(s);
+        return NULL;
+    }
+    int rc = sqlite3_open_v2(open_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc == SQLITE_OK) {
         /* Force first DB access so a read-only-FS WAL failure surfaces now. */
         if (sqlite3_exec(s->db, "SELECT 1 FROM sqlite_master LIMIT 1;", NULL, NULL, NULL) !=
@@ -1619,6 +1631,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_delete_file_state);
     finalize_stmt(&s->stmt_upsert_dirty_file);
     finalize_stmt(&s->stmt_clear_dirty_file);
+    finalize_stmt(&s->stmt_list_dirty_files);
     finalize_stmt(&s->stmt_count_dirty_files);
     finalize_stmt(&s->stmt_upsert_node_owner);
     finalize_stmt(&s->stmt_upsert_edge_owner);
@@ -1744,6 +1757,99 @@ int cbm_store_checkpoint(cbm_store_t *s) {
                      "concurrent readers block the WAL reset — the -wal file keeps growing");
     }
     return exec_sql(s, "PRAGMA optimize;");
+}
+
+static int prepare_sqlite_for_publish(sqlite3 *db) {
+    if (!db) {
+        return CBM_STORE_ERR;
+    }
+    int log_frames = -1;
+    int checkpointed_frames = -1;
+    int rc = sqlite3_wal_checkpoint_v2(db, NULL, SQLITE_CHECKPOINT_TRUNCATE, &log_frames,
+                                       &checkpointed_frames);
+    if (rc != SQLITE_OK || (log_frames >= 0 && checkpointed_frames != log_frames)) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "PRAGMA journal_mode=DELETE;", CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bool delete_mode = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *mode = (const char *)sqlite3_column_text(stmt, 0);
+        delete_mode = mode && strcmp(mode, "delete") == 0;
+    }
+    sqlite3_finalize(stmt);
+    return delete_mode ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+int cbm_store_prepare_for_publish(cbm_store_t *s) {
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    return prepare_sqlite_for_publish(s->db);
+}
+
+int cbm_store_prepare_path_for_replace(const char *path) {
+    if (!path) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = NULL;
+    int rc = sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(db, 10000);
+    int result = prepare_sqlite_for_publish(db);
+    if (sqlite3_close(db) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    return result;
+}
+
+int cbm_store_backup_path(const char *source_path, const char *staging_path) {
+    if (!source_path || !staging_path) {
+        return CBM_STORE_ERR;
+    }
+    if (cbm_remove_db_sidecars(staging_path) != 0) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3 *source = NULL;
+    sqlite3 *dest = NULL;
+    int rc = sqlite3_open_v2(source_path, &source, SQLITE_OPEN_READONLY, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(source, 10000);
+    rc = sqlite3_open_v2(staging_path, &dest, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
+    if (rc != SQLITE_OK) {
+        sqlite3_close(dest);
+        sqlite3_close(source);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_busy_timeout(dest, 10000);
+
+    sqlite3_backup *backup = sqlite3_backup_init(dest, "main", source, "main");
+    int result = CBM_STORE_ERR;
+    if (backup) {
+        int step_rc = sqlite3_backup_step(backup, CBM_NOT_FOUND);
+        int finish_rc = sqlite3_backup_finish(backup);
+        if (step_rc == SQLITE_DONE && finish_rc == SQLITE_OK) {
+            result = CBM_STORE_OK;
+        }
+    }
+    if (sqlite3_close(dest) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    if (sqlite3_close(source) != SQLITE_OK) {
+        result = CBM_STORE_ERR;
+    }
+    return result;
 }
 
 /* #1083: the WAL size limit configured on this (write) connection, in bytes.
@@ -3830,6 +3936,86 @@ int cbm_store_clear_dirty_file(cbm_store_t *s, const char *project, const char *
         store_set_error_sqlite(s, "clear_dirty_file");
         return CBM_STORE_ERR;
     }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_list_dirty_files(cbm_store_t *s, const char *project,
+                               cbm_dirty_file_state_t **out, int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !project || !project[0] || !out || !count) {
+        if (s) {
+            store_set_error(s, "list_dirty_files: invalid argument");
+        }
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = prepare_cached(
+        s, &s->stmt_list_dirty_files,
+        "SELECT project, rel_path, observed_hash, observed_mtime_ns, observed_size, "
+        "observed_generation, source, status FROM dirty_files "
+        "WHERE project = ?1 ORDER BY rel_path;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_dirty_file_state_t *rows = calloc((size_t)cap, sizeof(*rows));
+    if (!rows) {
+        sqlite3_reset(stmt);
+        store_set_error(s, "list_dirty_files out of memory");
+        return CBM_STORE_ERR;
+    }
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            int next_cap = cap * ST_GROWTH;
+            cbm_dirty_file_state_t *next =
+                realloc(rows, (size_t)next_cap * sizeof(*rows));
+            if (!next) {
+                cbm_store_free_dirty_files(rows, n);
+                sqlite3_reset(stmt);
+                store_set_error(s, "list_dirty_files out of memory");
+                return CBM_STORE_ERR;
+            }
+            rows = next;
+            memset(rows + cap, 0, (size_t)(next_cap - cap) * sizeof(*rows));
+            cap = next_cap;
+        }
+        const char *observed_hash = (const char *)sqlite3_column_text(stmt, ST_COL_2);
+        rows[n].project = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+        rows[n].rel_path = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_1));
+        rows[n].observed_hash = heap_strdup(observed_hash ? observed_hash : "");
+        rows[n].observed_mtime_ns = sqlite3_column_int64(stmt, ST_COL_3);
+        rows[n].observed_size = sqlite3_column_int64(stmt, ST_COL_4);
+        rows[n].observed_generation = sqlite3_column_int64(stmt, ST_COL_5);
+        rows[n].source = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_6));
+        rows[n].status = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_7));
+        if (!rows[n].project || !rows[n].rel_path || !rows[n].observed_hash ||
+            !rows[n].source || !rows[n].status) {
+            cbm_store_free_dirty_files(rows, n + 1);
+            sqlite3_reset(stmt);
+            store_set_error(s, "list_dirty_files out of memory");
+            return CBM_STORE_ERR;
+        }
+        n++;
+    }
+    if (step_rc != SQLITE_DONE) {
+        cbm_store_free_dirty_files(rows, n);
+        sqlite3_reset(stmt);
+        store_set_error_sqlite(s, "list_dirty_files");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_reset(stmt);
+    *out = rows;
+    *count = n;
     return CBM_STORE_OK;
 }
 
@@ -8721,7 +8907,8 @@ int cbm_store_coverage_replace_ex(cbm_store_t *s, const char *project,
                                            : "unavailable";
         int ignored_stored = meta->ignored_files_stored > 0 ? meta->ignored_files_stored : 0;
         int ignored_total = meta->ignored_files_total > 0 ? meta->ignored_files_total : 0;
-        int coverage_version = meta->coverage_version > 0 ? meta->coverage_version : 1;
+        int coverage_version =
+            meta->coverage_version > 0 ? meta->coverage_version : CBM_COVERAGE_VERSION;
 
         sqlite3_stmt *up_meta = NULL;
         if (sqlite3_prepare_v2(
@@ -16903,6 +17090,20 @@ void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count) {
         safe_str_free(&hashes[i].sha256);
     }
     free(hashes);
+}
+
+void cbm_store_free_dirty_files(cbm_dirty_file_state_t *states, int count) {
+    if (!states) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        safe_str_free(&states[i].project);
+        safe_str_free(&states[i].rel_path);
+        safe_str_free(&states[i].observed_hash);
+        safe_str_free(&states[i].source);
+        safe_str_free(&states[i].status);
+    }
+    free(states);
 }
 
 void cbm_store_file_state_free_fields(cbm_file_state_t *state) {

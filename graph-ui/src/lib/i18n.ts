@@ -70,10 +70,8 @@ export const messages = {
       processLogs: "Process Logs",
       noProcesses: "No processes found",
       noLogs: "No logs yet",
-      kill: "Kill",
       thisProcess: "THIS",
       uptime: "Uptime",
-      killConfirm: (pid: number) => `Kill process ${pid}?`,
     },
   },
   zh: {
@@ -143,10 +141,8 @@ export const messages = {
       processLogs: "进程日志",
       noProcesses: "未找到进程",
       noLogs: "暂无日志",
-      kill: "结束",
       thisProcess: "本进程",
       uptime: "运行时间",
-      killConfirm: (pid: number) => `结束进程 ${pid}？`,
     },
   },
 } as const;

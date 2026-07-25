@@ -726,6 +726,29 @@ static int incr_clear_dirty_classification_path(const char *db_path, const char 
     return rc;
 }
 
+/* Re-mark through a fresh handle, mirroring the clear above. Needed after a FAILED
+ * publish: publishing replaces the project row (cbm_store_delete_project, called
+ * from cbm_gbuf_flush_to_store), and dirty_files is declared
+ * REFERENCES projects(name) ON DELETE CASCADE (src/store/store.c:744), so the
+ * cascade deletes every dirty row the reindex recorded before publishing. Without
+ * re-marking, a failed publish leaves the ledger empty and the next run classifies
+ * those files clean and never reindexes them: a permanent, silent hole in the
+ * graph. The sibling table index_coverage has the same exposure and is already
+ * compensated for inside publish_and_persist (#963). */
+static int incr_mark_dirty_classification_path(const char *db_path, const char *project,
+                                               const cbm_incr_classification_t *cls) {
+    if (!db_path || !project || !cls) {
+        return CBM_STORE_ERR;
+    }
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return CBM_STORE_ERR;
+    }
+    int rc = incr_mark_dirty_classification(store, project, cls);
+    cbm_store_close(store);
+    return rc;
+}
+
 static void incr_classification_free(cbm_incr_classification_t *c) {
     if (!c) {
         return;
@@ -2744,12 +2767,17 @@ static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char
     }
     if (rc == CBM_STORE_OK) {
         /* Hashes must be authoritative before coverage replacement: its prune
-         * removes stale failure rows for files deleted from the repository. */
-        rc = cbm_store_coverage_replace(hash_store, project, coverage, coverage_count);
-        if (rc != CBM_STORE_OK) {
-            cbm_log_error("incremental.err", "phase", "persist_coverage", "rc",
-                          itoa_buf_incr(rc));
-        }
+         * removes stale failure rows for files deleted from the repository.
+         *
+         * The metadata is written on this route for the same reason it is
+         * written on the full-index route: omitting it would CLEAR the previous
+         * run's metadata, leaving check_index_coverage unable to tell complete
+         * coverage from never-recorded coverage. hash_records_complete is true
+         * by construction — persist_hashes above is gated on rc == CBM_STORE_OK
+         * and its failure skips this block entirely. */
+        rc = cbm_pipeline_coverage_replace_with_meta(pipeline, hash_store, project, coverage,
+                                                     coverage_count, /*rows_available=*/true,
+                                                     /*hash_records_complete=*/true);
     }
     if (rc == CBM_STORE_OK) {
         rc = cbm_store_rebuild_file_delta_owners(hash_store, project,
@@ -2791,9 +2819,14 @@ static int publish_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char
     return 0;
 }
 
+/* hash_records_complete is a parameter rather than a constant because the
+ * callers genuinely differ: the no-op route treats a failed file_hash refresh
+ * as nonfatal and continues, so on that path the hash records really can be
+ * incomplete. Recording that in the coverage metadata is what lets a reader see
+ * it; otherwise it exists only as a log line nobody queries. */
 static int incr_refresh_coverage(cbm_store_t *store, cbm_pipeline_t *pipeline,
                                  const char *project, const cbm_file_info_t *changed_files,
-                                 int changed_count) {
+                                 int changed_count, bool hash_records_complete) {
     cbm_coverage_row_t *previous = NULL;
     int previous_count = 0;
     cbm_coverage_row_t *coverage = NULL;
@@ -2804,7 +2837,9 @@ static int incr_refresh_coverage(cbm_store_t *store, cbm_pipeline_t *pipeline,
                                  changed_count, &coverage, &coverage_count);
     }
     if (rc == CBM_STORE_OK) {
-        rc = cbm_store_coverage_replace(store, project, coverage, coverage_count);
+        rc = cbm_pipeline_coverage_replace_with_meta(pipeline, store, project, coverage,
+                                                     coverage_count, /*rows_available=*/true,
+                                                     hash_records_complete);
     }
     free(coverage);
     cbm_store_free_coverage(previous, previous_count);
@@ -2875,15 +2910,18 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * current and a later run can hash-confirm again. */
     if (cls.n_changed == 0 && cls.deleted_count == 0) {
         CBM_PROF_START(t_incr_noop_refresh);
+        bool noop_hash_records_complete = true;
         if (cls.n_metadata_only > 0 &&
             persist_hashes(store, project, files, file_count, cls.mode_skipped,
                            cls.mode_skipped_count) != CBM_STORE_OK) {
             cbm_log_warn("incremental.noop_metadata_refresh_failed", "count",
                          itoa_buf_incr(cls.n_metadata_only));
+            noop_hash_records_complete = false;
         }
         CBM_PROF_END_N("incremental", "4_noop_metadata_refresh", t_incr_noop_refresh,
                        cls.n_metadata_only);
-        int coverage_rc = incr_refresh_coverage(store, p, project, NULL, 0);
+        int coverage_rc =
+            incr_refresh_coverage(store, p, project, NULL, 0, noop_hash_records_complete);
         if (coverage_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "noop_coverage", "rc",
                           itoa_buf_incr(coverage_rc));
@@ -2920,7 +2958,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     (void)incr_try_exact_delete_route(p, store, db_path, project, cls.deleted, cls.deleted_count,
                                       ci, &exact_applied);
     if (exact_applied) {
-        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
+        /* The three exact routes write their file_hash rows inside
+         * cbm_pipeline_apply_file_delta_batch and only set exact_applied when
+         * that batch succeeded, so the hash records are complete here. */
+        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci,
+                                                /*hash_records_complete=*/true);
         if (coverage_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "exact_delete_coverage", "rc",
                           itoa_buf_incr(coverage_rc));
@@ -2941,7 +2983,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     (void)incr_try_overlay_upsert_route(p, store, project, changed_files, ci, files, file_count,
                                         cls.deleted_count, pass_fingerprint, &exact_applied);
     if (exact_applied) {
-        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
+        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci,
+                                                /*hash_records_complete=*/true);
         if (coverage_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "overlay_coverage", "rc",
                           itoa_buf_incr(coverage_rc));
@@ -2959,7 +3002,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
                                       file_count, cls.deleted, cls.deleted_count,
                                       pass_fingerprint, &exact_applied);
     if (exact_applied) {
-        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci);
+        int coverage_rc = incr_refresh_coverage(store, p, project, changed_files, ci,
+                                                /*hash_records_complete=*/true);
         if (coverage_rc != CBM_STORE_OK) {
             cbm_log_error("incremental.err", "phase", "exact_upsert_coverage", "rc",
                           itoa_buf_incr(coverage_rc));
@@ -3287,6 +3331,11 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         if (incr_clear_dirty_classification_path(db_path, project, &cls) != CBM_STORE_OK) {
             cbm_log_warn("incremental.dirty_ledger.warn", "phase", "clear_containment");
         }
+    } else if (incr_mark_dirty_classification_path(db_path, project, &cls) != CBM_STORE_OK) {
+        /* Loud: losing the ledger silently is what makes the next run skip these
+         * files forever, so a failure to restore it must be visible in the log. */
+        cbm_log_error("incremental.dirty_ledger.err", "phase", "remark_after_failed_publish",
+                      "project", project);
     }
     incr_classification_free(&cls);
     cbm_gbuf_free(existing);

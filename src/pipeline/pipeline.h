@@ -18,6 +18,7 @@
 #include <stdbool.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "discover/discover.h" /* cbm_ignored_file_t (#963) */
 
@@ -165,6 +166,12 @@ bool cbm_pipeline_githistory_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p);
 int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p);
 int cbm_pipeline_exact_max_affected_paths(const cbm_pipeline_t *p);
+
+/* Bind cancellation to a caller-owned atomic flag. The flag must outlive the
+ * pipeline and should be initialized before binding. This lets a long-lived
+ * daemon request cancellation without retaining/dereferencing a pipeline
+ * pointer that its request thread may concurrently retire. */
+void cbm_pipeline_bind_cancel_flag(cbm_pipeline_t *p, atomic_int *cancelled);
 
 /* Get the project name derived from repo_path. Returned string is
  * owned by the pipeline. Valid until cbm_pipeline_free(). */

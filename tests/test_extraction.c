@@ -5087,6 +5087,86 @@ TEST(iris_export_xml_multi_class) {
     PASS();
 }
 
+/* ── Restored from the merge base ─────────────────────────────────────
+ * These three lost their tests when this file auto-merged, with no conflict
+ * raised. Every capability they cover still ships: route_path/route_method
+ * are populated in internal/cbm/extract_defs.c and internal/cbm/service_patterns.c
+ * (which still carries the jakarta/ws.rs handling), and parse_incomplete is
+ * still a CBMFileResult field in internal/cbm/cbm.h. The macro pair is a
+ * matched set and must stay together: one asserts a benign in-body macro call
+ * does NOT report a coverage gap, the other asserts a real syntax error in a
+ * body STILL does. Keeping only the suppressing half would let over-broad
+ * suppression pass unnoticed. */
+
+TEST(extract_java_jaxrs_path_composition_issue1005) {
+    CBMFileResult *r = extract("import jakarta.ws.rs.GET;\n"
+                               "import jakarta.ws.rs.Path;\n"
+                               "@Path(\"/api/v1/widgets\")\n"
+                               "public class WidgetResource {\n"
+                               "  @GET\n"
+                               "  public String list() { return \"\"; }\n"
+                               "  @GET\n"
+                               "  @Path(\"/count\")\n"
+                               "  public String count() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "WidgetResource.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *list = find_def_by_name(r, "list");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(list->route_path);
+    ASSERT_STR_EQ(list->route_path, "/api/v1/widgets");
+    ASSERT_STR_EQ(list->route_method, "GET");
+    const CBMDefinition *count = find_def_by_name(r, "count");
+    ASSERT_NOT_NULL(count);
+    ASSERT_NOT_NULL(count->route_path);
+    ASSERT_STR_EQ(count->route_path, "/api/v1/widgets/count");
+    ASSERT_STR_EQ(count->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071) {
+    CBMFileResult *r = extract("#include <cstddef>\n"
+                               "#include <cstdlib>\n"
+                               "\n"
+                               "#define SYNTH_ALLOC_ARRAY(Type, Count) \\\n"
+                               "  ((Type*)std::malloc(sizeof(Type) * (Count)))\n"
+                               "\n"
+                               "struct Buffer {\n"
+                               "  char* data;\n"
+                               "  std::size_t size;\n"
+                               "};\n"
+                               "\n"
+                               "Buffer make_buffer(std::size_t n) {\n"
+                               "  Buffer b;\n"
+                               "  b.data = SYNTH_ALLOC_ARRAY(char, n);\n"
+                               "  b.size = n;\n"
+                               "  return b;\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "alloc.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete); /* benign in-body macro call — not a coverage gap */
+    ASSERT(has_def(r, "Function", "make_buffer"));
+    ASSERT(has_def(r, "Macro", "SYNTH_ALLOC_ARRAY"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_real_in_body_error_still_flagged_issue1071) {
+    /* `int x = ;` is a genuine syntax error inside foo()'s body — no macro
+     * involved, so the coverage gap must not be suppressed. */
+    CBMFileResult *r = extract("int foo() {\n"
+                               "  int x = ;\n"
+                               "  return x;\n"
+                               "}\n",
+                               CBM_LANG_CPP, "t", "broken.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete); /* real gap stays reported */
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -5385,6 +5465,10 @@ SUITE(extraction) {
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    /* restored from merge base */
+    RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_cpp_functionlike_macro_type_arg_no_false_parse_partial_issue1071);
+    RUN_TEST(extract_cpp_real_in_body_error_still_flagged_issue1071);
     RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);

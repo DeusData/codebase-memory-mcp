@@ -14,6 +14,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <foundation/platform.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -106,17 +107,14 @@ static int integration_setup(void) {
     if (!g_project)
         return -1;
 
-    /* Build db path for direct store queries (pipeline writes here). Honors
-     * CBM_CACHE_DIR so it matches the pipeline write path (test isolation). */
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db",
-             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp", g_project);
-
-    /* Ensure cache dir exists */
-    char cache_dir[512];
-    /* Honor CBM_CACHE_DIR so this matches the pipeline write path (test isolation). */
-    snprintf(cache_dir, sizeof(cache_dir), "%s",
-             cbm_resolve_cache_dir() ? cbm_resolve_cache_dir() : "/tmp");
-    cbm_mkdir(cache_dir);
+    /* Build db path for direct store queries (pipeline writes here) */
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int dbpath_length =
+        cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
+    if (dbpath_length <= 0 || (size_t)dbpath_length >= sizeof(g_dbpath) ||
+        !cbm_mkdir_p(cache_dir, 0700)) {
+        return -1;
+    }
 
     /* Remove stale db from previous test runs */
     unlink(g_dbpath);
@@ -177,7 +175,7 @@ static char *call_tool(const char *tool, const char *args) {
 
 TEST(integ_index_has_nodes) {
     /* Open the indexed db directly and check node counts */
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     int nodes = cbm_store_count_nodes(store, g_project);
@@ -190,7 +188,7 @@ TEST(integ_index_has_nodes) {
 }
 
 TEST(integ_index_has_edges) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     int edges = cbm_store_count_edges(store, g_project);
@@ -202,7 +200,7 @@ TEST(integ_index_has_edges) {
 }
 
 TEST(integ_index_has_functions) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     cbm_node_t *funcs = NULL;
@@ -232,7 +230,7 @@ TEST(integ_index_has_functions) {
 }
 
 TEST(integ_index_has_files) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     cbm_node_t *files = NULL;
@@ -260,7 +258,7 @@ TEST(integ_index_has_files) {
 }
 
 TEST(integ_index_has_calls) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     int call_count = cbm_store_count_edges_by_type(store, g_project, "CALLS");
@@ -394,7 +392,7 @@ TEST(integ_mcp_trace_path) {
  * committed — exactly what a new MCP session sees after a cross-repo pass writes
  * CROSS_* edges (g_srv's cached connection predates this write). */
 TEST(integ_mcp_trace_path_cross_service) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     cbm_node_t *src = NULL;
@@ -520,7 +518,7 @@ TEST(integ_pipeline_cancel) {
  * ══════════════════════════════════════════════════════════════════ */
 
 TEST(integ_store_search_by_degree) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     /* Find functions with at least 1 outbound call */
@@ -543,7 +541,7 @@ TEST(integ_store_search_by_degree) {
 }
 
 TEST(integ_store_find_by_file) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     cbm_node_t *nodes = NULL;
@@ -559,7 +557,7 @@ TEST(integ_store_find_by_file) {
 }
 
 TEST(integ_store_bfs_traversal) {
-    cbm_store_t *store = cbm_store_open_path(g_dbpath);
+    cbm_store_t *store = cbm_store_open_path_existing(g_dbpath);
     ASSERT_NOT_NULL(store);
 
     /* Find a function node to start BFS from */

@@ -510,6 +510,16 @@ TEST(store_project_update) {
 TEST(store_project_delete) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
+    cbm_dirty_file_state_t dirty = {
+        .project = "test",
+        .rel_path = "retry.c",
+        .source = CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX,
+        .status = CBM_STORE_DIRTY_STATUS_PENDING,
+    };
+    ASSERT_EQ(cbm_store_upsert_dirty_file(s, &dirty), CBM_STORE_OK);
+    int dirty_pending = 0;
+    ASSERT_EQ(cbm_store_count_dirty_files(s, "test", &dirty_pending, NULL), CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 1);
 
     int rc = cbm_store_delete_project(s, "test");
     ASSERT_EQ(rc, CBM_STORE_OK);
@@ -517,6 +527,9 @@ TEST(store_project_delete) {
     cbm_project_t p = {0};
     rc = cbm_store_get_project(s, "test", &p);
     ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+    dirty_pending = -1;
+    ASSERT_EQ(cbm_store_count_dirty_files(s, "test", &dirty_pending, NULL), CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
 
     cbm_store_close(s);
     PASS();

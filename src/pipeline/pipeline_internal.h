@@ -723,6 +723,27 @@ bool cbm_pipeline_file_state_content_matches_current(cbm_store_t *store, const c
 int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                      const cbm_file_info_t *files, int file_count,
                                      int64_t generation, const char *pass_fingerprint);
+
+/* Replace the project's coverage rows AND the metadata describing how
+ * completely this run recorded them (#963), in one transaction.
+ *
+ * EVERY publish route must go through this, not just the full-index one.
+ * cbm_store_coverage_replace() forwards a NULL meta, and a NULL meta CLEARS
+ * whatever metadata was there (store.h:1008-1012) — so a route that used the
+ * plain call would leave check_index_coverage unable to distinguish "recorded
+ * complete coverage and found nothing missing" from "never recorded coverage
+ * at all". Those two are reported identically and both look like success,
+ * which is exactly the ambiguity the metadata exists to remove.
+ *
+ * rows_available is false when the caller could not assemble the row set (an
+ * allocation failure, not an empty repository); it is what makes the recorded
+ * status "unavailable" rather than a truthful-looking "complete". Passing p as
+ * NULL is only for callers with no pipeline in hand: the mode and the
+ * ignored-file counts are then omitted rather than guessed. */
+int cbm_pipeline_coverage_replace_with_meta(const cbm_pipeline_t *p, cbm_store_t *store,
+                                            const char *project, const cbm_coverage_row_t *rows,
+                                            int count, bool rows_available,
+                                            bool hash_records_complete);
 int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *project,
                                             const char *rel_path, int64_t generation,
                                             cbm_pipeline_file_delta_t *out);
@@ -891,6 +912,20 @@ int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits
  * Finds Interface nodes, matches method sets against Class nodes,
  * creates IMPLEMENTS + OVERRIDE edges. Returns edge count created. */
 int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx);
+
+/* Edge type for an explicit base-class relation, keyed off the resolved
+ * TARGET node's label: Interface → IMPLEMENTS, anything else → INHERITS.
+ * The single decision point for BOTH the sequential semantic pass and the
+ * parallel per-file resolve — the two venues must never diverge. */
+const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node);
+
+/* Explicit-language override detection on the full graph (serial tail).
+ * For every IMPLEMENTS/INHERITS edge whose source is a non-Go class, matches
+ * the class's DEFINES_METHOD children by name against the base's and creates
+ * Method→Method OVERRIDE edges (Java @Override, TS/C#/Kotlin override, PHP
+ * redefinition). Go is excluded: implicit satisfaction already covers it.
+ * Returns edge count created. */
+int cbm_pipeline_override_explicit(cbm_pipeline_ctx_t *ctx);
 
 /* ── Git diff helpers (pass_gitdiff.c) ───────────────────────────── */
 
@@ -1309,6 +1344,22 @@ void cbm_pipeline_set_exact_delta_stats_with_limit(cbm_pipeline_t *p, int change
                                                    int affected_paths, int published_paths,
                                                    int affected_paths_limit,
                                                    bool affected_paths_truncated);
+
+/* Test seam: invoked after a complete staging DB is sealed and immediately
+ * before the cancellation check + atomic replace. Not part of the public API. */
+void cbm_pipeline_set_before_publish_hook_for_tests(
+    cbm_pipeline_t *p, void (*hook)(cbm_pipeline_t *, const char *, void *), void *ctx);
+void cbm_pipeline_set_rename_hook_for_tests(cbm_pipeline_t *p,
+                                            int (*hook)(const char *, const char *, void *),
+                                            void *ctx);
+
+/* Synchronous thread-local seam for deterministic cross-repo cancellation
+ * tests. The callback runs immediately after a CROSS_* edge is committed and
+ * is never retained; it must not re-enter cross-repo matching. */
+typedef void (*cbm_cross_repo_after_insert_test_hook_t)(const char *project, const char *edge_type,
+                                                        void *context);
+void cbm_cross_repo_set_after_insert_hook_for_tests(cbm_cross_repo_after_insert_test_hook_t hook,
+                                                    void *context);
 
 /* Parse a gRPC stub call "<service-stub>.<method>" into the canonical proto
  * service name + method. Returns true ONLY when a recognized gRPC stub/client

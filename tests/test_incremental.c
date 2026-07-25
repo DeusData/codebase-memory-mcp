@@ -24,9 +24,6 @@
 #include <foundation/mem.h>
 #include <foundation/platform.h>
 #include <foundation/str_util.h>
-/* Forward decl (foundation/platform.c): honors CBM_CACHE_DIR so the test reads
- * the index from the same dir the pipeline writes it (needed for isolation). */
-const char *cbm_resolve_cache_dir(void);
 
 #include <stdarg.h>
 #include <string.h>
@@ -214,7 +211,7 @@ static int count_in_response(const char *resp, const char *key) {
 /* ── Direct store queries (more reliable than MCP for tests) ────── */
 
 static cbm_store_t *open_store(void) {
-    return cbm_store_open_path(g_dbpath);
+    return cbm_store_open_path_existing(g_dbpath);
 }
 
 static int dump_current_store_to_file(const char *dest_path) {
@@ -581,11 +578,25 @@ static int incremental_setup(void) {
 
     snprintf(g_repodir, sizeof(g_repodir), "%s/fastapi", g_tmpdir);
 
+    /* incr_clone_fastapi_fixture() implements the same once-per-machine cache
+     * upstream inlined here, and validates the cached tree (required files plus
+     * the expected commit) instead of only testing for the directory, so a torn
+     * download cannot masquerade as a valid cache. */
     int rc = incr_clone_fastapi_fixture();
     if (rc != 0) {
         printf("  FastAPI fixture setup failed (rc=%d) — cache invalid and network offline?\n", rc);
         return -1;
     }
+    /* Index the same corpus everywhere: CI historically indexed a sparse
+     * checkout without docs/ and tests/ (the assertion thresholds are sized
+     * for it) while local runs indexed the full tree — twice the files for
+     * the identical assertions, and a local/CI divergence. Trimming the two
+     * directories is the portable equivalent of that sparse profile. */
+    char trim[600];
+    snprintf(trim, sizeof(trim), "%s/docs", g_repodir);
+    th_rmtree(trim);
+    snprintf(trim, sizeof(trim), "%s/tests", g_repodir);
+    th_rmtree(trim);
 
     g_project = cbm_project_name_from_path(g_repodir);
     if (!g_project)
@@ -595,22 +606,20 @@ static int incremental_setup(void) {
      * and matches the index WRITE path (pipeline.c). Hardcoding ~/.cache here
      * made get_node_count read from a different dir than the index wrote under
      * CBM_TEST_ISOLATE, yielding 0-node indexes (and a div-by-zero). */
-    const char *cdir = cbm_resolve_cache_dir();
-    if (!cdir) {
-        cdir = "/tmp";
+    const char *cache_dir = cbm_resolve_cache_dir();
+    int dbpath_length =
+        cache_dir ? snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cache_dir, g_project) : -1;
+    if (dbpath_length <= 0 || (size_t)dbpath_length >= sizeof(g_dbpath) ||
+        !cbm_mkdir_p(cache_dir, 0700)) {
+        return -1;
     }
-    snprintf(g_dbpath, sizeof(g_dbpath), "%s/%s.db", cdir, g_project);
-
-    char cache_dir[512];
-    snprintf(cache_dir, sizeof(cache_dir), "%s", cdir);
-    cbm_mkdir(cache_dir);
 
     cbm_unlink(g_dbpath);
 
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
         return -1;
-    g_cfg = cbm_config_open(cdir);
+    g_cfg = cbm_config_open(cache_dir);
     if (!g_cfg) {
         cbm_mcp_server_free(g_srv);
         g_srv = NULL;
