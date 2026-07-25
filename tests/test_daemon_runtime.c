@@ -45,6 +45,10 @@
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -331,7 +335,7 @@ static bool runtime_test_windows_spawn_image_holder(const char *image_path, cons
 
 #endif
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 
 static bool runtime_test_copy_executable(const char *source, const char *destination) {
     int source_fd = open(source, O_RDONLY | O_CLOEXEC);
@@ -452,7 +456,7 @@ static void runtime_test_stop_blocked_executable(pid_t child, int release_fd) {
 
 #endif
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 static bool runtime_test_self_image_path(char source[RUNTIME_TEST_PATH_CAP]) {
 #ifdef __APPLE__
     int length = proc_pidpath(getpid(), source, RUNTIME_TEST_PATH_CAP);
@@ -460,6 +464,10 @@ static bool runtime_test_self_image_path(char source[RUNTIME_TEST_PATH_CAP]) {
     if (resolved) {
         source[length] = '\0';
     }
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t length = RUNTIME_TEST_PATH_CAP;
+    bool resolved = sysctl(mib, 4, source, &length, NULL, 0) == 0;
 #else
     ssize_t length = readlink("/proc/self/exe", source, RUNTIME_TEST_PATH_CAP - 1);
     bool resolved = length > 0 && length < (ssize_t)RUNTIME_TEST_PATH_CAP - 1;
@@ -474,7 +482,7 @@ static bool runtime_test_self_image_path(char source[RUNTIME_TEST_PATH_CAP]) {
 static bool runtime_test_copy_self_image(const char *destination) {
 #ifdef _WIN32
     return runtime_test_windows_copy_self(destination);
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     char source[RUNTIME_TEST_PATH_CAP];
     return runtime_test_self_image_path(source) &&
            runtime_test_copy_executable(source, destination);
@@ -525,6 +533,12 @@ static bool runtime_test_process_image_matches(uint64_t process_id, const char *
                      ? proc_pidpath((int)process_id, observed, (uint32_t)sizeof(observed))
                      : 0;
     if (length <= 0 || length >= (int)sizeof(observed)) {
+        observed[0] = '\0';
+    }
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, (int)process_id};
+    size_t length = sizeof(observed);
+    if (sysctl(mib, 4, observed, &length, NULL, 0) != 0) {
         observed[0] = '\0';
     }
 #elif defined(__linux__)
@@ -607,7 +621,7 @@ static bool runtime_test_force_terminate_verified(uint64_t process_id, const cha
     }
     (void)CloseHandle(process);
     return terminated;
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     /* The marker lives in a private test directory and was written by this
      * exact copied image. Revalidate immediately before signaling so the
      * cleanup backstop never targets an unrelated or PID-reused process. */
@@ -620,7 +634,7 @@ static bool runtime_test_force_terminate_verified(uint64_t process_id, const cha
 #endif
 }
 
-#if defined(_WIN32) || defined(__linux__)
+#if defined(_WIN32) || defined(__linux__) || defined(__FreeBSD__)
 static bool runtime_test_append_image_marker(const char *path) {
     FILE *file = cbm_fopen(path, "ab");
     bool written = file && fputc('\n', file) != EOF;
@@ -690,7 +704,7 @@ static bool runtime_test_run_hello_image(const char *image_path,
         *exit_code_out = (int)exit_code;
     }
     return read && exit_code <= INT_MAX;
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     pid_t child = fork();
     if (child == 0) {
         (void)alarm(TF_RUNTIME_IMAGE_WATCHDOG_SECONDS);
@@ -756,7 +770,7 @@ static bool runtime_test_run_activation_image(const char *image_path,
         *exit_code_out = (int)exit_code;
     }
     return read && exit_code <= INT_MAX;
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     char action_text[16];
     int action_written = snprintf(action_text, sizeof(action_text), "%u", (unsigned int)action);
     pid_t child = action_written > 0 && action_written < (int)sizeof(action_text) ? fork() : -1;
@@ -2035,7 +2049,7 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
     PASS();
 }
 
-#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 TEST(daemon_runtime_activation_accepts_authenticated_different_build) {
     cbm_daemon_build_identity_t active_identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
@@ -3445,7 +3459,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_application_before_exit) {
 }
 
 TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_other_session) {
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__linux__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__linux__) && !defined(__FreeBSD__)
     SKIP_PLATFORM("requires a queryable copied process image");
 #else
     enum {
@@ -4185,7 +4199,7 @@ TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed)
     (void)cbm_unlink(identical_path);
     runtime_test_fixture_finish(&identical_fixture);
 
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     runtime_test_fixture_t changed_fixture;
     bool changed_started =
         runtime_test_fixture_start(&changed_fixture, "copied-changed", &identity);
@@ -4214,7 +4228,7 @@ TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed)
     ASSERT_TRUE(identical_ran);
     ASSERT_EQ(identical_exit, 0);
     ASSERT_TRUE(identical_exited);
-#ifdef __linux__
+#if defined(__linux__) || defined(__FreeBSD__)
     ASSERT_TRUE(changed_started);
     ASSERT_TRUE(changed_copied);
     ASSERT_TRUE(changed_bytes);
@@ -4301,7 +4315,7 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     ASSERT_TRUE(!fingerprinted || strcmp(observed, replacement) != 0);
     PASS();
 }
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     char directory[RUNTIME_TEST_PATH_CAP] = {0};
     char image_path[RUNTIME_TEST_PATH_CAP] = {0};
@@ -4545,7 +4559,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_mac_fast_path_rejects_foreign_main_image_mapping_active);
 #endif
     RUN_TEST(daemon_runtime_copied_image_fallback_accepts_identical_and_rejects_changed);
-#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     RUN_TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path);
 #endif
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
@@ -4554,7 +4568,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_unexpected_frame_payload_is_freed_once);
     RUN_TEST(daemon_runtime_activation_rejects_forged_and_malformed_without_stop);
     RUN_TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients);
-#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
+#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     RUN_TEST(daemon_runtime_activation_accepts_authenticated_different_build);
 #endif
     RUN_TEST(daemon_runtime_future_generation_gets_stable_explicit_conflict);

@@ -27,6 +27,10 @@
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 
 /* Portable git: `git -C "<dir>" <args>` with identity + non-interactive
  * config injected via -c, so it needs no global config and no POSIX shell
@@ -850,7 +854,7 @@ static bool watcher_windows_terminate_verified(HANDLE process,
 }
 #endif
 
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 typedef struct {
     cbm_watcher_t *watcher;
     atomic_bool completed;
@@ -870,6 +874,13 @@ static bool watcher_test_self_image(char out[CBM_SZ_4K]) {
         return false;
     }
     out[length] = '\0';
+    return true;
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t length = CBM_SZ_4K;
+    if (sysctl(mib, 4, out, &length, NULL, 0) != 0) {
+        return false;
+    }
     return true;
 #else
     ssize_t length = readlink("/proc/self/exe", out, CBM_SZ_4K - 1);
@@ -1057,7 +1068,7 @@ TEST(watcher_stop_and_unwatch_cancel_blocked_git_without_backstop) {
     ASSERT_TRUE(unwatch_run_completed);
     ASSERT_EQ(unwatch_join_rc, 0);
     PASS();
-#elif defined(__APPLE__) || defined(__linux__)
+#elif defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
     char work[CBM_SZ_1K] = "/tmp/cbm-watcher-blocked-git-XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(work));
     char root[CBM_SZ_1K];

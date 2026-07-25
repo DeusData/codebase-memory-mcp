@@ -35,6 +35,10 @@
 #ifdef __APPLE__
 #include <libproc.h>
 #endif
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 #include <spawn.h>
 #include <signal.h>
 #include <sys/wait.h>
@@ -8106,6 +8110,10 @@ static bool idxfailclosed_self_path(char out[CBM_SZ_4K]) {
         out[length] = '\0';
     }
     return resolved;
+#elif defined(__FreeBSD__)
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t length = CBM_SZ_4K;
+    return sysctl(mib, 4, out, &length, NULL, 0) == 0;
 #else
     (void)out;
     return false;
