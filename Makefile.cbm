@@ -166,9 +166,7 @@ ifeq ($(PRODUCTION_HARDENING),1)
 # ELF targets and silently skipping all hardening. printf '%s\n' arg1 arg2 ...
 # emits one real newline per argument on every POSIX shell, so this is safe
 # across dash, bash, and FreeBSD sh alike.
-ELF_BUILD := $(shell \
-	printf '%s\n' '#ifndef __ELF__' '#error "Not ELF"' '#endif' | \
-	$(CC) -E -x c - >/dev/null 2>&1 && echo yes || echo no)
+ELF_BUILD := $(shell echo | $(CC) -dM -E -x c - 2>/dev/null | grep -q '__ELF__' && echo yes || echo no)
 
 ifeq ($(ELF_BUILD),yes)
 
