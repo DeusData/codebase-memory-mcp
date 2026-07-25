@@ -8,10 +8,11 @@
 #include "lsp/py_lsp.h"
 #include <time.h>
 
-static double elapsed_ms(struct timespec t0, struct timespec t1) {
-    double s = (double)(t1.tv_sec - t0.tv_sec);
-    double ns = (double)(t1.tv_nsec - t0.tv_nsec);
-    return s * 1000.0 + ns / 1000000.0;
+static double elapsed_cpu_ms(clock_t t0, clock_t t1) {
+    if (t0 == (clock_t)-1 || t1 == (clock_t)-1 || t1 < t0) {
+        return -1.0;
+    }
+    return (double)(t1 - t0) * 1000.0 / (double)CLOCKS_PER_SEC;
 }
 
 /* Build N synthetic class/call pairs into an arena-backed buffer. */
@@ -51,12 +52,17 @@ static double measure(int n_classes, int *out_calls, int *out_resolved) {
     int slen = 0;
     char *src = build_fixture(n_classes, &slen);
     if (!src) return -1.0;
-    struct timespec t0, t1;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /*
+     * This is a complexity guard, so measure process work rather than elapsed
+     * wall time. A scheduler pause during only the large fixture otherwise
+     * inflates the ratio and reports a quadratic regression that did not occur.
+     * ISO C clock() also keeps the measurement portable across supported hosts.
+     */
+    clock_t t0 = clock();
     CBMFileResult *r = cbm_extract_file(src, slen, CBM_LANG_PYTHON,
         "test", "scale.py", 0, NULL, NULL);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
-    double ms = elapsed_ms(t0, t1);
+    clock_t t1 = clock();
+    double ms = elapsed_cpu_ms(t0, t1);
     if (out_calls) *out_calls = r ? r->calls.count : 0;
     if (out_resolved) *out_resolved = r ? r->resolved_calls.count : 0;
     if (r) cbm_free_result(r);
@@ -71,6 +77,9 @@ TEST(pylsp_scale_linear_growth) {
     double t100 = measure(100, &c100, &r100);
     double t500 = measure(500, &c500, &r500);
     double t2000 = measure(2000, &c2000, &r2000);
+    ASSERT(t100 >= 0.0);
+    ASSERT(t500 >= 0.0);
+    ASSERT(t2000 >= 0.0);
     printf("    scale: 100=%.1fms (calls=%d resolved=%d)  500=%.1fms (calls=%d resolved=%d)  2000=%.1fms (calls=%d resolved=%d)\n",
         t100, c100, r100, t500, c500, r500, t2000, c2000, r2000);
 
