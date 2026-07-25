@@ -36,6 +36,20 @@ enum {
     CBM_DEP_DISCOVERY_OVERFETCH_MAX = 500,
 };
 
+const char *const CBM_MANIFEST_FILES[] = {
+    /* Interpreted languages */
+    "Cargo.toml", "pyproject.toml", "package.json", "go.mod",
+    "requirements.txt", "Gemfile", "build.gradle", "build.gradle.kts",
+    "pom.xml", "composer.json", "pubspec.yaml", "mix.exs", "Package.swift",
+    "setup.py", "Pipfile", "bun.lockb",
+    /* .NET */
+    "global.json", "Directory.Build.props", "NuGet.Config",
+    /* C/C++ build systems */
+    "Makefile", "GNUmakefile", "Makefile.cbm", "CMakeLists.txt", "meson.build",
+    "conanfile.txt", "conanfile.py", "vcpkg.json",
+    NULL
+};
+
 /* Upper bound for fetching project Variable/import-reference nodes, shared by
  * cbm_dep_link_cross_edges() (matches project imports to already-indexed dep
  * Module nodes) and rank_by_import_usage() below (counts project imports per

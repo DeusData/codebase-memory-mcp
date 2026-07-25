@@ -29,20 +29,8 @@ typedef struct cbm_config cbm_config_t;
 
 /* DRY manifest file list — used by depindex, pass_configlink, and dep discovery.
  * These are the basenames of files that declare project dependencies.
- * When adding a new manifest file, add it here — all consumers pick it up. */
-static const char *CBM_MANIFEST_FILES[] = {
-    /* Interpreted languages */
-    "Cargo.toml", "pyproject.toml", "package.json", "go.mod",
-    "requirements.txt", "Gemfile", "build.gradle", "build.gradle.kts",
-    "pom.xml", "composer.json", "pubspec.yaml", "mix.exs", "Package.swift",
-    "setup.py", "Pipfile", "bun.lockb",
-    /* .NET */
-    "global.json", "Directory.Build.props", "NuGet.Config",
-    /* C/C++ build systems */
-    "Makefile", "GNUmakefile", "Makefile.cbm", "CMakeLists.txt", "meson.build",
-    "conanfile.txt", "conanfile.py", "vcpkg.json",
-    NULL
-};
+ * When adding a new manifest file, add it in depindex.c — all consumers pick it up. */
+extern const char *const CBM_MANIFEST_FILES[];
 
 /* Configuration defaults: auto_index_deps=false disables automation;
  * configured auto_dep_limit=0 is unlimited and positive values are caps.
