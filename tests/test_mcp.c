@@ -9801,6 +9801,11 @@ TEST(first_search_reports_automatic_index_block_reason) {
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(response_has_structured_content(response));
     ASSERT_NOT_NULL(strstr(response, "auto_index_limit"));
+    /* The bounded counter reports the first rejected cardinality, not the
+     * saturated configured limit. This also proves the MCP resolve path uses
+     * the same configured-limit helper as daemon admission. */
+    ASSERT_NOT_NULL(strstr(response, "at least 2 indexable files"));
+    ASSERT_NOT_NULL(strstr(response, "auto_index_limit=1"));
     ASSERT_NOT_NULL(strstr(response, "_hidden_tools"));
     ASSERT_NOT_NULL(strstr(response, "tools/list"));
     ASSERT_NOT_NULL(strstr(response, "index_repository"));
