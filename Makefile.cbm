@@ -1055,9 +1055,14 @@ endif
 
 # ── Static analysis (Clang analyzer only — GCC has no --analyze flag) ──────
 ifeq ($(IS_GCC),no)
+# EDITOR_TEST_DEFINES is required, not optional: the test sources call the
+# *_for_testing seams that those defines gate. Analyzing without them makes
+# every such call an implicit declaration returning int, which then reports as
+# a "call to undeclared function" error plus downstream int-to-pointer errors,
+# and poisons the analyzer's type reasoning for the whole translation unit.
 test-analyze: $(ALL_TEST_SRCS) $(PROD_SRCS)
 	@echo "Running Clang static analyzer..."
-	$(CC) --analyze $(CFLAGS_COMMON) \
+	$(CC) --analyze $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 2>&1 | \
 		grep -E "warning:|error:|note:" || echo "No issues found."
 else
