@@ -8452,12 +8452,11 @@ static void install_pochi_durable_context(const char *home, bool force, bool dry
         dry_run);
 }
 
-static void install_omp_durable_context(const cbm_agent_registry_context_t *registry,
-                                       bool force, bool dry_run) {
-    const char *agent_dir = registry->options.omp_agent_dir
-                                && registry->options.omp_agent_dir[0]
-                            ? registry->options.omp_agent_dir
-                            : NULL;
+static void install_omp_durable_context(const cbm_agent_registry_context_t *registry, bool force,
+                                        bool dry_run) {
+    const char *agent_dir = registry->options.omp_agent_dir && registry->options.omp_agent_dir[0]
+                                ? registry->options.omp_agent_dir
+                                : NULL;
     char resolved_dir[CLI_BUF_1K];
     if (!agent_dir) {
         int written = snprintf(resolved_dir, sizeof(resolved_dir), "%s/.omp/agent",
@@ -11291,10 +11290,9 @@ static void uninstall_pochi_durable_context(const char *home, bool dry_run) {
 
 static void uninstall_omp_durable_context(const cbm_agent_registry_context_t *registry,
                                           bool dry_run) {
-    const char *agent_dir = registry->options.omp_agent_dir
-                                && registry->options.omp_agent_dir[0]
-                            ? registry->options.omp_agent_dir
-                            : NULL;
+    const char *agent_dir = registry->options.omp_agent_dir && registry->options.omp_agent_dir[0]
+                                ? registry->options.omp_agent_dir
+                                : NULL;
     char resolved_dir[CLI_BUF_1K];
     if (!agent_dir) {
         int written = snprintf(resolved_dir, sizeof(resolved_dir), "%s/.omp/agent",

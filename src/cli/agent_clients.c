@@ -74,8 +74,8 @@ static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] =
     {CBM_AGENT_CLIENT_SOURCEGRAPH_CODY, "sourcegraph-cody", "Sourcegraph Cody", CBM_AGENT_OPT_IN,
      CBM_AGENT_CAP_MCP, NULL, agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_OMP, "omp", "Oh My Pi (omp)", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "omp",
-     agent_install_callback, agent_remove_callback},
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "omp", agent_install_callback,
+     agent_remove_callback},
 };
 
 size_t cbm_agent_client_count(void) {
