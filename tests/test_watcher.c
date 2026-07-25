@@ -198,7 +198,10 @@ TEST(watcher_null_safety) {
     PASS();
 }
 
-TEST(watcher_rejects_overlong_git_command_path) {
+/* argv execution has no fixed shell-command formatting buffer. Registration
+ * should not reject a nonempty path merely because its textual length exceeds
+ * the old 1 KiB command string; filesystem existence is handled by polling. */
+TEST(watcher_has_no_shell_command_buffer_path_limit) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, NULL, NULL);
 
@@ -207,24 +210,25 @@ TEST(watcher_rejects_overlong_git_command_path) {
     memset(long_path + 1, 'a', sizeof(long_path) - CBM_SZ_2);
     long_path[sizeof(long_path) - 1] = '\0';
 
-    cbm_watcher_watch(w, "too-long", long_path);
-    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_TRUE(cbm_watcher_watch(w, "long-argv-path", long_path));
+    ASSERT_EQ(cbm_watcher_watch_count(w), 1);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
     PASS();
 }
 
-TEST(git_snapshot_rejects_overlong_path) {
+TEST(git_snapshot_has_no_shell_command_buffer_path_limit) {
     char long_path[CBM_SZ_2K];
     long_path[0] = '/';
     memset(long_path + 1, 'b', sizeof(long_path) - CBM_SZ_2);
     long_path[sizeof(long_path) - 1] = '\0';
 
     cbm_git_snapshot_t snap = {0};
-    ASSERT_FALSE(cbm_git_snapshot_path_supported(long_path));
-    ASSERT_EQ(cbm_git_snapshot_read(long_path, CBM_GIT_SNAPSHOT_HEAD, &snap), CBM_NOT_FOUND);
-    ASSERT_FALSE(snap.path_supported);
+    ASSERT_TRUE(cbm_git_snapshot_path_supported(long_path));
+    ASSERT_EQ(cbm_git_snapshot_read(long_path, CBM_GIT_SNAPSHOT_HEAD, &snap), 0);
+    ASSERT_TRUE(snap.path_supported);
+    ASSERT_FALSE(snap.is_git);
     PASS();
 }
 
@@ -3656,8 +3660,8 @@ SUITE(watcher) {
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_stopped_rejects_new_registration);
     RUN_TEST(watcher_null_safety);
-    RUN_TEST(watcher_rejects_overlong_git_command_path);
-    RUN_TEST(git_snapshot_rejects_overlong_path);
+    RUN_TEST(watcher_has_no_shell_command_buffer_path_limit);
+    RUN_TEST(git_snapshot_has_no_shell_command_buffer_path_limit);
     RUN_TEST(git_snapshot_non_git_path);
     RUN_TEST(git_snapshot_clean_and_dirty_repo);
     RUN_TEST(git_status_paths_tracks_rename_current_and_previous_path);

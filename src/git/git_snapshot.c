@@ -45,63 +45,53 @@ static void git_dirty_hash_file_metadata(const char *repo_path, char **paths, in
     }
 }
 
-static int git_capture_command(const char *cmd, char **out, size_t *out_len) {
+static int git_capture_command(const char *repo_path, const char *const git_args[],
+                               char **out, size_t *out_len) {
     *out = NULL;
     *out_len = 0;
-    FILE *fp = cbm_popen(cmd, "r");
-    if (!fp) {
+    cbm_git_output_t output;
+    cbm_proc_result_t result;
+    if (cbm_git_run_argv(repo_path, git_args, NULL, &output, &result) != 0 ||
+        result.outcome != CBM_PROC_CLEAN) {
+        cbm_git_output_cleanup(&output);
         return CBM_NOT_FOUND;
     }
-    char *buf = NULL;
-    size_t len = 0;
-    size_t cap = 0;
-    char chunk[CBM_SZ_4K];
-    size_t got = 0;
-    while ((got = fread(chunk, CBM_ALLOC_ONE, sizeof(chunk), fp)) > 0) {
-        if (got > SIZE_MAX - len - 1) {
-            free(buf);
-            (void)cbm_pclose(fp);
-            return CBM_NOT_FOUND;
-        }
-        if (len + got + 1 > cap) {
-            size_t new_cap = cap > 0 ? cap : CBM_SZ_4K;
-            while (new_cap < len + got + 1) {
-                if (new_cap > SIZE_MAX / PAIR_LEN) {
-                    free(buf);
-                    (void)cbm_pclose(fp);
-                    return CBM_NOT_FOUND;
-                }
-                new_cap *= PAIR_LEN;
-            }
-            char *tmp = safe_realloc(buf, new_cap);
-            if (!tmp) {
-                free(buf);
-                (void)cbm_pclose(fp);
-                return CBM_NOT_FOUND;
-            }
-            buf = tmp;
-            cap = new_cap;
-        }
-        memcpy(buf + len, chunk, got);
-        len += got;
+    if (output.size == 0) {
+        cbm_git_output_cleanup(&output);
+        return 0;
     }
-    bool read_error = ferror(fp) != 0;
-    int rc = cbm_pclose(fp);
-    if (read_error || rc != 0) {
+    if (output.size == SIZE_MAX) {
+        cbm_git_output_cleanup(&output);
+        return CBM_NOT_FOUND;
+    }
+    FILE *fp = cbm_fopen(output.path, "rb");
+    char *buf = fp ? malloc(output.size + 1U) : NULL;
+    size_t got = buf ? fread(buf, CBM_ALLOC_ONE, output.size, fp) : 0;
+    bool failed = !fp || !buf || got != output.size || ferror(fp) != 0;
+    int close_rc = fp ? fclose(fp) : 0;
+    cbm_git_output_cleanup(&output);
+    if (failed || close_rc != 0) {
         free(buf);
         return CBM_NOT_FOUND;
     }
-    if (buf) {
-        buf[len] = '\0';
-    }
+    buf[got] = '\0';
     *out = buf;
-    *out_len = len;
+    *out_len = got;
     return 0;
 }
 
-static int git_hash_command_output(const char *cmd, uint64_t *hash, int *bytes_read) {
-    FILE *fp = cbm_popen(cmd, "r");
+static int git_hash_command_output(const char *repo_path, const char *const git_args[],
+                                   uint64_t *hash, int *bytes_read) {
+    cbm_git_output_t output;
+    cbm_proc_result_t result;
+    if (cbm_git_run_argv(repo_path, git_args, NULL, &output, &result) != 0 ||
+        result.outcome != CBM_PROC_CLEAN) {
+        cbm_git_output_cleanup(&output);
+        return CBM_NOT_FOUND;
+    }
+    FILE *fp = cbm_fopen(output.path, "rb");
     if (!fp) {
+        cbm_git_output_cleanup(&output);
         return CBM_NOT_FOUND;
     }
     unsigned char buf[CBM_SZ_1K];
@@ -116,33 +106,16 @@ static int git_hash_command_output(const char *cmd, uint64_t *hash, int *bytes_r
         }
     }
     bool read_error = ferror(fp) != 0;
-    int rc = cbm_pclose(fp);
+    int rc = fclose(fp);
+    cbm_git_output_cleanup(&output);
     if (bytes_read) {
         *bytes_read += total;
     }
     return rc == 0 && !read_error ? 0 : CBM_NOT_FOUND;
 }
 
-#if !defined(_WIN32)
-static bool git_format_submodule_status_command(char *cmd, size_t cmd_size, const char *repo_path) {
-    if (!cmd || cmd_size == 0 || !repo_path || !cbm_git_validate_repo_path(repo_path)) {
-        return false;
-    }
-    int n = snprintf(cmd, cmd_size,
-                     "git --no-optional-locks -C \"%s\" submodule foreach --quiet --recursive "
-                     "\"git status --porcelain --untracked-files=normal 2>/dev/null\" "
-                     "2>/dev/null",
-                     repo_path);
-    return cbm_git_command_fits(n, cmd_size);
-}
-#endif
-
 bool cbm_git_snapshot_path_supported(const char *repo_path) {
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    return cbm_git_format_command(cmd, sizeof(cmd), repo_path, "rev-parse --git-dir") &&
-           cbm_git_format_command(cmd, sizeof(cmd), repo_path, "rev-parse HEAD") &&
-           cbm_git_format_status_command(cmd, sizeof(cmd), repo_path) &&
-           cbm_git_format_command(cmd, sizeof(cmd), repo_path, "ls-files");
+    return cbm_git_validate_repo_path(repo_path);
 }
 
 static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size) {
@@ -151,19 +124,12 @@ static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size
     }
     memcpy(out_hash, CBM_GIT_EMPTY_DIRTY_HASH, sizeof(CBM_GIT_EMPTY_DIRTY_HASH));
 
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    int command_len = snprintf(cmd, sizeof(cmd),
-                               "git --no-optional-locks -C \"%s\" status --porcelain=v1 -z "
-                               "--untracked-files=all 2>%s",
-                               repo_path, cbm_git_null_device());
-    if (!cbm_git_command_fits(command_len, sizeof(cmd))) {
-        return CBM_NOT_FOUND;
-    }
-
     uint64_t h = CBM_GIT_DIRTY_HASH_SEED;
     char *status = NULL;
     size_t status_len = 0;
-    if (git_capture_command(cmd, &status, &status_len) != 0) {
+    const char *const status_args[] = {
+        "status", "--porcelain=v1", "-z", "--untracked-files=all", NULL};
+    if (git_capture_command(repo_path, status_args, &status, &status_len) != 0) {
         return CBM_NOT_FOUND;
     }
     h = git_dirty_hash_update(h, (const unsigned char *)status, status_len);
@@ -179,9 +145,10 @@ static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size
     free(status);
 
 #if !defined(_WIN32)
-    if (git_format_submodule_status_command(cmd, sizeof(cmd), repo_path)) {
-        (void)git_hash_command_output(cmd, &h, &bytes);
-    }
+    const char *const submodule_args[] = {
+        "submodule", "foreach", "--quiet", "--recursive",
+        "git status --porcelain --untracked-files=normal 2>/dev/null", NULL};
+    (void)git_hash_command_output(repo_path, submodule_args, &h, &bytes);
 #endif
     if (bytes <= 0) {
         cbm_git_status_paths_free(paths, path_count);
@@ -199,12 +166,17 @@ static int git_dirty_hash(const char *repo_path, char *out_hash, size_t out_size
 }
 
 static int git_file_count(const char *repo_path) {
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    if (!cbm_git_format_command(cmd, sizeof(cmd), repo_path, "ls-files")) {
+    const char *const args[] = {"ls-files", NULL};
+    cbm_git_output_t output;
+    cbm_proc_result_t result;
+    if (cbm_git_run_argv(repo_path, args, NULL, &output, &result) != 0 ||
+        result.outcome != CBM_PROC_CLEAN) {
+        cbm_git_output_cleanup(&output);
         return 0;
     }
-    FILE *fp = cbm_popen(cmd, "r");
+    FILE *fp = cbm_fopen(output.path, "rb");
     if (!fp) {
+        cbm_git_output_cleanup(&output);
         return 0;
     }
 
@@ -219,7 +191,8 @@ static int git_file_count(const char *repo_path) {
         }
     }
     bool read_error = ferror(fp) != 0;
-    int rc = cbm_pclose(fp);
+    int rc = fclose(fp);
+    cbm_git_output_cleanup(&output);
     return rc == 0 && !read_error ? count : 0;
 }
 
@@ -323,18 +296,11 @@ int cbm_git_status_paths(const char *repo_path, char ***out_paths, int *out_coun
         return CBM_NOT_FOUND;
     }
 
-    char cmd[CBM_GIT_CMD_BUFSZ];
-    int n = snprintf(cmd, sizeof(cmd),
-                     "git --no-optional-locks -C \"%s\" status --porcelain=v1 -z "
-                     "--untracked-files=all 2>%s",
-                     repo_path, cbm_git_null_device());
-    if (!cbm_git_command_fits(n, sizeof(cmd))) {
-        return CBM_NOT_FOUND;
-    }
-
     char *buf = NULL;
     size_t len = 0;
-    int rc = git_capture_command(cmd, &buf, &len);
+    const char *const args[] = {
+        "status", "--porcelain=v1", "-z", "--untracked-files=all", NULL};
+    int rc = git_capture_command(repo_path, args, &buf, &len);
     if (rc != 0) {
         return CBM_NOT_FOUND;
     }
@@ -358,14 +324,15 @@ int cbm_git_snapshot_read(const char *repo_path, unsigned flags, cbm_git_snapsho
         return CBM_NOT_FOUND;
     }
 
-    out->is_git = cbm_git_drain_command(repo_path, "rev-parse --git-dir") == 0;
+    const char *const git_dir_args[] = {"rev-parse", "--git-dir", NULL};
+    out->is_git = cbm_git_drain_command(repo_path, git_dir_args) == 0;
     if (!out->is_git) {
         return 0;
     }
 
     if ((flags & CBM_GIT_SNAPSHOT_HEAD) != 0) {
-        (void)cbm_git_capture_first_line_buf(repo_path, "rev-parse HEAD", out->head,
-                                             sizeof(out->head));
+        const char *const head_args[] = {"rev-parse", "HEAD", NULL};
+        (void)cbm_git_capture_first_line_buf(repo_path, head_args, out->head, sizeof(out->head));
     }
     if ((flags & CBM_GIT_SNAPSHOT_DIRTY) != 0) {
         out->dirty_bytes = git_dirty_hash(repo_path, out->dirty_hash, sizeof(out->dirty_hash));

@@ -4560,17 +4560,22 @@ TEST(tool_index_status_includes_git_metadata) {
 TEST(tool_index_status_distinguishes_dirty_worktree_from_head) {
     char *tmp = th_mktempdir("cbm-status-git");
     ASSERT_NOT_NULL(tmp);
-    if (cbm_git_drain_command(tmp, "init -q") != 0 ||
-        cbm_git_drain_command(tmp, "config user.email test@example.com") != 0 ||
-        cbm_git_drain_command(tmp, "config user.name Test") != 0) {
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.com", NULL};
+    const char *const name_args[] = {"config", "user.name", "Test", NULL};
+    if (cbm_git_drain_command(tmp, init_args) != 0 ||
+        cbm_git_drain_command(tmp, email_args) != 0 ||
+        cbm_git_drain_command(tmp, name_args) != 0) {
         th_rmtree(tmp);
         SKIP_PLATFORM("git is unavailable");
     }
     char source_path[CBM_SZ_1K];
     snprintf(source_path, sizeof(source_path), "%s/main.c", tmp);
     ASSERT_EQ(th_write_file(source_path, "int main(void) { return 0; }\n"), 0);
-    ASSERT_EQ(cbm_git_drain_command(tmp, "add main.c"), 0);
-    ASSERT_EQ(cbm_git_drain_command(tmp, "commit -q -m initial"), 0);
+    const char *const add_args[] = {"add", "main.c", NULL};
+    const char *const commit_args[] = {"commit", "-q", "-m", "initial", NULL};
+    ASSERT_EQ(cbm_git_drain_command(tmp, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(tmp, commit_args), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -12933,20 +12938,89 @@ TEST(mcp_path_within_root_rejects_escape) {
 #endif
 }
 
-/* base_branch is spliced into a `git diff --name-only "<base>"...HEAD` command;
- * a value starting with '-' would be taken by git as an option (e.g.
- * --output=<path> writes the diff to an arbitrary file) rather than a ref. It
- * must be rejected up front, alongside the shell-metacharacter check. */
-TEST(detect_changes_rejects_option_like_base_branch) {
+/* A leading '-' is not a valid branch spelling. Reject it before spawning Git
+ * instead of depending on command-specific --end-of-options support. */
+TEST(detect_changes_rejects_option_like_base_branch_before_git) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"detect_changes\","
-             "\"arguments\":{\"project\":\"p\",\"base_branch\":\"--output=/tmp/cbm_pwn\"}}}");
+             "\"arguments\":{\"project\":\"option-argv-project\","
+             "\"base_branch\":\"--option-probe\",\"scope\":\"files\"}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "invalid characters"));
+    ASSERT_NOT_NULL(strstr(resp, "base_branch contains invalid characters"));
     free(resp);
     cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Exercise the actual Git executable on every platform. The repository path
+ * contains all cmd.exe expansion/control metacharacters from the superseded
+ * Windows-only validator tests; the branch uses the subset Git permits in a
+ * ref name. Shell-backed execution either rejected or reinterpreted these
+ * bytes, while argv execution must preserve them literally. */
+TEST(detect_changes_handles_cmd_metacharacters_as_literal_argv) {
+    char base[CBM_PATH_MAX];
+    char *raw = th_mktempdir("cbm_detect_literal_argv");
+    ASSERT_NOT_NULL(raw);
+    int base_written = snprintf(base, sizeof(base), "%s", raw);
+    ASSERT_GT(base_written, 0);
+    ASSERT_LT((size_t)base_written, sizeof(base));
+
+    char repo[CBM_PATH_MAX];
+    int repo_written = snprintf(repo, sizeof(repo), "%s/repo %%!^&; literal", base);
+    ASSERT_GT(repo_written, 0);
+    ASSERT_LT((size_t)repo_written, sizeof(repo));
+    ASSERT_EQ(th_mkdir_p(repo), 0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.com", NULL};
+    const char *const name_args[] = {"config", "user.name", "Test", NULL};
+    if (cbm_git_drain_command(repo, init_args) != 0 ||
+        cbm_git_drain_command(repo, email_args) != 0 ||
+        cbm_git_drain_command(repo, name_args) != 0) {
+        th_rmtree(base);
+        SKIP_PLATFORM("git is unavailable");
+    }
+    char source_path[CBM_PATH_MAX];
+    int source_written = snprintf(source_path, sizeof(source_path), "%s/main.c", repo);
+    ASSERT_GT(source_written, 0);
+    ASSERT_LT((size_t)source_written, sizeof(source_path));
+    ASSERT_EQ(th_write_file(source_path, "int value = 1;\n"), 0);
+    const char *const add_args[] = {"add", "main.c", NULL};
+    const char *const commit_args[] = {"commit", "-q", "-m", "initial", NULL};
+    const char *const branch_args[] = {"checkout", "-q", "-b", "topic%PATH%!&;", NULL};
+    ASSERT_EQ(cbm_git_drain_command(repo, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(repo, commit_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(repo, branch_args), 0);
+    ASSERT_EQ(th_write_file(source_path, "int value = 2;\n"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "literal-argv-project", repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "literal-argv-project");
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"detect_changes\","
+             "\"arguments\":{\"project\":\"literal-argv-project\","
+             "\"base_branch\":\"topic%PATH%!&;\",\"scope\":\"files\"}}}");
+    ASSERT_NOT_NULL(response);
+    bool literal_base = strstr(response, "topic%PATH%!&;") != NULL;
+    bool changed_file = strstr(response, "main.c") != NULL;
+    bool validation_error = strstr(response, "invalid characters") != NULL;
+    if (!literal_base || !changed_file || validation_error) {
+        printf("    literal argv detect_changes response: %s\n", response);
+    }
+    free(response);
+    cbm_mcp_server_free(srv);
+    ASSERT_EQ(th_rmtree(base), 0);
+
+    ASSERT_TRUE(literal_base);
+    ASSERT_TRUE(changed_file);
+    ASSERT_FALSE(validation_error);
     PASS();
 }
 
@@ -13043,6 +13117,7 @@ typedef struct {
 typedef struct {
     bool reject_merge_base;
     int diff_calls;
+    int status_calls;
     int merge_base_calls;
 } mcp_command_hook_probe_t;
 
@@ -13067,7 +13142,13 @@ static bool mcp_command_hook_probe(void *context, const char *command) {
         probe->merge_base_calls++;
         return !probe->reject_merge_base;
     }
-    probe->diff_calls++;
+    if (strcmp(command, "diff") == 0) {
+        probe->diff_calls++;
+    } else if (strcmp(command, "status") == 0) {
+        probe->status_calls++;
+    } else {
+        return false;
+    }
     return true;
 }
 
@@ -15151,10 +15232,10 @@ TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete) {
     PASS();
 }
 
-/* detect_changes owns shell output through regular temporary files. An error
- * after opening that file must use fclose + unlink. The command hook then
- * rejects merge-base only when it reaches the contained subprocess helper, so
- * a raw popen regression bypasses the hook and fails this test. */
+/* detect_changes owns argv-child stdout through regular temporary files. Every
+ * success, validation error, and injected pre-spawn rejection must restore the
+ * pre-call artifact count. The hook also proves every Git operation reaches the
+ * contained argv helper; a raw popen regression bypasses it and fails here. */
 TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     char cache[512];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-detect-contained-XXXXXX", cbm_tmpdir());
@@ -15175,6 +15256,8 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
         cbm_mcp_server_set_project(srv, project);
         cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
     }
+    int artifacts_before =
+        mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-git-");
 
     char *invalid_response =
         project_ready ? cbm_mcp_handle_tool(srv, "detect_changes",
@@ -15183,10 +15266,10 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
                                             "\"direction\":\"sideways\"}")
                       : NULL;
     bool invalid_rejected = invalid_response && strstr(invalid_response, "invalid direction");
-    char logs[640];
-    (void)snprintf(logs, sizeof(logs), "%s/logs", cache);
     int artifacts_after_error =
-        invalid_response ? mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") : -1;
+        invalid_response
+            ? mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-git-")
+            : -1;
 
     char *rejected_response =
         project_ready ? cbm_mcp_handle_tool(srv, "detect_changes",
@@ -15196,7 +15279,9 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     bool containment_rejected =
         rejected_response && strstr(rejected_response, "contained command could not complete");
     int artifacts_after_rejection =
-        rejected_response ? mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") : -1;
+        rejected_response
+            ? mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-git-")
+            : -1;
 
     command_probe.reject_merge_base = false;
     char *success_response =
@@ -15206,7 +15291,9 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
                       : NULL;
     bool merge_base_reported = success_response && strstr(success_response, "merge_base");
     int artifacts_after_success =
-        success_response ? mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") : -1;
+        success_response
+            ? mcp_count_directory_entries_with_prefix(cbm_tmpdir(), "cbm-git-")
+            : -1;
 
     free(invalid_response);
     free(rejected_response);
@@ -15221,13 +15308,19 @@ TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
     ASSERT_TRUE(root_ready);
     ASSERT_TRUE(server_ready);
     ASSERT_TRUE(project_ready);
+    ASSERT_TRUE(artifacts_before >= 0);
     ASSERT_TRUE(invalid_rejected);
-    ASSERT_EQ(artifacts_after_error, 0);
+    ASSERT_EQ(artifacts_after_error, artifacts_before);
     ASSERT_TRUE(containment_rejected);
-    ASSERT_EQ(artifacts_after_rejection, 0);
+    ASSERT_EQ(artifacts_after_rejection, artifacts_before);
     ASSERT_TRUE(merge_base_reported);
-    ASSERT_EQ(artifacts_after_success, 0);
-    ASSERT_EQ(command_probe.diff_calls, 3);
+    ASSERT_EQ(artifacts_after_success, artifacts_before);
+    /* Each request reaches two diff operations and one status operation.
+     * The rejected request stops at merge-base; the successful request
+     * completes it. Keeping the operation classes separate catches a missing
+     * or duplicated argv child instead of accepting only the aggregate. */
+    ASSERT_EQ(command_probe.diff_calls, 6);
+    ASSERT_EQ(command_probe.status_calls, 3);
     ASSERT_EQ(command_probe.merge_base_calls, 2);
     ASSERT_TRUE(cleaned);
     PASS();
@@ -15383,61 +15476,6 @@ TEST(index_supervisor_start_failure_is_fail_closed_in_real_host) {
 #endif
 }
 
-TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch) {
-#ifdef _WIN32
-    const char *const branches[] = {"topic%PATH%", "topic!name!", "topic^name"};
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    for (size_t i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
-        char request[512];
-        snprintf(request, sizeof(request),
-                 "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
-                 "\"params\":{\"name\":\"detect_changes\","
-                 "\"arguments\":{\"project\":\"p\",\"base_branch\":\"%s\"}}}",
-                 branches[i]);
-        char *response = cbm_mcp_server_handle(srv, request);
-        ASSERT_NOT_NULL(response);
-        ASSERT_NOT_NULL(strstr(response, "base_branch contains invalid characters"));
-        free(response);
-    }
-    cbm_mcp_server_free(srv);
-    PASS();
-#else
-    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
-#endif
-}
-
-TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
-#ifdef _WIN32
-    const char *const roots[] = {"C:\\cbm-root-%PATH%", "C:\\cbm-root-!name!",
-                                 "C:\\cbm-root-^name"};
-    const char *project = "windows-cmd-root-validation";
-    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
-    ASSERT_NOT_NULL(srv);
-    cbm_store_t *store = cbm_mcp_server_store(srv);
-    ASSERT_NOT_NULL(store);
-    cbm_mcp_server_set_project(srv, project);
-    mcp_command_hook_probe_t command_probe = {0};
-    cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
-
-    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
-        ASSERT_EQ(cbm_store_upsert_project(store, project, roots[i]), CBM_STORE_OK);
-        char *response = cbm_mcp_handle_tool(
-            srv, "detect_changes",
-            "{\"project\":\"windows-cmd-root-validation\",\"base_branch\":\"main\"}");
-        ASSERT_NOT_NULL(response);
-        ASSERT_NOT_NULL(strstr(response, "project path contains invalid characters"));
-        free(response);
-    }
-    ASSERT_EQ(command_probe.diff_calls, 0);
-    ASSERT_EQ(command_probe.merge_base_calls, 0);
-    cbm_mcp_server_free(srv);
-    PASS();
-#else
-    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
-#endif
-}
-
 TEST(index_repository_relative_path_uses_explicit_session_root) {
     char session_root[512];
     char cache[512];
@@ -15575,7 +15613,8 @@ TEST(index_repository_supervisor_uses_canonical_session_path) {
 
 SUITE(mcp) {
     RUN_TEST(mcp_path_within_root_rejects_escape);
-    RUN_TEST(detect_changes_rejects_option_like_base_branch);
+    RUN_TEST(detect_changes_rejects_option_like_base_branch_before_git);
+    RUN_TEST(detect_changes_handles_cmd_metacharacters_as_literal_argv);
     RUN_TEST(index_repository_honors_allowed_root);
     /* JSON-RPC parsing */
     RUN_TEST(jsonrpc_parse_request);
@@ -15899,8 +15938,6 @@ SUITE(mcp) {
     RUN_TEST(query_store_reopens_after_database_replacement);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
-    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
-    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
     RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
 }

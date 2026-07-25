@@ -31,13 +31,8 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
-#include "git/git_command.h"  /* cbm_git_validate_repo_path */
+#include "git/git_command.h"
 #include "git/git_snapshot.h" /* cbm_git_snapshot_path_supported */
-#ifdef _WIN32
-#include "foundation/win_utf8.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
 
 #include <errno.h>
 #include <limits.h>
@@ -213,120 +208,6 @@ static bool watcher_git_output_create(watcher_git_output_t *output) {
     return closed;
 }
 
-#ifdef _WIN32
-/* CreateProcessW does not search PATH when lpApplicationName is non-NULL.
- * Resolve Git ourselves, and deliberately accept only absolute PATH entries:
- * empty/relative entries would reintroduce Windows' current-directory search. */
-static bool watcher_windows_path_absolute(const wchar_t *path) {
-    if (!path || wcslen(path) < 3U) {
-        return false;
-    }
-    bool drive = ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
-                 path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
-    bool unc = (path[0] == L'\\' || path[0] == L'/') && (path[1] == L'\\' || path[1] == L'/') &&
-               path[2] != L'\0' && path[2] != L'\\' && path[2] != L'/';
-    return drive || unc;
-}
-
-static bool watcher_windows_git_candidate(const wchar_t *entry, size_t entry_length,
-                                          char output[CBM_SZ_4K]) {
-    while (entry_length > 0U && (entry[0] == L' ' || entry[0] == L'\t')) {
-        entry++;
-        entry_length--;
-    }
-    while (entry_length > 0U &&
-           (entry[entry_length - 1U] == L' ' || entry[entry_length - 1U] == L'\t')) {
-        entry_length--;
-    }
-    if (entry_length >= 2U && entry[0] == L'"' && entry[entry_length - 1U] == L'"') {
-        entry++;
-        entry_length -= 2U;
-    }
-    while (entry_length > 0U && (entry[0] == L' ' || entry[0] == L'\t')) {
-        entry++;
-        entry_length--;
-    }
-    while (entry_length > 0U &&
-           (entry[entry_length - 1U] == L' ' || entry[entry_length - 1U] == L'\t')) {
-        entry_length--;
-    }
-    if (entry_length == 0U || entry_length >= CBM_SZ_4K) {
-        return false;
-    }
-    wchar_t directory[CBM_SZ_4K];
-    memcpy(directory, entry, entry_length * sizeof(*directory));
-    directory[entry_length] = L'\0';
-    if (!watcher_windows_path_absolute(directory) || wcschr(directory, L'"') != NULL) {
-        return false;
-    }
-
-    bool separator = directory[entry_length - 1U] == L'\\' || directory[entry_length - 1U] == L'/';
-    wchar_t candidate[CBM_SZ_4K];
-    int written =
-        swprintf(candidate, CBM_SZ_4K, separator ? L"%lsgit.exe" : L"%ls\\git.exe", directory);
-    if (written <= 0 || written >= CBM_SZ_4K) {
-        return false;
-    }
-    DWORD required = GetFullPathNameW(candidate, 0U, NULL, NULL);
-    wchar_t *normalized =
-        required > 0U ? malloc(((size_t)required + 1U) * sizeof(*normalized)) : NULL;
-    DWORD normalized_length =
-        normalized ? GetFullPathNameW(candidate, required + 1U, normalized, NULL) : 0U;
-    if (!normalized || normalized_length == 0U || normalized_length > required ||
-        !watcher_windows_path_absolute(normalized)) {
-        free(normalized);
-        return false;
-    }
-    HANDLE file = CreateFileW(normalized, GENERIC_READ | FILE_READ_ATTRIBUTES,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                              OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    BY_HANDLE_FILE_INFORMATION information;
-    bool regular = file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK &&
-                   GetFileInformationByHandle(file, &information) != 0 &&
-                   (information.dwFileAttributes &
-                    (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
-    if (file != INVALID_HANDLE_VALUE) {
-        (void)CloseHandle(file);
-    }
-    char *utf8 = regular ? cbm_wide_to_utf8(normalized) : NULL;
-    size_t utf8_length = utf8 ? strlen(utf8) : 0U;
-    bool valid = utf8 && utf8_length > 0U && utf8_length < CBM_SZ_4K;
-    if (valid) {
-        memcpy(output, utf8, utf8_length + 1U);
-    }
-    free(utf8);
-    free(normalized);
-    return valid;
-}
-
-static bool watcher_resolve_git_executable(char output[CBM_SZ_4K]) {
-    output[0] = '\0';
-    DWORD required = GetEnvironmentVariableW(L"PATH", NULL, 0U);
-    wchar_t *path = required > 0U ? malloc((size_t)required * sizeof(*path)) : NULL;
-    DWORD length = path ? GetEnvironmentVariableW(L"PATH", path, required) : 0U;
-    if (!path || length == 0U || length >= required) {
-        free(path);
-        return false;
-    }
-    const wchar_t *entry = path;
-    for (const wchar_t *cursor = path;; cursor++) {
-        if (*cursor != L';' && *cursor != L'\0') {
-            continue;
-        }
-        if (watcher_windows_git_candidate(entry, (size_t)(cursor - entry), output)) {
-            free(path);
-            return true;
-        }
-        if (*cursor == L'\0') {
-            break;
-        }
-        entry = cursor + 1;
-    }
-    free(path);
-    return false;
-}
-#endif
-
 /* Run one literal argv vector in a contained process tree. active_git is
  * published under projects_lock before supervision starts, so stop/unwatch can
  * request cancellation without racing destruction of the handle. */
@@ -345,7 +226,7 @@ static watcher_git_status_t watcher_git_run(cbm_watcher_t *w, project_state_t *s
 
 #ifdef _WIN32
     char git_executable[CBM_SZ_4K];
-    if (!watcher_resolve_git_executable(git_executable)) {
+    if (!cbm_git_resolve_executable(git_executable)) {
         watcher_git_output_cleanup(output);
         return WATCHER_GIT_SUPERVISION_FAILED;
     }

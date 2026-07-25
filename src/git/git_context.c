@@ -122,8 +122,8 @@ static int resolve_current_branch(const char *path, char **out_branch) {
     }
     char branch[CBM_GIT_OUTPUT_BUFSZ];
     int exit_code = CBM_NOT_FOUND;
-    if (cbm_git_run_first_line_buf(path, "symbolic-ref --quiet --short HEAD", branch,
-                                   sizeof(branch), &exit_code) != 0) {
+    const char *const args[] = {"symbolic-ref", "--quiet", "--short", "HEAD", NULL};
+    if (cbm_git_run_first_line_buf(path, args, branch, sizeof(branch), &exit_code) != 0) {
         return CBM_NOT_FOUND;
     }
     const char *resolved = exit_code == 0 && branch[0] ? branch : exit_code == 1 ? "DETACHED" : NULL;
@@ -207,21 +207,23 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
         return 0;
     }
 
-    if (cbm_git_capture_first_line(path, "rev-parse --show-toplevel", &out->worktree_root) !=
-        0) {
+    const char *const show_toplevel[] = {"rev-parse", "--show-toplevel", NULL};
+    if (cbm_git_capture_first_line(path, show_toplevel, &out->worktree_root) != 0) {
         out->is_git = false;
         return 0;
     }
     out->is_git = true;
 
-    if (cbm_git_capture_first_line(path, "rev-parse --git-dir", &out->git_dir) != 0) {
+    const char *const git_dir[] = {"rev-parse", "--git-dir", NULL};
+    if (cbm_git_capture_first_line(path, git_dir, &out->git_dir) != 0) {
         out->git_dir = cbm_strdup("");
     }
-    if (cbm_git_capture_first_line(path, "rev-parse --git-common-dir", &out->git_common_dir) !=
-        0) {
+    const char *const git_common_dir[] = {"rev-parse", "--git-common-dir", NULL};
+    if (cbm_git_capture_first_line(path, git_common_dir, &out->git_common_dir) != 0) {
         out->git_common_dir = cbm_strdup("");
     }
-    if (cbm_git_capture_first_line(path, "rev-parse --verify HEAD", &out->head_sha) != 0) {
+    const char *const verify_head[] = {"rev-parse", "--verify", "HEAD", NULL};
+    if (cbm_git_capture_first_line(path, verify_head, &out->head_sha) != 0) {
         out->head_sha = cbm_strdup("");
     }
 
@@ -237,13 +239,15 @@ int cbm_git_context_resolve(const char *path, cbm_git_context_t *out) {
     /* git 2.31+ canonical absolute common-dir (best-effort; NULL on older git,
      * where derive_canonical_root falls back to the relative common-dir). */
     char *abs_common_dir = NULL;
-    (void)cbm_git_capture_first_line(path, "rev-parse --path-format=absolute --git-common-dir",
-                                     &abs_common_dir);
+    const char *const absolute_common_dir[] = {
+        "rev-parse", "--path-format=absolute", "--git-common-dir", NULL};
+    (void)cbm_git_capture_first_line(path, absolute_common_dir, &abs_common_dir);
     out->canonical_root =
         derive_canonical_root(path, out->worktree_root, out->git_common_dir, abs_common_dir);
     free(abs_common_dir);
     out->branch_slug = slug_from_branch(out->branch, out->is_detached);
-    if (cbm_git_capture_first_line(path, "merge-base HEAD @{upstream}", &out->base_sha) != 0) {
+    const char *const merge_base[] = {"merge-base", "HEAD", "@{upstream}", NULL};
+    if (cbm_git_capture_first_line(path, merge_base, &out->base_sha) != 0) {
         out->base_sha = cbm_strdup("");
     }
 

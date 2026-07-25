@@ -56,11 +56,16 @@ static int dpk_setup_repo(const char **filenames, const char **contents, int cou
  * the 3-fixture-only forward check still runs either way. Returns true iff
  * the repo was created, so callers can gate git-only reverse-pin keys. */
 static bool dpk_add_git_context(void) {
-    if (cbm_git_drain_command(g_dpk_tmpdir, "init -q") != 0 ||
-        cbm_git_drain_command(g_dpk_tmpdir, "config user.email test@example.com") != 0 ||
-        cbm_git_drain_command(g_dpk_tmpdir, "config user.name Test") != 0 ||
-        cbm_git_drain_command(g_dpk_tmpdir, "add .") != 0 ||
-        cbm_git_drain_command(g_dpk_tmpdir, "commit -q -m init") != 0) {
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.com", NULL};
+    const char *const name_args[] = {"config", "user.name", "Test", NULL};
+    const char *const add_args[] = {"add", ".", NULL};
+    const char *const commit_args[] = {"commit", "-q", "-m", "init", NULL};
+    if (cbm_git_drain_command(g_dpk_tmpdir, init_args) != 0 ||
+        cbm_git_drain_command(g_dpk_tmpdir, email_args) != 0 ||
+        cbm_git_drain_command(g_dpk_tmpdir, name_args) != 0 ||
+        cbm_git_drain_command(g_dpk_tmpdir, add_args) != 0 ||
+        cbm_git_drain_command(g_dpk_tmpdir, commit_args) != 0) {
         return false;
     }
     return true;
