@@ -16,11 +16,13 @@
 #include <cli/cli.h>
 #include <mcp/index_supervisor.h> /* spawn-count hook — #845 in-process guard */
 #include <mcp/mcp.h>
+#include <mcp/mcp_internal.h>
 #include <pagerank/pagerank.h>
 #include <pipeline/pipeline.h>
 #include <store/store.h>
 #include <watcher/watcher.h>
 #include <yyjson/yyjson.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +33,11 @@
 #define cbm_chdir _chdir
 #define cbm_getcwd _getcwd
 #else
+#ifdef __APPLE__
+#include <libproc.h> /* proc_pidpath — macOS only */
+#endif
+#include <signal.h>
+#include <spawn.h>
 #include <sys/wait.h> /* waitpid — #845 fork+alarm harness */
 #include <unistd.h>
 #define cbm_chdir chdir
@@ -1543,6 +1550,12 @@ TEST(tool_list_projects_paginates_with_explicit_full_compatibility) {
     PASS();
 }
 
+/* Defined with the other corrupt-store helpers further down; forward-declared
+ * so this earlier test can locate a quarantine backup by pattern rather than by
+ * a fixed filename. */
+static int mcp_find_corrupt_backups(const char *cache, const char *project, char *unique_path,
+                                    size_t unique_path_size);
+
 TEST(resolve_store_quarantines_structurally_corrupt_db) {
     char cache[256];
     snprintf(cache, sizeof(cache), "/tmp/cbm-corrupt-quarantine-XXXXXX");
@@ -1567,10 +1580,6 @@ TEST(resolve_store_quarantines_structurally_corrupt_db) {
     ASSERT_EQ(sqlite3_exec(db, "DROP TABLE projects;", NULL, NULL, NULL), SQLITE_OK);
     cbm_store_close(store);
 
-    char quarantine[512];
-    int quarantine_len = snprintf(quarantine, sizeof(quarantine), "%s.corrupt", db_path);
-    ASSERT_TRUE(quarantine_len > 0 && (size_t)quarantine_len < sizeof(quarantine));
-
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
     char *resp = cbm_mcp_server_handle(
@@ -1581,8 +1590,23 @@ TEST(resolve_store_quarantines_structurally_corrupt_db) {
     free(resp);
     cbm_mcp_server_free(srv);
 
+    /* Asserted as "a quarantined copy exists", not as one filename.
+     *
+     * This previously required the fixed path "<db>.corrupt". The merged
+     * quarantine is upstream's and reserves a UNIQUE backup name
+     * (reserve_unique_corrupt_pending, src/mcp/mcp.c:4041+), which is the
+     * stronger behavior and is itself pinned by
+     * tool_corrupt_store_cleanup_preserves_existing_backup_and_uses_unique_name:
+     * a fixed name silently OVERWRITES the previous quarantine the second time
+     * a project corrupts, destroying the earlier copy — data loss of exactly
+     * the kind this branch's own #557 fix exists to prevent. Locate the backup
+     * by pattern, the same way the other corrupt-store tests do. */
     ASSERT_FALSE(test_file_exists_mcp(db_path));
-    ASSERT_TRUE(test_file_exists_mcp(quarantine));
+    char quarantine[CBM_SZ_1K] = {0};
+    int quarantine_count =
+        mcp_find_corrupt_backups(cache, "corrupt-project", quarantine, sizeof(quarantine));
+    ASSERT_EQ(quarantine_count, 1);
+    ASSERT_TRUE(quarantine[0] != '\0');
 
     if (saved_copy) {
         cbm_setenv("CBM_CACHE_DIR", saved_copy, 1);
@@ -12181,7 +12205,18 @@ TEST(sequential_service_edge_props_are_valid_json_issue898) {
     ASSERT_NOT_NULL(strstr(resp, "indexed"));
     free(resp);
 
-    cbm_store_t *store = cbm_mcp_server_store(srv);
+    /* File-backed MCP stores are deliberately request-scoped (release_request_store,
+     * src/mcp/mcp.c) so a sibling process can atomically replace the DB generation and
+     * so Windows retains no replacement-blocking handle. index_repository resolves a
+     * file-backed store, so this server holds no cached handle once the call returns;
+     * inspect the published DB through an independent query handle. The capability that
+     * makes this necessary is pinned by
+     * file_backed_store_is_released_at_request_end_not_pinned. */
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+    char db_path[CBM_SZ_512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(store);
     struct sqlite3 *db = cbm_store_get_db(store);
     ASSERT_NOT_NULL(db);
@@ -12230,8 +12265,177 @@ TEST(sequential_service_edge_props_are_valid_json_issue898) {
     sqlite3_finalize(stmt);
     ASSERT_TRUE(brokered >= 1);
 
+    cbm_store_close(store);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    unlink(src_path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+/* index_repository used to accept any mode spelling and silently fall back to
+ * CBM_MODE_FULL, so a typo, or the internal-only "dep", produced a different index
+ * than the caller asked for and still reported success. Assert the rejection names
+ * the offending value and the accepted set, and that the accepted set is derived
+ * from CBM_INDEX_MODE_TABLE rather than restated in the message. */
+TEST(index_repository_rejects_unknown_mode_instead_of_silent_full) {
+    char accepted[CBM_SZ_64];
+    int accepted_len = cbm_index_mode_accepted(accepted, (int)sizeof(accepted));
+    ASSERT_TRUE(accepted_len > 0);
+    /* Every caller-selectable spelling appears; the internal-only one does not. */
+    ASSERT_NOT_NULL(strstr(accepted, "full"));
+    ASSERT_NOT_NULL(strstr(accepted, "moderate"));
+    ASSERT_NOT_NULL(strstr(accepted, "fast"));
+    ASSERT_NULL(strstr(accepted, "dep"));
+
+    /* The parser and the emitter agree in both directions for every spelling. */
+    cbm_index_mode_t parsed = CBM_MODE_FULL;
+    bool selectable = false;
+    ASSERT_TRUE(cbm_index_mode_from_name("fast", &parsed, &selectable));
+    ASSERT_EQ(parsed, CBM_MODE_FAST);
+    ASSERT_TRUE(selectable);
+    ASSERT_STR_EQ(cbm_index_mode_name(CBM_MODE_FAST), "fast");
+    ASSERT_TRUE(cbm_index_mode_from_name("dep", &parsed, &selectable));
+    ASSERT_EQ(parsed, CBM_MODE_DEP);
+    ASSERT_FALSE(selectable);
+    ASSERT_FALSE(cbm_index_mode_from_name("fsat", &parsed, &selectable));
+
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_modevocab_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("mkdtemp failed");
+    }
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_modevocab_cache_XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp);
+        FAIL("cache mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[CBM_SZ_512];
+    snprintf(src_path, sizeof(src_path), "%s/mod.py", tmp);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def handler():\n    return 1\n", f);
+    fclose(f);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fsat\"}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    /* Loud: names the bad value and the accepted set, and did NOT index. */
+    ASSERT_NOT_NULL(strstr(resp, "fsat"));
+    ASSERT_NOT_NULL(strstr(resp, accepted));
+    ASSERT_NULL(strstr(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    /* The internal-only spelling is rejected the same way, not treated as full. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"dep\"}", tmp);
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"status\":\"indexed\""));
+    free(resp);
+
+    /* A rejected mode must not leave the project mutation held: a valid run still
+     * succeeds afterwards on the same server. */
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", tmp);
+    resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    free(resp);
+
     cbm_mcp_server_free(srv);
     char *project = cbm_project_name_from_path(tmp);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    unlink(src_path);
+    cbm_rmdir(tmp);
+    PASS();
+}
+
+/* Companion pinning the capability the test above accommodates. The branch parent
+ * had no request-scoped release, so its copy of that test read the session handle
+ * directly; upstream added release_request_store (src/mcp/mcp.c) and rewrote its
+ * copy to open the DB by path. Merging both left the branch's body running against
+ * upstream's release, which nulled the handle and made a successful index look like
+ * a session holding no store. Assert the release itself: without it a caller pins a
+ * superseded DB generation, and on Windows that retained handle blocks the atomic
+ * replacement that publishes the next index. The in-memory exemption is asserted in
+ * the same test so neither half can regress silently. */
+TEST(file_backed_store_is_released_at_request_end_not_pinned) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_reqscope_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("mkdtemp failed");
+    }
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm_reqscope_cache_XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        cbm_rmdir(tmp);
+        FAIL("cache mkdtemp failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char src_path[CBM_SZ_512];
+    snprintf(src_path, sizeof(src_path), "%s/mod.py", tmp);
+    FILE *f = fopen(src_path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def handler():\n    return 1\n", f);
+    fclose(f);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    /* A pristine in-memory store has no path, so the request-scoped release must
+     * leave it alone: embedded and test callers keep it for the process lifetime. */
+    cbm_store_t *pristine = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(pristine);
+    ASSERT_NULL(cbm_store_db_path(pristine));
+
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", tmp);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "indexed"));
+    free(resp);
+
+    /* The request resolved a file-backed store; none may be retained past the call. */
+    ASSERT_NULL(cbm_mcp_server_store(srv));
+
+    /* Non-vacuous: the published DB exists and holds the indexed graph, so the NULL
+     * above is a released handle rather than an index that never happened. */
+    char *project = cbm_project_name_from_path(tmp);
+    ASSERT_NOT_NULL(project);
+    char db_path[CBM_SZ_512];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *published = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(published);
+    struct sqlite3 *db = cbm_store_get_db(published);
+    ASSERT_NOT_NULL(db);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "SELECT count(*) FROM nodes;", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    int nodes = sqlite3_column_int(stmt, 0);
+    sqlite3_finalize(stmt);
+    ASSERT_TRUE(nodes >= 1);
+    cbm_store_close(published);
+
+    cbm_mcp_server_free(srv);
     cleanup_project_db(cache, project);
     free(project);
     restore_cache_dir(saved_cache_copy);
@@ -12779,6 +12983,2596 @@ TEST(index_repository_honors_allowed_root) {
  *  SUITE
  * ══════════════════════════════════════════════════════════════════ */
 
+
+#define MCP_MUTATION_GUARD_MAX_EVENTS 16
+
+enum {
+    IDXFAILCLOSED_OK = 0,
+    IDXFAILCLOSED_NO_SERVER = 81,
+    IDXFAILCLOSED_PARENT_MUTATED = 82,
+    IDXFAILCLOSED_NO_RESPONSE = 83,
+    IDXFAILCLOSED_INDEXED = 84,
+    IDXFAILCLOSED_NOT_ERROR = 85,
+};
+
+enum {
+    IDXCANON_OK = 0,
+    IDXCANON_GETCWD_FAILED = 71,
+    IDXCANON_CHDIR_FAILED = 72,
+    IDXCANON_NO_SERVER = 73,
+    IDXCANON_CONTEXT_FAILED = 74,
+    IDXCANON_NO_SPAWN = 75,
+    IDXCANON_NO_RESULT = 76,
+    IDXCANON_NOT_INDEXED = 77,
+    IDXCANON_WRONG_PROJECT = 78,
+    IDXCANON_DECOY_INDEXED = 79,
+    IDXCANON_TARGET_MISSING = 80,
+    IDXCANON_CWD_RESTORE_FAILED = 81,
+};
+
+/* ── Support helpers carried over from upstream main ──────────────
+ * Required by the upstream-only tests below; none of these names exist in
+ * the api-consolidation copy of this file, so no duplicate is introduced. */
+
+extern char **environ;
+
+typedef struct {
+    int deny_begin_call;      /* one-based; zero allows every acquisition */
+    int cancel_on_begin_call; /* one-based; zero never requests cancellation */
+    int begin_count;
+    int end_count;
+    cbm_mcp_server_t *cancel_server;
+    bool cancel_attempted;
+    bool cancel_accepted;
+    const char *observed_db_path;
+    const char *observed_backup_path;
+    bool db_exists_at_begin;
+    bool backup_exists_at_begin;
+    bool db_exists_at_end;
+    bool backup_exists_at_end;
+    char begin_projects[MCP_MUTATION_GUARD_MAX_EVENTS][CBM_SZ_256];
+    char end_projects[MCP_MUTATION_GUARD_MAX_EVENTS][CBM_SZ_256];
+} mcp_mutation_guard_probe_t;
+
+typedef struct {
+    const char *deny_step;
+    int call_count;
+    char steps[4][64];
+} mcp_quarantine_hook_probe_t;
+
+typedef struct {
+    bool reject_merge_base;
+    int diff_calls;
+    int merge_base_calls;
+} mcp_command_hook_probe_t;
+
+static bool mcp_quarantine_hook_probe(void *context, const char *step) {
+    mcp_quarantine_hook_probe_t *probe = context;
+    if (!probe || !step) {
+        return false;
+    }
+    int event = probe->call_count++;
+    if (event >= 0 && event < 4) {
+        snprintf(probe->steps[event], sizeof(probe->steps[event]), "%s", step);
+    }
+    return !probe->deny_step || strcmp(probe->deny_step, step) != 0;
+}
+
+static bool mcp_command_hook_probe(void *context, const char *command) {
+    mcp_command_hook_probe_t *probe = context;
+    if (!probe || !command) {
+        return false;
+    }
+    if (strstr(command, "merge-base")) {
+        probe->merge_base_calls++;
+        return !probe->reject_merge_base;
+    }
+    probe->diff_calls++;
+    return true;
+}
+
+static bool mcp_mutation_guard_probe_begin(void *context, const char *project) {
+    mcp_mutation_guard_probe_t *probe = context;
+    if (!probe) {
+        return false;
+    }
+
+    int event = probe->begin_count++;
+    if (event < MCP_MUTATION_GUARD_MAX_EVENTS) {
+        snprintf(probe->begin_projects[event], sizeof(probe->begin_projects[event]), "%s",
+                 project ? project : "");
+    }
+    if (probe->cancel_on_begin_call > 0 && probe->begin_count == probe->cancel_on_begin_call) {
+        probe->cancel_attempted = true;
+        probe->cancel_accepted = cbm_mcp_server_cancel_active(probe->cancel_server);
+    }
+    if (probe->observed_db_path) {
+        probe->db_exists_at_begin = cbm_file_exists(probe->observed_db_path);
+    }
+    if (probe->observed_backup_path) {
+        probe->backup_exists_at_begin = cbm_file_exists(probe->observed_backup_path);
+    }
+    return probe->deny_begin_call == 0 || probe->begin_count != probe->deny_begin_call;
+}
+
+static void mcp_mutation_guard_probe_end(void *context, const char *project) {
+    mcp_mutation_guard_probe_t *probe = context;
+    if (!probe) {
+        return;
+    }
+
+    int event = probe->end_count++;
+    if (event < MCP_MUTATION_GUARD_MAX_EVENTS) {
+        snprintf(probe->end_projects[event], sizeof(probe->end_projects[event]), "%s",
+                 project ? project : "");
+    }
+    if (probe->observed_db_path) {
+        probe->db_exists_at_end = cbm_file_exists(probe->observed_db_path);
+    }
+    if (probe->observed_backup_path) {
+        probe->backup_exists_at_end = cbm_file_exists(probe->observed_backup_path);
+    }
+}
+
+static bool mcp_make_corrupt_project_store(const char *cache, const char *project) {
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return false;
+    }
+
+    /* A numeric root path alone is NOT a corruption trigger in this tree — it is
+     * the #557 COSMETIC case, which cbm_store_check_integrity_full reports via
+     * path_only_failure (src/store/store.c:1519-1525) so that
+     * resolve_store_internal RETAINS the database (src/mcp/mcp.c:4234) instead
+     * of quarantining it. Tests that mean "structurally corrupt" must also
+     * break the projects table itself, which makes the integrity check's own
+     * "SELECT count(*) FROM projects" fail to prepare (store.c:1473-1477) and
+     * leaves path_only false. The `nodes` table survives, so
+     * validate_cbm_db_with_timeout still admits the file as one of ours.
+     *
+     * The cosmetic half is pinned by
+     * tool_cosmetic_root_path_store_is_retained_not_quarantined, so both
+     * behaviors are locked and neither can regress silently. */
+    bool created = cbm_store_upsert_project(store, project, "826") == CBM_STORE_OK &&
+                   cbm_store_exec(store, "DROP TABLE projects;") == CBM_STORE_OK;
+    cbm_store_close(store);
+    return created;
+}
+
+static cbm_store_t *mcp_open_corrupt_project_store_with_wal(const char *cache,
+                                                            const char *project) {
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return NULL;
+    }
+
+    /* The corruption must be STRUCTURAL, not cosmetic.
+     *
+     * This fixture previously marked corruption only by writing root_path
+     * "826", which was sufficient upstream. In the merged tree that is
+     * explicitly the COSMETIC case: cbm_store_check_integrity_full
+     * (src/store/store.c:1501-1525) flags a root_path not starting with '/' or
+     * a letter, but reports it through path_only_failure, and
+     * resolve_store_internal (src/mcp/mcp.c:4234) then RETAINS the database
+     * rather than quarantining it — the #557 data-loss fix. The guarded
+     * quarantine arm was therefore never reached and the mutation guard never
+     * fired, which is what made every test using this fixture fail.
+     *
+     * Dropping `projects` makes the integrity check's own "SELECT count(*) FROM
+     * projects" fail to prepare (store.c:1473-1477), so it returns false with
+     * path_only_failure left false — genuine corruption, which is what these
+     * tests mean to exercise. The `nodes` table survives, so
+     * validate_cbm_db_with_timeout still admits the file as one of ours; the
+     * drop is a write, so the WAL the tests snapshot still exists.
+     *
+     * The cosmetic half is pinned separately by
+     * tool_cosmetic_root_path_store_is_retained_not_quarantined, so neither
+     * parent's behavior can regress unnoticed. */
+    bool ready =
+        cbm_store_exec(store, "PRAGMA wal_autocheckpoint=0;") == CBM_STORE_OK &&
+        cbm_store_upsert_project(store, project, "826") == CBM_STORE_OK &&
+        cbm_store_exec(store, "CREATE TABLE IF NOT EXISTS guard_wal_sentinel(value TEXT);"
+                              "INSERT INTO guard_wal_sentinel(value) VALUES('committed');") ==
+            CBM_STORE_OK &&
+        cbm_store_exec(store, "DROP TABLE projects;") == CBM_STORE_OK;
+    if (!ready) {
+        cbm_store_close(store);
+        return NULL;
+    }
+    return store;
+}
+
+static bool mcp_make_valid_project_store_at(const char *path, const char *project,
+                                            const char *root_path) {
+    cbm_store_t *store = cbm_store_open_path(path);
+    if (!store) {
+        return false;
+    }
+    bool ready = cbm_store_upsert_project(store, project, root_path) == CBM_STORE_OK &&
+                 cbm_store_prepare_for_publish(store) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return ready;
+}
+
+static unsigned char *mcp_read_file_bytes(const char *path, long *out_len) {
+    if (!out_len) {
+        return NULL;
+    }
+    *out_len = 0;
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return NULL;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long size = ftell(fp);
+    if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    unsigned char *bytes = malloc(size > 0 ? (size_t)size : 1);
+    if (!bytes) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t read_count = fread(bytes, 1, (size_t)size, fp);
+    fclose(fp);
+    if (read_count != (size_t)size) {
+        free(bytes);
+        return NULL;
+    }
+    *out_len = size;
+    return bytes;
+}
+
+static bool mcp_file_matches_snapshot(const char *path, const unsigned char *expected,
+                                      long expected_len) {
+    long actual_len = 0;
+    unsigned char *actual = mcp_read_file_bytes(path, &actual_len);
+    bool matches = actual && expected && actual_len == expected_len &&
+                   memcmp(actual, expected, (size_t)actual_len) == 0;
+    free(actual);
+    return matches;
+}
+
+static bool mcp_is_corrupt_backup_main_name(const char *name, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    if (strcmp(name, prefix) == 0) {
+        return true;
+    }
+    const char *suffix = name + prefix_len;
+    if (strncmp(name, prefix, prefix_len) != 0 || suffix[0] != '.' || strlen(suffix + 1) != 16) {
+        return false;
+    }
+    for (const char *cursor = suffix + 1; *cursor; cursor++) {
+        if (!isxdigit((unsigned char)*cursor)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int mcp_find_corrupt_backups(const char *cache, const char *project, char *unique_path,
+                                    size_t unique_path_size) {
+    if (unique_path && unique_path_size > 0) {
+        unique_path[0] = '\0';
+    }
+    char prefix[CBM_DIRENT_NAME_MAX];
+    snprintf(prefix, sizeof(prefix), "%s.db.corrupt", project);
+    int count = 0;
+    cbm_dir_t *dir = cbm_opendir(cache);
+    if (!dir) {
+        return 0;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (!mcp_is_corrupt_backup_main_name(entry->name, prefix)) {
+            continue;
+        }
+        char path[CBM_SZ_1K];
+        snprintf(path, sizeof(path), "%s/%s", cache, entry->name);
+        if (!cbm_file_exists(path)) {
+            continue;
+        }
+        count++;
+        if (unique_path && unique_path_size > 0 && unique_path[0] == '\0' &&
+            strcmp(entry->name, prefix) != 0) {
+            snprintf(unique_path, unique_path_size, "%s", path);
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+static int mcp_count_corrupt_artifacts(const char *cache, const char *project) {
+    char prefix[CBM_DIRENT_NAME_MAX];
+    snprintf(prefix, sizeof(prefix), "%s.db.corrupt", project);
+    size_t prefix_len = strlen(prefix);
+    int count = 0;
+    cbm_dir_t *dir = cbm_opendir(cache);
+    if (!dir) {
+        return 0;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, prefix, prefix_len) == 0) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+static int mcp_count_directory_entries_with_prefix(const char *directory, const char *prefix) {
+    cbm_dir_t *dir = cbm_opendir(directory);
+    if (!dir) {
+        return -1;
+    }
+    size_t prefix_length = strlen(prefix);
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, prefix, prefix_length) == 0) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+static void mcp_cleanup_corrupt_backups(const char *cache, const char *project) {
+    char prefix[CBM_DIRENT_NAME_MAX];
+    snprintf(prefix, sizeof(prefix), "%s.db.corrupt", project);
+    size_t prefix_len = strlen(prefix);
+    cbm_dir_t *dir = cbm_opendir(cache);
+    if (!dir) {
+        return;
+    }
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, prefix, prefix_len) == 0) {
+            char path[CBM_SZ_1K];
+            snprintf(path, sizeof(path), "%s/%s", cache, entry->name);
+            cbm_unlink(path);
+        }
+    }
+    cbm_closedir(dir);
+}
+
+typedef struct {
+    mcp_mutation_guard_probe_t guard;
+    const char *replacement_path;
+    const char *live_path;
+    bool replacement_attempted;
+    bool replacement_succeeded;
+} mcp_replacing_mutation_guard_t;
+
+static bool mcp_replacing_mutation_guard_begin(void *context, const char *project) {
+    mcp_replacing_mutation_guard_t *replacement = context;
+    if (!replacement || !mcp_mutation_guard_probe_begin(&replacement->guard, project)) {
+        return false;
+    }
+    replacement->replacement_attempted = true;
+    bool sidecars_removed = cbm_remove_db_sidecars(replacement->live_path) == 0;
+    replacement->replacement_succeeded =
+        sidecars_removed &&
+        cbm_rename_replace(replacement->replacement_path, replacement->live_path) == 0;
+    return true;
+}
+
+static void mcp_replacing_mutation_guard_end(void *context, const char *project) {
+    mcp_replacing_mutation_guard_t *replacement = context;
+    if (replacement) {
+        mcp_mutation_guard_probe_end(&replacement->guard, project);
+    }
+}
+
+static bool mcp_cross_repo_create_project_store(const char *cache, const char *project,
+                                                const char *root_path) {
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return false;
+    }
+    bool created = cbm_store_upsert_project(store, project, root_path) == CBM_STORE_OK;
+    cbm_store_close(store);
+    return created;
+}
+
+static bool mcp_cross_repo_seed_http_match(const char *cache, const char *source_project,
+                                           const char *target_project, const char *root_path) {
+    char source_path[CBM_SZ_1K];
+    char target_path[CBM_SZ_1K];
+    snprintf(source_path, sizeof(source_path), "%s/%s.db", cache, source_project);
+    snprintf(target_path, sizeof(target_path), "%s/%s.db", cache, target_project);
+
+    cbm_store_t *source = cbm_store_open_path(source_path);
+    cbm_store_t *target = cbm_store_open_path(target_path);
+    if (!source || !target) {
+        cbm_store_close(source);
+        cbm_store_close(target);
+        return false;
+    }
+
+    bool ok = cbm_store_upsert_project(source, source_project, root_path) == CBM_STORE_OK &&
+              cbm_store_upsert_project(target, target_project, root_path) == CBM_STORE_OK;
+
+    cbm_node_t caller = {.project = source_project,
+                         .label = "Function",
+                         .name = "call_once",
+                         .qualified_name = "cross.source.call_once",
+                         .file_path = "client.c",
+                         .start_line = 1,
+                         .end_line = 2};
+    cbm_node_t local_route = {.project = source_project,
+                              .label = "Route",
+                              .name = "GET /dedupe",
+                              .qualified_name = "__route__GET__/dedupe",
+                              .file_path = "client.c",
+                              .start_line = 3,
+                              .end_line = 3};
+    int64_t caller_id = ok ? cbm_store_upsert_node(source, &caller) : 0;
+    int64_t local_route_id = ok ? cbm_store_upsert_node(source, &local_route) : 0;
+    cbm_edge_t http_call = {.project = source_project,
+                            .source_id = caller_id,
+                            .target_id = local_route_id,
+                            .type = "HTTP_CALLS",
+                            .properties_json = "{\"url_path\":\"/dedupe\",\"method\":\"GET\"}"};
+    ok = ok && caller_id > 0 && local_route_id > 0 && cbm_store_insert_edge(source, &http_call) > 0;
+
+    cbm_node_t target_route = {.project = target_project,
+                               .label = "Route",
+                               .name = "GET /dedupe",
+                               .qualified_name = "__route__GET__/dedupe",
+                               .file_path = "server.c",
+                               .start_line = 3,
+                               .end_line = 3};
+    cbm_node_t handler = {.project = target_project,
+                          .label = "Function",
+                          .name = "handle_once",
+                          .qualified_name = "cross.target.handle_once",
+                          .file_path = "server.c",
+                          .start_line = 1,
+                          .end_line = 2};
+    int64_t target_route_id = ok ? cbm_store_upsert_node(target, &target_route) : 0;
+    int64_t handler_id = ok ? cbm_store_upsert_node(target, &handler) : 0;
+    cbm_edge_t handles = {.project = target_project,
+                          .source_id = handler_id,
+                          .target_id = target_route_id,
+                          .type = "HANDLES"};
+    ok = ok && target_route_id > 0 && handler_id > 0 && cbm_store_insert_edge(target, &handles) > 0;
+
+    cbm_store_close(source);
+    cbm_store_close(target);
+    return ok;
+}
+
+static unsigned char mcp_test_ascii_casefold(unsigned char ch) {
+    return ch >= 'A' && ch <= 'Z' ? (unsigned char)(ch + ('a' - 'A')) : ch;
+}
+
+static bool mcp_test_project_keys_equivalent(const char *left, const char *right) {
+    if (!left || !right) {
+        return left == right;
+    }
+    while (*left && *right) {
+        if (mcp_test_ascii_casefold((unsigned char)*left) !=
+            mcp_test_ascii_casefold((unsigned char)*right)) {
+            return false;
+        }
+        left++;
+        right++;
+    }
+    return *left == *right;
+}
+
+int mcp_test_idxfailclosed_supervisor_start_check(const char *repo_dir, const char *cache_dir) {
+    (void)cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_index_supervisor_mark_host();
+    (void)cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    if (!srv) {
+        return IDXFAILCLOSED_NO_SERVER;
+    }
+    mcp_mutation_guard_probe_t parent_guard = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &parent_guard);
+
+    char args[CBM_SZ_4K];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo_dir);
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+
+    int result = IDXFAILCLOSED_OK;
+    if (parent_guard.begin_count != 0 || parent_guard.end_count != 0) {
+        result = IDXFAILCLOSED_PARENT_MUTATED;
+    } else if (!response) {
+        result = IDXFAILCLOSED_NO_RESPONSE;
+    } else if (response_contains_json_fragment(response, "\"status\":\"indexed\"")) {
+        result = IDXFAILCLOSED_INDEXED;
+    } else if (!response_contains_json_fragment(response, "\"status\":\"error\"") ||
+               !response_contains_json_fragment(response, "\"outcome\":\"spawn_failed\"")) {
+        result = IDXFAILCLOSED_NOT_ERROR;
+    }
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    return result;
+}
+
+static bool idxfailclosed_self_path(char out[CBM_SZ_4K]) {
+#ifdef __APPLE__
+    int length = proc_pidpath(getpid(), out, CBM_SZ_4K);
+    bool resolved = length > 0 && length < CBM_SZ_4K;
+    if (resolved) {
+        out[length] = '\0';
+    }
+    return resolved;
+#elif defined(__linux__)
+    ssize_t length = readlink("/proc/self/exe", out, CBM_SZ_4K - 1);
+    bool resolved = length > 0 && length < (ssize_t)CBM_SZ_4K - 1;
+    if (resolved) {
+        out[length] = '\0';
+    }
+    return resolved;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
+static int idxcanon_supervised_session_path_check(const char *session_root, const char *decoy_cwd) {
+    char saved_cwd[CBM_SZ_4K];
+    if (!cbm_getcwd(saved_cwd, sizeof(saved_cwd))) {
+        return IDXCANON_GETCWD_FAILED;
+    }
+    if (cbm_chdir(decoy_cwd) != 0) {
+        return IDXCANON_CHDIR_FAILED;
+    }
+
+    /* Match a real supervisor host. Environment changes are isolated to this
+     * forked child and inherited by its worker; the parent test process keeps
+     * its supervisor kill switch and allowed-root environment untouched. */
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_unsetenv("CBM_ALLOWED_ROOT");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "1", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+
+    char session_repo[CBM_SZ_4K];
+    char decoy_repo[CBM_SZ_4K];
+    snprintf(session_repo, sizeof(session_repo), "%s/repo", session_root);
+    snprintf(decoy_repo, sizeof(decoy_repo), "%s/repo", decoy_cwd);
+    char *session_project = cbm_project_name_from_path(session_repo);
+    char *decoy_project = cbm_project_name_from_path(decoy_repo);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    int code = IDXCANON_OK;
+    if (!srv) {
+        code = IDXCANON_NO_SERVER;
+    } else if (!cbm_mcp_server_set_session_context(srv, session_root, session_root)) {
+        code = IDXCANON_CONTEXT_FAILED;
+    }
+
+    int spawns_before = cbm_index_supervisor_spawn_count();
+    char *resp = code == IDXCANON_OK
+                     ? cbm_mcp_handle_tool(srv, "index_repository",
+                                           "{\"repo_path\":\"repo\",\"mode\":\"fast\"}")
+                     : NULL;
+    int spawns_after = cbm_index_supervisor_spawn_count();
+    if (code == IDXCANON_OK && spawns_after == spawns_before) {
+        code = IDXCANON_NO_SPAWN;
+    } else if (code == IDXCANON_OK && !resp) {
+        code = IDXCANON_NO_RESULT;
+    } else if (code == IDXCANON_OK &&
+               !response_contains_json_fragment(resp, "\"status\":\"indexed\"")) {
+        code = IDXCANON_NOT_INDEXED;
+    }
+
+    if (code == IDXCANON_OK) {
+        char expected[CBM_SZ_4K];
+        snprintf(expected, sizeof(expected), "\"project\":\"%s\"",
+                 session_project ? session_project : "");
+        if (!session_project || !response_contains_json_fragment(resp, expected)) {
+            code = IDXCANON_WRONG_PROJECT;
+        }
+    }
+    free(resp);
+
+    /* A raw "repo" handoff is interpreted relative to decoy_cwd by the worker
+     * and creates this project DB. Its absence proves the original JSON did not
+     * substitute a different path after the parent validated session_repo. */
+    if (code == IDXCANON_OK) {
+        const char *cache = getenv("CBM_CACHE_DIR");
+        char decoy_db[CBM_SZ_4K];
+        snprintf(decoy_db, sizeof(decoy_db), "%s/%s.db", cache ? cache : "",
+                 decoy_project ? decoy_project : "");
+        if (!cache || !decoy_project || cbm_file_size(decoy_db) >= 0) {
+            code = IDXCANON_DECOY_INDEXED;
+        }
+    }
+
+    if (code == IDXCANON_OK) {
+        char query[CBM_SZ_4K];
+        snprintf(query, sizeof(query),
+                 "{\"project\":\"%s\",\"name_pattern\":\"canonical_target_fn\","
+                 "\"label\":\"Function\"}",
+                 session_project ? session_project : "");
+        char *search = cbm_mcp_handle_tool(srv, "search_graph", query);
+        if (!session_project || !search || !strstr(search, "canonical_target_fn")) {
+            code = IDXCANON_TARGET_MISSING;
+        }
+        free(search);
+    }
+
+    cbm_mcp_server_free(srv);
+    free(session_project);
+    free(decoy_project);
+    if (cbm_chdir(saved_cwd) != 0 && code == IDXCANON_OK) {
+        code = IDXCANON_CWD_RESTORE_FAILED;
+    }
+    return code;
+}
+
+/* ── Tests carried over from upstream main ──────────────────────────
+ * Upstream-only coverage: cross-repo mutation guards and lease cancellation,
+ * corrupt-store cleanup, request-scope cancellation, index-supervisor
+ * fail-closed behavior, and Windows cmd metacharacter rejection. */
+
+TEST(tool_search_graph_toon_never_leaks_internal_fields) {
+    /* The similarity/semantic pipeline intermediates (fp minhash hex, sp
+     * structural profile, bt body-token bag) dominated the legacy payload
+     * (~45%) and carry zero agent value. GUARD: they never appear in TOON
+     * output — not by default and not even when explicitly requested via
+     * fields (blocklist). */
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    /* A node whose properties carry the internal fields with sentinels. */
+    cbm_node_t n = {0};
+    n.project = "test-project";
+    n.label = "Function";
+    n.name = "fpCarrier";
+    n.qualified_name = "test-project.src.fpCarrier";
+    n.file_path = "src/fp.go";
+    n.start_line = 1;
+    n.end_line = 2;
+    n.properties_json = "{\"fp\":\"FPSENTINEL00\",\"sp\":\"SPSENTINEL00\","
+                        "\"bt\":\"BTSENTINEL00\",\"complexity\":7}";
+    ASSERT_GT(cbm_store_upsert_node(st, &n), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":45,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"test-project\",\"name_pattern\":\"fpCarrier\","
+             "\"fields\":[\"fp\",\"sp\",\"bt\",\"complexity\"],\"limit\":5}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "fpCarrier"));
+    ASSERT_NULL(strstr(inner, "FPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "SPSENTINEL00"));
+    ASSERT_NULL(strstr(inner, "BTSENTINEL00"));
+    /* Non-blocked requested field still comes through. */
+    ASSERT_NOT_NULL(strstr(inner, "complexity"));
+    free(inner);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_trace_call_path_not_found) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"trace_call_path\","
+                                   "\"arguments\":{\"function_name\":\"NonExistent\","
+                                   "\"project\":\"nonexistent\"}}}");
+    ASSERT_NOT_NULL(resp);
+    /* Should return error about project not found */
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression: two same-named definitions with equal rank must be reported
+ * ambiguous, not silently traced (trace_path previously took nodes[0]). */
+TEST(tool_trace_call_path_ambiguous) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "amb-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/amb");
+    cbm_node_t a = {.project = proj,
+                    .label = "Function",
+                    .name = "amb",
+                    .qualified_name = "amb-proj.a.amb",
+                    .file_path = "a.c",
+                    .start_line = 10,
+                    .end_line = 20};
+    cbm_node_t b = {.project = proj,
+                    .label = "Function",
+                    .name = "amb",
+                    .qualified_name = "amb-proj.b.amb",
+                    .file_path = "b.c",
+                    .start_line = 10,
+                    .end_line = 20}; /* equal span -> genuine tie */
+    ASSERT_GT(cbm_store_upsert_node(st, &a), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &b), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":61,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\","
+             "\"arguments\":{\"function_name\":\"amb\",\"project\":\"amb-proj\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NOT_NULL(strstr(inner, "suggestions"));
+    ASSERT_NULL(strstr(inner, "\"callees\""));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* Regression: when same-named nodes differ in rank, trace must pick the real
+ * definition (callable, larger body) — NOT nodes[0]. The Module is inserted
+ * first; if trace took nodes[0] the outbound trace would be empty. */
+TEST(tool_trace_call_path_prefers_definition) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "pref-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/pref");
+    /* nodes[0]: the WRONG match (a Module, tiny span), inserted first. */
+    cbm_node_t wrong = {.project = proj,
+                        .label = "Module",
+                        .name = "dup",
+                        .qualified_name = "pref-proj.dup",
+                        .file_path = "dup.x",
+                        .start_line = 1,
+                        .end_line = 1};
+    /* the real definition: a Function with a body. */
+    cbm_node_t def = {.project = proj,
+                      .label = "Function",
+                      .name = "dup",
+                      .qualified_name = "pref-proj.src.dup",
+                      .file_path = "src/dup.c",
+                      .start_line = 10,
+                      .end_line = 50};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "callee",
+                         .qualified_name = "pref-proj.src.callee",
+                         .file_path = "src/dup.c",
+                         .start_line = 60,
+                         .end_line = 70};
+    ASSERT_GT(cbm_store_upsert_node(st, &wrong), 0);
+    int64_t id_def = cbm_store_upsert_node(st, &def);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_def, 0);
+    ASSERT_GT(id_callee, 0);
+    cbm_edge_t e = {.project = proj, .source_id = id_def, .target_id = id_callee, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":62,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"dup\","
+             "\"project\":\"pref-proj\",\"direction\":\"outbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    /* picked the Function definition -> its outbound CALLS edge to "callee" shows */
+    ASSERT_NOT_NULL(strstr(inner, "callee"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-guard-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-delete-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, "/tmp/guard-delete-project"), CBM_STORE_OK);
+    cbm_store_close(setup);
+    ASSERT_TRUE(cbm_file_exists(db_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp =
+        cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"guard-delete-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "blocked"));
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_STR_EQ(probe.begin_projects[0], project);
+    ASSERT_TRUE(cbm_file_exists(db_path));
+    free(resp);
+
+    probe.deny_begin_call = 0;
+    resp = cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"guard-delete-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    ASSERT_EQ(probe.begin_count, 2);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[1], project);
+    ASSERT_STR_EQ(probe.end_projects[0], project);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
+TEST(tool_index_repository_mutation_guard_blocks_before_local_worker) {
+    char root[CBM_SZ_1K];
+    (void)snprintf(root, sizeof(root), "%s/cbm-index-guard-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char args[CBM_SZ_2K];
+    (void)snprintf(args, sizeof(args),
+                   "{\"repo_path\":\"%s\",\"name\":\"GuardedIndex\","
+                   "\"mode\":\"fast\"}",
+                   root);
+    int spawn_before = cbm_index_supervisor_spawn_count();
+    char *response = cbm_mcp_handle_tool(srv, "index_repository", args);
+    int spawn_after = cbm_index_supervisor_spawn_count();
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "blocked"));
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 0);
+    ASSERT_STR_EQ(probe.begin_projects[0], "GuardedIndex");
+    ASSERT_EQ(spawn_after, spawn_before);
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    (void)th_rmtree(root);
+    PASS();
+}
+
+TEST(tool_manage_adr_mutation_guard_balances_success) {
+    const char *project = "guard-adr-success";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/guard-adr-success"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"guard-adr-success\",\"mode\":\"update\","
+                                     "\"content\":\"## PURPOSE\\nGuarded ADR.\\n\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "updated"));
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], project);
+    ASSERT_STR_EQ(probe.end_projects[0], project);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_manage_adr_mutation_guard_releases_on_missing_store) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-adr-guard-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-adr-missing";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *resp = cbm_mcp_handle_tool(srv, "manage_adr",
+                                     "{\"project\":\"guard-adr-missing\",\"mode\":\"get\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_TRUE(strstr(resp, "not found") || strstr(resp, "not indexed"));
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_STR_EQ(probe.begin_projects[0], project);
+    ASSERT_STR_EQ(probe.end_projects[0], project);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
+/* A raw cbm_mcp_handle_tool() call is still one request lifetime. Cancellation
+ * published from inside a non-pipeline handler must therefore be accepted,
+ * observed before the write, and retired at completion so the next raw request
+ * on the same server is not poisoned. */
+TEST(tool_raw_dispatch_cancel_is_scoped_non_mutating_and_next_request_clean) {
+    const char *project = "raw-cancel-adr";
+    char root[256];
+    snprintf(root, sizeof(root), "%s/cbm-mcp-raw-adr-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, root), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    mcp_mutation_guard_probe_t probe = {
+        .cancel_on_begin_call = 1,
+        .cancel_server = srv,
+    };
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char *cancelled_response =
+        cbm_mcp_handle_tool(srv, "manage_adr",
+                            "{\"project\":\"raw-cancel-adr\",\"mode\":\"update\","
+                            "\"content\":\"## PURPOSE\\nMUST NOT COMMIT.\\n\"}");
+    bool cancellation_reported = cancelled_response && strstr(cancelled_response, "cancelled") &&
+                                 strstr(cancelled_response, "\"isError\":true");
+
+    cbm_adr_t cancelled_adr = {0};
+    int cancelled_lookup = cbm_store_adr_get(store, project, &cancelled_adr);
+    if (cancelled_lookup == CBM_STORE_OK) {
+        cbm_store_adr_free(&cancelled_adr);
+    }
+
+    char *next_response =
+        cbm_mcp_handle_tool(srv, "manage_adr",
+                            "{\"project\":\"raw-cancel-adr\",\"mode\":\"update\","
+                            "\"content\":\"## PURPOSE\\nClean next request.\\n\"}");
+    bool next_response_clean = next_response && strstr(next_response, "updated") &&
+                               !strstr(next_response, "cancelled") &&
+                               !strstr(next_response, "\"isError\":true");
+    cbm_adr_t next_adr = {0};
+    int next_lookup = cbm_store_adr_get(store, project, &next_adr);
+    bool next_write_committed = next_lookup == CBM_STORE_OK && next_adr.content &&
+                                strstr(next_adr.content, "Clean next request") &&
+                                !strstr(next_adr.content, "MUST NOT COMMIT");
+    if (next_lookup == CBM_STORE_OK) {
+        cbm_store_adr_free(&next_adr);
+    }
+
+    free(cancelled_response);
+    free(next_response);
+    cbm_mcp_server_free(srv);
+    (void)cbm_rmdir(root);
+
+    ASSERT_TRUE(probe.cancel_attempted);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_TRUE(cancellation_reported);
+    ASSERT_EQ(cancelled_lookup, CBM_STORE_NOT_FOUND);
+    ASSERT_TRUE(next_response_clean);
+    ASSERT_TRUE(next_write_committed);
+    ASSERT_EQ(probe.begin_count, 2);
+    ASSERT_EQ(probe.end_count, 2);
+    ASSERT_STR_EQ(probe.begin_projects[0], project);
+    ASSERT_STR_EQ(probe.end_projects[0], project);
+    ASSERT_STR_EQ(probe.begin_projects[1], project);
+    ASSERT_STR_EQ(probe.end_projects[1], project);
+    PASS();
+}
+
+/* The daemon publishes its transport request before entering MCP dispatch. A
+ * disconnect in that narrow interval must remain latched through the nested
+ * raw tool scope instead of being erased at dispatch entry. */
+TEST(tool_outer_request_scope_preserves_predispatch_cancel) {
+    const char *project = "outer-scope-cancel-adr";
+    char root[256];
+    (void)snprintf(root, sizeof(root), "%s/cbm-mcp-outer-cancel-XXXXXX", cbm_tmpdir());
+    bool root_created = cbm_mkdtemp(root) != NULL;
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    bool project_ready =
+        root_created && store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    cbm_mcp_server_set_project(srv, project);
+    bool outer_scope = project_ready && cbm_mcp_server_request_scope_begin(srv);
+    bool cancel_accepted = outer_scope && cbm_mcp_server_cancel_active(srv);
+    char *cancelled_response =
+        cancel_accepted
+            ? cbm_mcp_handle_tool(srv, "manage_adr",
+                                  "{\"project\":\"outer-scope-cancel-adr\","
+                                  "\"mode\":\"update\",\"content\":\"MUST NOT COMMIT\"}")
+            : NULL;
+    bool cancellation_reported = cancelled_response && strstr(cancelled_response, "cancelled") &&
+                                 strstr(cancelled_response, "\"isError\":true");
+    cbm_mcp_server_request_scope_end(srv);
+
+    char *next_response = srv ? cbm_mcp_handle_tool(srv, "ingest_traces", "{\"traces\":[]}") : NULL;
+    bool next_response_clean = next_response && strstr(next_response, "accepted") &&
+                               !strstr(next_response, "cancelled") &&
+                               !strstr(next_response, "\"isError\":true");
+
+    free(cancelled_response);
+    free(next_response);
+    cbm_mcp_server_free(srv);
+    (void)cbm_rmdir(root);
+
+    ASSERT_TRUE(root_created);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(project_ready);
+    ASSERT_TRUE(outer_scope);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(cancellation_reported);
+    ASSERT_TRUE(next_response_clean);
+    PASS();
+}
+
+/* Publish cancellation from the local index mutation guard: the request scope
+ * must already be active, and the cancellation must either stop before
+ * pipeline admission or remain set through pipeline binding. No project DB may
+ * be published, and the following request must start with a clean token. */
+TEST(tool_index_repository_early_raw_cancel_survives_index_entry) {
+    char cache[256];
+    char repo[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-raw-index-cache-XXXXXX", cbm_tmpdir());
+    snprintf(repo, sizeof(repo), "%s/cbm-mcp-raw-index-repo-XXXXXX", cbm_tmpdir());
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+    bool repo_created = cbm_mkdtemp(repo) != NULL;
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    if (cache_created) {
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    }
+
+    char *project = repo_created ? cbm_project_name_from_path(repo) : NULL;
+    cbm_mcp_server_t *srv =
+        cache_created && repo_created && project ? cbm_mcp_server_new(NULL) : NULL;
+    mcp_mutation_guard_probe_t probe = {
+        .cancel_on_begin_call = 1,
+        .cancel_server = srv,
+    };
+    if (srv) {
+        cbm_mcp_server_set_background_tasks(srv, false);
+        cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                                  mcp_mutation_guard_probe_end, &probe);
+    }
+
+    char args[CBM_SZ_1K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", repo);
+    char *cancelled_response = srv ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
+    bool cancellation_reported = cancelled_response && strstr(cancelled_response, "cancelled") &&
+                                 strstr(cancelled_response, "\"isError\":true");
+
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing-project");
+    bool no_project_published = !cbm_file_exists(db_path);
+
+    char *next_response = srv ? cbm_mcp_handle_tool(srv, "ingest_traces", "{\"traces\":[]}") : NULL;
+    bool next_response_clean = next_response && strstr(next_response, "accepted") &&
+                               !strstr(next_response, "cancelled") &&
+                               !strstr(next_response, "\"isError\":true");
+
+    free(cancelled_response);
+    free(next_response);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    if (cache_created) {
+        (void)cbm_rmdir(cache);
+    }
+    if (repo_created) {
+        (void)cbm_rmdir(repo);
+    }
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    free(project);
+
+    ASSERT_TRUE(cache_created);
+    ASSERT_TRUE(repo_created);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(probe.cancel_attempted);
+    ASSERT_TRUE(probe.cancel_accepted);
+    ASSERT_TRUE(cancellation_reported);
+    ASSERT_EQ(probe.begin_count, 1);
+    ASSERT_EQ(probe.end_count, 1);
+    ASSERT_TRUE(no_project_published);
+    ASSERT_TRUE(next_response_clean);
+    PASS();
+}
+
+TEST(tool_cross_repo_mutation_guard_sorts_dedupes_and_unwinds) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-cross-guard-XXXXXX");
+    if (!cbm_mkdtemp(repo)) {
+        PASS();
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, repo, NULL));
+
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 3};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"zzz-target\",\"000-target\",\"zzz-target\"]}",
+             repo);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "blocked"));
+
+    /* The source plus two unique targets are acquired in lexical order. The
+     * third acquisition is denied, so only the first two are unwound. */
+    ASSERT_EQ(probe.begin_count, 3);
+    ASSERT_TRUE(strcmp(probe.begin_projects[0], probe.begin_projects[1]) < 0);
+    ASSERT_TRUE(strcmp(probe.begin_projects[1], probe.begin_projects[2]) < 0);
+    int low_target_count = 0;
+    int high_target_count = 0;
+    for (int i = 0; i < probe.begin_count; i++) {
+        low_target_count += strcmp(probe.begin_projects[i], "000-target") == 0;
+        high_target_count += strcmp(probe.begin_projects[i], "zzz-target") == 0;
+    }
+    ASSERT_EQ(low_target_count, 1);
+    ASSERT_EQ(high_target_count, 1);
+    ASSERT_EQ(probe.end_count, 2);
+    ASSERT_STR_EQ(probe.end_projects[0], probe.begin_projects[1]);
+    ASSERT_STR_EQ(probe.end_projects[1], probe.begin_projects[0]);
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_rmdir(repo);
+    PASS();
+}
+
+/* Project-lock keys ASCII-fold A-Z, so case aliases must be one lease here too.
+ * Otherwise Foo + foo self-deadlocks, and two requests whose raw strcmp order
+ * differs can acquire the same OS locks in opposite (ABBA) order. Keep the
+ * original spellings: folding is only the comparison key, not a lookup value. */
+TEST(tool_cross_repo_mutation_guard_casefolds_aliases_and_order) {
+    char repo[256];
+    snprintf(repo, sizeof(repo), "/tmp/cbm-mcp-cross-case-guard-XXXXXX");
+    if (!cbm_mkdtemp(repo)) {
+        PASS();
+    }
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, repo, NULL));
+
+    mcp_mutation_guard_probe_t first = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &first);
+    char first_args[CBM_SZ_2K];
+    snprintf(first_args, sizeof(first_args),
+             "{\"repo_path\":\"%s\",\"name\":\"Zulu\","
+             "\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"Foo\",\"foo\",\"Alpha\"]}",
+             repo);
+    char *first_resp = cbm_mcp_handle_tool(srv, "index_repository", first_args);
+    ASSERT_NOT_NULL(first_resp);
+    free(first_resp);
+
+    mcp_mutation_guard_probe_t second = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &second);
+    char second_args[CBM_SZ_2K];
+    snprintf(second_args, sizeof(second_args),
+             "{\"repo_path\":\"%s\",\"name\":\"zULU\","
+             "\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"foo\",\"ALPHA\",\"FOO\"]}",
+             repo);
+    char *second_resp = cbm_mcp_handle_tool(srv, "index_repository", second_args);
+    ASSERT_NOT_NULL(second_resp);
+    free(second_resp);
+
+    ASSERT_EQ(first.begin_count, 3);
+    ASSERT_EQ(first.end_count, 3);
+    ASSERT_EQ(second.begin_count, 3);
+    ASSERT_EQ(second.end_count, 3);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_TRUE(
+            mcp_test_project_keys_equivalent(first.begin_projects[i], second.begin_projects[i]));
+        ASSERT_TRUE(
+            mcp_test_project_keys_equivalent(first.end_projects[i], first.begin_projects[2 - i]));
+        ASSERT_TRUE(
+            mcp_test_project_keys_equivalent(second.end_projects[i], second.begin_projects[2 - i]));
+    }
+    ASSERT_STR_EQ(first.begin_projects[0], "Alpha");
+    ASSERT_STR_EQ(first.begin_projects[1], "Foo");
+    ASSERT_STR_EQ(first.begin_projects[2], "Zulu");
+    ASSERT_STR_EQ(second.begin_projects[0], "ALPHA");
+    ASSERT_STR_EQ(second.begin_projects[1], "FOO");
+    ASSERT_STR_EQ(second.begin_projects[2], "zULU");
+
+    cbm_mcp_server_free(srv);
+    cbm_rmdir(repo);
+    PASS();
+}
+
+/* A wildcard means "all projects" and therefore cannot be combined with a
+ * named target. Accepting the mixed form both obscures caller intent and lets
+ * the cross-repo pass create/use a literal "*.db" target on POSIX. Validation
+ * must happen before any project mutation lease is acquired. */
+TEST(tool_cross_repo_rejects_wildcard_mixed_with_named_targets) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-wildcard-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"*\",\"named-target\"]}",
+             cache);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool rejected = resp && strstr(resp, "\"isError\":true") != NULL;
+    bool explained = resp && strstr(resp, "target_projects") && strstr(resp, "*") &&
+                     (strstr(resp, "only") || strstr(resp, "combin"));
+    int begin_count = probe.begin_count;
+    int end_count = probe.end_count;
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cleanup_project_db(cache, "*");
+    cleanup_project_db(cache, "named-target");
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(rejected);
+    ASSERT_TRUE(explained);
+    ASSERT_EQ(begin_count, 0);
+    ASSERT_EQ(end_count, 0);
+    PASS();
+}
+
+/* Cancellation can arrive while the final mutation lease is being acquired.
+ * The cross-repo operation must advertise itself through cancel_active(),
+ * observe the pending cancellation before doing cross-project writes, and
+ * unwind every lease it acquired. */
+TEST(tool_cross_repo_checks_cancellation_after_acquiring_leases) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-cancel-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    mcp_mutation_guard_probe_t probe = {
+        .cancel_on_begin_call = 3,
+        .cancel_server = srv,
+    };
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"000-cancel-target\",\"zzz-cancel-target\"]}",
+             cache);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool response_cancelled = resp && strstr(resp, "cancelled") != NULL;
+    bool cancel_attempted = probe.cancel_attempted;
+    bool cancel_accepted = probe.cancel_accepted;
+    int begin_count = probe.begin_count;
+    int end_count = probe.end_count;
+    bool reverse_unwind = begin_count == 3 && end_count == 3 &&
+                          strcmp(probe.end_projects[0], probe.begin_projects[2]) == 0 &&
+                          strcmp(probe.end_projects[1], probe.begin_projects[1]) == 0 &&
+                          strcmp(probe.end_projects[2], probe.begin_projects[0]) == 0;
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cleanup_project_db(cache, "000-cancel-target");
+    cleanup_project_db(cache, "zzz-cancel-target");
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(cancel_attempted);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(response_cancelled);
+    ASSERT_EQ(begin_count, 3);
+    ASSERT_EQ(end_count, 3);
+    ASSERT_TRUE(reverse_unwind);
+    PASS();
+}
+
+/* cbm_store_open_path() creates its path. Cross-repo validation must therefore
+ * reject an absent source or named target before the matcher opens either one;
+ * otherwise a typo silently becomes a valid-looking empty project database. */
+TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-missing-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *source_project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(source_project);
+    const char *existing_target = "existing-cross-target";
+    const char *missing_target = "missing-cross-target";
+    ASSERT_TRUE(mcp_cross_repo_create_project_store(cache, existing_target, cache));
+
+    char source_db_path[CBM_SZ_1K];
+    char missing_target_db_path[CBM_SZ_1K];
+    snprintf(source_db_path, sizeof(source_db_path), "%s/%s.db", cache, source_project);
+    snprintf(missing_target_db_path, sizeof(missing_target_db_path), "%s/%s.db", cache,
+             missing_target);
+    ASSERT_FALSE(cbm_file_exists(source_db_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\"]}",
+             cache, existing_target);
+    char *source_resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool source_failed = source_resp && strstr(source_resp, "\"isError\":true");
+    bool source_reported =
+        source_resp && (strstr(source_resp, "not indexed") || strstr(source_resp, "not found") ||
+                        strstr(source_resp, "missing"));
+    bool source_ghost_created = cbm_file_exists(source_db_path);
+    free(source_resp);
+
+    cleanup_project_db(cache, source_project);
+    ASSERT_TRUE(mcp_cross_repo_create_project_store(cache, source_project, cache));
+    ASSERT_FALSE(cbm_file_exists(missing_target_db_path));
+
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\"]}",
+             cache, missing_target);
+    char *target_resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool target_failed = target_resp && strstr(target_resp, "\"isError\":true");
+    bool target_reported =
+        target_resp && (strstr(target_resp, "not indexed") || strstr(target_resp, "not found") ||
+                        strstr(target_resp, "missing"));
+    bool target_ghost_created = cbm_file_exists(missing_target_db_path);
+    free(target_resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, source_project);
+    cleanup_project_db(cache, existing_target);
+    cleanup_project_db(cache, missing_target);
+    free(source_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(source_failed);
+    ASSERT_TRUE(source_reported);
+    ASSERT_FALSE(source_ghost_created);
+    ASSERT_TRUE(target_failed);
+    ASSERT_TRUE(target_reported);
+    ASSERT_FALSE(target_ghost_created);
+    PASS();
+}
+
+/* Named targets are a set, not a work list. A duplicate must be leased,
+ * scanned, and counted once; the fixture provides one real edge so the result
+ * counters cannot pass vacuously at zero. */
+TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-dedupe-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *source_project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(source_project);
+    const char *target_project = "cross-dedupe-target";
+    ASSERT_TRUE(mcp_cross_repo_seed_http_match(cache, source_project, target_project, cache));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\",\"%s\"]}",
+             cache, target_project, target_project);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool succeeded = resp && strstr(resp, "\"isError\":true") == NULL;
+    bool scanned_once = response_contains_json_fragment(resp, "\"projects_scanned\":1");
+    bool counted_once = response_contains_json_fragment(resp, "\"cross_http_calls\":1") &&
+                        response_contains_json_fragment(resp, "\"total_cross_edges\":1");
+
+    char source_db_path[CBM_SZ_1K];
+    char target_db_path[CBM_SZ_1K];
+    snprintf(source_db_path, sizeof(source_db_path), "%s/%s.db", cache, source_project);
+    snprintf(target_db_path, sizeof(target_db_path), "%s/%s.db", cache, target_project);
+    cbm_store_t *source = cbm_store_open_path_query(source_db_path);
+    cbm_store_t *target = cbm_store_open_path_query(target_db_path);
+    int source_cross_edges =
+        source ? cbm_store_count_edges_by_type(source, source_project, "CROSS_HTTP_CALLS") : -1;
+    int target_cross_edges =
+        target ? cbm_store_count_edges_by_type(target, target_project, "CROSS_HTTP_CALLS") : -1;
+    cbm_store_close(source);
+    cbm_store_close(target);
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, source_project);
+    cleanup_project_db(cache, target_project);
+    free(source_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(succeeded);
+    ASSERT_TRUE(scanned_once);
+    ASSERT_TRUE(counted_once);
+    ASSERT_EQ(source_cross_edges, 1);
+    ASSERT_EQ(target_cross_edges, 1);
+    PASS();
+}
+
+/* The OTHER half of the cross-repo missing-input contract, and the companion to
+ * tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases.
+ *
+ * pass_cross_repo.h:35-37 states both outcomes, and they are opposite: "a
+ * missing source sets source_missing and runs nothing; a missing named target
+ * is skipped and counted in targets_missing. Neither creates a database."
+ * A missing SOURCE must be reported as an error, because nothing was matched
+ * from. A missing TARGET must NOT fail the run — one unindexed project in a
+ * target list would otherwise sink an otherwise-good scan — it is skipped and
+ * surfaced as a count so the caller can see what was left out.
+ *
+ * Both halves are pinned so neither can regress alone. Restoring the
+ * source_missing error without this test would invite "simplifying" the two
+ * cases back together, which is exactly how the source half was lost: the field
+ * was set by pass_cross_repo.c and read by nobody, so an unindexed source
+ * returned a success envelope with every edge count at zero — indistinguishable
+ * from a repository that genuinely shares no interfaces. */
+TEST(tool_cross_repo_missing_target_is_skipped_and_counted_not_failed) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-skip-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *source_project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(source_project);
+    const char *target_project = "cross-skip-target";
+    ASSERT_TRUE(mcp_cross_repo_seed_http_match(cache, source_project, target_project, cache));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    /* One real target and one that was never indexed. */
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\",\"cross-skip-never-indexed\"]}",
+             cache, target_project);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+
+    bool succeeded = resp && strstr(resp, "\"isError\":true") == NULL;
+    bool counted_missing = response_contains_json_fragment(resp, "\"targets_missing\":1");
+    /* The indexed target still matched: skipping one must not abort the scan. */
+    bool still_scanned = response_contains_json_fragment(resp, "\"projects_scanned\":1");
+    /* No database is created for the never-indexed target. */
+    char ghost_db[CBM_SZ_1K];
+    snprintf(ghost_db, sizeof(ghost_db), "%s/cross-skip-never-indexed.db", cache);
+    bool no_ghost = !test_file_exists_mcp(ghost_db);
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, source_project);
+    cleanup_project_db(cache, target_project);
+    free(source_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(succeeded);
+    ASSERT_TRUE(counted_missing);
+    ASSERT_TRUE(still_scanned);
+    ASSERT_TRUE(no_ghost);
+    PASS();
+}
+
+/* `name` is the documented index project-name override and must identify the
+ * cross-repo source too. Deriving from repo_path here makes custom-named
+ * projects impossible to rescan even though ordinary indexing created them. */
+TEST(tool_cross_repo_honors_source_name_override) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-name-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *source_project = "cross-custom-source";
+    const char *target_project = "cross-custom-target";
+    ASSERT_TRUE(mcp_cross_repo_seed_http_match(cache, source_project, target_project, cache));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"name\":\"%s\","
+             "\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"%s\"]}",
+             cache, source_project, target_project);
+    char *resp = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool succeeded = resp && !response_contains_json_fragment(resp, "\"isError\":true") &&
+                     response_contains_json_fragment(resp, "\"cross_http_calls\":1");
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, source_project);
+    cleanup_project_db(cache, target_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(succeeded);
+    PASS();
+}
+
+/* Corrupt-store quarantine renames/unlinks the project DB and sidecars, so it
+ * is a mutation even when resolve_store() was reached by a query tool. The
+ * query path needs one balanced lease; manage_adr already owns that project
+ * lease and must not acquire a nested second lease during the same cleanup. */
+TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-guard-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-corrupt-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+
+    ASSERT_TRUE(mcp_make_corrupt_project_store(cache, project));
+    cbm_mcp_server_t *query_srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(query_srv);
+    mcp_mutation_guard_probe_t query_probe = {
+        .observed_db_path = db_path,
+    };
+    cbm_mcp_server_set_project_mutation_guard(query_srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &query_probe);
+
+    char *resp =
+        cbm_mcp_handle_tool(query_srv, "search_graph",
+                            "{\"project\":\"guard-corrupt-project\",\"name_pattern\":\".*\"}");
+    free(resp);
+    cbm_mcp_server_free(query_srv);
+    char query_backup_path[CBM_SZ_1K];
+    int query_backup_count =
+        mcp_find_corrupt_backups(cache, project, query_backup_path, sizeof(query_backup_path));
+    bool query_quarantined =
+        !cbm_file_exists(db_path) && query_backup_count == 1 && query_backup_path[0] != '\0';
+
+    /* Replant the same deterministic corruption to exercise manage_adr's
+     * already-held lease independently from the query server above. */
+    mcp_cleanup_corrupt_backups(cache, project);
+    ASSERT_TRUE(mcp_make_corrupt_project_store(cache, project));
+    cbm_mcp_server_t *adr_srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(adr_srv);
+    mcp_mutation_guard_probe_t adr_probe = {
+        .observed_db_path = db_path,
+    };
+    cbm_mcp_server_set_project_mutation_guard(adr_srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &adr_probe);
+    resp = cbm_mcp_handle_tool(adr_srv, "manage_adr",
+                               "{\"project\":\"guard-corrupt-project\",\"mode\":\"get\"}");
+    free(resp);
+    cbm_mcp_server_free(adr_srv);
+    char adr_backup_path[CBM_SZ_1K];
+    int adr_backup_count =
+        mcp_find_corrupt_backups(cache, project, adr_backup_path, sizeof(adr_backup_path));
+    bool adr_quarantined =
+        !cbm_file_exists(db_path) && adr_backup_count == 1 && adr_backup_path[0] != '\0';
+
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(query_quarantined);
+    ASSERT_EQ(query_probe.begin_count, 1);
+    ASSERT_EQ(query_probe.end_count, 1);
+    ASSERT_STR_EQ(query_probe.begin_projects[0], project);
+    ASSERT_STR_EQ(query_probe.end_projects[0], project);
+    ASSERT_TRUE(query_probe.db_exists_at_begin);
+    ASSERT_FALSE(query_probe.db_exists_at_end);
+    ASSERT_TRUE(adr_quarantined);
+    ASSERT_EQ(adr_probe.begin_count, 1);
+    ASSERT_EQ(adr_probe.end_count, 1);
+    ASSERT_STR_EQ(adr_probe.begin_projects[0], project);
+    ASSERT_STR_EQ(adr_probe.end_projects[0], project);
+    ASSERT_TRUE(adr_probe.db_exists_at_begin);
+    ASSERT_FALSE(adr_probe.db_exists_at_end);
+    PASS();
+}
+
+/* Integrity is checked before the lease is requested, but quarantine itself
+ * must fail closed when that lease is denied. In particular, a rejected query
+ * may not remove either a recoverable DB generation or its committed WAL. */
+TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-denied-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-corrupt-denied";
+    char db_path[CBM_SZ_1K];
+    char wal_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    cbm_store_t *writer = mcp_open_corrupt_project_store_with_wal(cache, project);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_TRUE(cbm_file_exists(db_path));
+    ASSERT_TRUE(cbm_file_exists(wal_path));
+
+    long db_len = 0;
+    long wal_len = 0;
+    unsigned char *db_before = mcp_read_file_bytes(db_path, &db_len);
+    unsigned char *wal_before = mcp_read_file_bytes(wal_path, &wal_len);
+    ASSERT_NOT_NULL(db_before);
+    ASSERT_NOT_NULL(wal_before);
+    ASSERT_TRUE(db_len > 0);
+    ASSERT_TRUE(wal_len > 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {.deny_begin_call = 1};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph", "{\"project\":\"guard-corrupt-denied\",\"name_pattern\":\".*\"}");
+
+    bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
+    bool wal_unchanged = mcp_file_matches_snapshot(wal_path, wal_before, wal_len);
+    char unexpected_backup[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unexpected_backup, sizeof(unexpected_backup));
+    int artifact_count = mcp_count_corrupt_artifacts(cache, project);
+    int begin_count = probe.begin_count;
+    int end_count = probe.end_count;
+    bool guarded_project = begin_count == 1 && strcmp(probe.begin_projects[0], project) == 0;
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(db_before);
+    free(wal_before);
+    cbm_store_close(writer);
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_EQ(begin_count, 1);
+    ASSERT_EQ(end_count, 0);
+    ASSERT_TRUE(guarded_project);
+    ASSERT_TRUE(db_unchanged);
+    ASSERT_TRUE(wal_unchanged);
+    ASSERT_EQ(backup_count, 0);
+    ASSERT_EQ(artifact_count, 0);
+    PASS();
+}
+
+/* The OTHER half of the corrupt-store contract, and the reason the fixture
+ * above had to be changed.
+ *
+ * A store whose ONLY defect is a cosmetic root_path is RETAINED, never
+ * quarantined: cbm_store_check_integrity_full reports it through
+ * path_only_failure (src/store/store.c:1519-1525) and resolve_store_internal
+ * takes the retain branch (src/mcp/mcp.c:4234). That is the #557 data-loss fix
+ * — deleting such a database destroyed intact node and edge data over a
+ * defect that queries, which key off project name rather than root_path, never
+ * observe.
+ *
+ * This pairs with the structurally-corrupt tests: together they pin BOTH
+ * parents' behavior, so neither can regress unnoticed. Without this test,
+ * "fixing" the guard tests by weakening the path_only classification would
+ * silently reintroduce #557 and every test would still pass. The guard must
+ * NOT be acquired here — retaining is not a mutation. */
+TEST(tool_cosmetic_root_path_store_is_retained_not_quarantined) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cosmetic-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "cosmetic-root-path";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+
+    /* Valid store in every structural respect; only root_path is malformed. */
+    cbm_store_t *writer = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_EQ(cbm_store_upsert_project(writer, project, "826"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_prepare_for_publish(writer), CBM_STORE_OK);
+    cbm_store_close(writer);
+
+    long db_len = 0;
+    unsigned char *db_before = mcp_read_file_bytes(db_path, &db_len);
+    ASSERT_NOT_NULL(db_before);
+    ASSERT_TRUE(db_len > 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    char args[CBM_SZ_512];
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*\"}", project);
+    char *resp = cbm_mcp_handle_tool(srv, "search_graph", args);
+
+    char unexpected_backup[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unexpected_backup, sizeof(unexpected_backup));
+    int begin_count = probe.begin_count;
+    bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(db_before);
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    /* Retained: byte-identical, no backup produced, and the mutation guard was
+     * never claimed because nothing was mutated. */
+    ASSERT_TRUE(db_unchanged);
+    ASSERT_EQ(backup_count, 0);
+    ASSERT_EQ(begin_count, 0);
+    PASS();
+}
+
+/* Another session may publish a good generation while this query waits for
+ * the mutation lease. Cleanup must re-open and re-check the path after lease
+ * acquisition; quarantining based on the stale pre-wait handle loses the new
+ * generation and returns a false "not indexed" result. */
+TEST(tool_corrupt_store_cleanup_rechecks_generation_after_guard_wait) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-recheck-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-corrupt-recheck";
+    const char *replacement_root = "/tmp/guard-corrupt-replacement";
+    char db_path[CBM_SZ_1K];
+    char replacement_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    snprintf(replacement_path, sizeof(replacement_path), "%s/%s.replacement.db", cache, project);
+    ASSERT_TRUE(mcp_make_corrupt_project_store(cache, project));
+    ASSERT_TRUE(mcp_make_valid_project_store_at(replacement_path, project, replacement_root));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_replacing_mutation_guard_t replacement = {
+        .replacement_path = replacement_path,
+        .live_path = db_path,
+    };
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_replacing_mutation_guard_begin,
+                                              mcp_replacing_mutation_guard_end, &replacement);
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph", "{\"project\":\"guard-corrupt-recheck\",\"name_pattern\":\".*\"}");
+    bool response_used_replacement =
+        resp && !response_contains_json_fragment(resp, "\"isError\":true");
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    cbm_store_t *check = cbm_store_open_path_query(db_path);
+    bool valid_generation = check && cbm_store_check_integrity(check);
+    cbm_project_t stored_project = {0};
+    bool replacement_root_visible =
+        check && cbm_store_get_project(check, project, &stored_project) == CBM_STORE_OK &&
+        stored_project.root_path && strcmp(stored_project.root_path, replacement_root) == 0;
+    cbm_project_free_fields(&stored_project);
+    cbm_store_close(check);
+    char unexpected_backup[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unexpected_backup, sizeof(unexpected_backup));
+    bool live_exists = cbm_file_exists(db_path);
+    bool replacement_consumed = !cbm_file_exists(replacement_path);
+    int begin_count = replacement.guard.begin_count;
+    int end_count = replacement.guard.end_count;
+    bool guarded_project = begin_count == 1 && end_count == 1 &&
+                           strcmp(replacement.guard.begin_projects[0], project) == 0 &&
+                           strcmp(replacement.guard.end_projects[0], project) == 0;
+    bool replacement_attempted = replacement.replacement_attempted;
+    bool replacement_succeeded = replacement.replacement_succeeded;
+
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    cbm_unlink(replacement_path);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(replacement_attempted);
+    ASSERT_TRUE(replacement_succeeded);
+    ASSERT_TRUE(guarded_project);
+    ASSERT_TRUE(response_used_replacement);
+    ASSERT_TRUE(live_exists);
+    ASSERT_TRUE(replacement_consumed);
+    ASSERT_TRUE(valid_generation);
+    ASSERT_TRUE(replacement_root_visible);
+    ASSERT_EQ(backup_count, 0);
+    PASS();
+}
+
+/* A fixed `.corrupt` destination is itself user recovery data. A later
+ * quarantine must retain it byte-for-byte and choose a distinct backup name
+ * rather than unlinking the previous incident before rename. */
+TEST(tool_corrupt_store_cleanup_preserves_existing_backup_and_uses_unique_name) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-unique-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-corrupt-unique";
+    char db_path[CBM_SZ_1K];
+    char existing_backup_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    snprintf(existing_backup_path, sizeof(existing_backup_path), "%s.corrupt", db_path);
+    ASSERT_TRUE(mcp_make_corrupt_project_store(cache, project));
+    ASSERT_EQ(th_write_file(existing_backup_path, "previous-backup-must-survive\n"), 0);
+
+    long existing_len = 0;
+    unsigned char *existing_before = mcp_read_file_bytes(existing_backup_path, &existing_len);
+    ASSERT_NOT_NULL(existing_before);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t probe = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &probe);
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph", "{\"project\":\"guard-corrupt-unique\",\"name_pattern\":\".*\"}");
+    free(resp);
+    cbm_mcp_server_free(srv);
+
+    bool existing_unchanged =
+        mcp_file_matches_snapshot(existing_backup_path, existing_before, existing_len);
+    free(existing_before);
+    char unique_backup_path[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unique_backup_path, sizeof(unique_backup_path));
+    cbm_store_t *quarantined =
+        unique_backup_path[0] ? cbm_store_open_path_query(unique_backup_path) : NULL;
+    bool unique_backup_is_corrupt = quarantined && !cbm_store_check_integrity(quarantined);
+    cbm_store_close(quarantined);
+    bool live_removed = !cbm_file_exists(db_path);
+    int begin_count = probe.begin_count;
+    int end_count = probe.end_count;
+    bool guarded_project = begin_count == 1 && end_count == 1 &&
+                           strcmp(probe.begin_projects[0], project) == 0 &&
+                           strcmp(probe.end_projects[0], project) == 0;
+
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(guarded_project);
+    ASSERT_TRUE(existing_unchanged);
+    ASSERT_EQ(backup_count, 2);
+    ASSERT_TRUE(unique_backup_path[0] != '\0');
+    ASSERT_TRUE(unique_backup_is_corrupt);
+    ASSERT_TRUE(live_removed);
+    PASS();
+}
+
+/* Deterministically fail immediately before atomic snapshot publication on
+ * every platform. The incomplete pending copy must be removed while the live
+ * DB and its committed WAL remain byte-for-byte untouched. */
+TEST(tool_corrupt_store_cleanup_publish_failure_preserves_db_and_wal) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-publish-fail-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-corrupt-publish-fail";
+    char db_path[CBM_SZ_1K];
+    char wal_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    cbm_store_t *writer = mcp_open_corrupt_project_store_with_wal(cache, project);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_TRUE(cbm_file_exists(wal_path));
+
+    long db_len = 0;
+    long wal_len = 0;
+    unsigned char *db_before = mcp_read_file_bytes(db_path, &db_len);
+    unsigned char *wal_before = mcp_read_file_bytes(wal_path, &wal_len);
+    ASSERT_NOT_NULL(db_before);
+    ASSERT_NOT_NULL(wal_before);
+    ASSERT_TRUE(db_len > 0);
+    ASSERT_TRUE(wal_len > 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t guard = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &guard);
+    mcp_quarantine_hook_probe_t hook = {.deny_step = "before_snapshot_publish"};
+    cbm_mcp_server_set_quarantine_test_hook(srv, mcp_quarantine_hook_probe, &hook);
+    char *resp =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"guard-corrupt-publish-fail\",\"name_pattern\":\".*\"}");
+
+    bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
+    bool wal_unchanged = mcp_file_matches_snapshot(wal_path, wal_before, wal_len);
+    char unexpected_backup[CBM_SZ_1K];
+    int backup_count =
+        mcp_find_corrupt_backups(cache, project, unexpected_backup, sizeof(unexpected_backup));
+    int artifact_count = mcp_count_corrupt_artifacts(cache, project);
+    int begin_count = guard.begin_count;
+    int end_count = guard.end_count;
+    bool guarded_project = begin_count == 1 && end_count == 1 &&
+                           strcmp(guard.begin_projects[0], project) == 0 &&
+                           strcmp(guard.end_projects[0], project) == 0;
+    bool failed_at_publish =
+        hook.call_count == 1 && strcmp(hook.steps[0], "before_snapshot_publish") == 0;
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(db_before);
+    free(wal_before);
+    cbm_store_close(writer);
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(failed_at_publish);
+    ASSERT_TRUE(guarded_project);
+    ASSERT_TRUE(db_unchanged);
+    ASSERT_TRUE(wal_unchanged);
+    ASSERT_EQ(backup_count, 0);
+    ASSERT_EQ(artifact_count, 0);
+    PASS();
+}
+
+/* Once the recovery snapshot is atomically visible, a crash/failure before
+ * deleting the live generation may leave both copies. The live DB/WAL must be
+ * unchanged, and the published backup must already contain committed WAL data
+ * as one self-contained SQLite database. */
+TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-corrupt-after-publish-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "guard-corrupt-after-publish";
+    char db_path[CBM_SZ_1K];
+    char wal_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+    cbm_store_t *writer = mcp_open_corrupt_project_store_with_wal(cache, project);
+    ASSERT_NOT_NULL(writer);
+    ASSERT_TRUE(cbm_file_exists(wal_path));
+
+    long db_len = 0;
+    long wal_len = 0;
+    unsigned char *db_before = mcp_read_file_bytes(db_path, &db_len);
+    unsigned char *wal_before = mcp_read_file_bytes(wal_path, &wal_len);
+    ASSERT_NOT_NULL(db_before);
+    ASSERT_NOT_NULL(wal_before);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_mutation_guard_probe_t guard = {0};
+    cbm_mcp_server_set_project_mutation_guard(srv, mcp_mutation_guard_probe_begin,
+                                              mcp_mutation_guard_probe_end, &guard);
+    mcp_quarantine_hook_probe_t hook = {.deny_step = "after_snapshot_publish"};
+    cbm_mcp_server_set_quarantine_test_hook(srv, mcp_quarantine_hook_probe, &hook);
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"guard-corrupt-after-publish\",\"name_pattern\":\".*\"}");
+
+    bool db_unchanged = mcp_file_matches_snapshot(db_path, db_before, db_len);
+    bool wal_unchanged = mcp_file_matches_snapshot(wal_path, wal_before, wal_len);
+    char backup_path[CBM_SZ_1K];
+    int backup_count = mcp_find_corrupt_backups(cache, project, backup_path, sizeof(backup_path));
+    int artifact_count = mcp_count_corrupt_artifacts(cache, project);
+    /* Prove the WAL content reached the snapshot by reading back the sentinel
+     * row, which is what guard_wal_sentinel exists for: the fixture writes it
+     * under PRAGMA wal_autocheckpoint=0, so it lives ONLY in the WAL until a
+     * checkpoint. Finding it in the backup proves the quarantine published a
+     * complete, checkpointed snapshot rather than copying the bare .db.
+     *
+     * This previously read the projects row and compared root_path to "826".
+     * That no longer works and could not: the fixture must DROP the projects
+     * table to be structurally corrupt at all, because a readable projects
+     * table with a malformed root_path is the COSMETIC case that
+     * cbm_store_check_integrity_full reports via path_only_failure and that
+     * resolve_store_internal deliberately RETAINS (#557). A store that reaches
+     * quarantine therefore cannot still have a readable projects row — the two
+     * requirements are mutually exclusive. The sentinel proves the same
+     * property without that contradiction. */
+    cbm_store_t *snapshot = backup_path[0] ? cbm_store_open_path_query(backup_path) : NULL;
+    bool recovered_wal_project = false;
+    if (snapshot) {
+        sqlite3 *snap_db = cbm_store_get_db(snapshot);
+        sqlite3_stmt *sentinel = NULL;
+        if (snap_db && sqlite3_prepare_v2(snap_db, "SELECT value FROM guard_wal_sentinel LIMIT 1;",
+                                          -1, &sentinel, NULL) == SQLITE_OK) {
+            if (sqlite3_step(sentinel) == SQLITE_ROW) {
+                const char *value = (const char *)sqlite3_column_text(sentinel, 0);
+                recovered_wal_project = value && strcmp(value, "committed") == 0;
+            }
+            sqlite3_finalize(sentinel);
+        }
+    }
+    cbm_store_close(snapshot);
+    char backup_wal[CBM_SZ_2K];
+    char backup_shm[CBM_SZ_2K];
+    snprintf(backup_wal, sizeof(backup_wal), "%s-wal", backup_path);
+    snprintf(backup_shm, sizeof(backup_shm), "%s-shm", backup_path);
+    bool snapshot_self_contained = !cbm_file_exists(backup_wal) && !cbm_file_exists(backup_shm);
+    bool hook_order = hook.call_count == 2 &&
+                      strcmp(hook.steps[0], "before_snapshot_publish") == 0 &&
+                      strcmp(hook.steps[1], "after_snapshot_publish") == 0;
+    bool guard_balanced = guard.begin_count == 1 && guard.end_count == 1 &&
+                          strcmp(guard.begin_projects[0], project) == 0 &&
+                          strcmp(guard.end_projects[0], project) == 0;
+
+    free(resp);
+    cbm_mcp_server_free(srv);
+    free(db_before);
+    free(wal_before);
+    cbm_store_close(writer);
+    mcp_cleanup_corrupt_backups(cache, project);
+    cleanup_project_db(cache, project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(hook_order);
+    ASSERT_TRUE(guard_balanced);
+    ASSERT_TRUE(db_unchanged);
+    ASSERT_TRUE(wal_unchanged);
+    ASSERT_EQ(backup_count, 1);
+    ASSERT_EQ(artifact_count, 1);
+    ASSERT_TRUE(recovered_wal_project);
+    ASSERT_TRUE(snapshot_self_contained);
+    PASS();
+}
+
+/* detect_changes owns shell output through regular temporary files. An error
+ * after opening that file must use fclose + unlink. The command hook then
+ * rejects merge-base only when it reaches the contained subprocess helper, so
+ * a raw popen regression bypasses the hook and fails this test. */
+TEST(tool_detect_changes_contained_commands_clean_up_error_and_success) {
+    char cache[512];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-detect-contained-XXXXXX", cbm_tmpdir());
+    bool cache_created = cbm_mkdtemp(cache) != NULL;
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    bool environment_ready = cache_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+
+    char root[CBM_SZ_4K] = {0};
+    bool root_ready = cbm_getcwd(root, sizeof(root)) != NULL;
+    const char *project = "detect-contained-project";
+    cbm_mcp_server_t *srv = environment_ready && root_ready ? cbm_mcp_server_new(NULL) : NULL;
+    bool server_ready = srv != NULL;
+    cbm_store_t *store = srv ? cbm_mcp_server_store(srv) : NULL;
+    bool project_ready = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    mcp_command_hook_probe_t command_probe = {.reject_merge_base = true};
+    if (project_ready) {
+        cbm_mcp_server_set_project(srv, project);
+        cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
+    }
+
+    char *invalid_response =
+        project_ready ? cbm_mcp_handle_tool(srv, "detect_changes",
+                                            "{\"project\":\"detect-contained-project\","
+                                            "\"base_branch\":\"HEAD\",\"scope\":\"files\","
+                                            "\"direction\":\"sideways\"}")
+                      : NULL;
+    bool invalid_rejected = invalid_response && strstr(invalid_response, "invalid direction");
+    char logs[640];
+    (void)snprintf(logs, sizeof(logs), "%s/logs", cache);
+    int artifacts_after_error =
+        invalid_response ? mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") : -1;
+
+    char *rejected_response =
+        project_ready ? cbm_mcp_handle_tool(srv, "detect_changes",
+                                            "{\"project\":\"detect-contained-project\","
+                                            "\"base_branch\":\"HEAD\",\"scope\":\"files\"}")
+                      : NULL;
+    bool containment_rejected =
+        rejected_response && strstr(rejected_response, "contained command could not complete");
+    int artifacts_after_rejection =
+        rejected_response ? mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") : -1;
+
+    command_probe.reject_merge_base = false;
+    char *success_response =
+        project_ready ? cbm_mcp_handle_tool(srv, "detect_changes",
+                                            "{\"project\":\"detect-contained-project\","
+                                            "\"base_branch\":\"HEAD\",\"scope\":\"files\"}")
+                      : NULL;
+    bool merge_base_reported = success_response && strstr(success_response, "merge_base");
+    int artifacts_after_success =
+        success_response ? mcp_count_directory_entries_with_prefix(logs, ".mcp-command-") : -1;
+
+    free(invalid_response);
+    free(rejected_response);
+    free(success_response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    bool cleaned = !cache_created || th_rmtree(cache) == 0;
+
+    ASSERT_TRUE(cache_created);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(root_ready);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(project_ready);
+    ASSERT_TRUE(invalid_rejected);
+    ASSERT_EQ(artifacts_after_error, 0);
+    ASSERT_TRUE(containment_rejected);
+    ASSERT_EQ(artifacts_after_rejection, 0);
+    ASSERT_TRUE(merge_base_reported);
+    ASSERT_EQ(artifacts_after_success, 0);
+    ASSERT_EQ(command_probe.diff_calls, 3);
+    ASSERT_EQ(command_probe.merge_base_calls, 2);
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
+/* Reproduce-first: one MCP session caches a query connection to generation A,
+ * then the fixture models an independent writer publishing generation B by
+ * atomically replacing the project DB at the same cache path. Because
+ * resolve_store() keys its cache only by project name, the next query can reuse
+ * stale generation A. It must instead return generation B. */
+TEST(query_store_reopens_after_database_replacement) {
+    static const char project[] = "cbm-store-generation-refresh";
+    static const char active_filename[] = "cbm-store-generation-refresh.db";
+    static const char staged_filename[] = "cbm-store-generation-next.db";
+
+    char cache[512];
+    snprintf(cache, sizeof(cache), "%s/cbm-store-generation-XXXXXX", cbm_tmpdir());
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    if (cache_ready) {
+        cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    }
+
+    bool generation_a_ready =
+        cache_ready && issue704_make_db(cache, active_filename, project, "GenerationA");
+    cbm_mcp_server_t *srv = generation_a_ready ? cbm_mcp_server_new(NULL) : NULL;
+    bool server_ready = srv != NULL;
+
+    char args[512];
+    snprintf(args, sizeof(args),
+             "{\"project\":\"%s\",\"name_pattern\":\".*Generation.*\",\"limit\":10}", project);
+    char *before = srv ? cbm_mcp_handle_tool(srv, "search_graph", args) : NULL;
+    bool saw_generation_a = before && strstr(before, "GenerationA") != NULL;
+
+    bool generation_b_ready =
+        cache_ready && issue704_make_db(cache, staged_filename, project, "GenerationB");
+    char active_path[700];
+    char staged_path[700];
+    snprintf(active_path, sizeof(active_path), "%s/%s", cache, active_filename);
+    snprintf(staged_path, sizeof(staged_path), "%s/%s", cache, staged_filename);
+    bool replaced = generation_b_ready && cbm_rename_replace(staged_path, active_path) == 0;
+
+    char *after = (srv && replaced) ? cbm_mcp_handle_tool(srv, "search_graph", args) : NULL;
+    bool saw_generation_b = after && strstr(after, "GenerationB") != NULL;
+    bool retained_generation_a = after && strstr(after, "GenerationA") != NULL;
+
+    free(before);
+    free(after);
+    if (srv) {
+        cbm_mcp_server_free(srv);
+    }
+    if (cache_ready) {
+        cleanup_project_db(cache, project);
+        cleanup_project_db(cache, "cbm-store-generation-next");
+        cbm_rmdir(cache);
+    }
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(generation_a_ready);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(saw_generation_a);
+    ASSERT_TRUE(generation_b_ready);
+    ASSERT_TRUE(replaced);
+    ASSERT_TRUE(saw_generation_b);
+    ASSERT_FALSE(retained_generation_a);
+    PASS();
+}
+
+TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery) {
+    char response[] = "{\"status\":\"indexed\"}";
+    cbm_index_worker_result_t result = {
+        .outcome = CBM_PROC_CLEAN,
+        .exit_code = 0,
+        .tree_quiesced = true,
+        .response = response,
+    };
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result), CBM_MCP_SUPERVISED_RESULT_SUCCESS);
+
+    result.cancellation_requested = true;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
+    result.cancellation_requested = false;
+    result.tree_quiesced = false;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
+    result.tree_quiesced = true;
+    result.supervision_failed = true;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL);
+
+    result.supervision_failed = false;
+    result.outcome = CBM_PROC_CRASH;
+    result.response = NULL;
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(0, &result),
+              CBM_MCP_SUPERVISED_RESULT_CONTAINED_FAILURE);
+    ASSERT_EQ(cbm_mcp_supervised_result_disposition(-1, &result),
+              CBM_MCP_SUPERVISED_RESULT_FALLBACK);
+    PASS();
+}
+
+TEST(index_supervisor_start_failure_is_fail_closed_in_real_host) {
+#ifdef _WIN32
+    SKIP_PLATFORM("immutable host mark needs fork isolation (POSIX-only)");
+#else
+    char repo_dir[CBM_SZ_1K];
+    char cache_dir[CBM_SZ_1K];
+    (void)snprintf(repo_dir, sizeof(repo_dir), "%s/cbm-idx-failclosed-repo-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache_dir, sizeof(cache_dir), "%s/cbm-idx-failclosed-cache-XXXXXX",
+                   cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo_dir));
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache_dir));
+
+    char source_path[CBM_SZ_4K];
+    (void)snprintf(source_path, sizeof(source_path), "%s/should_not_index.py", repo_dir);
+    FILE *source = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    ASSERT_TRUE(fputs("def should_not_index():\n    return True\n", source) >= 0);
+    ASSERT_EQ(fclose(source), 0);
+
+    char *project = cbm_project_name_from_path(repo_dir);
+    ASSERT_NOT_NULL(project);
+    char db_path[CBM_SZ_4K];
+    (void)snprintf(db_path, sizeof(db_path), "%s/%s.db", cache_dir, project);
+
+    char self_path[CBM_SZ_4K] = {0};
+    ASSERT_TRUE(idxfailclosed_self_path(self_path));
+    char *const child_argv[] = {
+        self_path, "__cbm_mcp_idxfailclosed_probe", repo_dir, cache_dir, NULL,
+    };
+    (void)fflush(NULL);
+    pid_t child = -1;
+    ASSERT_EQ(posix_spawn(&child, self_path, NULL, NULL, child_argv, environ), 0);
+    ASSERT_TRUE(child > 0);
+    int status = 0;
+    ASSERT_EQ(waitpid(child, &status, 0), child);
+    bool exited = WIFEXITED(status);
+    int child_result = exited ? WEXITSTATUS(status) : -1;
+    bool database_absent = !cbm_file_exists(db_path);
+
+    cleanup_project_db(cache_dir, project);
+    free(project);
+    (void)cbm_unlink(source_path);
+    (void)th_rmtree(repo_dir);
+    (void)th_rmtree(cache_dir);
+
+    ASSERT_TRUE(exited);
+    ASSERT_EQ(child_result, IDXFAILCLOSED_OK);
+    ASSERT_TRUE(database_absent);
+    PASS();
+#endif
+}
+
+TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch) {
+#ifdef _WIN32
+    const char *const branches[] = {"topic%PATH%", "topic!name!", "topic^name"};
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    for (size_t i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+        char request[512];
+        snprintf(request, sizeof(request),
+                 "{\"jsonrpc\":\"2.0\",\"id\":78,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"detect_changes\","
+                 "\"arguments\":{\"project\":\"p\",\"base_branch\":\"%s\"}}}",
+                 branches[i]);
+        char *response = cbm_mcp_server_handle(srv, request);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "base_branch contains invalid characters"));
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    PASS();
+#else
+    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
+#endif
+}
+
+TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root) {
+#ifdef _WIN32
+    const char *const roots[] = {"C:\\cbm-root-%PATH%", "C:\\cbm-root-!name!",
+                                 "C:\\cbm-root-^name"};
+    const char *project = "windows-cmd-root-validation";
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    cbm_mcp_server_set_project(srv, project);
+    mcp_command_hook_probe_t command_probe = {0};
+    cbm_mcp_server_set_command_test_hook(srv, mcp_command_hook_probe, &command_probe);
+
+    for (size_t i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
+        ASSERT_EQ(cbm_store_upsert_project(store, project, roots[i]), CBM_STORE_OK);
+        char *response = cbm_mcp_handle_tool(
+            srv, "detect_changes",
+            "{\"project\":\"windows-cmd-root-validation\",\"base_branch\":\"main\"}");
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "project path contains invalid characters"));
+        free(response);
+    }
+    ASSERT_EQ(command_probe.diff_calls, 0);
+    ASSERT_EQ(command_probe.merge_base_calls, 0);
+    cbm_mcp_server_free(srv);
+    PASS();
+#else
+    SKIP_PLATFORM("cmd.exe interpolation validation runs on Windows");
+#endif
+}
+
+TEST(index_repository_relative_path_uses_explicit_session_root) {
+    char session_root[512];
+    char cache[512];
+    snprintf(session_root, sizeof(session_root), "%s/cbm_daemon_session_XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm_daemon_cache_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(session_root) || !cbm_mkdtemp(cache)) {
+        th_rmtree(session_root);
+        th_rmtree(cache);
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    char repo[1024];
+    char source[1200];
+    snprintf(repo, sizeof(repo), "%s/repo", session_root);
+    snprintf(source, sizeof(source), "%s/main.py", repo);
+    ASSERT_EQ(th_write_file(source, "def main():\n    return 1\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_supervisor = getenv("CBM_INDEX_SUPERVISOR");
+    char *saved_supervisor_copy = saved_supervisor ? strdup(saved_supervisor) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    bool context_set = srv && cbm_mcp_server_set_session_context(srv, session_root, session_root);
+    const char request[] = "{\"jsonrpc\":\"2.0\",\"id\":89,\"method\":\"tools/call\","
+                           "\"params\":{\"name\":\"index_repository\","
+                           "\"arguments\":{\"repo_path\":\"repo\",\"mode\":\"fast\"}}}";
+    char *response = context_set ? cbm_mcp_server_handle(srv, request) : NULL;
+    bool accepted = response && strstr(response, "outside the allowed root") == NULL &&
+                    strstr(response, "\"isError\":true") == NULL;
+
+    char *project = cbm_project_name_from_path(repo);
+    char db_path[CBM_SZ_4K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing");
+    bool indexed_session_repo = project && cbm_file_size(db_path) >= 0;
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    if (saved_supervisor_copy) {
+        cbm_setenv("CBM_INDEX_SUPERVISOR", saved_supervisor_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    }
+    free(saved_supervisor_copy);
+    th_rmtree(session_root);
+    th_rmtree(cache);
+
+    ASSERT_TRUE(context_set);
+    ASSERT_TRUE(accepted);
+    ASSERT_TRUE(indexed_session_repo);
+    PASS();
+}
+
+TEST(index_repository_supervisor_uses_canonical_session_path) {
+#ifdef _WIN32
+    SKIP_PLATFORM("supervisor-host guard needs fork isolation (POSIX-only)");
+#else
+    char session_root[512];
+    char decoy_cwd[512];
+    char cache[512];
+    snprintf(session_root, sizeof(session_root), "%s/cbm_canonical_session_XXXXXX", cbm_tmpdir());
+    snprintf(decoy_cwd, sizeof(decoy_cwd), "%s/cbm_canonical_decoy_XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm_canonical_cache_XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(session_root) || !cbm_mkdtemp(decoy_cwd) || !cbm_mkdtemp(cache)) {
+        th_rmtree(session_root);
+        th_rmtree(decoy_cwd);
+        th_rmtree(cache);
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    char session_source[CBM_SZ_4K];
+    char decoy_source[CBM_SZ_4K];
+    snprintf(session_source, sizeof(session_source), "%s/repo/main.py", session_root);
+    snprintf(decoy_source, sizeof(decoy_source), "%s/repo/main.py", decoy_cwd);
+    ASSERT_EQ(th_write_file(session_source, "def canonical_target_fn():\n    return 1\n"), 0);
+    ASSERT_EQ(th_write_file(decoy_source, "def decoy_fn():\n    return 2\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(60);
+        _exit(idxcanon_supervised_session_path_check(session_root, decoy_cwd));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+
+    char session_repo[CBM_SZ_4K];
+    char decoy_repo[CBM_SZ_4K];
+    snprintf(session_repo, sizeof(session_repo), "%s/repo", session_root);
+    snprintf(decoy_repo, sizeof(decoy_repo), "%s/repo", decoy_cwd);
+    char *session_project = cbm_project_name_from_path(session_repo);
+    char *decoy_project = cbm_project_name_from_path(decoy_repo);
+    cleanup_project_db(cache, session_project);
+    cleanup_project_db(cache, decoy_project);
+    free(session_project);
+    free(decoy_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(session_root);
+    th_rmtree(decoy_cwd);
+    th_rmtree(cache);
+
+    if (signalled) {
+        printf("    child killed by signal %d (alarm => worker hang)\n", sig);
+    } else if (code != IDXCANON_OK) {
+        printf("    child exit code %d (75=no spawn, 77=not indexed, 78=wrong project, "
+               "79=decoy indexed, 80=target missing)\n",
+               code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDXCANON_OK);
+    PASS();
+#endif
+}
+
 SUITE(mcp) {
     RUN_TEST(mcp_path_within_root_rejects_escape);
     RUN_TEST(detect_changes_rejects_option_like_base_branch);
@@ -13010,6 +15804,8 @@ SUITE(mcp) {
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_bg_paths_route_through_supervisor_issue832);
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
+    RUN_TEST(file_backed_store_is_released_at_request_end_not_pinned);
+    RUN_TEST(index_repository_rejects_unknown_mode_instead_of_silent_full);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);
     RUN_TEST(tool_manage_adr_not_found_rich_error);
@@ -13094,4 +15890,46 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
+    /* upstream-main-only tests */
+    RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
+    RUN_TEST(tool_trace_call_path_not_found);
+    RUN_TEST(tool_trace_call_path_ambiguous);
+    RUN_TEST(tool_trace_call_path_prefers_definition);
+    RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
+    RUN_TEST(query_store_reopens_after_database_replacement);
+    RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
+    RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);
+    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_base_branch);
+    RUN_TEST(detect_changes_rejects_windows_cmd_metacharacters_in_project_root);
+    RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
+    RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
+}
+
+/* Split out of SUITE(mcp) so `mcp_mutation_guard` can be selected on its own:
+   Makefile.cbm TEST_TSAN_SUITES names it explicitly, because the mutation gate,
+   the request-scoped cancellation paths, and the corrupt-store cleanup guard are
+   threaded production surfaces that must run under ThreadSanitizer. */
+SUITE(mcp_mutation_guard) {
+    RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+    RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
+    RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
+    RUN_TEST(tool_manage_adr_mutation_guard_releases_on_missing_store);
+    RUN_TEST(tool_raw_dispatch_cancel_is_scoped_non_mutating_and_next_request_clean);
+    RUN_TEST(tool_outer_request_scope_preserves_predispatch_cancel);
+    RUN_TEST(tool_index_repository_early_raw_cancel_survives_index_entry);
+    RUN_TEST(tool_cross_repo_mutation_guard_sorts_dedupes_and_unwinds);
+    RUN_TEST(tool_cross_repo_mutation_guard_casefolds_aliases_and_order);
+    RUN_TEST(tool_cross_repo_rejects_wildcard_mixed_with_named_targets);
+    RUN_TEST(tool_cross_repo_checks_cancellation_after_acquiring_leases);
+    RUN_TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases);
+    RUN_TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting);
+    RUN_TEST(tool_cross_repo_missing_target_is_skipped_and_counted_not_failed);
+    RUN_TEST(tool_cross_repo_honors_source_name_override);
+    RUN_TEST(tool_cosmetic_root_path_store_is_retained_not_quarantined);
+    RUN_TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested);
+    RUN_TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal);
+    RUN_TEST(tool_corrupt_store_cleanup_rechecks_generation_after_guard_wait);
+    RUN_TEST(tool_corrupt_store_cleanup_preserves_existing_backup_and_uses_unique_name);
+    RUN_TEST(tool_corrupt_store_cleanup_publish_failure_preserves_db_and_wal);
+    RUN_TEST(tool_corrupt_store_cleanup_publishes_complete_wal_snapshot_before_delete);
 }

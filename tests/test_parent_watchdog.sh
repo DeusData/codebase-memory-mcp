@@ -49,7 +49,7 @@ cat >"${tmpdir}/wrapper.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 exec 3<>"${FIFO}"
-CBM_LOG_LEVEL=info "${CBM_BINARY}" <&3 >/dev/null 2>"${TMPDIR_PATH}/child.err" &
+"${CBM_BINARY}" <&3 >"${TMPDIR_PATH}/child.out" 2>"${TMPDIR_PATH}/child.err" &
 echo "$!" >"${TMPDIR_PATH}/child.pid"
 wait
 SH
@@ -78,24 +78,24 @@ if ! kill -0 "${child_pid}" 2>/dev/null; then
   exit 3
 fi
 
-# Publishing the child PID happens immediately after fork, before main() has
-# necessarily captured its initial parent PID. Killing the wrapper at that
-# point races startup: the child can observe ppid==1 and deliberately disable
-# the watchdog. mem.init is emitted after watchdog creation, so it is the
-# readiness barrier for a deterministic parent-death assertion.
-for ((attempt = 0; attempt < CHILD_START_ATTEMPTS; attempt++)); do
-  grep -q "${CHILD_READY_LOG_PATTERN}" "${tmpdir}/child.err" 2>/dev/null && break
-  if ! kill -0 "${child_pid}" 2>/dev/null; then
-    echo "child exited before watchdog initialization" >&2
-    [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
-    exit 3
+# Complete one MCP request before killing the parent. A response proves that
+# the frontend reached its stdio loop after installing the parent watchdog.
+# The old mem.init log sync point belonged to the pre-daemon architecture: the
+# shared daemon now owns memory initialization, so a frontend need not emit it.
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"parent-watchdog-test","version":"1.0"}}}' \
+  >"${tmpdir}/stdin"
+for _ in {1..150}; do
+  if [[ -s "${tmpdir}/child.out" ]] &&
+    grep -Eq '"id"[[:space:]]*:[[:space:]]*1' "${tmpdir}/child.out"; then
+    break
   fi
   sleep "${CHILD_START_POLL_SECONDS}"
 done
-
-if ! grep -q "${CHILD_READY_LOG_PATTERN}" "${tmpdir}/child.err" 2>/dev/null; then
-  echo "child did not initialize the parent watchdog" >&2
+if ! grep -Eq '"id"[[:space:]]*:[[:space:]]*1' "${tmpdir}/child.out" 2>/dev/null; then
+  echo "child did not reach watchdog-ready startup point" >&2
   [[ -s "${tmpdir}/child.err" ]] && cat "${tmpdir}/child.err" >&2
+  [[ -s "${tmpdir}/child.out" ]] && cat "${tmpdir}/child.out" >&2
   exit 3
 fi
 

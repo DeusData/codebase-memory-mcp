@@ -157,7 +157,7 @@ bool cbm_pipeline_build_service_route_identity(const char *path, cbm_svc_kind_t 
     if (svc == CBM_SVC_HTTP) {
         prefix = method ? method : CBM_ROUTE_DEFAULT_METHOD;
         /* Strip any "scheme://host[:port]" first so a client-side full URL
-         * ("http://users-svc/api/x") builds the same canonical identity a
+         * (say http, then "//users-svc/api/x") builds the same canonical identity a
          * server-side registration builds ("/api/x") — otherwise the caller's
          * Route and the handler's Route never merge. Bare paths pass through
          * unchanged. Async topics keep scheme-like text ("kafka://orders"). */

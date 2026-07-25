@@ -79,6 +79,14 @@ enum {
  * response always carries 'total' and 'has_more', and agents page via
  * offset+limit or narrow with label/file_pattern when has_more is true. */
 enum { CBM_DEFAULT_SEARCH_LIMIT = 50 };
+/* String twin for compile-time concatenation into user-visible text (the
+ * installed skill quotes this default), mirroring the
+ * CBM_DEFAULT_QUERY_MAX_ROWS / _STR pair in cli.h. Published text must be built
+ * from the value it describes, never restate it: a restated number stays
+ * plausible and wrong after the value moves. The two spellings are locked
+ * together by cli_installed_skill_limits_match_server_contract, which asserts
+ * atoi(CBM_DEFAULT_SEARCH_LIMIT_STR) == CBM_DEFAULT_SEARCH_LIMIT. */
+#define CBM_DEFAULT_SEARCH_LIMIT_STR "50"
 
 /* Resolution scoring: prefer production symbols over test/mock definitions
  * before namespace-distance tie-breaks. Shared by call and import resolvers so

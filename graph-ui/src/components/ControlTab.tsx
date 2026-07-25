@@ -27,9 +27,9 @@ function Gauge({ label, value, max, unit, color }: {
 
 /* ── Process card ───────────────────────────────────────── */
 
-function ProcessCard({ proc, selected, onSelect, onKill }: {
+function ProcessCard({ proc, selected, onSelect }: {
   proc: ProcessInfo; selected: boolean;
-  onSelect: () => void; onKill: () => void;
+  onSelect: () => void;
 }) {
   const t = useUiMessages();
   return (
@@ -51,14 +51,6 @@ function ProcessCard({ proc, selected, onSelect, onKill }: {
             <span className="text-[9px] px-1.5 py-0.5 rounded bg-primary/15 text-primary font-medium">{t.control.thisProcess}</span>
           )}
         </div>
-        {!proc.is_self && (
-          <button
-            onClick={(e) => { e.stopPropagation(); onKill(); }}
-            className="px-2 py-1 rounded-lg text-[10px] text-foreground/20 hover:text-destructive hover:bg-destructive/10 transition-all"
-          >
-            {t.control.kill}
-          </button>
-        )}
       </div>
 
       <div className="grid grid-cols-3 gap-3 mb-2">
@@ -159,18 +151,6 @@ export function ControlTab() {
     return () => clearInterval(interval);
   }, [fetchProcesses]);
 
-  const killProcess = useCallback(async (pid: number) => {
-    if (!confirm(t.control.killConfirm(pid))) return;
-    try {
-      await fetch("/api/process-kill", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pid }),
-      });
-      setTimeout(fetchProcesses, 1000);
-    } catch { /* ignore */ }
-  }, [fetchProcesses, t.control]);
-
   /* Aggregates */
   const totalCpu = processes.reduce((s, p) => s + p.cpu, 0);
   const totalRam = processes.reduce((s, p) => s + p.rss_mb, 0);
@@ -212,7 +192,6 @@ export function ControlTab() {
                   proc={p}
                   selected={selectedPid === p.pid}
                   onSelect={() => setSelectedPid(selectedPid === p.pid ? null : p.pid)}
-                  onKill={() => killProcess(p.pid)}
                 />
               ))}
             </div>

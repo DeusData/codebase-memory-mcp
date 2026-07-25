@@ -8,6 +8,7 @@
 #include "store/store.h"
 
 #include <stdbool.h>
+#include <stdatomic.h>
 
 /* Result of a cross-repo matching run. */
 typedef struct {
@@ -21,6 +22,9 @@ typedef struct {
     int targets_missing; /* named targets with no indexed .db (skipped) */
     bool source_missing; /* source project has no indexed .db (nothing ran) */
     double elapsed_ms;
+    bool failed;          /* source/target validation, open, or allocation failed */
+    bool cancelled;       /* stopped at a bounded cancellation checkpoint */
+    bool partial_results; /* committed writes before cancellation were retained */
 } cbm_cross_repo_result_t;
 
 /* Run cross-repo matching for `project` against `target_projects`.
@@ -33,5 +37,13 @@ typedef struct {
  * counted in targets_missing. Neither creates a database. */
 cbm_cross_repo_result_t cbm_cross_repo_match(const char *project, const char **target_projects,
                                              int target_count);
+
+/* Cancellation-aware form used by session-owned frontends. The caller-owned
+ * flag must outlive the call. Cancellation is not a multi-database rollback:
+ * already committed target writes remain and are reported as partial results. */
+cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
+                                                         const char **target_projects,
+                                                         int target_count,
+                                                         const atomic_int *cancelled);
 
 #endif /* CBM_PASS_CROSS_REPO_H */

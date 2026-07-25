@@ -11,9 +11,22 @@ src/foundation/compat_fs.c:fork:cbm_exec_no_shell — fork+execvp for shell-free
 src/foundation/subprocess.c:fork:cbm_run_posix — fork+execv for the crash/hang-isolating index worker (supervisor primitive; child execs immediately, no code runs in the forked image)
 src/foundation/compat_fs.c:execvp:cbm_exec_no_shell — direct exec without shell interpretation
 
+# ── Coordination daemon: detached bootstrap and test-only watchdog probe ────
+src/daemon/bootstrap.c:fork:validated shell-free double-fork; grandchild resets signals/umask, closes inherited descriptors, and execv's the exact current CBM image
+src/main.c:fork:test-only parent-death containment descendant; inert unless the private CBM_TEST_WORKER_DESCENDANT_PID_FILE probe is explicitly set
+
+# ── Coordination daemon: count-bounded local IPC (never Internet sockets) ──
+# Format: NETWORK:file:function:expected-count:justification
+NETWORK:src/daemon/ipc.c:socket:1:single owner-only AF_UNIX stream constructor
+NETWORK:src/daemon/ipc.c:connect:1:single sockaddr_un-typed connect wrapper used only with the stable owner-only daemon endpoint
+
+# ── Coordination daemon: count-bounded private internal file writes ────────
+# Format: WRITE:file:expected-count:justification
+WRITE:src/main.c:1:supervised worker writes its MCP result only to the private unique response path created and retained by its parent
+WRITE:src/daemon/application.c:1:recovery truncates only its private uniquely-created per-job marker file
+
 # ── CLI: update command (user-initiated, interactive) ──────────────────────
 src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
-src/cli/cli.c:cbm_popen:pgrep for kill_other_instances (hardcoded process name)
 src/cli/cli.c:popen:sha256 checksum computation via shasum
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
@@ -23,9 +36,11 @@ src/watcher/watcher.c:cbm_popen:git working tree status (git_is_dirty)
 src/watcher/watcher.c:cbm_popen:git file count (git_file_count)
 src/watcher/watcher.c:popen:via cbm_popen wrapper calls
 
-# ── Git context: git metadata resolution (repo paths validated via cbm_validate_shell_arg) ──
-src/git/git_context.c:cbm_popen:git rev-parse/symbolic-ref/merge-base metadata lookup
-src/git/git_context.c:popen:via cbm_popen wrapper call
+# ── Git: metadata resolution (repo paths validated via cbm_git_validate_repo_path) ──
+src/git/git_command.c:cbm_popen:git rev-parse/symbolic-ref/merge-base/status metadata lookup
+src/git/git_command.c:popen:via cbm_popen wrapper call
+src/git/git_snapshot.c:cbm_popen:git snapshot metadata via the same validated command builders
+src/git/git_snapshot.c:popen:via cbm_popen wrapper call
 
 # ── MCP server: search and change detection ────────────────────────────────
 src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)

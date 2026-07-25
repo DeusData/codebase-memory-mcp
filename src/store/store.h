@@ -250,6 +250,18 @@ int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const 
 /* Restore database from another store (backup API). */
 int cbm_store_restore_from(cbm_store_t *dst, cbm_store_t *src);
 
+/* Copy a transactionally-consistent snapshot, including committed WAL frames,
+ * from an existing DB into a same-directory staging path. */
+int cbm_store_backup_path(const char *source_path, const char *staging_path);
+
+/* Seal a staging DB into one self-contained main file before atomic publish.
+ * The store must have no concurrent users. */
+int cbm_store_prepare_for_publish(cbm_store_t *s);
+
+/* Checkpoint and detach sidecars from an existing destination immediately
+ * before replacement. Fails closed while another process prevents sealing. */
+int cbm_store_prepare_path_for_replace(const char *path);
+
 /* ── Search ─────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -387,8 +399,10 @@ cbm_store_t *cbm_store_open_memory(void);
 /* Open a file-backed database at the given path. Creates if needed. */
 cbm_store_t *cbm_store_open_path(const char *db_path);
 
-/* Open an existing file-backed database read-write without creating a missing
- * file. Intended for maintenance operations on a previously resolved store. */
+/* Open an existing file-backed database read-write without CREATE. Intended for
+ * maintenance operations on a previously resolved store and for coordinated
+ * mutations where a missing/typo path must never materialize a ghost database.
+ * Returns NULL when the file does not exist. */
 cbm_store_t *cbm_store_open_path_existing(const char *db_path);
 
 /* Open an existing file-backed database for querying only. Opened READ-ONLY
@@ -726,6 +740,8 @@ int cbm_store_delete_file_state(cbm_store_t *s, const char *project, const char 
  * they only let callers warn that newer file contents may exist. */
 int cbm_store_upsert_dirty_file(cbm_store_t *s, const cbm_dirty_file_state_t *state);
 int cbm_store_clear_dirty_file(cbm_store_t *s, const char *project, const char *rel_path);
+int cbm_store_list_dirty_files(cbm_store_t *s, const char *project,
+                               cbm_dirty_file_state_t **out, int *count);
 int cbm_store_count_dirty_files(cbm_store_t *s, const char *project, int *out_pending,
                                 int *out_overlay_ready);
 
@@ -984,6 +1000,12 @@ typedef struct {
     int coverage_version;
     bool hash_records_complete;
 } cbm_coverage_meta_t;
+
+/* Schema version of the coverage row set and its metadata. Bump it when the
+ * meaning of a stored row or meta field changes, so a reader can tell a row set
+ * it understands from one it does not. Writers that leave coverage_version at
+ * 0 are defaulted to this value on store. */
+#define CBM_COVERAGE_VERSION 1
 
 /* Replace the project's coverage rows in one transaction, then prune rows for
  * files absent from file_hashes (deleted from the repo). Call AFTER hashes
@@ -1349,6 +1371,9 @@ void cbm_store_free_projects(cbm_project_t *projects, int count);
 
 /* Free an array of file hashes. */
 void cbm_store_free_file_hashes(cbm_file_hash_t *hashes, int count);
+
+/* Free an array of dirty-file states returned by cbm_store_list_dirty_files. */
+void cbm_store_free_dirty_files(cbm_dirty_file_state_t *states, int count);
 
 /* Free heap-allocated strings in a stack-allocated file state. */
 void cbm_store_file_state_free_fields(cbm_file_state_t *state);

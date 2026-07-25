@@ -6,6 +6,7 @@
  * RETURN with COUNT/ORDER BY/LIMIT/DISTINCT.
  */
 #include "cypher/cypher.h"
+#include "foundation/compat.h"
 #include "store/store.h"
 #include "foundation/hash_table.h"
 #include "foundation/platform.h"
@@ -1022,11 +1023,11 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
     }
     cbm_node_pattern_t anchor = {0};
     cbm_rel_pattern_t rel = {0};
-    cbm_node_pattern_t far = {0};
-    if (parse_node(p, &anchor) < 0 || parse_rel(p, &rel) < 0 || parse_node(p, &far) < 0) {
+    cbm_node_pattern_t far_node = {0};
+    if (parse_node(p, &anchor) < 0 || parse_rel(p, &rel) < 0 || parse_node(p, &far_node) < 0) {
         free_one_node_pattern(&anchor);
         free_one_rel_pattern(&rel);
-        free_one_node_pattern(&far);
+        free_one_node_pattern(&far_node);
         snprintf(p->error, sizeof(p->error),
                  "unsupported EXISTS pattern — only the single-hop form "
                  "'(var)-[:TYPE]->()' is supported");
@@ -1044,7 +1045,7 @@ static cbm_expr_t *parse_exists_predicate(parser_t *p, bool negated) {
                                                                             : 0;
     free_one_node_pattern(&anchor);
     free_one_rel_pattern(&rel);
-    free_one_node_pattern(&far);
+    free_one_node_pattern(&far_node);
     return expr_leaf(c);
 }
 
@@ -2547,7 +2548,7 @@ static const char *json_extract_prop_ex(const char *json, const char *key, char 
     return buf;
 }
 
-/* Get edge property by name. Uses rotating static buffers to allow
+/* Get edge property by name. Uses rotating thread-local buffers to allow
  * multiple concurrent calls (e.g. projecting r.url_path, r.confidence
  * in the same row). */
 static const char *edge_prop_ex(const cbm_edge_t *e, const char *prop, bool *is_null) {
@@ -2560,9 +2561,10 @@ static const char *edge_prop_ex(const cbm_edge_t *e, const char *prop, bool *is_
         return e->type ? e->type : "";
     }
     /* Rotate through per-thread buffers so columns cannot alias and concurrent
-     * MCP requests cannot race over projection scratch storage. */
-    static _Thread_local char ebufs[CYP_BUF_8][CBM_SZ_512];
-    static _Thread_local int ebuf_idx = 0;
+     * MCP requests cannot race over projection scratch storage. CBM_TLS is the
+     * project's portable thread-local qualifier (foundation/compat.h). */
+    static CBM_TLS char ebufs[CYP_BUF_8][CBM_SZ_512];
+    static CBM_TLS int ebuf_idx = 0;
     char *buf = ebufs[ebuf_idx++ & CYP_EBUF_MASK];
     json_extract_prop_ex(e->properties_json, prop, buf, CBM_SZ_512, is_null);
     return buf;

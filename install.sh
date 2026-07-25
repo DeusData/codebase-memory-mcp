@@ -23,11 +23,63 @@ VARIANT="standard"
 SKIP_CONFIG=false
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
 
-# Security: reject non-HTTPS download URLs (defense-in-depth)
-case "$CBM_DOWNLOAD_URL" in
-    https://*|http://localhost*|http://127.0.0.1*) ;;
-    *) echo "error: refusing non-HTTPS download URL: $CBM_DOWNLOAD_URL" >&2; exit 1 ;;
-esac
+# Security: every remote hop must remain HTTPS. Plain HTTP is accepted only
+# for an exact loopback authority used by local smoke tests, with redirects
+# disabled so a local fixture cannot bounce the installer to the network.
+is_loopback_http_url() {
+    [[ "$1" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]+)?([/?\#].*)?$ ]]
+}
+
+if [[ "$CBM_DOWNLOAD_URL" == https://* ]]; then
+    CBM_DOWNLOAD_LOOPBACK=false
+elif is_loopback_http_url "$CBM_DOWNLOAD_URL"; then
+    CBM_DOWNLOAD_LOOPBACK=true
+else
+    echo "error: refusing non-HTTPS download URL: $CBM_DOWNLOAD_URL" >&2
+    exit 1
+fi
+
+download_file() {
+    local url="$1"
+    local destination="$2"
+    local progress="$3"
+    if [ "$CBM_DOWNLOAD_LOOPBACK" = true ]; then
+        is_loopback_http_url "$url" || {
+            echo "error: loopback download escaped its authority: $url" >&2
+            return 1
+        }
+        if command -v curl &>/dev/null; then
+            local curl_args=(-fS --noproxy '*' --proto '=http')
+            [ "$progress" = true ] && curl_args+=(--progress-bar) || curl_args+=(-s)
+            curl "${curl_args[@]}" -o "$destination" "$url"
+        elif command -v wget &>/dev/null; then
+            local wget_args=(--no-proxy --max-redirect=0)
+            [ "$progress" = true ] && wget_args+=(--show-progress) || wget_args+=(-q)
+            wget "${wget_args[@]}" -O "$destination" "$url"
+        else
+            echo "error: curl or wget required" >&2
+            return 1
+        fi
+        return
+    fi
+
+    [[ "$url" == https://* ]] || {
+        echo "error: HTTPS download downgraded: $url" >&2
+        return 1
+    }
+    if command -v curl &>/dev/null; then
+        local curl_args=(-fSL --max-redirs 5 --proto '=https' --proto-redir '=https')
+        [ "$progress" = true ] && curl_args+=(--progress-bar) || curl_args+=(-sS)
+        curl "${curl_args[@]}" -o "$destination" "$url"
+    elif command -v wget &>/dev/null; then
+        local wget_args=(--https-only --max-redirect=5)
+        [ "$progress" = true ] && wget_args+=(--show-progress) || wget_args+=(-q)
+        wget "${wget_args[@]}" -O "$destination" "$url"
+    else
+        echo "error: curl or wget required" >&2
+        return 1
+    fi
+}
 
 for arg in "$@"; do
     case "$arg" in
@@ -116,45 +168,75 @@ DLDIR=$(mktemp -d)
 trap 'rm -rf "$DLDIR"' EXIT
 
 echo "Downloading ${ARCHIVE}..."
-if command -v curl &>/dev/null; then
-    curl -fSL --progress-bar -o "$DLDIR/$ARCHIVE" "$URL"
-elif command -v wget &>/dev/null; then
-    wget -q --show-progress -O "$DLDIR/$ARCHIVE" "$URL"
-else
-    echo "error: curl or wget required" >&2
+download_file "$URL" "$DLDIR/$ARCHIVE" true
+
+# Checksum verification is mandatory. Activation must never stop running CBM
+# sessions for a candidate whose published digest was not positively verified.
+CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
+download_file "$CHECKSUM_URL" "$DLDIR/checksums.txt" false || {
+    echo "error: could not download checksums.txt" >&2
+    exit 1
+}
+CHECKSUM_BYTES=$(wc -c < "$DLDIR/checksums.txt" | tr -d '[:space:]')
+case "$CHECKSUM_BYTES" in
+    ''|*[!0-9]*)
+        echo "error: could not determine checksums.txt size" >&2
+        exit 1
+        ;;
+esac
+if [ "$CHECKSUM_BYTES" -gt 1048576 ]; then
+    echo "error: checksums.txt exceeds the 1 MiB safety limit" >&2
     exit 1
 fi
-
-# Checksum verification
-CHECKSUM_URL="${CBM_DOWNLOAD_URL}/checksums.txt"
-if curl -fsSL -o "$DLDIR/checksums.txt" "$CHECKSUM_URL" 2>/dev/null; then
-    EXPECTED=$(grep "$ARCHIVE" "$DLDIR/checksums.txt" | awk '{print $1}')
-    if [ -n "$EXPECTED" ]; then
-        if command -v sha256sum &>/dev/null; then
-            ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        elif command -v shasum &>/dev/null; then
-            ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
-        else
-            ACTUAL=""
-        fi
-        if [ -n "$ACTUAL" ] && [ "$EXPECTED" != "$ACTUAL" ]; then
-            echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
-            echo "  expected: $EXPECTED" >&2
-            echo "  actual:   $ACTUAL" >&2
+awk -v archive="$ARCHIVE" \
+    '$2 == archive || $2 == "*" archive { print $1 }' \
+    "$DLDIR/checksums.txt" > "$DLDIR/matching-checksums.txt"
+EXPECTED=""
+while IFS= read -r digest; do
+    case "$digest" in
+        ''|*[!0-9A-Fa-f]*)
+            echo "error: invalid SHA-256 digest for $ARCHIVE" >&2
             exit 1
-        elif [ -n "$ACTUAL" ]; then
-            echo "Checksum verified."
-        fi
+            ;;
+    esac
+    if [ "${#digest}" -ne 64 ]; then
+        echo "error: invalid SHA-256 digest length for $ARCHIVE" >&2
+        exit 1
     fi
+    digest=$(printf '%s' "$digest" | tr 'A-F' 'a-f')
+    if [ -n "$EXPECTED" ] && [ "$EXPECTED" != "$digest" ]; then
+        echo "error: conflicting SHA-256 digests for $ARCHIVE" >&2
+        exit 1
+    fi
+    EXPECTED="$digest"
+done < "$DLDIR/matching-checksums.txt"
+if [ -z "$EXPECTED" ]; then
+    echo "error: no SHA-256 digest for $ARCHIVE in checksums.txt" >&2
+    exit 1
 fi
+if command -v sha256sum &>/dev/null; then
+    ACTUAL=$(sha256sum "$DLDIR/$ARCHIVE" | awk '{print $1}')
+elif command -v shasum &>/dev/null; then
+    ACTUAL=$(shasum -a 256 "$DLDIR/$ARCHIVE" | awk '{print $1}')
+else
+    echo "error: sha256sum or shasum is required to verify the download" >&2
+    exit 1
+fi
+ACTUAL=$(printf '%s' "$ACTUAL" | tr 'A-F' 'a-f')
+if [ "$EXPECTED" != "$ACTUAL" ]; then
+    echo "error: CHECKSUM MISMATCH — download may be corrupted!" >&2
+    echo "  expected: $EXPECTED" >&2
+    echo "  actual:   $ACTUAL" >&2
+    exit 1
+fi
+echo "Checksum verified."
 
 # Extract
 echo "Extracting..."
-cd "$DLDIR"
 if [ "$EXT" = "zip" ]; then
-    unzip -q "$ARCHIVE"
+    unzip -q "$DLDIR/$ARCHIVE" -d "$DLDIR"
 else
-    tar -xzf "$ARCHIVE"
+    tar -xzf "$DLDIR/$ARCHIVE" -C "$DLDIR"
 fi
 
 DLBIN="$DLDIR/codebase-memory-mcp"
@@ -170,14 +252,21 @@ if [ "$OS" = "darwin" ]; then
     codesign --sign - --force "$DLBIN" 2>/dev/null || true
 fi
 
-# Install
-mkdir -p "$INSTALL_DIR"
-DEST="$INSTALL_DIR/codebase-memory-mcp"
-if [ -f "$DEST" ]; then
-    rm -f "$DEST"
+# Verify the candidate before it requests account-wide maintenance. The
+# candidate itself owns process draining and the transactional target swap.
+chmod 755 "$DLBIN"
+if ! CANDIDATE_VERSION=$("$DLBIN" --version 2>&1); then
+    echo "error: downloaded binary failed to run" >&2
+    exit 1
 fi
-cp "$DLBIN" "$DEST"
-chmod 755 "$DEST"
+echo "Verified candidate: $CANDIDATE_VERSION"
+
+DEST="$INSTALL_DIR/codebase-memory-mcp"
+INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
+if [ "$SKIP_CONFIG" = true ]; then
+    INSTALL_ARGS+=(--skip-config)
+fi
+"$DLBIN" install "${INSTALL_ARGS[@]}"
 
 # Verify
 VERSION=$("$DEST" --version 2>&1) || {
@@ -189,18 +278,10 @@ VERSION=$("$DEST" --version 2>&1) || {
 }
 echo "Installed: $VERSION"
 
-# Configure agents
+# Agent configuration is part of the candidate-owned activation window.
 if [ "$SKIP_CONFIG" = true ]; then
     echo ""
     echo "Skipping agent configuration (--skip-config)"
-else
-    echo ""
-    echo "Configuring coding agents..."
-    "$DEST" install -y 2>&1 || {
-        echo ""
-        echo "Agent configuration failed (non-fatal)."
-        echo "Run manually: codebase-memory-mcp install"
-    }
 fi
 
 # PATH check

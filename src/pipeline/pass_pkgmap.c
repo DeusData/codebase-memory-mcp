@@ -787,7 +787,7 @@ static bool is_pkgmap_manifest_basename(const char *basename) {
  * safe_stat. */
 static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
 #ifdef _WIN32
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (!wpath) {
         return CBM_NOT_FOUND;
     }
@@ -820,7 +820,7 @@ static int pkgmap_safe_stat(const char *abs_path, struct stat *st) {
  * guarantee; this check is a best-effort early skip on top of it. */
 #ifdef _WIN32
 static bool pkgmap_is_reparse_point(const char *abs_path) {
-    wchar_t *wpath = cbm_utf8_to_wide(abs_path);
+    wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (!wpath) {
         return false;
     }

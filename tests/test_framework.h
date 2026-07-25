@@ -272,11 +272,18 @@ static inline int tf_test_filter_matches(const char *name) {
 
 #define SUITE(name) void suite_##name(void)
 
-#define RUN_SUITE(name)                                            \
+/* TF_RUN_SUITE_RAW is the unconditional runner. RUN_SUITE is its public
+ * spelling. They are separate names on purpose: test_main.c poisons RUN_SUITE
+ * inside its full-run path so a suite that runs without being listed by
+ * --list-suites is a compile error, and drives that path through
+ * TF_RUN_SUITE_RAW, which stays available. */
+#define TF_RUN_SUITE_RAW(name)                                     \
     do {                                                           \
         printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
         suite_##name();                                            \
     } while (0)
+
+#define RUN_SUITE(name) TF_RUN_SUITE_RAW(name)
 
 /* ── Summary ───────────────────────────────────────────────────── */
 

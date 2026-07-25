@@ -537,6 +537,11 @@ TEST(store_open_or_deep_integrity_rejects_page_corruption) {
     }
     (void)fclose(f);
 
+    /* Either rejection satisfies the contract this test is named for: open may
+     * refuse the corrupt file outright (bad == NULL), or accept it and leave the
+     * deep check to refuse. The NULL arm is not a vacuous pass -- the healthy
+     * ASSERT_NOT_NULL(ok) above uses the same open path, so a blanket open
+     * failure would already have failed this test before the corruption. */
     cbm_store_t *bad = cbm_store_open_path(db2);
     if (bad) {
         ASSERT_FALSE(cbm_store_check_integrity_deep(bad));

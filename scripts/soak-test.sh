@@ -2,7 +2,10 @@
 # soak-test.sh — Endurance test for codebase-memory-mcp.
 #
 # Runs compressed workload cycles: queries, file mutations, reindexes, idle periods.
-# Reads diagnostics from /tmp/cbm-diagnostics-<pid>.json (requires CBM_DIAGNOSTICS=1).
+# Reads the randomized diagnostics snapshot path the DAEMON emits in its log as
+# a diagnostics.start record (requires CBM_DIAGNOSTICS=1). The path cannot be
+# derived from the frontend pid: the daemon host, not the frontend this harness
+# spawns, is what writes diagnostics.
 # Outputs metrics to soak-results/ and exits 0 (pass) or 1 (fail).
 #
 # Usage:
@@ -148,18 +151,37 @@ SERVER_PID=""
 DIAG_FILE=""
 DIAG_FILES=()
 FDS_OPEN=false
+SOAK_CLEANED=false
 
-case "$(uname -s)" in
-    MINGW*|MSYS*|CYGWIN*)
-        MCP_SOAK_PROJECT=$(cygpath -m "$SOAK_PROJECT")
-        CBM_CACHE_DIR=$(cygpath -m "$SOAK_CACHE")
-        DIAG_DIR=$(cygpath -u "${TEMP:-${TMP:-.}}")
-        ;;
-    *)
-        # cbm_tmpdir() is /tmp on POSIX; keep the harness path identical.
-        DIAG_DIR=/tmp
-        ;;
-esac
+# Child-facing spellings of the two paths. Keyed off the BINARY being a .exe
+# rather than off the host OS, so a Windows binary run under Wine on Linux or
+# macOS still receives drive-letter paths while this Bash harness keeps the host
+# form for its own file and Git operations.
+if [[ "$BINARY" == *.exe ]] && command -v winepath >/dev/null 2>&1; then
+    MCP_SOAK_PROJECT=$(winepath -w "$SOAK_PROJECT")
+    MCP_SOAK_PROJECT=${MCP_SOAK_PROJECT//\\//}
+    CBM_CACHE_DIR=$(winepath -w "$SOAK_CACHE")
+elif [[ "$BINARY" == *.exe ]] && command -v cygpath >/dev/null 2>&1; then
+    MCP_SOAK_PROJECT=$(cygpath -m "$SOAK_PROJECT")
+    CBM_CACHE_DIR=$(cygpath -m "$SOAK_CACHE")
+else
+    case "$(uname -s)" in
+        MINGW*|MSYS*|CYGWIN*)
+            MCP_SOAK_PROJECT=$(cygpath -m "$SOAK_PROJECT")
+            CBM_CACHE_DIR=$(cygpath -m "$SOAK_CACHE")
+            ;;
+    esac
+fi
+
+# Every JSON request uses one pre-escaped spelling of the project path, so a
+# path containing a quote or backslash cannot corrupt the request.
+SOAK_PROJECT_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$MCP_SOAK_PROJECT")
+
+# Diagnostics are written by the DAEMON HOST, not by the frontend process this
+# harness spawns, so the path cannot be derived from $SERVER_PID. The daemon
+# emits it in its log as a diagnostics.start control record; refresh_diagnostics_paths()
+# below reads it from there.
+DAEMON_LOG="$SOAK_CACHE/logs/cbm-daemon.log"
 export CBM_CACHE_DIR
 
 close_server_fds() {
@@ -171,6 +193,11 @@ close_server_fds() {
 
 stop_server() {
     close_server_fds
+    # Numeric guard: a non-numeric SERVER_PID would make kill target a job spec.
+    if [[ ! "${SERVER_PID:-}" =~ ^[0-9]+$ ]]; then
+        SERVER_PID=""
+        return 0
+    fi
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
         local waited=0
         # Diagnostics shutdown may wait for its five-second writer interval.
@@ -189,12 +216,23 @@ stop_server() {
 }
 
 cleanup_runtime() {
+    # Idempotent: EXIT and INT/TERM can both fire, and running the teardown twice
+    # would kill a pid this run no longer owns.
+    if $SOAK_CLEANED; then
+        return 0
+    fi
+    SOAK_CLEANED=true
     set +e
     stop_server
     rm -f "$SERVER_IN" "$SERVER_OUT"
     for diag_file in "${DIAG_FILES[@]}"; do
         rm -f "$diag_file" "$diag_file.tmp"
     done
+    # Preserve the daemon log as run evidence before the cache root goes away;
+    # without it a failed soak leaves nothing to diagnose from.
+    if [ -f "$DAEMON_LOG" ]; then
+        cp "$DAEMON_LOG" "$RESULTS_DIR/cbm-daemon.log" 2>/dev/null || true
+    fi
     rm -rf "$SOAK_ROOT"
     return 0
 }
@@ -361,12 +399,33 @@ now_ms() {
     python3 -c "import time; print(int(time.time() * 1000))"
 }
 
-response_is_success() {
-    local response="$1"
-    [[ "$response" == *'"jsonrpc":"2.0"'* &&
-       "$response" == *'"result":'* &&
-       "$response" != *'"error":'* &&
-       "$response" != *'"isError":true'* ]]
+# Upstream main's form replaces this harness's response_is_success. Substring
+# matching on '"error":' false-negates whenever that text appears inside a
+# legitimate result payload (a search hit quoting it, for instance), and it
+# cannot tell that a response arrived for a DIFFERENT request -- which matters
+# on this FIFO where one dropped reply desynchronizes every later read. Parsing
+# the JSON and matching the id fixes both.
+json_rpc_response_ok() {
+    local expected_id="$1"
+    local response="$2"
+    python3 -c '
+import json
+import sys
+
+try:
+    message = json.loads(sys.stdin.read())
+    result = message.get("result") if isinstance(message, dict) else None
+    ok = (
+        isinstance(message, dict)
+        and message.get("id") == int(sys.argv[1])
+        and "error" not in message
+        and "result" in message
+        and not (isinstance(result, dict) and result.get("isError") is True)
+    )
+except (ValueError, TypeError):
+    ok = False
+sys.exit(0 if ok else 1)
+' "$expected_id" <<<"$response"
 }
 
 # Send a JSON-RPC tool call to the running server via its stdin pipe.
@@ -391,7 +450,7 @@ mcp_call() {
     local resp=""
     local status=1
     if read -r -t "$SOAK_RESPONSE_TIMEOUT_SECONDS" resp <&4 2>/dev/null &&
-        response_is_success "$resp"; then
+        json_rpc_response_ok "$id" "$resp"; then
         status=0
     fi
     LAST_MCP_RESPONSE="$resp"
@@ -429,12 +488,99 @@ mcp_initialize() {
         return 1
     fi
     local response=""
-    read -r -t 10 response <&4 2>/dev/null && response_is_success "$response"
+    read -r -t 10 response <&4 2>/dev/null && json_rpc_response_ok 0 "$response"
 }
 
 # ── Helper: collect diagnostics snapshot ─────────────────────────
 
+# Diagnostics discovery, carried over from upstream main and REQUIRED by the
+# daemon architecture: the daemon host writes the snapshot, not the frontend
+# this harness spawns, and its path is randomized. Deriving it from $SERVER_PID
+# (as this harness previously did) points at the wrong process, so DIAG_FILE
+# never exists, every snapshot records nothing, and the whole soak analysis runs
+# on an empty CSV while reporting success.
+
+diagnostics_host_path() {
+    local emitted_path="$1"
+    if [[ "$emitted_path" =~ ^[A-Za-z]:[/\\] ]] && command -v winepath >/dev/null 2>&1; then
+        winepath -u "$emitted_path"
+    elif [[ "$emitted_path" =~ ^[A-Za-z]:[/\\] ]] && command -v cygpath >/dev/null 2>&1; then
+        cygpath -u "$emitted_path"
+    else
+        printf '%s\n' "$emitted_path"
+    fi
+}
+
+refresh_diagnostics_paths() {
+    [ -f "$DAEMON_LOG" ] || return 1
+    local start_line snapshot_path trajectory_path
+    start_line=$(grep '"event":"diagnostics.start"' "$DAEMON_LOG" 2>/dev/null | tail -n 1) || true
+    [ -n "$start_line" ] || return 1
+    # The discovery record is JSON (a control record survives CBM_LOG_LEVEL
+    # suppression); decode the two standard escapes temp paths can carry.
+    snapshot_path=$(printf '%s\n' "$start_line" | sed -n 's/.*"snapshot":"\([^"]*\)".*/\1/p' |
+        sed 's/\\\([\"\\/]\)/\1/g')
+    trajectory_path=$(printf '%s\n' "$start_line" | sed -n 's/.*"trajectory":"\([^"]*\)".*/\1/p' |
+        sed 's/\\\([\"\\/]\)/\1/g')
+    [ -n "$snapshot_path" ] && [ -n "$trajectory_path" ] || return 1
+    DIAG_FILE=$(diagnostics_host_path "$snapshot_path")
+}
+
+diagnostics_start_count() {
+    if [ -f "$DAEMON_LOG" ]; then
+        grep -c '"event":"diagnostics.start"' "$DAEMON_LOG" 2>/dev/null || true
+    else
+        echo 0
+    fi
+}
+
+daemon_stop_count() {
+    if [ -f "$DAEMON_LOG" ]; then
+        grep -c 'msg=daemon.stop' "$DAEMON_LOG" 2>/dev/null || true
+    else
+        echo 0
+    fi
+}
+
+wait_for_daemon_stop() {
+    local after_count="$1"
+    local attempts=300
+    while [ "$attempts" -gt 0 ]; do
+        local current_count
+        current_count=$(daemon_stop_count)
+        if [ "${current_count:-0}" -gt "$after_count" ]; then
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+wait_for_diagnostics_snapshot() {
+    local after_count="${1:-0}"
+    local previous_path="${2:-}"
+    local attempts=100
+    while [ "$attempts" -gt 0 ]; do
+        local current_count
+        current_count=$(diagnostics_start_count)
+        if [ "${current_count:-0}" -gt "$after_count" ] && refresh_diagnostics_paths &&
+            [ -f "$DIAG_FILE" ] &&
+            { [ -z "$previous_path" ] || [ "$DIAG_FILE" != "$previous_path" ]; }; then
+            return 0
+        fi
+        attempts=$((attempts - 1))
+        sleep 0.1
+    done
+    return 1
+}
+
+SNAPSHOT_ATTEMPTS=0
 collect_snapshot() {
+    SNAPSHOT_ATTEMPTS=$((SNAPSHOT_ATTEMPTS + 1))
+    # Re-resolve the daemon-emitted path on every call: a daemon restart (Phase 5
+    # crash recovery) publishes a new randomized snapshot path.
+    refresh_diagnostics_paths || return 1
     if [ -n "$DIAG_FILE" ] && [ -f "$DIAG_FILE" ]; then
         local diag_values
         if ! diag_values=$(python3 -c "
@@ -458,6 +604,9 @@ print(f\"{d.get('uptime_s',0)},{d.get('rss_bytes',0)},{mem},{d.get('fd_count',0)
             >> "$METRICS_CSV"
         return 0
     fi
+    # Fail loud. Upstream's version returned 0 when the path could not be
+    # resolved, which made every `if ! collect_snapshot` guard dead and let a run
+    # that recorded no samples at all report success.
     return 1
 }
 
@@ -478,20 +627,39 @@ print(f"{uptime_s},{user_cpu_ms + system_cpu_ms}")
 ' < "$DIAG_FILE" 2>/dev/null
 }
 
-extract_index_project() {
+# Upstream main's form replaces this harness's extract_index_project: it skips
+# non-JSON content items (the update-available banner) instead of raising on
+# them, and type-checks every level. The old version aborted on a healthy run
+# whenever a banner preceded the summary JSON.
+mcp_response_project() {
+    local response="$1"
     python3 -c '
-import json, sys
-outer = json.load(sys.stdin)
-for item in outer.get("result", {}).get("content", []):
-    if item.get("type") != "text":
-        continue
-    inner = json.loads(item.get("text", "{}"))
-    project = inner.get("project")
-    if project:
-        print(project)
-        raise SystemExit(0)
-raise SystemExit(1)
-'
+import json
+import sys
+
+try:
+    message = json.loads(sys.stdin.read())
+    result = message.get("result", {})
+    content = result.get("content", []) if isinstance(result, dict) else []
+    project = ""
+    for item in content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            # The summary JSON may be preceded by plain-text banner items
+            # (update-available notice); skip anything that is not JSON.
+            try:
+                payload = json.loads(item.get("text", ""))
+            except ValueError:
+                continue
+            candidate = payload.get("project") if isinstance(payload, dict) else None
+            if isinstance(candidate, str) and candidate:
+                project = candidate
+                break
+    if not project:
+        raise ValueError("index response has no project")
+    print(project)
+except (ValueError, TypeError, AttributeError):
+    sys.exit(1)
+' <<<"$response"
 }
 
 start_server() {
@@ -499,11 +667,14 @@ start_server() {
     # fixture. Disable the product's configured session-CWD auto-index so an
     # unrelated checkout cannot contend for the global pipeline lock or pollute
     # the soak cache and idle-resource measurements.
-    CBM_AUTO_INDEX=false CBM_DIAGNOSTICS=1 \
+    # CBM_LOG_LEVEL/CBM_LOG_FORMAT are required, not cosmetic: the daemon's
+    # diagnostics.start record is how this harness discovers the snapshot path,
+    # and it must reach $DAEMON_LOG in a form refresh_diagnostics_paths can read.
+    local snapshots_before
+    snapshots_before=$(diagnostics_start_count)
+    CBM_AUTO_INDEX=false CBM_DIAGNOSTICS=1 CBM_LOG_LEVEL=info CBM_LOG_FORMAT=text \
         "$BINARY" < "$SERVER_IN" > "$SERVER_OUT" 2>>"$SERVER_STDERR" &
     SERVER_PID=$!
-    DIAG_FILE="$DIAG_DIR/cbm-diagnostics-${SERVER_PID}.json"
-    DIAG_FILES+=("$DIAG_FILE")
 
     exec 3>"$SERVER_IN"
     exec 4<"$SERVER_OUT"
@@ -514,6 +685,15 @@ start_server() {
         echo "FAIL: server did not start" >&2
         return 1
     fi
+    # The daemon owns diagnostics; wait for it to publish a snapshot path rather
+    # than guessing one from the frontend's pid.
+    # $1, when given, is the snapshot path seen BEFORE a restart: requiring a
+    # different one proves a fresh daemon generation rather than a stale reattach.
+    if ! wait_for_diagnostics_snapshot "${snapshots_before:-0}" "${1:-}"; then
+        echo "FAIL: daemon did not emit a usable diagnostics.start path" >&2
+        return 1
+    fi
+    DIAG_FILES+=("$DIAG_FILE")
     if ! mcp_initialize; then
         echo "FAIL: server initialize did not return a successful response" >&2
         return 1
@@ -535,7 +715,7 @@ fi
 # ── Phase 2: Initial index ───────────────────────────────────────
 
 echo "--- Phase 2: initial index ---"
-if ! mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"; then
+if ! mcp_call index_repository "{\"repo_path\":$SOAK_PROJECT_JSON}"; then
     exit 1
 fi
 sleep 6  # wait for diagnostics write
@@ -549,7 +729,7 @@ fi
 
 # Use the product's returned project slug rather than duplicating its path
 # normalization in this cross-platform harness.
-if ! PROJ_NAME=$(printf '%s' "$LAST_MCP_RESPONSE" | extract_index_project); then
+if ! PROJ_NAME=$(mcp_response_project "$LAST_MCP_RESPONSE"); then
     echo "FAIL: initial index response did not contain a project slug" >&2
     exit 1
 fi
@@ -597,7 +777,7 @@ while [ "$(date +%s)" -lt "$END_TIME" ]; do
 
         # Full reindex every 2 minutes (compressed — simulates 15min real interval).
         if [ $((NOW - LAST_REINDEX)) -ge "$WORKLOAD_REINDEX_INTERVAL_SECONDS" ]; then
-            run_mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"
+            run_mcp_call index_repository "{\"repo_path\":$SOAK_PROJECT_JSON}"
             LAST_REINDEX=$NOW
         fi
     fi
@@ -670,6 +850,41 @@ fi
 
 echo "OK: idle CPU=${IDLE_CPU}% over ${IDLE_OBSERVED_SECONDS}s"
 
+# ── Phase 4b: one-shot CLI admission churn ───────────────────────
+# Carried over from upstream main. Every `cli` one-shot is a complete daemon
+# client cycle (connect, commit, execute, close-intent, drain) against the SAME
+# daemon the metrics sampler is watching. The long-lived MCP session above never
+# exercises that path, so a per-admission leak in the accept/worker-finish cycle
+# would be invisible without this churn; it lands in the same RSS/FD analysis.
+
+echo "--- Phase 4b: CLI one-shot admission churn ---"
+CHURN_CYCLES="${CBM_SOAK_CLI_CHURN_CYCLES:-${SOAK_CLI_CHURN_CYCLES:-40}}"
+case "$CHURN_CYCLES" in
+    ''|*[!0-9]*)
+        echo "CBM_SOAK_CLI_CHURN_CYCLES must be a non-negative integer" >&2
+        exit 2
+        ;;
+esac
+CHURN_FAILS=0
+churn_index=0
+while [ "$churn_index" -lt "$CHURN_CYCLES" ]; do
+    if ! CBM_CACHE_DIR="$CBM_CACHE_DIR" "$BINARY" cli list_projects '{}' \
+        >/dev/null 2>>"$RESULTS_DIR/cli-churn-stderr.log"; then
+        CHURN_FAILS=$((CHURN_FAILS + 1))
+    fi
+    churn_index=$((churn_index + 1))
+done
+if [ "$CHURN_FAILS" -gt 0 ]; then
+    echo "FAIL: $CHURN_FAILS of $CHURN_CYCLES one-shot CLI churn cycles failed" | tee -a "$SUMMARY"
+    PASS=false
+else
+    echo "OK: $CHURN_CYCLES one-shot CLI churn cycles recycled the live daemon"
+fi
+if ! collect_snapshot; then
+    echo "FAIL: diagnostics snapshot unavailable after CLI churn" | tee -a "$SUMMARY"
+    PASS=false
+fi
+
 # ── Phase 5: Crash recovery test ────────────────────────────────
 # Skipped in query-leak mode: crash recovery re-indexes (Phase 5 calls
 # index_repository), which triggers cbm_mem_collect and would mask the #581
@@ -682,9 +897,16 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
     # process while the request may be active. The post-restart checked reindex
     # is the recovery oracle.
     echo "# crash recovery mutation $(date)" >> "$SOAK_PROJECT/src/main.py"
+    # Baselines for the two daemon-lifecycle assertions below, carried over from
+    # upstream main. Killing the frontend is only half the contract: the LAST
+    # session disconnecting must also let the shared account daemon terminate,
+    # and the restart must start a FRESH diagnostics generation rather than
+    # reattaching to the old one. Neither is observable without these counters.
+    DAEMON_STOP_COUNT=$(daemon_stop_count)
+    DIAG_FILE_BEFORE_CRASH="$DIAG_FILE"
     CRASH_REQUEST_ID=$QUERY_ID
     QUERY_ID=$((QUERY_ID + 1))
-    CRASH_REQUEST="{\"jsonrpc\":\"2.0\",\"id\":$CRASH_REQUEST_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"$MCP_SOAK_PROJECT\"}}}"
+    CRASH_REQUEST="{\"jsonrpc\":\"2.0\",\"id\":$CRASH_REQUEST_ID,\"method\":\"tools/call\",\"params\":{\"name\":\"index_repository\",\"arguments\":{\"repo_path\":$SOAK_PROJECT_JSON}}}"
     if ! printf '%s\n' "$CRASH_REQUEST" >&3; then
         echo "FAIL: crash-recovery index request write failed" >&2
         PASS=false
@@ -695,8 +917,13 @@ if [ "$SKIP_CRASH" != "--skip-crash-test" ] && [ "$CBM_SOAK_MODE" != "query-leak
     close_server_fds
     SERVER_PID=""
 
-    if start_server; then
-        if mcp_call index_repository "{\"repo_path\":\"$MCP_SOAK_PROJECT\"}"; then
+    if ! wait_for_daemon_stop "${DAEMON_STOP_COUNT:-0}"; then
+        echo "FAIL: last-session crash did not stop the shared daemon" | tee -a "$SUMMARY"
+        PASS=false
+    fi
+
+    if start_server "$DIAG_FILE_BEFORE_CRASH"; then
+        if mcp_call index_repository "{\"repo_path\":$SOAK_PROJECT_JSON}"; then
             echo "OK: server restarted and checked reindex passed after kill -9"
         else
             echo "FAIL: checked reindex failed after crash recovery"
@@ -711,12 +938,33 @@ fi
 # ── Phase 6: Shutdown + analysis ─────────────────────────────────
 
 echo "--- Phase 6: shutdown + analysis ---"
+# The shared account daemon must terminate when its last frontend goes away.
+# Without this assertion a daemon that outlives every session -- leaking its
+# mapped generations, logs and worker threads -- passes the soak silently.
+FINAL_DAEMON_STOP_COUNT=$(daemon_stop_count)
 stop_server
+if ! wait_for_daemon_stop "${FINAL_DAEMON_STOP_COUNT:-0}"; then
+    echo "FAIL: final frontend shutdown did not stop the shared daemon" | tee -a "$SUMMARY"
+    PASS=false
+fi
 
 # ── Analysis ─────────────────────────────────────────────────────
 
 if [ ! -s "$METRICS_CSV" ] || [ "$(wc -l < "$METRICS_CSV")" -lt 2 ]; then
     echo "FAIL: no diagnostics samples were recorded" | tee -a "$SUMMARY"
+    PASS=false
+fi
+
+# Check 0 (from upstream main): the analysis must have ENOUGH data, not merely
+# some. Snapshot collection tolerates transient misses, so a run where
+# diagnostics mostly failed to materialize would sail through every leak, FD and
+# latency verdict below vacuously. Require at least 60% of sampling attempts to
+# have landed. This is strictly stronger than the "any rows at all" check above,
+# which one lucky sample satisfies.
+SNAPSHOT_ROWS=$(($(wc -l < "$METRICS_CSV") - 1))
+if [ "${SNAPSHOT_ATTEMPTS:-0}" -gt 0 ] && [ $((SNAPSHOT_ROWS * 10)) -lt $((SNAPSHOT_ATTEMPTS * 6)) ]; then
+    echo "FAIL: only ${SNAPSHOT_ROWS}/${SNAPSHOT_ATTEMPTS} snapshots collected — analysis would be vacuous" \
+        | tee -a "$SUMMARY"
     PASS=false
 fi
 

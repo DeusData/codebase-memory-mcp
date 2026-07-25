@@ -887,10 +887,13 @@ int cbm_dep_auto_index_effective_with_stats(const char *project_name,
                 .max_file_size = 0,
             };
             int observed_files = 0;
-            int count_rc = cbm_discover_count_bounded(
-                deps[i].path, &opts, local_stats.dependency_file_limit,
+            /* LIMIT_EXCEEDED is a successful answer meaning "more than the cap",
+             * so only ERROR counts as a failed count. */
+            cbm_discover_status_t count_status = cbm_discover_count_bounded(
+                deps[i].path, &opts, local_stats.dependency_file_limit, 0,
                 &observed_files);
-            if (count_rc != 0 ||
+            bool count_failed = count_status == CBM_DISCOVER_ERROR;
+            if (count_failed || count_status == CBM_DISCOVER_LIMIT_EXCEEDED ||
                 observed_files > local_stats.dependency_file_limit) {
                 char observed_buf[CBM_SZ_32];
                 char limit_buf[CBM_SZ_32];
@@ -900,14 +903,14 @@ int cbm_dep_auto_index_effective_with_stats(const char *project_name,
                          local_stats.dependency_file_limit);
                 cbm_log_warn(
                     "dep.auto_index.skip", "reason",
-                    count_rc == 0 ? "too_many_files" : "file_count_failed",
+                    count_failed ? "file_count_failed" : "too_many_files",
                     "package", deps[i].package, "files_observed", observed_buf,
                     "dep_max_files", limit_buf, "recovery",
                     "call_index_dependencies_or_raise_dep_max_files_or_set_zero_for_unlimited");
-                if (count_rc == 0) {
-                    local_stats.packages_skipped_file_limit++;
-                } else {
+                if (count_failed) {
                     local_stats.packages_failed++;
+                } else {
+                    local_stats.packages_skipped_file_limit++;
                 }
                 continue;
             }
