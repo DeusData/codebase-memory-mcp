@@ -2805,16 +2805,14 @@ static bool cbm_mcp_auto_index_within_limit(cbm_mcp_server_t *srv, const char *r
         srv->autoindex_observed_files = 0;
         srv->autoindex_file_limit = file_limit;
     }
-    if (file_limit <= 0) {
+    int count = -1;
+    if (cbm_mcp_auto_index_within_configured_limit(root_path, file_limit, &count)) {
         return true;
     }
-    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
-    int count = 0;
-    /* Only a traversal/allocation failure is "count failed"; LIMIT_EXCEEDED is a
-     * successful answer meaning at least file_limit + 1 indexable files exist. */
-    cbm_discover_status_t count_status =
-        cbm_discover_count_bounded(root_path, &opts, file_limit, 0, &count);
-    if (count_status == CBM_DISCOVER_ERROR) {
+    /* The shared helper reports -1 for traversal/deadline failure and the first
+     * rejected cardinality (limit + 1, saturating at INT_MAX) for a limit hit.
+     * Keep MCP-specific diagnostics here without duplicating discovery policy. */
+    if (count < 0) {
         if (srv) {
             srv->autoindex_block = MCP_AUTOINDEX_BLOCK_FILE_COUNT;
         }
@@ -2822,23 +2820,15 @@ static bool cbm_mcp_auto_index_within_limit(cbm_mcp_server_t *srv, const char *r
                      root_path ? root_path : "");
         return false;
     }
-    /* The status is the authoritative over-limit answer, not the count: this walk
-     * stops BEFORE counting past file_limit (see cbm_discover_count_bounded in
-     * discover.h), so on LIMIT_EXCEEDED *count saturates AT file_limit and
-     * `count > file_limit` can never be true. Testing the count alone therefore
-     * admitted every oversized repository and defeated the limit entirely. */
-    if (count_status == CBM_DISCOVER_LIMIT_EXCEEDED || count > file_limit) {
-        if (srv) {
-            srv->autoindex_block = MCP_AUTOINDEX_BLOCK_FILE_LIMIT;
-            srv->autoindex_observed_files = count;
-        }
-        char count_buf[CBM_SZ_32];
-        snprintf(count_buf, sizeof(count_buf), "%d", count);
-        cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
-                     CBM_CONFIG_AUTO_INDEX_LIMIT, "path", root_path ? root_path : "");
-        return false;
+    if (srv) {
+        srv->autoindex_block = MCP_AUTOINDEX_BLOCK_FILE_LIMIT;
+        srv->autoindex_observed_files = count;
     }
-    return true;
+    char count_buf[CBM_SZ_32];
+    snprintf(count_buf, sizeof(count_buf), "%d", count);
+    cbm_log_warn("autoindex.skip", "reason", "too_many_files", "files", count_buf, "limit",
+                 CBM_CONFIG_AUTO_INDEX_LIMIT, "path", root_path ? root_path : "");
+    return false;
 }
 
 static bool cbm_mcp_run_sync_auto_index(cbm_mcp_server_t *srv, const char *root_path,
@@ -4536,7 +4526,7 @@ static char *build_project_list_error_srv(cbm_mcp_server_t *srv, const char *rea
         break;
     case MCP_AUTOINDEX_BLOCK_FILE_LIMIT:
         snprintf(recovery_hint, sizeof(recovery_hint),
-                 "Automatic indexing stopped after more than %d files exceeded "
+                 "Automatic indexing found at least %d indexable files, exceeding "
                  "auto_index_limit=%d. Check available memory before raising the limit and "
                  "retrying; if the larger run is intentional, %s",
                  srv->autoindex_observed_files, srv->autoindex_file_limit, index_action);
