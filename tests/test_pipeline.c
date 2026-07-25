@@ -11854,6 +11854,58 @@ TEST(incremental_full_then_noop) {
     PASS();
 }
 
+TEST(incremental_aborts_when_previous_coverage_is_unreadable) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    /* Simulate an unreadable prior coverage generation while leaving the
+     * graph and file hashes healthy enough to otherwise run incrementally. */
+    ASSERT_EQ(
+        cbm_store_exec(s, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
+        CBM_STORE_OK);
+    cbm_store_close(s);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    FILE *f = cbm_fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    ASSERT_GT(fprintf(f, "\nfunc MustNotBeIndexed() int { return 7 }\n"), 0);
+    ASSERT_EQ(fclose(f), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_TRUE(cbm_pipeline_run(p) != 0);
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+
+    /* Failure happens before the dump/replacement boundary, preserving the
+     * original graph rather than publishing a falsely complete generation. */
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
 TEST(incremental_touch_only_refreshes_metadata_without_reindex) {
     if (setup_incremental_repo() != 0) {
         FAIL("setup failed");
@@ -18701,6 +18753,7 @@ SUITE(pipeline) {
     RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_touch_only_refreshes_metadata_without_reindex);
     RUN_TEST(incremental_detects_changed_file);
     RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
