@@ -154,13 +154,32 @@ HARDEN_LDFLAGS :=
 ifeq ($(PRODUCTION_HARDENING),1)
 
 # Detect ELF target output purely via compiler preprocessor macros.
-ELF_BUILD := $(shell echo | $(CC) -dM -E -x c - 2>/dev/null | grep -q '__ELF__' && echo yes || echo no)
+# This eliminates dependencies on OS binary tools (readelf/file/hexdump/od)
+# and avoids disk/temporary file operations during Makefile parsing.
+#
+# NOTE: built with `printf '%s\n' ...` rather than `echo '...\n...'`.
+# The shell `echo` builtin's handling of literal `\n` inside a single quoted
+# string is NOT portable: dash (Linux's default /bin/sh) expands it to a real
+# newline, but the FreeBSD /bin/sh `echo` does not, which collapsed this whole
+# probe onto one line ("#ifndef __ELF__\n#error ...\n#endif") — an unterminated
+# #ifndef that always fails to preprocess, forcing ELF_BUILD=no even on real
+# ELF targets and silently skipping all hardening. printf '%s\n' arg1 arg2 ...
+# emits one real newline per argument on every POSIX shell, so this is safe
+# across dash, bash, and FreeBSD sh alike.
+ELF_BUILD := $(shell \
+	printf '%s\n' '#ifndef __ELF__' '#error "Not ELF"' '#endif' | \
+	$(CC) -E -x c - >/dev/null 2>&1 && echo yes || echo no)
 
 ifeq ($(ELF_BUILD),yes)
 
 comma := ,
 
 # Unified probe macro to detect compiler and linker flags empirically.
+# Usage: $(call probe_flag,TOOL,LANG,STAGE,FLAGS)
+#   TOOL:  Compiler driver ($(CC) or $(CXX))
+#   LANG:  Language ('c' or 'c++')
+#   STAGE: 'compile' (-c) or 'link' (full binary link)
+#   FLAGS: The flag or space-separated list of flags to test
 probe_flag = $(shell \
 	echo 'int main(void){return 0;}' | \
 	$(1) -Werror -O2 $(if $(filter compile,$(3)),-c) $(4) -x $(2) - -o /dev/null \
