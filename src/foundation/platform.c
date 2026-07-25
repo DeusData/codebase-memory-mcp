@@ -501,7 +501,8 @@ extern char **environ;
 #define CBM_ENVIRON environ
 #endif
 
-static const char *platform_copy_environment_value(char *buf, size_t buf_sz, const char *value) {
+static const char *cbm_platform_copy_environment_value(char *buf, size_t buf_sz,
+                                                       const char *value) {
     if (!buf || buf_sz == 0 || !value) {
         return NULL;
     }
@@ -514,9 +515,18 @@ static const char *platform_copy_environment_value(char *buf, size_t buf_sz, con
     return buf;
 }
 
-const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+typedef enum {
+    CBM_PLATFORM_ENV_MISSING = 0,
+    CBM_PLATFORM_ENV_EMPTY,
+    CBM_PLATFORM_ENV_VALUE,
+    CBM_PLATFORM_ENV_TOO_LONG,
+    CBM_PLATFORM_ENV_ERROR,
+} cbm_platform_env_status_t;
+
+static cbm_platform_env_status_t cbm_platform_read_environment_value(const char *name, char *buf,
+                                                                    size_t buf_sz) {
     if (!name || !name[0] || !buf || buf_sz == 0) {
-        return NULL;
+        return CBM_PLATFORM_ENV_ERROR;
     }
     buf[0] = '\0';
 #ifdef _WIN32
@@ -537,32 +547,37 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
             DWORD environment_error = GetLastError();
             if (needed == 0U) {
                 if (environment_error == ERROR_ENVVAR_NOT_FOUND) {
-                    return fallback ? platform_copy_environment_value(buf, buf_sz, fallback) : NULL;
+                    return CBM_PLATFORM_ENV_MISSING;
                 }
                 /* An existing empty variable is distinct from a missing one. */
-                return buf;
+                return environment_error == ERROR_SUCCESS ? CBM_PLATFORM_ENV_EMPTY
+                                                          : CBM_PLATFORM_ENV_ERROR;
             }
             wchar_t *wval = calloc((size_t)needed, sizeof(*wval));
             if (!wval) {
-                return NULL;
+                return CBM_PLATFORM_ENV_ERROR;
             }
             SetLastError(ERROR_SUCCESS);
             DWORD got = GetEnvironmentVariableW(wname, wval, needed);
             DWORD read_error = GetLastError();
             if (got >= needed || (got == 0U && read_error != ERROR_SUCCESS)) {
                 free(wval);
-                return NULL;
+                return CBM_PLATFORM_ENV_ERROR;
+            }
+            if (got == 0U) {
+                free(wval);
+                return CBM_PLATFORM_ENV_EMPTY;
             }
             char *utf8 = cbm_wide_to_utf8(wval);
             free(wval);
             if (!utf8) {
-                return NULL;
+                return CBM_PLATFORM_ENV_ERROR;
             }
-            const char *copied = platform_copy_environment_value(buf, buf_sz, utf8);
+            const char *copied = cbm_platform_copy_environment_value(buf, buf_sz, utf8);
             free(utf8);
-            return copied;
+            return copied ? CBM_PLATFORM_ENV_VALUE : CBM_PLATFORM_ENV_TOO_LONG;
         }
-        return NULL;
+        return CBM_PLATFORM_ENV_ERROR;
     }
 #else
     char **env = CBM_ENVIRON;
@@ -570,13 +585,27 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
         size_t nlen = strlen(name);
         for (; *env; env++) {
             if (strncmp(*env, name, nlen) == 0 && (*env)[nlen] == '=') {
-                return platform_copy_environment_value(buf, buf_sz, *env + nlen + SKIP_ONE);
+                const char *value = *env + nlen + SKIP_ONE;
+                if (!value[0]) {
+                    return CBM_PLATFORM_ENV_EMPTY;
+                }
+                return cbm_platform_copy_environment_value(buf, buf_sz, value)
+                           ? CBM_PLATFORM_ENV_VALUE
+                           : CBM_PLATFORM_ENV_TOO_LONG;
             }
         }
     }
 #endif
-    if (fallback) {
-        return platform_copy_environment_value(buf, buf_sz, fallback);
+    return CBM_PLATFORM_ENV_MISSING;
+}
+
+const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback) {
+    cbm_platform_env_status_t result = cbm_platform_read_environment_value(name, buf, buf_sz);
+    if (result == CBM_PLATFORM_ENV_VALUE || result == CBM_PLATFORM_ENV_EMPTY) {
+        return buf;
+    }
+    if (result == CBM_PLATFORM_ENV_MISSING && fallback) {
+        return cbm_platform_copy_environment_value(buf, buf_sz, fallback);
     }
     return NULL;
 }
@@ -613,35 +642,11 @@ bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present) 
     if (present) {
         *present = false;
     }
-    if (!name || !buf || buf_sz == 0) {
-        return false;
+    cbm_platform_env_status_t result = cbm_platform_read_environment_value(name, buf, buf_sz);
+    if (present && (result == CBM_PLATFORM_ENV_VALUE || result == CBM_PLATFORM_ENV_TOO_LONG)) {
+        *present = true;
     }
-    buf[0] = '\0';
-
-    char **env = CBM_ENVIRON;
-    if (!env) {
-        return false;
-    }
-    size_t nlen = strlen(name);
-    for (; *env; env++) {
-        if (strncmp(*env, name, nlen) != 0 || (*env)[nlen] != '=') {
-            continue;
-        }
-        const char *value = *env + nlen + SKIP_ONE;
-        if (!value[0]) {
-            return false;
-        }
-        if (present) {
-            *present = true;
-        }
-        size_t vlen = strlen(value);
-        if (vlen >= buf_sz) {
-            return false;
-        }
-        memcpy(buf, value, vlen + SKIP_ONE);
-        return true;
-    }
-    return false;
+    return result == CBM_PLATFORM_ENV_VALUE;
 }
 
 /* ── Home directory (cross-platform) ───────────────────── */
