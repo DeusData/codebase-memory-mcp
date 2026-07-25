@@ -119,6 +119,8 @@ TEST(subprocess_short_child_uses_fast_reap_window) {
     ASSERT_EQ(cbm_subprocess_poll_interval_ms(250, 200), 200);
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX /bin/sh latency canary; poll policy assertions ran");
+#elif defined(__SANITIZE_THREAD__) || __has_feature(thread_sanitizer)
+    SKIP_PLATFORM("wall-clock fork/exec canary is invalid under TSan; poll policy assertions ran");
 #else
     /* Coarse regression canary only: the old path unconditionally slept a full
      * steady interval after observing a still-running child. Exact policy is
