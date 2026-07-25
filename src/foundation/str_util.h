@@ -93,4 +93,8 @@ bool cbm_validate_project_name(const char *name);
  * If buf is too small, output is truncated but always NUL-terminated. */
 int cbm_json_escape(char *buf, int bufsize, const char *src);
 
+/* Exact output length of cbm_json_escape() with an unbounded destination.
+ * NULL is treated as an empty string. */
+size_t cbm_json_escaped_len(const char *src);
+
 #endif /* CBM_STR_UTIL_H */

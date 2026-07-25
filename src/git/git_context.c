@@ -7,6 +7,7 @@
 #include "foundation/str_util.h"
 
 #include <ctype.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -304,24 +305,6 @@ static bool append_fmt_checked(char *buf, int buf_size, int *off, const char *fm
     return true;
 }
 
-static int json_escaped_len(const char *src) {
-    if (!src) {
-        return 0;
-    }
-    int len = 0;
-    for (int i = 0; src[i]; i++) {
-        unsigned char c = (unsigned char)src[i];
-        if (c == '"' || c == '\\' || c == '\n' || c == '\r' || c == '\t') {
-            len += 2;
-        } else if (c < 0x20) {
-            len += 6; /* \u00XX */
-        } else {
-            len++;
-        }
-    }
-    return len;
-}
-
 static bool json_append_bool(char *buf, int buf_size, int *off, const char *name, bool value,
                              bool comma) {
     return append_fmt_checked(buf, buf_size, off, "\"%s\":%s%s", name, value ? "true" : "false",
@@ -330,14 +313,17 @@ static bool json_append_bool(char *buf, int buf_size, int *off, const char *name
 
 static bool json_append_string(char *buf, int buf_size, int *off, const char *name,
                                const char *value, bool comma) {
-    int needed = json_escaped_len(value ? value : "");
-    char *escaped = malloc((size_t)needed + 1);
+    size_t needed = cbm_json_escaped_len(value);
+    if (needed >= (size_t)INT_MAX) {
+        return false;
+    }
+    char *escaped = malloc(needed + 1);
     if (!escaped) {
         return false;
     }
-    int actual = cbm_json_escape(escaped, needed + 1, value ? value : "");
-    bool ok = actual == needed && append_fmt_checked(buf, buf_size, off, "\"%s\":\"%s\"%s", name,
-                                                     escaped, comma ? "," : "");
+    int actual = cbm_json_escape(escaped, (int)needed + 1, value);
+    bool ok = (size_t)actual == needed && append_fmt_checked(buf, buf_size, off, "\"%s\":\"%s\"%s",
+                                                             name, escaped, comma ? "," : "");
     free(escaped);
     return ok;
 }

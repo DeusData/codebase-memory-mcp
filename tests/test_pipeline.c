@@ -4460,6 +4460,20 @@ TEST(git_context_non_git_path) {
     ASSERT_NOT_NULL(strstr(json, "\"is_git\":false"));
     ASSERT_NOT_NULL(strstr(json, "\"root_exists\":true"));
 
+    const char control_root[] = {'r', 'o', 'o', 't', '\f', 'p', 'a', 't', 'h', '\0'};
+    cbm_git_context_t control_ctx = {
+        .root_exists = true,
+        .canonical_root = (char *)control_root,
+    };
+    ASSERT_GT(cbm_git_context_props_json(&control_ctx, json, sizeof(json)), 0);
+    ASSERT_NOT_NULL(strstr(json, "\"canonical_root\":\"root\\u000cpath\""));
+    yyjson_doc *control_doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(control_doc);
+    yyjson_val *control_value = yyjson_obj_get(yyjson_doc_get_root(control_doc), "canonical_root");
+    ASSERT_NOT_NULL(control_value);
+    ASSERT_STR_EQ(yyjson_get_str(control_value), control_root);
+    yyjson_doc_free(control_doc);
+
     char long_value[1200];
     memset(long_value, 'a', sizeof(long_value) - 1);
     long_value[sizeof(long_value) - 1] = '\0';

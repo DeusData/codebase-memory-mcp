@@ -337,6 +337,23 @@ bool cbm_validate_project_name(const char *name) {
     return true;
 }
 
+size_t cbm_json_escaped_len(const char *src) {
+    if (!src) {
+        return 0;
+    }
+    size_t len = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (*p == '"' || *p == '\\' || *p == '\n' || *p == '\r' || *p == '\t') {
+            len += JSON_ESC_LEN;
+        } else if (*p < JSON_CTRL_LIMIT) {
+            len += JSON_UNICODE_ESC_LEN;
+        } else {
+            len++;
+        }
+    }
+    return len;
+}
+
 int cbm_json_escape(char *buf, int bufsize, const char *src) {
     if (!buf || bufsize <= 0) {
         return 0;

@@ -456,6 +456,30 @@ TEST(json_escape_control_chars) {
     PASS();
 }
 
+TEST(json_escaped_len_matches_writer) {
+    const char input[] = {'A', '"', '\\', '\n', '\r', '\t', 0x01, 0x1f, 'Z', '\0'};
+    char buf[64];
+
+    size_t needed = cbm_json_escaped_len(input);
+    int written = cbm_json_escape(buf, sizeof(buf), input);
+
+    ASSERT_EQ(needed, 24);
+    ASSERT_EQ((size_t)written, needed);
+    ASSERT_EQ(strlen(buf), needed);
+    ASSERT_EQ(cbm_json_escaped_len(""), 0);
+    ASSERT_EQ(cbm_json_escaped_len(NULL), 0);
+
+    for (int byte = 1; byte <= 0xff; byte++) {
+        char single[] = {(char)byte, '\0'};
+        char escaped[8];
+        size_t single_needed = cbm_json_escaped_len(single);
+        int single_written = cbm_json_escape(escaped, sizeof(escaped), single);
+        ASSERT_EQ((size_t)single_written, single_needed);
+        ASSERT_EQ(strlen(escaped), single_needed);
+    }
+    PASS();
+}
+
 /* ── SNPRINTF_APPEND tests ────────────────────────────────────── */
 
 TEST(snprintf_append_basic) {
@@ -569,6 +593,7 @@ SUITE(str_util) {
     RUN_TEST(validate_shell_arg_spaces);
     /* JSON Escaping */
     RUN_TEST(json_escape_control_chars);
+    RUN_TEST(json_escaped_len_matches_writer);
     /* SNPRINTF_APPEND */
     RUN_TEST(snprintf_append_basic);
     RUN_TEST(snprintf_append_fills_exactly);

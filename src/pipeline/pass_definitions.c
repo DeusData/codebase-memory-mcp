@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD_ESC_SPACE = 2 };
+enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_SPACE = 2 };
 /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
  * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
@@ -30,6 +30,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,62 +113,6 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Append a JSON-escaped string value to buf at position *pos.
- * Writes: ,"key":"escaped_value"
- * Handles: \, ", \n, \r, \t */
-static int def_json_escape_char(char *buf, size_t avail, char ch) {
-    char esc = 0;
-    switch (ch) {
-    case '"':
-        esc = '"';
-        break;
-    case '\\':
-        esc = '\\';
-        break;
-    case '\n':
-        esc = 'n';
-        break;
-    case '\r':
-        esc = 'r';
-        break;
-    case '\t':
-        esc = 't';
-        break;
-    default:
-        if (avail >= SKIP_ONE) {
-            /* Any other raw control byte (e.g. form feed) is invalid inside a
-             * JSON string — degrade to a space. */
-            buf[0] = ((unsigned char)ch < 0x20) ? ' ' : ch;
-        }
-        return SKIP_ONE;
-    }
-    if (avail >= PD_ESC_SPACE) {
-        buf[0] = '\\';
-        buf[SKIP_ONE] = esc;
-    }
-    return PD_ESC_SPACE;
-}
-
-/* Escaped length of a string under def_json_escape_char's rules: escaped
- * characters expand to 2 bytes, everything else stays 1. */
-static size_t def_json_escaped_len(const char *s) {
-    size_t n = 0;
-    for (; *s; s++) {
-        switch (*s) {
-        case '"':
-        case '\\':
-        case '\n':
-        case '\r':
-        case '\t':
-            n += PD_ESC_SPACE;
-            break;
-        default:
-            n += SKIP_ONE;
-        }
-    }
-    return n;
-}
-
 /* Appends are ATOMIC: a field is emitted only if the WHOLE serialized form
  * fits (with PD_ESC_SPACE bytes reserved for the closing '}' + NUL). Cutting a
  * field mid-value produced unterminated strings/arrays — malformed properties
@@ -180,7 +125,8 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     /* ,"key":"<escaped>" — comma + 2 key quotes + colon + 2 value quotes */
-    size_t required = strlen(key) + def_json_escaped_len(val) + PD_JSON_FIELD_OVERHEAD;
+    size_t escaped_len = cbm_json_escaped_len(val);
+    size_t required = strlen(key) + escaped_len + PD_JSON_FIELD_OVERHEAD;
     if (*pos + required + PD_ESC_SPACE > bufsize) {
         return; /* whole field would not fit — skip it atomically */
     }
@@ -190,9 +136,16 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     p += (size_t)w;
-    for (const char *s = val; *s && p < bufsize - PD_ESC_MARGIN; s++) {
-        p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
+    if (bufsize - p > (size_t)INT_MAX) {
+        buf[*pos] = '\0';
+        return;
     }
+    int escaped = cbm_json_escape(buf + p, (int)(bufsize - p), val);
+    if ((size_t)escaped != escaped_len) {
+        buf[*pos] = '\0';
+        return;
+    }
+    p += (size_t)escaped;
     if (p < bufsize - SKIP_ONE) {
         buf[p++] = '"';
     }
@@ -210,7 +163,7 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     /* ,"key":[ + per item "<escaped>" + separating commas + ] */
     size_t required = strlen(key) + PD_JSON_FIELD_OVERHEAD;
     for (int i = 0; arr[i]; i++) {
-        required += def_json_escaped_len(arr[i]) + PD_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+        required += cbm_json_escaped_len(arr[i]) + PD_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
     }
     if (*pos + required + PD_ESC_SPACE > bufsize) {
         return; /* whole array would not fit — skip it atomically */
@@ -228,12 +181,17 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
         if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
-        /* Full escaping (not just quote/backslash): items like C param types
-         * sliced from multi-line declarations carry raw \n/\t bytes, which are
-         * invalid inside JSON strings. */
-        for (const char *s = arr[i]; *s && p < bufsize - PD_ESC_SPACE; s++) {
-            p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
+        size_t escaped_len = cbm_json_escaped_len(arr[i]);
+        if (bufsize - p > (size_t)INT_MAX) {
+            buf[*pos] = '\0';
+            return;
         }
+        int escaped = cbm_json_escape(buf + p, (int)(bufsize - p), arr[i]);
+        if ((size_t)escaped != escaped_len) {
+            buf[*pos] = '\0';
+            return;
+        }
+        p += (size_t)escaped;
         if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
