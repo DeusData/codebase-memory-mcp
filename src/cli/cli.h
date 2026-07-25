@@ -417,6 +417,7 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_DEFAULT_AUTO_INDEX_LIMIT_STR "50000"
 #define CBM_CONFIG_SEARCH_LIMIT "search_limit"
 #define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
+#define CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES "query_max_output_bytes"
 #define CBM_CONFIG_TOOL_MODE "tool_mode"
 #define CBM_CONFIG_TOOL_MODE_STREAMLINED "streamlined"
 #define CBM_CONFIG_TOOL_MODE_CLASSIC "classic"
@@ -424,6 +425,8 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_CONFIG_CONTEXT_INJECTION "context_injection"
 #define CBM_DEFAULT_QUERY_MAX_ROWS 100000
 #define CBM_DEFAULT_QUERY_MAX_ROWS_STR "100000"
+#define CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES 32768
+#define CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR "32768"
 
 typedef struct {
     const char *key;

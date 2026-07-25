@@ -14174,8 +14174,9 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {CBM_CONFIG_QUERY_MAX_ROWS, CBM_DEFAULT_QUERY_MAX_ROWS_STR, NULL, "Search",
      "Default result-row cap for query_graph when max_rows is omitted",
      "0-1000000",
-     "Matches the 100000-row Cypher ceiling by default. Lower to bound result rows without changing which rows match; Cypher LIMIT may lower but not bypass this cap."},
-    {"query_max_output_bytes", "32768", NULL, "Search",
+     "Matches the Cypher engine's non-bypassable row ceiling by default. Lower to bound result "
+     "rows without changing which rows match; Cypher LIMIT may lower but not bypass this cap."},
+    {CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR, NULL, "Search",
      "Max response bytes for query_graph (0=unlimited)",
      "0-104857600",
      "32KB default prevents huge responses. Set 0 for unlimited Cypher results. Raise for bulk analysis queries."},
