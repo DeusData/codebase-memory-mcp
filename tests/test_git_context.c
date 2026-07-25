@@ -27,6 +27,7 @@
 #include "test_helpers.h"
 #include "git/git_command.h"
 #include "git/git_context.h"
+#include "git/git_snapshot.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -67,15 +68,20 @@ static int make_git_repo(const char *dir) {
  * as well as POSIX. */
 static int make_git_repo_portable(const char *dir) {
     if (th_mkdir_p(dir) != 0) return -1;
-    if (cbm_git_drain_command(dir, "init -q") != 0) return -1;
-    if (cbm_git_drain_command(dir, "config user.email test@example.com") != 0) return -1;
-    if (cbm_git_drain_command(dir, "config user.name Test") != 0) return -1;
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.com", NULL};
+    const char *const name_args[] = {"config", "user.name", "Test", NULL};
+    if (cbm_git_drain_command(dir, init_args) != 0) return -1;
+    if (cbm_git_drain_command(dir, email_args) != 0) return -1;
+    if (cbm_git_drain_command(dir, name_args) != 0) return -1;
     char path[CBM_SZ_1K];
     int n = snprintf(path, sizeof(path), "%s/.keep", dir);
     if (n <= 0 || (size_t)n >= sizeof(path)) return -1;
     th_write_file(path, "");
-    if (cbm_git_drain_command(dir, "add .keep") != 0) return -1;
-    return cbm_git_drain_command(dir, "commit -q -m init");
+    const char *const add_args[] = {"add", ".keep", NULL};
+    const char *const commit_args[] = {"commit", "-q", "-m", "init", NULL};
+    if (cbm_git_drain_command(dir, add_args) != 0) return -1;
+    return cbm_git_drain_command(dir, commit_args);
 }
 
 /* ── canonical_root: normal repo indexed from its root ──────────── */
@@ -263,21 +269,25 @@ TEST(current_branch_resolves_attached_detached_unborn_and_non_git) {
     }
     snprintf(non_git, sizeof(non_git), "%s", raw);
 
-    bool setup_ok = make_git_repo_portable(repo) == 0 &&
-                    cbm_git_drain_command(repo, "checkout -q -b branch-probe") == 0;
+    const char *const branch_args[] = {"checkout", "-q", "-b", "branch-probe", NULL};
+    bool setup_ok =
+        make_git_repo_portable(repo) == 0 && cbm_git_drain_command(repo, branch_args) == 0;
     char *attached = NULL;
     char *detached = NULL;
     char *unborn = NULL;
     char *plain = NULL;
     int attached_rc = setup_ok ? cbm_git_current_branch(repo, &attached) : CBM_NOT_FOUND;
-    bool detach_ok = setup_ok && cbm_git_drain_command(repo, "checkout -q --detach") == 0;
+    const char *const detach_args[] = {"checkout", "-q", "--detach", NULL};
+    bool detach_ok = setup_ok && cbm_git_drain_command(repo, detach_args) == 0;
     int detached_rc = detach_ok ? cbm_git_current_branch(repo, &detached) : CBM_NOT_FOUND;
     cbm_git_context_t detached_context = {0};
     int detached_context_rc =
         detach_ok ? cbm_git_context_resolve(repo, &detached_context) : CBM_NOT_FOUND;
-    bool unborn_setup_ok = cbm_git_drain_command(non_git, "init -q") == 0 &&
-                           cbm_git_drain_command(
-                               non_git, "symbolic-ref HEAD refs/heads/unborn-probe") == 0;
+    const char *const unborn_init_args[] = {"init", "-q", NULL};
+    const char *const unborn_ref_args[] = {
+        "symbolic-ref", "HEAD", "refs/heads/unborn-probe", NULL};
+    bool unborn_setup_ok = cbm_git_drain_command(non_git, unborn_init_args) == 0 &&
+                           cbm_git_drain_command(non_git, unborn_ref_args) == 0;
     int unborn_rc =
         unborn_setup_ok ? cbm_git_current_branch(non_git, &unborn) : CBM_NOT_FOUND;
     char plain_dir[256];
@@ -314,6 +324,50 @@ TEST(current_branch_resolves_attached_detached_unborn_and_non_git) {
     PASS();
 }
 
+/* Shell command strings either reject or reinterpret these characters,
+ * especially through cmd.exe. The shared Git runner must pass the repository
+ * path as one literal argv element on every platform. This exercises command
+ * setup, context resolution, and snapshot capture through the real Git binary. */
+TEST(literal_metacharacter_repo_path_round_trips_through_git_argv) {
+    char base[CBM_PATH_MAX];
+    char *raw = th_mktempdir("cbm_git_argv_literal");
+    if (!raw) FAIL("th_mktempdir returned NULL");
+    int base_written = snprintf(base, sizeof(base), "%s", raw);
+    if (base_written <= 0 || (size_t)base_written >= sizeof(base)) {
+        FAIL("temporary base path does not fit");
+    }
+
+    char repo[CBM_PATH_MAX];
+    int repo_written = snprintf(repo, sizeof(repo), "%s/repo %%!^&; literal", base);
+    if (repo_written <= 0 || (size_t)repo_written >= sizeof(repo)) {
+        th_rmtree(base);
+        FAIL("literal repository path does not fit");
+    }
+    if (make_git_repo_portable(repo) != 0) {
+        th_rmtree(base);
+        SKIP_PLATFORM("git not available to initialize literal-path repository");
+    }
+
+    cbm_git_context_t context = {0};
+    cbm_git_snapshot_t snapshot = {0};
+    int context_rc = cbm_git_context_resolve(repo, &context);
+    int snapshot_rc = cbm_git_snapshot_read(
+        repo, CBM_GIT_SNAPSHOT_HEAD | CBM_GIT_SNAPSHOT_DIRTY | CBM_GIT_SNAPSHOT_FILE_COUNT,
+        &snapshot);
+    bool context_ok = context_rc == 0 && context.is_git && context.worktree_root &&
+                      strstr(context.worktree_root, "repo %!^&; literal") != NULL;
+    bool snapshot_ok = snapshot_rc == 0 && snapshot.path_supported && snapshot.is_git &&
+                       snapshot.head[0] != '\0' && snapshot.file_count == 1;
+
+    cbm_git_context_free(&context);
+    th_rmtree(base);
+
+    ASSERT_TRUE(cbm_git_validate_repo_path(repo));
+    ASSERT_TRUE(context_ok);
+    ASSERT_TRUE(snapshot_ok);
+    PASS();
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
@@ -321,4 +375,5 @@ SUITE(git_context) {
     RUN_TEST(canonical_root_subdir);
     RUN_TEST(canonical_root_linked_worktree);
     RUN_TEST(current_branch_resolves_attached_detached_unborn_and_non_git);
+    RUN_TEST(literal_metacharacter_repo_path_round_trips_through_git_argv);
 }

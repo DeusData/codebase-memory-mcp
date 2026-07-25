@@ -53,6 +53,7 @@ enum {
 #include "depindex/depindex.h"
 #include "pagerank/pagerank.h"
 #include "pipeline/pass_cross_repo.h"
+#include "git/git_command.h"
 #include "git/git_context.h"
 #include "git/git_snapshot.h"
 #include "cli/cli.h"
@@ -14534,19 +14535,6 @@ static bool validate_search_path_arg(const char *s) {
     return true;
 }
 
-/* These characters retain command-language meaning inside quoted cmd.exe
- * arguments: percent expands environment variables, exclamation can expand
- * delayed variables, and caret changes parsing. Never interpolate them from a
- * stored project root or request branch into the Windows detect_changes payload.
- * /V:OFF is defense in depth for exclamation; validation remains the boundary. */
-static bool validate_windows_cmd_interpolation_arg(const char *s) {
-#ifdef _WIN32
-    return s && strpbrk(s, "%!^") == NULL;
-#else
-    return s != NULL;
-#endif
-}
-
 static bool validate_search_args(const char *root_path, const char *file_pattern) {
     if (!validate_search_path_arg(root_path)) {
         return false;
@@ -15177,126 +15165,35 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── detect_changes ───────────────────────────────────────────── */
 
-/* Run shell-backed query helpers inside the same process-tree containment used
- * by indexing. A plain popen owns only its shell stream: on disconnect there is
- * no safe handle with which to stop a blocked git child or its descendants. */
-static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
-    char directory[CBM_SZ_1K];
-    const char *cache = cbm_resolve_cache_dir();
-    int written;
-    if (cache && cache[0]) {
-        written = snprintf(directory, sizeof(directory), "%s/logs", cache);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
-            return false;
-        }
-    } else {
-        written = snprintf(directory, sizeof(directory), "%s", cbm_tmpdir());
-        if (written <= 0 || written >= (int)sizeof(directory)) {
-            return false;
-        }
-    }
-    written = snprintf(out, CBM_SZ_2K, "%s/.mcp-command-XXXXXX", directory);
-    if (written <= 0 || written >= CBM_SZ_2K) {
-        out[0] = '\0';
-        return false;
-    }
-    int descriptor = cbm_mkstemp(out);
-    if (descriptor < 0) {
-        out[0] = '\0';
-        return false;
-    }
-#ifdef _WIN32
-    (void)_close(descriptor);
-#else
-    (void)close(descriptor);
-#endif
-    return true;
+static bool mcp_git_cancel_requested(void *context) {
+    return mcp_request_cancelled((cbm_mcp_server_t *)context);
 }
 
-#ifdef _WIN32
-/* Resolve the OS-owned command processor without consulting PATH or mutable
- * COMSPEC. cbm_subprocess receives this as lpApplicationName and validates the
- * same absolute cmd.exe path before using the dedicated payload serializer. */
-static bool mcp_resolve_windows_cmd(char out[CBM_SZ_4K]) {
-    if (!out) {
-        return false;
-    }
-    out[0] = '\0';
-    wchar_t system_directory[MAX_PATH + 1];
-    UINT directory_length = GetSystemDirectoryW(system_directory, MAX_PATH + 1);
-    static const wchar_t suffix[] = L"\\cmd.exe";
-    if (directory_length == 0 || directory_length > MAX_PATH ||
-        (size_t)directory_length + (sizeof(suffix) / sizeof(suffix[0])) >
-            sizeof(system_directory) / sizeof(system_directory[0])) {
-        return false;
-    }
-    memcpy(system_directory + directory_length, suffix, sizeof(suffix));
-    char *candidate = cbm_wide_to_utf8(system_directory);
-    if (!candidate) {
-        return false;
-    }
-    bool resolved = cbm_canonical_path(candidate, out, CBM_SZ_4K) != 0;
-    free(candidate);
-    return resolved;
-}
-#endif
-
-static int mcp_run_shell_command_cancellable(cbm_mcp_server_t *srv, const char *command,
-                                             char output_path[CBM_SZ_2K],
-                                             cbm_proc_result_t *result_out) {
-    if (!srv || !command || !output_path || !result_out || !mcp_command_output_path(output_path)) {
+/* Keep Git execution inside the request's owned cancellation boundary while
+ * passing every user-derived value as a literal argv element. */
+static int mcp_run_git_argv(cbm_mcp_server_t *srv, const char *repo_path,
+                            const char *const git_args[], cbm_git_output_t *output,
+                            cbm_proc_result_t *result_out) {
+    if (!srv || !repo_path || !git_args || !git_args[0] || !output || !result_out) {
         return -1;
     }
-    /* Internal test seam: rejecting after output allocation exercises the same
-     * cleanup contract as a contained process-tree failure. */
-    if (srv->command_test_hook && !srv->command_test_hook(srv->command_test_context, command)) {
+    /* Internal test seam: the hook observes a stable operation label, not a
+     * command string that could accidentally become executable again. */
+    if (srv->command_test_hook &&
+        !srv->command_test_hook(srv->command_test_context, git_args[0])) {
         return -1;
     }
-#ifdef _WIN32
-    char shell[CBM_SZ_4K];
-    if (!mcp_resolve_windows_cmd(shell)) {
-        (void)cbm_unlink(output_path);
-        output_path[0] = '\0';
-        return -1;
-    }
-#else
-    const char *shell = "/bin/sh";
-    const char *argv[] = {"sh", "-c", command, NULL};
-#endif
-    cbm_proc_opts_t options = {
-        .bin = shell,
-#ifdef _WIN32
-        .windows_cmd_payload = command,
-#else
-        .argv = argv,
-#endif
-        .log_file = output_path,
-        .quiet_timeout_ms = 0,
-        .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
-        .delete_log_on_exit = false,
+    cbm_git_run_opts_t opts = {
+        .cancel_requested = mcp_git_cancel_requested,
+        .cancel_context = srv,
     };
-    cbm_subprocess_t *process = NULL;
-    if (cbm_subprocess_spawn(&options, &process) != 0) {
-        (void)cbm_unlink(output_path);
-        output_path[0] = '\0';
-        return -1;
-    }
+    return cbm_git_run_argv(repo_path, git_args, &opts, output, result_out);
+}
 
-    cbm_proc_poll_t state;
-    for (;;) {
-        if (mcp_request_cancelled(srv)) {
-            (void)cbm_subprocess_request_cancel(process);
-        }
-        state = cbm_subprocess_poll(process, result_out);
-        if (state != CBM_PROC_POLL_RUNNING) {
-            break;
-        }
-        cbm_usleep(10000);
+static void mcp_git_outputs_cleanup(cbm_git_output_t *outputs, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        cbm_git_output_cleanup(&outputs[i]);
     }
-    bool contained = state == CBM_PROC_POLL_TERMINAL && result_out->tree_quiesced &&
-                     !result_out->supervision_failed;
-    cbm_subprocess_destroy(process);
-    return contained ? 0 : -1;
 }
 
 /* Collect BFS seed ids: every symbol DEFINED in a changed file (everything but
@@ -15320,6 +15217,61 @@ static void detect_collect_seeds(cbm_store_t *store, const char *project, const 
         }
     }
     cbm_store_free_nodes(nodes, ncount);
+}
+
+static bool detect_collect_changed_output(const cbm_git_output_t *output, cbm_store_t *store,
+                                          const char *project, bool want_symbols, char ***files,
+                                          int *file_count, int *file_cap, int64_t **seeds,
+                                          int *seed_count, int *seed_cap) {
+    FILE *fp = output && output->path[0] ? cbm_fopen(output->path, "rb") : NULL;
+    if (!fp) {
+        return false;
+    }
+    char line[CBM_SZ_1K];
+    while (fgets(line, sizeof(line), fp)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (len == 0) {
+            continue;
+        }
+        /* Strip the `git status --porcelain` 2-char code + space; for a rename
+         * ("R  old -> new") keep the destination path. */
+        char *path_line = line;
+        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
+            strchr(" MADRCU?!", line[1])) {
+            path_line = line + PAIR_LEN + SKIP_ONE;
+            char *arrow = strstr(path_line, " -> ");
+            if (arrow) {
+                enum { ARROW_LEN = 4 };
+                path_line = arrow + ARROW_LEN;
+            }
+        }
+        if (path_line[0] == '\0') {
+            continue;
+        }
+        bool duplicate = false;
+        for (int i = 0; i < *file_count; i++) {
+            if (strcmp((*files)[i], path_line) == 0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        if (*file_count >= *file_cap) {
+            *file_cap = *file_cap ? *file_cap * PAIR_LEN : MCP_COL_16;
+            *files = safe_realloc(*files, (size_t)*file_cap * sizeof(**files));
+        }
+        (*files)[(*file_count)++] = heap_strdup(path_line);
+        if (want_symbols) {
+            detect_collect_seeds(store, project, path_line, seeds, seed_count, seed_cap);
+        }
+    }
+    bool read_ok = ferror(fp) == 0;
+    return fclose(fp) == 0 && read_ok;
 }
 
 /* Module key for the impacted rollup = the first TWO path segments
@@ -15487,13 +15439,11 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         base_branch = heap_strdup("main");
     }
 
-    /* Reject shell metacharacters, and a leading '-', in the user-supplied
-     * branch name. base_branch is spliced into `git diff --name-only
-     * "<base>"...HEAD`; a value starting with '-' would be read by git as an
-     * option rather than a ref (e.g. `--output=<path>` writes the diff to an
-     * arbitrary file). A real git ref never begins with '-'. */
-    if (!cbm_validate_shell_arg(base_branch) || base_branch[0] == '-' ||
-        !validate_windows_cmd_interpolation_arg(base_branch)) {
+    /* The revision is a literal argv element, so shell metacharacters have no
+     * executable meaning. Keep rejecting a leading '-' because it is not a
+     * valid branch spelling and older supported Git versions do not uniformly
+     * accept --end-of-options in every revision-parsing command. */
+    if (base_branch[0] == '\0' || base_branch[0] == '-') {
         free(project);
         free(base_branch);
         free(scope);
@@ -15511,8 +15461,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return res;
     }
 
-    if (!validate_search_path_arg(root_path) ||
-        !validate_windows_cmd_interpolation_arg(root_path)) {
+    if (!cbm_git_validate_repo_path(root_path)) {
         free(root_path);
         free(project);
         free(base_branch);
@@ -15520,7 +15469,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("project path contains invalid characters", true);
     }
 
-    /* Get changed files via git (-C avoids cd + quoting issues on Windows).
+    /* Get changed files via literal Git argv (-C avoids changing process CWD).
      * Three sources are merged:
      *   1. committed changes vs base   (diff <base>...HEAD)
      *   2. unstaged tracked changes    (diff)
@@ -15529,38 +15478,51 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      *      brand-new file never appeared until a manual re-index (#520).
      * status --porcelain prefixes each path with a 2-char code + space
      * ("?? path", "A  path"); the prefix is stripped when parsing below. */
-    char cmd[CBM_SZ_2K];
-    int cmd_len;
-#ifdef _WIN32
-    cmd_len = snprintf(cmd, sizeof(cmd),
-                       "git -C \"%s\" diff --name-only \"%s\"...HEAD 2>NUL & "
-                       "git -C \"%s\" diff --name-only 2>NUL & "
-                       "git --no-optional-locks -C \"%s\" status --porcelain "
-                       "--untracked-files=normal 2>NUL",
-                       root_path, base_branch, root_path, root_path);
-#else
-    cmd_len = snprintf(cmd, sizeof(cmd),
-                       "{ git -C '%s' diff --name-only '%s'...HEAD 2>/dev/null; "
-                       "git -C '%s' diff --name-only 2>/dev/null; "
-                       "git --no-optional-locks -C '%s' status --porcelain "
-                       "--untracked-files=normal 2>/dev/null; } | sort -u",
-                       root_path, base_branch, root_path, root_path);
-#endif
-    if (cmd_len < 0 || (size_t)cmd_len >= sizeof(cmd)) {
+    size_t base_length = strlen(base_branch);
+    static const char revision_suffix[] = "...HEAD";
+    if (base_length > SIZE_MAX - sizeof(revision_suffix)) {
         free(root_path);
         free(project);
         free(base_branch);
         free(scope);
-        return cbm_mcp_text_result(
-            "git diff command is too long; use a shorter project path or branch name", true);
+        return cbm_mcp_text_result("base_branch is too long", true);
     }
+    char *revision = malloc(base_length + sizeof(revision_suffix));
+    if (!revision) {
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result("git diff failed: revision allocation failed", true);
+    }
+    memcpy(revision, base_branch, base_length);
+    memcpy(revision + base_length, revision_suffix, sizeof(revision_suffix));
 
-    char output_path[CBM_SZ_2K] = {0};
-    cbm_proc_result_t git_result = {0};
-    int git_run = mcp_run_shell_command_cancellable(srv, cmd, output_path, &git_result);
-    bool git_cancelled = git_result.cancellation_requested || mcp_request_cancelled(srv);
+    /* The trailing "--" disambiguates the preceding revision from a path
+     * without relying on the newer --end-of-options spelling. */
+    const char *const committed_args[] = {"diff", "--name-only", revision, "--", NULL};
+    const char *const unstaged_args[] = {"diff", "--name-only", NULL};
+    const char *const status_args[] = {
+        "status", "--porcelain", "--untracked-files=normal", NULL};
+    const char *const *commands[] = {committed_args, unstaged_args, status_args};
+    enum { DETECT_GIT_COMMAND_COUNT = 3 };
+    cbm_git_output_t git_outputs[DETECT_GIT_COMMAND_COUNT] = {0};
+    cbm_proc_result_t git_results[DETECT_GIT_COMMAND_COUNT] = {0};
+    int git_run = 0;
+    bool git_cancelled = false;
+    for (int i = 0; i < DETECT_GIT_COMMAND_COUNT; i++) {
+        if (mcp_run_git_argv(srv, root_path, commands[i], &git_outputs[i], &git_results[i]) != 0) {
+            git_run = -1;
+            break;
+        }
+        if (git_results[i].cancellation_requested || mcp_request_cancelled(srv)) {
+            git_cancelled = true;
+            break;
+        }
+    }
+    free(revision);
     if (git_cancelled) {
-        (void)cbm_unlink(output_path);
+        mcp_git_outputs_cleanup(git_outputs, DETECT_GIT_COMMAND_COUNT);
         free(root_path);
         free(project);
         free(base_branch);
@@ -15568,7 +15530,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("detect_changes cancelled for this request", true);
     }
     if (git_run != 0) {
-        (void)cbm_unlink(output_path);
+        mcp_git_outputs_cleanup(git_outputs, DETECT_GIT_COMMAND_COUNT);
         char errmsg[CBM_SZ_256];
         snprintf(errmsg, sizeof(errmsg),
                  "git diff failed: the contained command could not complete. "
@@ -15579,16 +15541,6 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(scope);
         return cbm_mcp_text_result(errmsg, true);
     }
-    FILE *fp = cbm_fopen(output_path, "rb");
-    if (!fp) {
-        (void)cbm_unlink(output_path);
-        free(root_path);
-        free(project);
-        free(base_branch);
-        free(scope);
-        return cbm_mcp_text_result("git diff failed: contained output could not be read", true);
-    }
-
     /* resolve_store already called via get_project_root above */
     cbm_store_t *store = srv->store;
 
@@ -15613,8 +15565,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(base_branch);
         free(scope);
-        (void)fclose(fp);
-        (void)cbm_unlink(output_path);
+        mcp_git_outputs_cleanup(git_outputs, DETECT_GIT_COMMAND_COUNT);
         return cbm_mcp_text_result(errbuf, true);
     }
     cbm_mcp_output_format_t response_format = cbm_mcp_response_format(srv, args);
@@ -15624,7 +15575,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(project);
         free(base_branch);
         free(scope);
-        (void)cbm_pclose(fp);
+        mcp_git_outputs_cleanup(git_outputs, DETECT_GIT_COMMAND_COUNT);
         return cbm_mcp_invalid_response_format();
     }
     bool legacy_json = response_format == CBM_MCP_OUTPUT_JSON;
@@ -15648,74 +15599,44 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     int seed_count = 0;
     int seed_cap = 0;
 
-    char line[CBM_SZ_1K];
-    while (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len == 0) {
-            continue;
-        }
-        /* Strip the `git status --porcelain` 2-char code + space; for a rename
-         * ("R  old -> new") keep the destination path. */
-        char *path_line = line;
-        if (len > PAIR_LEN && line[PAIR_LEN] == ' ' && strchr(" MADRCU?!", line[0]) &&
-            strchr(" MADRCU?!", line[1])) {
-            path_line = line + PAIR_LEN + SKIP_ONE;
-            char *arrow = strstr(path_line, " -> ");
-            if (arrow) {
-                enum { ARROW_LEN = 4 };
-                path_line = arrow + ARROW_LEN;
-            }
-        }
-        if (path_line[0] == '\0') {
-            continue;
-        }
-        /* Dedup: the three git sources are sorted+unioned on POSIX but not on
-         * Windows (separate commands), and a path can repeat. */
-        bool dup = false;
-        for (int i = 0; i < file_count; i++) {
-            if (strcmp(files[i], path_line) == 0) {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) {
-            continue;
-        }
-        if (file_count >= file_cap) {
-            file_cap = file_cap ? file_cap * 2 : 16;
-            files = safe_realloc(files, (size_t)file_cap * sizeof(char *));
-        }
-        files[file_count++] = heap_strdup(path_line);
-        if (want_symbols) {
-            detect_collect_seeds(store, project, path_line, &seeds, &seed_count, &seed_cap);
+    bool outputs_read = true;
+    for (int i = 0; i < DETECT_GIT_COMMAND_COUNT; i++) {
+        if (!detect_collect_changed_output(&git_outputs[i], store, project, want_symbols, &files,
+                                           &file_count, &file_cap, &seeds, &seed_count,
+                                           &seed_cap)) {
+            outputs_read = false;
+            break;
         }
     }
-    (void)fclose(fp);
-    (void)cbm_unlink(output_path);
-    int git_status = git_result.exit_code;
+    int git_status = git_results[DETECT_GIT_COMMAND_COUNT - 1].exit_code;
+    mcp_git_outputs_cleanup(git_outputs, DETECT_GIT_COMMAND_COUNT);
+    if (!outputs_read) {
+        for (int i = 0; i < file_count; i++) {
+            free(files[i]);
+        }
+        free(files);
+        free(seeds);
+        free(direction);
+        free(root_path);
+        free(project);
+        free(base_branch);
+        free(scope);
+        return cbm_mcp_text_result("git diff failed: contained output could not be read", true);
+    }
 
     /* merge-base SHA: the exact commit the diff is measured against, so the
      * result is reproducible even as base_branch advances. Best-effort. */
     char merge_base[64] = "";
     {
-        char mbcmd[CBM_SZ_2K];
-#ifdef _WIN32
-        snprintf(mbcmd, sizeof(mbcmd), "git -C \"%s\" merge-base \"%s\" HEAD 2>NUL", root_path,
-                 base_branch);
-#else
-        snprintf(mbcmd, sizeof(mbcmd), "git -C '%s' merge-base '%s' HEAD 2>/dev/null", root_path,
-                 base_branch);
-#endif
-        char mb_output_path[CBM_SZ_2K] = {0};
+        const char *const merge_base_args[] = {"merge-base", base_branch, "HEAD", NULL};
+        cbm_git_output_t mb_output = {0};
         cbm_proc_result_t mb_result = {0};
-        int mb_run = mcp_run_shell_command_cancellable(srv, mbcmd, mb_output_path, &mb_result);
+        int mb_run =
+            mcp_run_git_argv(srv, root_path, merge_base_args, &mb_output, &mb_result);
         bool mb_cancelled = mb_result.cancellation_requested || mcp_request_cancelled(srv);
-        bool mb_containment_failed = mb_run != 0 && mb_output_path[0] != '\0';
+        bool mb_containment_failed = mb_run != 0;
         FILE *mbfp =
-            mb_run == 0 && mb_result.exit_code == 0 ? cbm_fopen(mb_output_path, "rb") : NULL;
+            mb_run == 0 && mb_result.exit_code == 0 ? cbm_fopen(mb_output.path, "rb") : NULL;
         if (mbfp && !mb_cancelled) {
             if (fgets(merge_base, sizeof(merge_base), mbfp)) {
                 size_t l = strlen(merge_base);
@@ -15727,9 +15648,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (mbfp) {
             (void)fclose(mbfp);
         }
-        if (mb_output_path[0]) {
-            (void)cbm_unlink(mb_output_path);
-        }
+        cbm_git_output_cleanup(&mb_output);
         if (mb_cancelled || mb_containment_failed) {
             for (int i = 0; i < file_count; i++) {
                 free(files[i]);
