@@ -42,6 +42,7 @@
 #include <unistd.h>
 #define cbm_chdir chdir
 #define cbm_getcwd getcwd
+extern char **environ;
 #endif
 
 static bool mcp_response_has_exact_tool(const char *response, const char *expected_name) {
@@ -13092,8 +13093,6 @@ enum {
 /* ── Support helpers carried over from upstream main ──────────────
  * Required by the upstream-only tests below; none of these names exist in
  * the api-consolidation copy of this file, so no duplicate is introduced. */
-
-extern char **environ;
 
 typedef struct {
     int deny_begin_call;      /* one-based; zero allows every acquisition */
