@@ -76,6 +76,7 @@ typedef struct {
     const char *trae_config_path;
     const char *roo_config_path;
     const char *cody_config_path;
+    const char *omp_agent_dir;
     bool is_windows;
     cbm_agent_probe_fn path_exists;
     cbm_agent_probe_fn command_exists;

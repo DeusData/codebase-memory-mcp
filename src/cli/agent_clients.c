@@ -74,8 +74,8 @@ static const cbm_agent_client_profile_t agent_profiles[CBM_AGENT_CLIENT_COUNT] =
     {CBM_AGENT_CLIENT_SOURCEGRAPH_CODY, "sourcegraph-cody", "Sourcegraph Cody", CBM_AGENT_OPT_IN,
      CBM_AGENT_CAP_MCP, NULL, agent_install_callback, agent_remove_callback},
     {CBM_AGENT_CLIENT_OMP, "omp", "Oh My Pi (omp)", CBM_AGENT_STABLE,
-     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
-     "omp", agent_install_callback, agent_remove_callback},
+     CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT, "omp",
+     agent_install_callback, agent_remove_callback},
 };
 
 size_t cbm_agent_client_count(void) {
@@ -585,6 +585,10 @@ int cbm_agent_client_resolve_path(cbm_agent_client_id_t id,
     case CBM_AGENT_CLIENT_POCHI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pochi/config.jsonc");
     case CBM_AGENT_CLIENT_OMP:
+        if (options->omp_agent_dir && options->omp_agent_dir[0]) {
+            int written = snprintf(path_out, path_out_size, "%s/mcp.json", options->omp_agent_dir);
+            return written >= 0 && (size_t)written < path_out_size ? 0 : -1;
+        }
         return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent/mcp.json");
     case CBM_AGENT_CLIENT_PI:
         return 1;
@@ -652,6 +656,10 @@ static int agent_client_marker_path(cbm_agent_client_id_t id,
     case CBM_AGENT_CLIENT_POCHI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pochi");
     case CBM_AGENT_CLIENT_OMP:
+        if (options->omp_agent_dir && options->omp_agent_dir[0]) {
+            int written = snprintf(path_out, path_out_size, "%s", options->omp_agent_dir);
+            return written >= 0 && (size_t)written < path_out_size ? 0 : 1;
+        }
         return agent_join_path(path_out, path_out_size, options->home_dir, ".omp/agent");
     case CBM_AGENT_CLIENT_PI:
         return agent_join_path(path_out, path_out_size, options->home_dir, ".pi/agent");
