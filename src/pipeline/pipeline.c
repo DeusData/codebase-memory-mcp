@@ -1641,11 +1641,10 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
-static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
+static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
     }
-    *was_incremental = false;
 
     CBM_PROF_START(t_pipeline_total);
     struct timespec t0;
@@ -1703,7 +1702,6 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
         goto cleanup;
     }
     if (rc >= 0) {
-        *was_incremental = true;
         goto cleanup;
     }
     cbm_log_info("pipeline.route", "path", "full");
@@ -1951,8 +1949,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         free(final_path);
         return CBM_NOT_FOUND;
     }
-    bool was_incremental = false;
-    int rc = cbm_pipeline_run_staged(p, &was_incremental);
+    int rc = cbm_pipeline_run_staged(p);
     free(p->db_path);
     p->db_path = configured_db_path;
 

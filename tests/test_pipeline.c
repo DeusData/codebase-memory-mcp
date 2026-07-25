@@ -6520,10 +6520,10 @@ TEST(incremental_changed_file_propagates_explicit_persistence_failure) {
 
     char artifact_dir[512];
     snprintf(artifact_dir, sizeof(artifact_dir), "%s/.codebase-memory", tmpdir);
-    cbm_mkdir_p(artifact_dir, 0755);
+    ASSERT_TRUE(cbm_mkdir_p(artifact_dir, 0755));
     char artifact_path[512];
     snprintf(artifact_path, sizeof(artifact_path), "%s/graph.db.zst", artifact_dir);
-    cbm_mkdir_p(artifact_path, 0755);
+    ASSERT_TRUE(cbm_mkdir_p(artifact_path, 0755));
 
     pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(pipeline);
