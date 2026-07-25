@@ -8,6 +8,8 @@
 #                                        # Run matching tests inside one suite
 #   make -f Makefile.cbm test-foundation # Foundation tests only (fast)
 #   make -f Makefile.cbm test-tsan      # Thread sanitizer build
+#   make -f Makefile.cbm test-syntax TEST_SYNTAX_SRCS="tests/test_mcp.c"
+#                                        # syntax-check selected C units with real test flags
 #   make -f Makefile.cbm cbm            # Production binary (auto-signed on macOS)
 #   make -f Makefile.cbm install        # Build + install to INSTALL_DIR (default ~/.local/bin)
 #   make -f Makefile.cbm clean-c        # Remove build artifacts
@@ -718,7 +720,7 @@ GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke \
+.PHONY: test test-par test-repro test-foundation test-tsan test-syntax test-daemon-smoke \
         test-leak test-analyze test-memory test-gmalloc cbm cbm-launcher \
         cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck \
         lint-format lint-source-safety install test-runner-nosan security
@@ -735,6 +737,16 @@ $(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) \
 
 test-foundation: $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
+
+# Fast C syntax check for selected test or production translation units. Reuse
+# the nosan test flags so gated *_for_testing declarations and both test include
+# roots cannot drift from the real test builds. Example:
+#   make -f Makefile.cbm test-syntax TEST_SYNTAX_SRCS="tests/test_mcp.c src/mcp/mcp.c"
+TEST_SYNTAX_SRCS ?=
+test-syntax:
+	@test -n "$(strip $(TEST_SYNTAX_SRCS))" || \
+		(echo "TEST_SYNTAX_SRCS is required for test-syntax"; exit 2)
+	$(CC) $(CFLAGS_NOSAN) $(TEST_INCLUDE_FLAGS) -fsyntax-only $(TEST_SYNTAX_SRCS)
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
