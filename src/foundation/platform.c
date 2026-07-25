@@ -6,12 +6,15 @@
 #include "platform.h"
 
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/platform_internal.h"
+#include <errno.h>
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CBM_NSEC_PER_SEC 1000000000ULL
@@ -58,6 +61,26 @@ uint64_t cbm_platform_scale_counter_ns(uint64_t counter, uint64_t frequency) {
     return fraction_ns > UINT64_MAX - whole_ns ? UINT64_MAX : whole_ns + fraction_ns;
 }
 
+bool cbm_platform_parse_proc_stat_group(const char *stat_line, int64_t *process_group,
+                                        bool *execution_quiescent) {
+    if (!stat_line || !process_group || !execution_quiescent) {
+        return false;
+    }
+    const char *command_end = strrchr(stat_line, ')');
+    char state = '\0';
+    long long parent = 0;
+    long long group = 0;
+    if (!command_end ||
+        sscanf(command_end + 1, " %c %lld %lld", &state, &parent, &group) != 3 ||
+        state == '\0' || group <= 0) {
+        return false;
+    }
+    (void)parent;
+    *process_group = (int64_t)group;
+    *execution_quiescent = state == 'Z' || state == 'X';
+    return true;
+}
+
 /* Canonicalize a Windows drive letter to upper-case in place: "c:/x" -> "C:/x".
  * Windows drive letters are case-insensitive, but a lowercase one (as agent
  * CWDs often report, e.g. Claude Code's "c:\...") otherwise produces a distinct
@@ -85,6 +108,11 @@ static void cbm_canonicalize_drive(char *path) {
 #include <io.h>
 #include <sys/stat.h>
 #include "foundation/win_utf8.h"
+
+cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid) {
+    (void)pgid;
+    return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+}
 
 void *cbm_mmap_read(const char *path, size_t *out_size) {
     if (!path || !out_size) {
@@ -213,10 +241,124 @@ char *cbm_normalize_path_sep(char *path) {
 #ifdef __APPLE__
 #include <mach/mach_time.h>
 #include <pthread.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #else
 #include <sched.h>
 #endif
+
+cbm_platform_process_group_state_t cbm_platform_process_group_state(int64_t pgid) {
+    if (pgid <= 0) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+#ifdef __APPLE__
+    /* KERN_PROC_PGRP omits retained zombies on current macOS kernels. Query the
+     * zombie-inclusive table and filter e_pgid ourselves. */
+    int mib[] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t required = 0;
+    if (sysctl(mib, 4, NULL, &required, NULL, 0) != 0) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    size_t slack = 16U * sizeof(struct kinfo_proc);
+    if (required > SIZE_MAX - slack) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    size_t capacity = required + slack;
+    struct kinfo_proc *entries = (struct kinfo_proc *)calloc(1, capacity);
+    if (!entries) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    size_t received = capacity;
+    if (sysctl(mib, 4, entries, &received, NULL, 0) != 0 ||
+        received > capacity || received % sizeof(*entries) != 0) {
+        free(entries);
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+
+    bool saw_member = false;
+    size_t count = received / sizeof(*entries);
+    for (size_t i = 0; i < count; i++) {
+        if ((int64_t)entries[i].kp_eproc.e_pgid != pgid) {
+            continue;
+        }
+        saw_member = true;
+        if (entries[i].kp_proc.p_stat != SZOMB) {
+            free(entries);
+            return CBM_PLATFORM_PROCESS_GROUP_ACTIVE;
+        }
+    }
+    free(entries);
+    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED
+                      : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+#elif defined(__linux__)
+    cbm_dir_t *directory = cbm_opendir("/proc");
+    if (!directory) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    bool saw_member = false;
+    bool snapshot_unknown = false;
+    cbm_dirent_t *entry = NULL;
+    while ((entry = cbm_readdir(directory)) != NULL) {
+        if (!entry->name[0]) {
+            continue;
+        }
+        bool numeric = true;
+        for (const unsigned char *p = (const unsigned char *)entry->name; *p; p++) {
+            if (*p < (unsigned char)'0' || *p > (unsigned char)'9') {
+                numeric = false;
+                break;
+            }
+        }
+        if (!numeric) {
+            continue;
+        }
+        char path[CBM_PATH_MAX];
+        int written = snprintf(path, sizeof(path), "/proc/%s/stat", entry->name);
+        if (written < 0 || (size_t)written >= sizeof(path)) {
+            snapshot_unknown = true;
+            continue;
+        }
+        errno = 0;
+        FILE *file = cbm_fopen(path, "r");
+        if (!file) {
+            if (errno != ENOENT && errno != ESRCH) {
+                snapshot_unknown = true;
+            }
+            continue;
+        }
+        char stat_line[4096];
+        bool read_ok = fgets(stat_line, sizeof(stat_line), file) != NULL;
+        (void)fclose(file);
+        if (!read_ok) {
+            snapshot_unknown = true;
+            continue;
+        }
+        int64_t process_group = 0;
+        bool execution_quiescent = false;
+        if (!cbm_platform_parse_proc_stat_group(stat_line, &process_group,
+                                                &execution_quiescent)) {
+            snapshot_unknown = true;
+            continue;
+        }
+        if (process_group != pgid) {
+            continue;
+        }
+        saw_member = true;
+        if (!execution_quiescent) {
+            cbm_closedir(directory);
+            return CBM_PLATFORM_PROCESS_GROUP_ACTIVE;
+        }
+    }
+    cbm_closedir(directory);
+    if (snapshot_unknown) {
+        return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+    }
+    return saw_member ? CBM_PLATFORM_PROCESS_GROUP_QUIESCED
+                      : CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+#else
+    return CBM_PLATFORM_PROCESS_GROUP_UNKNOWN;
+#endif
+}
 
 /* ── Memory mapping ──────────────────────────── */
 

@@ -10,6 +10,7 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/platform_internal.h"
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h" /* cbm_fopen */
@@ -22,6 +23,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -405,6 +407,56 @@ static int spawn_ignoring_tree(const char *pid_path, int quiet_timeout_ms, int c
     return cbm_subprocess_spawn(&opts, out);
 }
 
+static pid_t create_zombie_group_member(pid_t pgid) {
+    int gate[2];
+    if (pipe(gate) != 0) {
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        (void)close(gate[0]);
+        (void)close(gate[1]);
+        return -1;
+    }
+    if (pid == 0) {
+        (void)close(gate[1]);
+        char ignored;
+        ssize_t received;
+        do {
+            received = read(gate[0], &ignored, sizeof(ignored));
+        } while (received < 0 && errno == EINTR);
+        (void)close(gate[0]);
+        _exit(received == 0 ? 0 : 101);
+    }
+    (void)close(gate[0]);
+    if (setpgid(pid, pgid) != 0) {
+        (void)close(gate[1]);
+        (void)kill(pid, SIGKILL);
+        (void)waitpid(pid, NULL, 0);
+        return -1;
+    }
+    (void)close(gate[1]); /* EOF releases the child; deliberately do not reap it yet */
+
+    uint64_t deadline = cbm_now_ms() + 1000U;
+    do {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (waitid(P_PID, (id_t)pid, &info, WEXITED | WNOHANG | WNOWAIT) == 0 &&
+            info.si_pid == pid) {
+            return pid;
+        }
+        subprocess_test_pause();
+    } while (cbm_now_ms() < deadline);
+    (void)kill(pid, SIGKILL);
+    (void)waitpid(pid, NULL, 0);
+    return -1;
+}
+
+static bool subprocess_zombie_process_table_available(void) {
+    return cbm_platform_process_group_state((int64_t)getpgrp()) ==
+           CBM_PLATFORM_PROCESS_GROUP_ACTIVE;
+}
+
 typedef struct {
     cbm_subprocess_t *process;
     int count;
@@ -649,6 +701,56 @@ TEST(subprocess_cancel_grace_is_hard_capped) {
     ASSERT_TRUE(terminal);
     ASSERT_TRUE(result.forced);
     ASSERT_TRUE(result.tree_quiesced);
+    PASS();
+#endif
+}
+
+TEST(subprocess_zombie_only_group_is_quiesced_without_extending_settle) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX zombie/process-group probe; Windows Job Objects exclude exited processes");
+#else
+    if (!subprocess_zombie_process_table_available()) {
+        SKIP_PLATFORM("host denies the process-table query required to classify zombie-only groups");
+    }
+    char pid_path[64];
+    ASSERT_TRUE(make_tree_pid_path(pid_path));
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(spawn_ignoring_tree(pid_path, 0, 100, &process), 0);
+    ASSERT_NOT_NULL(process);
+
+    pid_t parent_pid = -1;
+    pid_t grandchild_pid = -1;
+    bool ready = wait_for_tree_pids(pid_path, process, &parent_pid, &grandchild_pid, 1000);
+    /* This direct test child joins the owned PGID, exits, and remains deliberately
+     * unreaped. kill(-pgid, 0) therefore keeps succeeding past the force deadline
+     * even after no group member can execute. */
+    pid_t zombie_pid = ready ? create_zombie_group_member(parent_pid) : -1;
+    bool cancel_accepted = zombie_pid > 1 && cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result = {0};
+    bool terminal = cancel_accepted && poll_until_terminal(process, 2500, &result);
+    int zombie_status = 0;
+    bool zombie_reaped = zombie_pid > 1 && waitpid(zombie_pid, &zombie_status, 0) == zombie_pid;
+    if (!terminal) {
+        force_probe_cleanup(parent_pid, grandchild_pid);
+        cbm_proc_result_t cleanup_result;
+        if (poll_until_terminal(process, 1000, &cleanup_result)) {
+            cbm_subprocess_destroy(process);
+        }
+    } else {
+        cbm_subprocess_destroy(process);
+    }
+    (void)unlink(pid_path);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(zombie_pid > 1);
+    ASSERT_TRUE(cancel_accepted);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(result.forced);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(zombie_reaped);
+    ASSERT_TRUE(WIFEXITED(zombie_status));
+    ASSERT_EQ(WEXITSTATUS(zombie_status), 0);
     PASS();
 #endif
 }
@@ -1177,6 +1279,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
+    RUN_TEST(subprocess_zombie_only_group_is_quiesced_without_extending_settle);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
