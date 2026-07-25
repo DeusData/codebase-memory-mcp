@@ -5,6 +5,7 @@
  * on a temporary directory with known file layout.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/constants.h"
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
@@ -11932,7 +11933,7 @@ TEST(incremental_touch_only_refreshes_metadata_without_reindex) {
               0);
     struct stat touched;
     ASSERT_EQ(stat(path, &touched), 0);
-    ASSERT_NEQ(cbm_pipeline_stat_mtime_ns(&touched), cbm_pipeline_stat_mtime_ns(&before));
+    ASSERT_NEQ(cbm_stat_mtime_ns(&touched), cbm_stat_mtime_ns(&before));
 
     cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
     ASSERT_NOT_NULL(cfg);
@@ -11952,7 +11953,7 @@ TEST(incremental_touch_only_refreshes_metadata_without_reindex) {
     ASSERT_EQ(pipeline_store_file_hash_mtime(g_incr_dbpath, project, "helper.go",
                                              &hash_mtime_ns),
               CBM_STORE_OK);
-    ASSERT_EQ(hash_mtime_ns, cbm_pipeline_stat_mtime_ns(&touched));
+    ASSERT_EQ(hash_mtime_ns, cbm_stat_mtime_ns(&touched));
 
     free(project);
     cbm_config_close(cfg);
@@ -16055,6 +16056,9 @@ TEST(incremental_publish_failure_keeps_existing_db) {
     ASSERT_EQ(dirty_row_count, 1);
     ASSERT_STR_EQ(dirty_rows[0].project, project);
     ASSERT_STR_EQ(dirty_rows[0].rel_path, "helper.go");
+    char expected_dirty_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    ASSERT_EQ(cbm_file_content_hash(path, expected_dirty_hash, sizeof(expected_dirty_hash)), 0);
+    ASSERT_STR_EQ(dirty_rows[0].observed_hash, expected_dirty_hash);
     ASSERT_GT(dirty_rows[0].observed_mtime_ns, 0);
     ASSERT_GT(dirty_rows[0].observed_size, 0);
     ASSERT_STR_EQ(dirty_rows[0].source, CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX);

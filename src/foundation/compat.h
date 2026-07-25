@@ -9,6 +9,7 @@
 #define CBM_COMPAT_H
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -18,6 +19,12 @@
  * it those calls become implicit declarations that conflict with the real
  * stdlib.h types and fail to compile on native ARM64 Windows. */
 #include <stdlib.h>
+#include <sys/stat.h>
+
+/* Read struct stat's modification time through one portable spelling. Windows
+ * stat exposes seconds only; Darwin and other POSIX platforms expose their
+ * native nanosecond fields under different member names. */
+int64_t cbm_stat_mtime_ns(const struct stat *st);
 
 /* ── Thread-local storage ─────────────────────────────────────── */
 /* _Thread_local is C11 standard — works on GCC, Clang, and MSVC (2019+).

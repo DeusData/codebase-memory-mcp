@@ -16,6 +16,21 @@
 #include <sys/stat.h>
 #endif
 
+int64_t cbm_stat_mtime_ns(const struct stat *st) {
+    if (!st) {
+        return 0;
+    }
+#if defined(__APPLE__)
+    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+           (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
 /* ── strndup (Windows lacks it) ───────────────────────────────── */
 
 #ifdef _WIN32

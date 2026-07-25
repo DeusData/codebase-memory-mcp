@@ -5,6 +5,7 @@
  * poll_once behavior.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/constants.h"
 #include "../src/foundation/platform.h"
@@ -1554,6 +1555,7 @@ TEST(watcher_detects_dirty_worktree) {
 
 TEST(watcher_marks_dirty_file_before_failed_index_callback) {
     char tmpdir[256];
+    char dirty_path[300];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_dirty_ledger_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
@@ -1575,10 +1577,8 @@ TEST(watcher_marks_dirty_file_before_failed_index_callback) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 0);
 
-    {
-        char p[300];
-        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.go"), "\nfunc NewDirty() {}\n");
-    }
+    th_append_file(wt_path(dirty_path, sizeof(dirty_path), tmpdir, "file.go"),
+                   "\nfunc NewDirty() {}\n");
 
     cbm_watcher_touch(w, "dirty-ledger-repo");
     ASSERT_EQ(cbm_watcher_poll_once(w), 0);
@@ -1591,6 +1591,21 @@ TEST(watcher_marks_dirty_file_before_failed_index_callback) {
               CBM_STORE_OK);
     ASSERT_EQ(pending, 1);
     ASSERT_EQ(overlay_ready, 0);
+    cbm_dirty_file_state_t *dirty_rows = NULL;
+    int dirty_row_count = 0;
+    ASSERT_EQ(cbm_store_list_dirty_files(store, "dirty-ledger-repo", &dirty_rows,
+                                         &dirty_row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_row_count, 1);
+    ASSERT_STR_EQ(dirty_rows[0].rel_path, "file.go");
+    char expected_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    ASSERT_EQ(cbm_file_content_hash(dirty_path, expected_hash, sizeof(expected_hash)), 0);
+    ASSERT_STR_EQ(dirty_rows[0].observed_hash, expected_hash);
+    struct stat dirty_stat;
+    ASSERT_EQ(stat(dirty_path, &dirty_stat), 0);
+    ASSERT_EQ(dirty_rows[0].observed_mtime_ns, cbm_stat_mtime_ns(&dirty_stat));
+    ASSERT_EQ(dirty_rows[0].observed_size, dirty_stat.st_size);
+    cbm_store_free_dirty_files(dirty_rows, dirty_row_count);
 
     cbm_watcher_free(w);
     cbm_store_close(store);

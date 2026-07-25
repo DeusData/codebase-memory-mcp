@@ -49,6 +49,15 @@ int cbm_pclose_exit_code(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
 
+enum {
+    CBM_FILE_CONTENT_HASH_HEX_LEN = (int)(sizeof(uint64_t) * PAIR_LEN),
+    CBM_FILE_CONTENT_HASH_BUFSZ = CBM_FILE_CONTENT_HASH_HEX_LEN + 1,
+};
+
+/* Compute the canonical XXH3-64 content hash used by file-state and dirty-file
+ * metadata. out must provide CBM_FILE_CONTENT_HASH_BUFSZ bytes. */
+int cbm_file_content_hash(const char *path, char *out, size_t out_sz);
+
 /* Stable identity of one filesystem object. This distinguishes atomic path
  * replacement from in-place metadata changes and is valid across processes. */
 typedef struct {
