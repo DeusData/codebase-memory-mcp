@@ -9,6 +9,7 @@
 #include "compat_fs.h"
 #include "log.h"
 #include "platform.h" /* cbm_now_ms */
+#include "platform_internal.h"
 
 #include <stdio.h>
 #include <stdatomic.h>
@@ -1095,10 +1096,21 @@ static int cbm_subprocess_spawn_posix(cbm_subprocess_t *process) {
 }
 
 static bool cbm_posix_group_active(cbm_subprocess_t *process) {
-    if (kill(-process->pgid, 0) == 0) {
-        return true;
+    int existence = kill(-process->pgid, 0);
+    int existence_error = errno;
+    if (existence != 0 && existence_error == ESRCH) {
+        return false;
     }
-    return errno != ESRCH; /* EPERM/other errors fail closed as still active */
+    if (!process->force_sent || !process->root_reaped) {
+        return true; /* success, EPERM, and other errors all fail closed before force+reap */
+    }
+    /* kill(..., 0) reports zombies as existing. Once SIGKILL has been sent and
+     * the owned root has been reaped, a group containing only zombies is
+     * execution-quiescent: those entries cannot run or spawn and only await
+     * collection by their new parent. Enumerate on supported POSIX platforms so
+     * a live or numerically reused PGID still fails closed. */
+    return cbm_platform_process_group_state((int64_t)process->pgid) !=
+           CBM_PLATFORM_PROCESS_GROUP_QUIESCED;
 }
 
 static void cbm_posix_begin_termination(cbm_subprocess_t *process, uint64_t now) {

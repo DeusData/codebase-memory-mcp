@@ -125,6 +125,33 @@ TEST(platform_counter_scaling_preserves_monotonic_deadlines) {
     PASS();
 }
 
+TEST(platform_proc_stat_group_parser_handles_parentheses_and_states) {
+    int64_t process_group = 0;
+    bool execution_quiescent = false;
+    ASSERT_TRUE(cbm_platform_parse_proc_stat_group(
+        "123 (ordinary worker) R 7 41 41 0 -1 0", &process_group, &execution_quiescent));
+    ASSERT_EQ(process_group, 41);
+    ASSERT_FALSE(execution_quiescent);
+
+    ASSERT_TRUE(cbm_platform_parse_proc_stat_group(
+        "456 (worker ) name with spaces) Z 8 99 99 0 -1 0", &process_group,
+        &execution_quiescent));
+    ASSERT_EQ(process_group, 99);
+    ASSERT_TRUE(execution_quiescent);
+
+    ASSERT_TRUE(cbm_platform_parse_proc_stat_group(
+        "789 (dead worker) X 9 101 101 0 -1 0", &process_group, &execution_quiescent));
+    ASSERT_EQ(process_group, 101);
+    ASSERT_TRUE(execution_quiescent);
+
+    ASSERT_FALSE(cbm_platform_parse_proc_stat_group(
+        "123 missing-close R 7 41", &process_group, &execution_quiescent));
+    ASSERT_FALSE(cbm_platform_parse_proc_stat_group(
+        "123 (missing fields) R 7", &process_group, &execution_quiescent));
+    ASSERT_FALSE(cbm_platform_parse_proc_stat_group(NULL, &process_group, &execution_quiescent));
+    PASS();
+}
+
 typedef struct {
     atomic_int *ready;
     atomic_bool *go;
@@ -704,6 +731,7 @@ SUITE(platform) {
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);
+    RUN_TEST(platform_proc_stat_group_parser_handles_parentheses_and_states);
     RUN_TEST(platform_now_ns_concurrent_first_call);
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
