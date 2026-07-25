@@ -548,7 +548,7 @@ static bool pipeline_file_state_metadata_current(cbm_store_t *store, const char 
     if (rc == CBM_STORE_OK && state.content_hash && state.content_hash[0] &&
         state.pass_fingerprint && strcmp(state.pass_fingerprint, pass_fingerprint) == 0 &&
         state.size == st->st_size &&
-        state.mtime_ns == cbm_pipeline_stat_mtime_ns(st)) {
+        state.mtime_ns == cbm_stat_mtime_ns(st)) {
         current = true;
     }
     cbm_store_file_state_free_fields(&state);
@@ -592,7 +592,7 @@ static int pipeline_store_project_files_current(cbm_store_t *store, const char *
             current = false;
             break;
         }
-        int64_t mtime_ns = cbm_pipeline_stat_mtime_ns(&st);
+        int64_t mtime_ns = cbm_stat_mtime_ns(&st);
         if (st.st_size == hash->size && mtime_ns == hash->mtime_ns) {
             if (!pipeline_file_state_metadata_current(store, project, &files[i], pass_fingerprint,
                                                       &st)) {
@@ -2128,7 +2128,7 @@ static int pipeline_persist_replacement_metadata(cbm_pipeline_t *p, cbm_store_t 
             return CBM_STORE_ERR;
         }
         int hash_rc = cbm_store_upsert_file_hash(store, p->project_name, files[i].rel_path, "",
-                                                 cbm_pipeline_stat_mtime_ns(&fst), fst.st_size);
+                                                 cbm_stat_mtime_ns(&fst), fst.st_size);
         if (hash_rc != CBM_STORE_OK) {
             (void)cbm_store_rollback(store);
             cbm_log_error("pipeline.err", "phase", "persist_hashes_upsert", "rc",

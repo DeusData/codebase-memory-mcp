@@ -361,7 +361,7 @@ static bool *classify_files(cbm_store_t *store, const char *project, cbm_file_in
         if (st.st_size != h->size) {
             changed[i] = true;
             n_changed++;
-        } else if (cbm_pipeline_stat_mtime_ns(&st) != h->mtime_ns) {
+        } else if (cbm_stat_mtime_ns(&st) != h->mtime_ns) {
             if (cbm_pipeline_file_state_content_matches_current(store, project, &files[i],
                                                                 pass_fingerprint)) {
                 n_unchanged++;
@@ -632,8 +632,12 @@ typedef struct {
     int changed_file_count;
 } cbm_incr_classification_t;
 
-static void incr_observe_file_metadata(const cbm_file_info_t *file, int64_t *out_mtime_ns,
+static void incr_observe_file_metadata(const cbm_file_info_t *file, char *out_hash,
+                                       size_t out_hash_sz, int64_t *out_mtime_ns,
                                        int64_t *out_size) {
+    if (out_hash && out_hash_sz > 0) {
+        out_hash[0] = '\0';
+    }
     if (out_mtime_ns) {
         *out_mtime_ns = 0;
     }
@@ -643,10 +647,13 @@ static void incr_observe_file_metadata(const cbm_file_info_t *file, int64_t *out
     if (!file || !file->path) {
         return;
     }
+    if (out_hash && out_hash_sz > 0) {
+        (void)cbm_file_content_hash(file->path, out_hash, out_hash_sz);
+    }
     struct stat st;
     if (stat(file->path, &st) == 0) {
         if (out_mtime_ns) {
-            *out_mtime_ns = cbm_pipeline_stat_mtime_ns(&st);
+            *out_mtime_ns = cbm_stat_mtime_ns(&st);
         }
         if (out_size) {
             *out_size = st.st_size;
@@ -661,12 +668,15 @@ static int incr_mark_dirty_classification(cbm_store_t *store, const char *projec
     }
     int rc = CBM_STORE_OK;
     for (int i = 0; i < cls->changed_file_count; i++) {
+        char observed_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
         int64_t mtime_ns = 0;
         int64_t size = 0;
-        incr_observe_file_metadata(&cls->changed_files[i], &mtime_ns, &size);
+        incr_observe_file_metadata(&cls->changed_files[i], observed_hash, sizeof(observed_hash),
+                                   &mtime_ns, &size);
         cbm_dirty_file_state_t dirty = {
             .project = project,
             .rel_path = cls->changed_files[i].rel_path,
+            .observed_hash = observed_hash,
             .observed_mtime_ns = mtime_ns,
             .observed_size = size,
             .observed_generation = CBM_PIPELINE_COMPAT_GENERATION,
@@ -1042,7 +1052,7 @@ static int persist_hashes(cbm_store_t *store, const char *project, cbm_file_info
             continue;
         }
         int rc = cbm_store_upsert_file_hash(store, project, files[i].rel_path, "",
-                                            cbm_pipeline_stat_mtime_ns(&st), st.st_size);
+                                            cbm_stat_mtime_ns(&st), st.st_size);
         if (rc != CBM_STORE_OK) {
             cbm_log_warn("incremental.persist_hash_failed", "scope", "current", "rel_path",
                          files[i].rel_path, "rc", itoa_buf_incr(rc));

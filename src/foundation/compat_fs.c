@@ -10,9 +10,66 @@
 #include "foundation/compat_fs_internal.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define XXH_INLINE_ALL
+#include "xxhash/xxhash.h"
+
+int cbm_file_content_hash(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz < CBM_FILE_CONTENT_HASH_BUFSZ) {
+        return -1;
+    }
+    out[0] = '\0';
+    FILE *fp = cbm_fopen(path, "rb");
+    if (!fp) {
+        return -1;
+    }
+
+    XXH3_state_t *state = XXH3_createState();
+    if (!state) {
+        fclose(fp);
+        return -1;
+    }
+    if (XXH3_64bits_reset(state) == XXH_ERROR) {
+        XXH3_freeState(state);
+        fclose(fp);
+        return -1;
+    }
+
+    unsigned char buf[CBM_SZ_64K];
+    int rc = 0;
+    for (;;) {
+        size_t n = fread(buf, CBM_ALLOC_ONE, sizeof(buf), fp);
+        if (n > 0 && XXH3_64bits_update(state, buf, n) == XXH_ERROR) {
+            rc = -1;
+            break;
+        }
+        if (n < sizeof(buf)) {
+            if (ferror(fp)) {
+                rc = -1;
+            }
+            break;
+        }
+    }
+    uint64_t hash = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    if (fclose(fp) != 0) {
+        rc = -1;
+    }
+    if (rc != 0) {
+        out[0] = '\0';
+        return -1;
+    }
+    int n = snprintf(out, out_sz, "%0*" PRIx64, CBM_FILE_CONTENT_HASH_HEX_LEN, hash);
+    if (n != CBM_FILE_CONTENT_HASH_HEX_LEN) {
+        out[0] = '\0';
+        return -1;
+    }
+    return 0;
+}
 
 static bool cbm_dirent_name_len(const char *name, size_t *out_len) {
     if (!name) {

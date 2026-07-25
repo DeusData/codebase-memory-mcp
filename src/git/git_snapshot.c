@@ -26,18 +26,6 @@ static uint64_t git_dirty_hash_update(uint64_t h, const unsigned char *buf, size
     return h;
 }
 
-static int64_t git_snapshot_mtime_ns(const struct stat *st) {
-#if defined(__APPLE__)
-    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 static void git_dirty_hash_file_metadata(const char *repo_path, char **paths, int path_count,
                                          uint64_t *hash) {
     for (int i = 0; i < path_count; i++) {
@@ -48,7 +36,7 @@ static void git_dirty_hash_file_metadata(const char *repo_path, char **paths, in
         }
         struct stat st;
         if (stat(abs_path, &st) == 0) {
-            int64_t mtime_ns = git_snapshot_mtime_ns(&st);
+            int64_t mtime_ns = cbm_stat_mtime_ns(&st);
             int64_t size = (int64_t)st.st_size;
             *hash = git_dirty_hash_update(*hash, (const unsigned char *)&mtime_ns,
                                           sizeof(mtime_ns));

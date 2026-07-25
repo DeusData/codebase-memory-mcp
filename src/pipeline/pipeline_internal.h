@@ -703,7 +703,6 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
 /* Build a store-level per-file delta descriptor from graph-buffer facts.
  * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
  * back instead of publishing when unsupported edges are present. */
-int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st);
 const char *cbm_pipeline_file_delta_pass_fingerprint(void);
 int cbm_pipeline_format_file_delta_pass_fingerprint(char *out, size_t out_sz, int mode,
                                                     double similarity_threshold,

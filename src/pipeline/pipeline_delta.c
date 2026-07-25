@@ -1,6 +1,7 @@
 #include "pipeline/pipeline_internal.h"
 
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
 #include "foundation/str_util.h"
@@ -13,9 +14,6 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <yyjson/yyjson.h>
-
-#define XXH_INLINE_ALL
-#include "xxhash/xxhash.h"
 
 static const char cbm_delta_edge_imports[] = "IMPORTS";
 static const char cbm_delta_edge_usage[] = "USAGE";
@@ -59,7 +57,6 @@ static const char *const cbm_delta_scratch_registry_seed_labels[] = {
 
 enum {
     CBM_DELTA_GROWTH = 2,
-    CBM_DELTA_XXH64_HEX_LEN = (int)(sizeof(uint64_t) * PAIR_LEN),
     CBM_DELTA_ISO8601_UTC_LEN = 20,
 };
 
@@ -610,18 +607,6 @@ int cbm_pipeline_build_file_delta_from_gbuf(const cbm_gbuf_t *gbuf, const char *
     return ctx.rc;
 }
 
-int64_t cbm_pipeline_stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-           (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 static int delta_iso_now(char *buf, size_t sz) {
     if (!buf || sz <= CBM_DELTA_ISO8601_UTC_LEN) {
         return CBM_STORE_ERR;
@@ -635,50 +620,7 @@ static int delta_iso_now(char *buf, size_t sz) {
 }
 
 int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz) {
-    if (!path || !out || out_sz <= CBM_DELTA_XXH64_HEX_LEN) {
-        return CBM_STORE_ERR;
-    }
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        return CBM_STORE_ERR;
-    }
-
-    XXH3_state_t *state = XXH3_createState();
-    if (!state) {
-        fclose(fp);
-        return CBM_STORE_ERR;
-    }
-    if (XXH3_64bits_reset(state) == XXH_ERROR) {
-        XXH3_freeState(state);
-        fclose(fp);
-        return CBM_STORE_ERR;
-    }
-
-    unsigned char buf[CBM_SZ_64K];
-    int rc = CBM_STORE_OK;
-    for (;;) {
-        size_t n = fread(buf, CBM_ALLOC_ONE, sizeof(buf), fp);
-        if (n > 0 && XXH3_64bits_update(state, buf, n) == XXH_ERROR) {
-            rc = CBM_STORE_ERR;
-            break;
-        }
-        if (n < sizeof(buf)) {
-            if (ferror(fp)) {
-                rc = CBM_STORE_ERR;
-            }
-            break;
-        }
-    }
-    uint64_t hash = XXH3_64bits_digest(state);
-    XXH3_freeState(state);
-    if (fclose(fp) != 0) {
-        rc = CBM_STORE_ERR;
-    }
-    if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-    int n = snprintf(out, out_sz, "%0*" PRIx64, CBM_DELTA_XXH64_HEX_LEN, hash);
-    return n == CBM_DELTA_XXH64_HEX_LEN ? CBM_STORE_OK : CBM_STORE_ERR;
+    return cbm_file_content_hash(path, out, out_sz) == 0 ? CBM_STORE_OK : CBM_STORE_ERR;
 }
 
 static bool file_state_content_matches_current(cbm_store_t *store, const char *project,
@@ -757,7 +699,7 @@ int cbm_pipeline_persist_file_states(cbm_store_t *store, const char *project,
                                   .rel_path = files[i].rel_path,
                                   .content_hash = content_hash,
                                   .git_oid = NULL,
-                                  .mtime_ns = cbm_pipeline_stat_mtime_ns(&st),
+                                  .mtime_ns = cbm_stat_mtime_ns(&st),
                                   .size = st.st_size,
                                   .language = cbm_language_name(files[i].language),
                                   .pass_fingerprint = pass_fingerprint ? pass_fingerprint
@@ -797,7 +739,7 @@ int cbm_pipeline_attach_file_delta_metadata_with_fingerprint(cbm_pipeline_file_d
         return CBM_STORE_ERR;
     }
 
-    int64_t mtime_ns = cbm_pipeline_stat_mtime_ns(&st);
+    int64_t mtime_ns = cbm_stat_mtime_ns(&st);
     delta->file_hash = (cbm_file_hash_t){.project = delta->delta.project,
                                          .rel_path = delta->delta.rel_path,
                                          .sha256 = cbm_delta_file_hash_legacy_empty,

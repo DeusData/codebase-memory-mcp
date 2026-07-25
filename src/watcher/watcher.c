@@ -511,17 +511,6 @@ static uint64_t sig_fold(uint64_t h, const void *data, size_t len) {
     return h;
 }
 
-/* Platform-portable mtime_ns (mirrors pipeline_incremental.c). */
-static int64_t sig_stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 /* Fold a listed path's (size, mtime) into the signature so an in-place edit
  * of an already-dirty file still produces a new signature. A failed stat
  * (deleted file, quoting artifact) degrades to the entry text alone — the
@@ -531,7 +520,7 @@ static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char
     snprintf(abs, sizeof(abs), "%s/%s", root_path, rel);
     struct stat st;
     if (stat(abs, &st) == 0) {
-        int64_t mt = sig_stat_mtime_ns(&st);
+        int64_t mt = cbm_stat_mtime_ns(&st);
         int64_t sz = (int64_t)st.st_size;
         h = sig_fold(h, &mt, sizeof(mt));
         h = sig_fold(h, &sz, sizeof(sz));
@@ -596,14 +585,29 @@ static bool watcher_store_has_project(cbm_store_t *store, const char *project_na
 }
 
 static void watcher_record_dirty_path(cbm_watcher_t *w, const project_state_t *state,
-                                      const char *rel_path, const char *observed_hash) {
+                                      const char *rel_path) {
     if (!w || !w->store || !state || !rel_path || !rel_path[0]) {
         return;
+    }
+    char observed_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    int64_t observed_mtime_ns = 0;
+    int64_t observed_size = 0;
+    char abs_path[CBM_PATH_MAX];
+    int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", state->root_path, rel_path);
+    if (n >= 0 && (size_t)n < sizeof(abs_path)) {
+        (void)cbm_file_content_hash(abs_path, observed_hash, sizeof(observed_hash));
+        struct stat st;
+        if (stat(abs_path, &st) == 0) {
+            observed_mtime_ns = cbm_stat_mtime_ns(&st);
+            observed_size = (int64_t)st.st_size;
+        }
     }
     cbm_dirty_file_state_t dirty = {
         .project = state->project_name,
         .rel_path = rel_path,
         .observed_hash = observed_hash,
+        .observed_mtime_ns = observed_mtime_ns,
+        .observed_size = observed_size,
         .observed_generation = 0,
         .source = CBM_STORE_DIRTY_SOURCE_WATCHER,
         .status = CBM_STORE_DIRTY_STATUS_PENDING,
@@ -783,11 +787,8 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
      * dirty tree must not rewrite the same rows. Recorded before the index
      * callback runs, so the ledger survives a failed index. */
     if (ledger && *signature_out != state->last_dirty_sig) {
-        char observed[32];
-        snprintf(observed, sizeof(observed), "%016llx",
-                 (unsigned long long)*signature_out);
         for (size_t i = 0; i < ledger_count; i++) {
-            watcher_record_dirty_path(w, state, ledger_paths[i], observed);
+            watcher_record_dirty_path(w, state, ledger_paths[i]);
         }
     }
     watcher_ledger_free(ledger_paths, ledger_count);
