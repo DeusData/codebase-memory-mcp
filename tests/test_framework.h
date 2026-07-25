@@ -58,6 +58,10 @@ extern int tf_fail_count;
 extern int tf_skip_count;
 extern int tf_filter_count;
 
+/* Canonical repository root captured before any suite can change process CWD.
+ * Returns NULL when the runner image is not inside a source checkout. */
+const char *tf_repository_root(void);
+
 #define TF_ONLY_TEST_ENV "CBM_ONLY_TEST"
 
 /* ── Color helpers ─────────────────────────────────────────────── */
