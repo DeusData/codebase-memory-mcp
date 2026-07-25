@@ -722,12 +722,6 @@ enum {
 #define CBM_DEFAULT_TRACE_MAX_RESULTS 25
 #define CBM_CONFIG_TRACE_MAX_RESULTS "trace_max_results"
 
-/* Default max output bytes for query_graph responses.
- * Caps worst-case at ~8000 tokens. Set to 0 for unlimited.
- * Configurable via config key "query_max_output_bytes". */
-#define CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES 32768
-#define CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES "query_max_output_bytes"
-
 /* Idle store eviction: close cached project store after this many seconds
  * of inactivity to free SQLite memory during idle periods. */
 #define CBM_MCP_DEFAULT_STORE_IDLE_TIMEOUT_S 60

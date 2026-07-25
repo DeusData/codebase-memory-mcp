@@ -12880,6 +12880,24 @@ TEST(cli_config_registry_includes_query_max_rows) {
     ASSERT_NOT_NULL(strstr(found->guidance, "may lower but not bypass this cap"));
     PASS();
 }
+TEST(cli_config_registry_query_limits_use_shared_definitions) {
+    const cbm_config_entry_t *output = NULL;
+    const cbm_config_entry_t *rows = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES) == 0) {
+            output = &CBM_CONFIG_REGISTRY[i];
+        } else if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_ROWS) == 0) {
+            rows = &CBM_CONFIG_REGISTRY[i];
+        }
+    }
+
+    ASSERT_NOT_NULL(output);
+    ASSERT_STR_EQ(output->default_val, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR);
+    ASSERT_EQ(atoi(output->default_val), CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
+    ASSERT_NOT_NULL(rows);
+    ASSERT_NOT_NULL(strstr(rows->guidance, "Cypher engine's non-bypassable row ceiling"));
+    PASS();
+}
 TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {
     const cbm_config_entry_t *found = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
@@ -13535,6 +13553,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_effective_env_overrides_db);
     RUN_TEST(cli_config_registry_includes_dep_ranking_toggle);
     RUN_TEST(cli_config_registry_includes_query_max_rows);
+    RUN_TEST(cli_config_registry_query_limits_use_shared_definitions);
     RUN_TEST(cli_config_registry_auto_dep_limit_uses_shared_default);
     RUN_TEST(cli_config_registry_auto_index_deps_defaults_disabled);
     RUN_TEST(cli_config_registry_reindex_startup_guidance_is_precise);
