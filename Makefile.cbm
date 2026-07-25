@@ -1067,11 +1067,20 @@ ifeq ($(IS_GCC),no)
 # every such call an implicit declaration returning int, which then reports as
 # a "call to undeclared function" error plus downstream int-to-pointer errors,
 # and poisons the analyzer's type reasoning for the whole translation unit.
-test-analyze: $(ALL_TEST_SRCS) $(PROD_SRCS)
+ANALYZE_LOG = $(BUILD_DIR)/analyze-report.txt
+test-analyze: $(ALL_TEST_SRCS) $(PROD_SRCS) | $(BUILD_DIR)
 	@echo "Running Clang static analyzer..."
-	$(CC) --analyze $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(TEST_INCLUDE_FLAGS) \
-		$(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) 2>&1 | \
-		grep -E "warning:|error:|note:" || echo "No issues found."
+	@$(CC) --analyze $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) $(TEST_INCLUDE_FLAGS) \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) >"$(ANALYZE_LOG)" 2>&1; \
+		analyze_status=$$?; \
+		if grep -E "warning:|error:|note:" "$(ANALYZE_LOG)"; then \
+			:; \
+		elif [ $$analyze_status -eq 0 ]; then \
+			echo "No issues found."; \
+		else \
+			cat "$(ANALYZE_LOG)"; \
+		fi; \
+		exit $$analyze_status
 else
 test-analyze:
 	@echo "Static analysis skipped: requires Clang (not GCC). Install clang and re-run."
