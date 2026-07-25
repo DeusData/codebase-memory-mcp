@@ -1015,6 +1015,26 @@ test-tsan: $(BUILD_DIR)/test-runner-tsan
 # Note: if false positives appear from system libraries on Linux, create lsan.supp
 #   and set LSAN_OPTIONS=suppressions=lsan.supp
 LEAK_LOG = $(BUILD_DIR)/leak-report.txt
+
+# Stream a long-running gate through tee while preserving both failure sources.
+# Make recipes use /bin/sh by default, so Bash-only PIPESTATUS is not portable
+# (notably, Debian/Ubuntu /bin/sh is dash). The pipeline's left-hand subshell
+# records its status in a per-process sidecar; the parent shell then returns the
+# command failure first, or tee's failure when the command itself succeeded.
+define run_logged_command
+	@status_file="$(1).status.$$$$"; \
+	trap 'rm -f "$$status_file"' 0 1 2 3 15; \
+	{ $(2); printf '%s\n' "$$?" > "$$status_file"; } 2>&1 | tee "$(1)"; \
+	tee_status=$$?; \
+	if test ! -s "$$status_file"; then \
+		echo "ERROR: logged command ended without recording its status" >&2; \
+		exit 1; \
+	fi; \
+	command_status=$$(sed -n '1p' "$$status_file"); \
+	if test "$$command_status" -ne 0; then exit "$$command_status"; fi; \
+	exit "$$tee_status"
+endef
+
 # Apple's leaks debugger stops descendant test binaries, so crash, socket-
 # inheritance, and UI child-process probes cannot run under `leaks --atExit`
 # without deadlocking or failing their parent. Cover the allocation-owning
@@ -1037,11 +1057,11 @@ ifeq ($(UNAME_S),Darwin)
 test-leak: $(BUILD_DIR)/test-runner-nosan
 	@echo "Running heap leak detection via 'leaks --atExit' on nosan build (macOS). May take 2-5 minutes."
 	@echo "Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
-	leaks --atExit -- $(BUILD_DIR)/test-runner-nosan $(TEST_LEAK_SUITES) 2>&1 | tee $(LEAK_LOG); exit $${PIPESTATUS[0]}
+	$(call run_logged_command,$(LEAK_LOG),leaks --atExit -- $(BUILD_DIR)/test-runner-nosan $(TEST_LEAK_SUITES))
 else
 test-leak: $(BUILD_DIR)/test-runner
 	@echo "Running heap leak detection via ASan/LSan (Linux). Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
-	ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-runner 2>&1 | tee $(LEAK_LOG); exit $${PIPESTATUS[0]}
+	$(call run_logged_command,$(LEAK_LOG),ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-runner)
 endif
 
 # ── Memory-corruption debug (macOS) ───────────────────────────────
@@ -1058,7 +1078,7 @@ ifeq ($(UNAME_S),Darwin)
 test-memory: $(BUILD_DIR)/test-runner-nosan
 	@echo "Running under MallocScribble+MallocPreScribble (macOS nosan): uninit reads -> 0xAA, use-after-free -> 0x55."
 	@echo "Full report saved to $(MEM_LOG)."
-	MallocScribble=1 MallocPreScribble=1 $(BUILD_DIR)/test-runner-nosan 2>&1 | tee $(MEM_LOG); exit $${PIPESTATUS[0]}
+	$(call run_logged_command,$(MEM_LOG),MallocScribble=1 MallocPreScribble=1 $(BUILD_DIR)/test-runner-nosan)
 
 # Guard Malloc (libgmalloc): a guard page around EVERY allocation → crashes at
 # the exact overrun / use-after-free, with a stack trace. Stricter than scribble
@@ -1066,7 +1086,7 @@ test-memory: $(BUILD_DIR)/test-runner-nosan
 test-gmalloc: $(BUILD_DIR)/test-runner-nosan
 	@echo "Running allocation-owning suites under Guard Malloc (libgmalloc). Crashes at the exact overrun/UAF. Slow."
 	@echo "Full report saved to $(MEM_LOG)."
-	DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib $(BUILD_DIR)/test-runner-nosan $(TEST_GMALLOC_SUITES) 2>&1 | tee $(MEM_LOG); exit $${PIPESTATUS[0]}
+	$(call run_logged_command,$(MEM_LOG),DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib $(BUILD_DIR)/test-runner-nosan $(TEST_GMALLOC_SUITES))
 else
 test-memory test-gmalloc: $(BUILD_DIR)/test-runner
 	@echo "These targets are macOS-only (MallocScribble/libgmalloc). On Linux use 'make test-leak' (ASan/LSan), or build with -fsanitize=memory (MSan) for uninit detection."

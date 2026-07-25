@@ -82,7 +82,10 @@ bash "$ROOT/tests/test_windows_bundle_contract.sh"
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0g: security fuzz harness self-test ==="
+echo "=== Step 0g: portable Makefile logged-command status ==="
+bash "$ROOT/tests/test_makefile_logged_command.sh"
+
+echo "=== Step 0h: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
 # Verify compiler supports target arch
