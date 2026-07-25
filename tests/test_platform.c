@@ -391,6 +391,37 @@ TEST(platform_setenv_preserves_utf8_in_wide_environment) {
     PASS();
 }
 
+/* cbm_getenv_fits must share cbm_safe_getenv's UTF-16 environment reader.
+ * SetEnvironmentVariableW deliberately bypasses the CRT's narrow _environ
+ * snapshot so this test fails if the two public APIs drift apart again. */
+TEST(platform_getenv_fits_reads_windows_wide_environment) {
+    static const wchar_t name[] = L"CBM_TEST_GETENV_FITS_WIDE";
+    static const wchar_t wide[] = L"C:/cbm-config-\u0394-\u65e5\u672c";
+    static const char utf8[] = "C:/cbm-config-\xce\x94-\xe6\x97\xa5\xe6\x9c\xac";
+    ASSERT_TRUE(SetEnvironmentVariableW(name, wide) != 0);
+
+    char observed[128];
+    bool present = false;
+    bool fits =
+        cbm_getenv_fits("CBM_TEST_GETENV_FITS_WIDE", observed, sizeof(observed), &present);
+    bool full_value_present = present;
+
+    char too_small[8] = "stale";
+    present = false;
+    bool too_long =
+        !cbm_getenv_fits("CBM_TEST_GETENV_FITS_WIDE", too_small, sizeof(too_small), &present);
+    bool long_value_present = present;
+
+    ASSERT_TRUE(SetEnvironmentVariableW(name, NULL) != 0);
+    ASSERT_TRUE(fits);
+    ASSERT_TRUE(full_value_present);
+    ASSERT_STR_EQ(observed, utf8);
+    ASSERT_TRUE(too_long);
+    ASSERT_TRUE(long_value_present);
+    ASSERT_STR_EQ(too_small, "");
+    PASS();
+}
+
 /* Empty and absent variables have different fallback semantics. In
  * particular, an explicitly empty CBM_CACHE_DIR means "use the default"; it
  * must not be misreported as a failed wide-environment read. Unset is also
@@ -746,6 +777,7 @@ SUITE(platform) {
     RUN_TEST(platform_cache_dir_rejects_truncated_override);
 #ifdef _WIN32
     RUN_TEST(platform_setenv_preserves_utf8_in_wide_environment);
+    RUN_TEST(platform_getenv_fits_reads_windows_wide_environment);
     RUN_TEST(platform_windows_empty_environment_is_read_and_unset_idempotently);
 #endif
     RUN_TEST(platform_default_workers_env_override);
