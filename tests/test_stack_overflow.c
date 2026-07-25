@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 
 /* tree-sitter runtime allocator hooks (ts_runtime/src/alloc.h, TS_PUBLIC) and
  * mimalloc (vendored) — for the #424 allocator-binding regression test. */
