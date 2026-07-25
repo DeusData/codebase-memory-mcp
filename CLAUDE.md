@@ -46,11 +46,11 @@ For non-deterministic corruption (uninit reads, use-after-free, overruns) that A
 make -f Makefile.cbm test-memory    # MallocScribble=1 + MallocPreScribble=1
                                     # uninit reads -> 0xAA, use-after-free -> 0x55 (deterministic)
 make -f Makefile.cbm test-gmalloc   # Guard Malloc (libgmalloc): guard page per allocation
-                                    # crashes at the exact overrun/UAF with a stack trace
+                                    # allocation-owning suites; exact overrun/UAF stack
 # Report saved to build/c/mem-report.txt
 ```
 
-`test-memory` is the macOS MSan-equivalent for uninit reads (scribble makes them deterministic). `test-gmalloc` is the strictest — it crashes at the exact bad write, pinpointing the line. (No valgrind/MSan on macOS; on Linux use `-fsanitize=memory`.)
+`test-memory` is the macOS MSan-equivalent for uninit reads (scribble makes them deterministic). `test-gmalloc` is the strictest — it crashes at the exact bad write, pinpointing the line. Its default suite list stays on allocation-owning in-process surfaces because macOS propagates `DYLD_INSERT_LIBRARIES` into external helpers such as `git`; use `CBM_ONLY_SUITE`/`CBM_ONLY_TEST` for a narrower probe. (No valgrind/MSan on macOS; on Linux use `-fsanitize=memory`.)
 
 ## Project Structure (C server)
 

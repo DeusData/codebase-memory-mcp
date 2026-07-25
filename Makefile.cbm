@@ -1012,6 +1012,12 @@ TEST_LEAK_SUITES ?= arena hash_table dyn_array str_intern store_nodes store_edge
 	store_search store_bulk store_pragmas store_checkpoint dump_verify_io \
 	graph_buffer registry pipeline worker_pool parallel slab_alloc mem \
 	integration incremental
+# Guard Malloc is inherited across exec on macOS. Keep its default gate on
+# allocation-owning, in-process surfaces: otherwise external helpers such as
+# git are instrumented too, and watcher tests observe libgmalloc/tool behavior
+# instead of the server's memory safety. CBM_ONLY_SUITE/CBM_ONLY_TEST still
+# allow an explicit narrower probe.
+TEST_GMALLOC_SUITES ?= $(TEST_LEAK_SUITES) lz4 zstd artifact sqlite_writer
 ifeq ($(UNAME_S),Darwin)
 # macOS: 'leaks' cannot inspect ASan-instrumented processes (ASan replaces malloc).
 # Use test-runner-nosan (no ASan/UBSan) so leaks can walk the heap.
@@ -1045,9 +1051,9 @@ test-memory: $(BUILD_DIR)/test-runner-nosan
 # the exact overrun / use-after-free, with a stack trace. Stricter than scribble
 # (which only paints bytes); slower and noisier. The decisive memory tool.
 test-gmalloc: $(BUILD_DIR)/test-runner-nosan
-	@echo "Running under Guard Malloc (libgmalloc). Crashes at the exact overrun/UAF. Slow."
+	@echo "Running allocation-owning suites under Guard Malloc (libgmalloc). Crashes at the exact overrun/UAF. Slow."
 	@echo "Full report saved to $(MEM_LOG)."
-	DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib $(BUILD_DIR)/test-runner-nosan 2>&1 | tee $(MEM_LOG); exit $${PIPESTATUS[0]}
+	DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib $(BUILD_DIR)/test-runner-nosan $(TEST_GMALLOC_SUITES) 2>&1 | tee $(MEM_LOG); exit $${PIPESTATUS[0]}
 else
 test-memory test-gmalloc: $(BUILD_DIR)/test-runner
 	@echo "These targets are macOS-only (MallocScribble/libgmalloc). On Linux use 'make test-leak' (ASan/LSan), or build with -fsanitize=memory (MSan) for uninit detection."
