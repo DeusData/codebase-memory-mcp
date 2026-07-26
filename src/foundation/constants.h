@@ -101,6 +101,18 @@ enum { CBM_DEFAULT_SEARCH_LIMIT = 50 };
 #define CBM_DEFAULT_QUERY_MAX_ROWS_STR CBM_STRINGIFY(CBM_DEFAULT_QUERY_MAX_ROWS)
 #define CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR CBM_STRINGIFY(CBM_DEFAULT_QUERY_MAX_WORKING_ROWS)
 
+/* ── Architecture working budgets ───────────────────────────── */
+/* Leiden community detection has graph-sized runtime and memory cost. Keep a
+ * conservative default until cross-parent benchmarks justify changing it, but
+ * let operators select a much wider deliberate budget. Exhaustion must omit
+ * clusters with explicit metadata; it must never publish a node-prefix result
+ * as if it represented the complete graph. */
+#define CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET 8000
+#define CBM_MIN_ARCH_CLUSTER_NODE_BUDGET 2
+#define CBM_MAX_ARCH_CLUSTER_NODE_BUDGET 1000000
+#define CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET_STR CBM_STRINGIFY(CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET)
+#define CBM_MIN_ARCH_CLUSTER_NODE_BUDGET_STR CBM_STRINGIFY(CBM_MIN_ARCH_CLUSTER_NODE_BUDGET)
+
 /* Resolution scoring: prefer production symbols over test/mock definitions
  * before namespace-distance tie-breaks. Shared by call and import resolvers so
  * duplicate-name behavior stays consistent. */

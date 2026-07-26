@@ -1275,7 +1275,27 @@ typedef struct {
     int layer_count;
     int cluster_count;
     int file_tree_count;
+    /* Clusters are omitted rather than computed from an order-dependent node
+     * prefix when the configured working budget cannot cover every eligible
+     * node. These fields make that omission explicit to protocol serializers. */
+    int64_t cluster_nodes_total;
+    int cluster_node_budget;
+    bool clusters_omitted_for_budget;
 } cbm_architecture_info_t;
+
+typedef struct {
+    int hotspot_limit;
+    double leiden_resolution;
+    int cluster_node_budget;
+} cbm_architecture_options_t;
+
+/* Extended, source-compatible architecture entry point for configurable
+ * working budgets. The established functions below remain stable wrappers
+ * using default options. */
+int cbm_store_get_architecture_scoped_with_options(cbm_store_t *s, const char *project,
+                                                   const char *path, const char **aspects,
+                                                   int aspect_count, cbm_architecture_info_t *out,
+                                                   const cbm_architecture_options_t *options);
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,
                                int aspect_count, cbm_architecture_info_t *out,

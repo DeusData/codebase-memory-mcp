@@ -21,6 +21,7 @@
  *   TestIsTestFilePath
  */
 #include "test_framework.h"
+#include <foundation/constants.h>
 #include <store/store.h>
 #include <pagerank/pagerank.h>
 #include <string.h>
@@ -36,7 +37,10 @@ enum {
     TEST_ARCH_FALLBACK_WINNER_NODES = 20,
     TEST_ARCH_FALLBACK_NAME_BUF = 64,
     TEST_ARCH_FILE_TREE_DISTINCT_DIRS = 70,
-    TEST_ARCH_FILE_TREE_LONG_COMPONENT = 600
+    TEST_ARCH_FILE_TREE_LONG_COMPONENT = 600,
+    TEST_ARCH_CLUSTER_BUDGET_NODES = CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET + 1,
+    TEST_ARCH_CLUSTER_DISTRACTOR_CONTEXTS = 5,
+    TEST_ARCH_CLUSTER_WINNER_MEMBERS = 10
 };
 
 /* ── Helper: create architecture test store ──────────────────────── */
@@ -1017,6 +1021,109 @@ TEST(arch_clusters) {
         ASSERT_NOT_NULL(info.clusters[i].label);
         ASSERT_TRUE(info.clusters[i].label[0] != '\0');
     }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_clusters_reports_budget_exhaustion_without_prefix_results) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "cluster-budget", "/tmp/cluster-budget"), CBM_STORE_OK);
+
+    for (int i = 0; i < TEST_ARCH_CLUSTER_BUDGET_NODES; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "function%04d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "cluster-budget.pkg.%s", name) > 0);
+        cbm_node_t node = {.project = "cluster-budget",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "cluster.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "cluster-budget", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+    ASSERT_TRUE(info.clusters_omitted_for_budget);
+    ASSERT_EQ(info.cluster_nodes_total, TEST_ARCH_CLUSTER_BUDGET_NODES);
+    ASSERT_EQ(info.cluster_node_budget, CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET);
+    ASSERT_EQ(info.cluster_count, 0);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_clusters_selects_dominant_context_and_package_after_first_five) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "cluster-ranking", "/tmp/cluster-ranking"), CBM_STORE_OK);
+
+    int total_nodes = TEST_ARCH_CLUSTER_DISTRACTOR_CONTEXTS + TEST_ARCH_CLUSTER_WINNER_MEMBERS;
+    int64_t *ids = calloc((size_t)total_nodes, sizeof(*ids));
+    ASSERT_NOT_NULL(ids);
+    for (int i = 0; i < total_nodes; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        bool winner = i >= TEST_ARCH_CLUSTER_DISTRACTOR_CONTEXTS;
+        if (i == 0) {
+            ASSERT_TRUE(snprintf(name, sizeof(name), "get") > 0);
+        } else {
+            ASSERT_TRUE(snprintf(name, sizeof(name), "member%02d", i) > 0);
+        }
+        if (winner) {
+            ASSERT_TRUE(snprintf(qn, sizeof(qn), "cluster-ranking.winner.context.%s", name) > 0);
+        } else {
+            ASSERT_TRUE(
+                snprintf(qn, sizeof(qn), "cluster-ranking.distractor%d.context.%s", i, name) > 0);
+        }
+        cbm_node_t node = {.project = "cluster-ranking",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "cluster.c"};
+        ids[i] = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    for (int i = 1; i < total_nodes; i++) {
+        cbm_edge_t outward = {.project = "cluster-ranking",
+                              .source_id = ids[0],
+                              .target_id = ids[i],
+                              .type = "CALLS"};
+        cbm_edge_t inward = {.project = "cluster-ranking",
+                             .source_id = ids[i],
+                             .target_id = ids[0],
+                             .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &outward), 0);
+        ASSERT_GT(cbm_store_insert_edge(s, &inward), 0);
+    }
+    free(ids);
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "cluster-ranking", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_winner_package = false;
+    bool saw_winner_context = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        const cbm_cluster_info_t *cluster = &info.clusters[i];
+        for (int j = 0; j < cluster->package_count; j++) {
+            if (strcmp(cluster->packages[j], "winner") == 0) {
+                saw_winner_package = true;
+            }
+        }
+        if (cluster->label && strstr(cluster->label, "@winner.context")) {
+            saw_winner_context = true;
+        }
+    }
+    ASSERT_TRUE(saw_winner_package);
+    ASSERT_TRUE(saw_winner_context);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -2154,6 +2261,8 @@ SUITE(store_arch) {
     RUN_TEST(arch_file_tree_keeps_directories_beyond_former_working_set);
     RUN_TEST(arch_file_tree_keeps_paths_longer_than_split_scratch_buffer);
     RUN_TEST(arch_clusters);
+    RUN_TEST(arch_clusters_reports_budget_exhaustion_without_prefix_results);
+    RUN_TEST(arch_clusters_selects_dominant_context_and_package_after_first_five);
     RUN_TEST(arch_clusters_resolution_knob);
     RUN_TEST(analytics_work_across_languages);
 

@@ -11330,6 +11330,42 @@ TEST(cli_config_query_row_limits_enforce_advertised_ranges) {
     PASS();
 }
 
+TEST(cli_config_cluster_node_budget_uses_shared_broad_range) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-cluster-budget-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET,
+                             CBM_MIN_ARCH_CLUSTER_NODE_BUDGET_STR),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET,
+                             CBM_STRINGIFY(CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, "1"), 0);
+    char over_max[32];
+    ASSERT_GT(snprintf(over_max, sizeof(over_max), "%d", CBM_MAX_ARCH_CLUSTER_NODE_BUDGET + 1), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, over_max), 0);
+
+    const cbm_config_entry_t *entry = NULL;
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0) {
+            entry = &CBM_CONFIG_REGISTRY[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET_STR);
+    ASSERT_NOT_NULL(strstr(entry->range, CBM_STRINGIFY(CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)));
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_delete) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -13543,6 +13579,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_query_row_limits_enforce_advertised_ranges);
+    RUN_TEST(cli_config_cluster_node_budget_uses_shared_broad_range);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 
