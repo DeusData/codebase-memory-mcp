@@ -89,9 +89,6 @@ bool cbm_sem_is_enabled(void);
 
 /* ── Token extraction ────────────────────────────────────────────── */
 
-/* Maximum tokens per function from metadata (name + qn + path + sig + docstring + params). */
-enum { CBM_SEM_MAX_TOKENS = 512 };
-
 /* Split a name into tokens: camelCase, snake_case, dot.separated.
  * Writes up to max_out tokens into out. Returns token count.
  * Tokens are lowercased. Caller must free each token. */
