@@ -1499,13 +1499,14 @@ static const char skill_content[] =
     "use `query_graph` with Cypher to see actual edges.\n"
     /* Defaults are concatenated from constants.h rather than restated, so
      * changing either configured budget cannot leave this text stale. */
-    "2. `query_graph` is bounded three ways: query_max_rows defaults to "
-    CBM_DEFAULT_QUERY_MAX_ROWS_STR " final rows and marks a complete prefix as truncated; "
+    "2. `query_graph` is bounded three ways: query_max_rows defaults "
+    "to " CBM_DEFAULT_QUERY_MAX_ROWS_STR " final rows and marks a complete prefix as truncated; "
     "query_max_working_rows defaults to " CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
-    " intermediate rows and fails loudly when exhausted; query_max_output_bytes bounds the "
-    "serialized response. A Cypher LIMIT may lower but not bypass the output cap. Use LIMIT when "
-    "it helps exploration efficiency; omit it when full results are necessary, and set "
-    "max_output_bytes=0 only when uncapped output is appropriate.\n"
+    " intermediate rows and returns an MCP tool execution error instead of partial results when "
+    "exhausted; query_max_output_bytes bounds the serialized response. A Cypher LIMIT may lower "
+    "but not bypass the output cap. Use LIMIT when it helps exploration efficiency; omit it when "
+    "full results are necessary, and set max_output_bytes=0 only when uncapped output is "
+    "appropriate.\n"
     "3. `trace_path` works best with exact names — use `search_graph(name_pattern=...)` first.\n"
     "4. `direction=\"outbound\"` returns callees only; use `direction=\"both\"` for callers too.\n"
     /* Default concatenated from CBM_DEFAULT_SEARCH_LIMIT_STR (constants.h) so
@@ -14190,9 +14191,9 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
     {CBM_CONFIG_QUERY_MAX_WORKING_ROWS, CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR, NULL, "Search",
      "Maximum intermediate rows/candidates materialized by query_graph",
      "1-" CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS),
-     "A correctness-preserving resource budget, separate from output shaping. Exhaustion fails "
-     "loudly instead of returning partial matches. An explicit max_rows raises the effective "
-     "working budget when needed."},
+     "A correctness-preserving resource budget, separate from output shaping. Exhaustion returns "
+     "an MCP tool execution error instead of partial results. An explicit max_rows raises the "
+     "effective working budget when needed."},
     {CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR, NULL, "Search",
      "Max response bytes for query_graph (0=unlimited)",
      "0-104857600",

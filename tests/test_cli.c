@@ -10303,9 +10303,9 @@ TEST(cli_installed_skill_limits_match_server_contract) {
                   "query_max_rows defaults to " CBM_DEFAULT_QUERY_MAX_ROWS_STR
                   " final rows and marks a complete prefix as truncated") != NULL);
     ASSERT(strstr(installed[0].content,
-                  "query_max_working_rows defaults to "
-                  CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
-                  " intermediate rows and fails loudly when exhausted") != NULL);
+                  "query_max_working_rows defaults to " CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
+                  " intermediate rows and returns an MCP tool execution error instead of partial "
+                  "results when exhausted") != NULL);
     /* Locks the string twin to the value it describes, so the two cannot drift
      * apart silently. Without this, CBM_DEFAULT_SEARCH_LIMIT could move while
      * the published "50" stayed and every assertion below would still pass. */
@@ -12905,21 +12905,24 @@ TEST(cli_config_registry_includes_query_max_rows) {
 
     ASSERT_NOT_NULL(found);
     ASSERT_STR_EQ(found->default_val, CBM_DEFAULT_QUERY_MAX_ROWS_STR);
-    ASSERT_STR_EQ(found->range, "0-1000000");
+    ASSERT_STR_EQ(found->range, "0-" CBM_STRINGIFY(CBM_MAX_QUERY_ROWS));
     ASSERT_NOT_NULL(strstr(found->description, "result-row cap"));
     ASSERT_NOT_NULL(strstr(found->description, "query_graph"));
-    ASSERT_NOT_NULL(strstr(found->guidance, "without changing which rows match"));
+    ASSERT_NOT_NULL(strstr(found->guidance, "after exact selection"));
     ASSERT_NOT_NULL(strstr(found->guidance, "may lower but not bypass this cap"));
     PASS();
 }
 TEST(cli_config_registry_query_limits_use_shared_definitions) {
     const cbm_config_entry_t *output = NULL;
     const cbm_config_entry_t *rows = NULL;
+    const cbm_config_entry_t *working_rows = NULL;
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES) == 0) {
             output = &CBM_CONFIG_REGISTRY[i];
         } else if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_ROWS) == 0) {
             rows = &CBM_CONFIG_REGISTRY[i];
+        } else if (strcmp(CBM_CONFIG_REGISTRY[i].key, CBM_CONFIG_QUERY_MAX_WORKING_ROWS) == 0) {
+            working_rows = &CBM_CONFIG_REGISTRY[i];
         }
     }
 
@@ -12927,7 +12930,12 @@ TEST(cli_config_registry_query_limits_use_shared_definitions) {
     ASSERT_STR_EQ(output->default_val, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR);
     ASSERT_EQ(atoi(output->default_val), CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
     ASSERT_NOT_NULL(rows);
-    ASSERT_NOT_NULL(strstr(rows->guidance, "Cypher engine's non-bypassable row ceiling"));
+    ASSERT_STR_EQ(rows->default_val, CBM_DEFAULT_QUERY_MAX_ROWS_STR);
+    ASSERT_NOT_NULL(strstr(rows->guidance, "after exact selection"));
+    ASSERT_NOT_NULL(working_rows);
+    ASSERT_STR_EQ(working_rows->default_val, CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR);
+    ASSERT_NOT_NULL(strstr(working_rows->guidance, "MCP tool execution error"));
+    ASSERT_NOT_NULL(strstr(working_rows->guidance, "instead of partial results"));
     PASS();
 }
 TEST(cli_config_registry_auto_dep_limit_uses_shared_default) {

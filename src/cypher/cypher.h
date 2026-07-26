@@ -339,7 +339,8 @@ typedef struct {
 } cbm_cypher_limits_t;
 
 /* Execute with separate output-shaping and intermediate resource limits.
- * Values outside their documented 0..CBM_MAX_QUERY_* ranges fail loudly. */
+ * Values outside their documented 0..CBM_MAX_QUERY_* ranges return an error
+ * without partial results. */
 int cbm_cypher_execute_with_limits(cbm_store_t *store, const char *query, const char *project,
                                    const cbm_cypher_limits_t *limits, cbm_cypher_result_t *out);
 
