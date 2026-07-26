@@ -1,3 +1,8 @@
 # Vendored tree-sitter grammars — machine-generated, hide from stats and diffs
 internal/cbm/vendored/grammars/**/parser.c  linguist-generated=true diff=false
 internal/cbm/vendored/grammars/**/scanner.c linguist-generated=true diff=false
+
+# Shell entrypoints must stay executable from Windows checkouts mounted in WSL.
+*.sh                           text eol=lf
+scripts/git-hooks/commit-msg   text eol=lf
+scripts/hooks/pre-commit       text eol=lf
