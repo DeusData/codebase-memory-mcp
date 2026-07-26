@@ -205,77 +205,169 @@ static void free_index_value(const char *key, void *val, void *ud) {
 
 /* ── Standalone coupling computation (testable) ──────────────────── */
 
+typedef struct {
+    const char *file_a; /* borrowed from commits through collection */
+    const char *file_b;
+    int co_change_count;
+    long long last_co_change;
+} coupling_pair_t;
+
 /* Context for collect_coupling_result callback. */
 typedef struct {
     CBMHashTable *file_counts;
-    CBMHashTable *pair_timestamps; /* pair_key → long long*: max commit ts */
     cbm_change_coupling_t *out;
-    int out_count;
     int max_out;
     double min_coupling_score;
+    cbm_change_coupling_result_t result;
 } collect_coupling_ctx_t;
 
+/* Positive means a is preferred over b. Coupling strength leads, then
+ * observation support and recency; lexical order makes exact ties canonical. */
+static int coupling_quality_compare(const cbm_change_coupling_t *a,
+                                    const cbm_change_coupling_t *b) {
+    if (a->coupling_score != b->coupling_score) {
+        return a->coupling_score > b->coupling_score ? 1 : -1;
+    }
+    if (a->co_change_count != b->co_change_count) {
+        return a->co_change_count > b->co_change_count ? 1 : -1;
+    }
+    if (a->last_co_change != b->last_co_change) {
+        return a->last_co_change > b->last_co_change ? 1 : -1;
+    }
+    int cmp = strcmp(a->file_a, b->file_a);
+    if (cmp != 0) {
+        return cmp < 0 ? 1 : -1;
+    }
+    cmp = strcmp(a->file_b, b->file_b);
+    return cmp == 0 ? 0 : (cmp < 0 ? 1 : -1);
+}
+
+static void coupling_swap(cbm_change_coupling_t *a, cbm_change_coupling_t *b) {
+    cbm_change_coupling_t tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+/* Maintain a worst-first heap so a bounded output buffer always retains the
+ * strongest candidates seen across the complete hash-table traversal. */
+static void coupling_heap_push(collect_coupling_ctx_t *ctx,
+                               const cbm_change_coupling_t *candidate) {
+    if (ctx->max_out <= 0 || !ctx->out) {
+        return;
+    }
+
+    if (ctx->result.written < ctx->max_out) {
+        int child = ctx->result.written++;
+        ctx->out[child] = *candidate;
+        while (child > 0) {
+            int parent = (child - 1) / 2;
+            if (coupling_quality_compare(&ctx->out[child], &ctx->out[parent]) >= 0) {
+                break;
+            }
+            coupling_swap(&ctx->out[child], &ctx->out[parent]);
+            child = parent;
+        }
+        return;
+    }
+
+    if (coupling_quality_compare(candidate, &ctx->out[0]) <= 0) {
+        return;
+    }
+    ctx->out[0] = *candidate;
+    int parent = 0;
+    for (;;) {
+        int left = parent * 2 + 1;
+        if (left >= ctx->result.written) {
+            break;
+        }
+        int right = left + 1;
+        int worse = left;
+        if (right < ctx->result.written &&
+            coupling_quality_compare(&ctx->out[right], &ctx->out[left]) < 0) {
+            worse = right;
+        }
+        if (coupling_quality_compare(&ctx->out[parent], &ctx->out[worse]) <= 0) {
+            break;
+        }
+        coupling_swap(&ctx->out[parent], &ctx->out[worse]);
+        parent = worse;
+    }
+}
+
+static int coupling_best_first_qsort(const void *lhs, const void *rhs) {
+    int cmp = coupling_quality_compare(lhs, rhs);
+    return cmp > 0 ? -1 : (cmp < 0 ? 1 : 0);
+}
+
 static void collect_coupling_cb(const char *pair_key, void *val, void *ud) {
+    (void)pair_key;
     collect_coupling_ctx_t *cctx = ud;
-    int co_count = *(int *)val;
-    if (co_count < GH_MIN_COMMITS) {
-        return;
-    }
-    if (cctx->out_count >= cctx->max_out) {
+    coupling_pair_t *pair = val;
+    if (pair->co_change_count < GH_MIN_COMMITS) {
         return;
     }
 
-    const char *sep = strchr(pair_key, '\x01');
-    if (!sep) {
-        return;
-    }
-    size_t la = sep - pair_key;
-    const char *file_b = sep + SKIP_ONE;
-
-    char file_a_buf[CBM_SZ_512];
-    if (la >= sizeof(file_a_buf)) {
-        return;
-    }
-    memcpy(file_a_buf, pair_key, la);
-    file_a_buf[la] = '\0';
-
-    int *count_a = cbm_ht_get(cctx->file_counts, file_a_buf);
-    int *count_b = cbm_ht_get(cctx->file_counts, file_b);
+    int *count_a = cbm_ht_get(cctx->file_counts, pair->file_a);
+    int *count_b = cbm_ht_get(cctx->file_counts, pair->file_b);
     if (!count_a || !count_b) {
         return;
     }
-
     int min_total = *count_a < *count_b ? *count_a : *count_b;
     if (min_total == 0) {
         return;
     }
 
-    double score = (double)co_count / (double)min_total;
+    double score = (double)pair->co_change_count / (double)min_total;
     double min_score =
         cctx->min_coupling_score > 0.0 ? cctx->min_coupling_score : MIN_COUPLING_SCORE;
     if (score < min_score) {
         return;
     }
+    cctx->result.eligible++;
 
-    cbm_change_coupling_t *cc = &cctx->out[cctx->out_count++];
-    snprintf(cc->file_a, sizeof(cc->file_a), "%s", file_a_buf);
-    snprintf(cc->file_b, sizeof(cc->file_b), "%s", file_b);
-    cc->co_change_count = co_count;
-    cc->coupling_score = score;
-    long long *ts = cbm_ht_get(cctx->pair_timestamps, pair_key);
-    cc->last_co_change = ts ? *ts : 0;
+    if (strlen(pair->file_a) >= sizeof(((cbm_change_coupling_t *)0)->file_a) ||
+        strlen(pair->file_b) >= sizeof(((cbm_change_coupling_t *)0)->file_b)) {
+        cctx->result.path_too_long++;
+        return;
+    }
+
+    cbm_change_coupling_t candidate = {
+        .co_change_count = pair->co_change_count,
+        .coupling_score = score,
+        .last_co_change = pair->last_co_change,
+    };
+    snprintf(candidate.file_a, sizeof(candidate.file_a), "%s", pair->file_a);
+    snprintf(candidate.file_b, sizeof(candidate.file_b), "%s", pair->file_b);
+    coupling_heap_push(cctx, &candidate);
 }
 
-int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits,
-                                               int commit_count,
-                                               cbm_change_coupling_t *out, int max_out,
-                                               double min_coupling_score) {
+cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit_files_t *commits,
+                                                                int commit_count,
+                                                                cbm_change_coupling_t *out,
+                                                                int max_out,
+                                                                double min_coupling_score) {
+    /* Aggregation remains expected O(file observations + pair observations).
+     * The bounded strongest-first selection adds O(E log K) time for E
+     * eligible pairs and output budget K, with O(K) caller-owned output.
+     * Keeping timestamp and path references in the pair value avoids the
+     * former second hash table and its duplicate key allocation. */
+    cbm_change_coupling_result_t result = {0};
+    if (commit_count <= 0 || !commits) {
+        return result;
+    }
+    if (max_out > 0 && !out) {
+        result.allocation_failed = 1;
+        return result;
+    }
+
     CBMHashTable *file_counts = cbm_ht_create(CBM_SZ_1K);
     CBMHashTable *pair_counts = cbm_ht_create(CBM_SZ_2K);
-    /* Parallel table mapping pair_key → max commit timestamp seen for that
-     * pair, so the resulting edge can carry last_co_change. The pair_counts
-     * table consumes its key on insert; pair_timestamps gets its own copy. */
-    CBMHashTable *pair_timestamps = cbm_ht_create(CBM_SZ_2K);
+    if (!file_counts || !pair_counts) {
+        cbm_ht_free(file_counts);
+        cbm_ht_free(pair_counts);
+        result.allocation_failed = 1;
+        return result;
+    }
 
     for (int c = 0; c < commit_count; c++) {
         if (commits[c].count > GH_MAX_FILES) {
@@ -288,8 +380,19 @@ int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits
                 (*val)++;
             } else {
                 int *nv = malloc(sizeof(int));
+                char *key = cbm_strdup(commits[c].files[i]);
+                if (!nv || !key) {
+                    free(nv);
+                    free(key);
+                    goto allocation_failed;
+                }
                 *nv = SKIP_ONE;
-                cbm_ht_set(file_counts, strdup(commits[c].files[i]), nv);
+                cbm_ht_set(file_counts, key, nv);
+                if (cbm_ht_get(file_counts, key) != nv) {
+                    free(nv);
+                    free(key);
+                    goto allocation_failed;
+                }
             }
         }
 
@@ -304,31 +407,43 @@ int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits
                 }
                 size_t la = strlen(a);
                 size_t lb = strlen(b);
+                if (lb > SIZE_MAX - 2 || la > SIZE_MAX - lb - 2) {
+                    goto allocation_failed;
+                }
                 size_t pk_len = la + SKIP_ONE + lb + SKIP_ONE;
                 char *pk = malloc(pk_len);
+                if (!pk) {
+                    goto allocation_failed;
+                }
                 memcpy(pk, a, la);
                 pk[la] = '\x01';
                 memcpy(pk + la + SKIP_ONE, b, lb + SKIP_ONE);
 
-                int *val = cbm_ht_get(pair_counts, pk);
-                if (val) {
-                    (*val)++;
-                    long long *ts = cbm_ht_get(pair_timestamps, pk);
-                    if (ts && commits[c].timestamp > *ts) {
-                        *ts = commits[c].timestamp;
+                coupling_pair_t *pair = cbm_ht_get(pair_counts, pk);
+                if (pair) {
+                    pair->co_change_count++;
+                    if (commits[c].timestamp > pair->last_co_change) {
+                        pair->last_co_change = commits[c].timestamp;
                     }
                     free(pk);
                 } else {
-                    int *nv = malloc(sizeof(int));
-                    *nv = SKIP_ONE;
-                    /* pair_counts takes ownership of pk; pair_timestamps
-                     * needs its own copy. */
-                    char *pk2 = malloc(pk_len);
-                    memcpy(pk2, pk, pk_len);
-                    cbm_ht_set(pair_counts, pk, nv);
-                    long long *nts = malloc(sizeof(long long));
-                    *nts = commits[c].timestamp;
-                    cbm_ht_set(pair_timestamps, pk2, nts);
+                    pair = malloc(sizeof(*pair));
+                    if (!pair) {
+                        free(pk);
+                        goto allocation_failed;
+                    }
+                    *pair = (coupling_pair_t){
+                        .file_a = a,
+                        .file_b = b,
+                        .co_change_count = 1,
+                        .last_co_change = commits[c].timestamp,
+                    };
+                    cbm_ht_set(pair_counts, pk, pair);
+                    if (cbm_ht_get(pair_counts, pk) != pair) {
+                        free(pair);
+                        free(pk);
+                        goto allocation_failed;
+                    }
                 }
             }
         }
@@ -336,22 +451,35 @@ int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits
 
     collect_coupling_ctx_t cctx = {
         .file_counts = file_counts,
-        .pair_timestamps = pair_timestamps,
         .out = out,
-        .out_count = 0,
-        .max_out = max_out,
+        .max_out = max_out > 0 ? max_out : 0,
         .min_coupling_score = min_coupling_score,
     };
     cbm_ht_foreach(pair_counts, collect_coupling_cb, &cctx);
+    result = cctx.result;
+    result.omitted = result.eligible - result.written;
+    if (result.written > 1) {
+        qsort(out, (size_t)result.written, sizeof(*out), coupling_best_first_qsort);
+    }
+    goto cleanup;
 
+allocation_failed:
+    result = (cbm_change_coupling_result_t){.allocation_failed = 1};
+cleanup:
     cbm_ht_foreach(pair_counts, free_counter, NULL);
     cbm_ht_free(pair_counts);
-    cbm_ht_foreach(pair_timestamps, free_counter, NULL);
-    cbm_ht_free(pair_timestamps);
     cbm_ht_foreach(file_counts, free_counter, NULL);
     cbm_ht_free(file_counts);
 
-    return cctx.out_count;
+    return result;
+}
+
+int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits, int commit_count,
+                                               cbm_change_coupling_t *out, int max_out,
+                                               double min_coupling_score) {
+    return cbm_compute_change_coupling_result(commits, commit_count, out, max_out,
+                                              min_coupling_score)
+        .written;
 }
 
 int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_count,
@@ -506,8 +634,23 @@ int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
     }
 
     cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
-    int coupling_count = cbm_compute_change_coupling_with_threshold(
-        cf, commit_count, couplings, MAX_COUPLINGS, min_coupling_score);
+    cbm_change_coupling_result_t coupling_result = {0};
+    if (couplings) {
+        coupling_result = cbm_compute_change_coupling_result(cf, commit_count, couplings,
+                                                             MAX_COUPLINGS, min_coupling_score);
+    } else {
+        coupling_result.allocation_failed = 1;
+    }
+    if (coupling_result.allocation_failed) {
+        cbm_log_error("pass.githistory.alloc_failed", "phase", "couplings");
+    } else if (coupling_result.omitted > 0) {
+        cbm_log_warn("pass.githistory.couplings_partial", "written",
+                     itoa_log(coupling_result.written), "eligible",
+                     itoa_log(coupling_result.eligible), "omitted",
+                     itoa_log(coupling_result.omitted), "path_too_long",
+                     itoa_log(coupling_result.path_too_long));
+    }
+    int coupling_count = coupling_result.written;
 
     /* Exact per-file temporal aggregation remains expected O(observations)
      * while storing O(unique paths + path bytes). Unlike the former fixed
