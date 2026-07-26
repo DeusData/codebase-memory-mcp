@@ -14332,22 +14332,22 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
 #define MAX_PREVIEW_NAMES 15
 
 typedef struct {
-    int node_count;
+    int count;
     char name[];
-} arch_package_accumulator_t;
+} arch_name_count_t;
 
-static void arch_package_accumulators_free(arch_package_accumulator_t **items, int count) {
+static void arch_name_counts_free(arch_name_count_t **items, int count) {
     for (int i = 0; i < count; i++) {
         free(items[i]);
     }
     free(items);
 }
 
-static int arch_package_accumulator_cmp(const void *lhs, const void *rhs) {
-    const arch_package_accumulator_t *a = *(const arch_package_accumulator_t *const *)lhs;
-    const arch_package_accumulator_t *b = *(const arch_package_accumulator_t *const *)rhs;
-    if (a->node_count != b->node_count) {
-        return (a->node_count < b->node_count) ? SKIP_ONE : CBM_NOT_FOUND;
+static int arch_name_count_cmp(const void *lhs, const void *rhs) {
+    const arch_name_count_t *a = *(const arch_name_count_t *const *)lhs;
+    const arch_name_count_t *b = *(const arch_name_count_t *const *)rhs;
+    if (a->count != b->count) {
+        return (a->count < b->count) ? SKIP_ONE : CBM_NOT_FOUND;
     }
     return strcmp(a->name, b->name);
 }
@@ -14386,10 +14386,10 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
 
     int cap = ST_INIT_CAP_16;
     int np = 0;
-    arch_package_accumulator_t **packages = calloc((size_t)cap, sizeof(*packages));
+    arch_name_count_t **packages = calloc((size_t)cap, sizeof(*packages));
     CBMHashTable *package_indexes = cbm_ht_create((uint32_t)cap);
     if (!packages || !package_indexes) {
-        arch_package_accumulators_free(packages, np);
+        arch_name_counts_free(packages, np);
         cbm_ht_free(package_indexes);
         sqlite3_finalize(stmt);
         store_set_error(s, "arch_packages_qn out of memory");
@@ -14404,22 +14404,22 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
             continue;
         }
 
-        arch_package_accumulator_t *package = cbm_ht_get(package_indexes, pkg);
+        arch_name_count_t *package = cbm_ht_get(package_indexes, pkg);
         if (package) {
-            if (package->node_count == INT_MAX) {
-                arch_package_accumulators_free(packages, np);
+            if (package->count == INT_MAX) {
+                arch_name_counts_free(packages, np);
                 cbm_ht_free(package_indexes);
                 sqlite3_finalize(stmt);
                 store_set_error(s, "arch_packages_qn package count overflow");
                 return CBM_STORE_ERR;
             }
-            package->node_count++;
+            package->count++;
             continue;
         }
 
         if (np >= cap && store_grow_array(s, (void **)&packages, &cap, sizeof(*packages),
                                           "arch_packages_qn out of memory", true) != CBM_STORE_OK) {
-            arch_package_accumulators_free(packages, np);
+            arch_name_counts_free(packages, np);
             cbm_ht_free(package_indexes);
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
@@ -14427,18 +14427,18 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         size_t pkg_len = strlen(pkg);
         package = malloc(sizeof(*package) + pkg_len + SKIP_ONE);
         if (!package) {
-            arch_package_accumulators_free(packages, np);
+            arch_name_counts_free(packages, np);
             cbm_ht_free(package_indexes);
             sqlite3_finalize(stmt);
             store_set_error(s, "arch_packages_qn out of memory");
             return CBM_STORE_ERR;
         }
-        package->node_count = SKIP_ONE;
+        package->count = SKIP_ONE;
         memcpy(package->name, pkg, pkg_len + SKIP_ONE);
         cbm_ht_set(package_indexes, package->name, package);
         if (cbm_ht_get(package_indexes, package->name) != package) {
             free(package);
-            arch_package_accumulators_free(packages, np);
+            arch_name_counts_free(packages, np);
             cbm_ht_free(package_indexes);
             sqlite3_finalize(stmt);
             store_set_error(s, "arch_packages_qn out of memory");
@@ -14448,7 +14448,7 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         np++;
     }
     if (step_rc != SQLITE_DONE) {
-        arch_package_accumulators_free(packages, np);
+        arch_name_counts_free(packages, np);
         cbm_ht_free(package_indexes);
         store_set_error_sqlite(s, "arch_packages_qn");
         sqlite3_finalize(stmt);
@@ -14457,12 +14457,12 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
     sqlite3_finalize(stmt);
     cbm_ht_free(package_indexes);
 
-    qsort(packages, (size_t)np, sizeof(*packages), arch_package_accumulator_cmp);
+    qsort(packages, (size_t)np, sizeof(*packages), arch_name_count_cmp);
     int result_count = np < MAX_PREVIEW_NAMES ? np : MAX_PREVIEW_NAMES;
     cbm_package_summary_t *result =
         result_count > 0 ? calloc((size_t)result_count, sizeof(*result)) : NULL;
     if (result_count > 0 && !result) {
-        arch_package_accumulators_free(packages, np);
+        arch_name_counts_free(packages, np);
         store_set_error(s, "arch_packages_qn out of memory");
         return CBM_STORE_ERR;
     }
@@ -14470,13 +14470,13 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         result[i].name = heap_strdup(packages[i]->name);
         if (!result[i].name) {
             arch_free_packages(result, i);
-            arch_package_accumulators_free(packages, np);
+            arch_name_counts_free(packages, np);
             store_set_error(s, "arch_packages_qn out of memory");
             return CBM_STORE_ERR;
         }
-        result[i].node_count = packages[i]->node_count;
+        result[i].node_count = packages[i]->count;
     }
-    arch_package_accumulators_free(packages, np);
+    arch_name_counts_free(packages, np);
 
     *out_arr = result;
     *out_count = result_count;
@@ -15971,7 +15971,6 @@ enum {
     CBM_CLUSTER_MAX_TOPNODES = 5, /* representative node names per cluster */
     CBM_CLUSTER_MAX_PKGS = 5,     /* packages listed per cluster */
     CBM_CLUSTER_MIN_MEMBERS = 2,  /* skip singletons */
-    CBM_CLUSTER_NODE_CAP = 8000,  /* bound the work for very large graphs */
     CBM_CLUSTER_LABEL_CONTEXT_SEGMENTS = 2
 };
 
@@ -16053,26 +16052,64 @@ static int cluster_grow_edges(cbm_louvain_edge_t **edges, int **esrc, int **edst
     return CBM_STORE_OK;
 }
 
-/* Append `pkg` to a distinct package list (with a per-package count). */
-static int cluster_add_pkg(const char **pkgs, int *counts, int *count, int cap, const char *pkg) {
-    if (!pkg || !pkg[0]) {
+typedef struct {
+    CBMHashTable *index;
+    arch_name_count_t **items;
+    int count;
+    int cap;
+} arch_name_count_set_t;
+
+static void arch_name_count_set_free(arch_name_count_set_t *set) {
+    if (!set) {
+        return;
+    }
+    cbm_ht_free(set->index);
+    arch_name_counts_free(set->items, set->count);
+    memset(set, 0, sizeof(*set));
+}
+
+static int arch_name_count_set_init(arch_name_count_set_t *set) {
+    memset(set, 0, sizeof(*set));
+    set->cap = ST_INIT_CAP_8;
+    set->index = cbm_ht_create((uint32_t)set->cap);
+    set->items = calloc((size_t)set->cap, sizeof(*set->items));
+    if (!set->index || !set->items) {
+        arch_name_count_set_free(set);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static int arch_name_count_set_add(cbm_store_t *s, arch_name_count_set_t *set, const char *name) {
+    if (!name || !name[0]) {
         return CBM_STORE_OK;
     }
-    for (int i = 0; i < *count; i++) {
-        if (strcmp(pkgs[i], pkg) == 0) {
-            counts[i]++;
-            return CBM_STORE_OK;
-        }
-    }
-    if (*count < cap) {
-        char *copy = heap_strdup(pkg);
-        if (!copy) {
+    arch_name_count_t *item = cbm_ht_get(set->index, name);
+    if (item) {
+        if (item->count == INT_MAX) {
             return CBM_STORE_ERR;
         }
-        pkgs[*count] = copy;
-        counts[*count] = 1;
-        (*count)++;
+        item->count++;
+        return CBM_STORE_OK;
     }
+    if (set->count >= set->cap &&
+        store_grow_array(s, (void **)&set->items, &set->cap, sizeof(*set->items),
+                         "arch_clusters out of memory", true) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    size_t name_len = strlen(name);
+    item = malloc(sizeof(*item) + name_len + SKIP_ONE);
+    if (!item) {
+        return CBM_STORE_ERR;
+    }
+    item->count = SKIP_ONE;
+    memcpy(item->name, name, name_len + SKIP_ONE);
+    cbm_ht_set(set->index, item->name, item);
+    if (cbm_ht_get(set->index, item->name) != item) {
+        free(item);
+        return CBM_STORE_ERR;
+    }
+    set->items[set->count++] = item;
     return CBM_STORE_OK;
 }
 
@@ -16122,34 +16159,27 @@ static const char *cluster_label_context_from_qn(const char *qn) {
     return buf;
 }
 
-static const char *cluster_best_context(const char **qns, const int *comm, int n, int c) {
-    const char *contexts[CBM_CLUSTER_MAX_PKGS];
-    int counts[CBM_CLUSTER_MAX_PKGS];
-    int count = 0;
+static const char *cluster_best_context(cbm_store_t *s, const char **qns, const int *comm, int n,
+                                        int c) {
+    arch_name_count_set_t contexts;
+    if (arch_name_count_set_init(&contexts) != CBM_STORE_OK) {
+        return "";
+    }
     for (int i = 0; i < n; i++) {
         if (comm[i] != c) {
             continue;
         }
-        if (cluster_add_pkg(contexts, counts, &count, CBM_CLUSTER_MAX_PKGS,
-                            cluster_label_context_from_qn(qns[i])) != CBM_STORE_OK) {
-            for (int j = 0; j < count; j++) {
-                safe_str_free(&contexts[j]);
-            }
+        if (arch_name_count_set_add(s, &contexts, cluster_label_context_from_qn(qns[i])) !=
+            CBM_STORE_OK) {
+            arch_name_count_set_free(&contexts);
             return "";
         }
     }
-    const char *best = "";
-    int best_count = 0;
-    for (int i = 0; i < count; i++) {
-        if (counts[i] > best_count) {
-            best = contexts[i];
-            best_count = counts[i];
-        }
+    if (contexts.count > SKIP_ONE) {
+        qsort(contexts.items, (size_t)contexts.count, sizeof(*contexts.items), arch_name_count_cmp);
     }
-    char *ret = best[0] ? heap_strdup(best) : NULL;
-    for (int i = 0; i < count; i++) {
-        safe_str_free(&contexts[i]);
-    }
+    char *ret = contexts.count > 0 ? heap_strdup(contexts.items[0]->name) : NULL;
+    arch_name_count_set_free(&contexts);
     return ret ? ret : "";
 }
 
@@ -16246,8 +16276,9 @@ static char *cluster_make_disambiguated_label(const cbm_cluster_info_t *ci, cons
     return label;
 }
 
-static void cluster_disambiguate_label_pass(cbm_cluster_info_t *clusters, int count, int n,
-                                            const int *comm, const char **qns, bool include_id) {
+static void cluster_disambiguate_label_pass(cbm_store_t *s, cbm_cluster_info_t *clusters, int count,
+                                            int n, const int *comm, const char **qns,
+                                            bool include_id) {
     bool duplicate[CBM_CLUSTER_TOP_N] = {false};
     for (int i = 0; i < count; i++) {
         for (int j = 0; j < count; j++) {
@@ -16264,7 +16295,7 @@ static void cluster_disambiguate_label_pass(cbm_cluster_info_t *clusters, int co
             continue;
         }
 
-        const char *context = cluster_best_context(qns, comm, n, clusters[i].id);
+        const char *context = cluster_best_context(s, qns, comm, n, clusters[i].id);
         char *label =
             cluster_make_disambiguated_label(&clusters[i], context, clusters[i].id, include_id);
         if (context && context[0]) {
@@ -16277,14 +16308,15 @@ static void cluster_disambiguate_label_pass(cbm_cluster_info_t *clusters, int co
     }
 }
 
-static void cluster_disambiguate_duplicate_labels(cbm_cluster_info_t *clusters, int count,
-                                                  int n, const int *comm, const char **qns) {
-    cluster_disambiguate_label_pass(clusters, count, n, comm, qns, false);
-    cluster_disambiguate_label_pass(clusters, count, n, comm, qns, true);
+static void cluster_disambiguate_duplicate_labels(cbm_store_t *s, cbm_cluster_info_t *clusters,
+                                                  int count, int n, const int *comm,
+                                                  const char **qns) {
+    cluster_disambiguate_label_pass(s, clusters, count, n, comm, qns, false);
+    cluster_disambiguate_label_pass(s, clusters, count, n, comm, qns, true);
 }
 
 /* Build the cluster_info for one community c into *ci. */
-static int cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *comm,
+static int cluster_build_one(cbm_store_t *s, cbm_cluster_info_t *ci, int c, int n, const int *comm,
                              const int *degree, const char **names, const char **qns, int members,
                              double cohesion) {
     memset(ci, 0, sizeof(*ci));
@@ -16334,53 +16366,49 @@ static int cluster_build_one(cbm_cluster_info_t *ci, int c, int n, const int *co
         ci->top_node_count = tn;
     }
 
-    /* Distinct packages (+ dominant one as the label). */
-    const char *pkgs[CBM_CLUSTER_MAX_PKGS];
-    int pkg_counts[CBM_CLUSTER_MAX_PKGS];
-    int pc = 0;
+    /* Count every package before applying the five-name response shape. */
+    arch_name_count_set_t packages;
+    if (arch_name_count_set_init(&packages) != CBM_STORE_OK) {
+        arch_clear_cluster(ci);
+        return CBM_STORE_ERR;
+    }
     for (int i = 0; i < n; i++) {
-        if (comm[i] == c) {
-            if (cluster_add_pkg(pkgs, pkg_counts, &pc, CBM_CLUSTER_MAX_PKGS,
-                                cbm_qn_to_top_package(qns[i])) != CBM_STORE_OK) {
-                for (int j = 0; j < pc; j++) {
-                    safe_str_free(&pkgs[j]);
-                }
-                arch_clear_cluster(ci);
-                return CBM_STORE_ERR;
-            }
+        if (comm[i] == c &&
+            arch_name_count_set_add(s, &packages, cbm_qn_to_top_package(qns[i])) != CBM_STORE_OK) {
+            arch_name_count_set_free(&packages);
+            arch_clear_cluster(ci);
+            return CBM_STORE_ERR;
         }
     }
+    if (packages.count > SKIP_ONE) {
+        qsort(packages.items, (size_t)packages.count, sizeof(*packages.items), arch_name_count_cmp);
+    }
+    int pc = packages.count < CBM_CLUSTER_MAX_PKGS ? packages.count : CBM_CLUSTER_MAX_PKGS;
     if (pc > 0) {
         ci->packages = malloc((size_t)pc * sizeof(char *));
         if (!ci->packages) {
-            for (int i = 0; i < pc; i++) {
-                safe_str_free(&pkgs[i]);
-            }
+            arch_name_count_set_free(&packages);
             arch_clear_cluster(ci);
             return CBM_STORE_ERR;
         }
         for (int i = 0; i < pc; i++) {
-            ci->packages[i] = heap_strdup(pkgs[i]);
+            ci->packages[i] = heap_strdup(packages.items[i]->name);
             if (!ci->packages[i]) {
                 ci->package_count = i + 1;
-                for (int j = 0; j < pc; j++) {
-                    safe_str_free(&pkgs[j]);
-                }
+                arch_name_count_set_free(&packages);
                 arch_clear_cluster(ci);
                 return CBM_STORE_ERR;
             }
         }
         ci->package_count = pc;
-        for (int i = 0; i < pc; i++) {
-            safe_str_free(&pkgs[i]);
-        }
     }
+    arch_name_count_set_free(&packages);
     /* Label: the top hub node is the most informative AND discriminable name
      * for the community (e.g. "create_task", "install_plugins",
      * "execute_tmux_command"). Labeling by the dominant package made every
      * cluster in a single-package repo share one identical, uninformative
      * label. The package list is preserved separately in `packages`. */
-    const char *label_context = cluster_best_context(qns, comm, n, c);
+    const char *label_context = cluster_best_context(s, qns, comm, n, c);
     ci->label = cluster_make_label(ci, label_context);
     if (label_context && label_context[0]) {
         safe_str_free(&label_context);
@@ -16416,18 +16444,71 @@ static int cluster_rank_cmp(const void *a, const void *b) {
     return cb->members - ca->members;
 }
 
+static int arch_cluster_count_nodes(cbm_store_t *s, const char *project, bool scoped,
+                                    const char *norm, const char *like, int64_t *total) {
+    char sql[ST_SQL_BUF];
+    const char *base = "SELECT COUNT(*) FROM nodes "
+                       "WHERE project=?1 AND label IN ('Function','Method','Class')";
+    int written = scoped ? snprintf(sql, sizeof(sql), "%s%s", base, arch_path_scope_sql())
+                         : snprintf(sql, sizeof(sql), "%s", base);
+    if (written <= 0 || (size_t)written >= sizeof(sql)) {
+        store_set_error(s, "arch_clusters count SQL truncated");
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "arch_clusters count");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    if (scoped) {
+        arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
+    }
+    int step_rc = sqlite3_step(stmt);
+    if (step_rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "arch_clusters count");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    *total = sqlite3_column_int64(stmt, 0);
+    step_rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "arch_clusters count");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
-                         cbm_architecture_info_t *out, double resolution) {
+                         cbm_architecture_info_t *out, double resolution, int node_budget) {
     /* 1. Load Function/Method/Class nodes, ordered by id for bsearch. */
     char norm[CBM_SZ_512];
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
+    int64_t total_nodes = 0;
+    if (arch_cluster_count_nodes(s, project, scoped, norm, like, &total_nodes) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    out->cluster_nodes_total = total_nodes;
+    out->cluster_node_budget = node_budget;
+    if (total_nodes > node_budget) {
+        /* A Leiden result for the lowest node IDs is not a valid partial view:
+         * graph membership, community IDs, ranking, labels, and cohesion can
+         * all change when omitted nodes and edges are included. */
+        out->clusters_omitted_for_budget = true;
+        return CBM_STORE_OK;
+    }
+    if (total_nodes < CBM_CLUSTER_MIN_MEMBERS) {
+        return CBM_STORE_OK;
+    }
+
     char nsqlbuf[ST_SQL_BUF];
     const char *base = "SELECT id, name, qualified_name FROM nodes "
                        "WHERE project=?1 AND label IN ('Function','Method','Class')";
-    int nsql_len = scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id LIMIT ?4", base,
-                                     arch_path_scope_sql())
-                          : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id LIMIT ?2", base);
+    int nsql_len =
+        scoped ? snprintf(nsqlbuf, sizeof(nsqlbuf), "%s%s ORDER BY id", base, arch_path_scope_sql())
+               : snprintf(nsqlbuf, sizeof(nsqlbuf), "%s ORDER BY id", base);
     if (nsql_len <= 0 || (size_t)nsql_len >= sizeof(nsqlbuf)) {
         return CBM_STORE_OK; /* clusters are best-effort */
     }
@@ -16438,9 +16519,6 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
     bind_text(st, SKIP_ONE, project);
     if (scoped) {
         arch_bind_path_scope(st, ST_COL_2, ST_COL_3, norm, like);
-        sqlite3_bind_int(st, ST_COL_4, CBM_CLUSTER_NODE_CAP);
-    } else {
-        sqlite3_bind_int(st, ST_COL_2, CBM_CLUSTER_NODE_CAP);
     }
     int cap = ST_INIT_CAP_8;
     int n = 0;
@@ -16606,7 +16684,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             }
             double denom = internal[c] + boundary[c];
             double cohesion = denom > 0 ? (double)internal[c] / denom : 0.0;
-            if (cluster_build_one(&clusters[cc], c, n, comm, degree, names, qns, members[c],
+            if (cluster_build_one(s, &clusters[cc], c, n, comm, degree, names, qns, members[c],
                                   cohesion) != CBM_STORE_OK) {
                 arch_free_clusters(clusters, cc);
                 free(members);
@@ -16617,7 +16695,7 @@ static int arch_clusters(cbm_store_t *s, const char *project, const char *path,
             }
             cc++;
         }
-        cluster_disambiguate_duplicate_labels(clusters, cc, n, comm, qns);
+        cluster_disambiguate_duplicate_labels(s, clusters, cc, n, comm, qns);
         out->clusters = clusters;
         out->cluster_count = cc;
 
@@ -16663,10 +16741,18 @@ static bool want_aspect(const char **aspects, int aspect_count, const char *name
     return false;
 }
 
-int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const char *path,
-                                      const char **aspects, int aspect_count,
-                                      cbm_architecture_info_t *out, int hotspot_limit,
-                                      double leiden_resolution) {
+int cbm_store_get_architecture_scoped_with_options(cbm_store_t *s, const char *project,
+                                                   const char *path, const char **aspects,
+                                                   int aspect_count, cbm_architecture_info_t *out,
+                                                   const cbm_architecture_options_t *options) {
+    int hotspot_limit = options ? options->hotspot_limit : 0;
+    double leiden_resolution = options ? options->leiden_resolution : 1.0;
+    int cluster_node_budget =
+        options ? options->cluster_node_budget : CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET;
+    if (cluster_node_budget < CBM_MIN_ARCH_CLUSTER_NODE_BUDGET ||
+        cluster_node_budget > CBM_MAX_ARCH_CLUSTER_NODE_BUDGET) {
+        cluster_node_budget = CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET;
+    }
     /* Leiden resolution (gamma): controls cluster granularity. >1 → smaller
      * clusters; <1 → larger. Reject NaN/non-positive (config-tunable since the
      * value flows in from CBM_CONFIG_ARCH_RESOLUTION). Default 1.0. */
@@ -16730,7 +16816,7 @@ int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const
         }
     }
     if (want_aspect(aspects, aspect_count, "clusters")) {
-        rc = arch_clusters(s, project, path, out, leiden_resolution);
+        rc = arch_clusters(s, project, path, out, leiden_resolution, cluster_node_budget);
         if (rc != CBM_STORE_OK) {
             goto fail;
         }
@@ -16741,6 +16827,19 @@ int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const
 fail:
     cbm_store_architecture_free(out);
     return rc;
+}
+
+int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const char *path,
+                                      const char **aspects, int aspect_count,
+                                      cbm_architecture_info_t *out, int hotspot_limit,
+                                      double leiden_resolution) {
+    cbm_architecture_options_t options = {
+        .hotspot_limit = hotspot_limit,
+        .leiden_resolution = leiden_resolution,
+        .cluster_node_budget = CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET,
+    };
+    return cbm_store_get_architecture_scoped_with_options(s, project, path, aspects, aspect_count,
+                                                          out, &options);
 }
 
 int cbm_store_get_architecture(cbm_store_t *s, const char *project, const char **aspects,

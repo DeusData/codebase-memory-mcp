@@ -420,6 +420,7 @@ int cbm_config_apply_preset(cbm_config_t *cfg, const char *name);
 #define CBM_CONFIG_QUERY_MAX_ROWS "query_max_rows"
 #define CBM_CONFIG_QUERY_MAX_WORKING_ROWS "query_max_working_rows"
 #define CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES "query_max_output_bytes"
+#define CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET "arch_cluster_node_budget"
 #define CBM_CONFIG_TOOL_MODE "tool_mode"
 #define CBM_CONFIG_TOOL_MODE_STREAMLINED "streamlined"
 #define CBM_CONFIG_TOOL_MODE_CLASSIC "classic"

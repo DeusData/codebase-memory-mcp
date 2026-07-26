@@ -9577,10 +9577,22 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     double arch_leiden_resolution = srv && srv->config
         ? cbm_config_get_double(srv->config, CBM_CONFIG_ARCH_RESOLUTION, 1.0)
         : 1.0;
-    cbm_store_get_architecture_scoped(store, project, scope_path,
-                                      aspects_strs_count > 0 ? aspects_strs : NULL,
-                                      aspects_strs_count, &arch, arch_hotspot_limit,
-                                      arch_leiden_resolution);
+    int arch_cluster_node_budget =
+        srv && srv->config ? cbm_config_get_int(srv->config, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET,
+                                                CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET)
+                           : CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET;
+    if (arch_cluster_node_budget < CBM_MIN_ARCH_CLUSTER_NODE_BUDGET ||
+        arch_cluster_node_budget > CBM_MAX_ARCH_CLUSTER_NODE_BUDGET) {
+        arch_cluster_node_budget = CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET;
+    }
+    cbm_architecture_options_t arch_options = {
+        .hotspot_limit = arch_hotspot_limit,
+        .leiden_resolution = arch_leiden_resolution,
+        .cluster_node_budget = arch_cluster_node_budget,
+    };
+    cbm_store_get_architecture_scoped_with_options(store, project, scope_path,
+                                                   aspects_strs_count > 0 ? aspects_strs : NULL,
+                                                   aspects_strs_count, &arch, &arch_options);
 
     int node_count = cbm_store_count_nodes_scoped(store, project, scope_path);
     int edge_count = cbm_store_count_edges_scoped(store, project, scope_path);
@@ -9733,6 +9745,14 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                 cbm_toon_cell_str(&sb, arch.layers[i].reason, false);
                 cbm_toon_row_end(&sb);
             }
+        }
+        if (arch.clusters_omitted_for_budget) {
+            cbm_toon_scalar_bool(&sb, "clusters_omitted_for_budget", true);
+            cbm_toon_scalar_int(&sb, "cluster_nodes_total", arch.cluster_nodes_total);
+            cbm_toon_scalar_int(&sb, "cluster_node_budget", arch.cluster_node_budget);
+            cbm_toon_scalar_str(
+                &sb, "clusters_hint",
+                "narrow path or raise arch_cluster_node_budget to compute complete clusters");
         }
         if (arch.cluster_count > 0) {
             /* Nested lists become ';'-joined cells. */
@@ -10120,7 +10140,16 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_val(doc, root, "layers", layers);
     }
 
-    /* Clusters (community detection) */
+    /* Clusters (community detection). A node-prefix Leiden result would be
+     * misleading, so budget exhaustion reports the omission instead. */
+    if (arch.clusters_omitted_for_budget) {
+        yyjson_mut_obj_add_bool(doc, root, "clusters_omitted_for_budget", true);
+        yyjson_mut_obj_add_int(doc, root, "cluster_nodes_total", arch.cluster_nodes_total);
+        yyjson_mut_obj_add_int(doc, root, "cluster_node_budget", arch.cluster_node_budget);
+        yyjson_mut_obj_add_str(
+            doc, root, "clusters_hint",
+            "narrow path or raise arch_cluster_node_budget to compute complete clusters");
+    }
     if (arch.cluster_count > 0) {
         yyjson_mut_val *clusters = yyjson_mut_arr(doc);
         for (int i = 0; i < arch.cluster_count; i++) {

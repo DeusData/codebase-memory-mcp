@@ -5576,6 +5576,77 @@ TEST(tool_get_architecture_emits_populated_sections) {
     PASS();
 }
 
+TEST(tool_get_architecture_reports_cluster_budget_omission) {
+    char config_dir[CBM_PATH_MAX];
+    ASSERT_TRUE(snprintf(config_dir, sizeof(config_dir), "/tmp/cbm-mcp-cluster-budget-XXXXXX") > 0);
+    ASSERT_NOT_NULL(cbm_mkdtemp(config_dir));
+    cbm_config_t *config = cbm_config_open(config_dir);
+    ASSERT_NOT_NULL(config);
+    ASSERT_EQ(cbm_config_set(config, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, "4"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, config);
+    cbm_mcp_server_set_project(srv, "cluster-budget-mcp");
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "cluster-budget-mcp", "/tmp/cluster-budget-mcp"),
+              CBM_STORE_OK);
+    for (int i = 0; i < 5; i++) {
+        char name[CBM_SZ_32];
+        char qn[CBM_SZ_128];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "function%d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "cluster-budget-mcp.pkg.%s", name) > 0);
+        cbm_node_t node = {.project = "cluster-budget-mcp",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "cluster.c"};
+        ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
+    }
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":92,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"get_architecture\","
+                                   "\"arguments\":{\"project\":\"cluster-budget-mcp\","
+                                   "\"aspects\":[\"clusters\"],\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"clusters_omitted_for_budget\":true"));
+    ASSERT_NOT_NULL(strstr(inner, "\"cluster_nodes_total\":5"));
+    ASSERT_NOT_NULL(strstr(inner, "\"cluster_node_budget\":4"));
+    ASSERT_NOT_NULL(strstr(inner, "raise arch_cluster_node_budget"));
+    ASSERT_NULL(strstr(inner, "\"clusters\":["));
+
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"get_architecture\","
+                                      "\"arguments\":{\"project\":\"cluster-budget-mcp\","
+                                      "\"aspects\":[\"clusters\"],\"format\":\"toon\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "clusters_omitted_for_budget: true"));
+    ASSERT_NOT_NULL(strstr(inner, "cluster_nodes_total: 5"));
+    ASSERT_NOT_NULL(strstr(inner, "cluster_node_budget: 4"));
+    ASSERT_NOT_NULL(strstr(inner, "raise arch_cluster_node_budget"));
+    ASSERT_NULL(strstr(inner, "clusters["));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cbm_config_close(config);
+    char config_path[CBM_PATH_MAX];
+    ASSERT_TRUE(snprintf(config_path, sizeof(config_path), "%s/_config.db", config_dir) > 0);
+    cbm_remove_db_sidecars(config_path);
+    cbm_unlink(config_path);
+    cbm_rmdir(config_dir);
+    PASS();
+}
+
 TEST(tool_get_architecture_warns_on_stale_derived_views) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -15862,6 +15933,7 @@ SUITE(mcp) {
     RUN_TEST(tool_delete_project_not_found);
     RUN_TEST(tool_get_architecture_empty);
     RUN_TEST(tool_get_architecture_emits_populated_sections);
+    RUN_TEST(tool_get_architecture_reports_cluster_budget_omission);
     RUN_TEST(tool_get_architecture_warns_on_stale_derived_views);
     RUN_TEST(tool_get_architecture_reports_dirty_metadata_as_canonical_only);
     RUN_TEST(tool_get_architecture_uses_overlay_active_entry_points);

@@ -7174,6 +7174,11 @@ static bool cbm_config_value_is_valid(const char *key, const char *value) {
         !cbm_config_decimal_integer_in_range(value, 1, CBM_MAX_QUERY_WORKING_ROWS)) {
         return false;
     }
+    if (key && strcmp(key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0 &&
+        !cbm_config_decimal_integer_in_range(value, CBM_MIN_ARCH_CLUSTER_NODE_BUDGET,
+                                             CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)) {
+        return false;
+    }
     if (key && strcmp(key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 &&
         !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_AUTO_DEP_LIMIT)) {
         return false;
@@ -14434,6 +14439,13 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "1.0 is the standard Leiden default. Higher (2.0-5.0) splits code into more, finer-grained "
      "clusters; lower (0.3-0.5) merges related clusters into coarse subsystems. Non-positive and "
      "NaN values are clamped to 1.0. Drives the 'clusters' section of get_architecture."},
+    {CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET, CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET_STR, NULL,
+     "Architecture",
+     "Maximum Function, Method, and Class nodes processed by Leiden architecture clustering",
+     CBM_MIN_ARCH_CLUSTER_NODE_BUDGET_STR "-" CBM_STRINGIFY(CBM_MAX_ARCH_CLUSTER_NODE_BUDGET),
+     "Bounds graph-sized clustering runtime and memory without silently changing results. When a "
+     "project exceeds this budget, get_architecture omits clusters, reports the exact eligible "
+     "node count and budget, and advises narrowing path or raising this setting."},
     /* ── Similarity ── */
     {CBM_CONFIG_SIMILARITY_ENABLED, "true", NULL, "Similarity",
      "Create MinHash SIMILAR edges during full and moderate indexing",
