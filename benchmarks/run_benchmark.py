@@ -2074,8 +2074,18 @@ def cli_result_text(stdout: str) -> str:
 
 def mcp_result_text(response: dict[str, Any]) -> str:
     result = response.get("result", {})
-    if "content" in result:
-        return str(result["content"][0]["text"])
+    content = result.get("content")
+    if isinstance(content, list):
+        # The server may prepend a one-shot update notice as a separate text block.
+        # The tool payload remains the final text block; selecting it preserves both
+        # JSON and default TOON responses without matching notice wording.
+        for item in reversed(content):
+            if (
+                isinstance(item, dict)
+                and item.get("type") == "text"
+                and isinstance(item.get("text"), str)
+            ):
+                return item["text"]
     return json.dumps(result, separators=(",", ":"), sort_keys=True)
 
 
@@ -2545,7 +2555,13 @@ class McpClient:
         self, name: str, arguments: dict[str, Any]
     ) -> tuple[dict[str, Any], str, int, float]:
         text, stderr, stdout_bytes, elapsed_ms = self.call_tool_text(name, arguments)
-        return json.loads(text), stderr, stdout_bytes, elapsed_ms
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"MCP tool {name} returned non-JSON text: {text[:200]!r}"
+            ) from exc
+        return data, stderr, stdout_bytes, elapsed_ms
 
     def call_tool_text(
         self, name: str, arguments: dict[str, Any]
