@@ -110,6 +110,28 @@ static int bases_count(CBMDefinition *d) {
     return n;
 }
 
+static int assert_exact_bases(CBMDefinition *d, const char *class_name,
+                              const char *const *expected) {
+    int actual_count = bases_count(d);
+    int expected_count = 0;
+    while (expected[expected_count]) {
+        expected_count++;
+    }
+    if (actual_count != expected_count) {
+        printf("  FAIL  [%s] base_classes has %d entries, expected exactly %d\n", class_name,
+               actual_count, expected_count);
+        return 0;
+    }
+    for (int i = 0; i < expected_count; i++) {
+        if (strcmp(d->base_classes[i], expected[i]) != 0) {
+            printf("  FAIL  [%s] base_classes[%d] is \"%s\", expected \"%s\"\n", class_name, i,
+                   d->base_classes[i], expected[i]);
+            return 0;
+        }
+    }
+    return 1;
+}
+
 /* ── Table-driven case type ─────────────────────────────────────── */
 
 /* Labels used to look up the class definition in the extraction result.
@@ -1658,6 +1680,99 @@ TEST(inherit_rust_impls) {
     PASS();
 }
 
+/*
+ * Base-class lists are semantic data, not previews. Exercise independent
+ * generic and language-specific walkers above the former 15-entry local-array
+ * ceiling, requiring exact count and source order so tail loss, duplication,
+ * and reordering all fail automatically.
+ */
+TEST(inherit_wide_base_lists_are_exact) {
+    static const char *const expected[] = {
+        "Base01", "Base02", "Base03", "Base04", "Base05", "Base06", "Base07",
+        "Base08", "Base09", "Base10", "Base11", "Base12", "Base13", "Base14",
+        "Base15", "Base16", "Base17", "Base18", "Base19", "Base20", NULL,
+    };
+    static const inherit_case_t cases[] = {
+        {CBM_LANG_JAVA,
+         "Wide.java",
+         "interface WideJava extends Base01, Base02, Base03, Base04, Base05, Base06, Base07, "
+         "Base08, Base09, Base10, Base11, Base12, Base13, Base14, Base15, Base16, Base17, "
+         "Base18, Base19, Base20 {}",
+         "WideJava",
+         {NULL},
+         {NULL},
+         0},
+        {CBM_LANG_CPP,
+         "wide.cpp",
+         "class WideCpp : public Base01, public Base02, public Base03, public Base04, public "
+         "Base05, public Base06, public Base07, public Base08, public Base09, public Base10, "
+         "public Base11, public Base12, public Base13, public Base14, public Base15, public "
+         "Base16, public Base17, public Base18, public Base19, public Base20 {};",
+         "WideCpp",
+         {NULL},
+         {NULL},
+         0},
+        {CBM_LANG_CSHARP,
+         "Wide.cs",
+         "interface WideCs : Base01, Base02, Base03, Base04, Base05, Base06, Base07, Base08, "
+         "Base09, Base10, Base11, Base12, Base13, Base14, Base15, Base16, Base17, Base18, "
+         "Base19, Base20 {}",
+         "WideCs",
+         {NULL},
+         {NULL},
+         0},
+        {CBM_LANG_TYPESCRIPT,
+         "wide.ts",
+         "interface WideTs extends Base01, Base02, Base03, Base04, Base05, Base06, Base07, "
+         "Base08, Base09, Base10, Base11, Base12, Base13, Base14, Base15, Base16, Base17, "
+         "Base18, Base19, Base20 {}",
+         "WideTs",
+         {NULL},
+         {NULL},
+         0},
+        {CBM_LANG_PHP,
+         "Wide.php",
+         "<?php class WidePhp implements Base01, Base02, Base03, Base04, Base05, Base06, "
+         "Base07, Base08, Base09, Base10, Base11, Base12, Base13, Base14, Base15, Base16, "
+         "Base17, Base18, Base19, Base20 {}",
+         "WidePhp",
+         {NULL},
+         {NULL},
+         0},
+        {CBM_LANG_KOTLIN,
+         "Wide.kt",
+         "class WideKt : Base01, Base02, Base03, Base04, Base05, Base06, Base07, Base08, "
+         "Base09, Base10, Base11, Base12, Base13, Base14, Base15, Base16, Base17, Base18, "
+         "Base19, Base20 {}",
+         "WideKt",
+         {NULL},
+         {NULL},
+         0},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        const inherit_case_t *tc = &cases[i];
+        CBMFileResult *r =
+            cbm_extract_file(tc->src, (int)strlen(tc->src), tc->lang, "t", tc->path, 0, NULL, NULL);
+        if (!r) {
+            printf("  FAIL  [%s] cbm_extract_file returned NULL\n", tc->class_name);
+            return 1;
+        }
+        CBMDefinition *def = find_def_flex(r, tc->class_name);
+        if (!def) {
+            printf("  FAIL  [%s] definition not found in extraction result\n", tc->class_name);
+            cbm_free_result(r);
+            return 1;
+        }
+        int exact = assert_exact_bases(def, tc->class_name, expected);
+        cbm_free_result(r);
+        if (!exact) {
+            return 1;
+        }
+    }
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * SUITE declaration
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1668,6 +1783,7 @@ SUITE(extraction_inheritance) {
     RUN_TEST(inherit_csharp);
     RUN_TEST(inherit_cpp);
     RUN_TEST(inherit_rust_impls);
+    RUN_TEST(inherit_wide_base_lists_are_exact);
 
     /* Languages expected RED (broken extractors — reproduce-first) */
     RUN_TEST(inherit_python); /* RED: identifier-node not matched in collect_bases_from_field */
