@@ -517,6 +517,8 @@ typedef struct {
 typedef struct {
     const char *project;
     const char *generation;
+    /* Effective capability mode of the published generation; mirrored in the
+     * Project node for exact JSON validation during route selection. */
     const char *index_mode;
     const char *recorded_at;
     const char *recording_status;

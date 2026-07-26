@@ -36,6 +36,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "yyjson/yyjson.h"
 
 #include <errno.h>
 #include <stdint.h>
@@ -240,6 +241,82 @@ static const char *itoa_buf(int val) {
     idx = (idx + SKIP_ONE) & PL_RING_MASK;
     snprintf(bufs[i], sizeof(bufs[i]), "%d", val);
     return bufs[i];
+}
+
+static const char *pipeline_mode_name(cbm_index_mode_t mode) {
+    switch (mode) {
+    case CBM_MODE_FULL:
+        return "full";
+    case CBM_MODE_MODERATE:
+        return "moderate";
+    case CBM_MODE_FAST:
+        return "fast";
+    default:
+        return "unknown";
+    }
+}
+
+typedef enum {
+    INDEX_MODE_METADATA_OK = 0,
+    INDEX_MODE_METADATA_MISSING_OR_INVALID,
+    INDEX_MODE_METADATA_ERROR,
+} index_mode_metadata_status_t;
+
+static index_mode_metadata_status_t parse_index_mode(const char *properties_json,
+                                                     cbm_index_mode_t *out_mode) {
+    if (!out_mode) {
+        return INDEX_MODE_METADATA_ERROR;
+    }
+    if (!properties_json || !properties_json[0]) {
+        return INDEX_MODE_METADATA_MISSING_OR_INVALID;
+    }
+
+    yyjson_read_err read_error = {0};
+    yyjson_doc *doc =
+        yyjson_read_opts((char *)properties_json, strlen(properties_json), 0, NULL, &read_error);
+    if (!doc) {
+        return read_error.code == YYJSON_READ_ERROR_MEMORY_ALLOCATION
+                   ? INDEX_MODE_METADATA_ERROR
+                   : INDEX_MODE_METADATA_MISSING_OR_INVALID;
+    }
+
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *mode_value = yyjson_is_obj(root) ? yyjson_obj_get(root, "index_mode") : NULL;
+    index_mode_metadata_status_t status = INDEX_MODE_METADATA_OK;
+    if (yyjson_equals_str(mode_value, "full")) {
+        *out_mode = CBM_MODE_FULL;
+    } else if (yyjson_equals_str(mode_value, "moderate")) {
+        *out_mode = CBM_MODE_MODERATE;
+    } else if (yyjson_equals_str(mode_value, "fast")) {
+        *out_mode = CBM_MODE_FAST;
+    } else {
+        status = INDEX_MODE_METADATA_MISSING_OR_INVALID;
+    }
+
+    yyjson_doc_free(doc);
+    return status;
+}
+
+static bool index_mode_covers(cbm_index_mode_t stored_mode, cbm_index_mode_t requested_mode) {
+    return stored_mode >= CBM_MODE_FULL && stored_mode <= CBM_MODE_FAST &&
+           requested_mode >= CBM_MODE_FULL && requested_mode <= CBM_MODE_FAST &&
+           stored_mode <= requested_mode;
+}
+
+static index_mode_metadata_status_t read_stored_index_mode(cbm_store_t *store, const char *project,
+                                                           cbm_index_mode_t *out_mode) {
+    cbm_node_t node = {0};
+    int rc = cbm_store_find_node_by_qn(store, project, project, &node);
+    if (rc == CBM_STORE_NOT_FOUND) {
+        return INDEX_MODE_METADATA_MISSING_OR_INVALID;
+    }
+    if (rc != CBM_STORE_OK) {
+        return INDEX_MODE_METADATA_ERROR;
+    }
+
+    index_mode_metadata_status_t status = parse_index_mode(node.properties_json, out_mode);
+    cbm_node_free_fields(&node);
+    return status;
 }
 
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
@@ -614,7 +691,11 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
     cbm_log_info("pass.start", "pass", "structure", "files", itoa_buf(file_count));
 
     /* Project node */
-    cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0, "{}");
+    char project_props[CBM_SZ_64];
+    snprintf(project_props, sizeof(project_props), "{\"index_mode\":\"%s\"}",
+             pipeline_mode_name(p->mode));
+    cbm_gbuf_upsert_node(p->gbuf, "Project", p->project_name, p->project_name, NULL, 0, 0,
+                         project_props);
     const char *branch_qn = p->branch_qn ? p->branch_qn : p->project_name;
     const char *branch_name = p->git_ctx.branch ? p->git_ctx.branch : "working-tree";
     char branch_props[CBM_SZ_2K];
@@ -1344,7 +1425,7 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
  * metadata write has succeeded. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
-                                        int baseline_count) {
+                                        int baseline_count, bool force_full_on_change) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
@@ -1356,7 +1437,10 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     }
     cbm_store_t *check_store = cbm_store_open_path_query(db_path);
     bool valid = check_store && cbm_store_check_integrity(check_store);
+    cbm_index_mode_t stored_mode = CBM_MODE_FAST;
+    index_mode_metadata_status_t stored_mode_status = INDEX_MODE_METADATA_MISSING_OR_INVALID;
     if (check_store) {
+        stored_mode_status = read_stored_index_mode(check_store, p->project_name, &stored_mode);
         cbm_store_close(check_store);
     }
     if (!valid) {
@@ -1364,9 +1448,28 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         free(db_path);
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
     }
-    cbm_log_info("pipeline.route", "path", "incremental_manifest");
-    int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, baseline_manifest,
-                                          baseline_count);
+    if (stored_mode_status == INDEX_MODE_METADATA_ERROR) {
+        cbm_log_error("pipeline.route", "path", "metadata_read_error", "stored_mode", "error",
+                      "requested_mode", pipeline_mode_name(p->mode), "action", "preserve_db");
+        free(db_path);
+        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+    }
+
+    bool mode_covered =
+        stored_mode_status == INDEX_MODE_METADATA_OK && index_mode_covers(stored_mode, p->mode);
+    int rc = CBM_PIPELINE_FORCE_FULL_REINDEX;
+    if (mode_covered) {
+        cbm_log_info("pipeline.route", "path", "incremental_manifest", "stored_mode",
+                     pipeline_mode_name(stored_mode), "requested_mode",
+                     pipeline_mode_name(p->mode));
+        rc = cbm_pipeline_run_incremental(p, db_path, files, file_count, baseline_manifest,
+                                          baseline_count, force_full_on_change);
+    } else {
+        cbm_log_info("pipeline.route", "path", "mode_upgrade_reindex", "stored_mode",
+                     stored_mode_status == INDEX_MODE_METADATA_OK ? pipeline_mode_name(stored_mode)
+                                                                  : "unknown",
+                     "requested_mode", pipeline_mode_name(p->mode));
+    }
     /* Delete the existing generation ONLY when we are about to rebuild it.
      * On main this was guarded by an early `return rc` for the incremental
      * path; this function has no such early return, so the delete must be
@@ -1383,19 +1486,6 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     }
     free(db_path);
     return rc;
-}
-
-static const char *pipeline_mode_name(cbm_index_mode_t mode) {
-    switch (mode) {
-    case CBM_MODE_FULL:
-        return "full";
-    case CBM_MODE_MODERATE:
-        return "moderate";
-    case CBM_MODE_FAST:
-        return "fast";
-    default:
-        return "unknown";
-    }
 }
 
 static int pipeline_mode_coverage_rank(cbm_index_mode_t mode) {
@@ -1415,38 +1505,30 @@ static int pipeline_mode_coverage_rank(cbm_index_mode_t mode) {
  * must never erase files that the cheaper discovery intentionally skips. The
  * exact-manifest pipeline therefore keeps the most comprehensive successfully
  * published mode and performs any changed rebuild at that coverage level. */
-static void promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
+static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
     if (!p || !p->project_name) {
-        return;
+        return false;
     }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
-        return;
+        return false;
     }
     cbm_store_t *store = cbm_store_open_path_query(db_path);
     free(db_path);
     if (!store) {
-        return;
+        return false;
     }
-    cbm_coverage_meta_t meta = {0};
-    if (cbm_store_coverage_meta_get(store, p->project_name, &meta) == CBM_STORE_OK &&
-        meta.index_mode) {
-        cbm_index_mode_t stored_mode = p->mode;
-        if (strcmp(meta.index_mode, "full") == 0) {
-            stored_mode = CBM_MODE_FULL;
-        } else if (strcmp(meta.index_mode, "moderate") == 0) {
-            stored_mode = CBM_MODE_MODERATE;
-        } else if (strcmp(meta.index_mode, "fast") == 0) {
-            stored_mode = CBM_MODE_FAST;
-        }
-        if (pipeline_mode_coverage_rank(stored_mode) > pipeline_mode_coverage_rank(p->mode)) {
-            cbm_log_info("pipeline.mode", "requested", pipeline_mode_name(p->mode), "effective",
-                         pipeline_mode_name(stored_mode), "reason", "preserve_existing_coverage");
-            p->mode = stored_mode;
-        }
+    bool promoted = false;
+    cbm_index_mode_t stored_mode = p->mode;
+    if (read_stored_index_mode(store, p->project_name, &stored_mode) == INDEX_MODE_METADATA_OK &&
+        pipeline_mode_coverage_rank(stored_mode) > pipeline_mode_coverage_rank(p->mode)) {
+        cbm_log_info("pipeline.mode", "requested", pipeline_mode_name(p->mode), "effective",
+                     pipeline_mode_name(stored_mode), "reason", "preserve_existing_coverage");
+        p->mode = stored_mode;
+        promoted = true;
     }
-    cbm_store_coverage_meta_clear(&meta);
     cbm_store_close(store);
+    return promoted;
 }
 
 int cbm_pipeline_refresh_artifact(cbm_pipeline_t *p, const char *db_path) {
@@ -2105,7 +2187,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     cbm_file_hash_t *baseline_manifest = NULL;
     int baseline_count = 0;
 
-    promote_mode_to_existing_coverage(p);
+    bool mode_promoted = promote_mode_to_existing_coverage(p);
 
     /* cbm_pipeline_new() may precede the actual run by an arbitrary interval.
      * Refresh once here, then use this exact snapshot for both Branch graph
@@ -2171,7 +2253,8 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
     }
 
     /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count);
+    rc = try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count,
+                                      mode_promoted);
     if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB || rc == CBM_PIPELINE_PERSIST_FAILED) {
         goto cleanup;
     }

@@ -657,7 +657,7 @@ int cbm_scan_project_env_urls_excluded(const char *root_path, cbm_env_binding_t 
  * files, merges into disk DB. Returns 0 on success. */
 int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_file_info_t *files,
                                  int file_count, const cbm_file_hash_t *baseline_manifest,
-                                 int baseline_count);
+                                 int baseline_count, bool force_full_on_change);
 
 /* Exact semantic inputs for no-op/forced-full routing. The manifest contains
  * every discovered source plus repository controls actually consumed by
