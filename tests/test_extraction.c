@@ -74,6 +74,18 @@ static int has_channel(CBMFileResult *r, const char *channel_name, const char *t
     return 0;
 }
 
+static int has_infra_binding(CBMFileResult *r, const char *source_name, const char *target_url) {
+    for (int i = 0; i < r->infra_bindings.count; i++) {
+        const CBMInfraBinding *binding = &r->infra_bindings.items[i];
+        if (binding->source_name && binding->target_url &&
+            strcmp(binding->source_name, source_name) == 0 &&
+            strcmp(binding->target_url, target_url) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int has_call_enclosing(CBMFileResult *r, const char *callee, const char *must_contain,
                               const char *must_not_contain) {
     for (int i = 0; i < r->calls.count; i++) {
@@ -1181,6 +1193,47 @@ TEST(hcl_blocks) {
     /* Block labels are folded into the name so blocks are distinguishable (#337). */
     ASSERT(has_def(r, "Class", "resource.aws_instance.web"));
     ASSERT(has_def(r, "Class", "variable.region"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(hcl_infra_bindings_retain_all_nested_targets) {
+    enum { INFRA_TARGET_TEST_COUNT = 12 };
+    char source[CBM_SZ_8K];
+    size_t used = 0;
+    int n = snprintf(source, sizeof(source),
+                     "resource \"worker\" \"fanout\" {\n"
+                     "  topic = \"events\"\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source));
+    used = (size_t)n;
+
+    for (int i = 0; i < INFRA_TARGET_TEST_COUNT; i++) {
+        n = snprintf(source + used, sizeof(source) - used,
+                     "  http_target \"target_%02d\" {\n"
+                     "    uri = \"https://service-%02d.example/events\"\n"
+                     "  }\n",
+                     i, i);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, "}\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source) - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_HCL, "t", "fanout.tf");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(r->infra_bindings.count, INFRA_TARGET_TEST_COUNT);
+    for (int i = 0; i < INFRA_TARGET_TEST_COUNT; i++) {
+        char target[CBM_SZ_128];
+        n = snprintf(target, sizeof(target), "https://service-%02d.example/events", i);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(target));
+        ASSERT(has_infra_binding(r, "events", target));
+    }
+
     cbm_free_result(r);
     PASS();
 }
@@ -5358,6 +5411,7 @@ SUITE(extraction) {
     /* Markup/Config */
     RUN_TEST(yaml_variables);
     RUN_TEST(hcl_blocks);
+    RUN_TEST(hcl_infra_bindings_retain_all_nested_targets);
     RUN_TEST(sql_create_table);
     RUN_TEST(dockerfile_stages);
 

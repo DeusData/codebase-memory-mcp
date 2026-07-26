@@ -6,8 +6,7 @@
 #include "tree_sitter/api.h" // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
 #include "foundation/constants.h"
 
-enum { MAX_INFRA_BINDINGS = 8 };
-
+#include <limits.h>
 #include <stdint.h> // uint32_t, uint8_t
 #include <string.h>
 #include <strings.h> // strcasecmp (ObjectScript type inference)
@@ -979,6 +978,71 @@ static int is_target_key(const char *key) {
             strcmp(key, "webhook_url") == 0 || strcmp(key, "callback_url") == 0);
 }
 
+typedef struct {
+    const char *value;
+    const char *key;
+} infra_source_t;
+
+typedef struct {
+    infra_source_t *items;
+    int count;
+    int cap;
+} infra_source_list_t;
+
+typedef struct {
+    const char **items;
+    int count;
+    int cap;
+} infra_target_list_t;
+
+/* These lists are temporary views over arena-owned strings. Geometric growth
+ * keeps discovery O(S + T) before the inherently O(S*T) binding emission and
+ * uses O(S + T) pointer storage. Old pointer blocks remain arena-owned until
+ * the file result is freed, matching the extraction arrays' existing pattern. */
+static bool infra_list_grow(CBMExtractCtx *ctx, void **items, int count, int *cap,
+                            size_t item_size) {
+    if (*cap > INT_MAX / PAIR_LEN) {
+        ctx->result->has_error = true;
+        return false;
+    }
+    int new_cap = *cap == 0 ? CBM_SZ_8 : *cap * PAIR_LEN;
+    if ((size_t)new_cap > SIZE_MAX / item_size) {
+        ctx->result->has_error = true;
+        return false;
+    }
+    void *new_items = cbm_arena_alloc(ctx->arena, (size_t)new_cap * item_size);
+    if (!new_items) {
+        ctx->result->has_error = true;
+        return false;
+    }
+    if (count > 0) {
+        memcpy(new_items, *items, (size_t)count * item_size);
+    }
+    *items = new_items;
+    *cap = new_cap;
+    return true;
+}
+
+static bool infra_source_list_push(CBMExtractCtx *ctx, infra_source_list_t *list, const char *value,
+                                   const char *key) {
+    if (list->count >= list->cap && !infra_list_grow(ctx, (void **)&list->items, list->count,
+                                                     &list->cap, sizeof(*list->items))) {
+        return false;
+    }
+    list->items[list->count++] = (infra_source_t){.value = value, .key = key};
+    return true;
+}
+
+static bool infra_target_list_push(CBMExtractCtx *ctx, infra_target_list_t *list,
+                                   const char *target) {
+    if (list->count >= list->cap && !infra_list_grow(ctx, (void **)&list->items, list->count,
+                                                     &list->cap, sizeof(*list->items))) {
+        return false;
+    }
+    list->items[list->count++] = target;
+    return true;
+}
+
 /* Infer broker type from surrounding context */
 static const char *infer_broker(const char *file_path, const char *source_key) {
     if (strstr(file_path, "pubsub") || strstr(file_path, "pub-sub") ||
@@ -1017,8 +1081,8 @@ static char *strip_yaml_quotes(CBMArena *a, char *v) {
 }
 
 // Scan a nested YAML block_mapping for target keys (push_endpoint, uri, etc.).
-static void scan_nested_mapping_targets(CBMExtractCtx *ctx, TSNode val, const char **targets,
-                                        int *n_targets) {
+static bool scan_nested_mapping_targets(CBMExtractCtx *ctx, TSNode val,
+                                        infra_target_list_t *targets) {
     uint32_t vnc = ts_node_named_child_count(val);
     for (uint32_t vi = 0; vi < vnc; vi++) {
         TSNode vc = ts_node_named_child(val, vi);
@@ -1037,29 +1101,31 @@ static void scan_nested_mapping_targets(CBMExtractCtx *ctx, TSNode val, const ch
                 continue;
             }
             char *mktext = cbm_node_text(ctx->arena, mk, ctx->source);
-            if (mktext && is_target_key(mktext) && *n_targets < MAX_INFRA_BINDINGS) {
+            if (mktext && is_target_key(mktext)) {
                 char *mvtext =
                     strip_yaml_quotes(ctx->arena, cbm_node_text(ctx->arena, mv, ctx->source));
-                if (mvtext && strstr(mvtext, "://")) {
-                    targets[(*n_targets)++] = mvtext;
+                if (mvtext && strstr(mvtext, "://") &&
+                    !infra_target_list_push(ctx, targets, mvtext)) {
+                    return false;
                 }
             }
         }
     }
+    return true;
 }
 
 // Emit infra bindings for each source × target pair combination.
-static void emit_infra_bindings(CBMExtractCtx *ctx, const char **sources, const char **source_keys,
-                                int n_sources, const char **targets, int n_targets) {
-    for (int si = 0; si < n_sources; si++) {
-        for (int ti = 0; ti < n_targets; ti++) {
-            if (!sources[si] || !targets[ti]) {
+static void emit_infra_bindings(CBMExtractCtx *ctx, const infra_source_list_t *sources,
+                                const infra_target_list_t *targets) {
+    for (int si = 0; si < sources->count; si++) {
+        for (int ti = 0; ti < targets->count; ti++) {
+            if (!sources->items[si].value || !targets->items[ti]) {
                 continue;
             }
             CBMInfraBinding ib = {
-                .source_name = sources[si],
-                .target_url = targets[ti],
-                .broker = infer_broker(ctx->rel_path, source_keys[si]),
+                .source_name = sources->items[si].value,
+                .target_url = targets->items[ti],
+                .broker = infer_broker(ctx->rel_path, sources->items[si].key),
             };
             cbm_infrabinding_push(&ctx->result->infra_bindings, ctx->arena, ib);
         }
@@ -1067,11 +1133,8 @@ static void emit_infra_bindings(CBMExtractCtx *ctx, const char **sources, const 
 }
 
 static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
-    const char *sources[MAX_INFRA_BINDINGS] = {NULL};
-    const char *source_keys[MAX_INFRA_BINDINGS] = {NULL};
-    int n_sources = 0;
-    const char *targets[MAX_INFRA_BINDINGS] = {NULL};
-    int n_targets = 0;
+    infra_source_list_t sources = {0};
+    infra_target_list_t targets = {0};
 
     uint32_t nc = ts_node_named_child_count(mapping);
     for (uint32_t i = 0; i < nc; i++) {
@@ -1092,20 +1155,21 @@ static void scan_mapping_for_bindings(CBMExtractCtx *ctx, TSNode mapping) {
         const char *vtype = ts_node_type(val);
         if (strcmp(vtype, "block_node") != 0 && strcmp(vtype, "block_mapping") != 0) {
             char *v = strip_yaml_quotes(ctx->arena, cbm_node_text(ctx->arena, val, ctx->source));
-            if (is_source_key(k) && n_sources < MAX_INFRA_BINDINGS) {
-                sources[n_sources] = v;
-                source_keys[n_sources] = k;
-                n_sources++;
+            if (is_source_key(k) && !infra_source_list_push(ctx, &sources, v, k)) {
+                return;
             }
-            if (is_target_key(k) && n_targets < MAX_INFRA_BINDINGS && v && strstr(v, "://")) {
-                targets[n_targets++] = v;
+            if (is_target_key(k) && v && strstr(v, "://") &&
+                !infra_target_list_push(ctx, &targets, v)) {
+                return;
             }
         } else {
-            scan_nested_mapping_targets(ctx, val, targets, &n_targets);
+            if (!scan_nested_mapping_targets(ctx, val, &targets)) {
+                return;
+            }
         }
     }
 
-    emit_infra_bindings(ctx, sources, source_keys, n_sources, targets, n_targets);
+    emit_infra_bindings(ctx, &sources, &targets);
 }
 
 #define INFRA_SCAN_STACK_CAP CBM_SZ_512
@@ -1164,8 +1228,8 @@ static TSNode hcl_block_body(TSNode block) {
 }
 
 // Scan a nested HCL block for target keys (push_endpoint, uri, etc.).
-static void scan_hcl_nested_block_targets(CBMExtractCtx *ctx, TSNode block, const char **targets,
-                                          int *n_targets) {
+static bool scan_hcl_nested_block_targets(CBMExtractCtx *ctx, TSNode block,
+                                          infra_target_list_t *targets) {
     TSNode body = hcl_block_body(block);
     uint32_t bnc = ts_node_named_child_count(body);
     for (uint32_t bi = 0; bi < bnc; bi++) {
@@ -1183,10 +1247,11 @@ static void scan_hcl_nested_block_targets(CBMExtractCtx *ctx, TSNode block, cons
             continue;
         }
         char *bv = extract_hcl_string_val(ctx->arena, bval, ctx->source);
-        if (bv && strstr(bv, "://") && *n_targets < MAX_INFRA_BINDINGS) {
-            targets[(*n_targets)++] = bv;
+        if (bv && strstr(bv, "://") && !infra_target_list_push(ctx, targets, bv)) {
+            return false;
         }
     }
+    return true;
 }
 
 /* A scheduler/cron job has no topic/queue source key — its identity is the
@@ -1232,11 +1297,8 @@ static const char *hcl_scheduler_source(CBMExtractCtx *ctx, TSNode block, const 
 }
 
 static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
-    const char *sources[MAX_INFRA_BINDINGS] = {NULL};
-    const char *source_keys[MAX_INFRA_BINDINGS] = {NULL};
-    int n_sources = 0;
-    const char *targets[MAX_INFRA_BINDINGS] = {NULL};
-    int n_targets = 0;
+    infra_source_list_t sources = {0};
+    infra_target_list_t targets = {0};
 
     TSNode body = hcl_block_body(block);
     uint32_t nc = ts_node_named_child_count(body);
@@ -1260,16 +1322,17 @@ static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
                 continue;
             }
 
-            if (is_source_key(key) && n_sources < MAX_INFRA_BINDINGS) {
-                sources[n_sources] = val;
-                source_keys[n_sources] = key;
-                n_sources++;
+            if (is_source_key(key) && !infra_source_list_push(ctx, &sources, val, key)) {
+                return;
             }
-            if (is_target_key(key) && n_targets < MAX_INFRA_BINDINGS && strstr(val, "://")) {
-                targets[n_targets++] = val;
+            if (is_target_key(key) && strstr(val, "://") &&
+                !infra_target_list_push(ctx, &targets, val)) {
+                return;
             }
         } else if (strcmp(ck, "block") == 0) {
-            scan_hcl_nested_block_targets(ctx, child, targets, &n_targets);
+            if (!scan_hcl_nested_block_targets(ctx, child, &targets)) {
+                return;
+            }
         }
     }
 
@@ -1277,17 +1340,17 @@ static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
      * is the source. If we found an invocation target (uri/http_target) but no
      * explicit source key, synthesize the source from the scheduler resource so
      * the job→endpoint binding (INFRA_MAPS) still forms. */
-    if (n_sources == 0 && n_targets > 0) {
+    if (sources.count == 0 && targets.count > 0) {
         const char *sched_broker = NULL;
         const char *sched_src = hcl_scheduler_source(ctx, block, &sched_broker);
         if (sched_src) {
-            for (int ti = 0; ti < n_targets; ti++) {
-                if (!targets[ti]) {
+            for (int ti = 0; ti < targets.count; ti++) {
+                if (!targets.items[ti]) {
                     continue;
                 }
                 CBMInfraBinding ib = {
                     .source_name = sched_src,
-                    .target_url = targets[ti],
+                    .target_url = targets.items[ti],
                     .broker = sched_broker ? sched_broker : "cloud_scheduler",
                 };
                 cbm_infrabinding_push(&ctx->result->infra_bindings, ctx->arena, ib);
@@ -1296,7 +1359,7 @@ static void scan_hcl_block_for_bindings(CBMExtractCtx *ctx, TSNode block) {
         }
     }
 
-    emit_infra_bindings(ctx, sources, source_keys, n_sources, targets, n_targets);
+    emit_infra_bindings(ctx, &sources, &targets);
 }
 
 /* Handle YAML files: walk top-level block_mapping recursively */
