@@ -576,6 +576,13 @@ typedef int (*cbm_store_node_identity_visitor_fn)(const char *label, const char 
                                                   const char *file_path, void *userdata);
 int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                    cbm_store_node_identity_visitor_fn visitor, void *userdata);
+/* ID-bearing variant for callers that create relationships while streaming.
+ * Callback strings are borrowed until the next row. */
+typedef int (*cbm_store_node_ref_visitor_fn)(int64_t id, const char *label, const char *name,
+                                             const char *qualified_name, const char *file_path,
+                                             void *userdata);
+int cbm_store_visit_node_refs_by_label(cbm_store_t *s, const char *project, const char *label,
+                                       cbm_store_node_ref_visitor_fn visitor, void *userdata);
 
 /* Find nodes by file path. */
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
