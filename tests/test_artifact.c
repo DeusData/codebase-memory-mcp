@@ -379,13 +379,110 @@ TEST(pipeline_persistence_export_failure_returns_error) {
     capture_logs_start();
     int rc = cbm_pipeline_run(p);
     const char *logs = capture_logs_end();
-    cbm_pipeline_free(p);
 
     ASSERT_NEQ(rc, 0);
+    ASSERT_TRUE(cbm_pipeline_publication_committed(p));
     ASSERT_FALSE(cbm_artifact_exists(g_repo));
     ASSERT(strstr(logs, "msg=pipeline.err") != NULL);
     ASSERT(strstr(logs, "phase=artifact_export") != NULL);
+    cbm_pipeline_free(p);
 
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(pipeline_incremental_artifact_failure_reports_committed_graph) {
+    setup_artifact_test();
+
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/main.c", g_repo);
+    write_text_file(src, "int before_name(void) { return 0; }\n");
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(initial);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    cbm_pipeline_free(initial);
+    ASSERT_NOT_NULL(project);
+
+    /* Force the persistence export to fail only after the incremental staging
+     * database can be installed: an existing directory cannot be replaced by
+     * the graph.db.zst regular file. */
+    char art_dir[1024];
+    snprintf(art_dir, sizeof(art_dir), "%s/.codebase-memory", g_repo);
+    ASSERT_TRUE(cbm_mkdir_p(art_dir, 0755));
+    char zst[1024];
+    snprintf(zst, sizeof(zst), "%s/graph.db.zst", art_dir);
+    ASSERT_TRUE(cbm_mkdir_p(zst, 0755));
+    write_text_file(src, "int after_name_is_longer(void) { return 1; }\n");
+
+    cbm_pipeline_t *incremental = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(incremental);
+    cbm_pipeline_set_persistence(incremental, true);
+    int rc = cbm_pipeline_run(incremental);
+
+    ASSERT_NEQ(rc, 0);
+    ASSERT_TRUE(cbm_pipeline_publication_committed(incremental));
+    ASSERT_EQ(cbm_pipeline_publish_kind(incremental), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_FALSE(cbm_artifact_exists(g_repo));
+
+    cbm_store_t *store = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_nodes_by_name(store, project, "after_name_is_longer", &nodes, &node_count),
+        CBM_STORE_OK);
+    ASSERT_GT(node_count, 0);
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_store_close(store);
+
+    cbm_pipeline_free(incremental);
+    free(project);
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
+TEST(pipeline_full_publish_refreshes_existing_artifact_after_commit) {
+    setup_artifact_test();
+
+    char src[1024];
+    snprintf(src, sizeof(src), "%s/main.c", g_repo);
+    write_text_file(src, "int before_full_refresh(void) { return 0; }\n");
+
+    cbm_pipeline_t *initial = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(initial);
+    cbm_pipeline_set_persistence(initial, true);
+    ASSERT_EQ(cbm_pipeline_run(initial), 0);
+    ASSERT_TRUE(cbm_pipeline_publication_committed(initial));
+    ASSERT_TRUE(cbm_artifact_exists(g_repo));
+    char *project = strdup(cbm_pipeline_project_name(initial));
+    cbm_pipeline_free(initial);
+    ASSERT_NOT_NULL(project);
+
+    write_text_file(src, "int after_full_refresh_is_longer(void) { return 1; }\n");
+    cbm_pipeline_t *full = cbm_pipeline_new(g_repo, g_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(full);
+    ASSERT_EQ(cbm_pipeline_run(full), 0);
+    ASSERT_TRUE(cbm_pipeline_publication_committed(full));
+    ASSERT_EQ(cbm_pipeline_publish_kind(full), CBM_PIPELINE_PUBLISH_FULL);
+    cbm_pipeline_free(full);
+
+    char imported[1024];
+    snprintf(imported, sizeof(imported), "%s/refreshed.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, imported), 0);
+    cbm_store_t *store = cbm_store_open_path(imported);
+    ASSERT_NOT_NULL(store);
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, project, "after_full_refresh_is_longer", &nodes,
+                                           &node_count),
+              CBM_STORE_OK);
+    ASSERT_GT(node_count, 0);
+    cbm_store_free_nodes(nodes, node_count);
+    cbm_store_close(store);
+
+    free(project);
     cleanup_dir(g_tmpdir);
     PASS();
 }
@@ -565,6 +662,8 @@ SUITE(artifact) {
     RUN_TEST(artifact_gitattributes_created);
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
+    RUN_TEST(pipeline_incremental_artifact_failure_reports_committed_graph);
+    RUN_TEST(pipeline_full_publish_refreshes_existing_artifact_after_commit);
     RUN_TEST(artifact_import_rejects_size_mismatch);
     RUN_TEST(artifact_null_safety);
 }

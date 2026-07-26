@@ -235,6 +235,11 @@ const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p);
 /* True when the most recent FULL publish was reached by attempting an
  * incremental route first and safely falling back to a replacement rebuild. */
 bool cbm_pipeline_incremental_fallback(const cbm_pipeline_t *p);
+/* True once the staging database was atomically installed at the final path.
+ * This can remain true when a later persistence-artifact export fails, so
+ * callers can perform graph freshness/notification work while reporting the
+ * secondary failure explicitly. */
+bool cbm_pipeline_publication_committed(const cbm_pipeline_t *p);
 cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p);
 
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
