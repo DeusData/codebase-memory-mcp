@@ -878,6 +878,158 @@ TEST(cypher_func_type) {
     PASS();
 }
 
+enum {
+    WIDE_BINDING_NODE_COUNT = 17,
+    WIDE_BINDING_NINTH_EDGE_INDEX = 8,
+    WIDE_BINDING_NAME_CAP = 32,
+    WIDE_BINDING_QN_CAP = 64,
+    WIDE_BINDING_QUERY_CAP = 4096
+};
+
+static cbm_store_t *setup_wide_binding_store(void) {
+    cbm_store_t *s = cbm_store_open_memory();
+    if (!s ||
+        cbm_store_upsert_project(s, "wide-bindings", "/tmp/wide-bindings") != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+
+    int64_t ids[WIDE_BINDING_NODE_COUNT] = {0};
+    for (int i = 0; i < WIDE_BINDING_NODE_COUNT; i++) {
+        char name[WIDE_BINDING_NAME_CAP];
+        char qn[WIDE_BINDING_QN_CAP];
+        if (snprintf(name, sizeof(name), "node%02d", i) <= 0 ||
+            snprintf(qn, sizeof(qn), "wide-bindings.%s", name) <= 0) {
+            cbm_store_close(s);
+            return NULL;
+        }
+        cbm_node_t node = {.project = "wide-bindings",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "wide.c"};
+        ids[i] = cbm_store_upsert_node(s, &node);
+        if (ids[i] <= 0) {
+            cbm_store_close(s);
+            return NULL;
+        }
+    }
+    for (int i = 0; i + 1 < WIDE_BINDING_NODE_COUNT; i++) {
+        cbm_edge_t edge = {.project = "wide-bindings",
+                           .source_id = ids[i],
+                           .target_id = ids[i + 1],
+                           .type = "CALLS"};
+        if (cbm_store_insert_edge(s, &edge) <= 0) {
+            cbm_store_close(s);
+            return NULL;
+        }
+    }
+    return s;
+}
+
+static bool build_wide_binding_match(char *query, size_t query_capacity, size_t *used_out) {
+    if (!query || query_capacity == 0 || !used_out) {
+        return false;
+    }
+    int written = snprintf(query, query_capacity, "MATCH (n00:Function)");
+    if (written <= 0 || (size_t)written >= query_capacity) {
+        return false;
+    }
+    size_t used = (size_t)written;
+    for (int i = 0; i + 1 < WIDE_BINDING_NODE_COUNT; i++) {
+        written = snprintf(query + used, query_capacity - used,
+                           "-[r%02d:CALLS]->(n%02d:Function)", i, i + 1);
+        if (written <= 0 || (size_t)written >= query_capacity - used) {
+            return false;
+        }
+        used += (size_t)written;
+    }
+    *used_out = used;
+    return true;
+}
+
+TEST(cypher_exec_binds_every_node_and_edge_variable_beyond_inline_capacity) {
+    cbm_store_t *s = setup_wide_binding_store();
+    ASSERT_NOT_NULL(s);
+
+    char query[WIDE_BINDING_QUERY_CAP];
+    size_t used = 0;
+    ASSERT_TRUE(build_wide_binding_match(query, sizeof(query), &used));
+    int written = snprintf(query + used, sizeof(query) - used,
+                       " WHERE n00.name = 'node00' RETURN n%02d.name, type(r%02d)",
+                       WIDE_BINDING_NODE_COUNT - 1, WIDE_BINDING_NINTH_EDGE_INDEX);
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(query) - used);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, query, "wide-bindings", 0, &result), CBM_STORE_OK);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 2);
+    ASSERT_STR_EQ(result.rows[0][0], "node16");
+    ASSERT_STR_EQ(result.rows[0][1], "CALLS");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_default_projection_includes_every_variable_beyond_inline_capacity) {
+    cbm_store_t *s = setup_wide_binding_store();
+    ASSERT_NOT_NULL(s);
+
+    char query[WIDE_BINDING_QUERY_CAP];
+    size_t used = 0;
+    ASSERT_TRUE(build_wide_binding_match(query, sizeof(query), &used));
+    int written = snprintf(query + used, sizeof(query) - used, " WHERE n00.name = 'node00'");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(query) - used);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, query, "wide-bindings", 0, &result), CBM_STORE_OK);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, WIDE_BINDING_NODE_COUNT * 3);
+    ASSERT_STR_EQ(result.columns[result.col_count - 3], "n16.name");
+    ASSERT_STR_EQ(result.rows[0][result.col_count - 3], "node16");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_with_projects_every_variable_beyond_inline_capacity) {
+    cbm_store_t *s = setup_wide_binding_store();
+    ASSERT_NOT_NULL(s);
+
+    char query[WIDE_BINDING_QUERY_CAP];
+    size_t used = 0;
+    ASSERT_TRUE(build_wide_binding_match(query, sizeof(query), &used));
+    int written = snprintf(query + used, sizeof(query) - used,
+                           " WHERE n00.name = 'node00' WITH ");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(query) - used);
+    used += (size_t)written;
+    for (int i = 0; i < WIDE_BINDING_NODE_COUNT; i++) {
+        written = snprintf(query + used, sizeof(query) - used, "%sn%02d AS a%02d",
+                           i == 0 ? "" : ", ", i, i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(query) - used);
+        used += (size_t)written;
+    }
+    written = snprintf(query + used, sizeof(query) - used, " RETURN a16");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, sizeof(query) - used);
+
+    cbm_cypher_result_t result = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, query, "wide-bindings", 0, &result), CBM_STORE_OK);
+    ASSERT_EQ(result.row_count, 1);
+    ASSERT_EQ(result.col_count, 1);
+    ASSERT_STR_EQ(result.rows[0][0], "node16");
+
+    cbm_cypher_result_free(&result);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_func_id) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
@@ -4232,6 +4384,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_return_properties);
     RUN_TEST(cypher_func_labels);
     RUN_TEST(cypher_func_type);
+    RUN_TEST(cypher_exec_binds_every_node_and_edge_variable_beyond_inline_capacity);
+    RUN_TEST(cypher_exec_default_projection_includes_every_variable_beyond_inline_capacity);
+    RUN_TEST(cypher_exec_with_projects_every_variable_beyond_inline_capacity);
     RUN_TEST(cypher_func_id);
     RUN_TEST(cypher_active_overlay_id_query_uses_canonical_identity);
     RUN_TEST(cypher_func_keys);
