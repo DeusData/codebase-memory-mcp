@@ -5,6 +5,7 @@
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "foundation/compat.h" // CBM_TLS
+#include <limits.h>
 #include <stdlib.h>            // calloc/free for the symbol-set cache
 
 enum {
@@ -594,34 +595,90 @@ static bool is_member_access_node(const char *kind) {
     return false;
 }
 
+typedef struct {
+    TSNode node;
+    int bdepth;
+    int ldepth;
+    int adepth;
+} complexity_frame_t;
+
+typedef struct {
+    complexity_frame_t inline_items[CBM_SZ_64];
+    complexity_frame_t *items;
+    int count;
+    int capacity;
+} complexity_stack_t;
+
+static void complexity_stack_init(complexity_stack_t *stack) {
+    stack->items = stack->inline_items;
+    stack->count = 0;
+    stack->capacity = CBM_SZ_64;
+}
+
+static void complexity_stack_destroy(complexity_stack_t *stack) {
+    if (stack->items != stack->inline_items) {
+        free(stack->items);
+    }
+}
+
+/*
+ * The inline working set keeps ordinary functions allocation-free. Wider
+ * sibling sets grow geometrically, so a function with F AST nodes takes O(F)
+ * traversal time, amortized O(1) pushes, and O(W) peak scratch memory for the
+ * maximum pending frontier W. Spill storage is freed before this function
+ * returns rather than extending the extracted result's lifetime.
+ */
+static bool complexity_stack_push(complexity_stack_t *stack, complexity_frame_t frame) {
+    if (stack->count >= stack->capacity) {
+        if (stack->capacity > INT_MAX / PAIR_LEN) {
+            return false;
+        }
+        int next_capacity = stack->capacity * PAIR_LEN;
+        if ((size_t)next_capacity > SIZE_MAX / sizeof(*stack->items)) {
+            return false;
+        }
+        size_t bytes = (size_t)next_capacity * sizeof(*stack->items);
+        complexity_frame_t *grown = NULL;
+        if (stack->items == stack->inline_items) {
+            grown = (complexity_frame_t *)malloc(bytes);
+            if (grown) {
+                memcpy(grown, stack->inline_items, (size_t)stack->count * sizeof(*stack->items));
+            }
+        } else {
+            grown = (complexity_frame_t *)realloc(stack->items, bytes);
+        }
+        if (!grown) {
+            return false;
+        }
+        stack->items = grown;
+        stack->capacity = next_capacity;
+    }
+    stack->items[stack->count++] = frame;
+    return true;
+}
+
 // One traversal computing cyclomatic + cognitive + loop-nesting + access-depth
 // metrics. Each frame carries its branch-, loop- and access-nesting depth so
 // every metric (cognitive Campbell penalty, loop_depth polynomial-degree proxy,
 // max chained access depth) is produced in a single walk.
-void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out) {
+bool cbm_compute_complexity(TSNode node, const char **branching_types, cbm_complexity_t *out) {
     out->cyclomatic = 0;
     out->cognitive = 0;
     out->loop_count = 0;
     out->loop_depth = 0;
     out->max_access_depth = 0;
     if (!branching_types) {
-        return;
+        return true;
     }
-    struct cx_frame {
-        TSNode node;
-        int bdepth;
-        int ldepth;
-        int adepth;
-    };
-    struct cx_frame stack[BRANCHING_STACK_CAP];
-    int top = 0;
-    stack[top].node = node;
-    stack[top].bdepth = 0;
-    stack[top].ldepth = 0;
-    stack[top].adepth = 0;
-    top++;
-    while (top > 0) {
-        struct cx_frame f = stack[--top];
+    complexity_stack_t stack;
+    complexity_stack_init(&stack);
+    if (!complexity_stack_push(
+            &stack, (complexity_frame_t){.node = node, .bdepth = 0, .ldepth = 0, .adepth = 0})) {
+        complexity_stack_destroy(&stack);
+        return false;
+    }
+    while (stack.count > 0) {
+        complexity_frame_t f = stack.items[--stack.count];
         const char *kind = ts_node_type(f.node);
         bool is_branch = false;
         for (const char **t = branching_types; *t; t++) {
@@ -660,14 +717,21 @@ void cbm_compute_complexity(TSNode node, const char **branching_types, cbm_compl
             child_l = d;
         }
         uint32_t n = ts_node_child_count(f.node);
-        for (int i = (int)n - SKIP_ONE; i >= 0 && top < BRANCHING_STACK_CAP; i--) {
-            stack[top].node = ts_node_child(f.node, (uint32_t)i);
-            stack[top].bdepth = child_b;
-            stack[top].ldepth = child_l;
-            stack[top].adepth = child_a;
-            top++;
+        for (int i = (int)n - SKIP_ONE; i >= 0; i--) {
+            complexity_frame_t child = {
+                .node = ts_node_child(f.node, (uint32_t)i),
+                .bdepth = child_b,
+                .ldepth = child_l,
+                .adepth = child_a,
+            };
+            if (!complexity_stack_push(&stack, child)) {
+                complexity_stack_destroy(&stack);
+                return false;
+            }
         }
     }
+    complexity_stack_destroy(&stack);
+    return true;
 }
 
 // --- Enclosing function detection ---

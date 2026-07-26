@@ -3180,14 +3180,21 @@ static void resolve_cpp_trailing_return(CBMArena *a, TSNode func_node, const cha
 }
 
 /* Compute and store the structural complexity metrics for a definition. */
-static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpec *spec) {
+static bool set_def_complexity(CBMExtractCtx *ctx, CBMDefinition *def, TSNode body,
+                               const CBMLangSpec *spec) {
     cbm_complexity_t cx;
-    cbm_compute_complexity(body, spec->branching_node_types, &cx);
+    if (!cbm_compute_complexity(body, spec->branching_node_types, &cx)) {
+        ctx->result->has_error = true;
+        ctx->result->error_msg =
+            cbm_arena_strdup(ctx->arena, "complexity traversal allocation failed");
+        return false;
+    }
     def->complexity = cx.cyclomatic;
     def->cognitive = cx.cognitive;
     def->loop_count = cx.loop_count;
     def->loop_depth = cx.loop_depth;
     def->max_access_depth = cx.max_access_depth;
+    return true;
 }
 
 /* Extract the bare type name from a Go method receiver node.
@@ -3381,7 +3388,9 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
 
     // Complexity
     if (spec->branching_node_types && spec->branching_node_types[0]) {
-        set_def_complexity(&def, node, spec);
+        if (!set_def_complexity(ctx, &def, node, spec)) {
+            return;
+        }
     }
 
     // MinHash fingerprint
@@ -4339,7 +4348,9 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
     if (spec->branching_node_types && spec->branching_node_types[0]) {
-        set_def_complexity(&def, child, spec);
+        if (!set_def_complexity(ctx, &def, child, spec)) {
+            return;
+        }
     }
 
     // MinHash fingerprint
@@ -4545,7 +4556,9 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         }
 
         if (spec->branching_node_types && spec->branching_node_types[0]) {
-            set_def_complexity(&def, child, spec);
+            if (!set_def_complexity(ctx, &def, child, spec)) {
+                return;
+            }
         }
 
         // MinHash fingerprint
