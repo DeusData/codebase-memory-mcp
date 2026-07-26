@@ -126,6 +126,50 @@ static bool tool_schema_required_has(const char *json, const char *tool, const c
     return found;
 }
 
+static bool tool_input_schemas_equal(const char *left_json, const char *right_json,
+                                     const char *tool_name) {
+    yyjson_doc *left_doc = yyjson_read(left_json, strlen(left_json), 0);
+    yyjson_doc *right_doc = yyjson_read(right_json, strlen(right_json), 0);
+    if (!left_doc || !right_doc) {
+        yyjson_doc_free(left_doc);
+        yyjson_doc_free(right_doc);
+        return false;
+    }
+
+    const yyjson_val *left_tools = tool_array_from_doc(left_doc);
+    const yyjson_val *right_tools = tool_array_from_doc(right_doc);
+    yyjson_val *left_schema = NULL;
+    yyjson_val *right_schema = NULL;
+    yyjson_arr_iter it;
+    yyjson_val *item;
+
+    if (left_tools) {
+        yyjson_arr_iter_init((yyjson_val *)left_tools, &it);
+        while ((item = yyjson_arr_iter_next(&it)) != NULL) {
+            yyjson_val *name = yyjson_obj_get(item, "name");
+            if (name && yyjson_is_str(name) && strcmp(yyjson_get_str(name), tool_name) == 0) {
+                left_schema = yyjson_obj_get(item, "inputSchema");
+                break;
+            }
+        }
+    }
+    if (right_tools) {
+        yyjson_arr_iter_init((yyjson_val *)right_tools, &it);
+        while ((item = yyjson_arr_iter_next(&it)) != NULL) {
+            yyjson_val *name = yyjson_obj_get(item, "name");
+            if (name && yyjson_is_str(name) && strcmp(yyjson_get_str(name), tool_name) == 0) {
+                right_schema = yyjson_obj_get(item, "inputSchema");
+                break;
+            }
+        }
+    }
+
+    bool equal = left_schema && right_schema && yyjson_equals(left_schema, right_schema);
+    yyjson_doc_free(left_doc);
+    yyjson_doc_free(right_doc);
+    return equal;
+}
+
 static char *save_tool_mode(void) {
     const char *mode = getenv("CBM_TOOL_MODE");
     if (!mode) return NULL;
@@ -911,6 +955,24 @@ TEST(streamlined_reveal_covers_classic_capabilities) {
     PASS();
 }
 
+TEST(query_graph_input_schema_identical_across_modes) {
+    char *saved_mode = save_tool_mode();
+
+    cbm_setenv("CBM_TOOL_MODE", "classic", 1);
+    char *classic = cbm_mcp_tools_list(NULL);
+    cbm_unsetenv("CBM_TOOL_MODE");
+    char *streamlined = cbm_mcp_tools_list(NULL);
+
+    restore_tool_mode(saved_mode);
+    ASSERT_NOT_NULL(classic);
+    ASSERT_NOT_NULL(streamlined);
+    ASSERT(tool_input_schemas_equal(classic, streamlined, "query_graph"));
+
+    free(streamlined);
+    free(classic);
+    PASS();
+}
+
 TEST(streamlined_core_parameter_contract) {
     char *saved_mode = save_tool_mode();
     cbm_unsetenv("CBM_TOOL_MODE");
@@ -930,7 +992,9 @@ TEST(streamlined_core_parameter_contract) {
         ASSERT(tool_schema_has_property(json, "search_graph", search_params[i]));
     }
 
-    const char *query_params[] = {"query", "project", "max_rows", "max_output_bytes"};
+    const char *query_params[] = {
+        "query", "project", "max_rows", "max_output_bytes", "graph", "format",
+    };
     for (size_t i = 0; i < sizeof(query_params) / sizeof(query_params[0]); i++) {
         ASSERT(tool_schema_has_property(json, "query_graph", query_params[i]));
     }
@@ -3435,6 +3499,7 @@ SUITE(tool_consolidation) {
     RUN_TEST(hidden_tools_reveal_discoverable_tools);
     RUN_TEST(hidden_tools_payload_excludes_already_visible_configured_tools);
     RUN_TEST(streamlined_reveal_covers_classic_capabilities);
+    RUN_TEST(query_graph_input_schema_identical_across_modes);
     RUN_TEST(streamlined_core_parameter_contract);
     RUN_TEST(default_tool_autoindex_description_is_precise);
     RUN_TEST(query_graph_description_explains_compositional_value);

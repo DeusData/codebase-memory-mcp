@@ -10294,13 +10294,18 @@ TEST(cli_installed_skill_limits_match_server_contract) {
     const cbm_skill_t *installed = cbm_get_skills();
     ASSERT_NOT_NULL(installed);
     ASSERT_NOT_NULL(installed[0].content);
-    /* Derived from the same macro the skill text and the config registry use
-     * (CBM_DEFAULT_QUERY_MAX_ROWS_STR, cli.h:400), so this test cannot pass
-     * while the published limit disagrees with the enforced one. Upstream
-     * asserted the literal "100k row ceiling", which would keep passing after
-     * the cap changed — the exact drift a test named "limits match server
-     * contract" exists to prevent. */
-    ASSERT(strstr(installed[0].content, CBM_DEFAULT_QUERY_MAX_ROWS_STR " row ceiling") != NULL);
+    /* Derived from the same constants.h macros the skill text and config
+     * registry use, so this test cannot pass while either published budget
+     * disagrees with the enforced one. Upstream asserted the literal "100k row
+     * ceiling", which would keep passing after the cap changed — the exact
+     * drift a test named "limits match server contract" exists to prevent. */
+    ASSERT(strstr(installed[0].content,
+                  "query_max_rows defaults to " CBM_DEFAULT_QUERY_MAX_ROWS_STR
+                  " final rows and marks a complete prefix as truncated") != NULL);
+    ASSERT(strstr(installed[0].content,
+                  "query_max_working_rows defaults to "
+                  CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
+                  " intermediate rows and fails loudly when exhausted") != NULL);
     /* Locks the string twin to the value it describes, so the two cannot drift
      * apart silently. Without this, CBM_DEFAULT_SEARCH_LIMIT could move while
      * the published "50" stayed and every assertion below would still pass. */
@@ -11292,6 +11297,33 @@ TEST(cli_config_get_int) {
     /* Non-numeric → default */
     cbm_config_set(cfg, "limit", "abc");
     ASSERT_EQ(cbm_config_get_int(cfg, "limit", 50000), 50000);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_query_row_limits_enforce_advertised_ranges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-query-limits-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "0"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, CBM_STRINGIFY(CBM_MAX_QUERY_ROWS)), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "-1"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_ROWS, "1000001"), 0);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS,
+                             CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS)),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "0"), 0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_QUERY_MAX_WORKING_ROWS, "1000001"), 0);
 
     cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
@@ -13502,6 +13534,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
+    RUN_TEST(cli_config_query_row_limits_enforce_advertised_ranges);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
 

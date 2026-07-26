@@ -88,6 +88,19 @@ enum { CBM_DEFAULT_SEARCH_LIMIT = 50 };
  * atoi(CBM_DEFAULT_SEARCH_LIMIT_STR) == CBM_DEFAULT_SEARCH_LIMIT. */
 #define CBM_DEFAULT_SEARCH_LIMIT_STR "50"
 
+/* ── Cypher query row budgets ────────────────────────────────── */
+/* max_rows is an output-shaping cap. The working-row budget is a separate
+ * correctness-preserving resource bound for intermediate bindings. An
+ * explicit output cap raises the effective working budget to at least the
+ * requested output size; both remain bounded by these operator-approved
+ * maxima. Keep registry/help strings derived with CBM_STRINGIFY. */
+#define CBM_DEFAULT_QUERY_MAX_ROWS 100000
+#define CBM_MAX_QUERY_ROWS 1000000
+#define CBM_DEFAULT_QUERY_MAX_WORKING_ROWS 100000
+#define CBM_MAX_QUERY_WORKING_ROWS 1000000
+#define CBM_DEFAULT_QUERY_MAX_ROWS_STR CBM_STRINGIFY(CBM_DEFAULT_QUERY_MAX_ROWS)
+#define CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR CBM_STRINGIFY(CBM_DEFAULT_QUERY_MAX_WORKING_ROWS)
+
 /* Resolution scoring: prefer production symbols over test/mock definitions
  * before namespace-distance tie-breaks. Shared by call and import resolvers so
  * duplicate-name behavior stays consistent. */

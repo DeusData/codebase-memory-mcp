@@ -557,6 +557,9 @@ int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_
 /* Find nodes by label. */
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count);
+/* Limited canonical node read. limit <= 0 delegates to the unbounded API. */
+int cbm_store_find_nodes_by_label_limited(cbm_store_t *s, const char *project, const char *label,
+                                          int limit, cbm_node_t **out, int *count);
 /* Active overlay node read view for project + optional label.
  * label == NULL returns all active nodes for the project. */
 int cbm_store_find_nodes_by_label_overlay_view(cbm_store_t *s, const char *project,

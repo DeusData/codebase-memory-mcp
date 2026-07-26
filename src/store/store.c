@@ -170,6 +170,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_nodes_by_name;
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_label;
+    sqlite3_stmt *stmt_find_nodes_by_label_limited;
     sqlite3_stmt *stmt_find_nodes_by_file;
     sqlite3_stmt *stmt_count_nodes;
     sqlite3_stmt *stmt_delete_nodes_by_project;
@@ -1599,6 +1600,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_find_nodes_by_name);
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
     finalize_stmt(&s->stmt_find_nodes_by_label);
+    finalize_stmt(&s->stmt_find_nodes_by_label_limited);
     finalize_stmt(&s->stmt_find_nodes_by_file);
     finalize_stmt(&s->stmt_count_nodes);
     finalize_stmt(&s->stmt_delete_nodes_by_project);
@@ -2837,6 +2839,33 @@ int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const cha
                               "start_line, end_line, properties FROM nodes "
                               "WHERE project = ?1 AND label = ?2;",
                               project, label, out, count);
+}
+
+int cbm_store_find_nodes_by_label_limited(cbm_store_t *s, const char *project, const char *label,
+                                          int limit, cbm_node_t **out, int *count) {
+    if (limit <= 0) {
+        return cbm_store_find_nodes_by_label(s, project, label, out, count);
+    }
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project || !label) {
+        return CBM_STORE_ERR;
+    }
+
+    static const char sql[] = "SELECT id, project, label, name, qualified_name, file_path, "
+                              "start_line, end_line, properties FROM nodes "
+                              "WHERE project = ?1 AND label = ?2 ORDER BY id LIMIT ?3;";
+    sqlite3_stmt *stmt = prepare_cached(s, &s->stmt_find_nodes_by_label_limited, sql);
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, ST_COL_1, project);
+    bind_text(stmt, ST_COL_2, label);
+    sqlite3_bind_int(stmt, ST_COL_3, limit);
+    return collect_nodes_from_stmt(s, stmt, "find_nodes_by_label_limited", out, count);
 }
 
 int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,

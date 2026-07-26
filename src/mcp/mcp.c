@@ -1154,7 +1154,7 @@ static const tool_def_t TOOLS[] = {
      "MATCH (f:File) RETURN f.file_path,count(*). Any supported query shape is allowed; "
      "WITH can feed later MATCH/OPTIONAL MATCH stages; ORDER BY accepts multiple projected "
      "fields or aliases. Explicit labels/properties and LIMIT are optional efficiency aids. "
-     "Server caps query_max_rows and "
+     "Server caps query_max_rows, query_max_working_rows, and "
      "query_max_output_bytes; raise only when needed. Dependency symbols use proj.dep.* and "
      "source:dependency; filter them with a supported predicate such as "
      "WHERE n.project =~ '.*\\.dep\\..*'. "
@@ -1167,7 +1167,7 @@ static const tool_def_t TOOLS[] = {
      "query\"},\"project\":{\"type\":\"string\",\"description\":\"Indexed project name. Omit to "
      "use the MCP server project derived from server CWD.\"},\"max_rows\":{\"type\":\"integer\","
      "\"description\":\"Maximum result rows. Omit to use query_max_rows config; set 0 to use "
-     "the implementation ceiling. Matching, aggregation, and ordering remain exact before this "
+     "the built-in default. Matching, aggregation, and ordering remain exact before this "
      "output cap. A Cypher LIMIT can lower but not bypass the cap. For response bytes, set "
      "max_output_bytes.\"},"
      "\"max_output_bytes\":{\"type\":"
@@ -8018,6 +8018,8 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
                                           CBM_DEFAULT_QUERY_MAX_ROWS);
     int max_rows = cbm_mcp_has_arg(args, "max_rows") ? cbm_mcp_get_int_arg(args, "max_rows", 0)
                                                      : cfg_max_rows;
+    int max_working_rows = cbm_config_get_int(srv->config, CBM_CONFIG_QUERY_MAX_WORKING_ROWS,
+                                              CBM_DEFAULT_QUERY_MAX_WORKING_ROWS);
     int cfg_max_output = cbm_config_get_int(srv->config, CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES,
                                             CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES);
     int max_output_bytes = cbm_mcp_get_int_arg(args, "max_output_bytes", cfg_max_output);
@@ -8065,10 +8067,14 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         !missed_graph && project && mcp_overlay_view_ready(store, project, &overlay_summary);
     bool used_active_cypher_nodes = false;
     cbm_cypher_result_t result = {0};
+    cbm_cypher_limits_t limits = {
+        .max_output_rows = max_rows,
+        .max_working_rows = max_working_rows,
+    };
     int rc = overlay_ready
-                 ? cbm_cypher_execute_active_nodes(store, query, project, max_rows, &result,
-                                                   &used_active_cypher_nodes)
-                 : cbm_cypher_execute(store, query, cypher_project, max_rows, &result);
+                 ? cbm_cypher_execute_active_nodes_with_limits(store, query, project, &limits,
+                                                               &result, &used_active_cypher_nodes)
+                 : cbm_cypher_execute_with_limits(store, query, cypher_project, &limits, &result);
 
     if (rc < 0) {
         char *err_msg = result.error ? result.error : "query execution failed";
@@ -8103,10 +8109,16 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
             cbm_toon_row_end(&sb);
         }
         cbm_toon_scalar_int(&sb, "total", result.row_count);
+        if (result.truncated) {
+            cbm_toon_scalar_bool(&sb, "truncated", true);
+            cbm_toon_scalar_str(
+                &sb, "hint",
+                "query_max_rows returned a complete prefix; raise it or add an explicit LIMIT");
+        }
         if (result.warning) {
             cbm_toon_scalar_str(&sb, "warning", result.warning);
         }
-        if (result.row_count == 0) {
+        if (result.row_count == 0 && !result.truncated) {
             char *vocab_hint =
                 query_graph_no_rows_hint(store, cypher_project, overlay_ready, query);
             cbm_toon_scalar_str(&sb, "hint",
@@ -8137,11 +8149,17 @@ static char *handle_query_graph(cbm_mcp_server_t *srv, const char *args) {
         }
         yyjson_mut_obj_add_val(doc, root, "rows", rows);
         yyjson_mut_obj_add_int(doc, root, "total", result.row_count);
+        if (result.truncated) {
+            yyjson_mut_obj_add_bool(doc, root, "truncated", true);
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                "query_max_rows returned a complete prefix; raise it or add an explicit LIMIT");
+        }
         if (result.warning) {
             yyjson_mut_obj_add_str(doc, root, "warning", result.warning);
         }
 
-        if (result.row_count == 0) {
+        if (result.row_count == 0 && !result.truncated) {
             char *vocab_hint =
                 query_graph_no_rows_hint(store, cypher_project, overlay_ready, query);
             /* add_strcpy: add_str stores the pointer without copying, and the

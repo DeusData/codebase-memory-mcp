@@ -1497,12 +1497,15 @@ static const char skill_content[] =
     "## Gotchas\n"
     "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
     "use `query_graph` with Cypher to see actual edges.\n"
-    /* Row cap concatenated from CBM_DEFAULT_QUERY_MAX_ROWS_STR (cli.h:400) rather
-     * than spelled out, so raising the default cannot leave this text stale. */
-    "2. `query_graph` is bounded two ways: a " CBM_DEFAULT_QUERY_MAX_ROWS_STR " row ceiling "
-    "(query_max_rows, which a Cypher LIMIT may lower but not bypass) and query_max_output_bytes. "
-    "Use LIMIT when it helps exploration efficiency; omit it when full results are necessary, and "
-    "set max_output_bytes=0 only when uncapped output is appropriate.\n"
+    /* Defaults are concatenated from constants.h rather than restated, so
+     * changing either configured budget cannot leave this text stale. */
+    "2. `query_graph` is bounded three ways: query_max_rows defaults to "
+    CBM_DEFAULT_QUERY_MAX_ROWS_STR " final rows and marks a complete prefix as truncated; "
+    "query_max_working_rows defaults to " CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR
+    " intermediate rows and fails loudly when exhausted; query_max_output_bytes bounds the "
+    "serialized response. A Cypher LIMIT may lower but not bypass the output cap. Use LIMIT when "
+    "it helps exploration efficiency; omit it when full results are necessary, and set "
+    "max_output_bytes=0 only when uncapped output is appropriate.\n"
     "3. `trace_path` works best with exact names — use `search_graph(name_pattern=...)` first.\n"
     "4. `direction=\"outbound\"` returns callees only; use `direction=\"both\"` for callers too.\n"
     /* Default concatenated from CBM_DEFAULT_SEARCH_LIMIT_STR (constants.h) so
@@ -7162,6 +7165,14 @@ static bool cbm_config_decimal_integer_in_range(const char *value, long minimum,
 }
 
 static bool cbm_config_value_is_valid(const char *key, const char *value) {
+    if (key && strcmp(key, CBM_CONFIG_QUERY_MAX_ROWS) == 0 &&
+        !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_QUERY_ROWS)) {
+        return false;
+    }
+    if (key && strcmp(key, CBM_CONFIG_QUERY_MAX_WORKING_ROWS) == 0 &&
+        !cbm_config_decimal_integer_in_range(value, 1, CBM_MAX_QUERY_WORKING_ROWS)) {
+        return false;
+    }
     if (key && strcmp(key, CBM_CONFIG_AUTO_DEP_LIMIT) == 0 &&
         !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_AUTO_DEP_LIMIT)) {
         return false;
@@ -14173,9 +14184,15 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "Controls how far call chains are traced. 25 covers typical call depth; raise to 100+ for deep dependency tracing."},
     {CBM_CONFIG_QUERY_MAX_ROWS, CBM_DEFAULT_QUERY_MAX_ROWS_STR, NULL, "Search",
      "Default result-row cap for query_graph when max_rows is omitted",
-     "0-1000000",
-     "Matches the Cypher engine's non-bypassable row ceiling by default. Lower to bound result "
-     "rows without changing which rows match; Cypher LIMIT may lower but not bypass this cap."},
+     "0-" CBM_STRINGIFY(CBM_MAX_QUERY_ROWS),
+     "Bounds only rows returned after exact selection. Cypher LIMIT may lower but not bypass this "
+     "cap; 0 selects the default."},
+    {CBM_CONFIG_QUERY_MAX_WORKING_ROWS, CBM_DEFAULT_QUERY_MAX_WORKING_ROWS_STR, NULL, "Search",
+     "Maximum intermediate rows/candidates materialized by query_graph",
+     "1-" CBM_STRINGIFY(CBM_MAX_QUERY_WORKING_ROWS),
+     "A correctness-preserving resource budget, separate from output shaping. Exhaustion fails "
+     "loudly instead of returning partial matches. An explicit max_rows raises the effective "
+     "working budget when needed."},
     {CBM_CONFIG_QUERY_MAX_OUTPUT_BYTES, CBM_DEFAULT_QUERY_MAX_OUTPUT_BYTES_STR, NULL, "Search",
      "Max response bytes for query_graph (0=unlimited)",
      "0-104857600",

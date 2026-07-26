@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <foundation/constants.h>
 #include <store/store.h>
 
 /* ── Token types ────────────────────────────────────────────────── */
@@ -319,6 +320,8 @@ typedef struct {
     /* rows[row_idx][col_idx] = string value */
     const char ***rows;
     int row_count;
+    /* True when max_output_rows returned a complete result prefix. */
+    bool truncated;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
     /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-
@@ -327,8 +330,21 @@ typedef struct {
     char *warning;
 } cbm_cypher_result_t;
 
+typedef struct {
+    /* Final result rows. Zero selects CBM_DEFAULT_QUERY_MAX_ROWS. */
+    int max_output_rows;
+    /* Intermediate bindings/candidates. Zero selects the default; the
+     * effective value is never lower than max_output_rows. */
+    int max_working_rows;
+} cbm_cypher_limits_t;
+
+/* Execute with separate output-shaping and intermediate resource limits.
+ * Values outside their documented 0..CBM_MAX_QUERY_* ranges fail loudly. */
+int cbm_cypher_execute_with_limits(cbm_store_t *store, const char *query, const char *project,
+                                   const cbm_cypher_limits_t *limits, cbm_cypher_result_t *out);
+
 /* Execute a Cypher query against a store.
- * max_rows: limit on output rows (0 = use the implementation ceiling).
+ * max_rows: limit on output rows (0 = CBM_DEFAULT_QUERY_MAX_ROWS).
  * project: project name filter (NULL = all projects).
  * Returns -1 on error (check out->error for message). */
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
@@ -342,6 +358,10 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
 int cbm_cypher_execute_active_nodes(cbm_store_t *store, const char *query, const char *project,
                                     int max_rows, cbm_cypher_result_t *out,
                                     bool *used_active_nodes);
+int cbm_cypher_execute_active_nodes_with_limits(cbm_store_t *store, const char *query,
+                                                const char *project,
+                                                const cbm_cypher_limits_t *limits,
+                                                cbm_cypher_result_t *out, bool *used_active_nodes);
 
 /* Free a query result. */
 void cbm_cypher_result_free(cbm_cypher_result_t *r);
