@@ -42,6 +42,63 @@ static const CBMDefinition *find_def(const CBMFileResult *r, const char *name) {
     return NULL;
 }
 
+/* Build two functions with an identical, structurally meaningful prefix whose
+ * leaf-token count exceeds the former 4096-token MinHash prefix. The optional
+ * suffix then proves that structure after that boundary affects the result. */
+static char *build_long_minhash_source(const char *name, bool add_distinct_suffix) {
+    enum { MINHASH_LONG_PREFIX_STATEMENTS = 1800 };
+    char *source = malloc(CBM_SZ_64K);
+    if (!source) {
+        return NULL;
+    }
+    int n = snprintf(source, CBM_SZ_64K,
+                     "package main\n"
+                     "func %s(x int) int {\n"
+                     "    if x > 0 { x-- } else { x++ }\n"
+                     "    for i := 0; i < 8; i++ { x += i }\n"
+                     "    switch x {\n"
+                     "    case 1: x *= 2\n"
+                     "    case 2: x /= 2\n"
+                     "    default: x %%= 3\n"
+                     "    }\n"
+                     "    values := []int{1, 2, 3}\n"
+                     "    for _, value := range values { x += value }\n"
+                     "    defer func() { x++ }()\n",
+                     name);
+    if (n <= 0 || (size_t)n >= CBM_SZ_64K) {
+        free(source);
+        return NULL;
+    }
+    size_t used = (size_t)n;
+    for (int i = 0; i < MINHASH_LONG_PREFIX_STATEMENTS; i++) {
+        n = snprintf(source + used, CBM_SZ_64K - used, "    x += 1\n");
+        if (n <= 0 || (size_t)n >= CBM_SZ_64K - used) {
+            free(source);
+            return NULL;
+        }
+        used += (size_t)n;
+    }
+    const char *suffix =
+        add_distinct_suffix
+            ? "    ch := make(chan int, 1)\n"
+              "    select {\n"
+              "    case ch <- x: x = <-ch\n"
+              "    default: close(ch)\n"
+              "    }\n"
+              "    labels := map[string]int{\"value\": x}\n"
+              "    for key, value := range labels {\n"
+              "        if len(key) > 0 && value != 0 { x += value }\n"
+              "    }\n"
+              "    go func(value int) { _ = value }(x)\n"
+            : "";
+    n = snprintf(source + used, CBM_SZ_64K - used, "%s    return x\n}\n", suffix);
+    if (n <= 0 || (size_t)n >= CBM_SZ_64K - used) {
+        free(source);
+        return NULL;
+    }
+    return source;
+}
+
 /* Count SIMILAR_TO edges in graph buffer. */
 static int count_similar_to_edges(const cbm_gbuf_t *gb) {
     int count = 0;
@@ -393,6 +450,38 @@ TEST(minhash_type_annotation_normalized) {
 
     cbm_free_result(ra);
     cbm_free_result(rb);
+    PASS();
+}
+
+TEST(minhash_reads_structure_after_former_token_prefix) {
+    char *src_without_suffix = build_long_minhash_source("LongPrefixOnly", false);
+    char *src_with_suffix = build_long_minhash_source("LongPrefixWithSuffix", true);
+    ASSERT_NOT_NULL(src_without_suffix);
+    ASSERT_NOT_NULL(src_with_suffix);
+
+    CBMFileResult *without_result =
+        extract_one(src_without_suffix, CBM_LANG_GO, "test", "without_suffix.go");
+    CBMFileResult *with_result =
+        extract_one(src_with_suffix, CBM_LANG_GO, "test", "with_suffix.go");
+    ASSERT_NOT_NULL(without_result);
+    ASSERT_NOT_NULL(with_result);
+
+    const CBMDefinition *without_def = find_def(without_result, "LongPrefixOnly");
+    const CBMDefinition *with_def = find_def(with_result, "LongPrefixWithSuffix");
+    ASSERT_NOT_NULL(without_def);
+    ASSERT_NOT_NULL(with_def);
+    ASSERT_NOT_NULL(without_def->fingerprint);
+    ASSERT_NOT_NULL(with_def->fingerprint);
+
+    double jaccard =
+        cbm_minhash_jaccard((const cbm_minhash_t *)without_def->fingerprint,
+                            (const cbm_minhash_t *)with_def->fingerprint);
+    ASSERT_LT(jaccard, 1.0);
+
+    cbm_free_result(without_result);
+    cbm_free_result(with_result);
+    free(src_without_suffix);
+    free(src_with_suffix);
     PASS();
 }
 
@@ -1157,6 +1246,7 @@ SUITE(simhash) {
     RUN_TEST(minhash_minor_edit_high_jaccard);
     RUN_TEST(minhash_empty_body_skipped);
     RUN_TEST(minhash_type_annotation_normalized);
+    RUN_TEST(minhash_reads_structure_after_former_token_prefix);
 
     /* Suite 2: Jaccard + LSH */
     RUN_TEST(jaccard_identical);

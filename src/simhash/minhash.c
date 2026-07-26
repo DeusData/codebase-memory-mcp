@@ -27,9 +27,6 @@
 /* Maximum trigram string length: 3 node types × max 40 chars each + separators */
 enum { TRIGRAM_BUF_LEN = 160 };
 
-/* Maximum AST body nodes to walk (stack depth). */
-enum { AST_WALK_CAP = 2048 };
-
 /* Hex encoding constants */
 enum { HEX_CHARS_PER_U32 = 8, HEX_BASE = 16 };
 
@@ -57,9 +54,6 @@ enum { SEEN_SET_BITS = 14, SEEN_SET_SIZE = 16384, SEEN_SET_MASK = 16383 };
 
 /* Knuth multiplicative hash constant for node_id → seen-set slot. */
 enum { KNUTH_MULT = 2654435761ULL };
-
-/* Maximum normalised tokens per function body. */
-enum { MAX_TOKENS = 4096 };
 
 /* Check if a node type is an identifier-like leaf. */
 static bool is_identifier_type(const char *kind) {
@@ -136,43 +130,11 @@ static int trigram_structural_weight(const char *a, const char *b, const char *c
     return w;
 }
 
-/* Phase 1: Walk AST iteratively and collect normalised LEAF token types.
- * Leaf-only counting is language-agnostic: leaf nodes correspond to actual
- * source tokens, not grammar-internal structure that varies across parsers. */
-static int collect_ast_tokens(TSNode root, const char **tokens, int max_tokens) {
-    int token_count = 0;
-    TSNode stack[AST_WALK_CAP];
-    int top = 0;
-    stack[top++] = root;
-
-    while (top > 0 && token_count < max_tokens) {
-        TSNode node = stack[--top];
-        uint32_t child_count = ts_node_child_count(node);
-
-        if (child_count == 0) {
-            /* Leaf node — actual source token.  Normalise and record. */
-            const char *kind = ts_node_type(node);
-            if (kind[0] != '\0') {
-                tokens[token_count++] = normalise_node_type(kind);
-            }
-        } else {
-            /* Internal node — push children only (skip the node itself).
-             * Structural info comes from leaf token patterns, not grammar nodes. */
-            for (int i = (int)child_count - SKIP_ONE; i >= 0 && top < AST_WALK_CAP; i--) {
-                stack[top++] = ts_node_child(node, (uint32_t)i);
-            }
-        }
-    }
-    return token_count;
-}
-
-/* Phase 2: Hash trigrams into MinHash signature with structural weighting.
+/* Hash trigrams into a MinHash signature with structural weighting.
  *
  * - Skip weight-0 trigrams (all tokens are I/S/N/T — pure noise)
  * - Use repetition-based weighted MinHash: hash w times per seed for weight w
- * - Track unique trigrams via hash set; reject if < MIN_UNIQUE_TRIGRAMS
- *
- * Returns the number of unique structural trigrams processed. */
+ * - Track unique trigrams via hash set; reject if < MIN_UNIQUE_TRIGRAMS */
 /* Unique-trigram set: open addressing on 64-bit hashes. */
 enum { UNIQ_SET_SIZE = 4096, UNIQ_SET_MASK = 4095 };
 
@@ -218,32 +180,19 @@ static void weighted_minhash_update(cbm_minhash_t *out, const char *trigram, int
     }
 }
 
-static int hash_trigrams(const char **tokens, int token_count, cbm_minhash_t *out) {
-    for (int k = 0; k < CBM_MINHASH_K; k++) {
-        out->values[k] = UINT32_MAX;
+static void hash_trigram(const char *a, const char *b, const char *c, cbm_minhash_t *out,
+                         uniq_trig_set_t *uniq) {
+    int weight = trigram_structural_weight(a, b, c);
+    if (weight == 0) {
+        return;
     }
-
-    uniq_trig_set_t uniq;
-    uniq_trig_init(&uniq);
     char trigram_buf[TRIGRAM_BUF_LEN];
-
-    for (int i = 0; i + TRIGRAM_WINDOW < token_count; i++) {
-        int w =
-            trigram_structural_weight(tokens[i], tokens[i + SKIP_ONE], tokens[i + TRIGRAM_WINDOW]);
-        if (w == 0) {
-            continue;
-        }
-
-        int len = snprintf(trigram_buf, sizeof(trigram_buf), "%s|%s|%s", tokens[i],
-                           tokens[i + SKIP_ONE], tokens[i + TRIGRAM_WINDOW]);
-        if (len <= 0 || (size_t)len >= sizeof(trigram_buf)) {
-            continue;
-        }
-
-        uniq_trig_insert(&uniq, XXH3_64bits(trigram_buf, (size_t)len));
-        weighted_minhash_update(out, trigram_buf, len, w);
+    int len = snprintf(trigram_buf, sizeof(trigram_buf), "%s|%s|%s", a, b, c);
+    if (len <= 0 || (size_t)len >= sizeof(trigram_buf)) {
+        return;
     }
-    return uniq.count;
+    uniq_trig_insert(uniq, XXH3_64bits(trigram_buf, (size_t)len));
+    weighted_minhash_update(out, trigram_buf, len, weight);
 }
 
 bool cbm_minhash_compute(TSNode func_body, const char *source, int language, cbm_minhash_t *out) {
@@ -254,14 +203,46 @@ bool cbm_minhash_compute(TSNode func_body, const char *source, int language, cbm
         return false;
     }
 
-    const char *tokens[MAX_TOKENS];
-    int token_count = collect_ast_tokens(func_body, tokens, MAX_TOKENS);
-    if (token_count < CBM_MINHASH_MIN_NODES) {
-        return false;
+    for (int k = 0; k < CBM_MINHASH_K; k++) {
+        out->values[k] = UINT32_MAX;
     }
+    uniq_trig_set_t uniq;
+    uniq_trig_init(&uniq);
 
-    int unique_structural = hash_trigrams(tokens, token_count, out);
-    return unique_structural >= MIN_UNIQUE_TRIGRAMS;
+    /* Stream the full leaf sequence through a tree cursor. Only the preceding
+     * two normalized node types are retained, so complete-function hashing is
+     * O(leaves * CBM_MINHASH_K) time and O(UNIQ_SET_SIZE + AST depth) memory
+     * instead of silently fingerprinting fixed AST/token prefixes. */
+    const char *previous[TRIGRAM_WINDOW] = {NULL, NULL};
+    size_t token_count = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(func_body);
+    bool done = false;
+    while (!done) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (ts_node_child_count(node) == 0) {
+            const char *kind = ts_node_type(node);
+            if (kind[0] != '\0') {
+                const char *token = normalise_node_type(kind);
+                if (token_count >= TRIGRAM_WINDOW) {
+                    hash_trigram(previous[0], previous[SKIP_ONE], token, out, &uniq);
+                }
+                previous[0] = previous[SKIP_ONE];
+                previous[SKIP_ONE] = token;
+                token_count++;
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&cursor)) {
+            if (!ts_tree_cursor_goto_parent(&cursor)) {
+                done = true;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return token_count >= CBM_MINHASH_MIN_NODES && uniq.count >= MIN_UNIQUE_TRIGRAMS;
 }
 
 /* ── Jaccard similarity ──────────────────────────────────────────── */
