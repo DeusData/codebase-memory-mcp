@@ -697,30 +697,15 @@ static void add_query_graph_derived_warnings(yyjson_mut_doc *doc, yyjson_mut_val
 /* Default snippet fallback line count (when end_line unknown) */
 #define SNIPPET_DEFAULT_LINES 50
 
-/* Default result limit for search_graph and search_code.
- * Prevents unbounded 500K-result responses. Callers can override.
- * Configurable via config key "search_limit". */
-#define CBM_MCP_DEFAULT_SEARCH_LIMIT 50
-
 /* Default: rank dependency sub-project symbols (proj.dep.*) LAST so a stdlib
  * symbol like 'Path' never fronts the user's own 'Path'. Tunable off via config
  * key "search_disable_dep_ranking" (true = pure relevance, deps may rank high). */
 #define CBM_CONFIG_SEARCH_DISABLE_DEP_RANKING "search_disable_dep_ranking"
 
-/* Default max source lines returned by get_code_snippet.
- * Set to 0 for unlimited. Prevents huge functions from consuming tokens.
- * Configurable via config key "snippet_max_lines". */
-#define CBM_DEFAULT_SNIPPET_MAX_LINES 200
-#define CBM_CONFIG_SNIPPET_MAX_LINES "snippet_max_lines"
 enum {
     CBM_SNIPPET_HEAD_PERCENT = 60,
     CBM_SNIPPET_PERCENT_DENOMINATOR = 100,
 };
-
-/* Default max BFS results for trace_path per direction.
- * Configurable via config key "trace_max_results". */
-#define CBM_DEFAULT_TRACE_MAX_RESULTS 25
-#define CBM_CONFIG_TRACE_MAX_RESULTS "trace_max_results"
 
 /* Idle store eviction: close cached project store after this many seconds
  * of inactivity to free SQLite memory during idle periods. */
@@ -738,14 +723,11 @@ enum {
 /* Config key: comma-separated glob patterns to exclude from key_functions.
  * Set via: config set key_functions_exclude "scripts/,tools/,tests/" */
 #define CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE "key_functions_exclude"
-#define CBM_CONFIG_KEY_FUNCTIONS_COUNT   "key_functions_count"
 /* Bound on the key_functions summary PUSHED in the first-response _context
  * header (closes the codebase://architecture pull-only gap). Smaller than the
  * get_architecture default (25) to keep first-response token cost modest. */
-#define CBM_CONTEXT_KEY_FUNCTIONS_LIMIT  10
 /* Config-tunable override for the _context key_functions push bound.
- * <=0 falls back to the CBM_CONTEXT_KEY_FUNCTIONS_LIMIT default above. */
-#define CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT "context_key_functions_limit"
+ * <=0 falls back to CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT from cli.h. */
 #define CBM_CONFIG_ARCH_HOTSPOT_LIMIT    "arch_hotspot_limit"
 #define CBM_CONFIG_ARCH_RESOLUTION       "architecture_resolution"
 
@@ -4773,7 +4755,7 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
      * knows where to start tracing WITHOUT having to pull codebase://architecture
      * (an MCP resource — application-controlled/pull-only by spec; the only
      * reliable delivery channel into the model is this _context header). Honors
-     * key_functions_exclude (config). Bounded by CBM_CONTEXT_KEY_FUNCTIONS_LIMIT
+     * key_functions_exclude (config). Bounded by the configured context limit
      * to keep the first-response token cost modest. */
     if (db && proj && !pagerank_stale) {
         const char *kf_exclude = srv->config
@@ -4781,10 +4763,10 @@ static void inject_context_once(yyjson_mut_doc *doc, yyjson_mut_val *root,
             : "";
         int kf_cfg_limit = srv->config
             ? cbm_config_get_int(srv->config, CBM_CONFIG_CONTEXT_KEY_FUNCTIONS_LIMIT,
-                                 CBM_CONTEXT_KEY_FUNCTIONS_LIMIT)
-            : CBM_CONTEXT_KEY_FUNCTIONS_LIMIT;
+                                 CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT)
+            : CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT;
         if (kf_cfg_limit <= 0) {
-            kf_cfg_limit = CBM_CONTEXT_KEY_FUNCTIONS_LIMIT;
+            kf_cfg_limit = CBM_DEFAULT_CONTEXT_KEY_FUNCTIONS_LIMIT;
         }
         char *kf_sql = build_key_functions_sql(kf_exclude, NULL, kf_cfg_limit, false);
         if (kf_sql) {
@@ -7249,12 +7231,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
      * and return early.  The regex/vector path below handles all other callers.
      * If FTS5 is unavailable or the query is empty after tokenization, fall
      * through to the regex path. */
-    int cfg_search_limit = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
-                                               CBM_MCP_DEFAULT_SEARCH_LIMIT);
+    int cfg_search_limit =
+        cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT, CBM_DEFAULT_SEARCH_LIMIT);
     char *query = cbm_mcp_get_string_arg(args, "query");
     if (query && query[0]) {
         int q_limit = cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit,
-                                                   CBM_MCP_DEFAULT_SEARCH_LIMIT);
+                                                   CBM_DEFAULT_SEARCH_LIMIT);
         int q_offset = cbm_mcp_get_int_arg(args, "offset", 0);
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
         cbm_store_overlay_node_view_summary_t q_overlay_summary = {0};
@@ -7379,7 +7361,7 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(errbuf, true);
     }
     int limit = cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit,
-                                             CBM_MCP_DEFAULT_SEARCH_LIMIT);
+                                             CBM_DEFAULT_SEARCH_LIMIT);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
     bool cfg_compact = cbm_config_get_bool(srv->config, "compact", true);
     bool compact = cbm_mcp_get_bool_arg_default(args, "compact", cfg_compact);
@@ -10009,8 +9991,9 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                     ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
                     : "";
                 int kf_limit = srv->config
-                    ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
-                    : 25;
+                    ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT,
+                                         CBM_DEFAULT_KEY_FUNCTIONS_COUNT)
+                    : CBM_DEFAULT_KEY_FUNCTIONS_COUNT;
                 char *kf_sql_heap = build_key_functions_sql(excl_csv, (const char **)excl_arr,
                                                             kf_limit, path_scoped);
                 if (!kf_sql_heap) {
@@ -14782,10 +14765,10 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
                                                    sizeof(exact_filter_path));
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     int context_lines = cbm_mcp_get_int_arg(args, "context", 0);
-    int cfg_search_limit_sc = cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT,
-                                                CBM_MCP_DEFAULT_SEARCH_LIMIT);
+    int cfg_search_limit_sc =
+        cbm_config_get_int(srv->config, CBM_CONFIG_SEARCH_LIMIT, CBM_DEFAULT_SEARCH_LIMIT);
     int limit = cbm_mcp_get_positive_int_arg(args, "limit", cfg_search_limit_sc,
-                                             CBM_MCP_DEFAULT_SEARCH_LIMIT);
+                                             CBM_DEFAULT_SEARCH_LIMIT);
     bool use_regex = cbm_mcp_get_bool_arg(args, "regex");
     uint64_t search_t0 = cbm_now_ms();
     /* In literal (non-regex) mode a '|' is matched as a byte, not alternation —
@@ -17469,15 +17452,16 @@ static void build_resource_architecture(yyjson_mut_doc *doc, yyjson_mut_val *roo
         }
     }
 
-    /* Key functions by PageRank (top 10), with config-driven exclude patterns */
+    /* Key functions by PageRank, with config-driven count and exclude patterns. */
     struct sqlite3 *db = cbm_store_get_db(store);
     if (db && proj) {
         const char *excl_csv = srv->config
             ? cbm_config_get(srv->config, CBM_CONFIG_KEY_FUNCTIONS_EXCLUDE, "")
             : "";
         int kf_limit = srv->config
-            ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT, 25)
-            : 25;
+            ? cbm_config_get_int(srv->config, CBM_CONFIG_KEY_FUNCTIONS_COUNT,
+                                 CBM_DEFAULT_KEY_FUNCTIONS_COUNT)
+            : CBM_DEFAULT_KEY_FUNCTIONS_COUNT;
         char *sql = build_key_functions_sql(excl_csv, NULL, kf_limit, false);
         sqlite3_stmt *stmt = NULL;
         if (!sql) {
