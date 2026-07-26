@@ -892,7 +892,7 @@ typedef struct {
  * nodes can carry change_count and last_modified for hotspot / risk
  * analysis queries. */
 typedef struct {
-    char file_path[CBM_SZ_512];
+    char *file_path; /* exact owned path; release with cbm_file_temporal_free */
     int change_count;
     long long last_modified; /* unix epoch of most recent commit */
 } cbm_file_temporal_t;
@@ -906,6 +906,9 @@ int cbm_compute_change_coupling_with_threshold(const cbm_commit_files_t *commits
                                                int commit_count,
                                                cbm_change_coupling_t *out, int max_out,
                                                double min_coupling_score);
+int cbm_compute_file_temporal(const cbm_commit_files_t *commits, int commit_count,
+                              cbm_file_temporal_t **out, int *out_count);
+void cbm_file_temporal_free(cbm_file_temporal_t *items, int count);
 
 /* Go-style implicit interface satisfaction on graph buffer.
  * Finds Interface nodes, matches method sets against Class nodes,

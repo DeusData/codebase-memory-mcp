@@ -2232,6 +2232,92 @@ TEST(githistory_coupling_carries_last_co_change) {
     PASS();
 }
 
+TEST(githistory_temporal_retains_files_past_legacy_capacity) {
+    enum {
+        GH_TEST_FILES_PER_COMMIT = 20,
+        GH_TEST_UNIQUE_FILES = 16385,
+        GH_TEST_BASE_COMMITS =
+            (GH_TEST_UNIQUE_FILES + GH_TEST_FILES_PER_COMMIT - 1) / GH_TEST_FILES_PER_COMMIT,
+        GH_TEST_COMMIT_COUNT = GH_TEST_BASE_COMMITS + 1,
+    };
+    char (*paths)[CBM_SZ_32] = calloc(GH_TEST_UNIQUE_FILES, sizeof(*paths));
+    char **file_ptrs = calloc(GH_TEST_UNIQUE_FILES, sizeof(*file_ptrs));
+    cbm_commit_files_t *commits = calloc(GH_TEST_COMMIT_COUNT, sizeof(*commits));
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(file_ptrs);
+    ASSERT_NOT_NULL(commits);
+
+    for (int i = 0; i < GH_TEST_UNIQUE_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "file-%05d.go", i);
+        file_ptrs[i] = paths[i];
+    }
+    for (int c = 0; c < GH_TEST_BASE_COMMITS; c++) {
+        int offset = c * GH_TEST_FILES_PER_COMMIT;
+        int remaining = GH_TEST_UNIQUE_FILES - offset;
+        commits[c].files = &file_ptrs[offset];
+        commits[c].count =
+            remaining < GH_TEST_FILES_PER_COMMIT ? remaining : GH_TEST_FILES_PER_COMMIT;
+        commits[c].timestamp = c + 1;
+    }
+    commits[GH_TEST_BASE_COMMITS] = (cbm_commit_files_t){
+        .files = &file_ptrs[GH_TEST_UNIQUE_FILES - 1],
+        .count = 1,
+        .timestamp = 999999,
+    };
+
+    cbm_file_temporal_t *temporal = NULL;
+    int temporal_count = 0;
+    ASSERT_EQ(cbm_compute_file_temporal(commits, GH_TEST_COMMIT_COUNT, &temporal, &temporal_count),
+              0);
+    ASSERT_EQ(temporal_count, GH_TEST_UNIQUE_FILES);
+
+    const cbm_file_temporal_t *last = NULL;
+    for (int i = 0; i < temporal_count; i++) {
+        if (strcmp(temporal[i].file_path, paths[GH_TEST_UNIQUE_FILES - 1]) == 0) {
+            last = &temporal[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(last);
+    ASSERT_EQ(last->change_count, 2);
+    ASSERT_EQ(last->last_modified, 999999);
+
+    cbm_file_temporal_free(temporal, temporal_count);
+    free(commits);
+    free(file_ptrs);
+    free(paths);
+    PASS();
+}
+
+TEST(githistory_temporal_preserves_long_file_paths) {
+    char path[CBM_SZ_1K];
+    memset(path, 'a', sizeof(path));
+    path[0] = 's';
+    path[1] = 'r';
+    path[2] = 'c';
+    path[3] = '/';
+    path[sizeof(path) - 4] = '.';
+    path[sizeof(path) - 3] = 'c';
+    path[sizeof(path) - 2] = 'p';
+    path[sizeof(path) - 1] = '\0';
+
+    char *files[] = {path};
+    cbm_commit_files_t commits[] = {
+        {.files = files, .count = 1, .timestamp = 123456},
+    };
+    cbm_file_temporal_t *temporal = NULL;
+    int temporal_count = 0;
+
+    ASSERT_EQ(cbm_compute_file_temporal(commits, 1, &temporal, &temporal_count), 0);
+    ASSERT_EQ(temporal_count, 1);
+    ASSERT_STR_EQ(temporal[0].file_path, path);
+    ASSERT_EQ(temporal[0].change_count, 1);
+    ASSERT_EQ(temporal[0].last_modified, 123456);
+
+    cbm_file_temporal_free(temporal, temporal_count);
+    PASS();
+}
+
 TEST(githistory_skip_large_commits) {
     /* A single commit with 25 files → should be skipped (>20) */
     char *files[25];
@@ -18999,6 +19085,8 @@ SUITE(pipeline) {
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
     RUN_TEST(githistory_coupling_carries_last_co_change);
+    RUN_TEST(githistory_temporal_retains_files_past_legacy_capacity);
+    RUN_TEST(githistory_temporal_preserves_long_file_paths);
     RUN_TEST(githistory_skip_large_commits);
     RUN_TEST(githistory_limits_to_max);
     /* Test detection */

@@ -28,6 +28,8 @@ enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_M
 /* Minimum coupling score to create an edge */
 #define MIN_COUPLING_SCORE 0.3
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -195,6 +197,12 @@ static void free_counter(const char *key, void *val, void *ud) {
     free(val);
 }
 
+static void free_index_value(const char *key, void *val, void *ud) {
+    (void)key;
+    (void)ud;
+    free(val);
+}
+
 /* ── Standalone coupling computation (testable) ──────────────────── */
 
 /* Context for collect_coupling_result callback. */
@@ -355,7 +363,111 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
 
 /* Pre-computed coupling result buffer for fused post-pass parallelism. */
 #define MAX_COUPLINGS 8192
-#define MAX_FILE_TEMPORAL 16384
+
+void cbm_file_temporal_free(cbm_file_temporal_t *items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i].file_path);
+    }
+    free(items);
+}
+
+int cbm_compute_file_temporal(const cbm_commit_files_t *commits, int commit_count,
+                              cbm_file_temporal_t **out, int *out_count) {
+    if (!out || !out_count || commit_count < 0 || (commit_count > 0 && !commits)) {
+        return CBM_NOT_FOUND;
+    }
+    *out = NULL;
+    *out_count = 0;
+    if (commit_count == 0) {
+        return 0;
+    }
+
+    CBMHashTable *file_idx = cbm_ht_create(CBM_SZ_1K);
+    if (!file_idx) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_file_temporal_t *items = NULL;
+    int count = 0;
+    int capacity = 0;
+    for (int c = 0; c < commit_count; c++) {
+        if (commits[c].count > GH_MAX_FILES) {
+            continue;
+        }
+        for (int f = 0; f < commits[c].count; f++) {
+            const char *path = commits[c].files[f];
+            if (!path) {
+                continue;
+            }
+            int *idx = cbm_ht_get(file_idx, path);
+            if (idx) {
+                if (*idx < 0 || *idx >= count) {
+                    goto fail;
+                }
+                items[*idx].change_count++;
+                if (commits[c].timestamp > items[*idx].last_modified) {
+                    items[*idx].last_modified = commits[c].timestamp;
+                }
+                continue;
+            }
+
+            if (count == capacity) {
+                if (capacity > INT_MAX / 2) {
+                    goto fail;
+                }
+                int next_capacity = capacity == 0 ? CBM_SZ_256 : capacity * 2;
+                if ((size_t)next_capacity > SIZE_MAX / sizeof(*items)) {
+                    goto fail;
+                }
+                cbm_file_temporal_t *grown = realloc(items, (size_t)next_capacity * sizeof(*items));
+                if (!grown) {
+                    goto fail;
+                }
+                items = grown;
+                capacity = next_capacity;
+            }
+
+            char *owned_path = cbm_strdup(path);
+            int *new_idx = malloc(sizeof(*new_idx));
+            if (!owned_path || !new_idx) {
+                free(owned_path);
+                free(new_idx);
+                goto fail;
+            }
+            *new_idx = count;
+            cbm_ht_set(file_idx, owned_path, new_idx);
+            if (cbm_ht_get(file_idx, owned_path) != new_idx) {
+                free(owned_path);
+                free(new_idx);
+                goto fail;
+            }
+
+            items[count].file_path = owned_path;
+            items[count].change_count = 1;
+            items[count].last_modified = commits[c].timestamp;
+            count++;
+        }
+    }
+
+    cbm_ht_foreach(file_idx, free_index_value, NULL);
+    cbm_ht_free(file_idx);
+    if (count == 0) {
+        free(items);
+        items = NULL;
+    }
+    *out = items;
+    *out_count = count;
+    return 0;
+
+fail:
+    cbm_ht_foreach(file_idx, free_index_value, NULL);
+    cbm_ht_free(file_idx);
+    cbm_file_temporal_free(items, count);
+    return CBM_NOT_FOUND;
+}
 
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
@@ -397,42 +509,12 @@ int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
     int coupling_count = cbm_compute_change_coupling_with_threshold(
         cf, commit_count, couplings, MAX_COUPLINGS, min_coupling_score);
 
-    /* Per-file temporal aggregation: change_count + last_modified.
-     * Single hash-table pass over the same commit set used for coupling so
-     * we don't re-scan history. NULL on OOM is fine — the caller still
-     * gets the couplings. */
-    cbm_file_temporal_t *ft_arr = malloc(MAX_FILE_TEMPORAL * sizeof(cbm_file_temporal_t));
-    if (ft_arr) {
-        int ft_count = 0;
-        CBMHashTable *file_idx = cbm_ht_create(CBM_SZ_1K);
-        for (int c = 0; c < commit_count; c++) {
-            if (cf[c].count > GH_MAX_FILES) {
-                continue;
-            }
-            for (int f = 0; f < cf[c].count; f++) {
-                const char *fp = cf[c].files[f];
-                int *idx = cbm_ht_get(file_idx, fp);
-                if (idx) {
-                    ft_arr[*idx].change_count++;
-                    if (cf[c].timestamp > ft_arr[*idx].last_modified) {
-                        ft_arr[*idx].last_modified = cf[c].timestamp;
-                    }
-                } else if (ft_count < MAX_FILE_TEMPORAL) {
-                    int new_idx = ft_count++;
-                    snprintf(ft_arr[new_idx].file_path, sizeof(ft_arr[new_idx].file_path), "%s",
-                             fp);
-                    ft_arr[new_idx].change_count = 1;
-                    ft_arr[new_idx].last_modified = cf[c].timestamp;
-                    int *nidx = malloc(sizeof(int));
-                    *nidx = new_idx;
-                    cbm_ht_set(file_idx, strdup(fp), nidx);
-                }
-            }
-        }
-        cbm_ht_foreach(file_idx, free_counter, NULL);
-        cbm_ht_free(file_idx);
-        result->file_temporal = ft_arr;
-        result->file_temporal_count = ft_count;
+    /* Exact per-file temporal aggregation remains expected O(observations)
+     * while storing O(unique paths + path bytes). Unlike the former fixed
+     * array, no valid tail entries or long paths are silently truncated. */
+    if (cbm_compute_file_temporal(cf, commit_count, &result->file_temporal,
+                                  &result->file_temporal_count) != 0) {
+        cbm_log_error("pass.githistory.alloc_failed", "phase", "file_temporal");
     }
 
     free(cf);
@@ -525,7 +607,7 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     }
 
     free(result.couplings);
-    free(result.file_temporal);
+    cbm_file_temporal_free(result.file_temporal, result.file_temporal_count);
 
     cbm_log_info("pass.done", "pass", "githistory", "commits", itoa_log(result.commit_count),
                  "edges", itoa_log(edge_count));
