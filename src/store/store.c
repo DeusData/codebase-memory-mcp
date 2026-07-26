@@ -60,12 +60,11 @@ enum {
     ST_LIKE_HINT_MAX = 2,     /* max LIKE hints extracted per regex pattern */
     ST_SEARCH_CONNECTED_NAMES_LIMIT = 10,
     ST_BFS_EDGE_TYPE_LIMIT = 16,
-    ST_MAX_PKGS = 64,
+    ST_ARCH_BOUNDARY_RESULT_LIMIT = 10,
     ST_INIT_CAP_4 = 4,
     ST_HEADER_PREFIX = 3,
     ST_MIN_INDEGREE = 3,
     ST_MAX_PATH_DEPTH = 3,
-    ST_MAX_ITERATIONS = 10,
     ST_MAX_SECTIONS = 16,
     ST_METHOD_PROP_LEN = 8,
     ST_PATH_PROP_LEN = 6,
@@ -14020,47 +14019,152 @@ static void arch_free_pkg_lookup(int64_t *nids, char **npkgs, int count) {
     free(npkgs);
 }
 
-static void arch_free_boundary_scratch(char **bfroms, char **btos, int *bcounts, int count) {
-    for (int i = 0; i < count; i++) {
-        free(bfroms ? bfroms[i] : NULL);
-        free(btos ? btos[i] : NULL);
+typedef struct {
+    char *name;
+    CBMHashTable *targets;
+} arch_boundary_source_t;
+
+typedef struct {
+    arch_boundary_source_t *source;
+    char *target;
+    int call_count;
+} arch_boundary_accumulator_t;
+
+typedef struct {
+    CBMHashTable *sources;
+    arch_boundary_source_t **source_items;
+    int source_count;
+    int source_cap;
+    arch_boundary_accumulator_t **items;
+    int count;
+    int cap;
+} arch_boundary_accumulator_set_t;
+
+static void arch_boundary_accumulator_set_free(arch_boundary_accumulator_set_t *set) {
+    if (!set) {
+        return;
     }
-    free(bfroms);
-    free(btos);
-    free(bcounts);
+    cbm_ht_free(set->sources);
+    for (int i = 0; i < set->source_count; i++) {
+        cbm_ht_free(set->source_items[i]->targets);
+    }
+    for (int i = 0; i < set->count; i++) {
+        free(set->items[i]->target);
+        free(set->items[i]);
+    }
+    for (int i = 0; i < set->source_count; i++) {
+        free(set->source_items[i]->name);
+        free(set->source_items[i]);
+    }
+    free(set->source_items);
+    free(set->items);
+    memset(set, 0, sizeof(*set));
 }
 
-/* Accumulate a cross-package boundary into parallel arrays. */
-static int accum_boundary(const char *src_pkg, const char *tgt_pkg, char **bfroms, char **btos,
-                          int *bcounts, int *bn, int bcap) {
-    int found = ST_FOUND;
-    for (int i = 0; i < *bn; i++) {
-        if (strcmp(bfroms[i], src_pkg) == 0 && strcmp(btos[i], tgt_pkg) == 0) {
-            found = i;
-            break;
-        }
-    }
-    if (found >= 0) {
-        bcounts[found]++;
-    } else if (*bn < bcap) {
-        char *from = heap_strdup(src_pkg);
-        char *to = heap_strdup(tgt_pkg);
-        if (!from || !to) {
-            free(from);
-            free(to);
-            return CBM_STORE_ERR;
-        }
-        bfroms[*bn] = from;
-        btos[*bn] = to;
-        bcounts[*bn] = SKIP_ONE;
-        (*bn)++;
+static int arch_boundary_accumulator_set_init(cbm_store_t *s,
+                                              arch_boundary_accumulator_set_t *set) {
+    memset(set, 0, sizeof(*set));
+    set->source_cap = ST_INIT_CAP_16;
+    set->cap = CBM_SZ_32;
+    set->sources = cbm_ht_create((uint32_t)set->source_cap);
+    set->source_items = calloc((size_t)set->source_cap, sizeof(*set->source_items));
+    set->items = calloc((size_t)set->cap, sizeof(*set->items));
+    if (!set->sources || !set->source_items || !set->items) {
+        arch_boundary_accumulator_set_free(set);
+        store_set_error(s, "arch_boundaries out of memory");
+        return CBM_STORE_ERR;
     }
     return CBM_STORE_OK;
 }
 
-static int arch_boundaries(cbm_store_t *s, const char *project, const char *path,
+static int arch_boundary_accumulate(cbm_store_t *s, arch_boundary_accumulator_set_t *set,
+                                    const char *src_pkg, const char *tgt_pkg) {
+    arch_boundary_source_t *source = cbm_ht_get(set->sources, src_pkg);
+    if (!source) {
+        if (set->source_count >= set->source_cap &&
+            store_grow_array(s, (void **)&set->source_items, &set->source_cap,
+                             sizeof(*set->source_items), "arch_boundaries out of memory",
+                             true) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+        source = calloc(CBM_ALLOC_ONE, sizeof(*source));
+        if (source) {
+            source->name = heap_strdup(src_pkg);
+            source->targets = cbm_ht_create(ST_INIT_CAP_16);
+        }
+        if (!source || !source->name || !source->targets) {
+            if (source) {
+                cbm_ht_free(source->targets);
+                free(source->name);
+                free(source);
+            }
+            store_set_error(s, "arch_boundaries out of memory");
+            return CBM_STORE_ERR;
+        }
+        cbm_ht_set(set->sources, source->name, source);
+        if (cbm_ht_get(set->sources, source->name) != source) {
+            cbm_ht_free(source->targets);
+            free(source->name);
+            free(source);
+            store_set_error(s, "arch_boundaries out of memory");
+            return CBM_STORE_ERR;
+        }
+        set->source_items[set->source_count++] = source;
+    }
+
+    arch_boundary_accumulator_t *boundary = cbm_ht_get(source->targets, tgt_pkg);
+    if (boundary) {
+        if (boundary->call_count == INT_MAX) {
+            store_set_error(s, "arch_boundaries call count overflow");
+            return CBM_STORE_ERR;
+        }
+        boundary->call_count++;
+        return CBM_STORE_OK;
+    }
+
+    if (set->count >= set->cap &&
+        store_grow_array(s, (void **)&set->items, &set->cap, sizeof(*set->items),
+                         "arch_boundaries out of memory", true) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    boundary = calloc(CBM_ALLOC_ONE, sizeof(*boundary));
+    if (boundary) {
+        boundary->target = heap_strdup(tgt_pkg);
+    }
+    if (!boundary || !boundary->target) {
+        if (boundary) {
+            free(boundary->target);
+            free(boundary);
+        }
+        store_set_error(s, "arch_boundaries out of memory");
+        return CBM_STORE_ERR;
+    }
+    boundary->source = source;
+    boundary->call_count = SKIP_ONE;
+    cbm_ht_set(source->targets, boundary->target, boundary);
+    if (cbm_ht_get(source->targets, boundary->target) != boundary) {
+        free(boundary->target);
+        free(boundary);
+        store_set_error(s, "arch_boundaries out of memory");
+        return CBM_STORE_ERR;
+    }
+    set->items[set->count++] = boundary;
+    return CBM_STORE_OK;
+}
+
+static int arch_boundary_accumulator_cmp(const void *lhs, const void *rhs) {
+    const arch_boundary_accumulator_t *a = *(const arch_boundary_accumulator_t *const *)lhs;
+    const arch_boundary_accumulator_t *b = *(const arch_boundary_accumulator_t *const *)rhs;
+    if (a->call_count != b->call_count) {
+        return (a->call_count < b->call_count) ? SKIP_ONE : CBM_NOT_FOUND;
+    }
+    int from_cmp = strcmp(a->source->name, b->source->name);
+    return from_cmp != 0 ? from_cmp : strcmp(a->target, b->target);
+}
+
+static int arch_boundaries(cbm_store_t *s, const char *project, const char *path, int result_limit,
                            cbm_cross_pkg_boundary_t **out_arr, int *out_count) {
-    if (!out_arr || !out_count) {
+    if (result_limit < 0 || !out_arr || !out_count) {
         store_set_error(s, "arch_boundaries invalid output");
         return CBM_STORE_ERR;
     }
@@ -14162,16 +14266,10 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     }
     bind_text(estmt, SKIP_ONE, project);
 
-    int bcap = CBM_SZ_32;
-    int bn = 0;
-    char **bfroms = calloc((size_t)bcap, sizeof(char *));
-    char **btos = calloc((size_t)bcap, sizeof(char *));
-    int *bcounts = calloc((size_t)bcap, sizeof(int));
-    if (!bfroms || !btos || !bcounts) {
+    arch_boundary_accumulator_set_t boundaries;
+    if (arch_boundary_accumulator_set_init(s, &boundaries) != CBM_STORE_OK) {
         arch_free_pkg_lookup(nids, npkgs, nn);
-        arch_free_boundary_scratch(bfroms, btos, bcounts, 0);
         sqlite3_finalize(estmt);
-        store_set_error(s, "arch_boundaries out of memory");
         return CBM_STORE_ERR;
     }
 
@@ -14184,18 +14282,16 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
         if (!src_pkg || !tgt_pkg || !src_pkg[0] || !tgt_pkg[0] || strcmp(src_pkg, tgt_pkg) == 0) {
             continue;
         }
-        if (accum_boundary(src_pkg, tgt_pkg, bfroms, btos, bcounts, &bn, bcap) !=
-            CBM_STORE_OK) {
+        if (arch_boundary_accumulate(s, &boundaries, src_pkg, tgt_pkg) != CBM_STORE_OK) {
             arch_free_pkg_lookup(nids, npkgs, nn);
-            arch_free_boundary_scratch(bfroms, btos, bcounts, bn);
+            arch_boundary_accumulator_set_free(&boundaries);
             sqlite3_finalize(estmt);
-            store_set_error(s, "arch_boundaries out of memory");
             return CBM_STORE_ERR;
         }
     }
     if (step_rc != SQLITE_DONE) {
         arch_free_pkg_lookup(nids, npkgs, nn);
-        arch_free_boundary_scratch(bfroms, btos, bcounts, bn);
+        arch_boundary_accumulator_set_free(&boundaries);
         store_set_error_sqlite(s, "arch_boundaries_edges");
         sqlite3_finalize(estmt);
         return CBM_STORE_ERR;
@@ -14203,47 +14299,33 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
     sqlite3_finalize(estmt);
     arch_free_pkg_lookup(nids, npkgs, nn);
 
-    /* Sort by count descending */
-    for (int i = SKIP_ONE; i < bn; i++) {
-        int j = i;
-        while (j > 0 && bcounts[j] > bcounts[j - SKIP_ONE]) {
-            int tc = bcounts[j];
-            bcounts[j] = bcounts[j - SKIP_ONE];
-            bcounts[j - SKIP_ONE] = tc;
-            char *tf = bfroms[j];
-            bfroms[j] = bfroms[j - SKIP_ONE];
-            bfroms[j - SKIP_ONE] = tf;
-            char *tt = btos[j];
-            btos[j] = btos[j - SKIP_ONE];
-            btos[j - SKIP_ONE] = tt;
-            j--;
-        }
+    qsort(boundaries.items, (size_t)boundaries.count, sizeof(*boundaries.items),
+          arch_boundary_accumulator_cmp);
+    int result_count = boundaries.count;
+    if (result_limit > 0 && result_count > result_limit) {
+        result_count = result_limit;
     }
-    if (bn > CBM_DECIMAL_BASE) {
-        for (int i = ST_MAX_ITERATIONS; i < bn; i++) {
-            free(bfroms[i]);
-            free(btos[i]);
-        }
-        bn = ST_MAX_ITERATIONS;
-    }
-
     cbm_cross_pkg_boundary_t *result =
-        (bn > 0) ? calloc(bn, sizeof(cbm_cross_pkg_boundary_t)) : NULL;
-    if (bn > 0 && !result) {
-        arch_free_boundary_scratch(bfroms, btos, bcounts, bn);
+        (result_count > 0) ? calloc((size_t)result_count, sizeof(*result)) : NULL;
+    if (result_count > 0 && !result) {
+        arch_boundary_accumulator_set_free(&boundaries);
         store_set_error(s, "arch_boundaries out of memory");
         return CBM_STORE_ERR;
     }
-    for (int i = 0; i < bn; i++) {
-        result[i].from = bfroms[i];
-        result[i].to = btos[i];
-        result[i].call_count = bcounts[i];
+    for (int i = 0; i < result_count; i++) {
+        result[i].from = heap_strdup(boundaries.items[i]->source->name);
+        result[i].to = heap_strdup(boundaries.items[i]->target);
+        result[i].call_count = boundaries.items[i]->call_count;
+        if (!result[i].from || !result[i].to) {
+            arch_free_boundaries(result, i + 1);
+            arch_boundary_accumulator_set_free(&boundaries);
+            store_set_error(s, "arch_boundaries out of memory");
+            return CBM_STORE_ERR;
+        }
     }
-    free(bfroms);
-    free(btos);
-    free(bcounts);
+    arch_boundary_accumulator_set_free(&boundaries);
     *out_arr = result;
-    *out_count = bn;
+    *out_count = result_count;
     return CBM_STORE_OK;
 }
 
@@ -14515,40 +14597,97 @@ static void classify_layer(const char *pkg, int in, int out_deg, bool has_routes
     (void)pkg;
 }
 
-/* Find or insert a package name. A full fixed-size summary is nonfatal. */
-static int find_or_add_pkg(char **all_pkgs, int *npkgs, int max_pkgs, const char *pkg,
-                           int *out_idx) {
-    if (!all_pkgs || !npkgs || !pkg || !out_idx) {
-        return CBM_STORE_ERR;
+typedef struct {
+    int fan_in;
+    int fan_out;
+    bool has_route;
+    bool has_entry;
+    char name[];
+} arch_layer_package_t;
+
+typedef struct {
+    CBMHashTable *index;
+    arch_layer_package_t **items;
+    int count;
+    int cap;
+} arch_layer_package_set_t;
+
+static void arch_layer_package_set_free(arch_layer_package_set_t *set) {
+    if (!set) {
+        return;
     }
-    *out_idx = CBM_STORE_NOT_FOUND;
-    for (int j = 0; j < *npkgs; j++) {
-        if (strcmp(all_pkgs[j], pkg) == 0) {
-            *out_idx = j;
-            return CBM_STORE_OK;
-        }
+    cbm_ht_free(set->index);
+    for (int i = 0; i < set->count; i++) {
+        free(set->items[i]);
     }
-    if (*npkgs < max_pkgs) {
-        int idx = *npkgs;
-        all_pkgs[idx] = heap_strdup(pkg);
-        if (!all_pkgs[idx]) {
-            return CBM_STORE_ERR;
-        }
-        (*npkgs)++;
-        *out_idx = idx;
-        return CBM_STORE_OK;
-    }
-    return CBM_STORE_NOT_FOUND;
+    free(set->items);
+    memset(set, 0, sizeof(*set));
 }
 
-/* Check if a package name appears in an array. */
-static bool pkg_in_list(const char *pkg, char **list, int count) {
-    for (int j = 0; j < count; j++) {
-        if (strcmp(pkg, list[j]) == 0) {
-            return true;
-        }
+static int arch_layer_package_set_init(cbm_store_t *s, arch_layer_package_set_t *set) {
+    memset(set, 0, sizeof(*set));
+    set->cap = ST_INIT_CAP_16;
+    set->index = cbm_ht_create((uint32_t)set->cap);
+    set->items = calloc((size_t)set->cap, sizeof(*set->items));
+    if (!set->index || !set->items) {
+        arch_layer_package_set_free(set);
+        store_set_error(s, "arch_layers out of memory");
+        return CBM_STORE_ERR;
     }
-    return false;
+    return CBM_STORE_OK;
+}
+
+static int arch_layer_package_get_or_add(cbm_store_t *s, arch_layer_package_set_t *set,
+                                         const char *name, arch_layer_package_t **out) {
+    if (!set || !name || !name[0] || !out) {
+        store_set_error(s, "arch_layers invalid package");
+        return CBM_STORE_ERR;
+    }
+    arch_layer_package_t *package = cbm_ht_get(set->index, name);
+    if (package) {
+        *out = package;
+        return CBM_STORE_OK;
+    }
+    if (set->count >= set->cap &&
+        store_grow_array(s, (void **)&set->items, &set->cap, sizeof(*set->items),
+                         "arch_layers out of memory", true) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    size_t name_len = strlen(name);
+    if (name_len > SIZE_MAX - sizeof(*package) - SKIP_ONE) {
+        store_set_error(s, "arch_layers out of memory");
+        return CBM_STORE_ERR;
+    }
+    package = calloc(CBM_ALLOC_ONE, sizeof(*package) + name_len + SKIP_ONE);
+    if (!package) {
+        store_set_error(s, "arch_layers out of memory");
+        return CBM_STORE_ERR;
+    }
+    memcpy(package->name, name, name_len + SKIP_ONE);
+    cbm_ht_set(set->index, package->name, package);
+    if (cbm_ht_get(set->index, package->name) != package) {
+        free(package);
+        store_set_error(s, "arch_layers out of memory");
+        return CBM_STORE_ERR;
+    }
+    set->items[set->count++] = package;
+    *out = package;
+    return CBM_STORE_OK;
+}
+
+static int arch_layer_add_fan(cbm_store_t *s, int *fan, int increment) {
+    if (!fan || increment < 0 || *fan > INT_MAX - increment) {
+        store_set_error(s, "arch_layers fan count overflow");
+        return CBM_STORE_ERR;
+    }
+    *fan += increment;
+    return CBM_STORE_OK;
+}
+
+static int arch_layer_cmp(const void *lhs, const void *rhs) {
+    const cbm_package_layer_t *a = lhs;
+    const cbm_package_layer_t *b = rhs;
+    return strcmp(a->name, b->name);
 }
 
 static const char *arch_file_path_to_package(const char *file_path) {
@@ -14603,8 +14742,8 @@ static const char *arch_route_node_package(const char *qn, const char *file_path
 }
 
 /* Collect package names from nodes matching a SQL query (must use ?1 = project). */
-static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *project, const char *path,
-                             char **pkgs, int max_pkgs) {
+static int collect_entry_pkg_names(cbm_store_t *s, const char *sql, const char *project,
+                                   const char *path, arch_layer_package_set_t *packages) {
     char norm[CBM_SZ_512];
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
@@ -14612,6 +14751,7 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
     int nsql = scoped ? snprintf(sqlbuf, sizeof(sqlbuf), "%s%s", sql, arch_path_scope_sql())
                       : snprintf(sqlbuf, sizeof(sqlbuf), "%s", sql);
     if (nsql <= 0 || (size_t)nsql >= sizeof(sqlbuf)) {
+        store_set_error(s, "arch_layers entry package SQL truncated");
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
@@ -14619,39 +14759,38 @@ static int collect_pkg_names(cbm_store_t *s, const char *sql, const char *projec
         if (stmt) {
             sqlite3_finalize(stmt);
         }
+        store_set_error_sqlite(s, "arch_layers_entry_packages");
         return CBM_STORE_ERR;
     }
     bind_text(stmt, SKIP_ONE, project);
     if (scoped) {
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
     }
-    int count = 0;
     int step_rc = SQLITE_OK;
-    while (count < max_pkgs && (step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
-        char *pkg = heap_strdup(cbm_qn_to_package(qn));
-        if (!pkg) {
-            for (int i = 0; i < count; i++) {
-                free(pkgs[i]);
-            }
+        const char *pkg = cbm_qn_to_package(qn);
+        if (!pkg || !pkg[0]) {
+            continue;
+        }
+        arch_layer_package_t *package = NULL;
+        if (arch_layer_package_get_or_add(s, packages, pkg, &package) != CBM_STORE_OK) {
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
         }
-        pkgs[count++] = pkg;
+        package->has_entry = true;
     }
-    if (step_rc != SQLITE_DONE && count < max_pkgs) {
-        for (int i = 0; i < count; i++) {
-            free(pkgs[i]);
-        }
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "arch_layers_entry_packages");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
-    return count;
+    return CBM_STORE_OK;
 }
 
 static int collect_route_pkg_names(cbm_store_t *s, const char *project, const char *path,
-                                   char **pkgs, int max_pkgs) {
+                                   arch_layer_package_set_t *packages) {
     char norm[CBM_SZ_512];
     char like[CBM_SZ_512 + ST_ARCH_PATH_LIKE_EXTRA];
     bool scoped = arch_path_prepare(path, norm, sizeof(norm), like, sizeof(like));
@@ -14677,13 +14816,13 @@ static int collect_route_pkg_names(cbm_store_t *s, const char *project, const ch
         if (stmt) {
             sqlite3_finalize(stmt);
         }
+        store_set_error_sqlite(s, "arch_layers_route_packages");
         return CBM_STORE_ERR;
     }
     arch_bind_node_view_sql(stmt, use_active_nodes, project, scoped, norm, like, 0);
 
-    int count = 0;
     int step_rc = SQLITE_OK;
-    while (count < max_pkgs && (step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *name = (const char *)sqlite3_column_text(stmt, 0);
         const char *qn = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
         const char *fp = (const char *)sqlite3_column_text(stmt, CBM_SZ_2);
@@ -14694,25 +14833,20 @@ static int collect_route_pkg_names(cbm_store_t *s, const char *project, const ch
         if (!pkg || !pkg[0]) {
             continue;
         }
-        pkgs[count] = heap_strdup(pkg);
-        if (!pkgs[count]) {
-            for (int i = 0; i < count; i++) {
-                free(pkgs[i]);
-            }
+        arch_layer_package_t *package = NULL;
+        if (arch_layer_package_get_or_add(s, packages, pkg, &package) != CBM_STORE_OK) {
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
         }
-        count++;
+        package->has_route = true;
     }
-    if (step_rc != SQLITE_DONE && count < max_pkgs) {
-        for (int i = 0; i < count; i++) {
-            free(pkgs[i]);
-        }
+    if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "arch_layers_route_packages");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
-    return count;
+    return CBM_STORE_OK;
 }
 
 static int arch_layers(cbm_store_t *s, const char *project, const char *path,
@@ -14720,140 +14854,78 @@ static int arch_layers(cbm_store_t *s, const char *project, const char *path,
     out->layers = NULL;
     out->layer_count = 0;
 
-    /* Get boundaries for fan analysis */
+    arch_layer_package_set_t packages;
+    if (arch_layer_package_set_init(s, &packages) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    /* Layers require every boundary for exact fan analysis. The public
+     * boundaries aspect applies its preview limit only after aggregation. */
     cbm_cross_pkg_boundary_t *boundaries = NULL;
     int bcount = 0;
-    int rc = arch_boundaries(s, project, path, &boundaries, &bcount);
+    int rc = arch_boundaries(s, project, path, 0, &boundaries, &bcount);
     if (rc != CBM_STORE_OK) {
-        return rc;
-    }
-
-    /* Collect route and entry point packages */
-    char *route_pkgs[CBM_SZ_32];
-    int nrpkgs = collect_route_pkg_names(s, project, path, route_pkgs, CBM_SZ_32);
-    if (nrpkgs < 0) {
-        arch_free_boundaries(boundaries, bcount);
-        store_set_error(s, "arch_layers route package collection failed");
+        arch_layer_package_set_free(&packages);
         return CBM_STORE_ERR;
     }
-
-    char *entry_pkgs[CBM_SZ_32];
-    int nepkgs = collect_pkg_names(s,
-                                   "SELECT qualified_name FROM nodes WHERE project=?1 AND "
-                                   "json_extract(properties, '$.is_entry_point') = 1",
-                                   project, path, entry_pkgs, CBM_SZ_32);
-    if (nepkgs < 0) {
-        for (int i = 0; i < nrpkgs; i++) {
-            free(route_pkgs[i]);
-        }
-        arch_free_boundaries(boundaries, bcount);
-        store_set_error(s, "arch_layers entry package collection failed");
-        return CBM_STORE_ERR;
-    }
-
-    /* Compute fan-in/out per package */
-    char *all_pkgs[CBM_SZ_64];
-    int fan_in[CBM_SZ_64];
-    int fan_out[CBM_SZ_64];
-    int npkgs = 0;
-    memset(fan_in, 0, sizeof(fan_in));
-    memset(fan_out, 0, sizeof(fan_out));
 
     for (int i = 0; i < bcount; i++) {
-        int fi = CBM_STORE_NOT_FOUND;
-        rc = find_or_add_pkg(all_pkgs, &npkgs, ST_MAX_PKGS, boundaries[i].from, &fi);
-        if (rc == CBM_STORE_ERR) {
-            goto oom;
-        } else if (rc == CBM_STORE_OK && fi >= 0) {
-            fan_out[fi] += boundaries[i].call_count;
+        arch_layer_package_t *from = NULL;
+        arch_layer_package_t *to = NULL;
+        if (arch_layer_package_get_or_add(s, &packages, boundaries[i].from, &from) !=
+                CBM_STORE_OK ||
+            arch_layer_package_get_or_add(s, &packages, boundaries[i].to, &to) != CBM_STORE_OK ||
+            arch_layer_add_fan(s, &from->fan_out, boundaries[i].call_count) != CBM_STORE_OK ||
+            arch_layer_add_fan(s, &to->fan_in, boundaries[i].call_count) != CBM_STORE_OK) {
+            goto fail;
         }
-        int ti = CBM_STORE_NOT_FOUND;
-        rc = find_or_add_pkg(all_pkgs, &npkgs, ST_MAX_PKGS, boundaries[i].to, &ti);
-        if (rc == CBM_STORE_ERR) {
-            goto oom;
-        } else if (rc == CBM_STORE_OK && ti >= 0) {
-            fan_in[ti] += boundaries[i].call_count;
-        }
+    }
+    arch_free_boundaries(boundaries, bcount);
+    boundaries = NULL;
+    bcount = 0;
+
+    if (collect_route_pkg_names(s, project, path, &packages) != CBM_STORE_OK ||
+        collect_entry_pkg_names(s,
+                                "SELECT qualified_name FROM nodes WHERE project=?1 AND "
+                                "json_extract(properties, '$.is_entry_point') = 1",
+                                project, path, &packages) != CBM_STORE_OK) {
+        goto fail;
     }
 
-    /* Also include route/entry packages */
-    for (int i = 0; i < nrpkgs; i++) {
-        int idx = CBM_STORE_NOT_FOUND;
-        if (find_or_add_pkg(all_pkgs, &npkgs, ST_MAX_PKGS, route_pkgs[i], &idx) ==
-            CBM_STORE_ERR) {
-            goto oom;
-        }
+    out->layers = packages.count > 0 ? calloc((size_t)packages.count, sizeof(*out->layers)) : NULL;
+    if (packages.count > 0 && !out->layers) {
+        store_set_error(s, "arch_layers out of memory");
+        goto fail;
     }
-    for (int i = 0; i < nepkgs; i++) {
-        int idx = CBM_STORE_NOT_FOUND;
-        if (find_or_add_pkg(all_pkgs, &npkgs, ST_MAX_PKGS, entry_pkgs[i], &idx) ==
-            CBM_STORE_ERR) {
-            goto oom;
-        }
-    }
-
-    /* Classify each package */
-    out->layers = (npkgs > 0) ? calloc(npkgs, sizeof(cbm_package_layer_t)) : NULL;
-    if (npkgs > 0 && !out->layers) {
-        goto oom;
-    }
-    out->layer_count = npkgs;
-    for (int i = 0; i < npkgs; i++) {
-        bool has_route = pkg_in_list(all_pkgs[i], route_pkgs, nrpkgs);
-        bool has_entry = pkg_in_list(all_pkgs[i], entry_pkgs, nepkgs);
+    out->layer_count = packages.count;
+    for (int i = 0; i < packages.count; i++) {
+        arch_layer_package_t *package = packages.items[i];
         const char *layer;
         const char *reason;
-        classify_layer(all_pkgs[i], fan_in[i], fan_out[i], has_route, has_entry, &layer, &reason);
-        out->layers[i].name = all_pkgs[i]; /* transfer ownership */
+        classify_layer(package->name, package->fan_in, package->fan_out, package->has_route,
+                       package->has_entry, &layer, &reason);
+        out->layers[i].name = heap_strdup(package->name);
         out->layers[i].layer = heap_strdup(layer);
         out->layers[i].reason = heap_strdup(reason);
-        if (!out->layers[i].layer || !out->layers[i].reason) {
+        if (!out->layers[i].name || !out->layers[i].layer || !out->layers[i].reason) {
             out->layer_count = i + 1;
-            for (int j = i + 1; j < npkgs; j++) {
-                free(all_pkgs[j]);
-            }
-            goto oom_after_layers;
+            store_set_error(s, "arch_layers out of memory");
+            goto fail;
         }
     }
 
-    /* Sort layers by name */
-    for (int i = SKIP_ONE; i < npkgs; i++) {
-        int j = i;
-        while (j > 0 && strcmp(out->layers[j].name, out->layers[j - SKIP_ONE].name) < 0) {
-            cbm_package_layer_t tmp = out->layers[j];
-            out->layers[j] = out->layers[j - SKIP_ONE];
-            out->layers[j - SKIP_ONE] = tmp;
-            j--;
-        }
+    if (out->layer_count > 1) {
+        qsort(out->layers, (size_t)out->layer_count, sizeof(*out->layers), arch_layer_cmp);
     }
-
-    /* Cleanup */
-    arch_free_boundaries(boundaries, bcount);
-    for (int i = 0; i < nrpkgs; i++) {
-        free(route_pkgs[i]);
-    }
-    for (int i = 0; i < nepkgs; i++) {
-        free(entry_pkgs[i]);
-    }
-
+    arch_layer_package_set_free(&packages);
     return CBM_STORE_OK;
 
-oom:
-    for (int i = 0; i < npkgs; i++) {
-        free(all_pkgs[i]);
-    }
-oom_after_layers:
+fail:
+    arch_free_boundaries(boundaries, bcount);
     arch_free_layers(out->layers, out->layer_count);
     out->layers = NULL;
     out->layer_count = 0;
-    for (int i = 0; i < nrpkgs; i++) {
-        free(route_pkgs[i]);
-    }
-    for (int i = 0; i < nepkgs; i++) {
-        free(entry_pkgs[i]);
-    }
-    arch_free_boundaries(boundaries, bcount);
-    store_set_error(s, "arch_layers out of memory");
+    arch_layer_package_set_free(&packages);
     return CBM_STORE_ERR;
 }
 
@@ -16594,7 +16666,7 @@ int cbm_store_get_architecture_scoped(cbm_store_t *s, const char *project, const
     if (want_aspect(aspects, aspect_count, "boundaries")) {
         cbm_cross_pkg_boundary_t *barr = NULL;
         int bcount = 0;
-        rc = arch_boundaries(s, project, path, &barr, &bcount);
+        rc = arch_boundaries(s, project, path, ST_ARCH_BOUNDARY_RESULT_LIMIT, &barr, &bcount);
         if (rc != CBM_STORE_OK) {
             goto fail;
         }
