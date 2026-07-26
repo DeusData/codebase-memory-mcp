@@ -30,10 +30,13 @@
 
 enum {
     TEST_ARCH_PATH_BUF = 512,
+    TEST_ARCH_LONG_PATH_BUF = 1024,
     TEST_ARCH_NO_COMMUNITY = -1,
     TEST_ARCH_FALLBACK_DISTINCT_PACKAGES = 64,
     TEST_ARCH_FALLBACK_WINNER_NODES = 20,
-    TEST_ARCH_FALLBACK_NAME_BUF = 64
+    TEST_ARCH_FALLBACK_NAME_BUF = 64,
+    TEST_ARCH_FILE_TREE_DISTINCT_DIRS = 70,
+    TEST_ARCH_FILE_TREE_LONG_COMPONENT = 600
 };
 
 /* ── Helper: create architecture test store ──────────────────────── */
@@ -901,6 +904,96 @@ TEST(arch_file_tree) {
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_file_tree_keeps_directories_beyond_former_working_set) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "file-tree-scale", "/tmp/file-tree-scale"), CBM_STORE_OK);
+
+    for (int i = 0; i < TEST_ARCH_FILE_TREE_DISTINCT_DIRS; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        char file_path[TEST_ARCH_PATH_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "file%03d.c", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "file-tree-scale.root%03d.file", i) > 0);
+        ASSERT_TRUE(snprintf(file_path, sizeof(file_path), "root%03d/%s", i, name) > 0);
+        cbm_node_t file = {.project = "file-tree-scale",
+                           .label = "File",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = file_path};
+        ASSERT_GT(cbm_store_upsert_node(s, &file), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"file_tree"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "file-tree-scale", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_last_dir = false;
+    bool saw_last_file = false;
+    for (int i = 0; i < info.file_tree_count; i++) {
+        if (strcmp(info.file_tree[i].path, "root069") == 0 &&
+            strcmp(info.file_tree[i].type, "dir") == 0 && info.file_tree[i].children == 1) {
+            saw_last_dir = true;
+        }
+        if (strcmp(info.file_tree[i].path, "root069/file069.c") == 0 &&
+            strcmp(info.file_tree[i].type, "file") == 0) {
+            saw_last_file = true;
+        }
+    }
+
+    int file_tree_count = info.file_tree_count;
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_EQ(file_tree_count, TEST_ARCH_FILE_TREE_DISTINCT_DIRS * 2);
+    ASSERT_TRUE(saw_last_dir);
+    ASSERT_TRUE(saw_last_file);
+    PASS();
+}
+
+TEST(arch_file_tree_keeps_paths_longer_than_split_scratch_buffer) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "file-tree-long-path", "/tmp/file-tree-long-path"),
+              CBM_STORE_OK);
+
+    char component[TEST_ARCH_FILE_TREE_LONG_COMPONENT + 1];
+    memset(component, 'a', TEST_ARCH_FILE_TREE_LONG_COMPONENT);
+    component[TEST_ARCH_FILE_TREE_LONG_COMPONENT] = '\0';
+    char file_path[TEST_ARCH_LONG_PATH_BUF];
+    ASSERT_TRUE(snprintf(file_path, sizeof(file_path), "%s/file.c", component) > 0);
+    cbm_node_t file = {.project = "file-tree-long-path",
+                       .label = "File",
+                       .name = "file.c",
+                       .qualified_name = "file-tree-long-path.long.file",
+                       .file_path = file_path};
+    ASSERT_GT(cbm_store_upsert_node(s, &file), 0);
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"file_tree"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "file-tree-long-path", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_exact_dir = false;
+    bool saw_exact_file = false;
+    for (int i = 0; i < info.file_tree_count; i++) {
+        if (strcmp(info.file_tree[i].path, component) == 0 &&
+            strcmp(info.file_tree[i].type, "dir") == 0 && info.file_tree[i].children == 1) {
+            saw_exact_dir = true;
+        }
+        if (strcmp(info.file_tree[i].path, file_path) == 0 &&
+            strcmp(info.file_tree[i].type, "file") == 0) {
+            saw_exact_file = true;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_TRUE(saw_exact_dir);
+    ASSERT_TRUE(saw_exact_file);
     PASS();
 }
 
@@ -2058,6 +2151,8 @@ SUITE(store_arch) {
     RUN_TEST(arch_layers_collects_route_and_entry_packages_beyond_32);
     RUN_TEST(arch_layers_collects_boundary_packages_beyond_64);
     RUN_TEST(arch_file_tree);
+    RUN_TEST(arch_file_tree_keeps_directories_beyond_former_working_set);
+    RUN_TEST(arch_file_tree_keeps_paths_longer_than_split_scratch_buffer);
     RUN_TEST(arch_clusters);
     RUN_TEST(arch_clusters_resolution_knob);
     RUN_TEST(analytics_work_across_languages);
