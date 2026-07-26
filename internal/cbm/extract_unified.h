@@ -2,6 +2,7 @@
 #define CBM_EXTRACT_UNIFIED_H
 
 #include "cbm.h"
+#include "foundation/constants.h"
 #include "lang_specs.h"
 
 // Scope kinds for the walk state stack.
@@ -12,7 +13,13 @@
 #define SCOPE_LOOP 5
 #define SCOPE_BRANCH 6
 
-#define MAX_SCOPES 64
+typedef struct {
+    const char *qn;
+    uint32_t depth;
+    uint8_t kind;
+} cbm_walk_scope_t;
+
+enum { CBM_WALK_SCOPE_INLINE_CAP = CBM_SZ_64 };
 
 // ObjectScript type map: variable name → class name (for instance_method_call
 // resolution). Stack-allocated, per-method scope. Overflow is silent (no crash).
@@ -38,12 +45,10 @@ typedef struct {
     int loop_depth;                 // count of enclosing loop scopes (for bottleneck metrics)
     int branch_depth;               // count of enclosing branch scopes
 
-    struct {
-        const char *qn;
-        uint32_t depth;
-        uint8_t kind;
-    } scopes[MAX_SCOPES];
+    cbm_walk_scope_t inline_scopes[CBM_WALK_SCOPE_INLINE_CAP];
+    cbm_walk_scope_t *scopes;
     int scope_top;
+    int scope_capacity;
 
     os_type_map_t os_type_map; // ObjectScript variable → type mapping
 } WalkState;
