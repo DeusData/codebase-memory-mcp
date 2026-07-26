@@ -106,7 +106,20 @@ void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
 #define CBM_CONFIG_SEMANTIC_THRESHOLD "semantic_threshold"
 #define CBM_CONFIG_SEMANTIC_EDGES_ENABLED "semantic_edges_enabled"
 #define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
+#define CBM_CONFIG_GITHISTORY_MAX_COUPLINGS "githistory_max_couplings"
 #define CBM_CONFIG_GITHISTORY_ENABLED "githistory_enabled"
+/* Preserve the established default graph-size budget, but permit exhaustive
+ * output for the current parser window. At most C(20,2)=190 pairs are observed
+ * per accepted commit, and parse_git_log reads at most 10,000 commits. */
+#define CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS 8192
+#define CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS_STR "8192"
+#define CBM_GITHISTORY_HISTORY_COMMIT_LIMIT 10000
+#define CBM_GITHISTORY_MAX_FILES_PER_COMMIT 20
+#define CBM_GITHISTORY_MAX_PAIRS_PER_COMMIT \
+    ((CBM_GITHISTORY_MAX_FILES_PER_COMMIT * (CBM_GITHISTORY_MAX_FILES_PER_COMMIT - 1)) / 2)
+#define CBM_GITHISTORY_MAX_COUPLINGS_LIMIT \
+    (CBM_GITHISTORY_HISTORY_COMMIT_LIMIT * CBM_GITHISTORY_MAX_PAIRS_PER_COMMIT)
+#define CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR "1900000"
 #define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
 #define CBM_CONFIG_EXTRACT_TIMEOUT_MS "extract_timeout_ms"
 #define CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS 5000
@@ -149,6 +162,7 @@ void cbm_pipeline_set_httplinks_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_semantic_edges_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_githistory_max_couplings(cbm_pipeline_t *p, int max_couplings);
 void cbm_pipeline_set_githistory_enabled(cbm_pipeline_t *p, bool enabled);
 void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold);
 void cbm_pipeline_set_exact_delta_limits(cbm_pipeline_t *p, int max_changed_paths,
@@ -162,6 +176,7 @@ bool cbm_pipeline_httplinks_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p);
 bool cbm_pipeline_semantic_edges_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p);
+int cbm_pipeline_githistory_max_couplings(const cbm_pipeline_t *p);
 bool cbm_pipeline_githistory_enabled(const cbm_pipeline_t *p);
 double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p);
 int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p);

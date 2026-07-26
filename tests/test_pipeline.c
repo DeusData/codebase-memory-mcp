@@ -5670,8 +5670,8 @@ TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint) {
     enum { PIPELINE_DELTA_META_GENERATION = 13 };
     char effective_fingerprint[CBM_SZ_256];
     ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
-                  effective_fingerprint, sizeof(effective_fingerprint), CBM_MODE_FULL, 0.7,
-                  0.25, 0.75, 0.3, 0.6),
+                  effective_fingerprint, sizeof(effective_fingerprint), CBM_MODE_FULL, 0.7, 0.25,
+                  0.75, 0.3, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS, 0.6),
               CBM_STORE_OK);
     char *tmp = th_mktempdir("cbm_delta_meta_fingerprint");
     ASSERT_NOT_NULL(tmp);
@@ -5850,6 +5850,7 @@ TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
     char full_default[CBM_SZ_256];
     char full_tuned[CBM_SZ_256];
     char full_tuned_again[CBM_SZ_256];
+    char full_coupling_budget_tuned[CBM_SZ_256];
     char fast_default[CBM_SZ_256];
     char capabilities_disabled[CBM_SZ_256];
 
@@ -5870,6 +5871,10 @@ TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
     ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_tuned_again,
                                                     sizeof(full_tuned_again)),
               CBM_STORE_OK);
+    cbm_pipeline_set_githistory_max_couplings(full, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS + 1);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_coupling_budget_tuned,
+                                                    sizeof(full_coupling_budget_tuned)),
+              CBM_STORE_OK);
     ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(fast, fast_default, sizeof(fast_default)),
               CBM_STORE_OK);
     cbm_pipeline_set_similarity_enabled(full, false);
@@ -5882,8 +5887,9 @@ TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
 
     ASSERT_NEQ(strcmp(full_default, full_tuned), 0);
     ASSERT_STR_EQ(full_tuned, full_tuned_again);
+    ASSERT_NEQ(strcmp(full_tuned, full_coupling_budget_tuned), 0);
     ASSERT_NEQ(strcmp(full_default, fast_default), 0);
-    ASSERT_NEQ(strcmp(full_tuned, capabilities_disabled), 0);
+    ASSERT_NEQ(strcmp(full_coupling_budget_tuned, capabilities_disabled), 0);
 
     cbm_pipeline_free(full);
     cbm_pipeline_free(fast);
@@ -5901,12 +5907,12 @@ TEST(pipeline_file_state_current_check_rejects_stale_config_fingerprint) {
     char old_fingerprint[CBM_SZ_256];
     char current_fingerprint[CBM_SZ_256];
     ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
-                  old_fingerprint, sizeof(old_fingerprint), CBM_MODE_FULL, 0.7, 0.25, 0.75,
-                  0.3, 0.6),
+                  old_fingerprint, sizeof(old_fingerprint), CBM_MODE_FULL, 0.7, 0.25, 0.75, 0.3,
+                  CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS, 0.6),
               CBM_STORE_OK);
     ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
-                  current_fingerprint, sizeof(current_fingerprint), CBM_MODE_FULL, 0.8, 0.25,
-                  0.75, 0.3, 0.6),
+                  current_fingerprint, sizeof(current_fingerprint), CBM_MODE_FULL, 0.8, 0.25, 0.75,
+                  0.3, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS, 0.6),
               CBM_STORE_OK);
     ASSERT_NEQ(strcmp(old_fingerprint, current_fingerprint), 0);
 
@@ -17480,6 +17486,24 @@ TEST(pipeline_unit_threshold_setters_clamp_invalid_values) {
     PASS();
 }
 
+TEST(pipeline_githistory_max_couplings_clamps_to_shared_range) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
+
+    cbm_pipeline_set_githistory_max_couplings(p, CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+
+    cbm_pipeline_set_githistory_max_couplings(p, 0);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
+
+    cbm_pipeline_set_githistory_max_couplings(p, CBM_GITHISTORY_MAX_COUPLINGS_LIMIT + 1);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+
+    cbm_pipeline_free(p);
+    PASS();
+}
+
 TEST(pipeline_publish_kind_names_are_stable) {
     ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_NONE), "none");
     ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_FULL), "full");
@@ -17499,6 +17523,7 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     enum {
         PIPELINE_TEST_EXACT_MAX_CHANGED = 3,
         PIPELINE_TEST_EXACT_MAX_AFFECTED = 9,
+        PIPELINE_TEST_GITHISTORY_MAX_COUPLINGS = 65536,
     };
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pipeline_cfg_XXXXXX");
@@ -17512,6 +17537,12 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, "0.26"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, "0.76"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.31"), 0);
+    char githistory_max_couplings[CBM_SZ_32];
+    int n = snprintf(githistory_max_couplings, sizeof(githistory_max_couplings), "%d",
+                     PIPELINE_TEST_GITHISTORY_MAX_COUPLINGS);
+    ASSERT(n >= 0 && (size_t)n < sizeof(githistory_max_couplings));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, githistory_max_couplings),
+              0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, "0.61"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
@@ -17520,7 +17551,7 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "17000"), 0);
     char max_changed[CBM_SZ_32];
     char max_affected[CBM_SZ_32];
-    int n = snprintf(max_changed, sizeof(max_changed), "%d", PIPELINE_TEST_EXACT_MAX_CHANGED);
+    n = snprintf(max_changed, sizeof(max_changed), "%d", PIPELINE_TEST_EXACT_MAX_CHANGED);
     ASSERT(n >= 0 && (size_t)n < sizeof(max_changed));
     n = snprintf(max_affected, sizeof(max_affected), "%d", PIPELINE_TEST_EXACT_MAX_AFFECTED);
     ASSERT(n >= 0 && (size_t)n < sizeof(max_affected));
@@ -17541,6 +17572,7 @@ TEST(pipeline_apply_config_sets_all_thresholds) {
     ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) < 0.77);
     ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) > 0.30);
     ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) < 0.32);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), PIPELINE_TEST_GITHISTORY_MAX_COUPLINGS);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) > 0.60);
     ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
     ASSERT_FALSE(cbm_pipeline_similarity_enabled(p));
@@ -18177,6 +18209,20 @@ TEST(config_registry_includes_incremental_derived_results_refresh_policy) {
     ASSERT_NOT_NULL(strstr(entry->description, "similarity edges"));
     ASSERT_NOT_NULL(strstr(entry->description, "architecture"));
     ASSERT_NOT_NULL(strstr(entry->description, "routes"));
+    PASS();
+}
+
+TEST(config_registry_includes_githistory_max_couplings) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_GITHISTORY_MAX_COUPLINGS);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS_STR);
+    ASSERT_EQ(atoi(entry->default_val), CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
+    ASSERT_STR_EQ(entry->category, "Similarity");
+    ASSERT_STR_EQ(entry->range, "1-" CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR);
+    ASSERT_EQ(atoi(CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR), CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+    ASSERT_NOT_NULL(strstr(entry->guidance, "partial"));
+    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_STRINGIFY(CBM_GITHISTORY_HISTORY_COMMIT_LIMIT)));
+    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_STRINGIFY(CBM_GITHISTORY_MAX_FILES_PER_COMMIT)));
     PASS();
 }
 
@@ -19053,6 +19099,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
     RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
+    RUN_TEST(pipeline_githistory_max_couplings_clamps_to_shared_range);
     RUN_TEST(pipeline_apply_config_sets_all_thresholds);
     RUN_TEST(pipeline_capability_gates_default_enabled);
     RUN_TEST(pipeline_disabled_capabilities_skip_expensive_passes);
@@ -19074,6 +19121,7 @@ SUITE(pipeline) {
     RUN_TEST(config_registry_includes_overlay_compaction_policy);
     RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
     RUN_TEST(config_registry_includes_incremental_derived_results_refresh_policy);
+    RUN_TEST(config_registry_includes_githistory_max_couplings);
     RUN_TEST(config_registry_includes_rank_refresh_policy);
     RUN_TEST(config_registry_includes_capability_gates);
     RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);

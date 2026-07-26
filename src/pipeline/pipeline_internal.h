@@ -458,6 +458,7 @@ typedef struct {
     double httplink_min_confidence;    /* <=0 uses httplink pass default 0.25 */
     double semantic_threshold;         /* <=0 uses semantic default 0.75 */
     double githistory_min_coupling;    /* <=0 uses git-history default 0.3 */
+    int githistory_max_couplings;      /* bounded FILE_CHANGES_WITH output budget */
     double lsp_confidence_floor;       /* <=0 uses LSP default 0.6 */
     int64_t extract_timeout_micros;    /* bounded tree-sitter parse deadline */
 
@@ -704,12 +705,10 @@ void cbm_pipeline_free_import_map(const char **keys, const char **vals, int coun
  * Returns CBM_STORE_OK even when unsupported_edge_count > 0; callers must fall
  * back instead of publishing when unsupported edges are present. */
 const char *cbm_pipeline_file_delta_pass_fingerprint(void);
-int cbm_pipeline_format_file_delta_pass_fingerprint(char *out, size_t out_sz, int mode,
-                                                    double similarity_threshold,
-                                                    double httplink_min_confidence,
-                                                    double semantic_threshold,
-                                                    double githistory_min_coupling,
-                                                    double lsp_confidence_floor);
+int cbm_pipeline_format_file_delta_pass_fingerprint(
+    char *out, size_t out_sz, int mode, double similarity_threshold, double httplink_min_confidence,
+    double semantic_threshold, double githistory_min_coupling, int githistory_max_couplings,
+    double lsp_confidence_floor);
 int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, size_t out_sz);
 int cbm_pipeline_content_hash_file(const char *path, char *out, size_t out_sz);
 bool cbm_pipeline_file_state_is_current_or_legacy(cbm_store_t *store, const char *project,
@@ -1268,9 +1267,9 @@ typedef struct {
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
 int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result);
-int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
-                                                   cbm_githistory_result_t *result,
-                                                   double min_coupling_score);
+int cbm_pipeline_githistory_compute_with_limits(const char *repo_path,
+                                                cbm_githistory_result_t *result,
+                                                double min_coupling_score, int max_couplings);
 
 /* Apply pre-computed couplings to the graph buffer (main thread only). */
 int cbm_pipeline_githistory_apply(cbm_pipeline_ctx_t *ctx, const cbm_githistory_result_t *result);

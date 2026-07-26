@@ -123,23 +123,21 @@ static uint64_t delta_double_bits(double value) {
     return bits;
 }
 
-int cbm_pipeline_format_file_delta_pass_fingerprint(char *out, size_t out_sz, int mode,
-                                                    double similarity_threshold,
-                                                    double httplink_min_confidence,
-                                                    double semantic_threshold,
-                                                    double githistory_min_coupling,
-                                                    double lsp_confidence_floor) {
+int cbm_pipeline_format_file_delta_pass_fingerprint(
+    char *out, size_t out_sz, int mode, double similarity_threshold, double httplink_min_confidence,
+    double semantic_threshold, double githistory_min_coupling, int githistory_max_couplings,
+    double lsp_confidence_floor) {
     if (!out || out_sz == 0) {
         return CBM_STORE_ERR;
     }
-    int n = snprintf(out, out_sz,
-                     "%s|mode=%d|sim=%016" PRIx64 "|http=%016" PRIx64 "|sem=%016" PRIx64
-                     "|gh=%016" PRIx64 "|lsp=%016" PRIx64,
-                     cbm_delta_pass_fingerprint_v1, mode, delta_double_bits(similarity_threshold),
-                     delta_double_bits(httplink_min_confidence),
-                     delta_double_bits(semantic_threshold),
-                     delta_double_bits(githistory_min_coupling),
-                     delta_double_bits(lsp_confidence_floor));
+    int n =
+        snprintf(out, out_sz,
+                 "%s|mode=%d|sim=%016" PRIx64 "|http=%016" PRIx64 "|sem=%016" PRIx64
+                 "|gh=%016" PRIx64 "|ghmax=%d|lsp=%016" PRIx64,
+                 cbm_delta_pass_fingerprint_v1, mode, delta_double_bits(similarity_threshold),
+                 delta_double_bits(httplink_min_confidence), delta_double_bits(semantic_threshold),
+                 delta_double_bits(githistory_min_coupling), githistory_max_couplings,
+                 delta_double_bits(lsp_confidence_floor));
     if (n < 0 || (size_t)n >= out_sz) {
         out[0] = '\0';
         return CBM_STORE_ERR;

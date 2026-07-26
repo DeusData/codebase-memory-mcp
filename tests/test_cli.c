@@ -11330,6 +11330,31 @@ TEST(cli_config_query_row_limits_enforce_advertised_ranges) {
     PASS();
 }
 
+TEST(cli_config_githistory_max_couplings_enforces_advertised_range) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-githistory-couplings-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, "1"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS,
+                             CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, "0"), 0);
+    char over_max[CBM_SZ_32];
+    ASSERT_GT(snprintf(over_max, sizeof(over_max), "%d", CBM_GITHISTORY_MAX_COUPLINGS_LIMIT + 1),
+              0);
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, over_max), 0);
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_cluster_node_budget_uses_shared_broad_range) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-cluster-budget-XXXXXX");
@@ -13619,6 +13644,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_bool);
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_query_row_limits_enforce_advertised_ranges);
+    RUN_TEST(cli_config_githistory_max_couplings_enforces_advertised_range);
     RUN_TEST(cli_config_cluster_node_budget_uses_shared_broad_range);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
