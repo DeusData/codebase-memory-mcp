@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3, GH_MAX_FILES = 20 };
+enum { GH_RING = 4, GH_RING_MASK = 3, GH_INIT_CAP = 16, GH_MIN_COMMITS = 3 };
 
 #define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
@@ -129,7 +129,8 @@ static int parse_git_log(const char *repo_path, commit_t **out, int *out_count) 
      * other shell metacharacters that would otherwise be active inside them. */
     snprintf(cmd, sizeof(cmd),
              "git -C \"%s\" log --name-only --pretty=format:COMMIT:%%H:%%ct "
-             "--since=\"1 year ago\" --max-count=10000 2>%s",
+             "--since=\"1 year ago\" --max-count=" CBM_STRINGIFY(
+                 CBM_GITHISTORY_HISTORY_COMMIT_LIMIT) " 2>%s",
              repo_path, null_dev);
 
     FILE *fp = cbm_popen(cmd, "r");
@@ -400,7 +401,7 @@ cbm_change_coupling_result_t cbm_compute_change_coupling_result(const cbm_commit
     }
 
     for (int c = 0; c < commit_count; c++) {
-        if (commits[c].count > GH_MAX_FILES) {
+        if (commits[c].count > CBM_GITHISTORY_MAX_FILES_PER_COMMIT) {
             continue;
         }
 
@@ -522,9 +523,6 @@ int cbm_compute_change_coupling(const cbm_commit_files_t *commits, int commit_co
 
 /* ── Split pass: compute (I/O-bound) + apply (gbuf writes) ───────── */
 
-/* Pre-computed coupling result buffer for fused post-pass parallelism. */
-#define MAX_COUPLINGS 8192
-
 void cbm_file_temporal_free(cbm_file_temporal_t *items, int count) {
     if (!items) {
         return;
@@ -555,7 +553,7 @@ int cbm_compute_file_temporal(const cbm_commit_files_t *commits, int commit_coun
     int count = 0;
     int capacity = 0;
     for (int c = 0; c < commit_count; c++) {
-        if (commits[c].count > GH_MAX_FILES) {
+        if (commits[c].count > CBM_GITHISTORY_MAX_FILES_PER_COMMIT) {
             continue;
         }
         for (int f = 0; f < commits[c].count; f++) {
@@ -632,9 +630,22 @@ fail:
 
 /* Compute change couplings without touching the graph buffer.
  * Can run on a separate thread while other passes use the gbuf. */
-int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
-                                                   cbm_githistory_result_t *result,
-                                                   double min_coupling_score) {
+static int coupling_output_capacity(const commit_t *commits, int commit_count, int requested) {
+    int capacity = 0;
+    for (int i = 0; i < commit_count && capacity < requested; i++) {
+        int file_count = commits[i].count;
+        if (file_count < 2 || file_count > CBM_GITHISTORY_MAX_FILES_PER_COMMIT) {
+            continue;
+        }
+        int pair_count = file_count * (file_count - 1) / 2;
+        capacity = pair_count >= requested - capacity ? requested : capacity + pair_count;
+    }
+    return capacity;
+}
+
+int cbm_pipeline_githistory_compute_with_limits(const char *repo_path,
+                                                cbm_githistory_result_t *result,
+                                                double min_coupling_score, int max_couplings) {
     result->couplings = NULL;
     result->count = 0;
     result->commit_count = 0;
@@ -666,12 +677,23 @@ int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
         cf[c].timestamp = commits[c].timestamp;
     }
 
-    cbm_change_coupling_t *couplings = malloc(MAX_COUPLINGS * sizeof(cbm_change_coupling_t));
+    if (max_couplings <= 0) {
+        max_couplings = CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS;
+    } else if (max_couplings > CBM_GITHISTORY_MAX_COUPLINGS_LIMIT) {
+        max_couplings = CBM_GITHISTORY_MAX_COUPLINGS_LIMIT;
+    }
+    /* A wide configured budget must not reserve space for pairs the parsed
+     * history cannot possibly contain. This O(commits) bound is saturated at
+     * the requested K, adds constant memory, and preserves exact selection. */
+    int coupling_capacity = coupling_output_capacity(commits, commit_count, max_couplings);
+    cbm_change_coupling_t *couplings =
+        coupling_capacity > 0 ? malloc((size_t)coupling_capacity * sizeof(cbm_change_coupling_t))
+                              : NULL;
     cbm_change_coupling_result_t coupling_result = {0};
     if (couplings) {
         coupling_result = cbm_compute_change_coupling_result(cf, commit_count, couplings,
-                                                             MAX_COUPLINGS, min_coupling_score);
-    } else {
+                                                             coupling_capacity, min_coupling_score);
+    } else if (coupling_capacity > 0) {
         coupling_result.allocation_failed = 1;
     }
     if (coupling_result.allocation_failed) {
@@ -705,7 +727,8 @@ int cbm_pipeline_githistory_compute_with_threshold(const char *repo_path,
 }
 
 int cbm_pipeline_githistory_compute(const char *repo_path, cbm_githistory_result_t *result) {
-    return cbm_pipeline_githistory_compute_with_threshold(repo_path, result, 0.0);
+    return cbm_pipeline_githistory_compute_with_limits(repo_path, result, 0.0,
+                                                       CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
 }
 
 /* Apply pre-computed couplings to the graph buffer (must be on main thread). */
@@ -774,8 +797,8 @@ int cbm_pipeline_pass_githistory(cbm_pipeline_ctx_t *ctx) {
     cbm_log_info("pass.start", "pass", "githistory");
 
     cbm_githistory_result_t result = {0};
-    cbm_pipeline_githistory_compute_with_threshold(ctx->repo_path, &result,
-                                                   ctx->githistory_min_coupling);
+    cbm_pipeline_githistory_compute_with_limits(
+        ctx->repo_path, &result, ctx->githistory_min_coupling, ctx->githistory_max_couplings);
 
     int edge_count = 0;
     if (result.count > 0 || result.file_temporal_count > 0) {

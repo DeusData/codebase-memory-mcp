@@ -126,6 +126,7 @@ struct cbm_pipeline {
     double httplink_min_confidence;
     double semantic_threshold;
     double githistory_min_coupling;
+    int githistory_max_couplings;
     double lsp_confidence_floor;
     int64_t extract_timeout_micros;
     cbm_incremental_reindex_policy_t incremental_reindex;
@@ -255,6 +256,7 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path,
     p->httplink_min_confidence = 0.0;
     p->semantic_threshold = 0.0;
     p->githistory_min_coupling = 0.0;
+    p->githistory_max_couplings = CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS;
     p->lsp_confidence_floor = 0.0;
     p->extract_timeout_micros = CBM_EXTRACT_BUDGET;
     p->incremental_reindex = CBM_INCREMENTAL_REINDEX_ALWAYS;
@@ -343,6 +345,18 @@ void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshol
     }
 }
 
+void cbm_pipeline_set_githistory_max_couplings(cbm_pipeline_t *p, int max_couplings) {
+    if (!p) {
+        return;
+    }
+    if (max_couplings <= 0) {
+        max_couplings = CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS;
+    } else if (max_couplings > CBM_GITHISTORY_MAX_COUPLINGS_LIMIT) {
+        max_couplings = CBM_GITHISTORY_MAX_COUPLINGS_LIMIT;
+    }
+    p->githistory_max_couplings = max_couplings;
+}
+
 void cbm_pipeline_set_githistory_enabled(cbm_pipeline_t *p, bool enabled) {
     if (p) p->githistory_enabled = enabled;
 }
@@ -405,6 +419,9 @@ void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg) {
     if (gh_min > 0.0) {
         cbm_pipeline_set_githistory_min_coupling(p, gh_min);
     }
+    cbm_pipeline_set_githistory_max_couplings(
+        p, cbm_config_get_int(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS,
+                              CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS));
 
     double lsp_floor =
         cbm_config_get_double(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, 0.0);
@@ -494,6 +511,10 @@ double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p) {
     return p ? p->githistory_min_coupling : 0.0;
 }
 
+int cbm_pipeline_githistory_max_couplings(const cbm_pipeline_t *p) {
+    return p ? p->githistory_max_couplings : CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS;
+}
+
 bool cbm_pipeline_githistory_enabled(const cbm_pipeline_t *p) {
     return p ? p->githistory_enabled : true;
 }
@@ -522,9 +543,9 @@ int cbm_pipeline_current_pass_fingerprint(const cbm_pipeline_t *p, char *out, si
     }
     char base[CBM_SZ_256];
     if (cbm_pipeline_format_file_delta_pass_fingerprint(
-            base, sizeof(base), p->mode, p->similarity_threshold,
-            p->httplink_min_confidence, p->semantic_threshold,
-            p->githistory_min_coupling, p->lsp_confidence_floor) != CBM_STORE_OK) {
+            base, sizeof(base), p->mode, p->similarity_threshold, p->httplink_min_confidence,
+            p->semantic_threshold, p->githistory_min_coupling, p->githistory_max_couplings,
+            p->lsp_confidence_floor) != CBM_STORE_OK) {
         out[0] = '\0';
         return CBM_STORE_ERR;
     }
@@ -1229,12 +1250,13 @@ typedef struct {
     const char *repo_path;
     cbm_githistory_result_t *result;
     double min_coupling_score;
+    int max_couplings;
 } gh_compute_arg_t;
 
 static void *gh_compute_thread_fn(void *arg) {
     gh_compute_arg_t *a = arg;
-    cbm_pipeline_githistory_compute_with_threshold(a->repo_path, a->result,
-                                                   a->min_coupling_score);
+    cbm_pipeline_githistory_compute_with_limits(a->repo_path, a->result, a->min_coupling_score,
+                                                a->max_couplings);
     return NULL;
 }
 
@@ -2223,6 +2245,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         .repo_path = ctx->repo_path,
         .result = &gh_result,
         .min_coupling_score = ctx->githistory_min_coupling,
+        .max_couplings = ctx->githistory_max_couplings,
     };
 
     if (p->mode != CBM_MODE_FAST) {
@@ -2232,8 +2255,9 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
             }
         }
         if (!gh_threaded) {
-            cbm_pipeline_githistory_compute_with_threshold(ctx->repo_path, &gh_result,
-                                                           ctx->githistory_min_coupling);
+            cbm_pipeline_githistory_compute_with_limits(ctx->repo_path, &gh_result,
+                                                        ctx->githistory_min_coupling,
+                                                        ctx->githistory_max_couplings);
             cbm_log_info("pass.timing", "pass", "githistory_compute", "elapsed_ms",
                          itoa_buf((int)elapsed_ms(t_gh)));
         }
@@ -2414,6 +2438,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p, bool *was_incremental) {
         .httplink_min_confidence = p->httplink_min_confidence,
         .semantic_threshold = p->semantic_threshold,
         .githistory_min_coupling = p->githistory_min_coupling,
+        .githistory_max_couplings = p->githistory_max_couplings,
         .lsp_confidence_floor = p->lsp_confidence_floor,
         .extract_timeout_micros = p->extract_timeout_micros,
         .path_aliases = path_aliases,

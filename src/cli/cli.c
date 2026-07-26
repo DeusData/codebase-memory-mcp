@@ -7174,6 +7174,10 @@ static bool cbm_config_value_is_valid(const char *key, const char *value) {
         !cbm_config_decimal_integer_in_range(value, 1, CBM_MAX_QUERY_WORKING_ROWS)) {
         return false;
     }
+    if (key && strcmp(key, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS) == 0 &&
+        !cbm_config_decimal_integer_in_range(value, 1, CBM_GITHISTORY_MAX_COUPLINGS_LIMIT)) {
+        return false;
+    }
     if (key && strcmp(key, CBM_CONFIG_ARCH_CLUSTER_NODE_BUDGET) == 0 &&
         !cbm_config_decimal_integer_in_range(value, CBM_MIN_ARCH_CLUSTER_NODE_BUDGET,
                                              CBM_MAX_ARCH_CLUSTER_NODE_BUDGET)) {
@@ -14492,11 +14496,26 @@ const cbm_config_entry_t CBM_CONFIG_REGISTRY[] = {
      "0.0-1.0",
      "Raises or lowers the fork-only HTTP linker's match threshold. Higher values reduce speculative "
      "cross-service HTTP_CALLS edges; 0.0 keeps existing behavior."},
-    {"githistory_min_coupling", "0.0", NULL, "Similarity",
+    {CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.0", NULL, "Similarity",
      "Minimum file co-change coupling score for FILE_CHANGES_WITH edges (0.0 = built-in 0.3)",
      "0.0-1.0",
      "Controls how strongly two files must co-change before git-history coupling emits an edge. "
      "Higher values reduce noisy historical edges; 0.0 keeps existing behavior."},
+    {CBM_CONFIG_GITHISTORY_MAX_COUPLINGS,
+     CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS_STR,
+     NULL,
+     "Similarity",
+     "Maximum strongest FILE_CHANGES_WITH edges retained from git history",
+     "1-" CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR,
+     "The default preserves the established graph-size and indexing-cost budget. When more valid "
+     "pairs exist, the server returns the strongest complete subset and logs a couplings_partial "
+     "warning with written, eligible, and omitted counts. Raise toward the exhaustive "
+     CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR
+     " upper bound only when the additional graph size, runtime, and path-string memory are "
+     "acceptable; that bound covers every possible pair observation in the current "
+     CBM_STRINGIFY(CBM_GITHISTORY_HISTORY_COMMIT_LIMIT)
+     "-commit, " CBM_STRINGIFY(CBM_GITHISTORY_MAX_FILES_PER_COMMIT)
+     "-files-per-commit history window."},
     {"lsp_confidence_floor", "0.0", NULL, "Similarity",
      "Minimum LSP-resolved call confidence accepted by call resolution (0.0 = built-in 0.6)",
      "0.0-1.0",
