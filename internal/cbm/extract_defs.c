@@ -15,10 +15,8 @@
 #include <string.h>
 #include <ctype.h>
 
-// Buffer sizes for local arrays (base classes, params, return types).
+// Buffer sizes for local arrays (params and return types).
 #define MAX_COMMENT_LEN 500
-#define MAX_BASES 16
-#define MAX_BASES_MINUS_1 15
 #define MAX_PARAMS CBM_SZ_32
 #define MAX_PARAMS_MINUS_1 31
 
@@ -2070,29 +2068,99 @@ static char *extract_cpp_base_text(CBMArena *a, TSNode bc, const char *source) {
     return NULL;
 }
 
+typedef struct {
+    const char *inline_items[CBM_SZ_16];
+    const char **items;
+    size_t count;
+    size_t capacity;
+    bool failed;
+} base_class_list_t;
+
+/*
+ * Keep the inherited 16-pointer stack fast path, but use it as an optimization
+ * rather than a semantic cap. Larger lists grow geometrically in the result
+ * arena. Runtime is amortized O(1) per append and O(B) overall; temporary
+ * pointer blocks remain O(B) until the file result is freed.
+ */
+static bool base_class_list_reserve(CBMArena *a, base_class_list_t *list, size_t additional) {
+    if (list->failed) {
+        return false;
+    }
+    if (!list->items) {
+        list->items = list->inline_items;
+        list->capacity = CBM_SZ_16;
+    }
+    if (additional > SIZE_MAX - list->count) {
+        list->failed = true;
+        return false;
+    }
+    size_t needed = list->count + additional;
+    if (needed <= list->capacity) {
+        return true;
+    }
+    size_t next = list->capacity ? list->capacity : CBM_SZ_8;
+    while (next < needed) {
+        if (next > SIZE_MAX / PAIR_LEN) {
+            list->failed = true;
+            return false;
+        }
+        next *= PAIR_LEN;
+    }
+    if (next > SIZE_MAX / sizeof(*list->items)) {
+        list->failed = true;
+        return false;
+    }
+    const char **grown = cbm_arena_alloc(a, next * sizeof(*grown));
+    if (!grown) {
+        list->failed = true;
+        return false;
+    }
+    if (list->items && list->count > 0) {
+        memcpy(grown, list->items, list->count * sizeof(*grown));
+    }
+    list->items = grown;
+    list->capacity = next;
+    return true;
+}
+
+static bool base_class_list_push(CBMArena *a, base_class_list_t *list, const char *text) {
+    if (!text || !text[0]) {
+        return true;
+    }
+    if (!base_class_list_reserve(a, list, SKIP_ONE)) {
+        return false;
+    }
+    list->items[list->count++] = text;
+    return true;
+}
+
+static const char **base_class_list_finish(CBMArena *a, base_class_list_t *list) {
+    if (list->failed || list->count == 0) {
+        return NULL;
+    }
+    if (list->count > SIZE_MAX / sizeof(*list->items) - NULL_TERM) {
+        return NULL;
+    }
+    const char **result = cbm_arena_alloc(a, (list->count + NULL_TERM) * sizeof(*result));
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, list->items, list->count * sizeof(*result));
+    result[list->count] = NULL;
+    return result;
+}
+
 // Extract base classes from a C++ base_class_clause node.
 static const char **extract_cpp_base_classes(CBMArena *a, TSNode clause, const char *source) {
-    const char *bases[MAX_BASES];
-    int base_count = 0;
+    base_class_list_t bases = {0};
     uint32_t bnc = ts_node_named_child_count(clause);
-    for (uint32_t bi = 0; bi < bnc && base_count < MAX_BASES_MINUS_1; bi++) {
+    for (uint32_t bi = 0; bi < bnc; bi++) {
         char *text = extract_cpp_base_text(a, ts_node_named_child(clause, bi), source);
-        if (text && text[0]) {
-            bases[base_count++] = text;
+        if (!base_class_list_push(a, &bases, text)) {
+            return NULL;
         }
     }
-    if (base_count > 0) {
-        const char **result =
-            (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
-        if (result) {
-            for (int j = 0; j < base_count; j++) {
-                result[j] = bases[j];
-            }
-            result[base_count] = NULL;
-            return result;
-        }
-    }
-    return NULL;
+    return base_class_list_finish(a, &bases);
 }
 
 // Build a single-element NULL-terminated base class array.
@@ -2152,29 +2220,16 @@ static const char *extract_csharp_base_child_text(CBMArena *a, TSNode bc, const 
 
 /* Collect bases from a single base_list node into an arena-allocated array. */
 static const char **collect_csharp_bases(CBMArena *a, TSNode base_list, const char *source) {
-    const char *bases[MAX_BASES];
-    int base_count = 0;
+    base_class_list_t bases = {0};
     uint32_t bnc = ts_node_named_child_count(base_list);
-    for (uint32_t bi = 0; bi < bnc && base_count < MAX_BASES_MINUS_1; bi++) {
+    for (uint32_t bi = 0; bi < bnc; bi++) {
         const char *text =
             extract_csharp_base_child_text(a, ts_node_named_child(base_list, bi), source);
-        if (text) {
-            bases[base_count++] = text;
+        if (!base_class_list_push(a, &bases, text)) {
+            return NULL;
         }
     }
-    if (base_count == 0) {
-        return NULL;
-    }
-    const char **result =
-        (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
-    if (!result) {
-        return NULL;
-    }
-    for (int j = 0; j < base_count; j++) {
-        result[j] = bases[j];
-    }
-    result[base_count] = NULL;
-    return result;
+    return base_class_list_finish(a, &bases);
 }
 
 /* C# base_list: iterate children, find base_list node, extract bases. */
@@ -2193,15 +2248,11 @@ static const char **extract_csharp_base_list(CBMArena *a, TSNode node, const cha
     return NULL;
 }
 
-// Append a base name (generic args stripped) to out[] if non-empty.
-static void push_base_text(CBMArena *a, TSNode n, const char *source, const char **out, int out_cap,
-                           int *count) {
-    if (*count >= out_cap) {
-        return;
-    }
+// Append a base name (generic args stripped) if non-empty.
+static bool push_base_text(CBMArena *a, TSNode n, const char *source, base_class_list_t *out) {
     char *t = cbm_node_text(a, n, source);
     if (!t) {
-        return;
+        return true;
     }
     char *angle = strchr(t, '<');
     if (angle) {
@@ -2213,29 +2264,27 @@ static void push_base_text(CBMArena *a, TSNode n, const char *source, const char
     if (last_bs) {
         t = last_bs + 1;
     }
-    if (t[0]) {
-        out[(*count)++] = t;
-    }
+    return base_class_list_push(a, out, t);
 }
 
 /* TypeScript/TSX: bases live in a `class_heritage` (class) or directly in an
  * `extends_type_clause` (interface).  The extractor previously captured the
  * literal "extends"/"implements" keyword text instead of the type names. */
-static int collect_ts_bases(CBMArena *a, TSNode clause, const char *source, const char **out,
-                            int out_cap, int *count) {
+static bool collect_ts_bases(CBMArena *a, TSNode clause, const char *source,
+                             base_class_list_t *out) {
     const char *kk = ts_node_type(clause);
     if (strcmp(kk, "extends_clause") == 0) {
         /* `extends_clause` carries the superclass in its `value` field. */
         TSNode v = ts_node_child_by_field_name(clause, TS_FIELD("value"));
         if (!ts_node_is_null(v)) {
-            push_base_text(a, v, source, out, out_cap, count);
+            return push_base_text(a, v, source, out);
         }
-        return *count;
+        return true;
     }
     if (strcmp(kk, "implements_clause") == 0 || strcmp(kk, "extends_type_clause") == 0) {
         /* Named children are the implemented/extended types (possibly generic). */
         uint32_t nc = ts_node_named_child_count(clause);
-        for (uint32_t i = 0; i < nc && *count < out_cap; i++) {
+        for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_named_child(clause, i);
             const char *ck = ts_node_type(c);
             if (strcmp(ck, "type_arguments") == 0) {
@@ -2244,21 +2293,24 @@ static int collect_ts_bases(CBMArena *a, TSNode clause, const char *source, cons
             if (strcmp(ck, "generic_type") == 0) {
                 TSNode nm = ts_node_child_by_field_name(c, TS_FIELD("name"));
                 if (!ts_node_is_null(nm)) {
-                    push_base_text(a, nm, source, out, out_cap, count);
+                    if (!push_base_text(a, nm, source, out)) {
+                        return false;
+                    }
                     continue;
                 }
             }
-            push_base_text(a, c, source, out, out_cap, count);
+            if (!push_base_text(a, c, source, out)) {
+                return false;
+            }
         }
     }
-    return *count;
+    return true;
 }
 
 /* TypeScript: walk the class_heritage container (which holds extends_clause +
  * implements_clause), or handle a bare interface extends_type_clause. */
 static const char **extract_ts_bases(CBMArena *a, TSNode node, const char *source) {
-    const char *bases[MAX_BASES];
-    int count = 0;
+    base_class_list_t bases = {0};
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_child(node, i);
@@ -2266,33 +2318,23 @@ static const char **extract_ts_bases(CBMArena *a, TSNode node, const char *sourc
         if (strcmp(ck, "class_heritage") == 0) {
             uint32_t hc = ts_node_child_count(child);
             for (uint32_t j = 0; j < hc; j++) {
-                collect_ts_bases(a, ts_node_child(child, j), source, bases, MAX_BASES_MINUS_1,
-                                 &count);
+                if (!collect_ts_bases(a, ts_node_child(child, j), source, &bases)) {
+                    return NULL;
+                }
             }
         } else if (strcmp(ck, "extends_type_clause") == 0) {
-            collect_ts_bases(a, child, source, bases, MAX_BASES_MINUS_1, &count);
+            if (!collect_ts_bases(a, child, source, &bases)) {
+                return NULL;
+            }
         }
     }
-    if (count == 0) {
-        return NULL;
-    }
-    const char **result =
-        (const char **)cbm_arena_alloc(a, (size_t)(count + NULL_TERM) * sizeof(const char *));
-    if (!result) {
-        return NULL;
-    }
-    for (int i = 0; i < count; i++) {
-        result[i] = bases[i];
-    }
-    result[count] = NULL;
-    return result;
+    return base_class_list_finish(a, &bases);
 }
 
 /* PHP: bases live in `base_clause` (extends) and `class_interface_clause`
  * (implements) child nodes; named children are `name`/`qualified_name`. */
 static const char **extract_php_bases(CBMArena *a, TSNode node, const char *source) {
-    const char *bases[MAX_BASES];
-    int count = 0;
+    base_class_list_t bases = {0};
     uint32_t nc = ts_node_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_child(node, i);
@@ -2301,94 +2343,72 @@ static const char **extract_php_bases(CBMArena *a, TSNode node, const char *sour
             continue;
         }
         uint32_t cc = ts_node_named_child_count(child);
-        for (uint32_t j = 0; j < cc && count < MAX_BASES_MINUS_1; j++) {
-            push_base_text(a, ts_node_named_child(child, j), source, bases, MAX_BASES_MINUS_1,
-                           &count);
+        for (uint32_t j = 0; j < cc; j++) {
+            if (!push_base_text(a, ts_node_named_child(child, j), source, &bases)) {
+                return NULL;
+            }
         }
     }
-    if (count == 0) {
-        return NULL;
-    }
-    const char **result =
-        (const char **)cbm_arena_alloc(a, (size_t)(count + NULL_TERM) * sizeof(const char *));
-    if (!result) {
-        return NULL;
-    }
-    for (int i = 0; i < count; i++) {
-        result[i] = bases[i];
-    }
-    result[count] = NULL;
-    return result;
+    return base_class_list_finish(a, &bases);
 }
 
 /* Kotlin: a grammar revision may expose one `delegation_specifier` directly or
  * wrap all of them in `delegation_specifiers`. Each leaf holds either a bare
  * `user_type` (interface) or a `constructor_invocation` (superclass). */
-static void collect_kotlin_delegation_specifier(CBMArena *a, TSNode node, const char *source,
-                                                const char **bases, int *count) {
-    if (*count >= MAX_BASES_MINUS_1 ||
-        strcmp(ts_node_type(node), "delegation_specifier") != 0) {
-        return;
+static bool collect_kotlin_delegation_specifier(CBMArena *a, TSNode node, const char *source,
+                                                base_class_list_t *bases) {
+    if (strcmp(ts_node_type(node), "delegation_specifier") != 0) {
+        return true;
     }
     TSNode ut = ts_node_named_child(node, 0);
     if (!ts_node_is_null(ut) && strcmp(ts_node_type(ut), "constructor_invocation") == 0) {
         ut = ts_node_named_child(ut, 0);
     }
     if (ts_node_is_null(ut)) {
-        return;
+        return true;
     }
     TSNode ti = ut;
     if (strcmp(ts_node_type(ut), "user_type") == 0 && ts_node_named_child_count(ut) > 0) {
         ti = ts_node_named_child(ut, 0);
     }
-    push_base_text(a, ti, source, bases, MAX_BASES_MINUS_1, count);
+    return push_base_text(a, ti, source, bases);
 }
 
-static void collect_kotlin_delegations(CBMArena *a, TSNode node, const char *source,
-                                       const char **bases, int *count) {
+static bool collect_kotlin_delegations(CBMArena *a, TSNode node, const char *source,
+                                       base_class_list_t *bases) {
     const char *kind = ts_node_type(node);
     if (strcmp(kind, "delegation_specifier") == 0) {
-        collect_kotlin_delegation_specifier(a, node, source, bases, count);
-        return;
+        return collect_kotlin_delegation_specifier(a, node, source, bases);
     }
     if (strcmp(kind, "delegation_specifiers") != 0) {
-        return;
+        return true;
     }
     uint32_t nc = ts_node_named_child_count(node);
-    for (uint32_t i = 0; i < nc && *count < MAX_BASES_MINUS_1; i++) {
-        collect_kotlin_delegation_specifier(a, ts_node_named_child(node, i), source, bases,
-                                            count);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (!collect_kotlin_delegation_specifier(a, ts_node_named_child(node, i), source, bases)) {
+            return false;
+        }
     }
+    return true;
 }
 
 static const char **extract_kotlin_bases(CBMArena *a, TSNode node, const char *source) {
-    const char *bases[MAX_BASES];
-    int count = 0;
+    base_class_list_t bases = {0};
     uint32_t nc = ts_node_child_count(node);
-    for (uint32_t i = 0; i < nc && count < MAX_BASES_MINUS_1; i++) {
-        collect_kotlin_delegations(a, ts_node_child(node, i), source, bases, &count);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (!collect_kotlin_delegations(a, ts_node_child(node, i), source, &bases)) {
+            return NULL;
+        }
     }
-    if (count == 0) {
-        return NULL;
-    }
-    const char **result =
-        (const char **)cbm_arena_alloc(a, (size_t)(count + NULL_TERM) * sizeof(const char *));
-    if (!result) {
-        return NULL;
-    }
-    for (int i = 0; i < count; i++) {
-        result[i] = bases[i];
-    }
-    result[count] = NULL;
-    return result;
+    return base_class_list_finish(a, &bases);
 }
 
 // Walk a field node and collect type identifier names into out[].
 // Handles: direct type_identifier/generic_type/qualified_name, type_list children
 // (Java interfaces list), and raw text fallback (other languages).
-static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *source,
-                                    const char **out, int out_cap) {
-    int count = 0;
+static bool collect_bases_from_field(CBMArena *a, TSNode field_node, const char *source,
+                                     base_class_list_t *out) {
+    size_t initial_count = out->count;
     const char *fk = ts_node_type(field_node);
 
     // If the field node itself is a type node, extract directly.
@@ -2401,16 +2421,16 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
             if (angle) {
                 *angle = '\0';
             }
-            if (t[0] && count < out_cap) {
-                out[count++] = t;
+            if (!base_class_list_push(a, out, t)) {
+                return false;
             }
         }
-        return count;
+        return true;
     }
 
     // Walk named children: look for type identifiers or type_list/interface_type_list.
     uint32_t nc = ts_node_named_child_count(field_node);
-    for (uint32_t i = 0; i < nc && count < out_cap; i++) {
+    for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_named_child(field_node, i);
         const char *ck = ts_node_type(child);
         if (strcmp(ck, "type_identifier") == 0 || strcmp(ck, "generic_type") == 0 ||
@@ -2429,7 +2449,9 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
                     *angle = '\0';
                 }
                 if (t[0]) {
-                    out[count++] = t;
+                    if (!base_class_list_push(a, out, t)) {
+                        return false;
+                    }
                 }
             }
         } else if (strcmp(ck, "subscript") == 0) {
@@ -2443,13 +2465,15 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
             if (!ts_node_is_null(val)) {
                 char *t = cbm_node_text(a, val, source);
                 if (t && t[0]) {
-                    out[count++] = t;
+                    if (!base_class_list_push(a, out, t)) {
+                        return false;
+                    }
                 }
             }
         } else if (strcmp(ck, "type_list") == 0 || strcmp(ck, "interface_type_list") == 0) {
             // Java: super_interfaces contains type_list with multiple type_identifiers.
             uint32_t tlnc = ts_node_named_child_count(child);
-            for (uint32_t ti = 0; ti < tlnc && count < out_cap; ti++) {
+            for (uint32_t ti = 0; ti < tlnc; ti++) {
                 TSNode tl_child = ts_node_named_child(child, ti);
                 const char *tlk = ts_node_type(tl_child);
                 if (strcmp(tlk, "type_identifier") == 0 || strcmp(tlk, "generic_type") == 0 ||
@@ -2461,7 +2485,9 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
                             *angle = '\0';
                         }
                         if (t[0]) {
-                            out[count++] = t;
+                            if (!base_class_list_push(a, out, t)) {
+                                return false;
+                            }
                         }
                     }
                 }
@@ -2470,14 +2496,14 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
     }
 
     // Fallback: raw node text (for languages where the field node is the type name directly).
-    if (count == 0) {
+    if (out->count == initial_count) {
         char *t = cbm_node_text(a, field_node, source);
-        if (t && t[0] && count < out_cap) {
-            out[count++] = t;
+        if (!base_class_list_push(a, out, t)) {
+            return false;
         }
     }
 
-    return count;
+    return true;
 }
 
 // Extract base class names from a class node.
@@ -2514,29 +2540,18 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
         TSNode ext = cbm_find_child_by_kind(node, "class_extends");
         if (!ts_node_is_null(ext)) {
-            const char *bases[MAX_BASES];
-            int base_count = 0;
+            base_class_list_t bases = {0};
             uint32_t nc = ts_node_named_child_count(ext);
-            for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
+            for (uint32_t i = 0; i < nc; i++) {
                 TSNode ch = ts_node_named_child(ext, i);
                 if (strcmp(ts_node_type(ch), "class_name") == 0) {
                     char *base = cbm_node_text(a, ch, source);
-                    if (base && base[0]) {
-                        bases[base_count++] = base;
+                    if (!base_class_list_push(a, &bases, base)) {
+                        return NULL;
                     }
                 }
             }
-            if (base_count > 0) {
-                const char **result =
-                    (const char **)cbm_arena_alloc(a, (base_count + 1) * sizeof(const char *));
-                if (result) {
-                    for (int i = 0; i < base_count; i++) {
-                        result[i] = bases[i];
-                    }
-                    result[base_count] = NULL;
-                    return result;
-                }
-            }
+            return base_class_list_finish(a, &bases);
         }
         return NULL;
     }
@@ -2614,40 +2629,31 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     /* D: `class Dog : Animal, IFoo` — class_declaration lists one `base_class`
      * child per base, each wrapping an identifier/qualified name. */
     if (lang == CBM_LANG_DLANG) {
-        const char *pbases[MAX_BASES];
-        int pc = 0;
+        base_class_list_t bases = {0};
         uint32_t nc = ts_node_child_count(node);
-        for (uint32_t i = 0; i < nc && pc < MAX_BASES_MINUS_1; i++) {
+        for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_child(node, i);
             if (strcmp(ts_node_type(c), "base_class") != 0) {
                 continue;
             }
             char *bn = cbm_node_text(a, c, source);
-            if (bn && bn[0]) {
-                pbases[pc++] = bn;
+            if (!base_class_list_push(a, &bases, bn)) {
+                return NULL;
             }
         }
-        if (pc > 0) {
-            const char **result =
-                (const char **)cbm_arena_alloc(a, (pc + NULL_TERM) * sizeof(const char *));
-            if (result) {
-                for (int i = 0; i < pc; i++) {
-                    result[i] = pbases[i];
-                }
-                result[pc] = NULL;
-                return result;
-            }
+        const char **result = base_class_list_finish(a, &bases);
+        if (result) {
+            return result;
         }
     }
     /* PowerShell: `class Dog : Animal` — class_statement lists `simple_name`
      * children with a `:` token separating the class name from the base name(s).
      * Collect every simple_name that appears AFTER the first `:` token. */
     if (lang == CBM_LANG_POWERSHELL && strcmp(ts_node_type(node), "class_statement") == 0) {
-        const char *pbases[MAX_BASES];
-        int pc = 0;
+        base_class_list_t bases = {0};
         bool seen_colon = false;
         uint32_t nc = ts_node_child_count(node);
-        for (uint32_t i = 0; i < nc && pc < MAX_BASES_MINUS_1; i++) {
+        for (uint32_t i = 0; i < nc; i++) {
             TSNode c = ts_node_child(node, i);
             const char *ck = ts_node_type(c);
             if (strcmp(ck, ":") == 0) {
@@ -2659,30 +2665,22 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
             }
             if (seen_colon && strcmp(ck, "simple_name") == 0) {
                 char *bn = cbm_node_text(a, c, source);
-                if (bn && bn[0]) {
-                    pbases[pc++] = bn;
+                if (!base_class_list_push(a, &bases, bn)) {
+                    return NULL;
                 }
             }
         }
-        if (pc > 0) {
-            const char **result =
-                (const char **)cbm_arena_alloc(a, (pc + NULL_TERM) * sizeof(const char *));
-            if (result) {
-                for (int i = 0; i < pc; i++) {
-                    result[i] = pbases[i];
-                }
-                result[pc] = NULL;
-                return result;
-            }
+        const char **result = base_class_list_finish(a, &bases);
+        if (result) {
+            return result;
         }
     }
     /* Pascal: declClass carries one or more `parent` fields, each a `typeref`
      * (`= class(TBase, IFoo)`). Collect all parent typeref identifiers. */
     if (lang == CBM_LANG_PASCAL && strcmp(ts_node_type(node), "declClass") == 0) {
-        const char *pbases[MAX_BASES];
-        int pc = 0;
+        base_class_list_t bases = {0};
         uint32_t nc = ts_node_child_count(node);
-        for (uint32_t i = 0; i < nc && pc < MAX_BASES_MINUS_1; i++) {
+        for (uint32_t i = 0; i < nc; i++) {
             const char *fn = ts_node_field_name_for_child(node, i);
             if (!fn || strcmp(fn, "parent") != 0) {
                 continue;
@@ -2692,20 +2690,13 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                 continue; /* the '(' / ')' delimiters are also tagged `parent` */
             }
             char *bn = cbm_node_text(a, pn, source);
-            if (bn && bn[0]) {
-                pbases[pc++] = bn;
+            if (!base_class_list_push(a, &bases, bn)) {
+                return NULL;
             }
         }
-        if (pc > 0) {
-            const char **result =
-                (const char **)cbm_arena_alloc(a, (pc + NULL_TERM) * sizeof(const char *));
-            if (result) {
-                for (int i = 0; i < pc; i++) {
-                    result[i] = pbases[i];
-                }
-                result[pc] = NULL;
-                return result;
-            }
+        const char **result = base_class_list_finish(a, &bases);
+        if (result) {
+            return result;
         }
     }
     static const char *fields[] = {"superclass",
@@ -2718,14 +2709,14 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                                    NULL};
 
     // Collect all bases from all matching fields (fixes early-return bug and keyword-text bug).
-    const char *bases[MAX_BASES];
-    int base_count = 0;
+    base_class_list_t bases = {0};
 
     for (const char **f = fields; *f; f++) {
         TSNode super = ts_node_child_by_field_name(node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(super)) {
-            base_count += collect_bases_from_field(a, super, source, bases + base_count,
-                                                   MAX_BASES_MINUS_1 - base_count);
+            if (!collect_bases_from_field(a, super, source, &bases)) {
+                return NULL;
+            }
         }
     }
 
@@ -2734,27 +2725,21 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
     // Without this the interface's bases were never captured.
     static const char *heritage_children[] = {"extends_interfaces", "super_interfaces", NULL};
     uint32_t top_count = ts_node_child_count(node);
-    for (uint32_t i = 0; i < top_count && base_count < MAX_BASES_MINUS_1; i++) {
+    for (uint32_t i = 0; i < top_count; i++) {
         TSNode child = ts_node_child(node, i);
         const char *ck = ts_node_type(child);
         for (const char **h = heritage_children; *h; h++) {
             if (strcmp(ck, *h) == 0) {
-                base_count += collect_bases_from_field(a, child, source, bases + base_count,
-                                                       MAX_BASES_MINUS_1 - base_count);
+                if (!collect_bases_from_field(a, child, source, &bases)) {
+                    return NULL;
+                }
             }
         }
     }
 
-    if (base_count > 0) {
-        const char **result =
-            (const char **)cbm_arena_alloc(a, (base_count + NULL_TERM) * sizeof(const char *));
-        if (result) {
-            for (int i = 0; i < base_count; i++) {
-                result[i] = bases[i];
-            }
-            result[base_count] = NULL;
-            return result;
-        }
+    const char **field_result = base_class_list_finish(a, &bases);
+    if (field_result) {
+        return field_result;
     }
 
     // C/C++: handle base_class_clause
@@ -6654,8 +6639,8 @@ static bool kotlin_result_has_def_name(const CBMFileResult *result, const char *
     return false;
 }
 
-static void kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end,
-                                const char **bases, int *count) {
+static bool kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end,
+                                base_class_list_t *bases) {
     const char *source = ctx->source;
     int paren_depth = 0;
     int angle_depth = 0;
@@ -6680,11 +6665,11 @@ static void kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end
         }
     }
     if (colon >= header_end) {
-        return;
+        return true;
     }
 
     uint32_t i = colon + 1;
-    while (i < header_end && *count < MAX_BASES_MINUS_1) {
+    while (i < header_end) {
         while (i < header_end &&
                (source[i] == ' ' || source[i] == '\t' || source[i] == '\r' ||
                 source[i] == '\n' || source[i] == ',')) {
@@ -6700,7 +6685,9 @@ static void kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end
         }
         char *base = cbm_arena_strndup(ctx->arena, source + name_start, (size_t)(i - name_start));
         if (base && base[0] && strcmp(base, "by") != 0) {
-            bases[(*count)++] = base;
+            if (!base_class_list_push(ctx->arena, bases, base)) {
+                return false;
+            }
         }
 
         paren_depth = 0;
@@ -6722,6 +6709,7 @@ static void kotlin_source_bases(CBMExtractCtx *ctx, uint32_t start, uint32_t end
             i++;
         }
     }
+    return true;
 }
 
 static void recover_kotlin_error_source(CBMExtractCtx *ctx, TSNode err_node) {
@@ -6821,9 +6809,11 @@ static void recover_kotlin_error_source(CBMExtractCtx *ctx, TSNode err_node) {
             continue;
         }
 
-        const char *bases[MAX_BASES];
-        int base_count = 0;
-        kotlin_source_bases(ctx, i, end, bases, &base_count);
+        base_class_list_t bases = {0};
+        if (!kotlin_source_bases(ctx, i, end, &bases)) {
+            ctx->result->has_error = true;
+            return;
+        }
         CBMDefinition def;
         memset(&def, 0, sizeof(def));
         def.name = name;
@@ -6836,17 +6826,7 @@ static void recover_kotlin_error_source(CBMExtractCtx *ctx, TSNode err_node) {
         def.start_line = ts_node_start_point(err_node).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(err_node).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
-        if (base_count > 0) {
-            const char **result = (const char **)cbm_arena_alloc(
-                ctx->arena, (size_t)(base_count + NULL_TERM) * sizeof(const char *));
-            if (result) {
-                for (int j = 0; j < base_count; j++) {
-                    result[j] = bases[j];
-                }
-                result[base_count] = NULL;
-                def.base_classes = result;
-            }
-        }
+        def.base_classes = base_class_list_finish(ctx->arena, &bases);
         cbm_defs_push(&ctx->result->defs, ctx->arena, def);
     }
 }
@@ -6884,15 +6864,17 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
 
         /* Collect bases from any `delegation_specifier` siblings that follow the
          * name (until the class body `{` or the next class/object keyword). */
-        const char *bases[MAX_BASES];
-        int bcount = 0;
-        for (uint32_t j = base_start; j < cc && bcount < MAX_BASES_MINUS_1; j++) {
+        base_class_list_t bases = {0};
+        for (uint32_t j = base_start; j < cc; j++) {
             TSNode sib = ts_node_child(err_node, j);
             const char *st = ts_node_type(sib);
             if (strcmp(st, "{") == 0 || strcmp(st, "class") == 0 || strcmp(st, "object") == 0) {
                 break;
             }
-            collect_kotlin_delegations(a, sib, ctx->source, bases, &bcount);
+            if (!collect_kotlin_delegations(a, sib, ctx->source, &bases)) {
+                ctx->result->has_error = true;
+                return;
+            }
         }
 
         CBMDefinition def;
@@ -6904,17 +6886,7 @@ static void recover_kotlin_error_classes(CBMExtractCtx *ctx, TSNode err_node) {
         def.start_line = ts_node_start_point(name_node).row + TS_LINE_OFFSET;
         def.end_line = ts_node_end_point(err_node).row + TS_LINE_OFFSET;
         def.is_exported = cbm_is_exported(name, ctx->language);
-        if (bcount > 0) {
-            const char **result = (const char **)cbm_arena_alloc(a, (size_t)(bcount + NULL_TERM) *
-                                                                        sizeof(const char *));
-            if (result) {
-                for (int k = 0; k < bcount; k++) {
-                    result[k] = bases[k];
-                }
-                result[bcount] = NULL;
-                def.base_classes = result;
-            }
-        }
+        def.base_classes = base_class_list_finish(a, &bases);
         cbm_defs_push(&ctx->result->defs, a, def);
         i++;
     }
