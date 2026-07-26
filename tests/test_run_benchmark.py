@@ -1046,6 +1046,19 @@ class RunBenchmarkTest(unittest.TestCase):
         self.assertEqual(stderr_thread.join_calls, 1)
         self.assertIsNone(client.proc)
 
+    def test_mcp_client_call_tool_names_empty_non_json_response(self) -> None:
+        client = BENCHMARK.McpClient(Path("cbm"), {}, 10)
+        with mock.patch.object(
+            client,
+            "call_tool_text",
+            return_value=("", "worker diagnostics", 123, 4.5),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"MCP tool index_repository returned non-JSON text: ''",
+            ):
+                client.call_tool("index_repository", {"repo_path": "/tmp/repo"})
+
     def test_rank_quality_fixture_separates_graph_signal_from_lexical_order(
         self,
     ) -> None:
@@ -1808,6 +1821,19 @@ class RunBenchmarkTest(unittest.TestCase):
         mcp_response = {"result": {"content": [{"type": "text", "text": toon}]}}
         self.assertEqual(BENCHMARK.cli_result_text(cli_stdout), toon)
         self.assertEqual(BENCHMARK.mcp_result_text(mcp_response), toon)
+
+    def test_mcp_result_text_skips_prepended_update_notice(self) -> None:
+        payload = '{"status":"indexed"}'
+        response = {
+            "result": {
+                "content": [
+                    {"type": "text", "text": "Update available: dev -> v0.9.0"},
+                    {"type": "text", "text": payload},
+                ]
+            }
+        }
+
+        self.assertEqual(BENCHMARK.mcp_result_text(response), payload)
 
     def test_mcp_tool_call_measures_default_payload_and_uses_json_for_quality(
         self,
