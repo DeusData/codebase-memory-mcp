@@ -1157,6 +1157,12 @@ TEST(test_cross_edges_record_file_owner) {
     ASSERT_EQ(cbm_store_upsert_project(st, "dep-owner-test", "/tmp/project"), CBM_STORE_OK);
     ASSERT_EQ(cbm_store_upsert_project(st, "dep-owner-test.dep.requests", "/tmp/requests"),
               CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(st, "dep-owner-test.dep.requests-alt",
+                                       "/tmp/requests-alt"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(st, "dep-owner-test.dep.requests-tie",
+                                       "/tmp/requests-tie"),
+              CBM_STORE_OK);
 
     cbm_node_t import_node = {0};
     import_node.project = "dep-owner-test";
@@ -1167,7 +1173,8 @@ TEST(test_cross_edges_record_file_owner) {
     import_node.start_line = 1;
     import_node.end_line = 1;
     import_node.properties_json = "{}";
-    ASSERT_GT(cbm_store_upsert_node(st, &import_node), 0);
+    int64_t import_id = cbm_store_upsert_node(st, &import_node);
+    ASSERT_GT(import_id, 0);
 
     cbm_node_t module_node = {0};
     module_node.project = "dep-owner-test.dep.requests";
@@ -1178,9 +1185,39 @@ TEST(test_cross_edges_record_file_owner) {
     module_node.start_line = 1;
     module_node.end_line = 1;
     module_node.properties_json = "{}";
-    ASSERT_GT(cbm_store_upsert_node(st, &module_node), 0);
+    int64_t lower_ranked_module_id = cbm_store_upsert_node(st, &module_node);
+    ASSERT_GT(lower_ranked_module_id, 0);
+
+    cbm_node_t higher_ranked_module = module_node;
+    higher_ranked_module.project = "dep-owner-test.dep.requests-alt";
+    higher_ranked_module.qualified_name = "dep-owner-test.dep.requests-alt";
+    int64_t higher_ranked_module_id = cbm_store_upsert_node(st, &higher_ranked_module);
+    ASSERT_GT(higher_ranked_module_id, 0);
+
+    cbm_node_t tied_module = module_node;
+    tied_module.project = "dep-owner-test.dep.requests-tie";
+    tied_module.qualified_name = "dep-owner-test.dep.requests-tie";
+    int64_t tied_module_id = cbm_store_upsert_node(st, &tied_module);
+    ASSERT_GT(tied_module_id, higher_ranked_module_id);
+
+    char rank_sql[CBM_SZ_512];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) VALUES "
+             "('dep-owner-test.dep.requests',%lld,0.1,'2026-07-25T00:00:00Z'),"
+             "('dep-owner-test.dep.requests-alt',%lld,0.9,'2026-07-25T00:00:00Z'),"
+             "('dep-owner-test.dep.requests-tie',%lld,0.9,'2026-07-25T00:00:00Z')",
+             (long long)lower_ranked_module_id, (long long)higher_ranked_module_id,
+             (long long)tied_module_id);
+    ASSERT_EQ(cbm_store_exec(st, rank_sql), CBM_STORE_OK);
 
     ASSERT_EQ(cbm_dep_link_cross_edges(st, "dep-owner-test"), 1);
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source(st, import_id, &edges, &edge_count), CBM_STORE_OK);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0].target_id, higher_ranked_module_id);
+    cbm_store_free_edges(edges, edge_count);
+
     int node_owners = 0;
     int edge_owners = 0;
     ASSERT_EQ(cbm_store_count_file_delta_owners(st, "dep-owner-test", "app.py", &node_owners,

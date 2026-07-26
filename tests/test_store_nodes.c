@@ -725,6 +725,105 @@ TEST(store_visit_nodes_by_label_identity_rows) {
     PASS();
 }
 
+typedef struct {
+    int count;
+    int64_t zeta_id;
+    int64_t alpha_id;
+    int64_t beta_id;
+    int saw_zeta;
+    int saw_alpha;
+    int saw_beta;
+} store_visit_node_refs_pattern_ctx_t;
+
+static int store_visit_node_refs_pattern_cb(int64_t id, const char *label, const char *name,
+                                            const char *qualified_name, const char *file_path,
+                                            double pagerank, void *userdata) {
+    (void)qualified_name;
+    (void)file_path;
+    store_visit_node_refs_pattern_ctx_t *ctx = userdata;
+    if (!ctx || ctx->count >= 3 || !label || !name || strcmp(label, "Module") != 0) {
+        return CBM_STORE_ERR;
+    }
+    if (strcmp(name, "zeta") == 0 && id == ctx->zeta_id && pagerank == 0.9) {
+        ctx->saw_zeta = 1;
+    } else if (strcmp(name, "alpha") == 0 && id == ctx->alpha_id && pagerank == 0.1) {
+        ctx->saw_alpha = 1;
+    } else if (strcmp(name, "beta") == 0 && id == ctx->beta_id && pagerank == 0.1) {
+        ctx->saw_beta = 1;
+    } else {
+        return CBM_STORE_ERR;
+    }
+    ctx->count++;
+    return CBM_STORE_OK;
+}
+
+TEST(store_visit_ranked_node_refs_by_project_pattern_and_label) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT(s != NULL);
+    ASSERT_EQ(cbm_store_upsert_project(s, "app.dep.a", "/tmp/app-dep-a"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, "app.dep.b", "/tmp/app-dep-b"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, "other.dep.c", "/tmp/other-dep-c"), CBM_STORE_OK);
+
+    cbm_node_t zeta = {.project = "app.dep.a",
+                       .label = "Module",
+                       .name = "zeta",
+                       .qualified_name = "app.dep.a.zeta",
+                       .file_path = "zeta.py"};
+    cbm_node_t alpha = {.project = "app.dep.b",
+                        .label = "Module",
+                        .name = "alpha",
+                        .qualified_name = "app.dep.b.alpha",
+                        .file_path = "alpha.py"};
+    cbm_node_t beta = {.project = "app.dep.b",
+                       .label = "Module",
+                       .name = "beta",
+                       .qualified_name = "app.dep.b.beta",
+                       .file_path = "beta.py"};
+    cbm_node_t wrong_label = {.project = "app.dep.a",
+                              .label = "Function",
+                              .name = "delta",
+                              .qualified_name = "app.dep.a.delta",
+                              .file_path = "delta.py"};
+    cbm_node_t wrong_project = {.project = "other.dep.c",
+                                .label = "Module",
+                                .name = "gamma",
+                                .qualified_name = "other.dep.c.gamma",
+                                .file_path = "gamma.py"};
+    int64_t zeta_id = cbm_store_upsert_node(s, &zeta);
+    int64_t alpha_id = cbm_store_upsert_node(s, &alpha);
+    int64_t beta_id = cbm_store_upsert_node(s, &beta);
+    ASSERT(zeta_id > 0);
+    ASSERT(alpha_id > 0);
+    ASSERT(beta_id > 0);
+    ASSERT(cbm_store_upsert_node(s, &wrong_label) > 0);
+    ASSERT(cbm_store_upsert_node(s, &wrong_project) > 0);
+
+    char rank_sql[CBM_SZ_256];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) VALUES "
+             "('app.dep.a',%lld,0.9,'2026-07-25T00:00:00Z'),"
+             "('app.dep.b',%lld,0.1,'2026-07-25T00:00:00Z'),"
+             "('app.dep.b',%lld,0.1,'2026-07-25T00:00:00Z')",
+             (long long)zeta_id, (long long)alpha_id, (long long)beta_id);
+    ASSERT_EQ(cbm_store_exec(s, rank_sql), CBM_STORE_OK);
+
+    store_visit_node_refs_pattern_ctx_t ctx = {
+        .zeta_id = zeta_id,
+        .alpha_id = alpha_id,
+        .beta_id = beta_id,
+    };
+    int rc = cbm_store_visit_ranked_node_refs_by_project_pattern_and_label(
+        s, "app.dep.%", "Module", store_visit_node_refs_pattern_cb, &ctx);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(ctx.count, 3);
+    ASSERT_EQ(ctx.saw_zeta, 1);
+    ASSERT_EQ(ctx.saw_alpha, 1);
+    ASSERT_EQ(ctx.saw_beta, 1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_node_find_by_file) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -6637,6 +6736,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
     RUN_TEST(store_visit_nodes_by_label_identity_rows);
+    RUN_TEST(store_visit_ranked_node_refs_by_project_pattern_and_label);
     RUN_TEST(store_node_find_by_file);
     RUN_TEST(store_node_find_not_found);
     RUN_TEST(store_node_count_empty);
