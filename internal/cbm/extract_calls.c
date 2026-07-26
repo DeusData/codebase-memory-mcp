@@ -800,9 +800,13 @@ static char *extract_nickel_callee(CBMArena *a, TSNode node, const char *source,
     if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "applicative") == 0) {
         return NULL;
     }
-    enum { NICKEL_APPLY_DEPTH = 8 };
+    /*
+     * Only the outermost applicative reaches this walk, so following the full
+     * function-side chain is O(D) for curried depth D rather than repeated
+     * quadratic work. Stop on a null/self edge, not an arbitrary semantic cap.
+     */
     TSNode cur = node;
-    for (int depth = 0; depth < NICKEL_APPLY_DEPTH && !ts_node_is_null(cur); depth++) {
+    while (!ts_node_is_null(cur)) {
         const char *ck = ts_node_type(cur);
         if (strcmp(ck, "ident") == 0) {
             return cbm_node_text(a, cur, source);

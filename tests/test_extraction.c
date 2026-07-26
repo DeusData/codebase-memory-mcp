@@ -1420,6 +1420,18 @@ TEST(nickel_function_application_edge) {
     PASS();
 }
 
+TEST(nickel_curried_call_beyond_8_wrappers) {
+    CBMFileResult *r =
+        extract("let target = fun a => fun b => fun c => fun d => fun e => fun f => fun g => "
+                "fun h => fun i => fun j => a in target 1 2 3 4 5 6 7 8 9 10\n",
+                CBM_LANG_NICKEL, "t", "curried.ncl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_call_exact(r, "target"));
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(func_function_application_edge) {
     CBMFileResult *r = extract("() helper() {\n"
                                "}\n"
@@ -5679,6 +5691,7 @@ SUITE(extraction) {
     RUN_TEST(jsonnet_function_call_edge);
     RUN_TEST(typst_function_call_edge);
     RUN_TEST(nickel_function_application_edge);
+    RUN_TEST(nickel_curried_call_beyond_8_wrappers);
     RUN_TEST(func_function_application_edge);
     RUN_TEST(vhdl_function_call_edge);
     RUN_TEST(verilog_function_call_edge);
