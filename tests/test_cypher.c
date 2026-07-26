@@ -1346,6 +1346,106 @@ TEST(cypher_exec_unsupported_func_errors_issue373) {
     PASS();
 }
 
+/* Return the aggregate column of the row whose group column equals group_val,
+ * so assertions do not depend on group encounter order. */
+static const char *agg_lookup(cbm_cypher_result_t *r, const char *group_val) {
+    for (int i = 0; i < r->row_count; i++) {
+        if (r->rows[i][0] && strcmp(r->rows[i][0], group_val) == 0) {
+            return r->rows[i][1];
+        }
+    }
+    return NULL;
+}
+
+/* Grouping regression: a non-aggregate computed expression (labels(), type(),
+ * toLower(), ...) populates cbm_return_item_t.func just like an aggregate does.
+ * Treating "has func" as "is aggregate" dropped these columns from the GROUP BY
+ * key and then formatted them through the aggregate formatter, so every row
+ * collapsed into one group whose group column printed the row count. Fixture:
+ * 4 Function nodes + 1 Module node, 3 CALLS edges + 1 DEFINES edge. */
+TEST(cypher_exec_group_by_labels_func) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN labels(n) AS l, count(n) AS c", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_NOT_NULL(agg_lookup(&r, "[\"Function\"]"));
+    ASSERT_STR_EQ(agg_lookup(&r, "[\"Function\"]"), "4");
+    ASSERT_NOT_NULL(agg_lookup(&r, "[\"Module\"]"));
+    ASSERT_STR_EQ(agg_lookup(&r, "[\"Module\"]"), "1");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_group_by_type_func) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc =
+        cbm_cypher_execute(s, "MATCH ()-[r]->() RETURN type(r) AS t, count(r) AS c", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(agg_lookup(&r, "CALLS"), "3");
+    ASSERT_STR_EQ(agg_lookup(&r, "DEFINES"), "1");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_group_by_string_func) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN toLower(n.label) AS l, count(n) AS c", "test",
+                                0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(agg_lookup(&r, "function"), "4");
+    ASSERT_STR_EQ(agg_lookup(&r, "module"), "1");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Same defect existed on the WITH aggregation path, which additionally read the
+ * group value from the raw binding instead of evaluating the expression. */
+TEST(cypher_exec_group_by_func_in_with) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) WITH labels(n) AS l, count(n) AS c RETURN l, c",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(agg_lookup(&r, "[\"Function\"]"), "4");
+    ASSERT_STR_EQ(agg_lookup(&r, "[\"Module\"]"), "1");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A plain-property group key must keep working unchanged. */
+TEST(cypher_exec_group_by_plain_property_unchanged) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN n.label AS l, count(n) AS c", "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 2);
+    ASSERT_STR_EQ(agg_lookup(&r, "Function"), "4");
+    ASSERT_STR_EQ(agg_lookup(&r, "Module"), "1");
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* A recognised function still works, and an unknown one in plain RETURN errors. */
 TEST(cypher_exec_unknown_func_return_errors) {
     cbm_store_t *s = setup_cypher_store();
@@ -3240,6 +3340,11 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_label_test_issue241);
     RUN_TEST(cypher_exec_label_alternation_issue242);
     RUN_TEST(cypher_exec_count_distinct_issue239);
+    RUN_TEST(cypher_exec_group_by_labels_func);
+    RUN_TEST(cypher_exec_group_by_type_func);
+    RUN_TEST(cypher_exec_group_by_string_func);
+    RUN_TEST(cypher_exec_group_by_func_in_with);
+    RUN_TEST(cypher_exec_group_by_plain_property_unchanged);
     RUN_TEST(cypher_exec_unsupported_func_errors_issue373);
     RUN_TEST(cypher_exec_unknown_func_return_errors);
     RUN_TEST(cypher_exec_inline_props);
