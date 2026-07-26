@@ -14251,6 +14251,27 @@ static int arch_boundaries(cbm_store_t *s, const char *project, const char *path
 
 #define MAX_PREVIEW_NAMES 15
 
+typedef struct {
+    int node_count;
+    char name[];
+} arch_package_accumulator_t;
+
+static void arch_package_accumulators_free(arch_package_accumulator_t **items, int count) {
+    for (int i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
+static int arch_package_accumulator_cmp(const void *lhs, const void *rhs) {
+    const arch_package_accumulator_t *a = *(const arch_package_accumulator_t *const *)lhs;
+    const arch_package_accumulator_t *b = *(const arch_package_accumulator_t *const *)rhs;
+    if (a->node_count != b->node_count) {
+        return (a->node_count < b->node_count) ? SKIP_ONE : CBM_NOT_FOUND;
+    }
+    return strcmp(a->name, b->name);
+}
+
 /* Fallback: derive packages from QN segments when no Package nodes exist. */
 static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char *path,
                                  cbm_package_summary_t **out_arr, int *out_count) {
@@ -14283,9 +14304,18 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         arch_bind_path_scope(stmt, ST_COL_2, ST_COL_3, norm, like);
     }
 
-    char *pnames[CBM_SZ_64];
-    int pcounts[CBM_SZ_64];
+    int cap = ST_INIT_CAP_16;
     int np = 0;
+    arch_package_accumulator_t **packages = calloc((size_t)cap, sizeof(*packages));
+    CBMHashTable *package_indexes = cbm_ht_create((uint32_t)cap);
+    if (!packages || !package_indexes) {
+        arch_package_accumulators_free(packages, np);
+        cbm_ht_free(package_indexes);
+        sqlite3_finalize(stmt);
+        store_set_error(s, "arch_packages_qn out of memory");
+        return CBM_STORE_ERR;
+    }
+
     int step_rc = SQLITE_OK;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(stmt, 0);
@@ -14293,73 +14323,83 @@ static int arch_packages_from_qn(cbm_store_t *s, const char *project, const char
         if (!pkg[0]) {
             continue;
         }
-        int found = ST_FOUND;
-        for (int i = 0; i < np; i++) {
-            if (strcmp(pnames[i], pkg) == 0) {
-                found = i;
-                break;
-            }
-        }
-        if (found >= 0) {
-            pcounts[found]++;
-        } else if (np < CBM_SZ_64) {
-            pnames[np] = heap_strdup(pkg);
-            if (!pnames[np]) {
-                for (int i = 0; i < np; i++) {
-                    free(pnames[i]);
-                }
+
+        arch_package_accumulator_t *package = cbm_ht_get(package_indexes, pkg);
+        if (package) {
+            if (package->node_count == INT_MAX) {
+                arch_package_accumulators_free(packages, np);
+                cbm_ht_free(package_indexes);
                 sqlite3_finalize(stmt);
-                store_set_error(s, "arch_packages_qn out of memory");
+                store_set_error(s, "arch_packages_qn package count overflow");
                 return CBM_STORE_ERR;
             }
-            pcounts[np] = SKIP_ONE;
-            np++;
+            package->node_count++;
+            continue;
         }
+
+        if (np >= cap && store_grow_array(s, (void **)&packages, &cap, sizeof(*packages),
+                                          "arch_packages_qn out of memory", true) != CBM_STORE_OK) {
+            arch_package_accumulators_free(packages, np);
+            cbm_ht_free(package_indexes);
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        size_t pkg_len = strlen(pkg);
+        package = malloc(sizeof(*package) + pkg_len + SKIP_ONE);
+        if (!package) {
+            arch_package_accumulators_free(packages, np);
+            cbm_ht_free(package_indexes);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "arch_packages_qn out of memory");
+            return CBM_STORE_ERR;
+        }
+        package->node_count = SKIP_ONE;
+        memcpy(package->name, pkg, pkg_len + SKIP_ONE);
+        cbm_ht_set(package_indexes, package->name, package);
+        if (cbm_ht_get(package_indexes, package->name) != package) {
+            free(package);
+            arch_package_accumulators_free(packages, np);
+            cbm_ht_free(package_indexes);
+            sqlite3_finalize(stmt);
+            store_set_error(s, "arch_packages_qn out of memory");
+            return CBM_STORE_ERR;
+        }
+        packages[np] = package;
+        np++;
     }
     if (step_rc != SQLITE_DONE) {
-        for (int i = 0; i < np; i++) {
-            free(pnames[i]);
-        }
+        arch_package_accumulators_free(packages, np);
+        cbm_ht_free(package_indexes);
         store_set_error_sqlite(s, "arch_packages_qn");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
     sqlite3_finalize(stmt);
+    cbm_ht_free(package_indexes);
 
-    /* Sort by count desc */
-    for (int i = SKIP_ONE; i < np; i++) {
-        int j = i;
-        while (j > 0 && pcounts[j] > pcounts[j - SKIP_ONE]) {
-            int tc = pcounts[j];
-            pcounts[j] = pcounts[j - SKIP_ONE];
-            pcounts[j - SKIP_ONE] = tc;
-            char *tn = pnames[j];
-            pnames[j] = pnames[j - SKIP_ONE];
-            pnames[j - SKIP_ONE] = tn;
-            j--;
-        }
-    }
-    if (np > MAX_PREVIEW_NAMES) {
-        for (int i = MAX_PREVIEW_NAMES; i < np; i++) {
-            free(pnames[i]);
-        }
-        np = MAX_PREVIEW_NAMES;
-    }
-
-    cbm_package_summary_t *arr = (np > 0) ? calloc(np, sizeof(cbm_package_summary_t)) : NULL;
-    if (np > 0 && !arr) {
-        for (int i = 0; i < np; i++) {
-            free(pnames[i]);
-        }
+    qsort(packages, (size_t)np, sizeof(*packages), arch_package_accumulator_cmp);
+    int result_count = np < MAX_PREVIEW_NAMES ? np : MAX_PREVIEW_NAMES;
+    cbm_package_summary_t *result =
+        result_count > 0 ? calloc((size_t)result_count, sizeof(*result)) : NULL;
+    if (result_count > 0 && !result) {
+        arch_package_accumulators_free(packages, np);
         store_set_error(s, "arch_packages_qn out of memory");
         return CBM_STORE_ERR;
     }
-    for (int i = 0; i < np; i++) {
-        arr[i].name = pnames[i];
-        arr[i].node_count = pcounts[i];
+    for (int i = 0; i < result_count; i++) {
+        result[i].name = heap_strdup(packages[i]->name);
+        if (!result[i].name) {
+            arch_free_packages(result, i);
+            arch_package_accumulators_free(packages, np);
+            store_set_error(s, "arch_packages_qn out of memory");
+            return CBM_STORE_ERR;
+        }
+        result[i].node_count = packages[i]->node_count;
     }
-    *out_arr = arr;
-    *out_count = np;
+    arch_package_accumulators_free(packages, np);
+
+    *out_arr = result;
+    *out_count = result_count;
     return CBM_STORE_OK;
 }
 

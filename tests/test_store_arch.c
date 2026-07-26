@@ -28,7 +28,13 @@
 #include <stdint.h>
 #include <time.h>
 
-enum { TEST_ARCH_PATH_BUF = 512, TEST_ARCH_NO_COMMUNITY = -1 };
+enum {
+    TEST_ARCH_PATH_BUF = 512,
+    TEST_ARCH_NO_COMMUNITY = -1,
+    TEST_ARCH_FALLBACK_DISTINCT_PACKAGES = 64,
+    TEST_ARCH_FALLBACK_WINNER_NODES = 20,
+    TEST_ARCH_FALLBACK_NAME_BUF = 64
+};
 
 /* ── Helper: create architecture test store ──────────────────────── */
 
@@ -154,6 +160,47 @@ TEST(arch_get_all) {
     ASSERT_TRUE(info.route_count > 0);
     ASSERT_TRUE(info.hotspot_count > 0);
     ASSERT_TRUE(info.boundary_count > 0);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_package_fallback_ranks_all_qualified_names_before_preview) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "package-fallback", "/tmp/package-fallback"),
+              CBM_STORE_OK);
+
+    /* Fill the former fixed working set with singleton packages first. */
+    for (int i = 0; i < TEST_ARCH_FALLBACK_DISTINCT_PACKAGES; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_FALLBACK_NAME_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "singleton%03d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "package-fallback.root.pkg%03d.%s", i, name) > 0);
+        cbm_node_t node = {
+            .project = "package-fallback", .label = "Function", .name = name, .qualified_name = qn};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+    }
+
+    /* A later package must still win the exact count-based ranking. */
+    for (int i = 0; i < TEST_ARCH_FALLBACK_WINNER_NODES; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_FALLBACK_NAME_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "winner%03d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "package-fallback.root.winner.%s", name) > 0);
+        cbm_node_t node = {
+            .project = "package-fallback", .label = "Function", .name = name, .qualified_name = qn};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+    }
+
+    const char *aspects[] = {"packages"};
+    cbm_architecture_info_t info = {0};
+    ASSERT_EQ(cbm_store_get_architecture(s, "package-fallback", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+    ASSERT_TRUE(info.package_count > 0);
+    ASSERT_STR_EQ(info.packages[0].name, "winner");
+    ASSERT_EQ(info.packages[0].node_count, TEST_ARCH_FALLBACK_WINNER_NODES);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -1809,6 +1856,7 @@ TEST(search_case_sensitive_explicit) {
 SUITE(store_arch) {
     /* Architecture */
     RUN_TEST(arch_get_all);
+    RUN_TEST(arch_package_fallback_ranks_all_qualified_names_before_preview);
     RUN_TEST(arch_entry_points_exclude_tests);
     RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_hotspots_exclude_tests);
