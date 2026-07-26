@@ -46,11 +46,11 @@ enum { U32_MASK = 0xFFFFFFFF };
 /* Dynamic array growth constants */
 enum { BUCKET_INIT_CAP = 8, GROW_FACTOR = 2, ENTRY_INIT_CAP = 64, RESULT_INIT_CAP = 64 };
 
-/* Maximum bucket size — skip oversized buckets (noise from trivially similar functions). */
-enum { MAX_BUCKET_SIZE = 200 };
-
 /* Seen-set for O(1) dedup during query (simple open-addressing hash table). */
 enum { SEEN_SET_BITS = 14, SEEN_SET_SIZE = 16384, SEEN_SET_MASK = 16383 };
+
+_Static_assert((int)(CBM_LSH_BANDS * CBM_LSH_MAX_BUCKET_SIZE) < (int)SEEN_SET_SIZE,
+               "accepted LSH buckets must fit the query seen set");
 
 /* Knuth multiplicative hash constant for node_id → seen-set slot. */
 enum { KNUTH_MULT = 2654435761ULL };
@@ -451,7 +451,7 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
         uint32_t h = band_hash(fp, b);
         const lsh_bucket_t *bucket = &idx->bands[b][h];
         /* Skip oversized buckets — noise from trivially similar utility functions */
-        if (bucket->count > MAX_BUCKET_SIZE) {
+        if (bucket->count > CBM_LSH_MAX_BUCKET_SIZE) {
             continue;
         }
         for (int i = 0; i < bucket->count; i++) {
@@ -470,37 +470,49 @@ void cbm_lsh_query(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
     *count = mut_idx->result_count;
 }
 
-int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
-                       const cbm_lsh_entry_t **out_buf, int out_cap) {
+cbm_lsh_query_result_t cbm_lsh_query_into_result(const cbm_lsh_index_t *idx,
+                                                 const cbm_minhash_t *fp,
+                                                 const cbm_lsh_entry_t **out_buf, int out_cap) {
+    cbm_lsh_query_result_t result = {0};
     if (!idx || !fp || !out_buf || out_cap <= 0) {
-        return 0;
+        return result;
     }
 
     /* Thread-local dedup — no shared state touched. */
     seen_set_t seen;
     seen_set_init(&seen);
+    if (!seen.slots) {
+        result.allocation_failed = true;
+        return result;
+    }
 
-    int count = 0;
     for (int b = 0; b < CBM_LSH_BANDS; b++) {
         uint32_t h = band_hash(fp, b);
         const lsh_bucket_t *bucket = &idx->bands[b][h];
-        if (bucket->count > MAX_BUCKET_SIZE) {
+        if (bucket->count > CBM_LSH_MAX_BUCKET_SIZE) {
+            result.noisy_buckets++;
             continue;
         }
-        for (int i = 0; i < bucket->count && count < out_cap; i++) {
+        for (int i = 0; i < bucket->count; i++) {
             const cbm_lsh_entry_t *candidate = &idx->entries[bucket->items[i]];
             if (!seen_set_insert(&seen, candidate->node_id)) {
                 continue;
             }
-            out_buf[count++] = candidate;
-        }
-        if (count >= out_cap) {
-            break;
+            if (result.written < out_cap) {
+                out_buf[result.written++] = candidate;
+            } else {
+                result.omitted++;
+            }
         }
     }
 
     seen_set_free(&seen);
-    return count;
+    return result;
+}
+
+int cbm_lsh_query_into(const cbm_lsh_index_t *idx, const cbm_minhash_t *fp,
+                       const cbm_lsh_entry_t **out_buf, int out_cap) {
+    return cbm_lsh_query_into_result(idx, fp, out_buf, out_cap).written;
 }
 
 void cbm_lsh_free(cbm_lsh_index_t *idx) {
