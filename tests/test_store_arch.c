@@ -745,6 +745,146 @@ TEST(arch_layers_filter_infra_routes_and_use_route_file_package) {
     PASS();
 }
 
+TEST(arch_layers_collects_route_and_entry_packages_beyond_32) {
+    enum { LAYER_MARKED_PACKAGE_COUNT = 40 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "layer-marked", "/tmp/layer-marked"), CBM_STORE_OK);
+
+    for (int i = 0; i < LAYER_MARKED_PACKAGE_COUNT; i++) {
+        char route_name[TEST_ARCH_PATH_BUF];
+        char route_qn[TEST_ARCH_PATH_BUF];
+        char route_file[TEST_ARCH_PATH_BUF];
+        snprintf(route_name, sizeof(route_name), "/route-%03d", i);
+        snprintf(route_qn, sizeof(route_qn), "__route__GET__%s", route_name);
+        snprintf(route_file, sizeof(route_file), "pkg%03d/routes.c", i);
+        cbm_node_t route = {.project = "layer-marked",
+                            .label = "Route",
+                            .name = route_name,
+                            .qualified_name = route_qn,
+                            .file_path = route_file,
+                            .properties_json = "{\"method\":\"GET\"}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &route), 0);
+
+        char entry_name[TEST_ARCH_PATH_BUF];
+        char entry_qn[TEST_ARCH_PATH_BUF];
+        snprintf(entry_name, sizeof(entry_name), "entry%03d", i);
+        snprintf(entry_qn, sizeof(entry_qn), "layer-marked.pkg%03d.%s", i, entry_name);
+        cbm_node_t entry = {.project = "layer-marked",
+                            .label = "Function",
+                            .name = entry_name,
+                            .qualified_name = entry_qn,
+                            .file_path = route_file,
+                            .properties_json = "{\"is_entry_point\":true}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &entry), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "layer-marked", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_late_api_package = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        if (strcmp(info.layers[i].name, "pkg039") == 0) {
+            saw_late_api_package = strcmp(info.layers[i].layer, "api") == 0;
+            break;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_TRUE(saw_late_api_package);
+    PASS();
+}
+
+TEST(arch_layers_collects_boundary_packages_beyond_64) {
+    enum { LAYER_BOUNDARY_TARGET_COUNT = 70 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "layer-boundaries", "/tmp/layer-boundaries"),
+              CBM_STORE_OK);
+
+    cbm_node_t hub = {.project = "layer-boundaries",
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "layer-boundaries.hub.call",
+                      .file_path = "hub/call.c"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    ASSERT_GT(hub_id, 0);
+
+    int64_t last_target_id = 0;
+    for (int i = 0; i < LAYER_BOUNDARY_TARGET_COUNT; i++) {
+        char name[TEST_ARCH_PATH_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        char file_path[TEST_ARCH_PATH_BUF];
+        snprintf(name, sizeof(name), "target%03d", i);
+        snprintf(qn, sizeof(qn), "layer-boundaries.pkg%03d.%s", i, name);
+        snprintf(file_path, sizeof(file_path), "pkg%03d/target.c", i);
+        cbm_node_t target = {.project = "layer-boundaries",
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qn,
+                             .file_path = file_path};
+        int64_t target_id = cbm_store_upsert_node(s, &target);
+        ASSERT_GT(target_id, 0);
+        last_target_id = target_id;
+        cbm_edge_t edge = {.project = "layer-boundaries",
+                           .source_id = hub_id,
+                           .target_id = target_id,
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        char name[TEST_ARCH_PATH_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        snprintf(name, sizeof(name), "extra_hub%03d", i);
+        snprintf(qn, sizeof(qn), "layer-boundaries.hub.%s", name);
+        cbm_node_t extra_hub = {.project = "layer-boundaries",
+                                .label = "Function",
+                                .name = name,
+                                .qualified_name = qn,
+                                .file_path = "hub/call.c"};
+        int64_t extra_hub_id = cbm_store_upsert_node(s, &extra_hub);
+        ASSERT_GT(extra_hub_id, 0);
+        cbm_edge_t edge = {.project = "layer-boundaries",
+                           .source_id = extra_hub_id,
+                           .target_id = last_target_id,
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"boundaries", "layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "layer-boundaries", aspects, 2, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    int layer_count = info.layer_count;
+    bool saw_last_package = false;
+    bool saw_high_count_boundary = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        if (strcmp(info.layers[i].name, "pkg069") == 0) {
+            saw_last_package = true;
+            break;
+        }
+    }
+    for (int i = 0; i < info.boundary_count; i++) {
+        if (strcmp(info.boundaries[i].from, "hub") == 0 &&
+            strcmp(info.boundaries[i].to, "pkg069") == 0 && info.boundaries[i].call_count == 5) {
+            saw_high_count_boundary = true;
+            break;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_EQ(layer_count, LAYER_BOUNDARY_TARGET_COUNT + 1);
+    ASSERT_TRUE(saw_last_package);
+    ASSERT_TRUE(saw_high_count_boundary);
+    PASS();
+}
+
 TEST(arch_file_tree) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
@@ -1915,6 +2055,8 @@ SUITE(store_arch) {
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
     RUN_TEST(arch_layers_filter_infra_routes_and_use_route_file_package);
+    RUN_TEST(arch_layers_collects_route_and_entry_packages_beyond_32);
+    RUN_TEST(arch_layers_collects_boundary_packages_beyond_64);
     RUN_TEST(arch_file_tree);
     RUN_TEST(arch_clusters);
     RUN_TEST(arch_clusters_resolution_knob);
