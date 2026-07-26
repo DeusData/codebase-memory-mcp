@@ -45,6 +45,7 @@
 #include <depindex/depindex.h>
 #include <pagerank/pagerank.h>
 #include <pipeline/pipeline.h>
+#include <sqlite3.h>
 
 /* Binary path for the Gemini session-hook tests. cbm_upsert/remove_gemini_session_hooks
  * both take it, and removal matches owned entries by this exact path, so the paired
@@ -11138,6 +11139,144 @@ TEST(cli_config_open_close) {
     PASS();
 }
 
+static bool cli_seed_raw_config(const char *directory, const char *rows_sql) {
+    char dbpath[512];
+    int path_len = snprintf(dbpath, sizeof(dbpath), "%s/_config.db", directory);
+    if (path_len <= 0 || (size_t)path_len >= sizeof(dbpath)) {
+        return false;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open(dbpath, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    bool ok = sqlite3_exec(db, "CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)", NULL, NULL,
+                           NULL) == SQLITE_OK &&
+              sqlite3_exec(db, rows_sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+TEST(cli_config_open_migrates_development_spellings) {
+    static const struct {
+        const char *old_key;
+        const char *old_value;
+        const char *new_key;
+        const char *new_value;
+    } cases[] = {
+        {CBM_CONFIG_INCREMENTAL_REINDEX, "off", CBM_CONFIG_INCREMENTAL_REINDEX, "full_rebuild"},
+        {CBM_CONFIG_INCREMENTAL_REINDEX, "fast", CBM_CONFIG_INCREMENTAL_REINDEX,
+         "fast_mode_indexes_only"},
+        {"incremental_derived_refresh", "eager", CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+         "at_publish"},
+        {"incremental_derived_refresh", "stale_on_exact",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_exact_delta_reindexes"},
+        {"incremental_derived_refresh", "stale_on_incremental",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_all_incremental_reindexes"},
+        {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "eager",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "at_publish"},
+        {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_exact",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_exact_delta_reindexes"},
+        {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_incremental",
+         CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "defer_all_incremental_reindexes"},
+        {CBM_CONFIG_RANK_REFRESH, "eager", CBM_CONFIG_RANK_REFRESH, "at_publish"},
+        {CBM_CONFIG_RANK_REFRESH, "stale_on_exact", CBM_CONFIG_RANK_REFRESH,
+         "defer_exact_delta_reindexes"},
+        {CBM_CONFIG_RANK_REFRESH, "stale_on_incremental", CBM_CONFIG_RANK_REFRESH,
+         "defer_all_incremental_reindexes"},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        char tmpdir[256];
+        snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-migrate-XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+        char rows[1024];
+        int rows_len =
+            snprintf(rows, sizeof(rows),
+                     "INSERT INTO config(key,value) VALUES('%s','%s');"
+                     "INSERT INTO config(key,value) VALUES('private_extension','retained');",
+                     cases[i].old_key, cases[i].old_value);
+        ASSERT_TRUE(rows_len > 0 && (size_t)rows_len < sizeof(rows));
+        ASSERT_TRUE(cli_seed_raw_config(tmpdir, rows));
+
+        cbm_config_t *cfg = cbm_config_open(tmpdir);
+        ASSERT_NOT_NULL(cfg);
+        ASSERT_STR_EQ(cbm_config_get(cfg, cases[i].new_key, "missing"), cases[i].new_value);
+        ASSERT_STR_EQ(cbm_config_get(cfg, "private_extension", "missing"), "retained");
+        if (strcmp(cases[i].old_key, cases[i].new_key) != 0) {
+            ASSERT_STR_EQ(cbm_config_get(cfg, cases[i].old_key, "removed"), "removed");
+        }
+        cbm_config_close(cfg);
+        test_rmdir_r(tmpdir);
+    }
+    PASS();
+}
+
+TEST(cli_config_open_preserves_canonical_value_on_key_conflict) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-migrate-conflict-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    ASSERT_TRUE(cli_seed_raw_config(tmpdir,
+                                    "INSERT INTO config(key,value) VALUES"
+                                    "('incremental_derived_refresh','stale_on_incremental'),"
+                                    "('incremental_derived_results_refresh','at_publish');"));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "missing"),
+                  "at_publish");
+    ASSERT_STR_EQ(cbm_config_get(cfg, "incremental_derived_refresh", "removed"), "removed");
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_open_preserves_unrecognized_development_value) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-migrate-unknown-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    ASSERT_TRUE(cli_seed_raw_config(
+        tmpdir,
+        "INSERT INTO config(key,value) VALUES('incremental_derived_refresh','extension_owned');"));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_STR_EQ(cbm_config_get(cfg, "incremental_derived_refresh", "missing"), "extension_owned");
+    ASSERT_STR_EQ(cbm_config_get(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "absent"),
+                  "absent");
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_rejects_development_spellings_with_replacements) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-rename-error-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    ASSERT_NEQ(cbm_config_set(cfg, "incremental_derived_refresh", "eager"), 0);
+    char error[1024];
+    cbm_config_set_error_for_testing("incremental_derived_refresh", "eager", error, sizeof(error));
+    ASSERT_NOT_NULL(strstr(error, "incremental_derived_results_refresh"));
+    ASSERT_NOT_NULL(strstr(error, "at_publish"));
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, "off"), 0);
+    cbm_config_set_error_for_testing(CBM_CONFIG_INCREMENTAL_REINDEX, "off", error, sizeof(error));
+    ASSERT_NOT_NULL(strstr(error, "always|full_rebuild|fast_mode_indexes_only"));
+    ASSERT_NOT_NULL(strstr(error, "'off' was renamed to 'full_rebuild'"));
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_RANK_REFRESH, "stale_on_exact"), 0);
+    cbm_config_set_error_for_testing(CBM_CONFIG_RANK_REFRESH, "stale_on_exact", error,
+                                     sizeof(error));
+    ASSERT_NOT_NULL(strstr(error, "defer_exact_delta_reindexes"));
+
+    cbm_config_close(cfg);
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 TEST(cli_config_get_set) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
@@ -13639,6 +13778,10 @@ SUITE(cli) {
 
     /* Config store (7 tests — group F) */
     RUN_TEST(cli_config_open_close);
+    RUN_TEST(cli_config_open_migrates_development_spellings);
+    RUN_TEST(cli_config_open_preserves_canonical_value_on_key_conflict);
+    RUN_TEST(cli_config_open_preserves_unrecognized_development_value);
+    RUN_TEST(cli_config_rejects_development_spellings_with_replacements);
     RUN_TEST(cli_config_get_set);
     RUN_TEST(cli_config_get_result_storage_is_per_thread);
     RUN_TEST(cli_config_get_bool);

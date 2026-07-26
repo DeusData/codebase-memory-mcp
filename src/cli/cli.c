@@ -67,6 +67,8 @@ enum {
     SQL_NUL_TERM = -1, /* sqlite3 length = -1 means NUL-terminated */
     SQL_PARAM_1 = 1,   /* sqlite3_bind parameter index 1 */
     SQL_PARAM_2 = 2,
+    SQL_PARAM_3 = 3,
+    SQL_PARAM_4 = 4,
     SEMVER_PARTS = 3, /* major.minor.patch */
     DB_EXT_LEN = 3,   /* strlen(".db") */
     MIN_ARGC_CMD = 3,
@@ -7007,6 +7009,175 @@ struct cbm_config {
     sqlite3 *db;
 };
 
+typedef struct {
+    const char *old_key;
+    const char *old_value;
+    const char *new_key;
+    const char *new_value;
+} cbm_config_rename_t;
+
+/* Development builds used these spellings before the configuration vocabulary
+ * stabilized. They never shipped upstream, so migrate persisted rows once
+ * without retaining a permanent read-time alias surface. Exact old-key/value
+ * pairs keep unknown or user-owned extension rows untouched. */
+static const cbm_config_rename_t CBM_CONFIG_RENAMES[] = {
+    {CBM_CONFIG_INCREMENTAL_REINDEX, "off", CBM_CONFIG_INCREMENTAL_REINDEX,
+     CBM_CONFIG_INCREMENTAL_REINDEX_FULL_REBUILD},
+    {CBM_CONFIG_INCREMENTAL_REINDEX, "fast", CBM_CONFIG_INCREMENTAL_REINDEX,
+     CBM_CONFIG_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY},
+    {"incremental_derived_refresh", "eager", CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH},
+    {"incremental_derived_refresh", "stale_on_exact",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES},
+    {"incremental_derived_refresh", "stale_on_incremental",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "eager",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_exact",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES},
+    {CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH, "stale_on_incremental",
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+     CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES},
+    {CBM_CONFIG_RANK_REFRESH, "eager", CBM_CONFIG_RANK_REFRESH, CBM_RANK_REFRESH_AT_PUBLISH},
+    {CBM_CONFIG_RANK_REFRESH, "stale_on_exact", CBM_CONFIG_RANK_REFRESH,
+     CBM_RANK_REFRESH_DEFER_EXACT_DELTA_REINDEXES},
+    {CBM_CONFIG_RANK_REFRESH, "stale_on_incremental", CBM_CONFIG_RANK_REFRESH,
+     CBM_RANK_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES},
+};
+
+static const char *cbm_config_renamed_key(const char *key) {
+    return key && strcmp(key, "incremental_derived_refresh") == 0
+               ? CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH
+               : NULL;
+}
+
+static const cbm_config_rename_t *cbm_config_find_rename(const char *key, const char *value) {
+    if (!key || !value) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(CBM_CONFIG_RENAMES) / sizeof(CBM_CONFIG_RENAMES[0]); i++) {
+        if (strcmp(CBM_CONFIG_RENAMES[i].old_key, key) == 0 &&
+            strcmp(CBM_CONFIG_RENAMES[i].old_value, value) == 0) {
+            return &CBM_CONFIG_RENAMES[i];
+        }
+    }
+    return NULL;
+}
+
+static bool cbm_config_has_rename_rows(sqlite3 *db, bool *found) {
+    if (!found) {
+        return false;
+    }
+    *found = false;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM config WHERE key = ? AND value = ? LIMIT 1",
+                           SQL_NUL_TERM, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(CBM_CONFIG_RENAMES) / sizeof(CBM_CONFIG_RENAMES[0]); i++) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
+        if (sqlite3_bind_text(stmt, SQL_PARAM_1, CBM_CONFIG_RENAMES[i].old_key, SQL_NUL_TERM,
+                              cbm_sqlite_transient) != SQLITE_OK ||
+            sqlite3_bind_text(stmt, SQL_PARAM_2, CBM_CONFIG_RENAMES[i].old_value, SQL_NUL_TERM,
+                              cbm_sqlite_transient) != SQLITE_OK) {
+            ok = false;
+            break;
+        }
+        int step_rc = sqlite3_step(stmt);
+        if (step_rc == SQLITE_ROW) {
+            *found = true;
+            break;
+        }
+        if (step_rc != SQLITE_DONE) {
+            ok = false;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+static bool cbm_config_migrate_development_spellings(sqlite3 *db) {
+    bool has_rename_rows = false;
+    if (!cbm_config_has_rename_rows(db, &has_rename_rows)) {
+        return false;
+    }
+    if (!has_rename_rows) {
+        return true;
+    }
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        return false;
+    }
+
+    sqlite3_stmt *insert = NULL;
+    sqlite3_stmt *update = NULL;
+    sqlite3_stmt *delete_old = NULL;
+    bool ok = sqlite3_prepare_v2(db,
+                                 "INSERT OR IGNORE INTO config(key,value) "
+                                 "SELECT ?,? FROM config WHERE key = ? AND value = ?",
+                                 SQL_NUL_TERM, &insert, NULL) == SQLITE_OK &&
+              sqlite3_prepare_v2(db, "UPDATE config SET value = ? WHERE key = ? AND value = ?",
+                                 SQL_NUL_TERM, &update, NULL) == SQLITE_OK &&
+              sqlite3_prepare_v2(db, "DELETE FROM config WHERE key = ? AND value = ?", SQL_NUL_TERM,
+                                 &delete_old, NULL) == SQLITE_OK;
+
+    for (size_t i = 0; ok && i < sizeof(CBM_CONFIG_RENAMES) / sizeof(CBM_CONFIG_RENAMES[0]); i++) {
+        const cbm_config_rename_t *rename = &CBM_CONFIG_RENAMES[i];
+        if (strcmp(rename->old_key, rename->new_key) == 0) {
+            sqlite3_reset(update);
+            sqlite3_clear_bindings(update);
+            ok = sqlite3_bind_text(update, SQL_PARAM_1, rename->new_value, SQL_NUL_TERM,
+                                   cbm_sqlite_transient) == SQLITE_OK &&
+                 sqlite3_bind_text(update, SQL_PARAM_2, rename->old_key, SQL_NUL_TERM,
+                                   cbm_sqlite_transient) == SQLITE_OK &&
+                 sqlite3_bind_text(update, SQL_PARAM_3, rename->old_value, SQL_NUL_TERM,
+                                   cbm_sqlite_transient) == SQLITE_OK &&
+                 sqlite3_step(update) == SQLITE_DONE;
+            continue;
+        }
+
+        sqlite3_reset(insert);
+        sqlite3_clear_bindings(insert);
+        ok = sqlite3_bind_text(insert, SQL_PARAM_1, rename->new_key, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(insert, SQL_PARAM_2, rename->new_value, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(insert, SQL_PARAM_3, rename->old_key, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(insert, SQL_PARAM_4, rename->old_value, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_step(insert) == SQLITE_DONE;
+        if (!ok) {
+            break;
+        }
+
+        sqlite3_reset(delete_old);
+        sqlite3_clear_bindings(delete_old);
+        ok = sqlite3_bind_text(delete_old, SQL_PARAM_1, rename->old_key, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_bind_text(delete_old, SQL_PARAM_2, rename->old_value, SQL_NUL_TERM,
+                               cbm_sqlite_transient) == SQLITE_OK &&
+             sqlite3_step(delete_old) == SQLITE_DONE;
+    }
+
+    sqlite3_finalize(delete_old);
+    sqlite3_finalize(update);
+    sqlite3_finalize(insert);
+    if (ok) {
+        ok = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    }
+    if (!ok) {
+        (void)sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    }
+    return ok;
+}
+
 static cbm_config_t *cbm_config_wrap_db(sqlite3 *db) {
     cbm_config_t *cfg = calloc(CBM_ALLOC_ONE, sizeof(*cfg));
     if (!cfg) {
@@ -7041,6 +7212,10 @@ cbm_config_t *cbm_config_open(const char *cache_dir) {
     char *err_msg = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
         sqlite3_free(err_msg);
+        sqlite3_close(db);
+        return NULL;
+    }
+    if (!cbm_config_migrate_development_spellings(db)) {
         sqlite3_close(db);
         return NULL;
     }
@@ -7166,6 +7341,9 @@ static bool cbm_config_decimal_integer_in_range(const char *value, long minimum,
 }
 
 static bool cbm_config_value_is_valid(const char *key, const char *value) {
+    if (cbm_config_renamed_key(key)) {
+        return false;
+    }
     if (key && strcmp(key, CBM_CONFIG_QUERY_MAX_ROWS) == 0 &&
         !cbm_config_decimal_integer_in_range(value, 0, CBM_MAX_QUERY_ROWS)) {
         return false;
@@ -7198,6 +7376,53 @@ static bool cbm_config_value_is_valid(const char *key, const char *value) {
     }
     return true; /* preserve extension/private keys not owned by this registry */
 }
+
+static const cbm_config_entry_t *cbm_config_registry_entry(const char *key) {
+    if (!key) {
+        return NULL;
+    }
+    for (size_t i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
+            return &CBM_CONFIG_REGISTRY[i];
+        }
+    }
+    return NULL;
+}
+
+static void cbm_config_set_error(const char *key, const char *value, char *out, size_t out_size) {
+    if (!out || out_size == 0) {
+        return;
+    }
+    const cbm_config_rename_t *rename = cbm_config_find_rename(key, value);
+    const char *renamed_key = cbm_config_renamed_key(key);
+    const char *effective_key = renamed_key ? renamed_key : key;
+    const cbm_config_entry_t *entry = cbm_config_registry_entry(effective_key);
+
+    if (renamed_key && rename) {
+        (void)snprintf(out, out_size,
+                       "config key '%s' was renamed to '%s', and value '%s' was renamed to '%s'; "
+                       "use %s=%s",
+                       key, renamed_key, value, rename->new_value, renamed_key, rename->new_value);
+    } else if (renamed_key) {
+        (void)snprintf(out, out_size, "config key '%s' was renamed to '%s'; use %s=%s", key,
+                       renamed_key, renamed_key, value ? value : "");
+    } else if (rename && entry && entry->range) {
+        (void)snprintf(out, out_size, "%s must be %s, got '%s'; '%s' was renamed to '%s'", key,
+                       entry->range, value, value, rename->new_value);
+    } else if (entry && entry->range) {
+        (void)snprintf(out, out_size, "%s must be %s, got '%s'", key, entry->range,
+                       value ? value : "");
+    } else {
+        (void)snprintf(out, out_size, "failed to set %s", key ? key : "config value");
+    }
+}
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+void cbm_config_set_error_for_testing(const char *key, const char *value, char *out,
+                                      size_t out_size) {
+    cbm_config_set_error(key, value, out, out_size);
+}
+#endif
 
 int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value) {
     if (!cfg || !key || !value || !cbm_config_value_is_valid(key, value)) {
@@ -7314,7 +7539,10 @@ int cbm_cmd_config(int argc, char **argv) {
             if (cbm_config_set(cfg, argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]) == 0) {
                 printf("%s = %s\n", argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN]);
             } else {
-                (void)fprintf(stderr, "error: failed to set %s\n", argv[CLI_SKIP_ONE]);
+                char reason[CLI_BUF_1K];
+                cbm_config_set_error(argv[CLI_SKIP_ONE], argv[CLI_PAIR_LEN], reason,
+                                     sizeof(reason));
+                (void)fprintf(stderr, "error: %s\n", reason);
                 rc = CLI_TRUE;
             }
         }

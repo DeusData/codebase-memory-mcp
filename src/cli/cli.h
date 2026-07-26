@@ -218,6 +218,8 @@ int cbm_upsert_qwen_lifecycle_hooks_for_testing(const char *settings_path, const
                                                 bool windows);
 int cbm_upsert_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
 int cbm_remove_qoder_context_hooks_for_testing(const char *settings_path, const char *binary_path);
+void cbm_config_set_error_for_testing(const char *key, const char *value, char *out,
+                                      size_t out_size);
 /* Explicit lifecycle adapter seam for hook protocols whose output envelope is
  * not Claude/Gemini-compatible. Returns allocated JSON or NULL to fail open. */
 char *cbm_hook_augment_lifecycle_json_for_dialect(const char *input, const char *forced_event,
