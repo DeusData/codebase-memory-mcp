@@ -726,36 +726,36 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
 
 typedef struct {
     cbm_sem_corpus_t *corpus;
-    char **all_tokens;
+    char ***doc_tokens;
     const int *token_counts;
-    int max_tokens;
     int doc_count;
     _Atomic int *doc_freq_atomic; /* per-entry atomic counter (entry_count long) */
     _Atomic int next_idx;
+    _Atomic bool alloc_failed;
 } batch_resolve_ctx_t;
 
 /* Resolve one document: look up each token's global ID, fill the corpus
  * doc_token_ids[d], and bump the per-token doc_freq counter atomically.  The
  * caller is responsible for ensuring `seen` has capacity for `count` ints
  * before calling (the worker grows its per-thread scratch buffer). */
-static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *seen) {
+static bool batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *seen) {
     int count = bc->token_counts[doc_index];
     if (count <= 0) {
         bc->corpus->doc_token_ids[doc_index] = NULL;
         bc->corpus->doc_token_counts[doc_index] = 0;
-        return;
+        return true;
     }
     int *ids = malloc((size_t)count * sizeof(int));
     if (!ids) {
         bc->corpus->doc_token_ids[doc_index] = NULL;
         bc->corpus->doc_token_counts[doc_index] = 0;
-        return;
+        return false;
     }
     bc->corpus->doc_token_ids[doc_index] = ids;
     bc->corpus->doc_token_counts[doc_index] = count;
 
     int seen_count = 0;
-    char **tokens = &bc->all_tokens[(ptrdiff_t)doc_index * bc->max_tokens];
+    char **tokens = bc->doc_tokens[doc_index];
     for (int i = 0; i < count; i++) {
         const char *idx_str = cbm_ht_get(bc->corpus->token_map, tokens[i]);
         int tid = CBM_NOT_FOUND;
@@ -784,6 +784,7 @@ static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *s
                                       memory_order_relaxed);
         }
     }
+    return true;
 }
 
 static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
@@ -793,10 +794,14 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
     int local_seen_cap = CBM_SEM_SEEN_INIT_CAP;
     int *seen = malloc((size_t)local_seen_cap * sizeof(int));
     if (!seen) {
+        atomic_store_explicit(&bc->alloc_failed, true, memory_order_relaxed);
         return;
     }
 
     while (true) {
+        if (atomic_load_explicit(&bc->alloc_failed, memory_order_relaxed)) {
+            break;
+        }
         int start =
             atomic_fetch_add_explicit(&bc->next_idx, CBM_SEM_RESOLVE_CHUNK, memory_order_relaxed);
         if (start >= bc->doc_count) {
@@ -811,81 +816,120 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
             if (count > local_seen_cap) {
                 int *grown = realloc(seen, (size_t)count * sizeof(int));
                 if (!grown) {
-                    continue;
+                    atomic_store_explicit(&bc->alloc_failed, true, memory_order_relaxed);
+                    break;
                 }
                 seen = grown;
                 local_seen_cap = count;
             }
-            batch_resolve_one_doc(bc, d, seen);
+            if (!batch_resolve_one_doc(bc, d, seen)) {
+                atomic_store_explicit(&bc->alloc_failed, true, memory_order_relaxed);
+                break;
+            }
         }
     }
     free(seen);
 }
 
-void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
+bool cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
                                    const int *token_counts, int doc_count, int max_tokens_per_doc) {
-    cbm_sem_corpus_add_docs_batch_with_workers(corpus, all_tokens, token_counts, doc_count,
-                                               max_tokens_per_doc, 0);
+    return cbm_sem_corpus_add_docs_batch_with_workers(corpus, all_tokens, token_counts, doc_count,
+                                                      max_tokens_per_doc, 0);
 }
 
-void cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
+bool cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
                                                 const int *token_counts, int doc_count,
                                                 int max_tokens_per_doc, int worker_count) {
     if (!corpus || !all_tokens || !token_counts || doc_count <= 0 || max_tokens_per_doc <= 0) {
-        return;
+        return false;
+    }
+    if ((size_t)doc_count > SIZE_MAX / sizeof(char **) ||
+        (ptrdiff_t)doc_count > PTRDIFF_MAX / (ptrdiff_t)max_tokens_per_doc) {
+        return false;
+    }
+    char ***doc_tokens = malloc((size_t)doc_count * sizeof(*doc_tokens));
+    if (!doc_tokens) {
+        return false;
+    }
+    for (int d = 0; d < doc_count; d++) {
+        doc_tokens[d] = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
+    }
+    bool complete = cbm_sem_corpus_add_doc_arrays_with_workers(corpus, doc_tokens, token_counts,
+                                                               doc_count, worker_count);
+    free(doc_tokens);
+    return complete;
+}
+
+bool cbm_sem_corpus_add_doc_arrays_with_workers(cbm_sem_corpus_t *corpus, char ***doc_tokens,
+                                                const int *token_counts, int doc_count,
+                                                int worker_count) {
+    if (!corpus || !doc_tokens || !token_counts || doc_count <= 0 || corpus->doc_count != 0) {
+        return false;
+    }
+    for (int d = 0; d < doc_count; d++) {
+        if (token_counts[d] < 0 ||
+            (size_t)token_counts[d] > SIZE_MAX / sizeof(int) ||
+            (token_counts[d] > 0 && !doc_tokens[d])) {
+            return false;
+        }
     }
 
     /* Phase A (SEQUENTIAL): discover tokens, allocate doc arrays, then
      * canonicalize token IDs before Phase B writes doc_token_ids. */
     if (doc_count > INT_MAX - corpus->doc_count) {
-        return;
+        return false;
     }
     if (corpus->doc_cap < corpus->doc_count + doc_count) {
         int new_cap = corpus->doc_count + doc_count;
         if (!corpus_reserve_doc_arrays(corpus, new_cap)) {
-            return;
+            return false;
         }
     }
     int base_doc = corpus->doc_count;
-    corpus->doc_count += doc_count;
 
     for (int d = 0; d < doc_count; d++) {
         int count = token_counts[d];
-        char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
+        char **tokens = doc_tokens[d];
         for (int i = 0; i < count; i++) {
             /* Discovers unique tokens. Phase B re-lookups use canonical IDs
              * after corpus_rebuild_token_map_sorted(). */
-            (void)corpus_get_or_add(corpus, tokens[i]);
+            if (!tokens[i] || corpus_get_or_add(corpus, tokens[i]) < 0) {
+                return false;
+            }
         }
     }
-    (void)corpus_rebuild_token_map_sorted(corpus);
+    if (!corpus_rebuild_token_map_sorted(corpus)) {
+        return false;
+    }
+
+    if (corpus->entry_count == 0) {
+        for (int d = 0; d < doc_count; d++) {
+            corpus->doc_token_ids[base_doc + d] = NULL;
+            corpus->doc_token_counts[base_doc + d] = 0;
+        }
+        corpus->doc_count += doc_count;
+        return true;
+    }
 
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
      * to shared state except atomic doc_freq counters). */
     _Atomic int *doc_freq_atomic = calloc((size_t)corpus->entry_count, sizeof(_Atomic int));
     if (!doc_freq_atomic) {
-        /* OOM fallback: sequential path. Roll back doc_count first since
-         * add_doc increments it itself. */
-        corpus->doc_count = base_doc;
-        for (int d = 0; d < doc_count; d++) {
-            int count = token_counts[d];
-            char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
-            cbm_sem_corpus_add_doc(corpus, (const char **)tokens, count);
-        }
-        return;
+        return false;
     }
 
+    corpus->doc_count += doc_count;
     int resolved_worker_count = sem_worker_count_or_default(worker_count);
     batch_resolve_ctx_t bc = {
         .corpus = corpus,
-        .all_tokens = all_tokens,
+        .doc_tokens = doc_tokens,
         .token_counts = token_counts,
-        .max_tokens = max_tokens_per_doc,
         .doc_count = doc_count,
         .doc_freq_atomic = doc_freq_atomic,
     };
     atomic_init(&bc.next_idx, 0);
+    atomic_init(&bc.alloc_failed, false);
     /* Temporarily re-base doc arrays so workers write to base_doc..base_doc+doc_count */
     corpus->doc_token_ids += base_doc;
     corpus->doc_token_counts += base_doc;
@@ -894,12 +938,24 @@ void cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char *
     corpus->doc_token_ids -= base_doc;
     corpus->doc_token_counts -= base_doc;
 
+    bool complete = !atomic_load_explicit(&bc.alloc_failed, memory_order_relaxed);
     /* Phase C (SEQUENTIAL reduce): atomic counters → entries[].doc_freq */
-    for (int i = 0; i < corpus->entry_count; i++) {
-        corpus->entries[i].doc_freq +=
-            atomic_load_explicit(&doc_freq_atomic[i], memory_order_relaxed);
+    if (complete) {
+        for (int i = 0; i < corpus->entry_count; i++) {
+            corpus->entries[i].doc_freq +=
+                atomic_load_explicit(&doc_freq_atomic[i], memory_order_relaxed);
+        }
     }
     free(doc_freq_atomic);
+    if (!complete) {
+        for (int d = 0; d < doc_count; d++) {
+            free(corpus->doc_token_ids[base_doc + d]);
+            corpus->doc_token_ids[base_doc + d] = NULL;
+            corpus->doc_token_counts[base_doc + d] = 0;
+        }
+        corpus->doc_count = base_doc;
+    }
+    return complete;
 }
 
 /* ── Parallel corpus_finalize ─────────────────────────────────────── */

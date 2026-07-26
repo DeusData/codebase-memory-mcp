@@ -166,17 +166,26 @@ cbm_sem_corpus_t *cbm_sem_corpus_new(void);
 /* Register a function's tokens in the corpus (for IDF counting). */
 void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count);
 
-/* Batch-build the corpus from pre-tokenized documents (PARALLEL variant).
+/* Batch-build an empty corpus from pre-tokenized documents (PARALLEL variant).
  * `all_tokens` layout: all_tokens[f * max_tokens_per_doc + t] = token pointer.
  * `token_counts[f]` = number of tokens in document f.
- * This replaces a loop of cbm_sem_corpus_add_doc() calls. */
-void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
+ * This replaces a loop of cbm_sem_corpus_add_doc() calls. Returns false for
+ * invalid input, a non-empty corpus, or allocation failure. */
+bool cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
                                    const int *token_counts, int doc_count, int max_tokens_per_doc);
 
 /* Batch-build with an explicit worker count. worker_count <= 0 uses the default. */
-void cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
+bool cbm_sem_corpus_add_docs_batch_with_workers(cbm_sem_corpus_t *corpus, char **all_tokens,
                                                 const int *token_counts, int doc_count,
                                                 int max_tokens_per_doc, int worker_count);
+
+/* Batch-build an empty corpus from independently sized token arrays. Unlike
+ * the rectangular API above, memory is O(total tokens + documents), not
+ * O(max_tokens_per_doc * documents). Returns false if an input is invalid or
+ * any allocation fails so callers do not publish a partial semantic pass. */
+bool cbm_sem_corpus_add_doc_arrays_with_workers(cbm_sem_corpus_t *corpus, char ***doc_tokens,
+                                                const int *token_counts, int doc_count,
+                                                int worker_count);
 
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);

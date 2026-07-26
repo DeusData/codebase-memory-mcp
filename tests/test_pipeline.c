@@ -17593,8 +17593,11 @@ static cbm_sem_corpus_t *build_semantic_worker_parity_corpus(int worker_count) {
     if (!corpus) {
         return NULL;
     }
-    cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, SEM_PARITY_DOCS,
-                                               SEM_PARITY_MAX_TOKENS, worker_count);
+    if (!cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, SEM_PARITY_DOCS,
+                                                    SEM_PARITY_MAX_TOKENS, worker_count)) {
+        cbm_sem_corpus_free(corpus);
+        return NULL;
+    }
     cbm_sem_corpus_finalize_with_workers(corpus, worker_count);
     return corpus;
 }
@@ -17668,10 +17671,66 @@ TEST(pipeline_semantic_batch_rejects_invalid_token_stride) {
     cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
     ASSERT_NOT_NULL(corpus);
 
-    cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, 1, 0, 1);
+    ASSERT_FALSE(cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, 1, 0, 1));
 
     ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 0);
     ASSERT_EQ(cbm_sem_corpus_token_count(corpus), 0);
+
+    cbm_sem_corpus_free(corpus);
+    PASS();
+}
+
+TEST(pipeline_semantic_corpus_accepts_nonuniform_docs_beyond_legacy_stride) {
+    enum {
+        SEM_LONG_DOC_TOKENS = 600,
+        SEM_SHORT_DOC_TOKENS = 1,
+    };
+    char **long_doc = calloc(SEM_LONG_DOC_TOKENS, sizeof(*long_doc));
+    ASSERT_NOT_NULL(long_doc);
+    for (int i = 0; i < SEM_LONG_DOC_TOKENS; i++) {
+        long_doc[i] = malloc(CBM_SZ_32);
+        ASSERT_NOT_NULL(long_doc[i]);
+        snprintf(long_doc[i], CBM_SZ_32, "semantic_token_%d", i);
+    }
+    char *short_doc[SEM_SHORT_DOC_TOKENS] = {"short_doc_token"};
+    char **docs[] = {long_doc, short_doc};
+    int counts[] = {SEM_LONG_DOC_TOKENS, SEM_SHORT_DOC_TOKENS};
+
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+    ASSERT_TRUE(cbm_sem_corpus_add_doc_arrays_with_workers(corpus, docs, counts, 2, 2));
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 2);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus),
+              SEM_LONG_DOC_TOKENS + SEM_SHORT_DOC_TOKENS);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "semantic_token_0"), 0);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "semantic_token_599"), 0);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "short_doc_token"), 0);
+
+    cbm_sem_corpus_free(corpus);
+    for (int i = 0; i < SEM_LONG_DOC_TOKENS; i++) {
+        free(long_doc[i]);
+    }
+    free(long_doc);
+    PASS();
+}
+
+TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids) {
+    const char *existing[] = {"zeta"};
+    char *new_doc[] = {"alpha"};
+    char **docs[] = {new_doc};
+    int counts[] = {1};
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+    cbm_sem_corpus_add_doc(corpus, existing, 1);
+    ASSERT_EQ(cbm_sem_corpus_token_id(corpus, "zeta"), 0);
+
+    ASSERT_FALSE(cbm_sem_corpus_add_doc_arrays_with_workers(corpus, docs, counts, 1, 1));
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 1);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus), 1);
+    ASSERT_EQ(cbm_sem_corpus_token_id(corpus, "zeta"), 0);
+    ASSERT_EQ(cbm_sem_corpus_token_id(corpus, "alpha"), CBM_NOT_FOUND);
 
     cbm_sem_corpus_free(corpus);
     PASS();
@@ -18673,6 +18732,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
     RUN_TEST(pipeline_semantic_corpus_add_doc_reserves_without_losing_docs);
     RUN_TEST(pipeline_semantic_batch_rejects_invalid_token_stride);
+    RUN_TEST(pipeline_semantic_corpus_accepts_nonuniform_docs_beyond_legacy_stride);
+    RUN_TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(config_registry_includes_extract_timeout);
