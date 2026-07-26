@@ -1281,6 +1281,18 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx);
  * Opt-in: only runs when CBM_SEMANTIC_ENABLED=1. */
 int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
 
+typedef struct {
+    int function_index;
+    uint8_t band_matches;
+} cbm_semantic_candidate_t;
+
+/* Rank bounded LSH candidates by descending band matches, then canonical
+ * function index, before exact vector scoring. Runtime is O(count log count);
+ * count is bounded by the accepted LSH bucket working set. Returns the number
+ * selected (at most limit) and places them first. */
+int cbm_pipeline_rank_semantic_candidates(cbm_semantic_candidate_t *candidates, int count,
+                                          int limit);
+
 /* Pre-dump pass: interprocedural complexity propagation (Tier B).
  * Propagates per-function loop_depth along CALLS edges into a transitive
  * worst-case nested-loop estimate (transitive_loop_depth) and flags call-graph

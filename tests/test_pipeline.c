@@ -17866,6 +17866,28 @@ TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results) {
     PASS();
 }
 
+TEST(pipeline_semantic_candidate_rank_prefers_band_evidence_canonically) {
+    cbm_semantic_candidate_t candidates[] = {
+        {.function_index = 40, .band_matches = 1}, {.function_index = 30, .band_matches = 4},
+        {.function_index = 20, .band_matches = 4}, {.function_index = 10, .band_matches = 2},
+        {.function_index = 50, .band_matches = 3},
+    };
+    cbm_semantic_candidate_t permuted[] = {
+        candidates[SKIP_ONE], candidates[4], candidates[0], candidates[3], candidates[2],
+    };
+    const int expected[] = {20, 30, 50};
+
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(candidates, 5, 3), 3);
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(permuted, 5, 3), 3);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(candidates[i].function_index, expected[i]);
+        ASSERT_EQ(permuted[i].function_index, expected[i]);
+    }
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(candidates, 5, 0), 0);
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(NULL, 5, 3), 0);
+    PASS();
+}
+
 static const cbm_config_entry_t *find_config_entry(const char *key) {
     for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
         if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
@@ -18866,6 +18888,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids);
     RUN_TEST(pipeline_semantic_edges_tokenize_complete_long_metadata);
     RUN_TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results);
+    RUN_TEST(pipeline_semantic_candidate_rank_prefers_band_evidence_canonically);
     RUN_TEST(config_registry_includes_mcp_timeout_knobs);
     RUN_TEST(config_registry_includes_incremental_reindex_policy);
     RUN_TEST(config_registry_includes_extract_timeout);
