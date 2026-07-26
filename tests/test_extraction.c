@@ -2353,6 +2353,61 @@ TEST(c_caller_attribution) {
     PASS();
 }
 
+/*
+ * The unified walk's scope storage must preserve every active boundary, not
+ * merely a fixed prefix.  Loop depth is persisted on CALLS edges and feeds
+ * bottleneck analysis, so silently dropping deep scopes produces plausible but
+ * incorrect graph metadata.
+ */
+TEST(c_call_retains_loop_depth_beyond_64_scopes) {
+    enum { NESTED_LOOPS = 70 };
+    char source[CBM_SZ_8K];
+    size_t used = 0;
+    int n = snprintf(source, sizeof(source), "void target(void) {}\nvoid deep(void) {\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source));
+    used = (size_t)n;
+
+    for (int i = 0; i < NESTED_LOOPS; i++) {
+        n = snprintf(source + used, sizeof(source) - used, "while (1) {\n");
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, "target();\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source) - used);
+    used += (size_t)n;
+    for (int i = 0; i < NESTED_LOOPS; i++) {
+        n = snprintf(source + used, sizeof(source) - used, "}\n");
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, "}\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source) - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_C, "t", "deep.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *target_call = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, "target") == 0) {
+            ASSERT_NULL(target_call);
+            target_call = &r->calls.items[i];
+        }
+    }
+    ASSERT_NOT_NULL(target_call);
+    ASSERT_NOT_NULL(target_call->enclosing_func_qn);
+    ASSERT_NOT_NULL(strstr(target_call->enclosing_func_qn, "deep"));
+    ASSERT_EQ(target_call->loop_depth, NESTED_LOOPS);
+    ASSERT_EQ(target_call->branch_depth, 0);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 /* adc8304 (the dedup refactor bundled into #463) re-pointed the C/C++ enclosing-
  * function resolver at the canonical declarator walker: qualified names (Foo::bar)
  * now resolve via resolve_qualified_name(), and `type_identifier` was dropped from
@@ -5542,6 +5597,7 @@ SUITE(extraction) {
     RUN_TEST(wolfram_call);
     RUN_TEST(wolfram_caller_attribution);
     RUN_TEST(c_caller_attribution);
+    RUN_TEST(c_call_retains_loop_depth_beyond_64_scopes);
     RUN_TEST(cpp_out_of_line_method_caller_attribution);
     RUN_TEST(cpp_out_of_line_ctor_dtor_caller_attribution);
     RUN_TEST(wolfram_parse);

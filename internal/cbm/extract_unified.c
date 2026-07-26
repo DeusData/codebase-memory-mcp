@@ -8,19 +8,62 @@
 
 #include <limits.h>
 #include <stdint.h> // uint32_t, uint8_t
+#include <stdlib.h>
 #include <string.h>
 #include <strings.h> // strcasecmp (ObjectScript type inference)
 
 // --- Scope stack management ---
 
-static void push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
-    if (state->scope_top >= MAX_SCOPES) {
-        return;
+static void walk_state_init(WalkState *state) {
+    memset(state, 0, sizeof(*state));
+    state->scopes = state->inline_scopes;
+    state->scope_capacity = CBM_WALK_SCOPE_INLINE_CAP;
+}
+
+static void walk_state_destroy(WalkState *state) {
+    if (state->scopes != state->inline_scopes) {
+        free(state->scopes);
+    }
+}
+
+/*
+ * Keep the inherited 64-entry stack path allocation-free, but treat it as an
+ * inline optimization rather than a semantic cap. Spill storage is traversal
+ * scratch and is freed immediately after the walk instead of extending the
+ * result arena's lifetime. Geometric growth gives amortized O(1) pushes and
+ * O(D) peak memory for maximum active scope depth D.
+ */
+static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
+    if (state->scope_top >= state->scope_capacity) {
+        if (state->scope_capacity > INT_MAX / PAIR_LEN) {
+            return false;
+        }
+        int next_capacity = state->scope_capacity * PAIR_LEN;
+        if ((size_t)next_capacity > SIZE_MAX / sizeof(*state->scopes)) {
+            return false;
+        }
+        size_t bytes = (size_t)next_capacity * sizeof(*state->scopes);
+        cbm_walk_scope_t *grown = NULL;
+        if (state->scopes == state->inline_scopes) {
+            grown = (cbm_walk_scope_t *)malloc(bytes);
+            if (grown) {
+                memcpy(grown, state->inline_scopes,
+                       (size_t)state->scope_top * sizeof(*state->scopes));
+            }
+        } else {
+            grown = (cbm_walk_scope_t *)realloc(state->scopes, bytes);
+        }
+        if (!grown) {
+            return false;
+        }
+        state->scopes = grown;
+        state->scope_capacity = next_capacity;
     }
     state->scopes[state->scope_top].kind = kind;
     state->scopes[state->scope_top].depth = depth;
     state->scopes[state->scope_top].qn = qn;
     state->scope_top++;
+    return true;
 }
 
 // Pop scopes that we've ascended out of (depth >= current cursor depth).
@@ -1428,7 +1471,7 @@ static bool is_export_of_declaration(TSNode node) {
 }
 
 // Push scope markers for function, class, call, and import boundary nodes.
-static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
+static bool push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec,
                                  WalkState *state, uint32_t depth) {
     if (spec->function_node_types && cbm_kind_in_set(node, spec->function_node_types)) {
         /* OCaml: a nested local `let x = e in ...` is itself a value_definition,
@@ -1449,7 +1492,9 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         if (!skip_nested) {
             const char *fqn = compute_func_qn(ctx, node, spec, state);
             if (fqn) {
-                push_scope(state, SCOPE_FUNC, depth, fqn);
+                if (!push_scope(state, SCOPE_FUNC, depth, fqn)) {
+                    return false;
+                }
                 // ObjectScript: entering a method resets local var types (keeping
                 // class-level property types) and seeds the declared parameter types.
                 if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
@@ -1496,7 +1541,9 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     } else if (spec->class_node_types && cbm_kind_in_set(node, spec->class_node_types)) {
         const char *cqn = compute_class_qn(ctx, node, state);
         if (cqn) {
-            push_scope(state, SCOPE_CLASS, depth, cqn);
+            if (!push_scope(state, SCOPE_CLASS, depth, cqn)) {
+                return false;
+            }
             // ObjectScript: a new class clears the type map entirely.
             if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
                 ctx->language == CBM_LANG_OBJECTSCRIPT_ROUTINE) {
@@ -1514,7 +1561,9 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         if (!ts_node_is_null(prev)) {
             const char *fqn = compute_func_qn(ctx, prev, spec, state);
             if (fqn) {
-                push_scope(state, SCOPE_FUNC, depth, fqn);
+                if (!push_scope(state, SCOPE_FUNC, depth, fqn)) {
+                    return false;
+                }
             }
         }
     } else if (ctx->language == CBM_LANG_DART && strcmp(ts_node_type(node), "function_body") == 0) {
@@ -1531,27 +1580,38 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
         if (!ts_node_is_null(prev)) {
             const char *fqn = compute_func_qn(ctx, prev, spec, state);
             if (fqn) {
-                push_scope(state, SCOPE_FUNC, depth, fqn);
+                if (!push_scope(state, SCOPE_FUNC, depth, fqn)) {
+                    return false;
+                }
             }
         }
     }
 
     if (spec->call_node_types && cbm_kind_in_set(node, spec->call_node_types)) {
-        push_scope(state, SCOPE_CALL, depth, NULL);
+        if (!push_scope(state, SCOPE_CALL, depth, NULL)) {
+            return false;
+        }
     }
     if (spec->import_node_types && cbm_kind_in_set(node, spec->import_node_types) &&
         !is_export_of_declaration(node)) {
-        push_scope(state, SCOPE_IMPORT, depth, NULL);
+        if (!push_scope(state, SCOPE_IMPORT, depth, NULL)) {
+            return false;
+        }
     }
     /* Loop / branch nesting for bottleneck metrics. Loops are gated on named
      * nodes so anonymous `for`/`while` keyword tokens don't count. A loop is NOT
      * also counted as a branch (many specs list loops in branching_node_types,
      * but a loop is not a base-case guard for the unguarded-recursion signal). */
     if (ts_node_is_named(node) && cbm_is_loop_node_type(ts_node_type(node))) {
-        push_scope(state, SCOPE_LOOP, depth, NULL);
+        if (!push_scope(state, SCOPE_LOOP, depth, NULL)) {
+            return false;
+        }
     } else if (spec->branching_node_types && cbm_kind_in_set(node, spec->branching_node_types)) {
-        push_scope(state, SCOPE_BRANCH, depth, NULL);
+        if (!push_scope(state, SCOPE_BRANCH, depth, NULL)) {
+            return false;
+        }
     }
+    return true;
 }
 
 static void cbm_extract_unified_impl(CBMExtractCtx *ctx, bool calls_only) {
@@ -1562,7 +1622,7 @@ static void cbm_extract_unified_impl(CBMExtractCtx *ctx, bool calls_only) {
 
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     WalkState state;
-    memset(&state, 0, sizeof(state));
+    walk_state_init(&state);
 
     uint32_t depth = 0;
 
@@ -1589,7 +1649,11 @@ static void cbm_extract_unified_impl(CBMExtractCtx *ctx, bool calls_only) {
             scan_infra_bindings(ctx, node);
         }
 
-        push_boundary_scopes(ctx, node, spec, &state, depth);
+        if (!push_boundary_scopes(ctx, node, spec, &state, depth)) {
+            ctx->result->has_error = true;
+            ctx->result->error_msg = cbm_arena_strdup(ctx->arena, "scope stack allocation failed");
+            break;
+        }
 
         if (ts_tree_cursor_goto_first_child(&cursor)) {
             depth++;
@@ -1612,6 +1676,7 @@ static void cbm_extract_unified_impl(CBMExtractCtx *ctx, bool calls_only) {
     }
 
     ts_tree_cursor_delete(&cursor);
+    walk_state_destroy(&state);
 }
 
 void cbm_extract_unified(CBMExtractCtx *ctx) {
