@@ -21,6 +21,57 @@
         free(_r);                    \
     } while (0)
 
+enum { FQN_DEEP_SEGMENT_COUNT = 300 };
+
+static char *fqn_deep_path(const char *tail) {
+    size_t tail_len = strlen(tail);
+    size_t path_len = (size_t)FQN_DEEP_SEGMENT_COUNT * 2U + tail_len;
+    char *path = malloc(path_len + 1U);
+    if (!path) {
+        return NULL;
+    }
+    char *p = path;
+    for (int i = 0; i < FQN_DEEP_SEGMENT_COUNT; i++) {
+        *p++ = 'a';
+        *p++ = '/';
+    }
+    memcpy(p, tail, tail_len + 1U);
+    return path;
+}
+
+static char *fqn_expected_from_path(const char *path, const char *symbol, bool strip_extension) {
+    const char prefix[] = "proj.";
+    size_t path_len = strlen(path);
+    size_t symbol_len = symbol ? strlen(symbol) : 0U;
+    char *expected = malloc(sizeof(prefix) + path_len + symbol_len + 1U);
+    if (!expected) {
+        return NULL;
+    }
+    char *p = expected;
+    memcpy(p, prefix, sizeof(prefix) - 1U);
+    p += sizeof(prefix) - 1U;
+    memcpy(p, path, path_len + 1U);
+    for (char *c = p; *c; c++) {
+        if (*c == '/') {
+            *c = '.';
+        }
+    }
+    if (strip_extension) {
+        char *extension = strrchr(p, '.');
+        if (!extension) {
+            free(expected);
+            return NULL;
+        }
+        *extension = '\0';
+    }
+    p += strlen(p);
+    if (symbol_len > 0U) {
+        *p++ = '.';
+        memcpy(p, symbol, symbol_len + 1U);
+    }
+    return expected;
+}
+
 /* ================================================================
  * cbm_pipeline_fqn_compute
  * ================================================================ */
@@ -104,6 +155,21 @@ TEST(fqn_compute_nested_three_levels) {
 
 TEST(fqn_compute_nested_deep) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "a/b/c/d/e/f/g.ts", "fn"), "proj.a.b.c.d.e.f.g.fn");
+    PASS();
+}
+
+TEST(fqn_compute_retains_every_deep_path_segment) {
+    char *path = fqn_deep_path("tail.go");
+    ASSERT_NOT_NULL(path);
+    char *expected = fqn_expected_from_path(path, "Symbol", true);
+    ASSERT_NOT_NULL(expected);
+    char *actual = cbm_pipeline_fqn_compute("proj", path, "Symbol");
+    ASSERT_NOT_NULL(actual);
+    ASSERT_STR_EQ(actual, expected);
+    ASSERT_NOT_NULL(strstr(actual, ".tail.Symbol"));
+    free(actual);
+    free(expected);
+    free(path);
     PASS();
 }
 
@@ -410,6 +476,21 @@ TEST(fqn_folder_double_slash) {
     PASS();
 }
 
+TEST(fqn_folder_retains_every_deep_path_segment) {
+    char *path = fqn_deep_path("tail");
+    ASSERT_NOT_NULL(path);
+    char *expected = fqn_expected_from_path(path, NULL, false);
+    ASSERT_NOT_NULL(expected);
+    char *actual = cbm_pipeline_fqn_folder("proj", path);
+    ASSERT_NOT_NULL(actual);
+    ASSERT_STR_EQ(actual, expected);
+    ASSERT_NOT_NULL(strstr(actual, ".tail"));
+    free(actual);
+    free(expected);
+    free(path);
+    PASS();
+}
+
 TEST(fqn_without_project_exact_prefix) {
     ASSERT_STR_EQ(cbm_pipeline_fqn_without_project("tmp-a.b", "tmp-a.b.pkg.worker.run"),
                   "pkg.worker.run");
@@ -630,6 +711,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_compute_nested_two_levels);
     RUN_TEST(fqn_compute_nested_three_levels);
     RUN_TEST(fqn_compute_nested_deep);
+    RUN_TEST(fqn_compute_retains_every_deep_path_segment);
 
     /* fqn_compute: Python __init__.py */
     RUN_TEST(fqn_compute_init_py_with_name);
@@ -700,6 +782,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_folder_trailing_slash);
     RUN_TEST(fqn_folder_leading_slash);
     RUN_TEST(fqn_folder_double_slash);
+    RUN_TEST(fqn_folder_retains_every_deep_path_segment);
     RUN_TEST(fqn_without_project_exact_prefix);
     RUN_TEST(fqn_without_project_rejects_partial_prefix);
     RUN_TEST(fqn_without_project_preserves_project_node_and_nulls);

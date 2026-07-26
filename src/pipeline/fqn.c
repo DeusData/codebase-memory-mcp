@@ -20,9 +20,6 @@
 #include <io.h>
 #endif
 
-/* Maximum path segments in a FQN (CBM_SZ_256 slots total, -2 for project + name) */
-#define FQN_MAX_PATH_SEGS 254
-#define FQN_MAX_DIR_SEGS 255
 #define FQN_FILE_NODE_NAME "__file__"
 
 /* Max bytes for a derived project name. The name becomes a filename component
@@ -34,24 +31,79 @@
 
 /* ── Internal helpers ─────────────────────────────────────────────── */
 
+enum { FQN_SEGMENT_INLINE_CAP = CBM_SZ_256, FQN_SEGMENT_GROW = 2 };
+
+typedef struct {
+    const char **items;
+    size_t count;
+    size_t capacity;
+    const char **inline_items;
+} fqn_segment_vec_t;
+
+static void fqn_segment_vec_init(fqn_segment_vec_t *vec, const char **inline_items) {
+    vec->items = inline_items;
+    vec->count = 0;
+    vec->capacity = FQN_SEGMENT_INLINE_CAP;
+    vec->inline_items = inline_items;
+}
+
+static bool fqn_segment_vec_push(fqn_segment_vec_t *vec, const char *segment) {
+    if (vec->count == vec->capacity) {
+        if (vec->capacity > SIZE_MAX / FQN_SEGMENT_GROW) {
+            return false;
+        }
+        size_t new_capacity = vec->capacity * FQN_SEGMENT_GROW;
+        if (new_capacity > SIZE_MAX / sizeof(*vec->items)) {
+            return false;
+        }
+        const char **grown;
+        if (vec->items == vec->inline_items) {
+            grown = malloc(new_capacity * sizeof(*grown));
+            if (grown) {
+                memcpy(grown, vec->items, vec->count * sizeof(*grown));
+            }
+        } else {
+            grown = realloc(vec->items, new_capacity * sizeof(*grown));
+        }
+        if (!grown) {
+            return false;
+        }
+        vec->items = grown;
+        vec->capacity = new_capacity;
+    }
+    vec->items[vec->count++] = segment;
+    return true;
+}
+
+static void fqn_segment_vec_free(fqn_segment_vec_t *vec) {
+    if (vec->items != vec->inline_items) {
+        free(vec->items);
+    }
+}
+
 /* Build a dot-joined string from segments. Returns heap-allocated string. */
-static char *join_segments(const char **segments, int count) {
+static char *join_segments(const char **segments, size_t count) {
     if (count == 0) {
         return strdup("");
     }
     size_t total = 0;
-    for (int i = 0; i < count; i++) {
-        total += strlen(segments[i]);
-        if (i > 0) {
-            total++; /* dot separator */
+    for (size_t i = 0; i < count; i++) {
+        size_t separator = i > 0 ? SKIP_ONE : 0;
+        size_t length = strlen(segments[i]);
+        if (total > SIZE_MAX - separator || length > SIZE_MAX - total - separator) {
+            return NULL;
         }
+        total += separator + length;
+    }
+    if (total == SIZE_MAX) {
+        return NULL;
     }
     char *result = malloc(total + SKIP_ONE);
     if (!result) {
         return NULL;
     }
     char *p = result;
-    for (int i = 0; i < count; i++) {
+    for (size_t i = 0; i < count; i++) {
         if (i > 0) {
             *p++ = '.';
         }
@@ -73,39 +125,38 @@ static void strip_file_extension(char *path) {
     }
 }
 
-/* Tokenize path by '/' into segments array. Returns number of segments added. */
-static int tokenize_path(char *path, const char **segments, int max_segs) {
-    int count = 0;
+/* Tokenize every nonempty '/'-separated component into the growable vector. */
+static bool tokenize_path(char *path, fqn_segment_vec_t *segments) {
     if (path[0] == '\0') {
-        return 0;
+        return true;
     }
     char *tok = path;
-    while (tok && *tok && count < max_segs) {
+    while (tok && *tok) {
         char *slash = strchr(tok, '/');
         if (slash) {
             *slash = '\0';
         }
-        if (tok[0] != '\0') {
-            segments[count++] = tok;
+        if (tok[0] != '\0' && !fqn_segment_vec_push(segments, tok)) {
+            return false;
         }
         tok = slash ? slash + SKIP_ONE : NULL;
     }
-    return count;
+    return true;
 }
 
 /* Strip __init__ (Python) / index (JS/TS) from the last segment when a
  * symbol name is provided. Keeps it when no name is given to avoid QN
  * collision with Folder nodes for the same directory. */
-static void strip_init_or_index(const char **segments, int *seg_count, const char *name) {
-    if (*seg_count <= SKIP_ONE) {
+static void strip_init_or_index(fqn_segment_vec_t *segments, const char *name) {
+    if (segments->count <= SKIP_ONE) {
         return;
     }
-    const char *last = segments[*seg_count - SKIP_ONE];
+    const char *last = segments->items[segments->count - SKIP_ONE];
     if (strcmp(last, "__init__") != 0 && strcmp(last, "index") != 0) {
         return;
     }
     if (name && name[0] != '\0') {
-        (*seg_count)--;
+        segments->count--;
     }
 }
 
@@ -117,26 +168,30 @@ char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const 
     }
 
     char *path = strdup(rel_path ? rel_path : "");
+    if (!path) {
+        return NULL;
+    }
     cbm_normalize_path_sep(path);
     bool is_file_node = name && strcmp(name, FQN_FILE_NODE_NAME) == 0;
     if (!is_file_node) {
         strip_file_extension(path);
     }
 
-    const char *segments[CBM_SZ_256];
-    int seg_count = 0;
-    segments[seg_count++] = project;
-    seg_count += tokenize_path(path, segments + seg_count, FQN_MAX_PATH_SEGS);
+    const char *inline_segments[FQN_SEGMENT_INLINE_CAP];
+    fqn_segment_vec_t segments;
+    fqn_segment_vec_init(&segments, inline_segments);
+    bool complete = fqn_segment_vec_push(&segments, project) && tokenize_path(path, &segments);
 
-    if (!is_file_node) {
-        strip_init_or_index(segments, &seg_count, name);
+    if (complete && !is_file_node) {
+        strip_init_or_index(&segments, name);
     }
 
-    if (name && name[0] != '\0') {
-        segments[seg_count++] = name;
+    if (complete && name && name[0] != '\0') {
+        complete = fqn_segment_vec_push(&segments, name);
     }
 
-    char *result = join_segments(segments, seg_count);
+    char *result = complete ? join_segments(segments.items, segments.count) : NULL;
+    fqn_segment_vec_free(&segments);
     free(path);
     return result;
 }
@@ -354,29 +409,18 @@ char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir) {
         return strdup("");
     }
 
-    /* Work on mutable copy */
     char *dir = strdup(rel_dir ? rel_dir : "");
+    if (!dir) {
+        return NULL;
+    }
     cbm_normalize_path_sep(dir);
 
-    const char *segments[CBM_SZ_256];
-    int seg_count = 0;
-    segments[seg_count++] = project;
-
-    if (dir[0] != '\0') {
-        char *tok = dir;
-        while (tok && *tok && seg_count < FQN_MAX_DIR_SEGS) {
-            char *slash = strchr(tok, '/');
-            if (slash) {
-                *slash = '\0';
-            }
-            if (tok[0] != '\0') {
-                segments[seg_count++] = tok;
-            }
-            tok = slash ? slash + SKIP_ONE : NULL;
-        }
-    }
-
-    char *result = join_segments(segments, seg_count);
+    const char *inline_segments[FQN_SEGMENT_INLINE_CAP];
+    fqn_segment_vec_t segments;
+    fqn_segment_vec_init(&segments, inline_segments);
+    bool complete = fqn_segment_vec_push(&segments, project) && tokenize_path(dir, &segments);
+    char *result = complete ? join_segments(segments.items, segments.count) : NULL;
+    fqn_segment_vec_free(&segments);
     free(dir);
     return result;
 }
