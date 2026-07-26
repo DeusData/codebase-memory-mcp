@@ -2868,20 +2868,22 @@ int cbm_store_find_nodes_by_label_limited(cbm_store_t *s, const char *project, c
     return collect_nodes_from_stmt(s, stmt, "find_nodes_by_label_limited", out, count);
 }
 
-int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
-                                   cbm_store_node_identity_visitor_fn visitor, void *userdata) {
+static int visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
+                                cbm_store_node_identity_visitor_fn identity_visitor,
+                                cbm_store_node_ref_visitor_fn ref_visitor, void *userdata) {
     enum {
-        VISIT_NODE_LABEL_COL = 0,
+        VISIT_NODE_ID_COL = 0,
+        VISIT_NODE_LABEL_COL,
         VISIT_NODE_NAME_COL,
         VISIT_NODE_QN_COL,
         VISIT_NODE_FILE_PATH_COL,
     };
-    if (!s || !s->db || !project || !label || !visitor) {
+    if (!s || !s->db || !project || !label || (!identity_visitor && !ref_visitor)) {
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s->db,
-                                "SELECT label, name, qualified_name, file_path FROM nodes "
+                                "SELECT id, label, name, qualified_name, file_path FROM nodes "
                                 "WHERE project = ?1 AND label = ?2;",
                                 CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK || !stmt) {
@@ -2893,11 +2895,15 @@ int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const ch
     bind_text(stmt, SKIP_ONE, project);
     bind_text(stmt, ST_COL_2, label);
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int64_t row_id = sqlite3_column_int64(stmt, VISIT_NODE_ID_COL);
         const char *row_label = (const char *)sqlite3_column_text(stmt, VISIT_NODE_LABEL_COL);
         const char *row_name = (const char *)sqlite3_column_text(stmt, VISIT_NODE_NAME_COL);
         const char *row_qn = (const char *)sqlite3_column_text(stmt, VISIT_NODE_QN_COL);
         const char *row_path = (const char *)sqlite3_column_text(stmt, VISIT_NODE_FILE_PATH_COL);
-        if (visitor(row_label, row_name, row_qn, row_path, userdata) != CBM_STORE_OK) {
+        int visit_rc = ref_visitor
+                           ? ref_visitor(row_id, row_label, row_name, row_qn, row_path, userdata)
+                           : identity_visitor(row_label, row_name, row_qn, row_path, userdata);
+        if (visit_rc != CBM_STORE_OK) {
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
         }
@@ -2909,6 +2915,16 @@ int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const ch
     }
     sqlite3_finalize(stmt);
     return CBM_STORE_OK;
+}
+
+int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
+                                   cbm_store_node_identity_visitor_fn visitor, void *userdata) {
+    return visit_nodes_by_label(s, project, label, visitor, NULL, userdata);
+}
+
+int cbm_store_visit_node_refs_by_label(cbm_store_t *s, const char *project, const char *label,
+                                       cbm_store_node_ref_visitor_fn visitor, void *userdata) {
+    return visit_nodes_by_label(s, project, label, NULL, visitor, userdata);
 }
 
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,

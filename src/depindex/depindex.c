@@ -50,11 +50,6 @@ const char *const CBM_MANIFEST_FILES[] = {
     NULL
 };
 
-/* Upper bound for the one-shot project Variable/import-reference fetch used by
- * cbm_dep_link_cross_edges(). Dependency ranking below streams the full label
- * because a partial scan cannot identify the most-imported packages. */
-#define CBM_DEP_LINK_IMPORT_FETCH_LIMIT 500
-
 /* ── Package Manager Parse/String ──────────────────────────────── */
 
 cbm_pkg_manager_t cbm_parse_pkg_manager(const char *s) {
@@ -1014,24 +1009,48 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
  * convention. Dep linking is index-time, so a generous fetch is fine. */
 #define CBM_DEP_LINK_MODULE_FETCH 100000
 
+typedef struct {
+    cbm_store_t *store;
+    const char *project;
+    CBMHashTable *modules_by_name;
+    int linked;
+} cbm_dep_link_import_ctx_t;
+
+static int link_project_import(int64_t id, const char *label, const char *name,
+                               const char *qualified_name, const char *file_path, void *userdata) {
+    (void)label;
+    (void)qualified_name;
+    cbm_dep_link_import_ctx_t *ctx = userdata;
+    if (!ctx || !ctx->store || !ctx->project || !ctx->modules_by_name || !name || !name[0]) {
+        return CBM_STORE_OK;
+    }
+    void *hit = cbm_ht_get(ctx->modules_by_name, name);
+    if (!hit) {
+        return CBM_STORE_OK;
+    }
+    cbm_edge_t edge = {
+        .source_id = id,
+        .target_id = (int64_t)(intptr_t)hit,
+        .type = "IMPORTS",
+        .project = ctx->project,
+    };
+    int64_t edge_id = cbm_store_insert_edge(ctx->store, &edge);
+    if (edge_id <= 0) {
+        return CBM_STORE_OK;
+    }
+    ctx->linked++;
+    if (file_path && file_path[0] &&
+        cbm_store_upsert_edge_owner(ctx->store, ctx->project, edge_id, file_path, NULL,
+                                    CBM_PIPELINE_FILE_DELTA_GENERATION) != CBM_STORE_OK) {
+        cbm_log_warn("dep.cross_edges.owner", "project", ctx->project, "file", file_path);
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
     if (!store || !project_name || !project_name[0]) return 0;
 
-    /* Find all IMPORTS nodes in the main project */
-    cbm_search_params_t params = {0};
-    params.project = project_name;
-    params.project_exact = true;
-    params.label = "Variable";  /* import statements are typically Variable nodes */
-    params.limit = CBM_DEP_LINK_IMPORT_FETCH_LIMIT;
-
-    cbm_search_output_t out = {0};
-    int rc = cbm_store_search(store, &params, &out);
-    if (rc != 0 || out.count == 0) {
-        cbm_store_search_free(&out);
-        return 0;
-    }
-
-    /* Perf #8: was N+1 — one cbm_store_search PER import (up to 500) to find a
+    /* Perf #8: was N+1 — one cbm_store_search per import to find a
      * matching dep Module. Now ONE bulk fetch of all dep Module nodes + an
      * in-memory name→id hash, then O(1) per import. Behavior preserved: first
      * Module matching the name wins (hash set only if absent), matching the old
@@ -1059,44 +1078,26 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
         }
     }
 
-    int linked = 0;
-    for (int i = 0; i < out.count; i++) {
-        const char *import_name = out.results[i].node.name;
-        if (!import_name || !import_name[0]) continue;
-
-        void *hit = cbm_ht_get(mod_by_name, import_name);
-        if (!hit) continue;
-
-        cbm_edge_t edge = {
-            .source_id = out.results[i].node.id,
-            .target_id = (int64_t)(intptr_t)hit,
-            .type = "IMPORTS",
-            .project = project_name,
-        };
-        int64_t edge_id = cbm_store_insert_edge(store, &edge);
-        if (edge_id <= 0) {
-            continue;
-        }
-        linked++;
-        if (out.results[i].node.file_path && out.results[i].node.file_path[0] &&
-            cbm_store_upsert_edge_owner(store, project_name, edge_id,
-                                        out.results[i].node.file_path, NULL,
-                                        CBM_PIPELINE_FILE_DELTA_GENERATION) != CBM_STORE_OK) {
-            cbm_log_warn("dep.cross_edges.owner", "project", project_name, "file",
-                         out.results[i].node.file_path);
-        }
+    cbm_dep_link_import_ctx_t link_ctx = {
+        .store = store,
+        .project = project_name,
+        .modules_by_name = mod_by_name,
+    };
+    if (mod_by_name &&
+        cbm_store_visit_node_refs_by_label(store, project_name, "Variable", link_project_import,
+                                           &link_ctx) != CBM_STORE_OK) {
+        cbm_log_error("dep.cross_edges", "project", project_name, "phase", "visit_imports");
     }
 
     if (mod_by_name) cbm_ht_free(mod_by_name); /* keys borrowed from mod_out, not freed */
     cbm_store_search_free(&mod_out);
-    cbm_store_search_free(&out);
 
-    if (linked > 0) {
+    if (link_ctx.linked > 0) {
         char linked_str[16];
-        snprintf(linked_str, sizeof(linked_str), "%d", linked);
+        snprintf(linked_str, sizeof(linked_str), "%d", link_ctx.linked);
         cbm_log_info("dep.cross_edges", "project", project_name,
                      "linked", linked_str);
     }
 
-    return linked;
+    return link_ctx.linked;
 }

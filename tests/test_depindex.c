@@ -1297,6 +1297,38 @@ static void insert_import_reference(cbm_store_t *store, const char *project, con
     (void)cbm_store_upsert_node(store, &n);
 }
 
+TEST(test_cross_edges_link_imports_beyond_historical_fetch_cap) {
+    enum { IMPORT_COUNT = 501 };
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "dep-link-complete";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/dep-link-complete"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(store, "dep-link-complete.dep.requests", "/tmp/requests"),
+              CBM_STORE_OK);
+
+    cbm_node_t module = {.project = "dep-link-complete.dep.requests",
+                         .label = "Module",
+                         .name = "requests",
+                         .qualified_name = "dep-link-complete.dep.requests",
+                         .file_path = "__init__.py"};
+    ASSERT_GT(cbm_store_upsert_node(store, &module), 0);
+    for (int i = 0; i < IMPORT_COUNT; i++) {
+        insert_import_reference(store, project, "requests", i);
+    }
+
+    ASSERT_EQ(cbm_dep_link_cross_edges(store, project), IMPORT_COUNT);
+    ASSERT_EQ(cbm_store_count_edges_by_type(store, project, "IMPORTS"), IMPORT_COUNT);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(store, project, "app.py", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(edge_owners, IMPORT_COUNT);
+
+    cbm_store_close(store);
+    PASS();
+}
+
 TEST(test_discover_deps_ranks_by_import_usage) {
     char tmp[CBM_SZ_256];
     const char *names[] = {"pkg-a", "pkg-b", "pkg-c", "pkg-d", "pkg-e"};
@@ -1524,6 +1556,7 @@ SUITE(depindex) {
     RUN_TEST(test_snippet_has_source_origin_field);
     RUN_TEST(test_cross_edges_null_safety);
     RUN_TEST(test_cross_edges_record_file_owner);
+    RUN_TEST(test_cross_edges_link_imports_beyond_historical_fetch_cap);
     RUN_TEST(test_auto_index_deps_config_limit_policy);
 
     /* Usage-ranked dependency selection */
