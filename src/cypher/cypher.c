@@ -23,14 +23,15 @@ enum {
     CYP_TRIPLE = 3,
     CYP_INIT_CAP4 = 4,     /* initial small array capacity */
     CYP_INIT_CAP8 = 8,     /* initial medium array capacity */
-    CYP_MAX_VARS = 16,     /* max Cypher variables in a query */
-    CYP_MAX_EDGE_VARS = 8, /* max edge variables */
+    /* Keep common bindings allocation-free. Wider queries spill into geometric
+     * overflow storage instead of silently losing variables. */
+    CYP_INLINE_NODE_VARS = 16,
+    CYP_INLINE_EDGE_VARS = 8,
     CYP_GROWTH_10 = 10,    /* binding growth factor */
     CYP_CHAR_IDX1 = 1,     /* second character index (e.g. op[1]) */
     CYP_EBUF_MASK = 7,
     CYP_NODE_COLS = 4, /* columns per node var: name, qn, label, file */
     CYP_EDGE_COLS = 3, /* columns per edge var: name, qn, label */
-    CYP_COL_BUF = 48,  /* max column buffer (16 vars * 3 cols) */
     CYP_FOUND_NONE = -1,
     /* search miss sentinel */ /* mask for ebuf ring buffer (8 entries) */
 };
@@ -2280,16 +2281,35 @@ int cbm_cypher_parse(const char *query, cbm_query_t **out, char **error) {
  *  EXECUTOR
  * ══════════════════════════════════════════════════════════════════ */
 
-/* A binding: maps variable names to nodes and/or edges */
 typedef struct {
-    const char *var_names[CYP_MAX_VARS]; /* variable names (nodes) */
-    bool var_name_owned[CYP_MAX_VARS];   /* WITH aliases are heap-owned */
-    bool var_is_null[CYP_MAX_VARS];      /* projected null is distinct from an empty string */
-    cbm_node_t var_nodes[CYP_MAX_VARS];  /* node data */
+    const char *name;
+    bool name_owned;
+    bool is_null;
+    cbm_node_t node;
+} binding_node_overflow_t;
+
+typedef struct {
+    const char *name;
+    cbm_edge_t edge;
+} binding_edge_overflow_t;
+
+/* A binding maps variable names to nodes and/or edges. The inline arrays keep
+ * ordinary queries allocation-free; geometric overflow makes query width an
+ * O(V + E) storage concern rather than a correctness cap. */
+typedef struct {
+    const char *var_names[CYP_INLINE_NODE_VARS]; /* variable names (nodes) */
+    bool var_name_owned[CYP_INLINE_NODE_VARS];   /* WITH aliases are heap-owned */
+    bool var_is_null[CYP_INLINE_NODE_VARS]; /* projected null differs from an empty string */
+    cbm_node_t var_nodes[CYP_INLINE_NODE_VARS]; /* node data */
+    binding_node_overflow_t *var_overflow;
+    int var_overflow_capacity;
     int var_count;
-    const char *edge_var_names[CYP_MAX_EDGE_VARS]; /* variable names (edges) */
-    cbm_edge_t edge_vars[CYP_MAX_EDGE_VARS];       /* edge data */
+    const char *edge_var_names[CYP_INLINE_EDGE_VARS]; /* variable names (edges) */
+    cbm_edge_t edge_vars[CYP_INLINE_EDGE_VARS];       /* edge data */
+    binding_edge_overflow_t *edge_overflow;
+    int edge_overflow_capacity;
     int edge_var_count;
+    bool allocation_failed;
     cbm_store_t *store; /* for computing in_degree/out_degree on demand */
     const char *project; /* borrowed project filter for active overlay qn-keyed lookups */
     bool use_active_overlay_edges;
@@ -2300,6 +2320,138 @@ static void binding_free(binding_t *b);
 /* Per-execution state: query execution is re-entrant across server threads,
  * while a ceiling hit must never be reported by another request. */
 static _Thread_local int g_cypher_working_row_limit_hit = 0;
+static _Thread_local bool g_cypher_allocation_failed = false;
+
+static int binding_overflow_capacity(int current, int needed) {
+    int next = current > 0 ? current : CYP_INIT_CAP8;
+    while (next < needed) {
+        if (next > INT_MAX / PAIR_LEN) {
+            return needed;
+        }
+        next *= PAIR_LEN;
+    }
+    return next;
+}
+
+static bool binding_reserve_node_index(binding_t *b, int index) {
+    if (index < CYP_INLINE_NODE_VARS) {
+        return true;
+    }
+    int needed = index - CYP_INLINE_NODE_VARS + SKIP_ONE;
+    if (needed <= b->var_overflow_capacity) {
+        return true;
+    }
+    int next = binding_overflow_capacity(b->var_overflow_capacity, needed);
+    if ((size_t)next > SIZE_MAX / sizeof(*b->var_overflow)) {
+        b->allocation_failed = true;
+        return false;
+    }
+    void *grown = realloc(b->var_overflow, (size_t)next * sizeof(*b->var_overflow));
+    if (!grown) {
+        b->allocation_failed = true;
+        return false;
+    }
+    b->var_overflow = grown;
+    memset(&b->var_overflow[b->var_overflow_capacity], 0,
+           (size_t)(next - b->var_overflow_capacity) * sizeof(*b->var_overflow));
+    b->var_overflow_capacity = next;
+    return true;
+}
+
+static bool binding_reserve_edge_index(binding_t *b, int index) {
+    if (index < CYP_INLINE_EDGE_VARS) {
+        return true;
+    }
+    int needed = index - CYP_INLINE_EDGE_VARS + SKIP_ONE;
+    if (needed <= b->edge_overflow_capacity) {
+        return true;
+    }
+    int next = binding_overflow_capacity(b->edge_overflow_capacity, needed);
+    if ((size_t)next > SIZE_MAX / sizeof(*b->edge_overflow)) {
+        b->allocation_failed = true;
+        return false;
+    }
+    void *grown = realloc(b->edge_overflow, (size_t)next * sizeof(*b->edge_overflow));
+    if (!grown) {
+        b->allocation_failed = true;
+        return false;
+    }
+    b->edge_overflow = grown;
+    memset(&b->edge_overflow[b->edge_overflow_capacity], 0,
+           (size_t)(next - b->edge_overflow_capacity) * sizeof(*b->edge_overflow));
+    b->edge_overflow_capacity = next;
+    return true;
+}
+
+static const char *binding_node_name_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_NODE_VARS
+               ? b->var_names[index]
+               : b->var_overflow[index - CYP_INLINE_NODE_VARS].name;
+}
+
+static bool binding_node_name_owned_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_NODE_VARS
+               ? b->var_name_owned[index]
+               : b->var_overflow[index - CYP_INLINE_NODE_VARS].name_owned;
+}
+
+static bool binding_node_is_null_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_NODE_VARS
+               ? b->var_is_null[index]
+               : b->var_overflow[index - CYP_INLINE_NODE_VARS].is_null;
+}
+
+static cbm_node_t *binding_node_at(binding_t *b, int index) {
+    return index < CYP_INLINE_NODE_VARS
+               ? &b->var_nodes[index]
+               : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
+}
+
+static const cbm_node_t *binding_const_node_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_NODE_VARS
+               ? &b->var_nodes[index]
+               : &b->var_overflow[index - CYP_INLINE_NODE_VARS].node;
+}
+
+static const char *binding_edge_name_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_EDGE_VARS
+               ? b->edge_var_names[index]
+               : b->edge_overflow[index - CYP_INLINE_EDGE_VARS].name;
+}
+
+static cbm_edge_t *binding_edge_at(binding_t *b, int index) {
+    return index < CYP_INLINE_EDGE_VARS
+               ? &b->edge_vars[index]
+               : &b->edge_overflow[index - CYP_INLINE_EDGE_VARS].edge;
+}
+
+static const cbm_edge_t *binding_const_edge_at(const binding_t *b, int index) {
+    return index < CYP_INLINE_EDGE_VARS
+               ? &b->edge_vars[index]
+               : &b->edge_overflow[index - CYP_INLINE_EDGE_VARS].edge;
+}
+
+static void binding_set_node_metadata(binding_t *b, int index, const char *name, bool name_owned,
+                                      bool is_null) {
+    if (index < CYP_INLINE_NODE_VARS) {
+        b->var_names[index] = name;
+        b->var_name_owned[index] = name_owned;
+        b->var_is_null[index] = is_null;
+        return;
+    }
+    binding_node_overflow_t *slot = &b->var_overflow[index - CYP_INLINE_NODE_VARS];
+    slot->name = name;
+    slot->name_owned = name_owned;
+    slot->is_null = is_null;
+}
+
+static void binding_set_edge_name(binding_t *b, int index, const char *name) {
+    if (index < CYP_INLINE_EDGE_VARS) {
+        b->edge_var_names[index] = name;
+    } else {
+        b->edge_overflow[index - CYP_INLINE_EDGE_VARS].name = name;
+    }
+}
 
 /* Grow an owning binding array without losing the existing rows on OOM.
  * The caller retains and frees the old allocation when growth fails. */
@@ -2316,6 +2468,7 @@ static bool binding_array_reserve(binding_t **rows, int *capacity, int needed, i
     }
     void *grown = realloc(*rows, (size_t)next * sizeof(**rows));
     if (!grown) {
+        g_cypher_allocation_failed = true;
         return false;
     }
     *rows = grown;
@@ -2327,6 +2480,11 @@ static bool binding_array_reserve(binding_t **rows, int *capacity, int needed, i
  * release the row here so every caller has the same ownership contract. */
 static bool binding_array_append(binding_t **rows, int *count, int *capacity, int limit,
                                  binding_t *row) {
+    if (row->allocation_failed) {
+        g_cypher_allocation_failed = true;
+        binding_free(row);
+        return false;
+    }
     if (*count >= limit) {
         g_cypher_working_row_limit_hit = limit;
         binding_free(row);
@@ -2578,8 +2736,8 @@ static const char *edge_prop(const cbm_edge_t *e, const char *prop) {
 /* Find an edge variable in a binding */
 static cbm_edge_t *binding_get_edge(binding_t *b, const char *var) {
     for (int i = 0; i < b->edge_var_count; i++) {
-        if (strcmp(b->edge_var_names[i], var) == 0) {
-            return &b->edge_vars[i];
+        if (strcmp(binding_edge_name_at(b, i), var) == 0) {
+            return binding_edge_at(b, i);
         }
     }
     return NULL;
@@ -2588,22 +2746,37 @@ static cbm_edge_t *binding_get_edge(binding_t *b, const char *var) {
 /* Find a variable's node in a binding */
 static cbm_node_t *binding_get(binding_t *b, const char *var) {
     for (int i = 0; i < b->var_count; i++) {
-        if (strcmp(b->var_names[i], var) == 0) {
-            return &b->var_nodes[i];
+        if (strcmp(binding_node_name_at(b, i), var) == 0) {
+            return binding_node_at(b, i);
         }
     }
     return NULL;
 }
 
 /* Deep copy a node: heap-dup all string fields so the binding owns them */
-static void node_deep_copy(cbm_node_t *dst, const cbm_node_t *src) {
+static bool node_deep_copy(cbm_node_t *dst, const cbm_node_t *src) {
     *dst = *src;
+    dst->project = NULL;
+    dst->label = NULL;
+    dst->name = NULL;
+    dst->qualified_name = NULL;
+    dst->file_path = NULL;
+    dst->properties_json = NULL;
     dst->project = heap_strdup(src->project);
     dst->label = heap_strdup(src->label);
     dst->name = heap_strdup(src->name);
     dst->qualified_name = heap_strdup(src->qualified_name);
     dst->file_path = heap_strdup(src->file_path);
     dst->properties_json = heap_strdup(src->properties_json);
+    if ((src->project && !dst->project) || (src->label && !dst->label) ||
+        (src->name && !dst->name) || (src->qualified_name && !dst->qualified_name) ||
+        (src->file_path && !dst->file_path) ||
+        (src->properties_json && !dst->properties_json)) {
+        node_fields_free(dst);
+        memset(dst, 0, sizeof(*dst));
+        return false;
+    }
+    return true;
 }
 
 static void node_fields_free(cbm_node_t *n) {
@@ -2619,11 +2792,23 @@ static void node_fields_free(cbm_node_t *n) {
 }
 
 /* Deep copy an edge (binding owns the strings) */
-static void edge_deep_copy(cbm_edge_t *dst, const cbm_edge_t *src) {
+static void edge_fields_free(cbm_edge_t *e);
+
+static bool edge_deep_copy(cbm_edge_t *dst, const cbm_edge_t *src) {
     *dst = *src;
+    dst->project = NULL;
+    dst->type = NULL;
+    dst->properties_json = NULL;
     dst->project = heap_strdup(src->project);
     dst->type = heap_strdup(src->type);
     dst->properties_json = heap_strdup(src->properties_json);
+    if ((src->project && !dst->project) || (src->type && !dst->type) ||
+        (src->properties_json && !dst->properties_json)) {
+        edge_fields_free(dst);
+        memset(dst, 0, sizeof(*dst));
+        return false;
+    }
+    return true;
 }
 
 static void edge_fields_free(cbm_edge_t *e) {
@@ -2634,75 +2819,113 @@ static void edge_fields_free(cbm_edge_t *e) {
 
 /* Set an edge variable in a binding */
 static void binding_set_edge(binding_t *b, const char *var, const cbm_edge_t *edge) {
-    /* Check existing — free old fields first */
+    /* Build replacements before releasing existing storage so OOM cannot
+     * corrupt a binding that remains reachable during unwinding. */
     for (int i = 0; i < b->edge_var_count; i++) {
-        if (strcmp(b->edge_var_names[i], var) == 0) {
-            edge_fields_free(&b->edge_vars[i]);
-            edge_deep_copy(&b->edge_vars[i], edge);
+        if (strcmp(binding_edge_name_at(b, i), var) == 0) {
+            cbm_edge_t replacement = {0};
+            if (!edge_deep_copy(&replacement, edge)) {
+                b->allocation_failed = true;
+                return;
+            }
+            cbm_edge_t *slot = binding_edge_at(b, i);
+            edge_fields_free(slot);
+            *slot = replacement;
             return;
         }
     }
-    if (b->edge_var_count >= CYP_MAX_EDGE_VARS) {
+    int index = b->edge_var_count;
+    if (!binding_reserve_edge_index(b, index)) {
         return;
     }
-    b->edge_var_names[b->edge_var_count] = var; /* not owned — points to AST string */
-    edge_deep_copy(&b->edge_vars[b->edge_var_count], edge);
+    cbm_edge_t *slot = binding_edge_at(b, index);
+    if (!edge_deep_copy(slot, edge)) {
+        b->allocation_failed = true;
+        return;
+    }
+    binding_set_edge_name(b, index, var); /* borrowed from the AST */
     b->edge_var_count++;
 }
 
 /* Free all deep-copied nodes and edges in a binding */
 static void binding_free(binding_t *b) {
     for (int i = 0; i < b->var_count; i++) {
-        node_fields_free(&b->var_nodes[i]);
-        if (b->var_name_owned[i]) {
-            free((void *)b->var_names[i]);
-            b->var_names[i] = NULL;
-            b->var_name_owned[i] = false;
+        node_fields_free(binding_node_at(b, i));
+        if (binding_node_name_owned_at(b, i)) {
+            free((void *)binding_node_name_at(b, i));
         }
     }
     for (int i = 0; i < b->edge_var_count; i++) {
-        edge_fields_free(&b->edge_vars[i]);
+        edge_fields_free(binding_edge_at(b, i));
     }
+    free(b->var_overflow);
+    free(b->edge_overflow);
+    memset(b, 0, sizeof(*b));
 }
 
 /* Deep-copy a binding (so source and dest own separate string copies) */
 static void binding_copy(binding_t *dst, const binding_t *src) {
-    dst->var_count = src->var_count;
-    for (int i = 0; i < src->var_count; i++) {
-        node_deep_copy(&dst->var_nodes[i], &src->var_nodes[i]);
-        dst->var_name_owned[i] = src->var_name_owned[i];
-        dst->var_is_null[i] = src->var_is_null[i];
-        dst->var_names[i] = src->var_name_owned[i] ? heap_strdup(src->var_names[i])
-                                                   : src->var_names[i];
-    }
-    dst->edge_var_count = src->edge_var_count;
-    for (int i = 0; i < src->edge_var_count; i++) {
-        dst->edge_var_names[i] = src->edge_var_names[i]; /* AST-owned */
-        edge_deep_copy(&dst->edge_vars[i], &src->edge_vars[i]);
-    }
+    memset(dst, 0, sizeof(*dst));
     dst->store = src->store;
     dst->project = src->project;
     dst->use_active_overlay_edges = src->use_active_overlay_edges;
+    if (src->allocation_failed) {
+        dst->allocation_failed = true;
+        return;
+    }
+    for (int i = 0; i < src->var_count; i++) {
+        if (!binding_reserve_node_index(dst, i)) {
+            return;
+        }
+        const char *src_name = binding_node_name_at(src, i);
+        bool owned = binding_node_name_owned_at(src, i);
+        const char *dst_name = owned ? heap_strdup(src_name) : src_name;
+        if ((owned && src_name && !dst_name) ||
+            !node_deep_copy(binding_node_at(dst, i), binding_const_node_at(src, i))) {
+            free(owned ? (void *)dst_name : NULL);
+            dst->allocation_failed = true;
+            return;
+        }
+        binding_set_node_metadata(dst, i, dst_name, owned, binding_node_is_null_at(src, i));
+        dst->var_count++;
+    }
+    for (int i = 0; i < src->edge_var_count; i++) {
+        if (!binding_reserve_edge_index(dst, i) ||
+            !edge_deep_copy(binding_edge_at(dst, i), binding_const_edge_at(src, i))) {
+            dst->allocation_failed = true;
+            return;
+        }
+        binding_set_edge_name(dst, i, binding_edge_name_at(src, i)); /* AST-owned */
+        dst->edge_var_count++;
+    }
 }
 
 /* Deep-copy a node into a binding (binding owns the strings) */
 static void binding_set(binding_t *b, const char *var, const cbm_node_t *node) {
-    /* Check existing — free old fields first */
     for (int i = 0; i < b->var_count; i++) {
-        if (strcmp(b->var_names[i], var) == 0) {
-            node_fields_free(&b->var_nodes[i]);
-            node_deep_copy(&b->var_nodes[i], node);
-            b->var_is_null[i] = false;
+        if (strcmp(binding_node_name_at(b, i), var) == 0) {
+            cbm_node_t replacement = {0};
+            if (!node_deep_copy(&replacement, node)) {
+                b->allocation_failed = true;
+                return;
+            }
+            cbm_node_t *slot = binding_node_at(b, i);
+            node_fields_free(slot);
+            *slot = replacement;
+            binding_set_node_metadata(b, i, binding_node_name_at(b, i),
+                                      binding_node_name_owned_at(b, i), false);
             return;
         }
     }
-    if (b->var_count >= CYP_MAX_VARS) {
+    int index = b->var_count;
+    if (!binding_reserve_node_index(b, index)) {
         return;
     }
-    b->var_names[b->var_count] = var; /* not owned — points to AST string */
-    b->var_name_owned[b->var_count] = false;
-    b->var_is_null[b->var_count] = false;
-    node_deep_copy(&b->var_nodes[b->var_count], node);
+    if (!node_deep_copy(binding_node_at(b, index), node)) {
+        b->allocation_failed = true;
+        return;
+    }
+    binding_set_node_metadata(b, index, var, false, false); /* borrowed from the AST */
     b->var_count++;
 }
 
@@ -3077,25 +3300,66 @@ static void rb_init(result_builder_t *rb) {
     memset(rb, 0, sizeof(*rb));
     rb->row_cap = CBM_SZ_32;
     rb->rows = malloc(rb->row_cap * sizeof(const char **));
+    if (!rb->rows) {
+        rb->row_cap = 0;
+        g_cypher_allocation_failed = true;
+    }
 }
 
 static void rb_set_columns(result_builder_t *rb, const char **cols, int count) {
     rb->columns = malloc((count > 0 ? (size_t)count : SKIP_ONE) * sizeof(const char *));
+    if (!rb->columns) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    memset(rb->columns, 0, (count > 0 ? (size_t)count : SKIP_ONE) * sizeof(const char *));
     for (int i = 0; i < count; i++) {
         rb->columns[i] = heap_strdup(cols[i]);
+        if (cols[i] && !rb->columns[i]) {
+            for (int j = 0; j < i; j++) {
+                safe_str_free(&rb->columns[j]);
+            }
+            free(rb->columns);
+            rb->columns = NULL;
+            g_cypher_allocation_failed = true;
+            return;
+        }
     }
     rb->col_count = count;
 }
 
 static void rb_add_row(result_builder_t *rb, const char **values) {
+    if (g_cypher_allocation_failed) {
+        return;
+    }
     if (rb->row_count >= rb->row_cap) {
-        rb->row_cap *= PAIR_LEN;
-        rb->rows = safe_realloc(rb->rows, rb->row_cap * sizeof(const char **));
+        int next = rb->row_cap > 0 ? rb->row_cap * PAIR_LEN : CBM_SZ_32;
+        void *grown = realloc(rb->rows, (size_t)next * sizeof(const char **));
+        if (!grown) {
+            g_cypher_allocation_failed = true;
+            return;
+        }
+        rb->rows = grown;
+        rb->row_cap = next;
     }
     const char **row =
         malloc((rb->col_count > 0 ? (size_t)rb->col_count : SKIP_ONE) * sizeof(const char *));
+    if (!row) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    memset(row, 0,
+           (rb->col_count > 0 ? (size_t)rb->col_count : SKIP_ONE) * sizeof(const char *));
     for (int i = 0; i < rb->col_count; i++) {
         row[i] = values[i] ? heap_strdup(values[i]) : heap_strdup("");
+        if (!row[i]) {
+            for (int j = 0; j < i; j++) {
+                safe_str_free(&row[j]);
+            }
+            free(row);
+            g_cypher_allocation_failed = true;
+            return;
+        }
     }
     rb->rows[rb->row_count++] = row;
 }
@@ -3223,9 +3487,10 @@ static const char *binding_get_virtual_ex(binding_t *b, const char *var, const c
         snprintf(full, sizeof(full), "%s", var);
     }
     for (int i = 0; i < b->var_count; i++) {
-        if (strcmp(b->var_names[i], full) == 0) {
-            *is_null = b->var_is_null[i];
-            return b->var_nodes[i].name ? b->var_nodes[i].name : "";
+        if (strcmp(binding_node_name_at(b, i), full) == 0) {
+            const cbm_node_t *node = binding_const_node_at(b, i);
+            *is_null = binding_node_is_null_at(b, i);
+            return node->name ? node->name : "";
         }
     }
     /* Fall through to normal lookup */
@@ -3890,6 +4155,7 @@ static void expand_pattern_rels(cbm_store_t *store, cbm_pattern_t *pat, binding_
         }
         binding_t *new_bindings = malloc((size_t)new_capacity * sizeof(binding_t));
         if (!new_bindings) {
+            g_cypher_allocation_failed = true;
             return;
         }
         int new_count = 0;
@@ -4670,14 +4936,21 @@ static void with_agg_format(const char *func, with_agg_t *agg, int ci, char *buf
 
 /* Add a virtual variable binding for one WITH item */
 static void with_add_vbinding_var(binding_t *vb, const char *alias, const char *val, bool is_null) {
-    if (vb->var_count >= CYP_MAX_VARS) {
+    int index = vb->var_count;
+    if (!binding_reserve_node_index(vb, index)) {
         return;
     }
-    int index = vb->var_count++;
-    vb->var_names[index] = heap_strdup(alias);
-    vb->var_name_owned[index] = true;
-    vb->var_is_null[index] = is_null;
-    vb->var_nodes[index].name = heap_strdup(val);
+    char *owned_alias = heap_strdup(alias);
+    char *owned_value = heap_strdup(val);
+    if ((alias && !owned_alias) || (val && !owned_value)) {
+        free(owned_alias);
+        free(owned_value);
+        vb->allocation_failed = true;
+        return;
+    }
+    binding_set_node_metadata(vb, index, owned_alias, true, is_null);
+    binding_node_at(vb, index)->name = owned_value;
+    vb->var_count++;
 }
 
 /* Free with_agg_t array */
@@ -4722,8 +4995,9 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
         with_agg_accumulate(&aggs[found], wc, &bindings[bi]);
     }
 
-    *vbindings = safe_realloc(*vbindings, (agg_cnt + SKIP_ONE) * sizeof(binding_t));
+    *vbindings = safe_realloc(*vbindings, (size_t)(agg_cnt + SKIP_ONE) * sizeof(binding_t));
     if (!*vbindings) {
+        g_cypher_allocation_failed = true;
         aggregate_group_index_free(&group_index);
         with_agg_free(aggs, agg_cnt, wc->count);
         return;
@@ -4757,9 +5031,15 @@ static void execute_with_aggregate(cbm_return_clause_t *wc, binding_t *bindings,
                 /* Tag the carried virtual var with the node id (when the group
                  * var is a node) so node_prop can re-fetch its full properties. */
                 if (aggs[a].group_node_ids[ci] > 0 && vb.var_count > 0) {
-                    vb.var_nodes[vb.var_count - 1].id = aggs[a].group_node_ids[ci];
+                    binding_node_at(&vb, vb.var_count - SKIP_ONE)->id =
+                        aggs[a].group_node_ids[ci];
                 }
             }
+        }
+        if (vb.allocation_failed) {
+            g_cypher_allocation_failed = true;
+            binding_free(&vb);
+            break;
         }
         (*vbindings)[(*vcount)++] = vb;
     }
@@ -4793,9 +5073,14 @@ static void execute_with_simple(cbm_return_clause_t *wc, binding_t *bindings, in
             if (!wc->items[ci].func && !wc->items[ci].property && vb.var_count > 0) {
                 cbm_node_t *carried = binding_get(&bindings[bi], wc->items[ci].variable);
                 if (carried) {
-                    vb.var_nodes[vb.var_count - SKIP_ONE].id = carried->id;
+                    binding_node_at(&vb, vb.var_count - SKIP_ONE)->id = carried->id;
                 }
             }
+        }
+        if (vb.allocation_failed) {
+            g_cypher_allocation_failed = true;
+            binding_free(&vb);
+            break;
         }
         vbindings[(*vcount)++] = vb;
     }
@@ -4875,6 +5160,16 @@ static void execute_with_clause(cbm_query_t *q, binding_t **bindings_ptr, int *b
 
     binding_t *vbindings = malloc((bind_count + SKIP_ONE) * sizeof(binding_t));
     int vcount = 0;
+    if (!vbindings) {
+        g_cypher_allocation_failed = true;
+        for (int bi = 0; bi < bind_count; bi++) {
+            binding_free(&bindings[bi]);
+        }
+        free(bindings);
+        *bindings_ptr = NULL;
+        *bind_count_ptr = 0;
+        return;
+    }
 
     bool has_agg = false;
     for (int i = 0; i < wc->count; i++) {
@@ -5283,8 +5578,17 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
 
 /* Build default 3-column headers (name, qualified_name, label) per variable */
 static void build_default_columns(result_builder_t *rb, const char **vars, int vc) {
+    if (vc > INT_MAX / CYP_EDGE_COLS) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
     int col_n = vc * CYP_EDGE_COLS;
-    const char *col_names[CYP_COL_BUF];
+    const char **col_names =
+        calloc(col_n > 0 ? (size_t)col_n : SKIP_ONE, sizeof(*col_names));
+    if (!col_names) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
     for (int v = 0; v < vc; v++) {
         char buf[CBM_SZ_128];
         snprintf(buf, sizeof(buf), "%s.name", vars[v]);
@@ -5293,29 +5597,59 @@ static void build_default_columns(result_builder_t *rb, const char **vars, int v
         col_names[((size_t)v * CYP_EDGE_COLS) + SKIP_ONE] = heap_strdup(buf);
         snprintf(buf, sizeof(buf), "%s.label", vars[v]);
         col_names[((size_t)v * CYP_EDGE_COLS) + PAIR_LEN] = heap_strdup(buf);
+        size_t base = (size_t)v * CYP_EDGE_COLS;
+        if (!col_names[base] || !col_names[base + SKIP_ONE] ||
+            !col_names[base + PAIR_LEN]) {
+            g_cypher_allocation_failed = true;
+            break;
+        }
     }
-    rb_set_columns(rb, col_names, col_n);
+    if (!g_cypher_allocation_failed) {
+        rb_set_columns(rb, col_names, col_n);
+    }
     for (int i = 0; i < col_n; i++) {
         safe_str_free(&col_names[i]);
     }
+    free(col_names);
 }
 
 /* Default projection when no RETURN clause */
 static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings, int bind_count,
                                        int max_rows, result_builder_t *rb) {
-    const char *vars[CYP_MAX_VARS];
     int vc = 0;
-    for (int ni = 0; ni < pat0->node_count && vc < CYP_MAX_VARS; ni++) {
+    for (int ni = 0; ni < pat0->node_count; ni++) {
         if (pat0->nodes[ni].variable) {
-            vars[vc++] = pat0->nodes[ni].variable;
+            vc++;
+        }
+    }
+    if (vc > INT_MAX / CYP_EDGE_COLS) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    const char **vars = malloc((vc > 0 ? (size_t)vc : SKIP_ONE) * sizeof(*vars));
+    if (!vars) {
+        g_cypher_allocation_failed = true;
+        return;
+    }
+    int vi = 0;
+    for (int ni = 0; ni < pat0->node_count; ni++) {
+        if (pat0->nodes[ni].variable) {
+            vars[vi++] = pat0->nodes[ni].variable;
         }
     }
     build_default_columns(rb, vars, vc);
+    int col_n = vc * CYP_EDGE_COLS;
+    const char **vals = malloc((col_n > 0 ? (size_t)col_n : SKIP_ONE) * sizeof(*vals));
+    if (!vals) {
+        free(vars);
+        g_cypher_allocation_failed = true;
+        return;
+    }
     if (bind_count > max_rows) {
         rb->truncated = true;
     }
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
-        const char *vals[CYP_COL_BUF];
+    for (int bi = 0;
+         bi < bind_count && rb->row_count < max_rows && !g_cypher_allocation_failed; bi++) {
         for (int v = 0; v < vc; v++) {
             cbm_node_t *n = binding_get(&bindings[bi], vars[v]);
             vals[(size_t)v * CYP_EDGE_COLS] = n && n->name ? n->name : "";
@@ -5325,6 +5659,8 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
         }
         rb_add_row(rb, vals);
     }
+    free(vals);
+    free(vars);
 }
 
 /* Cross-join node-only pattern into existing bindings */
@@ -5340,6 +5676,7 @@ static void cross_join_nodes(binding_t **bindings, int *bind_count, cbm_node_t *
     }
     binding_t *new_bindings = malloc((size_t)new_cap * sizeof(binding_t));
     if (!new_bindings) {
+        g_cypher_allocation_failed = true;
         return;
     }
     int new_count = 0;
@@ -5386,6 +5723,7 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
     }
     binding_t *new_bindings = malloc((size_t)new_capacity * sizeof(binding_t));
     if (!new_bindings) {
+        g_cypher_allocation_failed = true;
         return;
     }
     int new_count = 0;
@@ -5394,8 +5732,14 @@ static void cross_join_with_rels(cbm_store_t *store, cbm_pattern_t *patn, bindin
             binding_t nb = {0};
             binding_copy(&nb, &(*bindings)[bi]);
             binding_set(&nb, nvar, &extra_nodes[ni]);
+            if (nb.allocation_failed) {
+                g_cypher_allocation_failed = true;
+                binding_free(&nb);
+                goto cross_join_rels_done;
+            }
             binding_t *tmp = malloc(sizeof(binding_t));
             if (!tmp) {
+                g_cypher_allocation_failed = true;
                 binding_free(&nb);
                 goto cross_join_rels_done;
             }
@@ -5460,6 +5804,7 @@ static void expand_from_bound_terminal(cbm_store_t *store, cbm_pattern_t *patn,
     }
     binding_t *new_bindings = malloc((size_t)new_capacity * sizeof(binding_t));
     if (!new_bindings) {
+        g_cypher_allocation_failed = true;
         return;
     }
     int new_count = 0;
@@ -5783,6 +6128,11 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
     binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
     int bind_count = 0;
+    if (!bindings) {
+        g_cypher_allocation_failed = true;
+        cbm_store_free_nodes(scanned, scan_count);
+        return 0;
+    }
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
             break;
@@ -5792,6 +6142,11 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         b.project = project;
         b.use_active_overlay_edges = scan_mode == CYP_NODE_SCAN_ACTIVE_OVERLAY;
         binding_set(&b, var_name, &scanned[i]);
+        if (b.allocation_failed) {
+            g_cypher_allocation_failed = true;
+            binding_free(&b);
+            break;
+        }
         bool pass = eval_where_partial(q->where, &b) != CYP_PARTIAL_FALSE;
         if (pass) {
             bindings[bind_count++] = b;
@@ -5803,7 +6158,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     /* OPTIONAL MATCH over an empty or fully predicate-rejected initial scan
      * still produces one null-extended row. Keep graph/project context on the
      * synthetic binding so later stages use the same store and overlay mode. */
-    if (q->pattern_optional[0] && bind_count == 0) {
+    if (!g_cypher_allocation_failed && q->pattern_optional[0] && bind_count == 0) {
         binding_t b = {0};
         b.store = store;
         b.project = project;
@@ -5928,6 +6283,7 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
     }
     g_cypher_depth_clamped = 0;
     g_cypher_working_row_limit_hit = 0;
+    g_cypher_allocation_failed = false;
     cypher_deadline_arm();
     int max_rows = limits ? limits->max_output_rows : 0;
     int max_working_rows = limits ? limits->max_working_rows : 0;
@@ -6019,6 +6375,14 @@ static int cbm_cypher_execute_impl(cbm_store_t *store, const char *query, const 
             heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
                         "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
                         "add LIMIT");
+        return CBM_NOT_FOUND;
+    }
+
+    if (g_cypher_allocation_failed) {
+        rb_free(&rb);
+        cbm_query_free(q);
+        out->error =
+            heap_strdup("query could not allocate memory while building bindings or results");
         return CBM_NOT_FOUND;
     }
 
