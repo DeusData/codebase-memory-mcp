@@ -8371,6 +8371,200 @@ TEST(k8s_extract_manifest_multidoc) {
     PASS();
 }
 
+static void k8s_selector_test_ctx(cbm_pipeline_ctx_t *ctx, cbm_gbuf_t *gbuf,
+                                  atomic_int *cancelled, const char *repo_path) {
+    atomic_init(cancelled, 0);
+    *ctx = (cbm_pipeline_ctx_t){.project_name = "k8s-selector-test",
+                                .repo_path = repo_path,
+                                .gbuf = gbuf,
+                                .cancelled = cancelled,
+                                .mode = CBM_MODE_FAST};
+}
+
+TEST(k8s_selector_links_manifests_after_former_record_limit) {
+    enum {
+        K8S_TEST_FORMER_RECORD_LIMIT = CBM_SZ_512,
+        K8S_TEST_FILE_COUNT = K8S_TEST_FORMER_RECORD_LIMIT + CBM_SZ_2
+    };
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_k8s_records_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char filler_path[CBM_SZ_512];
+    char service_path[CBM_SZ_512];
+    char workload_path[CBM_SZ_512];
+    snprintf(filler_path, sizeof(filler_path), "%s/filler.yaml", tmp);
+    snprintf(service_path, sizeof(service_path), "%s/service.yaml", tmp);
+    snprintf(workload_path, sizeof(workload_path), "%s/workload.yaml", tmp);
+    ASSERT_EQ(th_write_file(filler_path,
+                            "apiVersion: apps/v1\n"
+                            "kind: Deployment\n"
+                            "metadata:\n"
+                            "  name: filler\n"
+                            "spec:\n"
+                            "  template:\n"
+                            "    metadata:\n"
+                            "      labels:\n"
+                            "        app: filler\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "apiVersion: v1\n"
+                            "kind: Service\n"
+                            "metadata:\n"
+                            "  name: after-former-limit\n"
+                            "spec:\n"
+                            "  selector:\n"
+                            "    app: after-former-limit\n"),
+              0);
+    ASSERT_EQ(th_write_file(workload_path,
+                            "apiVersion: apps/v1\n"
+                            "kind: Deployment\n"
+                            "metadata:\n"
+                            "  name: after-former-limit\n"
+                            "spec:\n"
+                            "  template:\n"
+                            "    metadata:\n"
+                            "      labels:\n"
+                            "        app: after-former-limit\n"),
+              0);
+
+    cbm_file_info_t *files = calloc(K8S_TEST_FILE_COUNT, sizeof(*files));
+    char(*rel_paths)[CBM_SZ_64] = calloc(K8S_TEST_FILE_COUNT, sizeof(*rel_paths));
+    ASSERT_NOT_NULL(files);
+    ASSERT_NOT_NULL(rel_paths);
+    for (int i = 0; i < K8S_TEST_FORMER_RECORD_LIMIT; i++) {
+        snprintf(rel_paths[i], sizeof(rel_paths[i]), "filler-%d.yaml", i);
+        files[i] = (cbm_file_info_t){.path = filler_path,
+                                     .rel_path = rel_paths[i],
+                                     .language = CBM_LANG_YAML};
+    }
+    snprintf(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT],
+             sizeof(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT]), "service.yaml");
+    files[K8S_TEST_FORMER_RECORD_LIMIT] =
+        (cbm_file_info_t){.path = service_path,
+                          .rel_path = rel_paths[K8S_TEST_FORMER_RECORD_LIMIT],
+                          .language = CBM_LANG_YAML};
+    snprintf(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE],
+             sizeof(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE]), "workload.yaml");
+    files[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE] =
+        (cbm_file_info_t){.path = workload_path,
+                          .rel_path = rel_paths[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE],
+                          .language = CBM_LANG_YAML};
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("k8s-selector-test", tmp);
+    ASSERT_NOT_NULL(gbuf);
+    atomic_int cancelled;
+    cbm_pipeline_ctx_t ctx;
+    k8s_selector_test_ctx(&ctx, gbuf, &cancelled, tmp);
+    ASSERT_EQ(cbm_pipeline_pass_k8s(&ctx, files, K8S_TEST_FILE_COUNT), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_type(gbuf, "INFRA_MAPS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1);
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gbuf, edges[0]->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[0]->target_id);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(source->name, "Service/after-former-limit");
+    ASSERT_STR_EQ(target->name, "Deployment/after-former-limit");
+
+    cbm_gbuf_free(gbuf);
+    free(rel_paths);
+    free(files);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(k8s_selector_requires_every_key_value_pair_beyond_former_pair_limit) {
+    enum { K8S_TEST_SELECTOR_PAIRS = CBM_SZ_16 + SKIP_ONE };
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_k8s_pairs_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char service[CBM_SZ_4K];
+    char partial[CBM_SZ_4K];
+    char complete[CBM_SZ_4K];
+    int service_len =
+        snprintf(service, sizeof(service),
+                 "apiVersion: v1\nkind: Service\nmetadata:\n  name: exact-selector\nspec:\n"
+                 "  selector:\n");
+    int partial_len =
+        snprintf(partial, sizeof(partial),
+                 "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app-target\nspec:\n"
+                 "  template:\n    metadata:\n      labels:\n");
+    int complete_len =
+        snprintf(complete, sizeof(complete),
+                 "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: complete\nspec:\n"
+                 "  template:\n    metadata:\n      labels:\n");
+    ASSERT_GT(service_len, 0);
+    ASSERT_GT(partial_len, 0);
+    ASSERT_GT(complete_len, 0);
+    for (int i = 0; i < K8S_TEST_SELECTOR_PAIRS; i++) {
+        const char *key = i == K8S_TEST_SELECTOR_PAIRS - SKIP_ONE ? "app" : NULL;
+        const char *value = i == K8S_TEST_SELECTOR_PAIRS - SKIP_ONE ? "app-target" : NULL;
+        char generated_key[CBM_SZ_32];
+        char generated_value[CBM_SZ_32];
+        if (!key) {
+            snprintf(generated_key, sizeof(generated_key), "selector-%02d", i);
+            snprintf(generated_value, sizeof(generated_value), "value-%02d", i);
+            key = generated_key;
+            value = generated_value;
+        }
+        int n = snprintf(service + service_len, sizeof(service) - (size_t)service_len,
+                         "    %s: %s\n", key, value);
+        ASSERT_GT(n, 0);
+        service_len += n;
+        n = snprintf(complete + complete_len, sizeof(complete) - (size_t)complete_len,
+                     "        %s: %s\n", key, value);
+        ASSERT_GT(n, 0);
+        complete_len += n;
+        if (i < K8S_TEST_SELECTOR_PAIRS - SKIP_ONE) {
+            n = snprintf(partial + partial_len, sizeof(partial) - (size_t)partial_len,
+                         "        %s: %s\n", key, value);
+            ASSERT_GT(n, 0);
+            partial_len += n;
+        }
+    }
+    int n = snprintf(partial + partial_len, sizeof(partial) - (size_t)partial_len,
+                     "        app: conflicting-label\n");
+    ASSERT_GT(n, 0);
+    partial_len += n;
+
+    const char *names[] = {"service.yaml", "partial.yaml", "complete.yaml"};
+    const char *sources[] = {service, partial, complete};
+    cbm_file_info_t files[CBM_SZ_3] = {0};
+    char paths[CBM_SZ_3][CBM_SZ_512];
+    for (int i = 0; i < CBM_SZ_3; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmp, names[i]);
+        ASSERT_EQ(th_write_file(paths[i], sources[i]), 0);
+        files[i] = (cbm_file_info_t){
+            .path = paths[i], .rel_path = (char *)names[i], .language = CBM_LANG_YAML};
+    }
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("k8s-selector-test", tmp);
+    ASSERT_NOT_NULL(gbuf);
+    atomic_int cancelled;
+    cbm_pipeline_ctx_t ctx;
+    k8s_selector_test_ctx(&ctx, gbuf, &cancelled, tmp);
+    ASSERT_EQ(cbm_pipeline_pass_k8s(&ctx, files, CBM_SZ_3), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_type(gbuf, "INFRA_MAPS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1);
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gbuf, edges[0]->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[0]->target_id);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(source->name, "Service/exact-selector");
+    ASSERT_STR_EQ(target->name, "Deployment/complete");
+
+    cbm_gbuf_free(gbuf);
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── Infrascan: cleanJSONBrackets ───────────────────────────────── */
 
 TEST(infra_clean_json_brackets) {
@@ -18683,6 +18877,8 @@ SUITE(pipeline) {
     RUN_TEST(k8s_extract_manifest);
     RUN_TEST(k8s_extract_manifest_no_name);
     RUN_TEST(k8s_extract_manifest_multidoc);
+    RUN_TEST(k8s_selector_links_manifests_after_former_record_limit);
+    RUN_TEST(k8s_selector_requires_every_key_value_pair_beyond_former_pair_limit);
     RUN_TEST(infra_secret_detection);
     /* Infrascan: Dockerfile parser */
     RUN_TEST(infra_parse_dockerfile_multistage);

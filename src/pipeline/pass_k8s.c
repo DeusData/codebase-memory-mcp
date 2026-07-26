@@ -21,8 +21,10 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -154,26 +156,39 @@ static void handle_kustomize(cbm_pipeline_ctx_t *ctx, const char *path, const ch
 /* ── K8s cross-manifest label-selector matching ──────────────────────
  * A Service routes traffic to the workload Pods whose labels match the
  * Service's spec.selector.  We record, per manifest, the Resource node id plus
- * its selector label-values (Services) and pod label-values (workloads), then
+ * its keyed selector requirements (Services) and pod labels (workloads), then
  * after all manifests are processed connect each Service to the workload(s) it
  * targets via an INFRA_MAPS edge.  This models the runtime traffic path the same
  * way k8s itself resolves Service → Endpoints by label.
  *
- * Matching is by label *value*: a Service selector `app: frontend` matches a
- * workload that either carries the pod label value "frontend" OR is named
- * "frontend" (the ubiquitous app==name convention, used when the pod template
- * omits explicit labels). */
-enum { K8S_MAX_LABELS = 16, K8S_MAX_RECORDS = 512, K8S_LABEL_LEN = 128 };
+ * Kubernetes matchLabels semantics require every selector key/value pair.
+ * Preserve the historical app==name convention only for an absent `app` label;
+ * values under unrelated keys must never produce a match.
+ *
+ * Storage grows geometrically instead of imposing working-set caps.  Common
+ * manifests allocate only the pairs they contain; total memory is O(R + L),
+ * where R is the number of Resources and L is their total label pairs. */
+enum {
+    K8S_INITIAL_PAIR_CAPACITY = CBM_SZ_4,
+    K8S_INITIAL_RECORD_CAPACITY = CBM_SZ_32
+};
+
+typedef struct {
+    char *key;
+    char *value;
+} k8s_label_pair_t;
 
 typedef struct {
     int64_t node_id;
-    char name[K8S_LABEL_LEN];
+    char name[CBM_SZ_256];
     bool is_service;
     bool is_workload;
-    char selector_vals[K8S_MAX_LABELS][K8S_LABEL_LEN]; /* Service spec.selector values */
-    int n_selector;
-    char label_vals[K8S_MAX_LABELS][K8S_LABEL_LEN]; /* workload pod-template label values */
-    int n_label;
+    k8s_label_pair_t *selectors;
+    int selector_count;
+    int selector_capacity;
+    k8s_label_pair_t *labels;
+    int label_count;
+    int label_capacity;
 } k8s_record_t;
 
 typedef struct {
@@ -181,6 +196,107 @@ typedef struct {
     int count;
     int cap;
 } k8s_record_array_t;
+
+typedef struct {
+    const char *key;
+    const char *value;
+    int record_index;
+} k8s_label_ref_t;
+
+typedef struct {
+    k8s_label_ref_t *items;
+    int count;
+    int cap;
+} k8s_label_ref_array_t;
+
+static bool k8s_reserve_items(void **items, int *capacity, int required, size_t item_size,
+                              int initial_capacity) {
+    if (!items || !capacity || required < 0 || item_size == 0 || initial_capacity <= 0) {
+        return false;
+    }
+    if (required <= *capacity) {
+        return true;
+    }
+    int next_capacity = *capacity > 0 ? *capacity : initial_capacity;
+    while (next_capacity < required) {
+        if (next_capacity > INT_MAX / CBM_SZ_2) {
+            next_capacity = required;
+            break;
+        }
+        next_capacity *= CBM_SZ_2;
+    }
+    if ((size_t)next_capacity > SIZE_MAX / item_size) {
+        return false;
+    }
+    void *grown = realloc(*items, (size_t)next_capacity * item_size);
+    if (!grown) {
+        return false;
+    }
+    *items = grown;
+    *capacity = next_capacity;
+    return true;
+}
+
+static bool k8s_add_pair(k8s_label_pair_t **items, int *count, int *capacity, const char *key,
+                         const char *value) {
+    if (!items || !count || !capacity || !key || !key[0] || !value || !value[0]) {
+        return true;
+    }
+    if (!k8s_reserve_items((void **)items, capacity, *count + SKIP_ONE, sizeof(**items),
+                           K8S_INITIAL_PAIR_CAPACITY)) {
+        return false;
+    }
+    char *owned_key = cbm_strdup(key);
+    char *owned_value = cbm_strdup(value);
+    if (!owned_key || !owned_value) {
+        free(owned_key);
+        free(owned_value);
+        return false;
+    }
+    (*items)[*count] = (k8s_label_pair_t){.key = owned_key, .value = owned_value};
+    (*count)++;
+    return true;
+}
+
+static void k8s_record_free(k8s_record_t *rec) {
+    if (!rec) {
+        return;
+    }
+    for (int i = 0; i < rec->selector_count; i++) {
+        free(rec->selectors[i].key);
+        free(rec->selectors[i].value);
+    }
+    for (int i = 0; i < rec->label_count; i++) {
+        free(rec->labels[i].key);
+        free(rec->labels[i].value);
+    }
+    free(rec->selectors);
+    free(rec->labels);
+    *rec = (k8s_record_t){0};
+}
+
+static void k8s_record_array_free(k8s_record_array_t *records) {
+    if (!records) {
+        return;
+    }
+    for (int i = 0; i < records->count; i++) {
+        k8s_record_free(&records->items[i]);
+    }
+    free(records->items);
+    *records = (k8s_record_array_t){0};
+}
+
+static bool k8s_record_array_append(k8s_record_array_t *records, k8s_record_t *record) {
+    if (!records || !record ||
+        !k8s_reserve_items((void **)&records->items, &records->cap,
+                           records->count + SKIP_ONE, sizeof(*records->items),
+                           K8S_INITIAL_RECORD_CAPACITY)) {
+        return false;
+    }
+    records->items[records->count++] = *record;
+    *record = (k8s_record_t){0};
+    return true;
+}
 
 /* Count leading-space indentation of a line (tabs are invalid YAML indent). */
 static int k8s_indent(const char *line) {
@@ -231,19 +347,11 @@ static int k8s_split_kv(const char *t, char *key, size_t key_sz, char *val, size
     return 1;
 }
 
-static void k8s_add_val(char dst[][K8S_LABEL_LEN], int *n, const char *v) {
-    if (*n >= K8S_MAX_LABELS || !v || !v[0]) {
-        return;
-    }
-    snprintf(dst[*n], K8S_LABEL_LEN, "%s", v);
-    (*n)++;
-}
-
 /* Scan a single-document k8s manifest's text for the resource name, selector
- * label-values (Service) and pod-template label-values (workload).  A small
+ * requirements (Service) and pod-template labels (workload).  A small
  * indentation path-stack distinguishes spec.selector from
  * spec.template.metadata.labels and from top-level metadata.name. */
-static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
+static bool k8s_scan_labels(const char *source, k8s_record_t *rec) {
     enum { K8S_PATH_DEPTH = 12 };
     struct {
         int indent;
@@ -257,9 +365,15 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
         const char *eol = strchr(p, '\n');
         size_t len = eol ? (size_t)(eol - p) : strlen(p);
         char line[CBM_SZ_512];
-        size_t cp = len < sizeof(line) - 1 ? len : sizeof(line) - 1;
-        memcpy(line, p, cp);
-        line[cp] = '\0';
+        if (len >= sizeof(line)) {
+            /* A valid Kubernetes label key/value line fits in this buffer.
+             * Ignore unrelated oversized YAML scalars whole; parsing a prefix
+             * could fabricate a selector or label match. */
+            p = eol ? eol + SKIP_ONE : NULL;
+            continue;
+        }
+        memcpy(line, p, len);
+        line[len] = '\0';
 
         /* End of first YAML document — stop (one Resource per file). */
         const char *trimmed = line;
@@ -275,8 +389,8 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
             while (depth > 0 && stack[depth - 1].indent >= ind) {
                 depth--;
             }
-            char key[64];
-            char val[K8S_LABEL_LEN];
+            char key[CBM_SZ_512];
+            char val[CBM_SZ_512];
             if (k8s_split_kv(trimmed, key, sizeof(key), val, sizeof(val))) {
                 /* Build the current dotted path for context decisions. */
                 bool under_selector = (depth >= 1 && strcmp(stack[depth - 1].key, "selector") == 0);
@@ -303,11 +417,15 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
                         snprintf(rec->name, sizeof(rec->name), "%s", val);
                         got_name = true;
                     } else if (under_selector) {
-                        /* Service spec.selector matchLabels values. */
-                        k8s_add_val(rec->selector_vals, &rec->n_selector, val);
+                        if (!k8s_add_pair(&rec->selectors, &rec->selector_count,
+                                          &rec->selector_capacity, key, val)) {
+                            return false;
+                        }
                     } else if (under_labels) {
-                        /* Pod-template / metadata labels values. */
-                        k8s_add_val(rec->label_vals, &rec->n_label, val);
+                        if (!k8s_add_pair(&rec->labels, &rec->label_count,
+                                          &rec->label_capacity, key, val)) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -318,47 +436,185 @@ static void k8s_scan_labels(const char *source, k8s_record_t *rec) {
         }
         p = eol + 1;
     }
+    return true;
 }
 
-/* True if any of the service's selector values matches the workload. */
-static bool k8s_selector_matches(const k8s_record_t *svc, const k8s_record_t *wl) {
-    for (int s = 0; s < svc->n_selector; s++) {
-        const char *sv = svc->selector_vals[s];
-        if (!sv[0]) {
-            continue;
-        }
-        if (wl->name[0] && strcmp(sv, wl->name) == 0) {
-            return true;
-        }
-        for (int l = 0; l < wl->n_label; l++) {
-            if (strcmp(sv, wl->label_vals[l]) == 0) {
-                return true;
-            }
+static int k8s_pair_compare(const void *lhs, const void *rhs) {
+    const k8s_label_pair_t *a = lhs;
+    const k8s_label_pair_t *b = rhs;
+    int key_cmp = strcmp(a->key, b->key);
+    return key_cmp != 0 ? key_cmp : strcmp(a->value, b->value);
+}
+
+static bool k8s_workload_has_key(const k8s_record_t *workload, const char *key) {
+    int lo = 0;
+    int hi = workload->label_count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / CBM_SZ_2;
+        int cmp = strcmp(workload->labels[mid].key, key);
+        if (cmp < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
         }
     }
-    return false;
+    return lo < workload->label_count && strcmp(workload->labels[lo].key, key) == 0;
+}
+
+static bool k8s_workload_has_pair(const k8s_record_t *workload,
+                                  const k8s_label_pair_t *selector) {
+    if (workload->label_count > 0 &&
+        bsearch(selector, workload->labels, (size_t)workload->label_count,
+                sizeof(*workload->labels), k8s_pair_compare)) {
+        return true;
+    }
+    return strcmp(selector->key, "app") == 0 && !k8s_workload_has_key(workload, "app") &&
+           workload->name[0] &&
+           strcmp(selector->value, workload->name) == 0;
+}
+
+/* True only if every service selector requirement matches the workload. */
+static bool k8s_selector_matches(const k8s_record_t *svc, const k8s_record_t *wl) {
+    for (int i = 0; i < svc->selector_count; i++) {
+        if (!k8s_workload_has_pair(wl, &svc->selectors[i])) {
+            return false;
+        }
+    }
+    return svc->selector_count > 0;
+}
+
+static int k8s_label_ref_compare(const void *lhs, const void *rhs) {
+    const k8s_label_ref_t *a = lhs;
+    const k8s_label_ref_t *b = rhs;
+    int key_cmp = strcmp(a->key, b->key);
+    if (key_cmp != 0) {
+        return key_cmp;
+    }
+    int value_cmp = strcmp(a->value, b->value);
+    if (value_cmp != 0) {
+        return value_cmp;
+    }
+    return (a->record_index > b->record_index) - (a->record_index < b->record_index);
+}
+
+static bool k8s_label_ref_append(k8s_label_ref_array_t *refs, const char *key,
+                                 const char *value, int record_index) {
+    if (!k8s_reserve_items((void **)&refs->items, &refs->cap, refs->count + SKIP_ONE,
+                           sizeof(*refs->items), K8S_INITIAL_RECORD_CAPACITY)) {
+        return false;
+    }
+    refs->items[refs->count++] =
+        (k8s_label_ref_t){.key = key, .value = value, .record_index = record_index};
+    return true;
+}
+
+static int k8s_label_ref_key_value_compare(const k8s_label_ref_t *ref, const char *key,
+                                           const char *value) {
+    int key_cmp = strcmp(ref->key, key);
+    return key_cmp != 0 ? key_cmp : strcmp(ref->value, value);
+}
+
+static int k8s_label_ref_bound(const k8s_label_ref_array_t *refs, const char *key,
+                               const char *value, bool upper) {
+    int lo = 0;
+    int hi = refs->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / CBM_SZ_2;
+        int cmp = k8s_label_ref_key_value_compare(&refs->items[mid], key, value);
+        if (cmp < 0 || (upper && cmp == 0)) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+static bool k8s_build_workload_index(k8s_record_array_t *records,
+                                     k8s_label_ref_array_t *refs) {
+    for (int i = 0; i < records->count; i++) {
+        k8s_record_t *record = &records->items[i];
+        if (!record->is_workload || record->node_id <= 0) {
+            continue;
+        }
+        if (record->label_count > 1) {
+            qsort(record->labels, (size_t)record->label_count, sizeof(*record->labels),
+                  k8s_pair_compare);
+        }
+        for (int j = 0; j < record->label_count; j++) {
+            if (!k8s_label_ref_append(refs, record->labels[j].key, record->labels[j].value, i)) {
+                return false;
+            }
+        }
+        if (record->name[0] && !k8s_workload_has_key(record, "app") &&
+            !k8s_label_ref_append(refs, "app", record->name, i)) {
+            return false;
+        }
+    }
+    if (refs->count > 1) {
+        qsort(refs->items, (size_t)refs->count, sizeof(*refs->items), k8s_label_ref_compare);
+    }
+    return true;
 }
 
 /* After all manifests are recorded, connect each Service to the workload(s) its
- * selector targets via an INFRA_MAPS edge (Service Resource → workload Resource). */
-static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t *recs) {
+ * selector targets via an INFRA_MAPS edge (Service Resource → workload Resource).
+ *
+ * The inverted label index avoids scanning every workload for selectors with a
+ * selective requirement.  Construction is O(L log L), lookup is
+ * O(S*K*log L + C*K*log M), and memory is O(L), where K is selector size, C is
+ * the smallest candidate set, and M is labels per candidate workload. */
+static bool k8s_link_selectors(cbm_pipeline_ctx_t *ctx, k8s_record_array_t *recs) {
+    k8s_label_ref_array_t refs = {0};
+    if (!k8s_build_workload_index(recs, &refs)) {
+        free(refs.items);
+        return false;
+    }
+
     int edges = 0;
     for (int i = 0; i < recs->count; i++) {
         const k8s_record_t *svc = &recs->items[i];
-        if (!svc->is_service || svc->n_selector == 0 || svc->node_id <= 0) {
+        if (!svc->is_service || svc->selector_count == 0 || svc->node_id <= 0) {
             continue;
         }
-        for (int j = 0; j < recs->count; j++) {
-            const k8s_record_t *wl = &recs->items[j];
-            if (i == j || !wl->is_workload || wl->node_id <= 0) {
+
+        int candidate_lo = 0;
+        int candidate_hi = 0;
+        int candidate_count = INT_MAX;
+        for (int s = 0; s < svc->selector_count; s++) {
+            int lo = k8s_label_ref_bound(&refs, svc->selectors[s].key,
+                                         svc->selectors[s].value, false);
+            int hi = k8s_label_ref_bound(&refs, svc->selectors[s].key,
+                                         svc->selectors[s].value, true);
+            if (hi - lo < candidate_count) {
+                candidate_lo = lo;
+                candidate_hi = hi;
+                candidate_count = hi - lo;
+            }
+        }
+
+        int previous_record = -SKIP_ONE;
+        for (int c = candidate_lo; c < candidate_hi; c++) {
+            int record_index = refs.items[c].record_index;
+            if (record_index == previous_record) {
                 continue;
             }
+            previous_record = record_index;
+            const k8s_record_t *wl = &recs->items[record_index];
             if (k8s_selector_matches(svc, wl)) {
-                char props[CBM_SZ_256];
+                char escaped_service[CBM_SZ_1K];
+                char escaped_workload[CBM_SZ_1K];
+                char props[CBM_SZ_2K];
+                cbm_json_escape(escaped_service, sizeof(escaped_service), svc->name);
+                cbm_json_escape(escaped_workload, sizeof(escaped_workload), wl->name);
                 snprintf(props, sizeof(props),
                          "{\"kind\":\"selector\",\"service\":\"%s\",\"workload\":\"%s\"}",
-                         svc->name, wl->name);
-                cbm_gbuf_insert_edge(ctx->gbuf, svc->node_id, wl->node_id, "INFRA_MAPS", props);
+                         escaped_service, escaped_workload);
+                if (cbm_gbuf_insert_edge(ctx->gbuf, svc->node_id, wl->node_id, "INFRA_MAPS",
+                                         props) <= 0) {
+                    free(refs.items);
+                    return false;
+                }
                 edges++;
             }
         }
@@ -366,6 +622,8 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
     if (edges > 0) {
         cbm_log_info("pass.k8s.selectors", "linked", itoa_k8s(edges));
     }
+    free(refs.items);
+    return true;
 }
 
 /* ── K8s manifest handler ────────────────────────────────────────── */
@@ -374,7 +632,7 @@ static void k8s_link_selectors(cbm_pipeline_ctx_t *ctx, const k8s_record_array_t
  * must free after this call returns).  When `rec` is non-NULL it is populated
  * with the first Resource's node id, name and label/selector values for later
  * cross-manifest selector matching. */
-static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path,
+static bool handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const char *rel_path,
                                 const char *source, int src_len, k8s_record_t *rec) {
     (void)path; /* retained for symmetry; source is always provided now */
     int resource_count = 0;
@@ -384,7 +642,7 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const
                                       cbm_pipeline_ctx_extract_timeout(ctx), NULL, NULL,
                                       cbm_pipeline_mode_extracts_macro_nodes(ctx->mode));
     if (!res) {
-        return;
+        return true;
     }
 
     /* Compute file node QN for DEFINES edges */
@@ -421,11 +679,12 @@ static void handle_k8s_manifest(cbm_pipeline_ctx_t *ctx, const char *path, const
     cbm_free_result(res);
 
     /* Record selector / pod-label values for later Service → workload linking. */
-    if (rec && rec->node_id > 0) {
-        k8s_scan_labels(source, rec);
+    if (rec && rec->node_id > 0 && !k8s_scan_labels(source, rec)) {
+        return false;
     }
 
     cbm_log_info("pass.k8s.manifest", "file", rel_path, "resources", itoa_k8s(resource_count));
+    return true;
 }
 
 /* ── Helm chart handler ──────────────────────────────────────────── */
@@ -637,12 +896,10 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
 
     /* Collect per-manifest selector/label records for cross-manifest matching. */
     k8s_record_array_t recs = {0};
-    recs.items = calloc(K8S_MAX_RECORDS, sizeof(*recs.items));
-    recs.cap = recs.items ? K8S_MAX_RECORDS : 0;
 
     for (int i = 0; i < file_count; i++) {
         if (cbm_pipeline_check_cancel(ctx)) {
-            free(recs.items);
+            k8s_record_array_free(&recs);
             return CBM_NOT_FOUND;
         }
 
@@ -679,11 +936,22 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                      * pass and contain no "Resource" definitions.  Pass the already-
                      * read source buffer so handle_k8s_manifest does not re-read. */
                     (void)cached; /* cached YAML result intentionally discarded */
-                    k8s_record_t *rec = (recs.count < recs.cap) ? &recs.items[recs.count] : NULL;
-                    handle_k8s_manifest(ctx, path, rel, source, src_len, rec);
-                    if (rec && rec->node_id > 0) {
-                        recs.count++;
+                    k8s_record_t rec = {0};
+                    if (!handle_k8s_manifest(ctx, path, rel, source, src_len, &rec)) {
+                        k8s_record_free(&rec);
+                        free(source);
+                        k8s_record_array_free(&recs);
+                        cbm_log_error("pass.k8s.err", "phase", "selector_scan", "file", rel);
+                        return CBM_STORE_ERR;
                     }
+                    if (rec.node_id > 0 && !k8s_record_array_append(&recs, &rec)) {
+                        k8s_record_free(&rec);
+                        free(source);
+                        k8s_record_array_free(&recs);
+                        cbm_log_error("pass.k8s.err", "phase", "record_append", "file", rel);
+                        return CBM_STORE_ERR;
+                    }
+                    k8s_record_free(&rec);
                     manifest_count++;
                 }
                 free(source);
@@ -692,8 +960,12 @@ int cbm_pipeline_pass_k8s(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
     }
 
     /* Connect Services to the workloads their selectors target (INFRA_MAPS). */
-    k8s_link_selectors(ctx, &recs);
-    free(recs.items);
+    if (!k8s_link_selectors(ctx, &recs)) {
+        k8s_record_array_free(&recs);
+        cbm_log_error("pass.k8s.err", "phase", "selector_link");
+        return CBM_STORE_ERR;
+    }
+    k8s_record_array_free(&recs);
 
     cbm_log_info("pass.done", "pass", "k8s", "kustomize", itoa_k8s(kustomize_count), "manifests",
                  itoa_k8s(manifest_count));

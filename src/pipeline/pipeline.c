@@ -1628,7 +1628,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         bool ignore_err;
     } seq_passes[] = {
         {cbm_pipeline_pass_definitions, "definitions", false},
-        {cbm_pipeline_pass_k8s, "k8s", true},
+        {cbm_pipeline_pass_k8s, "k8s", false},
         {seq_pass_lsp_cross_dispatch, "lsp_cross", true},
         {cbm_pipeline_pass_calls, "calls", false},
         {cbm_pipeline_pass_usages, "usages", false},
@@ -1842,9 +1842,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return rc;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
-    cbm_pipeline_pass_k8s(ctx, files, file_count);
+    rc = cbm_pipeline_pass_k8s(ctx, files, file_count);
     cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
-    return check_cancel(p) ? CBM_NOT_FOUND : 0;
+    return check_cancel(p) ? CBM_NOT_FOUND : rc;
 }
 
 /* An incremental attempt records changed paths in the staging database before
