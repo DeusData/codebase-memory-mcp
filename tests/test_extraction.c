@@ -3511,6 +3511,45 @@ static const CBMDefinition *find_def(CBMFileResult *r, const char *name) {
     return NULL;
 }
 
+TEST(extract_go_retains_all_multi_return_types) {
+    enum { RETURN_TYPE_TEST_COUNT = 20 };
+    char source[CBM_SZ_2K];
+    size_t used = 0;
+    int n = snprintf(source, sizeof(source), "package p\nfunc fanout() (");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source));
+    used = (size_t)n;
+    for (int i = 0; i < RETURN_TYPE_TEST_COUNT; i++) {
+        n = snprintf(source + used, sizeof(source) - used, "%sT%02d", i == 0 ? "" : ", ", i);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(source) - used);
+        used += (size_t)n;
+    }
+    n = snprintf(source + used, sizeof(source) - used, ") { panic(\"not implemented\") }\n");
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(source) - used);
+
+    CBMFileResult *r = extract(source, CBM_LANG_GO, "t", "fanout.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *fanout = find_def(r, "fanout");
+    ASSERT_NOT_NULL(fanout);
+    ASSERT_NOT_NULL(fanout->return_types);
+    int return_count = 0;
+    while (fanout->return_types[return_count]) {
+        char expected[CBM_SZ_16];
+        n = snprintf(expected, sizeof(expected), "T%02d", return_count);
+        ASSERT_GT(n, 0);
+        ASSERT_LT((size_t)n, sizeof(expected));
+        ASSERT_STR_EQ(fanout->return_types[return_count], expected);
+        return_count++;
+    }
+    ASSERT_EQ(return_count, RETURN_TYPE_TEST_COUNT);
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(complexity_nested_loops_depth) {
     CBMFileResult *r = extract("package p\n"
                                "func deepLoops() {\n"
@@ -5593,6 +5632,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_mock_patch_is_not_route);
     RUN_TEST(extract_java_no_double_class_qn);
     RUN_TEST(extract_go_no_filename_in_module_qn);
+    RUN_TEST(extract_go_retains_all_multi_return_types);
     RUN_TEST(extract_large_ts_has_functions_issue213);
 
     /* Per-function complexity metrics (Tier A) */
