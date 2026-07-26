@@ -1004,10 +1004,61 @@ int cbm_dep_auto_index(const char *project_name, const char *project_root,
  * the project's import node to the dep's module node.
  *
  * This enables trace_path to follow imports across the project/dep boundary. */
-/* Upper bound for the one-shot bulk fetch of dep Module nodes when linking
- * cross-boundary IMPORTS edges. Named (not magic) — per the no-magic-values
- * convention. Dep linking is index-time, so a generous fetch is fine. */
-#define CBM_DEP_LINK_MODULE_FETCH 100000
+
+typedef struct {
+    int64_t id;
+    double pagerank;
+    char name[];
+} cbm_dep_module_ref_t;
+
+typedef struct {
+    CBMHashTable *modules_by_name;
+} cbm_dep_link_module_ctx_t;
+
+static int collect_dep_module(int64_t id, const char *label, const char *name,
+                              const char *qualified_name, const char *file_path, double pagerank,
+                              void *userdata) {
+    (void)label;
+    (void)qualified_name;
+    (void)file_path;
+    cbm_dep_link_module_ctx_t *ctx = userdata;
+    if (!ctx || !ctx->modules_by_name || !name || !name[0]) {
+        return CBM_STORE_OK;
+    }
+    cbm_dep_module_ref_t *existing = cbm_ht_get(ctx->modules_by_name, name);
+    if (existing) {
+        if (pagerank > existing->pagerank ||
+            (pagerank == existing->pagerank && id < existing->id)) {
+            existing->id = id;
+            existing->pagerank = pagerank;
+        }
+        return CBM_STORE_OK;
+    }
+    size_t name_len = strlen(name);
+    if (name_len > SIZE_MAX - sizeof(cbm_dep_module_ref_t) - CBM_ALLOC_ONE) {
+        return CBM_STORE_ERR;
+    }
+    cbm_dep_module_ref_t *module =
+        malloc(sizeof(cbm_dep_module_ref_t) + name_len + CBM_ALLOC_ONE);
+    if (!module) {
+        return CBM_STORE_ERR;
+    }
+    module->id = id;
+    module->pagerank = pagerank;
+    memcpy(module->name, name, name_len + CBM_ALLOC_ONE);
+    (void)cbm_ht_set(ctx->modules_by_name, module->name, module);
+    if (cbm_ht_get(ctx->modules_by_name, module->name) != module) {
+        free(module);
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static void free_dep_module_name(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    free(value);
+}
 
 typedef struct {
     cbm_store_t *store;
@@ -1024,13 +1075,13 @@ static int link_project_import(int64_t id, const char *label, const char *name,
     if (!ctx || !ctx->store || !ctx->project || !ctx->modules_by_name || !name || !name[0]) {
         return CBM_STORE_OK;
     }
-    void *hit = cbm_ht_get(ctx->modules_by_name, name);
-    if (!hit) {
+    cbm_dep_module_ref_t *module = cbm_ht_get(ctx->modules_by_name, name);
+    if (!module) {
         return CBM_STORE_OK;
     }
     cbm_edge_t edge = {
         .source_id = id,
-        .target_id = (int64_t)(intptr_t)hit,
+        .target_id = module->id,
         .type = "IMPORTS",
         .project = ctx->project,
     };
@@ -1050,32 +1101,29 @@ static int link_project_import(int64_t id, const char *label, const char *name,
 int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
     if (!store || !project_name || !project_name[0]) return 0;
 
-    /* Perf #8: was N+1 — one cbm_store_search per import to find a
-     * matching dep Module. Now ONE bulk fetch of all dep Module nodes + an
-     * in-memory name→id hash, then O(1) per import. Behavior preserved: first
-     * Module matching the name wins (hash set only if absent), matching the old
-     * limit=1 first-result semantics. */
+    /* Stream all matching dep Modules once, retaining one owned name, id, and
+     * rank per unique name. Duplicate names fold to the default search winner:
+     * highest PageRank, then lowest id. This avoids both a correctness cap and
+     * a global SQL sort. Building and probing the map is O(M + I) expected time
+     * and O(U) memory, where M is Module rows, I is imports, and U is names. */
     char dep_pattern[CBM_NAME_MAX];
     snprintf(dep_pattern, sizeof(dep_pattern), "%s" CBM_DEP_SEPARATOR "%%",
              project_name);
 
-    cbm_search_params_t mod_params = {0};
-    mod_params.project_pattern = dep_pattern;
-    mod_params.label = "Module";
-    mod_params.limit = CBM_DEP_LINK_MODULE_FETCH;
-    cbm_search_output_t mod_out = {0};
-    CBMHashTable *mod_by_name = NULL;
-    /* node ids are >= 1, so (void*)(intptr_t)id is non-NULL for present modules
-     * and cbm_ht_get returns NULL for absent names — a clean presence test. */
-    if (cbm_store_search(store, &mod_params, &mod_out) == 0) {
-        mod_by_name = cbm_ht_create((uint32_t)mod_out.count + 8);
-        for (int i = 0; i < mod_out.count; i++) {
-            const char *mname = mod_out.results[i].node.name;
-            if (!mname || !mname[0]) continue;
-            if (cbm_ht_get(mod_by_name, mname)) continue; /* first-wins */
-            int64_t mid = mod_out.results[i].node.id;
-            cbm_ht_set(mod_by_name, mname, (void *)(intptr_t)mid);
-        }
+    CBMHashTable *mod_by_name = cbm_ht_create(0);
+    if (!mod_by_name) {
+        cbm_log_error("dep.cross_edges", "project", project_name, "phase", "allocate_modules");
+        return 0;
+    }
+    cbm_dep_link_module_ctx_t module_ctx = {
+        .modules_by_name = mod_by_name,
+    };
+    if (cbm_store_visit_ranked_node_refs_by_project_pattern_and_label(
+            store, dep_pattern, "Module", collect_dep_module, &module_ctx) != CBM_STORE_OK) {
+        cbm_log_error("dep.cross_edges", "project", project_name, "phase", "visit_modules");
+        cbm_ht_foreach(mod_by_name, free_dep_module_name, NULL);
+        cbm_ht_free(mod_by_name);
+        return 0;
     }
 
     cbm_dep_link_import_ctx_t link_ctx = {
@@ -1083,14 +1131,13 @@ int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name) {
         .project = project_name,
         .modules_by_name = mod_by_name,
     };
-    if (mod_by_name &&
-        cbm_store_visit_node_refs_by_label(store, project_name, "Variable", link_project_import,
+    if (cbm_store_visit_node_refs_by_label(store, project_name, "Variable", link_project_import,
                                            &link_ctx) != CBM_STORE_OK) {
         cbm_log_error("dep.cross_edges", "project", project_name, "phase", "visit_imports");
     }
 
-    if (mod_by_name) cbm_ht_free(mod_by_name); /* keys borrowed from mod_out, not freed */
-    cbm_store_search_free(&mod_out);
+    cbm_ht_foreach(mod_by_name, free_dep_module_name, NULL);
+    cbm_ht_free(mod_by_name);
 
     if (link_ctx.linked > 0) {
         char linked_str[16];

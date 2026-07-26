@@ -2869,25 +2869,37 @@ int cbm_store_find_nodes_by_label_limited(cbm_store_t *s, const char *project, c
 }
 
 static int visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
+                                bool project_is_pattern,
                                 cbm_store_node_identity_visitor_fn identity_visitor,
-                                cbm_store_node_ref_visitor_fn ref_visitor, void *userdata) {
+                                cbm_store_node_ref_visitor_fn ref_visitor,
+                                cbm_store_ranked_node_ref_visitor_fn ranked_ref_visitor,
+                                void *userdata) {
     enum {
         VISIT_NODE_ID_COL = 0,
         VISIT_NODE_LABEL_COL,
         VISIT_NODE_NAME_COL,
         VISIT_NODE_QN_COL,
         VISIT_NODE_FILE_PATH_COL,
+        VISIT_NODE_PAGERANK_COL,
     };
-    if (!s || !s->db || !project || !label || (!identity_visitor && !ref_visitor)) {
+    if (!s || !s->db || !project || !label ||
+        (!identity_visitor && !ref_visitor && !ranked_ref_visitor)) {
         return CBM_STORE_ERR;
     }
     sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(s->db,
-                                "SELECT id, label, name, qualified_name, file_path FROM nodes "
-                                "WHERE project = ?1 AND label = ?2;",
-                                CBM_NOT_FOUND, &stmt, NULL);
+    const char *sql =
+        project_is_pattern
+            ? "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, "
+              "COALESCE(pr.rank, 0.0) "
+              "FROM nodes n LEFT JOIN pagerank pr ON pr.node_id = n.id "
+              "WHERE n.project LIKE ?1 AND n.label = ?2;"
+            : "SELECT id, label, name, qualified_name, file_path, 0.0 FROM nodes "
+              "WHERE project = ?1 AND label = ?2;";
+    int rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
     if (rc != SQLITE_OK || !stmt) {
-        store_set_error_sqlite(s, "visit_nodes_by_label prepare");
+        store_set_error_sqlite(s, project_is_pattern
+                                      ? "visit_ranked_node_refs_by_project_pattern_and_label prepare"
+                                      : "visit_nodes_by_label prepare");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
@@ -2900,16 +2912,22 @@ static int visit_nodes_by_label(cbm_store_t *s, const char *project, const char 
         const char *row_name = (const char *)sqlite3_column_text(stmt, VISIT_NODE_NAME_COL);
         const char *row_qn = (const char *)sqlite3_column_text(stmt, VISIT_NODE_QN_COL);
         const char *row_path = (const char *)sqlite3_column_text(stmt, VISIT_NODE_FILE_PATH_COL);
-        int visit_rc = ref_visitor
-                           ? ref_visitor(row_id, row_label, row_name, row_qn, row_path, userdata)
-                           : identity_visitor(row_label, row_name, row_qn, row_path, userdata);
+        double row_pagerank = sqlite3_column_double(stmt, VISIT_NODE_PAGERANK_COL);
+        int visit_rc =
+            ranked_ref_visitor
+                ? ranked_ref_visitor(row_id, row_label, row_name, row_qn, row_path, row_pagerank,
+                                     userdata)
+            : ref_visitor ? ref_visitor(row_id, row_label, row_name, row_qn, row_path, userdata)
+                          : identity_visitor(row_label, row_name, row_qn, row_path, userdata);
         if (visit_rc != CBM_STORE_OK) {
             sqlite3_finalize(stmt);
             return CBM_STORE_ERR;
         }
     }
     if (rc != SQLITE_DONE) {
-        store_set_error_sqlite(s, "visit_nodes_by_label");
+        store_set_error_sqlite(s, project_is_pattern
+                                      ? "visit_ranked_node_refs_by_project_pattern_and_label"
+                                      : "visit_nodes_by_label");
         sqlite3_finalize(stmt);
         return CBM_STORE_ERR;
     }
@@ -2919,12 +2937,18 @@ static int visit_nodes_by_label(cbm_store_t *s, const char *project, const char 
 
 int cbm_store_visit_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                    cbm_store_node_identity_visitor_fn visitor, void *userdata) {
-    return visit_nodes_by_label(s, project, label, visitor, NULL, userdata);
+    return visit_nodes_by_label(s, project, label, false, visitor, NULL, NULL, userdata);
 }
 
 int cbm_store_visit_node_refs_by_label(cbm_store_t *s, const char *project, const char *label,
                                        cbm_store_node_ref_visitor_fn visitor, void *userdata) {
-    return visit_nodes_by_label(s, project, label, NULL, visitor, userdata);
+    return visit_nodes_by_label(s, project, label, false, NULL, visitor, NULL, userdata);
+}
+
+int cbm_store_visit_ranked_node_refs_by_project_pattern_and_label(
+    cbm_store_t *s, const char *project_pattern, const char *label,
+    cbm_store_ranked_node_ref_visitor_fn visitor, void *userdata) {
+    return visit_nodes_by_label(s, project_pattern, label, true, NULL, NULL, visitor, userdata);
 }
 
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
