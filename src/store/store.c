@@ -47,7 +47,6 @@ enum {
     ST_SQLITE_BUSY_TIMEOUT_MS = 10000,
     ST_SQL_BUF = 8192,
     ST_ARCH_ROUTE_RESULT_LIMIT = 20,
-    ST_ARCH_ROUTE_SCAN_LIMIT = ST_ARCH_ROUTE_RESULT_LIMIT * 10,
     ST_ARCH_ENTRY_POINT_LIMIT = 20,
     ST_ARCH_DOC_LIMIT = 20,
     ST_QN_MAX_DOTS = 5,
@@ -13785,7 +13784,7 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
         "AND (json_extract(properties, '$.is_test') IS NULL OR "
         "json_extract(properties, '$.is_test') != 1) ";
     if (arch_build_node_view_sql(s, sqlbuf, sizeof(sqlbuf), use_active_nodes, active_base,
-                                 canonical_base, scoped, ST_ARCH_ROUTE_SCAN_LIMIT,
+                                 canonical_base, scoped, 0,
                                  "arch_routes SQL truncated") != CBM_STORE_OK) {
         return CBM_STORE_ERR;
     }
@@ -13794,8 +13793,7 @@ static int arch_routes(cbm_store_t *s, const char *project, const char *path,
         store_set_error_sqlite(s, "arch_routes");
         return CBM_STORE_ERR;
     }
-    arch_bind_node_view_sql(stmt, use_active_nodes, project, scoped, norm, like,
-                            ST_ARCH_ROUTE_SCAN_LIMIT);
+    arch_bind_node_view_sql(stmt, use_active_nodes, project, scoped, norm, like, 0);
 
     int cap = ST_INIT_CAP_8;
     int n = 0;
