@@ -547,8 +547,15 @@ static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
+static const char *g_suite_env_filter = NULL;
+static bool g_suite_env_matched = false;
 
 static bool suite_requested(const char *name) {
+    if (g_suite_env_filter) {
+        bool requested = strstr(name, g_suite_env_filter) != NULL;
+        g_suite_env_matched = g_suite_env_matched || requested;
+        return requested;
+    }
     if (g_suite_argc <= 1) {
         return true;
     }
@@ -934,9 +941,16 @@ int main(int argc, char **argv) {
 
     const char *skip_perf_env = getenv("CBM_SKIP_PERF");
     g_skip_perf = skip_perf_env != NULL && strcmp(skip_perf_env, "1") == 0;
+    const char *only_suite = getenv("CBM_ONLY_SUITE");
+    g_suite_env_filter = only_suite && only_suite[0] ? only_suite : NULL;
     if (argc == 2 && strcmp(argv[1], "--list-suites") == 0) {
         g_list_only = true;
         g_suite_argc = 1; /* no suite-name args to match */
+    } else if (g_suite_env_filter) {
+        /* The environment substring selector and argv exact-name selector are
+         * alternate interfaces to the same canonical suite registry below. */
+        g_suite_argc = 1;
+        g_suite_argv = argv;
     } else {
         g_suite_argc = argc;
         g_suite_argv = argv;
@@ -985,131 +999,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Optional focused runs:
-     *   CBM_ONLY_SUITE=<substring> selects matching suites.
-     *   CBM_ONLY_TEST=<substring> selects matching tests after suite setup.
-     * Leave both unset to run the complete test suite. */
-    const char *only_suite = getenv("CBM_ONLY_SUITE");
-    if (only_suite && only_suite[0]) {
-        if (strstr("arena", only_suite)) RUN_SUITE(arena);
-        if (strstr("hash_table", only_suite)) RUN_SUITE(hash_table);
-        if (strstr("dyn_array", only_suite)) RUN_SUITE(dyn_array);
-        if (strstr("str_intern", only_suite)) RUN_SUITE(str_intern);
-        if (strstr("log", only_suite)) RUN_SUITE(log);
-        if (strstr("str_util", only_suite)) RUN_SUITE(str_util);
-        if (strstr("platform", only_suite)) RUN_SUITE(platform);
-        if (strstr("subprocess", only_suite)) RUN_SUITE(subprocess);
-        if (strstr("dump_verify", only_suite)) RUN_SUITE(dump_verify);
-        if (strstr("ac", only_suite)) RUN_SUITE(ac);
-        if (strstr("extraction", only_suite)) RUN_SUITE(extraction);
-        if (strstr("extraction_inheritance", only_suite)) RUN_SUITE(extraction_inheritance);
-        if (strstr("extraction_imports", only_suite)) RUN_SUITE(extraction_imports);
-        if (strstr("grammar_regression", only_suite)) RUN_SUITE(grammar_regression);
-        if (strstr("grammar_labels", only_suite)) RUN_SUITE(grammar_labels);
-        if (strstr("grammar_imports", only_suite)) RUN_SUITE(grammar_imports);
-        if (strstr("store_nodes", only_suite)) RUN_SUITE(store_nodes);
-        if (strstr("store_edges", only_suite)) RUN_SUITE(store_edges);
-        if (strstr("store_search", only_suite)) RUN_SUITE(store_search);
-        if (strstr("store_bulk", only_suite)) RUN_SUITE(store_bulk);
-        if (strstr("store_pragmas", only_suite)) RUN_SUITE(store_pragmas);
-        if (strstr("store_checkpoint", only_suite)) RUN_SUITE(store_checkpoint);
-        if (strstr("dump_verify_io", only_suite)) RUN_SUITE(dump_verify_io);
-        if (strstr("schema_declared_property_keys", only_suite))
-            RUN_SUITE(schema_declared_property_keys);
-        if (strstr("cypher", only_suite)) RUN_SUITE(cypher);
-        if (strstr("mcp", only_suite)) RUN_SUITE(mcp);
-        if (strstr("language", only_suite)) RUN_SUITE(language);
-        if (strstr("userconfig", only_suite)) RUN_SUITE(userconfig);
-        if (strstr("gitignore", only_suite)) RUN_SUITE(gitignore);
-        if (strstr("git_context", only_suite)) RUN_SUITE(git_context);
-        if (strstr("discover", only_suite)) RUN_SUITE(discover);
-        if (strstr("graph_buffer", only_suite)) RUN_SUITE(graph_buffer);
-        if (strstr("registry", only_suite)) RUN_SUITE(registry);
-        if (strstr("pipeline", only_suite)) RUN_SUITE(pipeline);
-        if (strstr("index_resilience", only_suite)) RUN_SUITE(index_resilience);
-        if (strstr("fqn", only_suite)) RUN_SUITE(fqn);
-        if (strstr("route_canon", only_suite)) RUN_SUITE(route_canon);
-        if (strstr("path_alias", only_suite)) RUN_SUITE(path_alias);
-        if (strstr("watcher", only_suite)) RUN_SUITE(watcher);
-        if (strstr("lz4", only_suite)) RUN_SUITE(lz4);
-        if (strstr("zstd", only_suite)) RUN_SUITE(zstd);
-        if (strstr("sqlite_writer", only_suite)) RUN_SUITE(sqlite_writer);
-        if (strstr("artifact", only_suite)) RUN_SUITE(artifact);
-        if (strstr("scope", only_suite)) RUN_SUITE(scope);
-        if (strstr("type_rep", only_suite)) RUN_SUITE(type_rep);
-        if (strstr("go_lsp", only_suite)) RUN_SUITE(go_lsp);
-        if (strstr("c_lsp", only_suite)) RUN_SUITE(c_lsp);
-        if (strstr("php_lsp", only_suite)) RUN_SUITE(php_lsp);
-        if (strstr("cs_lsp", only_suite)) RUN_SUITE(cs_lsp);
-        if (strstr("cs_lsp_bench", only_suite)) RUN_SUITE(cs_lsp_bench);
-        if (strstr("perl_lsp", only_suite)) RUN_SUITE(perl_lsp);
-        if (strstr("py_lsp", only_suite)) RUN_SUITE(py_lsp);
-        if (strstr("kotlin_lsp", only_suite)) RUN_SUITE(kotlin_lsp);
-        if (strstr("rust_lsp", only_suite)) RUN_SUITE(rust_lsp);
-        if (strstr("py_lsp_bench", only_suite)) RUN_SUITE(py_lsp_bench);
-        if (strstr("py_lsp_stress", only_suite)) RUN_SUITE(py_lsp_stress);
-        if (strstr("py_lsp_scale", only_suite)) RUN_SUITE(py_lsp_scale);
-        if (strstr("ts_lsp", only_suite)) RUN_SUITE(ts_lsp);
-        if (strstr("java_lsp", only_suite)) RUN_SUITE(java_lsp);
-        if (strstr("java_lsp_coverage", only_suite)) RUN_SUITE(java_lsp_coverage);
-        if (strstr("store_arch", only_suite)) RUN_SUITE(store_arch);
-        if (strstr("httplink", only_suite)) RUN_SUITE(httplink);
-        if (strstr("traces", only_suite)) RUN_SUITE(traces);
-        if (strstr("configlink", only_suite)) RUN_SUITE(configlink);
-        if (strstr("infrascan", only_suite)) RUN_SUITE(infrascan);
-        if (strstr("cli", only_suite)) RUN_SUITE(cli);
-        if (strstr("agent_clients", only_suite)) RUN_SUITE(agent_clients);
-        if (strstr("agent_profiles", only_suite)) RUN_SUITE(agent_profiles);
-        if (strstr("config_json_like", only_suite)) RUN_SUITE(config_json_like);
-        if (strstr("config_toml_edit", only_suite)) RUN_SUITE(config_toml_edit);
-        if (strstr("config_yaml_edit", only_suite)) RUN_SUITE(config_yaml_edit);
-        if (strstr("config_text_edit", only_suite)) RUN_SUITE(config_text_edit);
-        if (strstr("system_info", only_suite)) RUN_SUITE(system_info);
-        if (strstr("worker_pool", only_suite)) RUN_SUITE(worker_pool);
-        if (strstr("parallel", only_suite)) RUN_SUITE(parallel);
-        if (strstr("mem", only_suite)) RUN_SUITE(mem);
-        if (strstr("ui", only_suite)) RUN_SUITE(ui);
-        if (strstr("token_reduction", only_suite)) RUN_SUITE(token_reduction);
-        if (strstr("depindex", only_suite)) RUN_SUITE(depindex);
-        if (strstr("pagerank", only_suite)) RUN_SUITE(pagerank);
-        if (strstr("tool_consolidation", only_suite)) RUN_SUITE(tool_consolidation);
-        if (strstr("input_validation", only_suite)) RUN_SUITE(input_validation);
-        if (strstr("httpd", only_suite)) RUN_SUITE(httpd);
-        if (strstr("security", only_suite)) RUN_SUITE(security);
-        if (strstr("yaml", only_suite)) RUN_SUITE(yaml);
-        if (strstr("semantic", only_suite)) RUN_SUITE(semantic);
-        if (strstr("ast_profile", only_suite)) RUN_SUITE(ast_profile);
-        if (strstr("simhash", only_suite)) RUN_SUITE(simhash);
-        if (strstr("stack_overflow_a", only_suite)) RUN_SUITE(stack_overflow_a);
-        if (strstr("stack_overflow_b", only_suite)) RUN_SUITE(stack_overflow_b);
-        if (strstr("stack_overflow_c", only_suite)) RUN_SUITE(stack_overflow_c);
-        if (strstr("integration", only_suite)) RUN_SUITE(integration);
-        if (strstr("lang_contract", only_suite)) RUN_SUITE(lang_contract);
-        if (strstr("edge_imports", only_suite)) RUN_SUITE(edge_imports);
-        if (strstr("edge_structural", only_suite)) RUN_SUITE(edge_structural);
-        if (strstr("lsp_resolution_probe", only_suite)) RUN_SUITE(lsp_resolution_probe);
-        if (strstr("node_creation_probe", only_suite)) RUN_SUITE(node_creation_probe);
-        if (strstr("edge_types_probe", only_suite)) RUN_SUITE(edge_types_probe);
-        if (strstr("convergence_probe", only_suite)) RUN_SUITE(convergence_probe);
-        if (strstr("matrix_known_classes", only_suite)) RUN_SUITE(matrix_known_classes);
-        if (strstr("matrix_new_constructs", only_suite)) RUN_SUITE(matrix_new_constructs);
-        if (strstr("grammar_probe_a", only_suite)) RUN_SUITE(grammar_probe_a);
-        if (strstr("grammar_probe_b", only_suite)) RUN_SUITE(grammar_probe_b);
-        if (strstr("grammar_probe_c", only_suite)) RUN_SUITE(grammar_probe_c);
-        if (strstr("grammar_probe_d", only_suite)) RUN_SUITE(grammar_probe_d);
-        if (strstr("grammar_probe_e", only_suite)) RUN_SUITE(grammar_probe_e);
-        if (strstr("grammar_probe_f", only_suite)) RUN_SUITE(grammar_probe_f);
-        if (strstr("grammar_probe_g", only_suite)) RUN_SUITE(grammar_probe_g);
-        if (strstr("incremental", only_suite)) RUN_SUITE(incremental);
-        /* Match the full-run exit path so focused sanitizer/leak runs do not
-         * report process-lifetime caches as suite-owned allocations. */
-        cbm_kind_in_set_free_cache();
-        sqlite3_shutdown();
-        require_test_cache_cleanup();
-        TEST_SUMMARY();
-        return 0;
-    }
-
 /* Every suite from here down MUST go through RUN_SELECTED_SUITE. A bare
  * RUN_SUITE would still execute the suite while leaving it out of
  * --list-suites, and that failure returns success at every layer: the shard
@@ -1121,7 +1010,7 @@ int main(int argc, char **argv) {
  * would also run under `make test-tsan`, which passes TEST_TSAN_SUITES as argv
  * (Makefile.cbm:997), defeating that list's documented exclusions.
  * Poisoning the raw spelling turns that into a compile error naming the fix.
- * The CBM_ONLY_SUITE block above uses RUN_SUITE legitimately and ends here. */
+ * CBM_ONLY_SUITE and argv selection both flow through this registry. */
 #undef RUN_SUITE
 #define RUN_SUITE(name) \
     RUN_SUITE_is_poisoned_in_the_full_run_path__use_RUN_SELECTED_SUITE(name)
@@ -1345,6 +1234,10 @@ int main(int argc, char **argv) {
     }
     if (g_suite_argc > 1 && !any_suite_matched) {
         fprintf(stderr, "No matching test suites requested\n");
+    }
+    if (g_suite_env_filter && !g_suite_env_matched) {
+        fprintf(stderr, "Unknown CBM_ONLY_SUITE selector: %s\n", g_suite_env_filter);
+        tf_fail_count++;
     }
     free(g_suite_arg_matched);
     g_suite_arg_matched = NULL;
