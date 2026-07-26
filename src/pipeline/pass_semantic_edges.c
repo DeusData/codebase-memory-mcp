@@ -966,6 +966,7 @@ enum {
      * Keep it distinct from the per-function exact-score work budget. */
     SEM_NOISY_BUCKET_SIZE = 200,
     SEM_SCORE_CANDIDATE_BUDGET = 200,
+    SEM_ACCEPTED_CANDIDATE_CAP = SEM_LSH_BANDS * SEM_NOISY_BUCKET_SIZE,
 };
 
 /* Row of a hyperplane matrix in the ROTATED (quantized) basis: LSH only
@@ -1038,35 +1039,64 @@ enum {
     SCORE_SEEN_EMPTY = -1,
 };
 
-_Static_assert(SEM_LSH_BANDS * SEM_NOISY_BUCKET_SIZE < SCORE_SEEN_CAP,
+_Static_assert((int)SEM_ACCEPTED_CANDIDATE_CAP < (int)SCORE_SEEN_CAP,
                "semantic LSH accepted buckets must fit the candidate seen set");
+_Static_assert(SEM_LSH_BANDS <= UINT8_MAX,
+               "semantic LSH band-match counts must fit cbm_semantic_candidate_t");
 
-/* Check whether `j` has already been recorded in the open-addressed `seen`
- * set for this function; insert it if not.  Returns true when the insertion
- * was fresh (caller should add to candidates). */
-static bool score_seen_insert(int *seen, int j) {
+/* Repeated independent band collisions are stronger LSH evidence than a
+ * single collision. The canonical function-index tie-break preserves the
+ * deterministic ordering established by commit d9ea73f9. */
+static int cmp_semantic_candidate_evidence(const void *pa, const void *pb) {
+    const cbm_semantic_candidate_t *a = pa;
+    const cbm_semantic_candidate_t *b = pb;
+    if (a->band_matches != b->band_matches) {
+        return a->band_matches > b->band_matches ? -1 : 1;
+    }
+    if (a->function_index != b->function_index) {
+        return a->function_index < b->function_index ? -1 : 1;
+    }
+    return 0;
+}
+
+int cbm_pipeline_rank_semantic_candidates(cbm_semantic_candidate_t *candidates, int count,
+                                          int limit) {
+    if (!candidates || count <= 0 || limit <= 0) {
+        return 0;
+    }
+    qsort(candidates, (size_t)count, sizeof(*candidates), cmp_semantic_candidate_evidence);
+    return count < limit ? count : limit;
+}
+
+/* Record one band collision in the open-addressed `seen` table. Table values
+ * are positions in candidates[], which lets repeated collisions increment the
+ * evidence count without a second candidate lookup. */
+static void score_record_candidate(int *seen, cbm_semantic_candidate_t *candidates,
+                                   int *candidate_count, int j) {
     uint32_t slot = (uint32_t)j & SCORE_SEEN_MASK;
     for (int p = 0; p < SCORE_SEEN_CAP; p++) {
         uint32_t idx = (slot + (uint32_t)p) & SCORE_SEEN_MASK;
         if (seen[idx] == SCORE_SEEN_EMPTY) {
-            seen[idx] = j;
-            return true;
+            int pos = (*candidate_count)++;
+            seen[idx] = pos;
+            candidates[pos] = (cbm_semantic_candidate_t){.function_index = j, .band_matches = 1};
+            return;
         }
-        if (seen[idx] == j) {
-            return false;
+        cbm_semantic_candidate_t *candidate = &candidates[seen[idx]];
+        if (candidate->function_index == j) {
+            candidate->band_matches++;
+            return;
         }
     }
-    return false;
 }
 
 /* Collect the unique candidate function indices for node `i` by iterating
- * every LSH band and merging bucket members via `seen[]`.  Continue past
- * cand_cap so omissions are counted exactly.  The compile-time assertion
- * above keeps the accepted-bucket working set below SCORE_SEEN_CAP.  Exact
- * scoring remains bounded without extra heap storage. */
-static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *candidates,
-                                    int cand_cap, uint64_t *noisy_bucket_visits,
-                                    uint64_t *unscored_candidates) {
+ * every LSH band and merging bucket members via `seen[]`. The compile-time
+ * assertion above proves candidates[] and seen[] can represent every member
+ * of every accepted bucket without heap allocation. */
+static int score_collect_candidates(score_ctx_t *sc, int i, int *seen,
+                                    cbm_semantic_candidate_t *candidates,
+                                    uint64_t *noisy_bucket_visits) {
     int cand_count = 0;
     for (int b = 0; b < SEM_LSH_BANDS; b++) {
         int shift = b * SEM_LSH_ROWS;
@@ -1085,13 +1115,7 @@ static int score_collect_candidates(score_ctx_t *sc, int i, int *seen, int *cand
             if (j <= i) {
                 continue;
             }
-            if (score_seen_insert(seen, j)) {
-                if (cand_count < cand_cap) {
-                    candidates[cand_count++] = j;
-                } else {
-                    (*unscored_candidates)++;
-                }
-            }
+            score_record_candidate(seen, candidates, &cand_count, j);
         }
     }
     return cand_count;
@@ -1134,12 +1158,13 @@ static void score_worker(int worker_id, void *ctx_ptr) {
         for (int s = 0; s < SCORE_SEEN_CAP; s++) {
             seen[s] = SCORE_SEEN_EMPTY;
         }
-        int candidates[SEM_SCORE_CANDIDATE_BUDGET];
+        cbm_semantic_candidate_t candidates[SEM_ACCEPTED_CANDIDATE_CAP];
         uint64_t noisy_bucket_visits = 0;
-        uint64_t unscored_candidates = 0;
-        int cand_count =
-            score_collect_candidates(sc, i, seen, candidates, SEM_SCORE_CANDIDATE_BUDGET,
-                                     &noisy_bucket_visits, &unscored_candidates);
+        int candidate_count =
+            score_collect_candidates(sc, i, seen, candidates, &noisy_bucket_visits);
+        int selected_count = cbm_pipeline_rank_semantic_candidates(candidates, candidate_count,
+                                                                   SEM_SCORE_CANDIDATE_BUDGET);
+        uint64_t unscored_candidates = (uint64_t)(candidate_count - selected_count);
         if (noisy_bucket_visits > 0) {
             atomic_fetch_add_explicit(&sc->noisy_bucket_visits, noisy_bucket_visits,
                                       memory_order_relaxed);
@@ -1148,8 +1173,8 @@ static void score_worker(int worker_id, void *ctx_ptr) {
             atomic_fetch_add_explicit(&sc->unscored_candidates, unscored_candidates,
                                       memory_order_relaxed);
         }
-        for (int c = 0; c < cand_count; c++) {
-            score_try_emit(sc, i, candidates[c], c, my_buf);
+        for (int c = 0; c < selected_count; c++) {
+            score_try_emit(sc, i, candidates[c].function_index, c, my_buf);
         }
     }
 }
